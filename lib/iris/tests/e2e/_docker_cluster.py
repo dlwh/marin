@@ -82,7 +82,7 @@ class E2ECluster:
             When None, a fresh temp directory is created per cluster.
         env_provider_factory: Optional factory for creating per-worker
             EnvironmentProviders. Signature: (worker_id, num_workers) -> provider.
-            Use TPUSimEnvironmentProvider for TPU simulation tests.
+            Use FixedEnvironmentProvider for TPU simulation tests.
     """
 
     def __init__(
