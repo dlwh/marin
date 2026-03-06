@@ -40,11 +40,11 @@ from iris.cluster.controller.state import (
 from iris.cluster.constraints import (
     AttributeValue,
     Constraint,
-    NormalizedConstraints,
+    PlacementRequirements,
     WellKnownAttribute,
     constraints_from_resources,
+    extract_placement_requirements,
     merge_constraints,
-    normalize_constraints,
 )
 from iris.cluster.types import (
     JobName,
@@ -186,10 +186,10 @@ def compute_demand_entries(
 
         invalid_reason: str | None = None
         try:
-            normalized = normalize_constraints(job.request.constraints)
+            normalized = extract_placement_requirements(job.request.constraints)
         except ValueError as e:
             invalid_reason = f"invalid_constraints: {e}"
-            normalized = NormalizedConstraints(
+            normalized = PlacementRequirements(
                 device_type=None,
                 device_variants=None,
                 preemptible=None,

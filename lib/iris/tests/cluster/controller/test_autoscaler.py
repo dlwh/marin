@@ -33,7 +33,7 @@ from iris.cluster.platform.base import (
     WorkerStatus,
 )
 from iris.cluster.constraints import WellKnownAttribute
-from iris.cluster.constraints import DeviceType, NormalizedConstraints
+from iris.cluster.constraints import DeviceType, PlacementRequirements
 from iris.cluster.types import VmWorkerStatus
 from iris.rpc import cluster_pb2, config_pb2, vm_pb2
 from iris.time_utils import Duration, Timestamp
@@ -60,7 +60,7 @@ def make_demand_entries(
     effective_variants = device_variants
     if effective_variants is None and device_variant is not None:
         effective_variants = frozenset({device_variant})
-    normalized = NormalizedConstraints(
+    normalized = PlacementRequirements(
         device_type=device_type,
         device_variants=effective_variants,
         preemptible=preemptible,
@@ -1547,7 +1547,7 @@ class TestAutoscalerWaterfallEndToEnd:
         )
 
         big_resources = cluster_pb2.ResourceSpecProto(cpu_millicores=128000, memory_bytes=128 * 1024**3)
-        normalized = NormalizedConstraints(
+        normalized = PlacementRequirements(
             device_type=DeviceType.TPU,
             device_variants=frozenset({"v5p-8"}),
             preemptible=None,
@@ -2496,7 +2496,7 @@ def _make_big_demand_entries(
         memory_bytes=memory_bytes,
         disk_bytes=disk_bytes,
     )
-    normalized = NormalizedConstraints(
+    normalized = PlacementRequirements(
         device_type=device_type,
         device_variants=device_variants,
         preemptible=None,
@@ -3312,7 +3312,7 @@ class TestRoutingBinPacking:
 
     def _make_entries(self, count: int, memory_bytes: int = 32 * 1024**3) -> list[DemandEntry]:
         resources = cluster_pb2.ResourceSpecProto(cpu_millicores=1000, memory_bytes=memory_bytes)
-        normalized = NormalizedConstraints(
+        normalized = PlacementRequirements(
             device_type=DeviceType.TPU,
             device_variants=frozenset({"v5p-8"}),
             preemptible=None,
@@ -3398,7 +3398,7 @@ class TestRoutingBinPacking:
         group = ScalingGroup(config, make_mock_platform(), scale_up_cooldown=Duration.from_ms(0))
 
         resources = cluster_pb2.ResourceSpecProto(cpu_millicores=1000, memory_bytes=1024)
-        normalized = NormalizedConstraints(
+        normalized = PlacementRequirements(
             device_type=DeviceType.TPU,
             device_variants=frozenset({"v5p-8"}),
             preemptible=None,
@@ -3440,7 +3440,7 @@ class TestRoutingBinPacking:
         group = ScalingGroup(config, make_mock_platform(), scale_up_cooldown=Duration.from_ms(0))
 
         resources = cluster_pb2.ResourceSpecProto(cpu_millicores=1000, memory_bytes=1024)
-        normalized = NormalizedConstraints(
+        normalized = PlacementRequirements(
             device_type=DeviceType.TPU,
             device_variants=frozenset({"v5p-8"}),
             preemptible=None,

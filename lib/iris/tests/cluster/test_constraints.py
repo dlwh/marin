@@ -9,12 +9,12 @@ from iris.cluster.constraints import (
     Constraint,
     ConstraintOp,
     DeviceType,
-    NormalizedConstraints,
+    PlacementRequirements,
     _match_device_type,
     _match_device_variant,
     _match_set_membership,
     merge_constraints,
-    normalize_constraints,
+    extract_placement_requirements,
 )
 from iris.rpc import cluster_pb2
 
@@ -64,7 +64,7 @@ def test_match_set_membership():
     assert not _match_set_membership("eu-west1", frozenset({"us-central1", "us-east1"}))
 
 
-# --- Normalization: proto constraints → NormalizedConstraints ---
+# --- Normalization: proto constraints → PlacementRequirements ---
 
 
 @pytest.mark.parametrize(
@@ -72,19 +72,19 @@ def test_match_set_membership():
     [
         (
             [_eq_constraint("device-type", "gpu")],
-            NormalizedConstraints(DeviceType.GPU, None, None, None, None),
+            PlacementRequirements(DeviceType.GPU, None, None, None, None),
         ),
         (
             [_eq_constraint("preemptible", "true")],
-            NormalizedConstraints(None, None, True, None, None),
+            PlacementRequirements(None, None, True, None, None),
         ),
         (
             [_eq_constraint("region", "us-central1")],
-            NormalizedConstraints(None, None, None, frozenset({"us-central1"}), None),
+            PlacementRequirements(None, None, None, frozenset({"us-central1"}), None),
         ),
         (
             [_in_constraint("zone", ["us-central1-a", "us-central1-b"])],
-            NormalizedConstraints(None, None, None, None, frozenset({"us-central1-a", "us-central1-b"})),
+            PlacementRequirements(None, None, None, None, frozenset({"us-central1-a", "us-central1-b"})),
         ),
         (
             [
@@ -92,12 +92,12 @@ def test_match_set_membership():
                 _eq_constraint("device-variant", "v5litepod-16"),
                 _eq_constraint("preemptible", "false"),
             ],
-            NormalizedConstraints(DeviceType.TPU, frozenset({"v5litepod-16"}), False, None, None),
+            PlacementRequirements(DeviceType.TPU, frozenset({"v5litepod-16"}), False, None, None),
         ),
     ],
 )
-def test_normalize_constraints_parameterized(constraints, expected):
-    result = normalize_constraints(constraints)
+def test_extract_placement_requirements_parameterized(constraints, expected):
+    result = extract_placement_requirements(constraints)
     assert result == expected
 
 

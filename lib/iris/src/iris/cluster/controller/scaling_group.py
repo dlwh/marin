@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 
 from iris.cluster.platform.base import Labels, Platform, SliceHandle
-from iris.cluster.constraints import DeviceType, NormalizedConstraints, WellKnownAttribute, routing_descriptors
+from iris.cluster.constraints import DeviceType, PlacementRequirements, WellKnownAttribute, routing_descriptors
 from iris.cluster.types import (
     VmWorkerStatusMap,
     get_gpu_count,
@@ -778,7 +778,7 @@ class ScalingGroup:
         group_variant = self._config.resources.device_variant if self._config.HasField("resources") else ""
         return group_variant.lower() in {v.lower() for v in device_variants}
 
-    def matches_demand(self, normalized: NormalizedConstraints) -> bool:
+    def matches_demand(self, normalized: PlacementRequirements) -> bool:
         """Check if this group satisfies the given normalized constraints.
 
         Iterates routing descriptors from the constraint registry and uses

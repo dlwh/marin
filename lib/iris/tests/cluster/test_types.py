@@ -11,13 +11,10 @@ from iris.cluster.constraints import (
     WellKnownAttribute,
     constraints_from_resources,
     device_variant_constraint,
+    extract_placement_requirements,
     merge_constraints,
-    normalize_constraints,
     preemptible_constraint,
-    preemptible_preference_from_constraints,
     region_constraint,
-    required_regions_from_constraints,
-    required_zones_from_constraints,
 )
 from iris.cluster.types import (
     Entrypoint,
@@ -162,7 +159,7 @@ def test_region_constraint_empty_string_raises():
 
 
 # ---------------------------------------------------------------------------
-# preemptible_preference_from_constraints (proto inputs)
+# extract_placement_requirements: preemptible field
 # ---------------------------------------------------------------------------
 
 
@@ -175,12 +172,12 @@ def test_region_constraint_empty_string_raises():
 )
 def test_preemptible_preference_returns_bool(raw_value: str, expected: bool):
     constraints = [_proto_constraint(WellKnownAttribute.PREEMPTIBLE, raw_value)]
-    assert preemptible_preference_from_constraints(constraints) is expected
+    assert extract_placement_requirements(constraints).preemptible is expected
 
 
 def test_preemptible_preference_none_when_absent():
     constraints = [_proto_constraint(WellKnownAttribute.REGION, "us-west4")]
-    assert preemptible_preference_from_constraints(constraints) is None
+    assert extract_placement_requirements(constraints).preemptible is None
 
 
 def test_preemptible_preference_conflicting_raises():
@@ -189,28 +186,28 @@ def test_preemptible_preference_conflicting_raises():
         _proto_constraint(WellKnownAttribute.PREEMPTIBLE, "false"),
     ]
     with pytest.raises(ValueError, match="conflicting"):
-        preemptible_preference_from_constraints(constraints)
+        extract_placement_requirements(constraints)
 
 
 def test_preemptible_preference_invalid_value_raises():
     constraints = [_proto_constraint(WellKnownAttribute.PREEMPTIBLE, "maybe")]
     with pytest.raises(ValueError, match="'true' or 'false'"):
-        preemptible_preference_from_constraints(constraints)
+        extract_placement_requirements(constraints)
 
 
 # ---------------------------------------------------------------------------
-# required_regions_from_constraints (proto inputs)
+# extract_placement_requirements: required_regions field
 # ---------------------------------------------------------------------------
 
 
 def test_required_regions_single():
     constraints = [_proto_constraint(WellKnownAttribute.REGION, "eu-west4")]
-    assert required_regions_from_constraints(constraints) == frozenset({"eu-west4"})
+    assert extract_placement_requirements(constraints).required_regions == frozenset({"eu-west4"})
 
 
 def test_required_regions_none_when_absent():
     constraints = [_proto_constraint(WellKnownAttribute.PREEMPTIBLE, "true")]
-    assert required_regions_from_constraints(constraints) is None
+    assert extract_placement_requirements(constraints).required_regions is None
 
 
 def test_required_regions_conflicting_raises():
@@ -219,28 +216,28 @@ def test_required_regions_conflicting_raises():
         _proto_constraint(WellKnownAttribute.REGION, "eu-west4"),
     ]
     with pytest.raises(ValueError, match="conflicting"):
-        required_regions_from_constraints(constraints)
+        extract_placement_requirements(constraints)
 
 
 def test_required_regions_empty_string_raises():
     constraints = [_proto_constraint(WellKnownAttribute.REGION, "")]
     with pytest.raises(ValueError, match="non-empty"):
-        required_regions_from_constraints(constraints)
+        extract_placement_requirements(constraints)
 
 
 # ---------------------------------------------------------------------------
-# required_zones_from_constraints (proto inputs)
+# extract_placement_requirements: required_zones field
 # ---------------------------------------------------------------------------
 
 
 def test_required_zones_single():
     constraints = [_proto_constraint(WellKnownAttribute.ZONE, "us-central2-b")]
-    assert required_zones_from_constraints(constraints) == frozenset({"us-central2-b"})
+    assert extract_placement_requirements(constraints).required_zones == frozenset({"us-central2-b"})
 
 
 def test_required_zones_none_when_absent():
     constraints = [_proto_constraint(WellKnownAttribute.PREEMPTIBLE, "true")]
-    assert required_zones_from_constraints(constraints) is None
+    assert extract_placement_requirements(constraints).required_zones is None
 
 
 def test_required_zones_conflicting_raises():
@@ -249,27 +246,27 @@ def test_required_zones_conflicting_raises():
         _proto_constraint(WellKnownAttribute.ZONE, "us-central2-b"),
     ]
     with pytest.raises(ValueError, match="conflicting"):
-        required_zones_from_constraints(constraints)
+        extract_placement_requirements(constraints)
 
 
 def test_required_zones_empty_string_raises():
     constraints = [_proto_constraint(WellKnownAttribute.ZONE, "")]
     with pytest.raises(ValueError, match="non-empty"):
-        required_zones_from_constraints(constraints)
+        extract_placement_requirements(constraints)
 
 
 # ---------------------------------------------------------------------------
-# normalize_constraints (proto inputs, combines both extractors)
+# extract_placement_requirements (proto inputs, combines both extractors)
 # ---------------------------------------------------------------------------
 
 
-def test_normalize_constraints_combines_fields():
+def test_extract_placement_requirements_combines_fields():
     constraints = [
         _proto_constraint(WellKnownAttribute.PREEMPTIBLE, "true"),
         _proto_constraint(WellKnownAttribute.REGION, "us-central1"),
         _proto_constraint(WellKnownAttribute.ZONE, "us-central1-a"),
     ]
-    nc = normalize_constraints(constraints)
+    nc = extract_placement_requirements(constraints)
     assert nc.preemptible is True
     assert nc.required_regions == frozenset({"us-central1"})
     assert nc.required_zones == frozenset({"us-central1-a"})
@@ -369,7 +366,7 @@ def test_constraint_in_proto_roundtrip():
 
 
 # ---------------------------------------------------------------------------
-# required_regions_from_constraints with IN operator (proto inputs)
+# extract_placement_requirements: IN operator for regions (proto inputs)
 # ---------------------------------------------------------------------------
 
 
@@ -383,13 +380,13 @@ def _proto_in_constraint(key: str, string_values: list[str]) -> cluster_pb2.Cons
 
 def test_required_regions_in_multiple():
     constraints = [_proto_in_constraint(WellKnownAttribute.REGION, ["us-central1", "us-central2"])]
-    result = required_regions_from_constraints(constraints)
+    result = extract_placement_requirements(constraints).required_regions
     assert result == frozenset({"us-central1", "us-central2"})
 
 
 def test_required_regions_in_single():
     constraints = [_proto_in_constraint(WellKnownAttribute.REGION, ["eu-west4"])]
-    result = required_regions_from_constraints(constraints)
+    result = extract_placement_requirements(constraints).required_regions
     assert result == frozenset({"eu-west4"})
 
 
@@ -397,17 +394,17 @@ def test_required_regions_in_empty_values_raises():
     """IN constraint with no values is invalid."""
     c = cluster_pb2.Constraint(key=WellKnownAttribute.REGION, op=cluster_pb2.CONSTRAINT_OP_IN)
     with pytest.raises(ValueError, match="at least one value"):
-        required_regions_from_constraints([c])
+        extract_placement_requirements([c])
 
 
-def test_normalize_constraints_with_in_region():
-    """normalize_constraints works with IN region constraints."""
+def test_extract_placement_requirements_with_in_region():
+    """extract_placement_requirements works with IN region constraints."""
     constraints = [
         _proto_constraint(WellKnownAttribute.PREEMPTIBLE, "false"),
         _proto_in_constraint(WellKnownAttribute.REGION, ["us-central1", "us-central2"]),
         _proto_constraint(WellKnownAttribute.ZONE, "us-central2-b"),
     ]
-    nc = normalize_constraints(constraints)
+    nc = extract_placement_requirements(constraints)
     assert nc.preemptible is False
     assert nc.required_regions == frozenset({"us-central1", "us-central2"})
     assert nc.required_zones == frozenset({"us-central2-b"})

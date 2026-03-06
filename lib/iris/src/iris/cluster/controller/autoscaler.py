@@ -33,7 +33,7 @@ from iris.cluster.platform.base import (
     QuotaExhaustedError,
     RemoteWorkerHandle,
 )
-from iris.cluster.constraints import DeviceType, NormalizedConstraints
+from iris.cluster.constraints import DeviceType, PlacementRequirements
 from iris.cluster.types import VmWorkerStatusMap
 from iris.cluster.controller.scaling_group import GroupAvailability, ScalingGroup, SliceLifecycleState
 from iris.managed_thread import ThreadContainer, get_thread_container
@@ -92,7 +92,7 @@ class DemandEntry:
 
     task_ids: list[str]
     coschedule_group_id: str | None
-    normalized: NormalizedConstraints
+    normalized: PlacementRequirements
     constraints: list[cluster_pb2.Constraint]
     resources: cluster_pb2.ResourceSpecProto
     invalid_reason: str | None = None

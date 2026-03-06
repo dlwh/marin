@@ -8,7 +8,7 @@ This module is the canonical home for all constraint-related types:
 - WellKnownAttribute: canonical string keys for worker metadata
 - AttributeValue, ConstraintOp, Constraint: core constraint dataclasses
 - DeviceType and device-config helpers (get_device_type, get_device_variant, etc.)
-- NormalizedConstraints and extraction functions for demand routing
+- PlacementRequirements and extraction functions for demand routing
 - Constraint factory functions (preemptible_constraint, region_constraint, etc.)
 - constraints_from_resources: auto-generates device constraints from ResourceSpecProto
 
@@ -274,8 +274,8 @@ def device_variant_constraint(variants: Sequence[str]) -> Constraint:
 
 
 @dataclass(frozen=True)
-class NormalizedConstraints:
-    """Normalized canonical placement constraints derived from proto constraints.
+class PlacementRequirements:
+    """Canonical placement constraints derived from proto constraints.
 
     Combines device type, device variant, preemptible preference, and
     region/zone requirements into a single object for demand routing.
@@ -304,153 +304,83 @@ class NormalizedConstraints:
         return getattr(self, field_name)
 
 
-def preemptible_preference_from_constraints(constraints: Sequence[cluster_pb2.Constraint]) -> bool | None:
-    """Extract preemptible preference from constraints.
+# ---------------------------------------------------------------------------
+# Shared helpers for extract_placement_requirements
+# ---------------------------------------------------------------------------
 
-    Returns:
-        True if explicitly required preemptible workers, False if explicitly
-        requiring non-preemptible workers, or None if unspecified.
 
-    Raises:
-        ValueError: If multiple conflicting preemptible constraints are present
-            or an invalid non-boolean value is used.
-    """
+def _collect_values(
+    constraint: Constraint,
+    *,
+    allow_in: bool = True,
+) -> list[str | int | float]:
+    """Flatten a Constraint's value(s) into a list. EQ → [value], IN → list(values)."""
+    if constraint.op == ConstraintOp.EQ:
+        if constraint.value is None:
+            raise ValueError(f"{constraint.key} constraint requires a value")
+        return [constraint.value]
+    if constraint.op == ConstraintOp.IN:
+        if not allow_in:
+            raise ValueError(f"{constraint.key} constraint must use EQ")
+        if not constraint.values:
+            raise ValueError(f"IN {constraint.key} constraint requires at least one value")
+        return list(constraint.values)
+    raise ValueError(f"{constraint.key} constraint must use EQ or IN, got {constraint.op}")
+
+
+def _extract_string_set(
+    constraints: list[Constraint],
+    key: str,
+    *,
+    transform: Callable[[str], str] = str.strip,
+    reject_empty: bool = True,
+    detect_eq_conflict: bool = True,
+) -> frozenset[str] | None:
+    """Extract a set of string values from constraints sharing the same key."""
+    values: set[str] = set()
+    has_in = False
+    for c in constraints:
+        raw_vals = _collect_values(c)
+        if c.op == ConstraintOp.IN:
+            has_in = True
+        for raw in raw_vals:
+            val = transform(str(raw))
+            if reject_empty and not val:
+                raise ValueError(f"{key} constraint must be non-empty")
+            values.add(val)
+    if detect_eq_conflict and not has_in and len(values) > 1:
+        raise ValueError(f"conflicting {key} constraints")
+    return frozenset(values) if values else None
+
+
+def _extract_preemptible(constraints: list[Constraint]) -> bool | None:
     values: set[bool] = set()
-    for constraint in constraints:
-        if constraint.key != WellKnownAttribute.PREEMPTIBLE:
-            continue
-        if constraint.op != cluster_pb2.CONSTRAINT_OP_EQ:
-            raise ValueError("preemptible constraint must use EQ")
-        if not constraint.value.HasField("string_value"):
-            raise ValueError("preemptible constraint requires string value")
-        raw = constraint.value.string_value.strip().lower()
-        if raw == "true":
-            values.add(True)
-        elif raw == "false":
-            values.add(False)
-        else:
-            raise ValueError("preemptible constraint must be 'true' or 'false'")
-
+    for c in constraints:
+        for raw in _collect_values(c, allow_in=False):
+            s = str(raw).strip().lower()
+            if s == "true":
+                values.add(True)
+            elif s == "false":
+                values.add(False)
+            else:
+                raise ValueError("preemptible constraint must be 'true' or 'false'")
     if len(values) > 1:
         raise ValueError("conflicting preemptible constraints")
     return next(iter(values)) if values else None
 
 
-def required_regions_from_constraints(constraints: Sequence[cluster_pb2.Constraint]) -> frozenset[str] | None:
-    """Extract required regions from constraints.
-
-    Returns:
-        Set of required regions when specified, otherwise None.
-
-    Raises:
-        ValueError: If region constraints use invalid operators/values or contain
-            conflicting EQ values.
-    """
-    regions: set[str] = set()
-    has_in = False
-    for constraint in constraints:
-        if constraint.key != WellKnownAttribute.REGION:
-            continue
-        if constraint.op == cluster_pb2.CONSTRAINT_OP_IN:
-            if not constraint.values:
-                raise ValueError("IN region constraint requires at least one value")
-            for av in constraint.values:
-                if not av.HasField("string_value"):
-                    raise ValueError("region constraint requires string value")
-                region = av.string_value.strip()
-                if not region:
-                    raise ValueError("region constraint must be non-empty")
-                regions.add(region)
-            has_in = True
-        elif constraint.op == cluster_pb2.CONSTRAINT_OP_EQ:
-            if not constraint.value.HasField("string_value"):
-                raise ValueError("region constraint requires string value")
-            region = constraint.value.string_value.strip()
-            if not region:
-                raise ValueError("region constraint must be non-empty")
-            regions.add(region)
-        else:
-            raise ValueError(f"region constraint must use EQ or IN, got {constraint.op}")
-
-    if not has_in and len(regions) > 1:
-        raise ValueError("conflicting region constraints")
-    return frozenset(regions) if regions else None
-
-
-def required_zones_from_constraints(constraints: Sequence[cluster_pb2.Constraint]) -> frozenset[str] | None:
-    """Extract required zones from constraints.
-
-    Returns:
-        Set of required zones when specified, otherwise None.
-
-    Raises:
-        ValueError: If zone constraints use invalid operators/values or contain
-            conflicting EQ values.
-    """
-    zones: set[str] = set()
-    has_in = False
-    for constraint in constraints:
-        if constraint.key != WellKnownAttribute.ZONE:
-            continue
-        if constraint.op == cluster_pb2.CONSTRAINT_OP_IN:
-            if not constraint.values:
-                raise ValueError("IN zone constraint requires at least one value")
-            for av in constraint.values:
-                if not av.HasField("string_value"):
-                    raise ValueError("zone constraint requires string value")
-                zone = av.string_value.strip()
-                if not zone:
-                    raise ValueError("zone constraint must be non-empty")
-                zones.add(zone)
-            has_in = True
-        elif constraint.op == cluster_pb2.CONSTRAINT_OP_EQ:
-            if not constraint.value.HasField("string_value"):
-                raise ValueError("zone constraint requires string value")
-            zone = constraint.value.string_value.strip()
-            if not zone:
-                raise ValueError("zone constraint must be non-empty")
-            zones.add(zone)
-        else:
-            raise ValueError(f"zone constraint must use EQ or IN, got {constraint.op}")
-
-    if not has_in and len(zones) > 1:
-        raise ValueError("conflicting zone constraints")
-    return frozenset(zones) if zones else None
-
-
-def device_type_from_constraints(constraints: Sequence[cluster_pb2.Constraint]) -> DeviceType | None:
-    """Extract device type from constraints.
-
-    Returns:
-        DeviceType when a device-type constraint is present, otherwise None.
-
-    Raises:
-        ValueError: If device-type constraints use invalid operators/values or
-            contain conflicting values.
-    """
-    values: set[str] = set()
-    for constraint in constraints:
-        if constraint.key != WellKnownAttribute.DEVICE_TYPE:
-            continue
-        if constraint.op == cluster_pb2.CONSTRAINT_OP_EQ:
-            if not constraint.value.HasField("string_value"):
-                raise ValueError("device-type constraint requires string value")
-            values.add(constraint.value.string_value.strip().lower())
-        elif constraint.op == cluster_pb2.CONSTRAINT_OP_IN:
-            if not constraint.values:
-                raise ValueError("IN device-type constraint requires at least one value")
-            for av in constraint.values:
-                if not av.HasField("string_value"):
-                    raise ValueError("device-type constraint requires string value")
-                values.add(av.string_value.strip().lower())
-        else:
-            raise ValueError(f"device-type constraint must use EQ or IN, got {constraint.op}")
-
+def _extract_device_type(constraints: list[Constraint]) -> DeviceType | None:
+    values = _extract_string_set(
+        constraints,
+        WellKnownAttribute.DEVICE_TYPE,
+        transform=lambda s: s.strip().lower(),
+        reject_empty=False,
+        detect_eq_conflict=False,
+    )
     if not values:
         return None
     if len(values) > 1:
         raise ValueError(f"conflicting device-type constraints: {values}")
-
     raw = next(iter(values))
     try:
         return DeviceType(raw)
@@ -458,49 +388,34 @@ def device_type_from_constraints(constraints: Sequence[cluster_pb2.Constraint]) 
         raise ValueError(f"unknown device type: {raw}") from e
 
 
-def required_device_variants_from_constraints(constraints: Sequence[cluster_pb2.Constraint]) -> frozenset[str] | None:
-    """Extract required device variants from constraints.
+def extract_placement_requirements(constraints: Sequence[cluster_pb2.Constraint]) -> PlacementRequirements:
+    """Extract canonical placement requirements from protobuf constraints.
 
-    Returns:
-        Set of required device variants when specified, otherwise None.
-
-    Raises:
-        ValueError: If device-variant constraints use invalid operators/values.
+    Parses proto constraints once, groups by key, then extracts each field
+    using shared helpers.
     """
-    variants: set[str] = set()
-    for constraint in constraints:
-        if constraint.key != WellKnownAttribute.DEVICE_VARIANT:
-            continue
-        if constraint.op == cluster_pb2.CONSTRAINT_OP_IN:
-            if not constraint.values:
-                raise ValueError("IN device-variant constraint requires at least one value")
-            for av in constraint.values:
-                if not av.HasField("string_value"):
-                    raise ValueError("device-variant constraint requires string value")
-                variant = av.string_value.strip()
-                if not variant:
-                    raise ValueError("device-variant constraint must be non-empty")
-                variants.add(variant)
-        elif constraint.op == cluster_pb2.CONSTRAINT_OP_EQ:
-            if not constraint.value.HasField("string_value"):
-                raise ValueError("device-variant constraint requires string value")
-            variant = constraint.value.string_value.strip()
-            if not variant:
-                raise ValueError("device-variant constraint must be non-empty")
-            variants.add(variant)
-        else:
-            raise ValueError(f"device-variant constraint must use EQ or IN, got {constraint.op}")
-    return frozenset(variants) if variants else None
+    parsed = [Constraint.from_proto(c) for c in constraints]
 
+    by_key: dict[str, list[Constraint]] = {}
+    for c in parsed:
+        by_key.setdefault(c.key, []).append(c)
 
-def normalize_constraints(constraints: Sequence[cluster_pb2.Constraint]) -> NormalizedConstraints:
-    """Normalize canonical placement constraints from protobuf constraints."""
-    return NormalizedConstraints(
-        device_type=device_type_from_constraints(constraints),
-        device_variants=required_device_variants_from_constraints(constraints),
-        preemptible=preemptible_preference_from_constraints(constraints),
-        required_regions=required_regions_from_constraints(constraints),
-        required_zones=required_zones_from_constraints(constraints),
+    return PlacementRequirements(
+        device_type=_extract_device_type(by_key.get(WellKnownAttribute.DEVICE_TYPE, [])),
+        device_variants=_extract_string_set(
+            by_key.get(WellKnownAttribute.DEVICE_VARIANT, []),
+            WellKnownAttribute.DEVICE_VARIANT,
+            detect_eq_conflict=False,
+        ),
+        preemptible=_extract_preemptible(by_key.get(WellKnownAttribute.PREEMPTIBLE, [])),
+        required_regions=_extract_string_set(
+            by_key.get(WellKnownAttribute.REGION, []),
+            WellKnownAttribute.REGION,
+        ),
+        required_zones=_extract_string_set(
+            by_key.get(WellKnownAttribute.ZONE, []),
+            WellKnownAttribute.ZONE,
+        ),
     )
 
 

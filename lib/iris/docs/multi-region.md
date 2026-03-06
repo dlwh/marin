@@ -72,24 +72,24 @@ Rule: all code paths use these constants/helpers; no raw string literals for the
 Required helper/parsing APIs (exact signatures):
 
 ```python
-def preemptible_preference_from_constraints(
+def extract_placement_requirements(
     constraints: Sequence[cluster_pb2.Constraint],
 ) -> bool | None: ...
 
-def required_regions_from_constraints(
+def extract_placement_requirements(
     constraints: Sequence[cluster_pb2.Constraint],
 ) -> frozenset[str] | None: ...
 
-def normalize_constraints(
+def extract_placement_requirements(
     constraints: Sequence[cluster_pb2.Constraint],
-) -> NormalizedConstraints: ...
+) -> PlacementRequirements: ...
 ```
 
-`NormalizedConstraints` (new dataclass in `/Users/power/code/marin/lib/iris/src/iris/cluster/types.py`):
+`PlacementRequirements` (new dataclass in `/Users/power/code/marin/lib/iris/src/iris/cluster/types.py`):
 
 ```python
 @dataclass(frozen=True)
-class NormalizedConstraints:
+class PlacementRequirements:
     preemptible: bool | None
     required_regions: frozenset[str] | None
 ```
@@ -338,15 +338,15 @@ def region_constraint(regions: Sequence[str]) -> Constraint:
 
 
 @dataclass(frozen=True)
-class NormalizedConstraints:
+class PlacementRequirements:
     preemptible: bool | None
     required_regions: frozenset[str] | None
 
 
-def normalize_constraints(constraints: Sequence[cluster_pb2.Constraint]) -> NormalizedConstraints:
-    preemptible = preemptible_preference_from_constraints(constraints)
-    regions = required_regions_from_constraints(constraints)
-    return NormalizedConstraints(preemptible=preemptible, required_regions=regions)
+def extract_placement_requirements(constraints: Sequence[cluster_pb2.Constraint]) -> PlacementRequirements:
+    preemptible = extract_placement_requirements(constraints)
+    regions = extract_placement_requirements(constraints)
+    return PlacementRequirements(preemptible=preemptible, required_regions=regions)
 ```
 
 ### Snippet 2: parent/child constraint merge
@@ -409,7 +409,7 @@ constraints = constraints_from_json(raw)
 
 ```python
 # controller.py
-normalized = normalize_constraints(job.request.constraints)
+normalized = extract_placement_requirements(job.request.constraints)
 entry = DemandEntry(
     ...,
     constraints=list(job.request.constraints),
@@ -426,7 +426,7 @@ entry = DemandEntry(
 
 2. Slice B: canonical key standardization
 - Add `REGION_ATTRIBUTE_KEY` and `region_constraint()` in `types.py`.
-- Add `normalize_constraints()` and related extraction helpers in `types.py`.
+- Add `extract_placement_requirements()` and related extraction helpers in `types.py`.
 - Replace raw `"preemptible"`/`"region"` strings with constants and helper calls.
 
 3. Slice C: constraint inheritance path
@@ -435,7 +435,7 @@ entry = DemandEntry(
 - Add parent->child constraint merge in `IrisClient.submit()`.
 
 4. Slice D: autoscaler routing alignment
-- Replace ad-hoc preemptible extraction with `normalize_constraints()`.
+- Replace ad-hoc preemptible extraction with `extract_placement_requirements()`.
 - Add region-aware group filtering in `route_demand()`.
 - Improve unmet reason diagnostics for region mismatch.
 
@@ -456,7 +456,7 @@ entry = DemandEntry(
 1. `/Users/power/code/marin/lib/iris/tests/cluster/test_types.py`
 - `region_constraint()` construction and validation.
 - Constraint merge helper behavior (override/dedup).
-- `normalize_constraints()` parsing/validation behavior.
+- `extract_placement_requirements()` parsing/validation behavior.
 
 2. `/Users/power/code/marin/lib/iris/tests/cluster/platform/test_config.py`
 - `worker.attributes.region` validation vs GCP zone.
@@ -503,7 +503,7 @@ Production code migration targets:
 
 1. `/Users/power/code/marin/lib/iris/src/iris/cluster/controller/controller.py`
 - Remove `_extract_preemptible_preference()` literal checks.
-- Replace with `normalize_constraints()` helper usage.
+- Replace with `extract_placement_requirements()` helper usage.
 
 2. `/Users/power/code/marin/lib/iris/src/iris/cluster/worker/env_probe.py`
 - Replace direct `PREEMPTIBLE_ATTRIBUTE_KEY` string fallback call sites with shared key constants only.
