@@ -80,7 +80,7 @@ def _gpu_metadata(variant: str = "H100") -> cluster_pb2.WorkerMetadata:
         device=_gpu_device(variant),
     )
     meta.attributes[WellKnownAttribute.DEVICE_TYPE].CopyFrom(cluster_pb2.AttributeValue(string_value="gpu"))
-    meta.attributes[WellKnownAttribute.DEVICE_VARIANT].CopyFrom(cluster_pb2.AttributeValue(string_value=variant))
+    meta.attributes[WellKnownAttribute.DEVICE_VARIANT].CopyFrom(cluster_pb2.AttributeValue(string_value=variant.lower()))
     return meta
 
 
@@ -91,7 +91,7 @@ def _default_attributes_for_device(device: cluster_pb2.DeviceConfig) -> dict[str
     attrs[WellKnownAttribute.DEVICE_TYPE] = AttributeValue(dt)
     dv = get_device_variant(device)
     if dv:
-        attrs[WellKnownAttribute.DEVICE_VARIANT] = AttributeValue(dv)
+        attrs[WellKnownAttribute.DEVICE_VARIANT] = AttributeValue(dv.lower())
     return attrs
 
 

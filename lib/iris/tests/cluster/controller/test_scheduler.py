@@ -297,11 +297,11 @@ def worker_metadata():
         # Populate well-known attributes matching what _build_worker_attributes does
         if tpu_name:
             meta.attributes[WellKnownAttribute.DEVICE_TYPE].string_value = "tpu"
-            meta.attributes[WellKnownAttribute.DEVICE_VARIANT].string_value = tpu_name
+            meta.attributes[WellKnownAttribute.DEVICE_VARIANT].string_value = tpu_name.lower()
         elif gpu_count > 0:
             meta.attributes[WellKnownAttribute.DEVICE_TYPE].string_value = "gpu"
             if gpu_name:
-                meta.attributes[WellKnownAttribute.DEVICE_VARIANT].string_value = gpu_name
+                meta.attributes[WellKnownAttribute.DEVICE_VARIANT].string_value = gpu_name.lower()
         else:
             meta.attributes[WellKnownAttribute.DEVICE_TYPE].string_value = "cpu"
 

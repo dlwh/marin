@@ -18,6 +18,7 @@ raw string literals so that typos are caught at import time.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum, IntEnum, StrEnum
@@ -269,8 +270,10 @@ def device_variant_constraint(variants: Sequence[str]) -> Constraint:
         if not v:
             raise ValueError("variant must be non-empty")
     if len(variants) == 1:
-        return Constraint(key=WellKnownAttribute.DEVICE_VARIANT, op=ConstraintOp.EQ, value=variants[0])
-    return Constraint(key=WellKnownAttribute.DEVICE_VARIANT, op=ConstraintOp.IN, values=tuple(variants))
+        return Constraint(key=WellKnownAttribute.DEVICE_VARIANT, op=ConstraintOp.EQ, value=variants[0].lower())
+    return Constraint(
+        key=WellKnownAttribute.DEVICE_VARIANT, op=ConstraintOp.IN, values=tuple(v.lower() for v in variants)
+    )
 
 
 @dataclass(frozen=True)
@@ -473,30 +476,6 @@ class ConstraintDescriptor:
     canonical: bool
     routing: bool
     extract: Callable[..., Any] | None
-    match: Callable[[Any, Any], bool] | None
-
-
-# --- Match functions for routing descriptors ---
-
-
-def _match_device_type(group_val: DeviceType, requested: DeviceType) -> bool:
-    if requested == DeviceType.CPU:
-        return True
-    return group_val == requested
-
-
-def _match_device_variant(group_val: str, requested: frozenset[str]) -> bool:
-    if not requested:
-        return True
-    return group_val.lower() in {v.lower() for v in requested}
-
-
-def _match_preemptible(group_val: bool, requested: bool) -> bool:
-    return group_val == requested
-
-
-def _match_set_membership(group_val: str, requested: frozenset[str]) -> bool:
-    return group_val in requested
 
 
 # --- Extract functions ---
@@ -552,7 +531,6 @@ _register(
         canonical=True,
         routing=True,
         extract=_extract_string_lower,
-        match=_match_device_type,
     )
 )
 _register(
@@ -564,7 +542,6 @@ _register(
         canonical=True,
         routing=True,
         extract=_extract_string,
-        match=_match_device_variant,
     )
 )
 _register(
@@ -576,7 +553,6 @@ _register(
         canonical=True,
         routing=True,
         extract=_extract_bool_string,
-        match=_match_preemptible,
     )
 )
 _register(
@@ -588,7 +564,6 @@ _register(
         canonical=True,
         routing=True,
         extract=_extract_string,
-        match=_match_set_membership,
     )
 )
 _register(
@@ -600,7 +575,6 @@ _register(
         canonical=True,
         routing=True,
         extract=_extract_string,
-        match=_match_set_membership,
     )
 )
 _register(
@@ -612,7 +586,6 @@ _register(
         canonical=False,
         routing=False,
         extract=_extract_string,
-        match=None,
     )
 )
 _register(
@@ -624,7 +597,6 @@ _register(
         canonical=False,
         routing=False,
         extract=_extract_int,
-        match=None,
     )
 )
 _register(
@@ -636,7 +608,6 @@ _register(
         canonical=False,
         routing=False,
         extract=_extract_string,
-        match=None,
     )
 )
 _register(
@@ -648,7 +619,6 @@ _register(
         canonical=False,
         routing=False,
         extract=_extract_int,
-        match=None,
     )
 )
 _register(
@@ -660,7 +630,6 @@ _register(
         canonical=False,
         routing=False,
         extract=_extract_string,
-        match=None,
     )
 )
 _register(
@@ -672,14 +641,8 @@ _register(
         canonical=False,
         routing=False,
         extract=_extract_int,
-        match=None,
     )
 )
-
-
-def routing_descriptors() -> list[ConstraintDescriptor]:
-    """Return all routing descriptors in registry insertion order."""
-    return [d for d in CONSTRAINT_REGISTRY.values() if d.routing]
 
 
 # ---------------------------------------------------------------------------
@@ -719,7 +682,7 @@ def constraints_from_resources(resources: cluster_pb2.ResourceSpecProto) -> list
             Constraint(
                 key=WellKnownAttribute.DEVICE_VARIANT,
                 op=ConstraintOp.EQ,
-                value=variant,
+                value=variant.lower(),
             )
         )
 
@@ -739,6 +702,285 @@ def accelerator_type_to_string(accel_type: int) -> str:
     raise ValueError(f"Unknown accelerator type: {accel_type}")
 
 
+def _compare_ordered(
+    attr_value: str | int | float,
+    target_value: str | int | float,
+    op: str,
+) -> bool:
+    """Compare two attribute values with an ordering operator.
+
+    Only numeric types (int, float) support ordered comparisons.
+    Strings are not orderable (comparing "v4-8" > "v5" is not meaningful).
+
+    Raises:
+        ValueError: If either value is a string (ordered comparison not supported).
+    """
+    if isinstance(attr_value, str) or isinstance(target_value, str):
+        raise ValueError(
+            f"Ordered comparison ({op}) not supported for string attributes: "
+            f"{attr_value!r} vs {target_value!r}. Use EQ or NE operators instead."
+        )
+
+    attr_num: int | float = attr_value
+    target_num: int | float = target_value
+
+    if op == "gt":
+        return attr_num > target_num
+    elif op == "ge":
+        return attr_num >= target_num
+    elif op == "lt":
+        return attr_num < target_num
+    elif op == "le":
+        return attr_num <= target_num
+    return False
+
+
+def evaluate_constraint(
+    attr: AttributeValue | None,
+    constraint: cluster_pb2.Constraint,
+) -> bool:
+    """Evaluate a single constraint against an entity's attribute.
+
+    Works for any entity (worker, scaling group, etc.) that has typed attributes.
+
+    Args:
+        attr: Attribute value (None if attribute doesn't exist on the entity)
+        constraint: Constraint to evaluate
+
+    Returns:
+        True if constraint is satisfied, False otherwise
+    """
+    op = constraint.op
+
+    # EXISTS/NOT_EXISTS don't need a value comparison
+    if op == cluster_pb2.CONSTRAINT_OP_EXISTS:
+        return attr is not None
+    if op == cluster_pb2.CONSTRAINT_OP_NOT_EXISTS:
+        return attr is None
+
+    # All other operators require the attribute to exist
+    if attr is None:
+        return False
+
+    target = AttributeValue.from_proto(constraint.value)
+
+    match op:
+        case cluster_pb2.CONSTRAINT_OP_EQ:
+            return attr.value == target.value
+        case cluster_pb2.CONSTRAINT_OP_NE:
+            return attr.value != target.value
+        case cluster_pb2.CONSTRAINT_OP_GT:
+            return _compare_ordered(attr.value, target.value, "gt")
+        case cluster_pb2.CONSTRAINT_OP_GE:
+            return _compare_ordered(attr.value, target.value, "ge")
+        case cluster_pb2.CONSTRAINT_OP_LT:
+            return _compare_ordered(attr.value, target.value, "lt")
+        case cluster_pb2.CONSTRAINT_OP_LE:
+            return _compare_ordered(attr.value, target.value, "le")
+        case cluster_pb2.CONSTRAINT_OP_IN:
+            target_values = {AttributeValue.from_proto(v).value for v in constraint.values}
+            return attr.value in target_values
+        case _:
+            return False
+
+
+def is_cpu_device_type_constraint(c: cluster_pb2.Constraint) -> bool:
+    """True if this constraint is device-type=cpu.
+
+    CPU jobs match any scaling group, so this constraint is stripped
+    before routing evaluation.
+    """
+    return (
+        c.key == WellKnownAttribute.DEVICE_TYPE
+        and c.op == cluster_pb2.CONSTRAINT_OP_EQ
+        and c.value.string_value.strip().lower() == "cpu"
+    )
+
+
+def routing_constraints(constraints: Sequence[cluster_pb2.Constraint]) -> list[cluster_pb2.Constraint]:
+    """Filter to routing-only constraints, stripping CPU device-type.
+
+    Non-routing constraints (tpu-name, tpu-worker-id, etc.) and unknown
+    constraints match individual workers, not scaling groups, so they are
+    excluded from group routing.
+    """
+    result = []
+    for c in constraints:
+        if is_cpu_device_type_constraint(c):
+            continue
+        desc = CONSTRAINT_REGISTRY.get(c.key)
+        if desc is None or not desc.routing:
+            continue
+        result.append(c)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# ConstraintIndex: posting-list index for fast constraint matching
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ConstraintIndex:
+    """Posting-list index for fast constraint matching over a set of entities.
+
+    Entities are identified by plain strings. Each entity has a dict of
+    AttributeValue attributes. The index supports fast EQ/IN/EXISTS/NOT_EXISTS
+    lookups via posting lists, with a slow-path fallback for ordered operators.
+    """
+
+    _all_ids: frozenset[str]
+    _discrete_lists: dict[str, dict[str | int | float, set[str]]]
+    _entity_attributes: dict[str, dict[str, AttributeValue]]
+
+    @classmethod
+    def build(cls, entities: dict[str, dict[str, AttributeValue]]) -> ConstraintIndex:
+        """Build index from entity_id -> attributes mapping."""
+        discrete_lists: dict[str, dict[str | int | float, set[str]]] = {}
+        for entity_id, attrs in entities.items():
+            for key, attr_value in attrs.items():
+                if key not in discrete_lists:
+                    discrete_lists[key] = {}
+                value = attr_value.value
+                if value not in discrete_lists[key]:
+                    discrete_lists[key][value] = set()
+                discrete_lists[key][value].add(entity_id)
+        return cls(
+            _all_ids=frozenset(entities.keys()),
+            _discrete_lists=discrete_lists,
+            _entity_attributes=dict(entities),
+        )
+
+    def matching_entities(self, constraints: Sequence[cluster_pb2.Constraint]) -> set[str]:
+        """Get entity IDs matching ALL constraints."""
+        if not constraints:
+            return set(self._all_ids)
+        result: set[str] | None = None
+        for constraint in constraints:
+            matches = self._evaluate_constraint_set(constraint)
+            if result is None:
+                result = matches
+            else:
+                result = result & matches
+            if not result:
+                return set()
+        return result or set()
+
+    def _evaluate_constraint_set(self, constraint: cluster_pb2.Constraint) -> set[str]:
+        """Evaluate a single constraint, returning matching entity IDs."""
+        key = constraint.key
+        op = constraint.op
+
+        if op == cluster_pb2.CONSTRAINT_OP_EQ and key in self._discrete_lists:
+            target = AttributeValue.from_proto(constraint.value).value
+            return self._discrete_lists[key].get(target, set())
+
+        if op == cluster_pb2.CONSTRAINT_OP_EXISTS:
+            if key in self._discrete_lists:
+                result: set[str] = set()
+                for entities in self._discrete_lists[key].values():
+                    result.update(entities)
+                return result
+            return set()
+
+        if op == cluster_pb2.CONSTRAINT_OP_NOT_EXISTS:
+            if key in self._discrete_lists:
+                has_attr: set[str] = set()
+                for entities in self._discrete_lists[key].values():
+                    has_attr.update(entities)
+                return set(self._all_ids) - has_attr
+            return set(self._all_ids)
+
+        if op == cluster_pb2.CONSTRAINT_OP_IN and key in self._discrete_lists:
+            in_result: set[str] = set()
+            for av in constraint.values:
+                target_val = AttributeValue.from_proto(av).value
+                in_result |= self._discrete_lists[key].get(target_val, set())
+            return in_result
+
+        # Slow path for NE, GT, GE, LT, LE, or non-indexed attributes
+        result_set: set[str] = set()
+        for entity_id, attrs in self._entity_attributes.items():
+            attr = attrs.get(key)
+            if evaluate_constraint(attr, constraint):
+                result_set.add(entity_id)
+        return result_set
+
+    def entities_by_group(self, group_by: str, matching_ids: set[str]) -> dict[str, list[str]]:
+        """Group entities by the specified attribute value."""
+        groups: dict[str, list[str]] = defaultdict(list)
+        if group_by not in self._discrete_lists:
+            return groups
+        for value, entities in self._discrete_lists[group_by].items():
+            for entity_id in entities:
+                if entity_id in matching_ids:
+                    groups[str(value)].append(entity_id)
+        return groups
+
+
+@dataclass(frozen=True)
+class ResourceCapacity:
+    """Resource dimensions for capacity comparison.
+
+    Used by both the autoscaler (ScalingGroup resource fit) and the scheduler
+    (WorkerCapacity resource fit) to check whether a request fits available capacity.
+    """
+
+    cpu_millicores: int = 0
+    memory_bytes: int = 0
+    disk_bytes: int = 0
+    gpu_count: int = 0
+    tpu_count: int = 0
+
+
+def check_resource_fit(
+    available: ResourceCapacity,
+    required: ResourceCapacity,
+    *,
+    zero_means_unlimited: bool = False,
+) -> str | None:
+    """Check if required resources fit within available capacity.
+
+    Returns None if fit, human-readable reason string otherwise.
+
+    When zero_means_unlimited is True, an available value of 0 means
+    "not configured / unlimited" for that dimension and never rejects.
+    """
+
+    def _check(avail: int, req: int, name: str, fmt: str = "d") -> str | None:
+        if req <= 0:
+            return None
+        if zero_means_unlimited and avail == 0:
+            return None
+        if req > avail:
+            return f"{name}: need {req:{fmt}}, available {avail:{fmt}}"
+        return None
+
+    for result in [
+        _check(available.cpu_millicores, required.cpu_millicores, "cpu"),
+        _check(available.memory_bytes, required.memory_bytes, "memory"),
+        _check(available.disk_bytes, required.disk_bytes, "disk"),
+        _check(available.gpu_count, required.gpu_count, "gpu"),
+        _check(available.tpu_count, required.tpu_count, "tpu"),
+    ]:
+        if result is not None:
+            return result
+    return None
+
+
+def resource_capacity_from_spec(spec: cluster_pb2.ResourceSpecProto) -> ResourceCapacity:
+    """Extract ResourceCapacity from a job's ResourceSpecProto."""
+    from iris.cluster.types import get_gpu_count, get_tpu_count
+
+    return ResourceCapacity(
+        cpu_millicores=spec.cpu_millicores,
+        memory_bytes=spec.memory_bytes,
+        disk_bytes=spec.disk_bytes,
+        gpu_count=get_gpu_count(spec.device) if spec.HasField("device") else 0,
+        tpu_count=get_tpu_count(spec.device) if spec.HasField("device") else 0,
+    )
+
+
 def worker_attributes_from_resources(resources: config_pb2.ScaleGroupResources) -> dict[str, str]:
     """Derive well-known worker attributes from scale group resources config.
 
@@ -748,6 +990,6 @@ def worker_attributes_from_resources(resources: config_pb2.ScaleGroupResources) 
     attrs: dict[str, str] = {}
     attrs[WellKnownAttribute.DEVICE_TYPE] = accelerator_type_to_string(resources.device_type)
     if resources.device_variant:
-        attrs[WellKnownAttribute.DEVICE_VARIANT] = resources.device_variant
+        attrs[WellKnownAttribute.DEVICE_VARIANT] = resources.device_variant.lower()
     attrs[WellKnownAttribute.PREEMPTIBLE] = str(resources.preemptible).lower()
     return attrs

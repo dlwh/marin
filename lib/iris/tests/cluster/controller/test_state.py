@@ -1824,7 +1824,7 @@ def test_demand_reservation_holder_uses_entry_resources():
     assert len(real_demand) == 2
     # Holder demand uses entry's H100 device, not parent's A100
     for d in synthetic_demand:
-        assert d.normalized.device_variants == frozenset({"H100"})
+        assert d.normalized.device_variants == frozenset({"h100"})
 
 
 def test_demand_reservation_mixed_jobs():
@@ -1861,7 +1861,7 @@ def test_demand_reservation_mixed_jobs():
 
     # h100-job: 3 real tasks + a100-job: 2 tasks = 5 real demand
     assert len(real_demand) == 5
-    a100_demand = [d for d in real_demand if d.normalized.device_variants == frozenset({"A100"})]
+    a100_demand = [d for d in real_demand if d.normalized.device_variants == frozenset({"a100"})]
     assert len(a100_demand) == 2
 
 
@@ -2226,7 +2226,7 @@ def _gpu_worker_metadata(
         ),
         attributes={
             WellKnownAttribute.DEVICE_TYPE: cluster_pb2.AttributeValue(string_value="gpu"),
-            WellKnownAttribute.DEVICE_VARIANT: cluster_pb2.AttributeValue(string_value=variant),
+            WellKnownAttribute.DEVICE_VARIANT: cluster_pb2.AttributeValue(string_value=variant.lower()),
             WellKnownAttribute.PREEMPTIBLE: cluster_pb2.AttributeValue(string_value="false"),
         },
     )
@@ -2251,7 +2251,7 @@ def _tpu_worker_metadata(
         ),
         attributes={
             WellKnownAttribute.DEVICE_TYPE: cluster_pb2.AttributeValue(string_value="tpu"),
-            WellKnownAttribute.DEVICE_VARIANT: cluster_pb2.AttributeValue(string_value=variant),
+            WellKnownAttribute.DEVICE_VARIANT: cluster_pb2.AttributeValue(string_value=variant.lower()),
             WellKnownAttribute.PREEMPTIBLE: cluster_pb2.AttributeValue(string_value="false"),
         },
     )

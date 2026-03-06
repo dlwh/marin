@@ -171,7 +171,7 @@ def test_gpu_worker_attributes_from_config():
     # Scheduling attributes from config
     attrs = metadata.attributes
     assert attrs[WellKnownAttribute.DEVICE_TYPE].string_value == "gpu"
-    assert attrs[WellKnownAttribute.DEVICE_VARIANT].string_value == "H100"
+    assert attrs[WellKnownAttribute.DEVICE_VARIANT].string_value == "h100"
     assert attrs[WellKnownAttribute.PREEMPTIBLE].string_value == "true"
 
 

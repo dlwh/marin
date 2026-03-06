@@ -32,8 +32,17 @@ from iris.cluster.platform.base import (
     SliceStatus,
     WorkerStatus,
 )
-from iris.cluster.constraints import WellKnownAttribute
-from iris.cluster.constraints import DeviceType, PlacementRequirements
+from iris.cluster.constraints import (
+    Constraint,
+    ConstraintOp,
+    DeviceType,
+    PlacementRequirements,
+    WellKnownAttribute,
+    device_variant_constraint,
+    preemptible_constraint,
+    region_constraint,
+    zone_constraint,
+)
 from iris.cluster.types import VmWorkerStatus
 from iris.rpc import cluster_pb2, config_pb2, vm_pb2
 from iris.time_utils import Duration, Timestamp
@@ -56,7 +65,12 @@ def make_demand_entries(
     if count <= 0:
         return []
     resources = cluster_pb2.ResourceSpecProto(cpu_millicores=1000, memory_bytes=1024)
-    # Convert device_variant to device_variants if not explicitly provided
+    if device_type == DeviceType.TPU:
+        resources.device.tpu.variant = device_variant or ""
+    elif device_type == DeviceType.GPU:
+        resources.device.gpu.variant = device_variant or ""
+    elif device_type == DeviceType.CPU:
+        resources.device.cpu.variant = ""
     effective_variants = device_variants
     if effective_variants is None and device_variant is not None:
         effective_variants = frozenset({device_variant})
@@ -67,12 +81,30 @@ def make_demand_entries(
         required_regions=required_regions,
         required_zones=required_zones,
     )
+
+    # Build proto constraints matching the PlacementRequirements
+    constraint_list: list[Constraint] = []
+    if device_type is not None:
+        constraint_list.append(
+            Constraint(key=WellKnownAttribute.DEVICE_TYPE, op=ConstraintOp.EQ, value=device_type.value)
+        )
+    if effective_variants:
+        constraint_list.append(device_variant_constraint(sorted(effective_variants)))
+    if preemptible is not None:
+        constraint_list.append(preemptible_constraint(preemptible))
+    if required_regions:
+        constraint_list.append(region_constraint(sorted(required_regions)))
+    if required_zones:
+        for z in sorted(required_zones):
+            constraint_list.append(zone_constraint(z))
+    proto_constraints = [c.to_proto() for c in constraint_list]
+
     return [
         DemandEntry(
             task_ids=[f"{task_prefix}-{i}"],
             coschedule_group_id=None,
             normalized=normalized,
-            constraints=[],
+            constraints=proto_constraints,
             resources=resources,
         )
         for i in range(count)

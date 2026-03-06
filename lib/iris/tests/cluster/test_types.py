@@ -436,7 +436,7 @@ def test_constraints_from_resources_gpu():
     type_c = next(c for c in result if c.key == WellKnownAttribute.DEVICE_TYPE)
     assert type_c.value == "gpu"
     variant_c = next(c for c in result if c.key == WellKnownAttribute.DEVICE_VARIANT)
-    assert variant_c.value == "H100"
+    assert variant_c.value == "h100"
 
 
 def test_constraints_from_resources_cpu_produces_nothing():

@@ -25,7 +25,6 @@ from iris.cluster.controller.scheduler import (
     Scheduler,
     SchedulingContext,
     WorkerSnapshot,
-    _evaluate_constraint,
 )
 from iris.cluster.controller.service import ControllerServiceImpl
 from iris.cluster.controller.state import (
@@ -43,6 +42,7 @@ from iris.cluster.constraints import (
     PlacementRequirements,
     WellKnownAttribute,
     constraints_from_resources,
+    evaluate_constraint,
     extract_placement_requirements,
     merge_constraints,
 )
@@ -250,7 +250,7 @@ def _worker_matches_reservation_entry(
     merged_protos = [c.to_proto() for c in merged]
     for constraint in merged_protos:
         attr = worker.attributes.get(constraint.key)
-        if not _evaluate_constraint(attr, constraint):
+        if not evaluate_constraint(attr, constraint):
             return False
 
     return True

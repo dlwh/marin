@@ -239,7 +239,9 @@ def _build_worker_attributes(
     attributes[WellKnownAttribute.DEVICE_TYPE] = cluster_pb2.AttributeValue(string_value=device_type_str)
 
     if accelerator_variant:
-        attributes[WellKnownAttribute.DEVICE_VARIANT] = cluster_pb2.AttributeValue(string_value=accelerator_variant)
+        attributes[WellKnownAttribute.DEVICE_VARIANT] = cluster_pb2.AttributeValue(
+            string_value=accelerator_variant.lower()
+        )
 
     attributes[WellKnownAttribute.PREEMPTIBLE] = cluster_pb2.AttributeValue(string_value=str(preemptible).lower())
 

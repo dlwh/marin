@@ -1,20 +1,21 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for the ConstraintDescriptor registry and match functions."""
+"""Tests for the ConstraintDescriptor registry and constraint evaluation."""
 
 import pytest
 
 from iris.cluster.constraints import (
+    AttributeValue,
     Constraint,
     ConstraintOp,
     DeviceType,
     PlacementRequirements,
-    _match_device_type,
-    _match_device_variant,
-    _match_set_membership,
+    evaluate_constraint,
+    is_cpu_device_type_constraint,
     merge_constraints,
     extract_placement_requirements,
+    routing_constraints,
 )
 from iris.rpc import cluster_pb2
 
@@ -33,35 +34,54 @@ def _in_constraint(key: str, values: list[str]) -> cluster_pb2.Constraint:
     return c
 
 
-# --- Match functions ---
+# --- is_cpu_device_type_constraint ---
 
 
-def test_match_device_type_cpu_matches_all():
-    """CPU demand routes to any group — this is a key business rule."""
-    assert _match_device_type(DeviceType.GPU, DeviceType.CPU)
-    assert _match_device_type(DeviceType.TPU, DeviceType.CPU)
-    assert _match_device_type(DeviceType.CPU, DeviceType.CPU)
+def test_is_cpu_device_type_constraint():
+    assert is_cpu_device_type_constraint(_eq_constraint("device-type", "cpu"))
+    assert is_cpu_device_type_constraint(_eq_constraint("device-type", "CPU"))
+    assert not is_cpu_device_type_constraint(_eq_constraint("device-type", "gpu"))
+    assert not is_cpu_device_type_constraint(_eq_constraint("device-variant", "cpu"))
 
 
-def test_match_device_type_gpu_requires_gpu():
-    assert _match_device_type(DeviceType.GPU, DeviceType.GPU)
-    assert not _match_device_type(DeviceType.TPU, DeviceType.GPU)
-    assert not _match_device_type(DeviceType.CPU, DeviceType.GPU)
+# --- routing_constraints ---
 
 
-def test_match_device_variant_case_insensitive():
-    assert _match_device_variant("H100", frozenset({"h100"}))
-    assert _match_device_variant("h100", frozenset({"H100"}))
+def test_routing_constraints_strips_cpu_and_non_routing():
+    constraints = [
+        _eq_constraint("device-type", "cpu"),
+        _eq_constraint("region", "us-central1"),
+        _eq_constraint("tpu-name", "my-pod"),
+    ]
+    result = routing_constraints(constraints)
+    assert len(result) == 1
+    assert result[0].key == "region"
 
 
-def test_match_device_variant_empty_matches_all():
-    """Empty variant set means no preference — matches any group."""
-    assert _match_device_variant("anything", frozenset())
+def test_routing_constraints_keeps_gpu_device_type():
+    constraints = [
+        _eq_constraint("device-type", "gpu"),
+        _eq_constraint("device-variant", "h100"),
+    ]
+    result = routing_constraints(constraints)
+    assert len(result) == 2
 
 
-def test_match_set_membership():
-    assert _match_set_membership("us-central1", frozenset({"us-central1", "us-east1"}))
-    assert not _match_set_membership("eu-west1", frozenset({"us-central1", "us-east1"}))
+# --- evaluate_constraint for routing ---
+
+
+def test_evaluate_constraint_eq():
+    attr = AttributeValue("gpu")
+    c = _eq_constraint("device-type", "gpu")
+    assert evaluate_constraint(attr, c)
+    assert not evaluate_constraint(AttributeValue("tpu"), c)
+
+
+def test_evaluate_constraint_in():
+    attr = AttributeValue("us-central1")
+    c = _in_constraint("region", ["us-central1", "us-east1"])
+    assert evaluate_constraint(attr, c)
+    assert not evaluate_constraint(AttributeValue("eu-west1"), c)
 
 
 # --- Normalization: proto constraints → PlacementRequirements ---

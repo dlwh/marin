@@ -33,7 +33,13 @@ from iris.cluster.platform.base import (
     QuotaExhaustedError,
     RemoteWorkerHandle,
 )
-from iris.cluster.constraints import DeviceType, PlacementRequirements
+from iris.cluster.constraints import (
+    ConstraintIndex,
+    DeviceType,
+    PlacementRequirements,
+    get_device_type_enum,
+    routing_constraints,
+)
 from iris.cluster.types import VmWorkerStatusMap
 from iris.cluster.controller.scaling_group import GroupAvailability, ScalingGroup, SliceLifecycleState
 from iris.managed_thread import ThreadContainer, get_thread_container
@@ -199,7 +205,7 @@ def compute_required_slices(group: ScalingGroup, entries: list[DemandEntry]) -> 
     for entry in entries:
         if entry.coschedule_group_id:
             coscheduled_count += 1
-        elif entry.normalized.device_type != DeviceType.CPU:
+        elif get_device_type_enum(entry.resources.device) != DeviceType.CPU:
             # Accelerator entries are not bin-packable — each task needs
             # exclusive access to the device, so treat as 1 VM per entry.
             accel_vm_count += 1
@@ -455,7 +461,7 @@ def _matches_filters(group: ScalingGroup, entry: DemandEntry) -> bool:
 
     Does NOT check resource capacity or accept-demand readiness.
     """
-    return group.matches_demand(entry.normalized)
+    return group.matches_constraints(entry.constraints)
 
 
 def _build_group_statuses(
@@ -519,6 +525,10 @@ def route_demand(
     ts = timestamp or Timestamp.now()
     sorted_groups = sorted(groups, key=lambda g: g.config.priority or 100)
 
+    # Build a ConstraintIndex over scaling groups for O(1) constraint matching
+    group_attrs = {g.name: g.to_attributes() for g in sorted_groups}
+    group_index = ConstraintIndex.build(group_attrs)
+
     routed: dict[str, list[DemandEntry]] = {}
     unmet: list[UnmetDemand] = []
     group_reasons: dict[str, str] = {}
@@ -543,7 +553,9 @@ def route_demand(
             unmet.append(UnmetDemand(entry=entry, reason=entry.invalid_reason))
             continue
 
-        matching_groups = [g for g in sorted_groups if _matches_filters(g, entry)]
+        routing_cs = routing_constraints(entry.constraints)
+        matching_names = group_index.matching_entities(routing_cs)
+        matching_groups = [g for g in sorted_groups if g.name in matching_names]
         if not matching_groups:
             unmet.append(UnmetDemand(entry=entry, reason=_diagnose_no_matching_group(entry, sorted_groups)))
             continue

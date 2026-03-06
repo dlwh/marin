@@ -15,8 +15,19 @@ import threading
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 
+from collections.abc import Sequence
+
 from iris.cluster.platform.base import Labels, Platform, SliceHandle
-from iris.cluster.constraints import DeviceType, PlacementRequirements, WellKnownAttribute, routing_descriptors
+from iris.cluster.constraints import (
+    AttributeValue,
+    CONSTRAINT_REGISTRY,
+    DeviceType,
+    ResourceCapacity,
+    WellKnownAttribute,
+    check_resource_fit,
+    evaluate_constraint,
+    is_cpu_device_type_constraint,
+)
 from iris.cluster.types import (
     VmWorkerStatusMap,
     get_gpu_count,
@@ -508,25 +519,20 @@ class ScalingGroup:
         if sg_resources is None:
             return f"group '{self.name}' has no resources configured"
 
-        if sg_resources.cpu_millicores and resources.cpu_millicores > sg_resources.cpu_millicores:
-            return (
-                f"cpu: need {resources.cpu_millicores / 1000:g},"
-                f" group '{self.name}' has {sg_resources.cpu_millicores / 1000:g}"
-            )
-        if sg_resources.memory_bytes and resources.memory_bytes > sg_resources.memory_bytes:
-            need_gb = resources.memory_bytes / (1024**3)
-            have_gb = sg_resources.memory_bytes / (1024**3)
-            return f"memory: need {need_gb:.1f}GB, group '{self.name}' has {have_gb:.1f}GB"
-        if sg_resources.disk_bytes and resources.disk_bytes > sg_resources.disk_bytes:
-            need_gb = resources.disk_bytes / (1024**3)
-            have_gb = sg_resources.disk_bytes / (1024**3)
-            return f"disk: need {need_gb:.1f}GB, group '{self.name}' has {have_gb:.1f}GB"
-
         device_count = get_gpu_count(resources.device) + get_tpu_count(resources.device)
-        if device_count > sg_resources.device_count:
-            return f"device: need {device_count}, group '{self.name}' has {sg_resources.device_count}"
-
-        return None
+        available = ResourceCapacity(
+            cpu_millicores=sg_resources.cpu_millicores,
+            memory_bytes=sg_resources.memory_bytes,
+            disk_bytes=sg_resources.disk_bytes,
+            gpu_count=sg_resources.device_count,
+        )
+        required = ResourceCapacity(
+            cpu_millicores=resources.cpu_millicores,
+            memory_bytes=resources.memory_bytes,
+            disk_bytes=resources.disk_bytes,
+            gpu_count=device_count,
+        )
+        return check_resource_fit(available, required, zero_means_unlimited=True)
 
     def update_slice_activity(self, vm_status_map: VmWorkerStatusMap, timestamp: Timestamp) -> None:
         """Update activity timestamps for all slices based on worker status.
@@ -778,36 +784,44 @@ class ScalingGroup:
         group_variant = self._config.resources.device_variant if self._config.HasField("resources") else ""
         return group_variant.lower() in {v.lower() for v in device_variants}
 
-    def matches_demand(self, normalized: PlacementRequirements) -> bool:
-        """Check if this group satisfies the given normalized constraints.
+    def to_attributes(self) -> dict[str, AttributeValue]:
+        """Express this group's routing properties as worker-style attributes.
 
-        Iterates routing descriptors from the constraint registry and uses
-        each descriptor's match function. Does NOT check resource capacity
-        or accept-demand readiness.
+        Enables the same evaluate_constraint + ConstraintIndex infrastructure
+        used for worker matching to also work for scaling group routing.
         """
-        for desc in routing_descriptors():
-            requested = normalized.get(desc.key)
-            if requested is None:
+        attrs: dict[str, AttributeValue] = {}
+        attrs[WellKnownAttribute.DEVICE_TYPE] = AttributeValue(self._get_device_type().value)
+        if self._config.HasField("resources") and self._config.resources.device_variant:
+            attrs[WellKnownAttribute.DEVICE_VARIANT] = AttributeValue(self._config.resources.device_variant.lower())
+        if self._config.HasField("resources"):
+            attrs[WellKnownAttribute.PREEMPTIBLE] = AttributeValue(str(self._config.resources.preemptible).lower())
+        region = self.region
+        if region:
+            attrs[WellKnownAttribute.REGION] = AttributeValue(region)
+        zone = self.zone
+        if zone:
+            attrs[WellKnownAttribute.ZONE] = AttributeValue(zone)
+        return attrs
+
+    def matches_constraints(self, constraints: Sequence[cluster_pb2.Constraint]) -> bool:
+        """Check if this group satisfies the given proto constraints.
+
+        Only evaluates routing constraints (device-type, device-variant,
+        preemptible, region, zone). Non-routing constraints (tpu-name, etc.)
+        and unknown constraints are scheduler-only and skipped here. CPU
+        device-type constraints are also skipped since CPU jobs match any group.
+        """
+        attrs = self.to_attributes()
+        for c in constraints:
+            if is_cpu_device_type_constraint(c):
                 continue
-            group_val = self._get_routing_value(desc.key)
-            assert desc.match is not None
-            if not desc.match(group_val, requested):
+            desc = CONSTRAINT_REGISTRY.get(c.key)
+            if desc is None or not desc.routing:
+                continue
+            if not evaluate_constraint(attrs.get(c.key), c):
                 return False
         return True
-
-    def _get_routing_value(self, key: str) -> DeviceType | str | bool:
-        """Return this group's value for a routing constraint key."""
-        if key == "device-type":
-            return self._get_device_type()
-        elif key == "device-variant":
-            return self._config.resources.device_variant if self._config.HasField("resources") else ""
-        elif key == "preemptible":
-            return self.config.resources.preemptible
-        elif key == "region":
-            return self.region or ""
-        elif key == "zone":
-            return self.zone or ""
-        raise ValueError(f"Unknown routing key: {key}")
 
     def _get_device_type(self) -> DeviceType:
         """Get device type from resources."""
