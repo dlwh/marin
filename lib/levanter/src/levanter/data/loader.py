@@ -36,7 +36,6 @@ from levanter.utils.jax_utils import is_named_array, local_cpu_mesh
 from levanter.utils.mesh import activate_mesh
 from levanter.utils.partitioning import (
     batch_axis,
-    current_thread_local_mapping,
     physical_axis_name,
     physical_axis_size,
     pspec_for_axis,
@@ -241,9 +240,6 @@ class DataLoaderIterator(Iterator[Ex]):
     def __init__(self, data_loader: DataLoader, start_from_batch: int | None = None):
         self.dl = data_loader
         self._start_from_batch = start_from_batch
-        self.mapping = self.dl.axis_resources
-        if self.mapping is None:
-            self.mapping = current_thread_local_mapping()
 
         buffered_batches = self.dl.max_buffered_batches
         self._batches: Iterator[Ex]
