@@ -22,7 +22,7 @@ defaults:
 controller:
   image: ghcr.io/marin-community/iris-controller:latest
   gcp:
-    zone: us-central1-a
+    zone: europe-west4-b
     machine_type: e2-standard-4
     port: 10000
 
