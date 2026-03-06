@@ -57,9 +57,6 @@ class ArrayLmHarnessModel(ArrayLmHeadModel, Protocol):
     """Array-native model surface required by eval harness-style flows."""
 
     @property
-    def Pos(self) -> hax.Axis: ...
-
-    @property
     def max_length(self) -> int: ...
 
 
