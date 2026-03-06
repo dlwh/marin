@@ -13,7 +13,6 @@ import equinox as eqx
 import haliax as hax
 import jax
 import numpy as np
-from haliax import is_named_array
 from jax import numpy as jnp
 from jax.experimental.multihost_utils import host_local_array_to_global_array
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec
@@ -36,6 +35,8 @@ from levanter.utils.types import ResourceMapping
 X = TypeVar("X")
 T = TypeVar("T", bound=PyTree)
 L = TypeVar("L")
+
+is_named_array = hax.is_named_array
 
 
 def jnp_to_python(a: jnp.ndarray):
@@ -99,9 +100,9 @@ def ensure_scalar(x: Any, *, name: str = "value") -> Any:
 
 def as_named_array_like(array: Any, like: Any) -> Any:
     """Wrap ``array`` in NamedArray form when ``like`` carries named axes."""
-    if is_named_array(array):
+    if hax.is_named_array(array):
         return array
-    if is_named_array(like):
+    if hax.is_named_array(like):
         return hax.NamedArray(array, like.axes)
     return array
 

@@ -5,9 +5,9 @@ import dataclasses
 
 import equinox as eqx
 import haliax as hax
+import haliax.haxtyping as ht
 import jax
 import jaxtyping
-from haliax import haxtyping as ht
 from jax import numpy as jnp
 
 from levanter.inference.page_table import PageBatchInfo, PageTable
