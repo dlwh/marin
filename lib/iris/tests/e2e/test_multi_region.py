@@ -19,11 +19,11 @@ from iris.client.client import IrisClient
 from iris.cluster.config import load_config, make_local_config
 from iris.cluster.manager import connect_cluster
 from iris.cluster.constraints import WellKnownAttribute
+from iris.cluster.constraints import region_constraint
 from iris.cluster.types import (
     Entrypoint,
     EnvironmentSpec,
     ResourceSpec,
-    region_constraint,
 )
 from iris.rpc import cluster_pb2, config_pb2
 from iris.rpc.cluster_connect import ControllerServiceClientSync
@@ -169,7 +169,7 @@ def _submit_child_with_region_override():
     The child specifies region-b, overriding the parent's region-a constraint.
     """
     from iris.client.client import iris_ctx
-    from iris.cluster.types import region_constraint
+    from iris.cluster.constraints import region_constraint
 
     ctx = iris_ctx()
     child = ctx.client.submit(

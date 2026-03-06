@@ -19,8 +19,7 @@ from iris.cli.job import (
     parse_reservation_spec,
     run_iris_job,
 )
-from iris.cluster.constraints import WellKnownAttribute
-from iris.cluster.types import ConstraintOp
+from iris.cluster.constraints import ConstraintOp, WellKnownAttribute
 
 # Unit tests for error handling and edge cases (not trivial assertions)
 

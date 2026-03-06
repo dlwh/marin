@@ -34,14 +34,13 @@ from iris.cluster.controller.events import (
 from iris.cluster.controller.scheduler import JobRequirements, Scheduler, SchedulingContext
 from iris.cluster.controller.state import ControllerState, ControllerWorker
 from iris.cluster.constraints import WellKnownAttribute
-from iris.cluster.types import (
+from iris.cluster.constraints import (
     AttributeValue,
-    JobName,
-    WorkerId,
     device_variant_constraint,
     get_device_type,
     get_device_variant,
 )
+from iris.cluster.types import JobName, WorkerId
 from iris.rpc import cluster_pb2
 from iris.time_utils import Timestamp
 

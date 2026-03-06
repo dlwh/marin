@@ -37,17 +37,20 @@ from iris.cluster.controller.state import (
     HeartbeatSnapshot,
     ReservationClaim,
 )
-from iris.cluster.constraints import WellKnownAttribute, constraints_from_resources
-from iris.cluster.types import (
+from iris.cluster.constraints import (
     AttributeValue,
     Constraint,
-    JobName,
     NormalizedConstraints,
+    WellKnownAttribute,
+    constraints_from_resources,
+    merge_constraints,
+    normalize_constraints,
+)
+from iris.cluster.types import (
+    JobName,
     VmWorkerStatus,
     VmWorkerStatusMap,
     WorkerId,
-    merge_constraints,
-    normalize_constraints,
 )
 from iris.cluster.controller.snapshot import (
     SnapshotResult,

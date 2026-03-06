@@ -25,9 +25,8 @@ from iris.cli.bug_report import file_github_issue, format_bug_report, gather_bug
 from iris.cli.main import require_controller_url
 from iris.client import IrisClient
 from iris.client.client import Job, JobFailedError
-from iris.cluster.constraints import WellKnownAttribute
+from iris.cluster.constraints import Constraint, WellKnownAttribute, region_constraint, zone_constraint
 from iris.cluster.types import (
-    Constraint,
     CoschedulingConfig,
     Entrypoint,
     EnvironmentSpec,
@@ -36,9 +35,7 @@ from iris.cluster.types import (
     ResourceSpec,
     get_tpu_topology,
     gpu_device,
-    region_constraint,
     tpu_device,
-    zone_constraint,
 )
 from iris.rpc import cluster_pb2
 from iris.time_utils import Duration, Timestamp

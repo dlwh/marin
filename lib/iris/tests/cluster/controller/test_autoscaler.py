@@ -33,7 +33,8 @@ from iris.cluster.platform.base import (
     WorkerStatus,
 )
 from iris.cluster.constraints import WellKnownAttribute
-from iris.cluster.types import DeviceType, NormalizedConstraints, VmWorkerStatus
+from iris.cluster.constraints import DeviceType, NormalizedConstraints
+from iris.cluster.types import VmWorkerStatus
 from iris.rpc import cluster_pb2, config_pb2, vm_pb2
 from iris.time_utils import Duration, Timestamp
 from tests.cluster.platform.fakes import FailureMode, FakePlatform, FakePlatformConfig

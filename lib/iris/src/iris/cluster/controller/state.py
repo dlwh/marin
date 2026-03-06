@@ -39,8 +39,8 @@ from iris.cluster.controller.events import (
     WorkerHeartbeatFailedEvent,
     WorkerRegisteredEvent,
 )
+from iris.cluster.constraints import AttributeValue
 from iris.cluster.types import (
-    AttributeValue,
     JobName,
     WorkerId,
     get_gpu_count,

@@ -946,7 +946,7 @@ class TestScalingGroupAvailability:
         self, scale_group_config: config_pb2.ScaleGroupConfig
     ):
         """matches_device_requirement filters groups by device type and variant."""
-        from iris.cluster.types import DeviceType
+        from iris.cluster.constraints import DeviceType
 
         platform = make_mock_platform()
         group = ScalingGroup(scale_group_config, platform)  # TPU with accelerator_variant="v5p-8"

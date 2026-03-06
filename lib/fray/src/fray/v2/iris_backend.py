@@ -24,7 +24,8 @@ from iris.client.client import Job as IrisJob
 from iris.client.client import JobAlreadyExists as IrisJobAlreadyExists
 from iris.client.client import get_iris_ctx, iris_ctx
 from iris.cluster.client.job_info import get_job_info
-from iris.cluster.types import Constraint, EnvironmentSpec, ResourceSpec
+from iris.cluster.constraints import Constraint
+from iris.cluster.types import EnvironmentSpec, ResourceSpec
 from iris.cluster.types import Entrypoint as IrisEntrypoint
 from iris.rpc import cluster_pb2
 
@@ -95,7 +96,7 @@ def convert_resources(resources: ResourceConfig) -> ResourceSpec:
 
 def convert_constraints(resources: ResourceConfig) -> list[Constraint]:
     """Build Iris scheduling constraints from fray v2 ResourceConfig."""
-    from iris.cluster.types import device_variant_constraint, preemptible_constraint, region_constraint
+    from iris.cluster.constraints import device_variant_constraint, preemptible_constraint, region_constraint
 
     constraints: list[Constraint] = []
     if not resources.preemptible:

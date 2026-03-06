@@ -5,14 +5,12 @@
 
 import pytest
 
-from iris.cluster.constraints import WellKnownAttribute, constraints_from_resources
-from iris.cluster.types import (
+from iris.cluster.constraints import (
     Constraint,
     ConstraintOp,
-    Entrypoint,
-    JobName,
+    WellKnownAttribute,
+    constraints_from_resources,
     device_variant_constraint,
-    gpu_device,
     merge_constraints,
     normalize_constraints,
     preemptible_constraint,
@@ -20,6 +18,11 @@ from iris.cluster.types import (
     region_constraint,
     required_regions_from_constraints,
     required_zones_from_constraints,
+)
+from iris.cluster.types import (
+    Entrypoint,
+    JobName,
+    gpu_device,
     tpu_device,
 )
 from iris.rpc import cluster_pb2

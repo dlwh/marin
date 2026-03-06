@@ -41,7 +41,7 @@ class TestConvertConstraints:
         region_constraints = [c for c in constraints if c.key == "region"]
         assert len(region_constraints) == 1
         c = region_constraints[0]
-        from iris.cluster.types import ConstraintOp
+        from iris.cluster.constraints import ConstraintOp
 
         assert c.op == ConstraintOp.EQ
         assert c.value == "us-central1"
@@ -52,7 +52,7 @@ class TestConvertConstraints:
         region_constraints = [c for c in constraints if c.key == "region"]
         assert len(region_constraints) == 1
         c = region_constraints[0]
-        from iris.cluster.types import ConstraintOp
+        from iris.cluster.constraints import ConstraintOp
 
         assert c.op == ConstraintOp.IN
         assert c.values == ("us-central1", "us-central2")
@@ -71,7 +71,7 @@ class TestConvertConstraintsDeviceAlternatives:
         device_constraints = [c for c in constraints if c.key == "device-variant"]
         assert len(device_constraints) == 1
         c = device_constraints[0]
-        from iris.cluster.types import ConstraintOp
+        from iris.cluster.constraints import ConstraintOp
 
         assert c.op == ConstraintOp.IN
         assert set(c.values) == {"v4-8", "v5p-8"}

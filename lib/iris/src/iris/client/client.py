@@ -42,8 +42,8 @@ from iris.cluster.controller.local import (
     make_local_cluster_config,
     wait_for_worker_registration,
 )
+from iris.cluster.constraints import Constraint, merge_constraints
 from iris.cluster.types import (
-    Constraint,
     CoschedulingConfig,
     Entrypoint,
     EnvironmentSpec,
@@ -51,7 +51,6 @@ from iris.cluster.types import (
     Namespace,
     ReservationEntry,
     ResourceSpec,
-    merge_constraints,
     adjust_tpu_replicas,
 )
 from iris.rpc import cluster_pb2

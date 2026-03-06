@@ -31,7 +31,8 @@ from iris.cluster.controller.state import (
     ControllerTask,
 )
 from iris.cluster.constraints import WellKnownAttribute, constraints_from_resources
-from iris.cluster.types import DeviceType, JobName, WorkerId
+from iris.cluster.constraints import DeviceType
+from iris.cluster.types import JobName, WorkerId
 from iris.rpc import cluster_pb2
 from iris.time_utils import Duration, Timestamp
 

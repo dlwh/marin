@@ -60,18 +60,20 @@ import click
 import fsspec
 from iris.client import IrisClient
 from iris.cluster.config import load_config
-from iris.cluster.constraints import WellKnownAttribute
-from iris.cluster.types import (
+from iris.cluster.constraints import (
     Constraint,
+    WellKnownAttribute,
+    device_variant_constraint,
+    preemptible_constraint,
+    region_constraint,
+)
+from iris.cluster.types import (
     CoschedulingConfig,
     Entrypoint,
     EnvironmentSpec,
     ReservationEntry,
     ResourceSpec,
-    device_variant_constraint,
     gpu_device,
-    preemptible_constraint,
-    region_constraint,
     tpu_device,
 )
 from iris.rpc import cluster_pb2, config_pb2

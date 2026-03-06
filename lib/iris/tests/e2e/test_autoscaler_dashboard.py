@@ -14,8 +14,7 @@ import pytest
 from iris.client.client import IrisClient
 from iris.cluster.config import load_config, make_local_config
 from iris.cluster.manager import connect_cluster
-from iris.cluster.constraints import WellKnownAttribute
-from iris.cluster.types import zone_constraint
+from iris.cluster.constraints import WellKnownAttribute, zone_constraint
 from iris.cluster.types import (
     Entrypoint,
     EnvironmentSpec,

@@ -22,8 +22,8 @@ from enum import StrEnum
 from typing import Any, Protocol
 
 from iris.cluster.constraints import WellKnownAttribute
+from iris.cluster.constraints import AttributeValue
 from iris.cluster.types import (
-    AttributeValue,
     JobName,
     WorkerId,
     get_gpu_count,

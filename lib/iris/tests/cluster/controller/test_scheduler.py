@@ -22,7 +22,8 @@ from iris.cluster.controller.scheduler import (
     SchedulingResult,
 )
 from iris.cluster.controller.state import ControllerState, ControllerTask
-from iris.cluster.types import Constraint, JobName, WorkerId, merge_constraints
+from iris.cluster.constraints import Constraint, merge_constraints
+from iris.cluster.types import JobName, WorkerId
 from iris.rpc import cluster_pb2, config_pb2
 from iris.time_utils import Timestamp
 

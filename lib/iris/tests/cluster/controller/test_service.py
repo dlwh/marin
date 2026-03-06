@@ -17,7 +17,8 @@ from iris.cluster.constraints import WellKnownAttribute
 from iris.cluster.controller.events import TaskAssignedEvent, TaskStateChangedEvent
 from iris.cluster.controller.service import ControllerServiceImpl
 from iris.cluster.controller.state import ControllerState, ControllerTask
-from iris.cluster.types import JobName, WorkerId, device_variant_constraint, tpu_device
+from iris.cluster.constraints import device_variant_constraint
+from iris.cluster.types import JobName, WorkerId, tpu_device
 from iris.logging import BufferedLogRecord, LogRingBuffer
 from iris.rpc import cluster_pb2
 

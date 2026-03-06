@@ -26,8 +26,8 @@ from iris.cluster.controller.state import (
     ControllerTaskAttempt,
     ControllerWorker,
 )
-from iris.cluster.constraints import WellKnownAttribute
-from iris.cluster.types import AttributeValue, JobName, WorkerId
+from iris.cluster.constraints import AttributeValue, WellKnownAttribute
+from iris.cluster.types import JobName, WorkerId
 from iris.rpc import cluster_pb2, config_pb2, snapshot_pb2
 from iris.time_utils import Deadline, Duration, Timestamp
 

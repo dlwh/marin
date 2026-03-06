@@ -16,10 +16,8 @@ from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 
 from iris.cluster.platform.base import Labels, Platform, SliceHandle
-from iris.cluster.constraints import WellKnownAttribute
+from iris.cluster.constraints import DeviceType, NormalizedConstraints, WellKnownAttribute, routing_descriptors
 from iris.cluster.types import (
-    DeviceType,
-    NormalizedConstraints,
     VmWorkerStatusMap,
     get_gpu_count,
     get_tpu_count,
@@ -783,20 +781,33 @@ class ScalingGroup:
     def matches_demand(self, normalized: NormalizedConstraints) -> bool:
         """Check if this group satisfies the given normalized constraints.
 
-        Combines device type/variant matching with preemptible preference
-        and region/zone filtering. Does NOT check resource capacity or
-        accept-demand readiness.
+        Iterates routing descriptors from the constraint registry and uses
+        each descriptor's match function. Does NOT check resource capacity
+        or accept-demand readiness.
         """
-        device_type = normalized.device_type or DeviceType.CPU
-        if not self.matches_device_requirement(device_type, normalized.device_variants):
-            return False
-        if normalized.preemptible is not None and self.config.resources.preemptible != normalized.preemptible:
-            return False
-        if normalized.required_regions and self.region not in normalized.required_regions:
-            return False
-        if normalized.required_zones and self.zone not in normalized.required_zones:
-            return False
+        for desc in routing_descriptors():
+            requested = normalized.get(desc.key)
+            if requested is None:
+                continue
+            group_val = self._get_routing_value(desc.key)
+            assert desc.match is not None
+            if not desc.match(group_val, requested):
+                return False
         return True
+
+    def _get_routing_value(self, key: str) -> DeviceType | str | bool:
+        """Return this group's value for a routing constraint key."""
+        if key == "device-type":
+            return self._get_device_type()
+        elif key == "device-variant":
+            return self._config.resources.device_variant if self._config.HasField("resources") else ""
+        elif key == "preemptible":
+            return self.config.resources.preemptible
+        elif key == "region":
+            return self.region or ""
+        elif key == "zone":
+            return self.zone or ""
+        raise ValueError(f"Unknown routing key: {key}")
 
     def _get_device_type(self) -> DeviceType:
         """Get device type from resources."""

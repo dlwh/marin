@@ -34,8 +34,8 @@ from iris.cluster.controller.state import (
     ControllerTask,
     ControllerWorker,
 )
-from iris.cluster.constraints import constraints_from_resources
-from iris.cluster.types import Constraint, JobName, WorkerId, merge_constraints
+from iris.cluster.constraints import Constraint, constraints_from_resources, merge_constraints
+from iris.cluster.types import JobName, WorkerId
 from iris.logging import LogBuffer
 from iris.rpc import cluster_pb2, vm_pb2
 from iris.rpc.cluster_connect import WorkerServiceClientSync

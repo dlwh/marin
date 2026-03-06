@@ -12,7 +12,7 @@ import pytest
 from iris.client.client import IrisClient
 from iris.cluster.config import load_config, make_local_config
 from iris.cluster.manager import connect_cluster
-from iris.cluster.types import Constraint, ConstraintOp
+from iris.cluster.constraints import Constraint, ConstraintOp
 from iris.rpc import cluster_pb2, config_pb2
 from iris.rpc.cluster_connect import ControllerServiceClientSync
 from iris.time_utils import Duration

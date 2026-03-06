@@ -17,10 +17,8 @@ import pytest
 
 from iris.client import IrisClient, IrisContext, LocalClientConfig, iris_ctx_scope
 from iris.cluster.client.job_info import JobInfo
-from iris.cluster.constraints import WellKnownAttribute
+from iris.cluster.constraints import Constraint, ConstraintOp, WellKnownAttribute
 from iris.cluster.types import (
-    Constraint,
-    ConstraintOp,
     Entrypoint,
     EnvironmentSpec,
     JobName,
