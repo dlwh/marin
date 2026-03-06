@@ -1362,7 +1362,9 @@ def test_log_entries_accumulated_in_log_store(job_request, worker_metadata):
     )
     state.complete_heartbeat(snapshot, response)
 
-    log_result = state.log_store.get_logs(task.task_id, task.current_attempt_id)
+    from iris.cluster.controller.logs import task_log_key
+
+    log_result = state.log_store.get_logs(task_log_key(task.task_id, task.current_attempt_id))
     assert len(log_result.entries) == 1
     assert log_result.entries[0].data == "hello world"
 
@@ -1395,7 +1397,9 @@ def test_log_entries_accumulated_across_heartbeats(job_request, worker_metadata)
         )
         state.complete_heartbeat(snapshot, response)
 
-    log_result = state.log_store.get_logs(task.task_id, task.current_attempt_id)
+    from iris.cluster.controller.logs import task_log_key
+
+    log_result = state.log_store.get_logs(task_log_key(task.task_id, task.current_attempt_id))
     assert len(log_result.entries) == 3
     assert [e.data for e in log_result.entries] == ["line 0", "line 1", "line 2"]
 
@@ -1405,23 +1409,24 @@ def test_log_store_concurrent_append_and_read():
     import re
     import threading
 
-    from iris.cluster.controller.state import ControllerLogStore
+    from iris.cluster.controller.logs import LogStore, task_log_key
     from iris.rpc import logging_pb2
 
-    store = ControllerLogStore()
+    store = LogStore()
     task_id = JobName.from_wire("/job/concurrent/task/0")
+    key = task_log_key(task_id, 0)
     errors: list[Exception] = []
 
     def writer():
         for i in range(500):
             entry = logging_pb2.LogEntry(source="stdout", data=f"line-{i}")
             entry.timestamp.epoch_ms = i
-            store.append(task_id, 0, [entry])
+            store.append(key, [entry])
 
     def reader():
         for _ in range(500):
             try:
-                store.get_logs(task_id, 0, regex_filter=re.compile("line"))
+                store.get_logs(key, regex_filter=re.compile("line"))
             except RuntimeError as e:
                 errors.append(e)
 

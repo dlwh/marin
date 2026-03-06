@@ -1,11 +1,11 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""SQLite-backed log store for controller task attempts.
+"""SQLite-backed log store with string keys.
 
-Replaces per-attempt JSONL files with a single SQLite database, eliminating
-the per-file FD pressure that can exhaust process limits when many tasks
-run concurrently. Uses WAL mode for concurrent reader/writer access.
+Stores log entries keyed by an arbitrary string, suitable for task attempt logs,
+process logs, autoscaler logs, or any other log stream. Uses WAL mode for
+concurrent reader/writer access.
 """
 
 import re
@@ -22,18 +22,22 @@ from iris.rpc import logging_pb2
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_wire TEXT NOT NULL,
-    attempt_id INTEGER NOT NULL,
+    key TEXT NOT NULL,
     source TEXT NOT NULL,
     data TEXT NOT NULL,
     epoch_ms INTEGER NOT NULL,
     level INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_task_attempt ON logs(task_wire, attempt_id, id);
+CREATE INDEX IF NOT EXISTS idx_key ON logs(key, id);
 """
 
 _MAX_RECORDS = 100_000_000
 _EVICT_CHECK_INTERVAL = 100_000  # check eviction every N appends
+
+
+def task_log_key(task_id: JobName, attempt_id: int) -> str:
+    """Build a hierarchical key for task attempt logs."""
+    return f"{task_id.to_wire()}:{attempt_id}"
 
 
 @dataclass
@@ -42,12 +46,11 @@ class LogReadResult:
     lines_read: int  # total line count at end of read (cursor for next poll)
 
 
-class ControllerLogStore:
-    """SQLite-backed log store for task attempts.
+class LogStore:
+    """SQLite-backed log store keyed by arbitrary strings.
 
-    Thread-safe: heartbeat writers (complete_heartbeat) and RPC readers
-    (get_task_logs) may run concurrently. WAL mode allows readers to
-    proceed without blocking the writer.
+    Thread-safe: writers and RPC readers may run concurrently. WAL mode
+    allows readers to proceed without blocking the writer.
     """
 
     def __init__(self, log_dir: Path | None = None, *, max_records: int = _MAX_RECORDS):
@@ -70,32 +73,13 @@ class ControllerLogStore:
         self._max_records = max_records
         self._append_count = 0
 
-    @staticmethod
-    def _entry_to_row(task_wire: str, attempt_id: int, entry: logging_pb2.LogEntry) -> tuple:
-        return (
-            task_wire,
-            attempt_id,
-            entry.source,
-            entry.data,
-            entry.timestamp.epoch_ms,
-            entry.level,
-        )
-
-    @staticmethod
-    def _row_to_entry(row: tuple) -> logging_pb2.LogEntry:
-        # row: (source, data, epoch_ms, attempt_id, level)
-        entry = logging_pb2.LogEntry(source=row[0], data=row[1], attempt_id=row[3], level=row[4])
-        entry.timestamp.epoch_ms = row[2]
-        return entry
-
-    def append(self, task_id: JobName, attempt_id: int, entries: list) -> None:
+    def append(self, key: str, entries: list) -> None:
         if not entries:
             return
-        task_wire = task_id.to_wire()
-        rows = [self._entry_to_row(task_wire, attempt_id, e) for e in entries]
+        rows = [(key, e.source, e.data, e.timestamp.epoch_ms, e.level) for e in entries]
         with self._lock:
             self._conn.executemany(
-                "INSERT INTO logs (task_wire, attempt_id, source, data, epoch_ms, level) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO logs (key, source, data, epoch_ms, level) VALUES (?, ?, ?, ?, ?)",
                 rows,
             )
             self._conn.commit()
@@ -105,8 +89,7 @@ class ControllerLogStore:
 
     def get_logs(
         self,
-        task_id: JobName,
-        attempt_id: int,
+        key: str,
         *,
         since_ms: int = 0,
         skip_lines: int = 0,
@@ -115,56 +98,48 @@ class ControllerLogStore:
         tail: bool = False,
         min_level: str = "",
     ) -> LogReadResult:
-        task_wire = task_id.to_wire()
         min_level_enum = str_to_log_level(min_level) if min_level else 0
 
         with self._lock:
-            total = self._count_lines(task_wire, attempt_id)
+            total = self._count_lines(key)
             if total == 0:
                 return LogReadResult(entries=[], lines_read=0)
 
             has_filter = regex_filter is not None or since_ms > 0 or min_level_enum > 0
 
-            # Build the query depending on mode
             if tail and max_lines > 0 and not has_filter:
-                # Optimized tail without filters: skip to last N rows via OFFSET
                 effective_skip = max(skip_lines, total - max_lines)
                 rows = self._conn.execute(
-                    "SELECT source, data, epoch_ms, attempt_id, level FROM logs "
-                    "WHERE task_wire = ? AND attempt_id = ? "
-                    "ORDER BY id LIMIT -1 OFFSET ?",
-                    (task_wire, attempt_id, effective_skip),
+                    "SELECT source, data, epoch_ms, level FROM logs " "WHERE key = ? " "ORDER BY id LIMIT -1 OFFSET ?",
+                    (key, effective_skip),
                 ).fetchall()
             elif tail and max_lines > 0 and has_filter:
-                # Tail with filters: fetch candidate rows, filter in Python, take last N
-                params: list = [task_wire, attempt_id]
+                params: list = [key]
                 where_extra = ""
                 if since_ms > 0:
                     where_extra += " AND epoch_ms > ?"
                     params.append(since_ms)
                 rows = self._conn.execute(
-                    "SELECT source, data, epoch_ms, attempt_id, level FROM logs "
-                    f"WHERE task_wire = ? AND attempt_id = ?{where_extra} "
-                    "ORDER BY id",
+                    "SELECT source, data, epoch_ms, level FROM logs " f"WHERE key = ?{where_extra} " "ORDER BY id",
                     params,
                 ).fetchall()
                 if regex_filter:
                     rows = [r for r in rows if regex_filter.search(r[1])]
                 if min_level_enum > 0:
                     # level=0 (UNKNOWN) is always included so untagged output is never hidden.
-                    rows = [r for r in rows if r[4] == 0 or r[4] >= min_level_enum]
+                    rows = [r for r in rows if r[3] == 0 or r[3] >= min_level_enum]
                 rows = rows[-max_lines:]
             else:
                 # Forward mode
-                params = [task_wire, attempt_id]
+                params = [key]
                 where_extra = ""
                 if since_ms > 0:
                     where_extra += " AND epoch_ms > ?"
                     params.append(since_ms)
 
                 query = (
-                    "SELECT source, data, epoch_ms, attempt_id, level FROM logs "
-                    f"WHERE task_wire = ? AND attempt_id = ?{where_extra} "
+                    "SELECT source, data, epoch_ms, level FROM logs "
+                    f"WHERE key = ?{where_extra} "
                     "ORDER BY id LIMIT -1 OFFSET ?"
                 )
                 params.append(skip_lines)
@@ -174,7 +149,7 @@ class ControllerLogStore:
                     rows = [r for r in rows if regex_filter.search(r[1])]
                 if min_level_enum > 0:
                     # level=0 (UNKNOWN) is always included so untagged output is never hidden.
-                    rows = [r for r in rows if r[4] == 0 or r[4] >= min_level_enum]
+                    rows = [r for r in rows if r[3] == 0 or r[3] >= min_level_enum]
 
                 if max_lines > 0:
                     rows = rows[:max_lines]
@@ -182,22 +157,17 @@ class ControllerLogStore:
         entries = [self._row_to_entry(r) for r in rows]
         return LogReadResult(entries=entries, lines_read=total)
 
-    def has_logs(self, task_id: JobName, attempt_id: int) -> bool:
-        task_wire = task_id.to_wire()
+    def has_logs(self, key: str) -> bool:
         with self._lock:
             row = self._conn.execute(
-                "SELECT 1 FROM logs WHERE task_wire = ? AND attempt_id = ? LIMIT 1",
-                (task_wire, attempt_id),
+                "SELECT 1 FROM logs WHERE key = ? LIMIT 1",
+                (key,),
             ).fetchone()
             return row is not None
 
-    def clear_attempt(self, task_id: JobName, attempt_id: int) -> None:
-        task_wire = task_id.to_wire()
+    def clear(self, key: str) -> None:
         with self._lock:
-            self._conn.execute(
-                "DELETE FROM logs WHERE task_wire = ? AND attempt_id = ?",
-                (task_wire, attempt_id),
-            )
+            self._conn.execute("DELETE FROM logs WHERE key = ?", (key,))
             self._conn.commit()
 
     def close(self) -> None:
@@ -206,10 +176,17 @@ class ControllerLogStore:
         if self._temp_dir is not None:
             self._temp_dir.cleanup()
 
-    def _count_lines(self, task_wire: str, attempt_id: int) -> int:
+    @staticmethod
+    def _row_to_entry(row: tuple) -> logging_pb2.LogEntry:
+        # row: (source, data, epoch_ms, level)
+        entry = logging_pb2.LogEntry(source=row[0], data=row[1], level=row[3])
+        entry.timestamp.epoch_ms = row[2]
+        return entry
+
+    def _count_lines(self, key: str) -> int:
         row = self._conn.execute(
-            "SELECT COUNT(*) FROM logs WHERE task_wire = ? AND attempt_id = ?",
-            (task_wire, attempt_id),
+            "SELECT COUNT(*) FROM logs WHERE key = ?",
+            (key,),
         ).fetchone()
         return row[0]
 

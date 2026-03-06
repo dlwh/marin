@@ -19,6 +19,7 @@ from connectrpc.errors import ConnectError
 from connectrpc.request import RequestContext
 
 from iris.cluster.controller.bundle_store import BundleStore
+from iris.cluster.controller.logs import task_log_key
 from iris.cluster.controller.events import (
     JobCancelledEvent,
     JobSubmittedEvent,
@@ -930,8 +931,7 @@ class ControllerServiceImpl:
                 offset_key = f"{task_id_wire}/{attempt.attempt_id}"
                 skip_lines = int(request.resume_offsets.get(offset_key, 0))
                 log_result = log_store.get_logs(
-                    task.task_id,
-                    attempt.attempt_id,
+                    task_log_key(task.task_id, attempt.attempt_id),
                     since_ms=request.since_ms,
                     skip_lines=skip_lines,
                     regex_filter=compiled_regex,
