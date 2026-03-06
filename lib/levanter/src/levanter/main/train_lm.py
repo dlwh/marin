@@ -116,6 +116,7 @@ def main(config: TrainLmConfig):
             batch_axis=config.trainer.batch_axis_name,
             key=key,
             logsumexp_weight=config.z_loss_weight,
+            axis_mapping=config.trainer.compute_axis_mapping,
         )
 
     # Using the trainer as a context manager does 2 things:
