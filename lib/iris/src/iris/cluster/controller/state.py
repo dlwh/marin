@@ -43,8 +43,6 @@ from iris.cluster.types import (
     AttributeValue,
     JobName,
     WorkerId,
-    get_device_type,
-    get_device_variant,
     get_gpu_count,
     get_tpu_count,
 )
@@ -810,28 +808,19 @@ class ControllerWorker:
 
     @property
     def device_type(self) -> str:
-        """Device type string from worker attributes.
-
-        Prefers the attribute value (set from config via _build_worker_attributes)
-        over the legacy metadata.device field. Falls back to metadata for workers
-        that haven't been updated yet.
-        """
+        """Device type string from worker attributes."""
         attr = self.attributes.get(WellKnownAttribute.DEVICE_TYPE)
         if attr is not None:
             return str(attr.value)
-        return get_device_type(self.metadata.device)
+        return "cpu"
 
     @property
     def device_variant(self) -> str | None:
-        """Device variant string from worker attributes.
-
-        Prefers the attribute value (set from config via _build_worker_attributes)
-        over the legacy metadata.device field.
-        """
+        """Device variant string from worker attributes."""
         attr = self.attributes.get(WellKnownAttribute.DEVICE_VARIANT)
         if attr is not None:
             return str(attr.value)
-        return get_device_variant(self.metadata.device)
+        return None
 
 
 @dataclass

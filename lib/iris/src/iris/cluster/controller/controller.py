@@ -41,14 +41,11 @@ from iris.cluster.constraints import WellKnownAttribute, constraints_from_resour
 from iris.cluster.types import (
     AttributeValue,
     Constraint,
-    DeviceType,
     JobName,
     NormalizedConstraints,
     VmWorkerStatus,
     VmWorkerStatusMap,
     WorkerId,
-    get_device_type_enum,
-    get_device_variant,
     merge_constraints,
     normalize_constraints,
 )
@@ -196,19 +193,6 @@ def compute_demand_entries(
                 required_regions=None,
                 required_zones=None,
             )
-
-        # Fall back to extracting device info from the ResourceSpec device field
-        # when constraints don't carry it (e.g. jobs submitted without going
-        # through the service layer's auto-injection).
-        device = job.request.resources.device
-        if normalized.device_type is None:
-            device_type = get_device_type_enum(device)
-            if device_type != DeviceType.CPU:
-                normalized = replace(normalized, device_type=device_type)
-        if normalized.device_variants is None:
-            variant = get_device_variant(device) if get_device_type_enum(device) != DeviceType.CPU else None
-            if variant:
-                normalized = replace(normalized, device_variants=frozenset({variant}))
 
         if job.is_coscheduled:
             remaining_ids = []

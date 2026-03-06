@@ -1361,3 +1361,53 @@ scale_groups:
         p.write_text(config_content)
         with pytest.raises(ValueError, match="collides"):
             load_config(p)
+
+
+class TestPreemptibleNormalization:
+    """Tests for preemptible field parsing during config normalization."""
+
+    _BASE_CONFIG = """\
+scale_groups:
+  test:
+    num_vms: 1
+    resources:
+      cpu: 8
+      ram: 16GB
+      disk: 50GB
+      device_type: gpu
+      device_variant: a100
+      device_count: 1
+      preemptible: {value}
+    slice_template:
+      manual:
+        hosts: [10.0.0.1]
+"""
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("true", True),
+            ("True", True),
+            ("TRUE", True),
+            ("false", False),
+            ("False", False),
+            ("FALSE", False),
+            (True, True),
+            (False, False),
+        ],
+    )
+    def test_preemptible_parsed_correctly(self, tmp_path: Path, value: object, expected: bool):
+        content = self._BASE_CONFIG.format(value=value)
+        p = tmp_path / "config.yaml"
+        p.write_text(content)
+        config = load_config(p)
+        assert config.scale_groups["test"].resources.preemptible == expected
+
+    @pytest.mark.parametrize("value", ['"yes"', '"no"', '"1"', '"0"', '"maybe"'])
+    def test_preemptible_rejects_invalid_string(self, tmp_path: Path, value: str):
+        """Strings other than 'true'/'false' are rejected."""
+        content = self._BASE_CONFIG.format(value=value)
+        p = tmp_path / "config.yaml"
+        p.write_text(content)
+        with pytest.raises(ValueError, match="preemptible must be true or false"):
+            load_config(p)

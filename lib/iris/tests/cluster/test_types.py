@@ -302,22 +302,32 @@ def test_merge_child_overrides_preemptible():
     assert preemptibles[0].value == "false"
 
 
-def test_merge_non_canonical_key_both_present():
-    """Non-canonical keys from parent and child are both kept."""
+def test_merge_child_overrides_zone():
+    """Child zone constraint replaces parent's (zone is canonical)."""
     parent = [Constraint(key=WellKnownAttribute.ZONE, op=ConstraintOp.EQ, value="a")]
     child = [Constraint(key=WellKnownAttribute.ZONE, op=ConstraintOp.EQ, value="b")]
     result = merge_constraints(parent, child)
     zone_constraints = [c for c in result if c.key == WellKnownAttribute.ZONE]
-    assert len(zone_constraints) == 2
-    assert {c.value for c in zone_constraints} == {"a", "b"}
+    assert len(zone_constraints) == 1
+    assert zone_constraints[0].value == "b"
+
+
+def test_merge_non_canonical_key_both_present():
+    """Non-canonical keys from parent and child are both kept."""
+    parent = [Constraint(key=WellKnownAttribute.TPU_NAME, op=ConstraintOp.EQ, value="a")]
+    child = [Constraint(key=WellKnownAttribute.TPU_NAME, op=ConstraintOp.EQ, value="b")]
+    result = merge_constraints(parent, child)
+    tpu_constraints = [c for c in result if c.key == WellKnownAttribute.TPU_NAME]
+    assert len(tpu_constraints) == 2
+    assert {c.value for c in tpu_constraints} == {"a", "b"}
 
 
 def test_merge_non_canonical_key_dedup():
     """Duplicate non-canonical constraints are deduplicated."""
-    shared = Constraint(key=WellKnownAttribute.ZONE, op=ConstraintOp.EQ, value="a")
+    shared = Constraint(key=WellKnownAttribute.TPU_NAME, op=ConstraintOp.EQ, value="a")
     result = merge_constraints([shared], [shared])
-    zone_constraints = [c for c in result if c.key == WellKnownAttribute.ZONE]
-    assert len(zone_constraints) == 1
+    tpu_constraints = [c for c in result if c.key == WellKnownAttribute.TPU_NAME]
+    assert len(tpu_constraints) == 1
 
 
 def test_merge_multiple_canonical_keys_partial_override():

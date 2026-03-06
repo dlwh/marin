@@ -23,6 +23,7 @@ from typing import Any, NewType
 import cloudpickle
 import humanfriendly
 
+from iris.cluster.constraints import WellKnownAttribute
 from iris.rpc import cluster_pb2
 
 
@@ -646,9 +647,6 @@ class Namespace(str):
         return cls(job_id.namespace)
 
 
-from iris.cluster.constraints import WellKnownAttribute  # noqa: E402 — must follow class defs above
-
-
 def preemptible_constraint(preemptible: bool = True) -> Constraint:
     """Constraint requiring workers to be preemptible (or not)."""
     return Constraint(key=WellKnownAttribute.PREEMPTIBLE, op=ConstraintOp.EQ, value=str(preemptible).lower())
@@ -938,6 +936,7 @@ def merge_constraints(parent: Sequence[Constraint], child: Sequence[Constraint])
         WellKnownAttribute.DEVICE_VARIANT,
         WellKnownAttribute.PREEMPTIBLE,
         WellKnownAttribute.REGION,
+        WellKnownAttribute.ZONE,
     )
     for key in _CANONICAL_KEYS:
         child_for_key = [constraint for constraint in child if constraint.key == key]

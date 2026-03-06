@@ -790,7 +790,23 @@ def _normalize_scale_group_resources(data: dict) -> None:
 
         preemptible = resources.get("preemptible")
         if preemptible is not None:
-            normalized["preemptible"] = bool(preemptible)
+            if isinstance(preemptible, bool):
+                normalized["preemptible"] = preemptible
+            elif isinstance(preemptible, str):
+                lower = preemptible.strip().lower()
+                if lower == "true":
+                    normalized["preemptible"] = True
+                elif lower == "false":
+                    normalized["preemptible"] = False
+                else:
+                    raise ValueError(
+                        f"scale_groups.{name}.resources.preemptible must be true or false, got {preemptible!r}"
+                    )
+            else:
+                raise ValueError(
+                    f"scale_groups.{name}.resources.preemptible must be bool or string,"
+                    f" got {type(preemptible).__name__}"
+                )
 
         sg["resources"] = normalized
 

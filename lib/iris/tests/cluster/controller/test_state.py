@@ -30,7 +30,7 @@ from iris.cluster.controller.state import (
     ControllerState,
     ControllerTask,
 )
-from iris.cluster.constraints import WellKnownAttribute
+from iris.cluster.constraints import WellKnownAttribute, constraints_from_resources
 from iris.cluster.types import DeviceType, JobName, WorkerId
 from iris.rpc import cluster_pb2
 from iris.time_utils import Duration, Timestamp
@@ -177,9 +177,27 @@ def submit_job(
     request: cluster_pb2.Controller.LaunchJobRequest,
     timestamp_ms: int | None = None,
 ) -> list[ControllerTask]:
-    """Submit a job via event and return tasks."""
+    """Submit a job via event and return tasks.
+
+    Auto-injects resource-derived constraints (device-type, device-variant)
+    to mirror service-layer behavior. All jobs in production go through
+    service.launch_job() which does this injection.
+    """
     jid = JobName.from_string(job_id) if job_id.startswith("/") else JobName.root("test-user", job_id)
     request.name = jid.to_wire()
+
+    auto_constraints = constraints_from_resources(request.resources)
+    for ac in auto_constraints:
+        already = any(c.key == ac.key for c in request.constraints)
+        if not already:
+            request.constraints.append(
+                cluster_pb2.Constraint(
+                    key=ac.key,
+                    op=cluster_pb2.CONSTRAINT_OP_EQ,
+                    value=cluster_pb2.AttributeValue(string_value=ac.value),
+                )
+            )
+
     state.handle_event(
         JobSubmittedEvent(
             job_id=jid,
@@ -1686,7 +1704,13 @@ def _make_reservation_job_request(
     reservation_devices: list[cluster_pb2.DeviceConfig],
     replicas: int = 1,
 ) -> cluster_pb2.Controller.LaunchJobRequest:
-    """Build a LaunchJobRequest with a reservation and task resources."""
+    """Build a LaunchJobRequest with a reservation and task resources.
+
+    Each reservation entry gets auto-generated constraints from its device
+    config, mirroring what the service layer does for the top-level request.
+    This ensures holder jobs get the correct device constraints from the
+    entry, not from the parent.
+    """
     req = cluster_pb2.Controller.LaunchJobRequest(
         name="reservation-job",
         entrypoint=_make_test_entrypoint(),
@@ -1699,13 +1723,16 @@ def _make_reservation_job_request(
         replicas=replicas,
     )
     for dev in reservation_devices:
+        entry_resources = cluster_pb2.ResourceSpecProto(
+            cpu_millicores=1000,
+            memory_bytes=1024**3,
+            device=dev,
+        )
+        entry_constraints = [c.to_proto() for c in constraints_from_resources(entry_resources)]
         req.reservation.entries.append(
             cluster_pb2.ReservationEntry(
-                resources=cluster_pb2.ResourceSpecProto(
-                    cpu_millicores=1000,
-                    memory_bytes=1024**3,
-                    device=dev,
-                ),
+                resources=entry_resources,
+                constraints=entry_constraints,
             )
         )
     return req
@@ -2186,7 +2213,7 @@ def _gpu_worker_metadata(
     variant: str = "H100",
     gpu_count: int = 8,
 ) -> cluster_pb2.WorkerMetadata:
-    """Create worker metadata for a GPU worker."""
+    """Create worker metadata for a GPU worker with scheduling attributes."""
     return cluster_pb2.WorkerMetadata(
         hostname="gpu-worker",
         ip_address="10.0.0.1",
@@ -2196,6 +2223,11 @@ def _gpu_worker_metadata(
         device=cluster_pb2.DeviceConfig(
             gpu=cluster_pb2.GpuDevice(variant=variant, count=gpu_count),
         ),
+        attributes={
+            WellKnownAttribute.DEVICE_TYPE: cluster_pb2.AttributeValue(string_value="gpu"),
+            WellKnownAttribute.DEVICE_VARIANT: cluster_pb2.AttributeValue(string_value=variant),
+            WellKnownAttribute.PREEMPTIBLE: cluster_pb2.AttributeValue(string_value="false"),
+        },
     )
 
 
@@ -2206,7 +2238,7 @@ def _tpu_worker_metadata(
     variant: str = "v5litepod-16",
     chip_count: int = 8,
 ) -> cluster_pb2.WorkerMetadata:
-    """Create worker metadata for a TPU worker."""
+    """Create worker metadata for a TPU worker with scheduling attributes."""
     return cluster_pb2.WorkerMetadata(
         hostname="tpu-worker",
         ip_address="10.0.0.1",
@@ -2216,6 +2248,11 @@ def _tpu_worker_metadata(
         device=cluster_pb2.DeviceConfig(
             tpu=cluster_pb2.TpuDevice(variant=variant, chip_count=chip_count),
         ),
+        attributes={
+            WellKnownAttribute.DEVICE_TYPE: cluster_pb2.AttributeValue(string_value="tpu"),
+            WellKnownAttribute.DEVICE_VARIANT: cluster_pb2.AttributeValue(string_value=variant),
+            WellKnownAttribute.PREEMPTIBLE: cluster_pb2.AttributeValue(string_value="false"),
+        },
     )
 
 
@@ -2233,6 +2270,10 @@ def _cpu_worker_metadata(
         device=cluster_pb2.DeviceConfig(
             cpu=cluster_pb2.CpuDevice(variant="cpu"),
         ),
+        attributes={
+            WellKnownAttribute.DEVICE_TYPE: cluster_pb2.AttributeValue(string_value="cpu"),
+            WellKnownAttribute.PREEMPTIBLE: cluster_pb2.AttributeValue(string_value="false"),
+        },
     )
 
 

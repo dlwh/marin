@@ -209,12 +209,20 @@ def collect_workdir_size_mb(workdir: Path) -> int:
 
 
 def _accelerator_type_to_string(accel_type: int) -> str:
-    """Convert AcceleratorType proto enum value to a scheduling string."""
+    """Convert AcceleratorType proto enum value to a scheduling string.
+
+    UNSPECIFIED (0) is treated as CPU to match the default device-building
+    behavior in build_worker_metadata. Truly unknown values raise ValueError.
+    """
+    if accel_type == config_pb2.ACCELERATOR_TYPE_UNSPECIFIED:
+        return "cpu"
+    if accel_type == config_pb2.ACCELERATOR_TYPE_CPU:
+        return "cpu"
     if accel_type == config_pb2.ACCELERATOR_TYPE_GPU:
         return "gpu"
-    elif accel_type == config_pb2.ACCELERATOR_TYPE_TPU:
+    if accel_type == config_pb2.ACCELERATOR_TYPE_TPU:
         return "tpu"
-    return "cpu"
+    raise ValueError(f"Unknown accelerator type: {accel_type}")
 
 
 def _build_worker_attributes(
