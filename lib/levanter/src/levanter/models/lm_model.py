@@ -16,6 +16,7 @@ import haliax as hax
 from levanter.layers.attention import AttentionMask
 from levanter.models.loss import maybe_fused_next_token_loss
 from levanter.utils.partitioning import axis as make_axis
+from levanter.utils.types import ResourceMapping
 
 
 LmConfigT = TypeVar("LmConfigT", bound="LmConfig")
@@ -42,6 +43,7 @@ class ArrayLmHeadModel(Protocol):
         logsumexp_weight: Optional[float] = None,
         loss_dtype: Optional[jnp.dtype] = jnp.float32,
         logit_soft_cap: Optional[float] = None,
+        axis_mapping: ResourceMapping | None = None,
     ) -> jax.Array: ...
 
     def logits_from_token_ids_array(
@@ -341,6 +343,7 @@ class LmHeadModel(eqx.Module, Generic[LmConfigT]):
         logsumexp_weight: Optional[float] = None,
         loss_dtype: Optional[jnp.dtype] = jnp.float32,
         logit_soft_cap: Optional[float] = None,
+        axis_mapping: ResourceMapping | None = None,
     ) -> jnp.ndarray | LmTensor:
         """
         Compute next-token cross-entropy for a named example.
@@ -366,6 +369,7 @@ class LmHeadModel(eqx.Module, Generic[LmConfigT]):
             logsumexp_weight=logsumexp_weight,
             dtype=loss_dtype,
             logit_soft_cap=logit_soft_cap,
+            axis_mapping=axis_mapping,
         )
 
         return loss + aux_loss
@@ -381,6 +385,7 @@ class LmHeadModel(eqx.Module, Generic[LmConfigT]):
         logsumexp_weight: Optional[float] = None,
         loss_dtype: Optional[jnp.dtype] = jnp.float32,
         logit_soft_cap: Optional[float] = None,
+        axis_mapping: ResourceMapping | None = None,
     ) -> jax.Array:
         """
         Compute next-token cross-entropy and always return a plain JAX array.
@@ -397,6 +402,7 @@ class LmHeadModel(eqx.Module, Generic[LmConfigT]):
             logsumexp_weight=logsumexp_weight,
             loss_dtype=loss_dtype,
             logit_soft_cap=logit_soft_cap,
+            axis_mapping=axis_mapping,
         )
 
         return _to_plain_jax_array(loss)
