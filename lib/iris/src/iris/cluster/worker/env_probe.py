@@ -17,7 +17,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Protocol
 
-from iris.cluster.constraints import WellKnownAttribute
+from iris.cluster.constraints import WellKnownAttribute, accelerator_type_to_string
 from iris.cluster.types import get_tpu_topology
 from iris.marin_fs import marin_temp_bucket
 from iris.rpc import cluster_pb2, config_pb2
@@ -208,23 +208,6 @@ def collect_workdir_size_mb(workdir: Path) -> int:
     return int(size_str)
 
 
-def _accelerator_type_to_string(accel_type: int) -> str:
-    """Convert AcceleratorType proto enum value to a scheduling string.
-
-    UNSPECIFIED (0) is treated as CPU to match the default device-building
-    behavior in build_worker_metadata. Truly unknown values raise ValueError.
-    """
-    if accel_type == config_pb2.ACCELERATOR_TYPE_UNSPECIFIED:
-        return "cpu"
-    if accel_type == config_pb2.ACCELERATOR_TYPE_CPU:
-        return "cpu"
-    if accel_type == config_pb2.ACCELERATOR_TYPE_GPU:
-        return "gpu"
-    if accel_type == config_pb2.ACCELERATOR_TYPE_TPU:
-        return "tpu"
-    raise ValueError(f"Unknown accelerator type: {accel_type}")
-
-
 def _build_worker_attributes(
     *,
     accelerator_type: int,
@@ -252,7 +235,7 @@ def _build_worker_attributes(
     attributes: dict[str, cluster_pb2.AttributeValue] = {}
 
     # Scheduling attributes from config
-    device_type_str = _accelerator_type_to_string(accelerator_type)
+    device_type_str = accelerator_type_to_string(accelerator_type)
     attributes[WellKnownAttribute.DEVICE_TYPE] = cluster_pb2.AttributeValue(string_value=device_type_str)
 
     if accelerator_variant:

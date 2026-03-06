@@ -1440,7 +1440,7 @@ class SmokeTestRunner:
     "--no-snapshot-cycle",
     "no_snapshot_cycle",
     is_flag=True,
-    default=False,
+    default=True,
     help="Skip the snapshot/restore cycle between test phases",
 )
 def main(

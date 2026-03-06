@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Protocol
 
 from iris.cluster.config import make_local_config
+from iris.cluster.constraints import worker_attributes_from_resources
 from iris.cluster.controller.autoscaler import Autoscaler
 from iris.cluster.controller.controller import (
     Controller as _InnerController,
@@ -76,8 +77,12 @@ def create_local_autoscaler(
     worker_attributes_by_group: dict[str, dict[str, str | int | float]] = {}
     gpu_count_by_group: dict[str, int] = {}
     for name, sg_config in config.scale_groups.items():
+        attrs: dict[str, str | int | float] = {}
+        if sg_config.HasField("resources"):
+            attrs.update(worker_attributes_from_resources(sg_config.resources))
         if sg_config.HasField("worker") and sg_config.worker.attributes:
-            worker_attributes_by_group[name] = dict(sg_config.worker.attributes)
+            attrs.update(sg_config.worker.attributes)
+        worker_attributes_by_group[name] = attrs
         if sg_config.resources.device_type == config_pb2.ACCELERATOR_TYPE_GPU and sg_config.resources.device_count > 0:
             gpu_count_by_group[name] = sg_config.resources.device_count
 

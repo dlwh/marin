@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from iris.rpc import cluster_pb2
+from iris.rpc import cluster_pb2, config_pb2
 
 
 class WellKnownAttribute(StrEnum):
@@ -88,3 +88,30 @@ def constraints_from_resources(resources: cluster_pb2.ResourceSpecProto) -> list
         )
 
     return constraints
+
+
+def accelerator_type_to_string(accel_type: int) -> str:
+    """Convert AcceleratorType proto enum value to a scheduling string."""
+    if accel_type == config_pb2.ACCELERATOR_TYPE_UNSPECIFIED:
+        return "cpu"
+    if accel_type == config_pb2.ACCELERATOR_TYPE_CPU:
+        return "cpu"
+    if accel_type == config_pb2.ACCELERATOR_TYPE_GPU:
+        return "gpu"
+    if accel_type == config_pb2.ACCELERATOR_TYPE_TPU:
+        return "tpu"
+    raise ValueError(f"Unknown accelerator type: {accel_type}")
+
+
+def worker_attributes_from_resources(resources: config_pb2.ScaleGroupResources) -> dict[str, str]:
+    """Derive well-known worker attributes from scale group resources config.
+
+    This ensures local workers advertise the same device-type, device-variant,
+    and preemptible attributes that constraint matching expects.
+    """
+    attrs: dict[str, str] = {}
+    attrs[WellKnownAttribute.DEVICE_TYPE] = accelerator_type_to_string(resources.device_type)
+    if resources.device_variant:
+        attrs[WellKnownAttribute.DEVICE_VARIANT] = resources.device_variant
+    attrs[WellKnownAttribute.PREEMPTIBLE] = str(resources.preemptible).lower()
+    return attrs
