@@ -347,37 +347,25 @@ class ResourceConfig:
         return self.device_flops(dtype) * self.chip_count()
 
     @staticmethod
-    def with_tpu(tpu_type: str, *, slice_count: int = 1, **kwargs: Any) -> ResourceConfig:
-        device = TpuConfig(variant=tpu_type)
-        topo = get_tpu_topology(tpu_type)
-        replicas = slice_count * topo.vm_count
-        kwargs = dict(kwargs)
-        kwargs.setdefault("cpu", 32)
-        kwargs.setdefault("ram", "128g")
-        kwargs.setdefault("disk", "50g")
-        return ResourceConfig(device=device, replicas=replicas, **kwargs)
+    def with_tpu(tpu_type: str | Sequence[str], *, slice_count: int = 1, **kwargs: Any) -> ResourceConfig:
+        """Create a resource config for TPU(s).
 
-    @staticmethod
-    def with_gpu(gpu_type: str, count: int = 1, **kwargs: Any) -> ResourceConfig:
-        device = GpuConfig(variant=gpu_type, count=count)
-        return ResourceConfig(device=device, **kwargs)
-
-    @staticmethod
-    def with_cpu(**kwargs: Any) -> ResourceConfig:
-        return ResourceConfig(device=CpuConfig(), **kwargs)
-
-    @staticmethod
-    def with_tpu_flexible(tpu_types: Sequence[str], *, slice_count: int = 1, **kwargs: Any) -> ResourceConfig:
-        """Create a resource config that accepts any of the given TPU types.
-
-        The first type is canonical (used for chip_count, env_vars, resource sizing).
-        All types must have the same vm_count so replicas are consistent across alternatives.
+        When ``tpu_type`` is a list, the first entry is canonical (used for
+        chip_count, env_vars, resource sizing) and the rest are alternatives.
+        All types in a list must share the same ``vm_count``.
         """
+        if isinstance(tpu_type, str):
+            tpu_types = [tpu_type]
+        else:
+            tpu_types = list(tpu_type)
+
         if not tpu_types:
-            raise ValueError("tpu_types must be non-empty")
+            raise ValueError("tpu_type must be non-empty")
+
         vm_counts = {t: get_tpu_topology(t).vm_count for t in tpu_types}
         if len(set(vm_counts.values())) != 1:
             raise ValueError(f"All TPU types must have the same vm_count for flexible scheduling. Got: {vm_counts}")
+
         primary = tpu_types[0]
         alternatives = list(tpu_types[1:]) or None
         device = TpuConfig(variant=primary)
@@ -388,6 +376,15 @@ class ResourceConfig:
         kwargs.setdefault("ram", "128g")
         kwargs.setdefault("disk", "50g")
         return ResourceConfig(device=device, replicas=replicas, device_alternatives=alternatives, **kwargs)
+
+    @staticmethod
+    def with_gpu(gpu_type: str, count: int = 1, **kwargs: Any) -> ResourceConfig:
+        device = GpuConfig(variant=gpu_type, count=count)
+        return ResourceConfig(device=device, **kwargs)
+
+    @staticmethod
+    def with_cpu(**kwargs: Any) -> ResourceConfig:
+        return ResourceConfig(device=CpuConfig(), **kwargs)
 
 
 @dataclass

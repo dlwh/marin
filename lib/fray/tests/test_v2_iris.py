@@ -66,7 +66,7 @@ class TestConvertConstraintsDeviceAlternatives:
         assert device_constraints == []
 
     def test_alternatives_produce_in_constraint(self):
-        resources = ResourceConfig.with_tpu_flexible(["v4-8", "v5p-8"])
+        resources = ResourceConfig.with_tpu(["v4-8", "v5p-8"])
         constraints = convert_constraints(resources)
         device_constraints = [c for c in constraints if c.key == "device-variant"]
         assert len(device_constraints) == 1
@@ -97,26 +97,26 @@ class TestIrisActorHandlePickle:
 
 class TestWithTpuFlexible:
     def test_single_type_returns_standard_config(self):
-        rc = ResourceConfig.with_tpu_flexible(["v5p-8"])
+        rc = ResourceConfig.with_tpu(["v5p-8"])
         assert isinstance(rc.device, TpuConfig)
         assert rc.device.variant == "v5p-8"
         assert rc.device_alternatives is None
 
     def test_multiple_types_sets_alternatives(self):
-        rc = ResourceConfig.with_tpu_flexible(["v4-8", "v5p-8"])
+        rc = ResourceConfig.with_tpu(["v4-8", "v5p-8"])
         assert rc.device.variant == "v4-8"
         assert rc.device_alternatives == ["v5p-8"]
         assert rc.replicas == 1  # both v4-8 and v5p-8 have vm_count=1
 
     def test_mismatched_vm_count_raises(self):
         with pytest.raises(ValueError, match="same vm_count"):
-            ResourceConfig.with_tpu_flexible(["v4-8", "v4-16"])
+            ResourceConfig.with_tpu(["v4-8", "v4-16"])
 
     def test_empty_raises(self):
         with pytest.raises(ValueError, match="non-empty"):
-            ResourceConfig.with_tpu_flexible([])
+            ResourceConfig.with_tpu([])
 
     def test_slice_count_multiplies_replicas(self):
-        rc = ResourceConfig.with_tpu_flexible(["v5p-16", "v4-16"], slice_count=2)
+        rc = ResourceConfig.with_tpu(["v5p-16", "v4-16"], slice_count=2)
         # v5p-16 has vm_count=2, so replicas = 2 * 2 = 4
         assert rc.replicas == 4
