@@ -19,6 +19,7 @@ import uvicorn
 from iris.chaos import chaos
 from iris.cluster.controller.autoscaler import Autoscaler, DemandEntry
 from iris.cluster.controller.dashboard import ControllerDashboard
+from iris.cluster.log_bridge import LogStoreHandler
 from iris.cluster.controller.events import TaskAssignedEvent, TaskStateChangedEvent
 from iris.cluster.controller.scheduler import (
     JobRequirements,
@@ -584,6 +585,12 @@ class Controller:
             host=config.host,
             port=config.port,
         )
+
+        # Ingest process logs into the LogStore so they are available via FetchLogs.
+        self._log_store_handler = LogStoreHandler(self._state.log_store, key="/system/controller")
+        self._log_store_handler.setLevel(logging.DEBUG)
+        self._log_store_handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(message)s"))
+        logging.getLogger().addHandler(self._log_store_handler)
 
         # Background loop state
         self._threads = threads if threads is not None else get_thread_container()

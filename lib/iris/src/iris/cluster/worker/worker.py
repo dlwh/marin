@@ -13,6 +13,8 @@ from pathlib import Path
 import uvicorn
 
 from iris.chaos import chaos
+from iris.cluster.controller.logs import LogStore
+from iris.cluster.log_bridge import LogStoreHandler
 from iris.cluster.runtime.docker import DockerRuntime
 from iris.cluster.runtime.types import ContainerRuntime
 from iris.cluster.types import JobName
@@ -157,7 +159,13 @@ class Worker:
 
         self._host_metrics = HostMetricsCollector(disk_path=str(self._cache_dir))
 
-        self._service = WorkerServiceImpl(self, log_buffer=get_global_buffer())
+        self._log_store = LogStore()
+        self._log_store_handler = LogStoreHandler(self._log_store, key="/system/worker")
+        self._log_store_handler.setLevel(logging.DEBUG)
+        self._log_store_handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(message)s"))
+        logging.getLogger().addHandler(self._log_store_handler)
+
+        self._service = WorkerServiceImpl(self, log_buffer=get_global_buffer(), log_store=self._log_store)
         self._dashboard = WorkerDashboard(
             self._service,
             host=config.host,
@@ -232,6 +240,9 @@ class Worker:
         self._threads.stop()
         if self._process_log_sink:
             self._process_log_sink.close()
+        logging.getLogger().removeHandler(self._log_store_handler)
+        self._log_store_handler.close()
+        self._log_store.close()
 
     def _run_lifecycle(self, stop_event: threading.Event) -> None:
         """Main lifecycle: register, serve, reset, repeat.

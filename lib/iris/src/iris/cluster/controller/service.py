@@ -1089,6 +1089,31 @@ class ControllerServiceImpl:
         records = build_process_log_records(self._log_buffer, request.prefix, request.limit)
         return cluster_pb2.Controller.GetProcessLogsResponse(records=records)
 
+    def fetch_logs(
+        self,
+        request: cluster_pb2.FetchLogsRequest,
+        ctx: Any,
+    ) -> cluster_pb2.FetchLogsResponse:
+        """Fetch logs from the LogStore by key with filtering and pagination."""
+        compiled_regex = None
+        if request.regex:
+            try:
+                compiled_regex = re.compile(request.regex)
+            except re.error as e:
+                raise ConnectError(Code.INVALID_ARGUMENT, f"Invalid regex: {e}") from e
+
+        max_lines = request.max_lines if request.max_lines > 0 else 1000
+        result = self._state.log_store.get_logs(
+            request.source,
+            since_ms=request.since_ms,
+            skip_lines=request.skip_lines,
+            regex_filter=compiled_regex,
+            max_lines=max_lines,
+            tail=request.tail,
+            min_level=request.min_level,
+        )
+        return cluster_pb2.FetchLogsResponse(entries=result.entries, lines_read=result.lines_read)
+
     # --- Worker Detail ---
 
     def get_worker_status(

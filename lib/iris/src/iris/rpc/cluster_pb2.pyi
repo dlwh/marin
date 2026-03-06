@@ -153,6 +153,32 @@ class ProcessLogRecord(_message.Message):
     message: str
     def __init__(self, timestamp: _Optional[float] = ..., level: _Optional[str] = ..., logger_name: _Optional[str] = ..., message: _Optional[str] = ...) -> None: ...
 
+class FetchLogsRequest(_message.Message):
+    __slots__ = ("source", "since_ms", "skip_lines", "regex", "max_lines", "tail", "min_level")
+    SOURCE_FIELD_NUMBER: _ClassVar[int]
+    SINCE_MS_FIELD_NUMBER: _ClassVar[int]
+    SKIP_LINES_FIELD_NUMBER: _ClassVar[int]
+    REGEX_FIELD_NUMBER: _ClassVar[int]
+    MAX_LINES_FIELD_NUMBER: _ClassVar[int]
+    TAIL_FIELD_NUMBER: _ClassVar[int]
+    MIN_LEVEL_FIELD_NUMBER: _ClassVar[int]
+    source: str
+    since_ms: int
+    skip_lines: int
+    regex: str
+    max_lines: int
+    tail: bool
+    min_level: str
+    def __init__(self, source: _Optional[str] = ..., since_ms: _Optional[int] = ..., skip_lines: _Optional[int] = ..., regex: _Optional[str] = ..., max_lines: _Optional[int] = ..., tail: _Optional[bool] = ..., min_level: _Optional[str] = ...) -> None: ...
+
+class FetchLogsResponse(_message.Message):
+    __slots__ = ("entries", "lines_read")
+    ENTRIES_FIELD_NUMBER: _ClassVar[int]
+    LINES_READ_FIELD_NUMBER: _ClassVar[int]
+    entries: _containers.RepeatedCompositeFieldContainer[_logging_pb2.LogEntry]
+    lines_read: int
+    def __init__(self, entries: _Optional[_Iterable[_Union[_logging_pb2.LogEntry, _Mapping]]] = ..., lines_read: _Optional[int] = ...) -> None: ...
+
 class TaskStatus(_message.Message):
     __slots__ = ("task_id", "state", "worker_id", "worker_address", "exit_code", "error", "started_at", "finished_at", "ports", "resource_usage", "build_metrics", "current_attempt_id", "attempts", "pending_reason", "can_be_scheduled")
     class PortsEntry(_message.Message):
