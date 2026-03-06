@@ -13,7 +13,9 @@ from jaxtyping import PyTree
 from levanter.utils.jax_utils import is_named_array
 
 if TYPE_CHECKING:
-    from haliax import Axis
+    import haliax as hax
+
+    Axis = hax.Axis
 else:
     Axis = Any
 

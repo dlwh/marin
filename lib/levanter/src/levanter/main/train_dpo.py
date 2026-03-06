@@ -37,7 +37,9 @@ from levanter.utils.tree_utils import inference_mode
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from haliax import Axis
+    import haliax as hax
+
+    Axis = hax.Axis
 else:
     Axis = Any
 

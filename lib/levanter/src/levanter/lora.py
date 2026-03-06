@@ -82,7 +82,7 @@ logger = logging.getLogger(__name__)
 M = TypeVar("M", bound=PyTree)
 
 if TYPE_CHECKING:
-    from haliax import Axis
+    Axis = hax.Axis
 else:
     Axis = Any
 

@@ -23,7 +23,7 @@ Args = ParamSpec("Args")
 R = TypeVar("R")
 
 if TYPE_CHECKING:
-    from haliax import Axis
+    Axis = hax.Axis
 else:
     Axis = Any
 
