@@ -13,10 +13,8 @@ from connectrpc.errors import ConnectError
 from connectrpc.request import RequestContext
 
 from iris.chaos import chaos
-from iris.cluster.controller.logs import LogStore
-from iris.cluster.task_logging import build_process_log_records
+from iris.cluster.log_store import LogStore
 from iris.cluster.worker.worker_types import TaskInfo
-from iris.logging import LogBuffer
 from iris.rpc import cluster_pb2
 from iris.rpc.errors import rpc_error_handler
 from iris.time_utils import Timer
@@ -44,11 +42,9 @@ class WorkerServiceImpl:
     def __init__(
         self,
         provider: TaskProvider,
-        log_buffer: LogBuffer | None = None,
         log_store: LogStore | None = None,
     ):
         self._provider = provider
-        self._log_buffer = log_buffer
         self._log_store = log_store
         self._timer = Timer()
 
@@ -90,15 +86,6 @@ class WorkerServiceImpl:
         )
         response.uptime.milliseconds = self._timer.elapsed_ms()
         return response
-
-    def get_process_logs(
-        self,
-        request: cluster_pb2.Worker.GetProcessLogsRequest,
-        _ctx: RequestContext,
-    ) -> cluster_pb2.Worker.GetProcessLogsResponse:
-        """Get worker process logs from the in-memory ring buffer."""
-        records = build_process_log_records(self._log_buffer, request.prefix, request.limit)
-        return cluster_pb2.Worker.GetProcessLogsResponse(records=records)
 
     def fetch_logs(
         self,

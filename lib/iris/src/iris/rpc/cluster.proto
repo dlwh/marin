@@ -81,8 +81,7 @@ message ProcessLogRecord {
 
 // Unified log fetching request, shared by controller and worker services.
 // The source key identifies the log stream:
-//   /system/controller      - controller process logs
-//   /system/worker/{id}     - worker process logs
+//   /process                - local process logs (controller or worker)
 //   /job/name/task/0:0      - task attempt logs (task_wire:attempt_id)
 message FetchLogsRequest {
   string source = 1;           // Log source key
@@ -780,8 +779,10 @@ message Controller {
     // Bootstrap logs (from VM init)
     string bootstrap_logs = 4;
 
-    // Worker daemon logs (proxied from worker, empty if unhealthy/absent)
-    repeated ProcessLogRecord worker_logs = 5;
+    // Worker daemon logs (proxied from worker via FetchLogs, empty if unhealthy/absent)
+    repeated iris.logging.LogEntry worker_log_entries = 9;
+
+    reserved 5;  // was: repeated ProcessLogRecord worker_logs
 
     // Recent tasks that ran or are running on this worker (newest first)
     repeated TaskStatus recent_tasks = 6;
@@ -911,10 +912,7 @@ service ControllerService {
   // Task logs (proxied to worker)
   rpc GetTaskLogs(Controller.GetTaskLogsRequest) returns (Controller.GetTaskLogsResponse);
 
-  // Controller process logs
-  rpc GetProcessLogs(Controller.GetProcessLogsRequest) returns (Controller.GetProcessLogsResponse);
-
-  // Unified log fetching (replaces per-source log RPCs for dashboard use)
+  // Unified log fetching (process logs, task logs, etc. by key)
   rpc FetchLogs(FetchLogsRequest) returns (FetchLogsResponse);
 
   // Profiling (proxied to worker)
@@ -931,7 +929,6 @@ service WorkerService {
   rpc GetTaskStatus(Worker.GetTaskStatusRequest) returns (TaskStatus);
   rpc ListTasks(Worker.ListTasksRequest) returns (Worker.ListTasksResponse);
   rpc HealthCheck(Empty) returns (Worker.HealthResponse);
-  rpc GetProcessLogs(Worker.GetProcessLogsRequest) returns (Worker.GetProcessLogsResponse);
   rpc FetchLogs(FetchLogsRequest) returns (FetchLogsResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc ProfileTask(ProfileTaskRequest) returns (ProfileTaskResponse);

@@ -15,10 +15,10 @@ from urllib.parse import urlsplit, urlunsplit
 
 from google.protobuf import json_format
 
-from iris.logging import BufferedLogRecord, LogBuffer, parse_log_level, str_to_log_level
+from iris.logging import parse_log_level, str_to_log_level
 from iris.marin_fs import filesystem
 from iris.cluster.types import JobName
-from iris.rpc import cluster_pb2, logging_pb2
+from iris.rpc import logging_pb2
 from iris.time_utils import Duration, Timestamp
 
 logger = logging.getLogger(__name__)
@@ -540,122 +540,3 @@ class LogReader:
         except Exception as e:
             logger.warning(f"Failed to read metadata from {metadata_path}: {e}")
             return None
-
-
-class ProcessLogSink:
-    """Periodic sink for process logs using fsspec JSONL storage.
-
-    Writes logs for a process to:
-    {prefix}/process/{process_name}/logs.jsonl
-
-    For workers, process_name is "worker/{worker_id}".
-    For the controller, process_name is "controller".
-    """
-
-    def __init__(
-        self,
-        *,
-        prefix: str,
-        process_name: str,
-        log_buffer: LogBuffer,
-        sync_interval: Duration | None = None,
-        max_entries: int = 5000,
-    ) -> None:
-        if "://" not in prefix:
-            raise ValueError(f"log prefix must be a URL, got: {prefix}")
-        self._prefix = prefix.rstrip("/")
-        self._process_name = process_name
-        self._log_buffer = log_buffer
-        self._sync_interval = sync_interval or Duration.from_seconds(10.0)
-        self._max_entries = max_entries
-        self._last_seq = 0
-        self._scheme, path = self._prefix.split("://", 1)
-        self._fs = filesystem(self._scheme)
-        self._path_prefix = path
-        self._stop_event = Event()
-        self._sync_thread = Thread(
-            target=self._sync_loop,
-            name=f"process-log-sync-{process_name}",
-            daemon=True,
-        )
-        self._sync_thread.start()
-
-    @property
-    def log_path(self) -> str:
-        return f"{self._scheme}://{self._storage_log_path}"
-
-    @property
-    def _storage_log_path(self) -> str:
-        return f"{self._path_prefix}/process/{self._process_name}/logs.jsonl"
-
-    def _sync_loop(self) -> None:
-        interval_s = self._sync_interval.to_seconds()
-        while not self._stop_event.wait(interval_s):
-            self.sync()
-
-    def sync(self) -> None:
-        records = self._log_buffer.query_since(self._last_seq, limit=self._max_entries)
-        if not records:
-            return
-        new_seq = max(r.seq for r in records)
-        lines = [self._record_to_json_line(r) for r in records]
-        try:
-            self._append_lines(self._storage_log_path, lines)
-        except Exception as e:
-            logger.warning("Failed to write process logs to %s: %r", self.log_path, e, exc_info=True)
-            return
-        self._last_seq = new_seq
-
-    def close(self) -> None:
-        self._stop_event.set()
-        self._sync_thread.join(timeout=5.0)
-        self.sync()
-
-    def _record_to_json_line(self, record: BufferedLogRecord) -> str:
-        return json.dumps(
-            {
-                "seq": record.seq,
-                "timestamp": record.timestamp,
-                "level": record.level,
-                "logger_name": record.logger_name,
-                "message": record.message,
-            },
-            ensure_ascii=False,
-        )
-
-    def _append_lines(self, path: str, lines: list[str]) -> None:
-        if self._scheme != "s3":
-            parent = str(Path(path).parent)
-            self._fs.makedirs(parent, exist_ok=True)
-
-        new_data = "".join(line + "\n" for line in lines).encode("utf-8")
-        try:
-            existing = self._fs.cat_file(path)
-        except FileNotFoundError:
-            existing = b""
-
-        self._fs.pipe_file(path, existing + new_data)
-
-
-def build_process_log_records(
-    log_buffer: LogBuffer | None,
-    prefix: str,
-    limit: int,
-) -> list[cluster_pb2.ProcessLogRecord]:
-    """Build ProcessLogRecord protos from a LogBuffer query.
-
-    Shared between controller and worker GetProcessLogs handlers.
-    """
-    if not log_buffer:
-        return []
-    limit = limit if limit > 0 else 200
-    records = log_buffer.query(prefix=prefix or None, limit=limit)
-    return [
-        cluster_pb2.ProcessLogRecord(
-            timestamp=r.timestamp,
-            level=r.level,
-            logger_name=r.logger_name,
-            message=r.message,
-        )
-        for r in records
-    ]

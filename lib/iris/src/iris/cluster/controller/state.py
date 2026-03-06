@@ -25,7 +25,7 @@ from enum import Enum
 from threading import RLock
 from typing import NamedTuple
 
-from iris.cluster.controller.logs import LogStore, task_log_key
+from iris.cluster.log_store import LogStore, task_log_key
 from iris.cluster.controller.events import (
     Event,
     JobCancelledEvent,

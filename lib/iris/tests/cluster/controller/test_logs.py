@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from iris.cluster.controller.logs import LogStore, task_log_key
+from iris.cluster.log_store import LogStore, task_log_key
 from iris.cluster.types import JobName
 from iris.rpc import logging_pb2
 

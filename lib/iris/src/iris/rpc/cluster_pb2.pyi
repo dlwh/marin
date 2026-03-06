@@ -974,12 +974,12 @@ class Controller(_message.Message):
         id: str
         def __init__(self, id: _Optional[str] = ...) -> None: ...
     class GetWorkerStatusResponse(_message.Message):
-        __slots__ = ("vm", "scale_group", "worker", "bootstrap_logs", "worker_logs", "recent_tasks", "current_resources", "resource_history")
+        __slots__ = ("vm", "scale_group", "worker", "bootstrap_logs", "worker_log_entries", "recent_tasks", "current_resources", "resource_history")
         VM_FIELD_NUMBER: _ClassVar[int]
         SCALE_GROUP_FIELD_NUMBER: _ClassVar[int]
         WORKER_FIELD_NUMBER: _ClassVar[int]
         BOOTSTRAP_LOGS_FIELD_NUMBER: _ClassVar[int]
-        WORKER_LOGS_FIELD_NUMBER: _ClassVar[int]
+        WORKER_LOG_ENTRIES_FIELD_NUMBER: _ClassVar[int]
         RECENT_TASKS_FIELD_NUMBER: _ClassVar[int]
         CURRENT_RESOURCES_FIELD_NUMBER: _ClassVar[int]
         RESOURCE_HISTORY_FIELD_NUMBER: _ClassVar[int]
@@ -987,11 +987,11 @@ class Controller(_message.Message):
         scale_group: str
         worker: Controller.WorkerHealthStatus
         bootstrap_logs: str
-        worker_logs: _containers.RepeatedCompositeFieldContainer[ProcessLogRecord]
+        worker_log_entries: _containers.RepeatedCompositeFieldContainer[_logging_pb2.LogEntry]
         recent_tasks: _containers.RepeatedCompositeFieldContainer[TaskStatus]
         current_resources: WorkerResourceSnapshot
         resource_history: _containers.RepeatedCompositeFieldContainer[WorkerResourceSnapshot]
-        def __init__(self, vm: _Optional[_Union[_vm_pb2.VmInfo, _Mapping]] = ..., scale_group: _Optional[str] = ..., worker: _Optional[_Union[Controller.WorkerHealthStatus, _Mapping]] = ..., bootstrap_logs: _Optional[str] = ..., worker_logs: _Optional[_Iterable[_Union[ProcessLogRecord, _Mapping]]] = ..., recent_tasks: _Optional[_Iterable[_Union[TaskStatus, _Mapping]]] = ..., current_resources: _Optional[_Union[WorkerResourceSnapshot, _Mapping]] = ..., resource_history: _Optional[_Iterable[_Union[WorkerResourceSnapshot, _Mapping]]] = ...) -> None: ...
+        def __init__(self, vm: _Optional[_Union[_vm_pb2.VmInfo, _Mapping]] = ..., scale_group: _Optional[str] = ..., worker: _Optional[_Union[Controller.WorkerHealthStatus, _Mapping]] = ..., bootstrap_logs: _Optional[str] = ..., worker_log_entries: _Optional[_Iterable[_Union[_logging_pb2.LogEntry, _Mapping]]] = ..., recent_tasks: _Optional[_Iterable[_Union[TaskStatus, _Mapping]]] = ..., current_resources: _Optional[_Union[WorkerResourceSnapshot, _Mapping]] = ..., resource_history: _Optional[_Iterable[_Union[WorkerResourceSnapshot, _Mapping]]] = ...) -> None: ...
     def __init__(self) -> None: ...
 
 class Worker(_message.Message):
