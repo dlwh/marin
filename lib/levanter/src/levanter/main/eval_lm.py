@@ -104,6 +104,7 @@ def main(config: EvalLmConfig):
                 batch_axis=batch_axis_name,
                 reduction=None,
                 reduction_axis=(),
+                axis_mapping=compute_axis_mapping,
             )
 
             per_pos_weight = loss_weight_array_from_lm_example(batch)

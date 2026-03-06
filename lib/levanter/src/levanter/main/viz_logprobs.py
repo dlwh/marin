@@ -86,6 +86,7 @@ def main(config: VizLmConfig):
                 batch_axis=batch_axis_name,
                 reduction=None,
                 reduction_axis=(),
+                axis_mapping=compute_axis_mapping,
             )
             logits = model.logits_from_token_ids_array(example.tokens, batch_axis=batch_axis_name, key=key)
 

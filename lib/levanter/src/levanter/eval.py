@@ -177,6 +177,7 @@ def _default_lm_eval_loss_fn(
     *,
     batch_axis_name: str,
     mp: jmp.Policy | None,
+    axis_mapping: ResourceMapping | None,
 ) -> LossFnOutput:
     model = inference_mode(model, True)
     if mp is not None:
@@ -187,6 +188,7 @@ def _default_lm_eval_loss_fn(
         batch_axis=batch_axis_name,
         reduction=None,
         reduction_axis=(),
+        axis_mapping=axis_mapping,
     )
 
     per_pos_weight = loss_weight_array_from_lm_example(batch)
@@ -242,7 +244,13 @@ def cb_tagged_lm_evaluate(
     if loss_fn is None:
 
         def loss_fn(model: ArrayLmHeadModel, batch: LmEvalExample) -> LossFnOutput:
-            return _default_lm_eval_loss_fn(model, batch, batch_axis_name=batch_axis_name, mp=mp)
+            return _default_lm_eval_loss_fn(
+                model,
+                batch,
+                batch_axis_name=batch_axis_name,
+                mp=mp,
+                axis_mapping=compute_axis_mapping,
+            )
 
     if batch_axis_resource is None:
         batch_axis_resource = resolve_batch_axis_resource(batch_axis_name, compute_axis_mapping)
