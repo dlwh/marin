@@ -192,6 +192,7 @@ def _default_lm_eval_loss_fn(
         model = mp.cast_to_compute(model)
     if axis_mapping is not None:
         with hax.axis_mapping(axis_mapping):
+            model = hax.shard_with_axis_mapping(model, axis_mapping)
             per_pos_loss = model.compute_next_token_loss(named_batch, reduction=None, reduction_axis=()).array
     else:
         per_pos_loss = model.compute_next_token_loss(named_batch, reduction=None, reduction_axis=()).array
