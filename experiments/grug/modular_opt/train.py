@@ -39,11 +39,7 @@ from levanter.utils.jax_utils import parameter_count
 from levanter.utils.logging import LoadingTimeTrackerIterator
 
 from experiments.grug.dispatch import dispatch_grug_training_run
-from experiments.grug.moe.model import GrugModelConfig, Transformer
-
-# This file intentionally mirrors `experiments/grug/base/train.py` with
-# variant-specific model/loss/FLOP wiring, per the grug copy-first workflow in
-# `docs/recipes/change_grug.md`.
+from experiments.grug.modular_opt.model import GrugModelConfig, Transformer
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +49,7 @@ class GrugTrainerConfig:
     """Runtime knobs for grug training."""
 
     trainer: TrainerConfig = field(default_factory=lambda: TrainerConfig(use_explicit_mesh_axes=True))
-    train_batch_pspec: P = field(default_factory=lambda: P(("data", "expert")))
+    train_batch_pspec: P = field(default_factory=lambda: P(("data",)))
     data_seed: int | None = None
     log_every: int = 1
     ema_beta: float | None = None  # EMA coefficient for eval/checkpoint model; None disables EMA.
@@ -65,7 +61,7 @@ class GrugEvalConfig:
     """Perplexity eval settings for grug training."""
 
     eval_batch_size: int = 512
-    eval_batch_pspec: P = field(default_factory=lambda: P(("data", "expert")))
+    eval_batch_pspec: P = field(default_factory=lambda: P(("data",)))
     steps_per_eval: int | None = 1000
     max_eval_batches: int | None = None
     prefix: str = "eval"
@@ -115,7 +111,7 @@ def build_train_loader(
     *,
     batch_schedule: BatchSchedule,
     mesh: Mesh,
-    batch_pspec: P = P(("data", "expert")),
+    batch_pspec: P = P(("data",)),
 ) -> DataLoader[GrugLmExample]:
     # DataLoader uses this batch axis mapping to shard batches across the distributed mesh.
     axis_resource = batch_pspec[0]
@@ -190,10 +186,7 @@ def _compute_flops(
         num_heads=model_config.num_heads,
         seq_len=model_config.max_seq_len,
         vocab_size=model_config.vocab_size,
-        glu=True,
-        num_experts=model_config.num_experts,
-        num_shared_experts=1 if model_config.shared_expert_intermediate_dim > 0 else 0,
-        num_experts_per_tok=model_config.num_experts_per_token,
+        glu=False,
     )
     flops_per_example = 3 * flops_per_token * model_config.max_seq_len
 
@@ -278,11 +271,9 @@ def _make_train_step(
                 mask=batch.attn_mask,
                 reduction="mean",
                 logsumexp_weight=z_loss,
-                return_router_metrics=True,
             )
 
-        (loss, summarized_metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
-        metrics = {"train/loss": loss, **summarized_metrics}
+        loss, grads = jax.value_and_grad(loss_fn)(state.params)
         updates, opt_state = optimizer.update(grads, state.opt_state, state.params)
         params = optax.apply_updates(state.params, updates)
 
@@ -318,13 +309,13 @@ def _make_train_step(
             ema_params=ema_params,
         )
 
-        return next_state, metrics, watch_stats
+        return next_state, {"train/loss": loss}, watch_stats
 
     return train_step
 
 
 def _run_grug_local(config: GrugRunConfig) -> None:
-    """Entry point for the grug template training loop."""
+    """Run grug training locally inside a Fray worker."""
     trainer = config.trainer.trainer
     trainer.initialize()
     levanter.tracker.log_configuration(config)
@@ -481,11 +472,6 @@ def _run_grug_local(config: GrugRunConfig) -> None:
                 last_step_duration = duration
                 levanter.tracker.log({"throughput/hook_time": time.perf_counter() - hook_start}, step=step)
                 levanter.tracker.log({"throughput/loading_time": iterator.this_load_time}, step=step)
-                router_metrics = {key: value for key, value in metrics.items() if key.startswith("train/router/")}
-                if router_metrics:
-                    levanter.tracker.log(router_metrics, step=step)
-                if "train/cross_entropy_loss" in metrics:
-                    levanter.tracker.log({"train/cross_entropy_loss": metrics["train/cross_entropy_loss"]}, step=step)
 
                 if watch_stats is not None:
                     levanter.tracker.log(watch_stats, step=step)
