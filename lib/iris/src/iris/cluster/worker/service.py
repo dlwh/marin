@@ -12,6 +12,7 @@ from connectrpc.errors import ConnectError
 from connectrpc.request import RequestContext
 
 from iris.chaos import chaos
+from iris.cluster.task_logging import build_process_log_records
 from iris.cluster.worker.worker_types import TaskInfo
 from iris.logging import LogBuffer
 from iris.rpc import cluster_pb2
@@ -88,22 +89,8 @@ class WorkerServiceImpl:
         _ctx: RequestContext,
     ) -> cluster_pb2.Worker.GetProcessLogsResponse:
         """Get worker process logs from the in-memory ring buffer."""
-        if not self._log_buffer:
-            return cluster_pb2.Worker.GetProcessLogsResponse(records=[])
-        prefix = request.prefix or None
-        limit = request.limit if request.limit > 0 else 200
-        records = self._log_buffer.query(prefix=prefix, limit=limit)
-        return cluster_pb2.Worker.GetProcessLogsResponse(
-            records=[
-                cluster_pb2.ProcessLogRecord(
-                    timestamp=r.timestamp,
-                    level=r.level,
-                    logger_name=r.logger_name,
-                    message=r.message,
-                )
-                for r in records
-            ]
-        )
+        records = build_process_log_records(self._log_buffer, request.prefix, request.limit)
+        return cluster_pb2.Worker.GetProcessLogsResponse(records=records)
 
     def heartbeat(
         self,

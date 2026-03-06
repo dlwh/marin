@@ -18,7 +18,7 @@ from google.protobuf import json_format
 from iris.logging import BufferedLogRecord, LogBuffer, parse_log_level, str_to_log_level
 from iris.marin_fs import filesystem
 from iris.cluster.types import JobName
-from iris.rpc import logging_pb2
+from iris.rpc import cluster_pb2, logging_pb2
 from iris.time_utils import Duration, Timestamp
 
 logger = logging.getLogger(__name__)
@@ -635,3 +635,27 @@ class ProcessLogSink:
             existing = b""
 
         self._fs.pipe_file(path, existing + new_data)
+
+
+def build_process_log_records(
+    log_buffer: LogBuffer | None,
+    prefix: str,
+    limit: int,
+) -> list[cluster_pb2.ProcessLogRecord]:
+    """Build ProcessLogRecord protos from a LogBuffer query.
+
+    Shared between controller and worker GetProcessLogs handlers.
+    """
+    if not log_buffer:
+        return []
+    limit = limit if limit > 0 else 200
+    records = log_buffer.query(prefix=prefix or None, limit=limit)
+    return [
+        cluster_pb2.ProcessLogRecord(
+            timestamp=r.timestamp,
+            level=r.level,
+            logger_name=r.logger_name,
+            message=r.message,
+        )
+        for r in records
+    ]

@@ -34,6 +34,7 @@ from iris.cluster.controller.state import (
     ControllerTask,
     ControllerWorker,
 )
+from iris.cluster.task_logging import build_process_log_records
 from iris.cluster.types import JobName, WorkerId
 from iris.logging import LogBuffer
 from iris.rpc import cluster_pb2, vm_pb2
@@ -1085,22 +1086,8 @@ class ControllerServiceImpl:
         ctx: Any,
     ) -> cluster_pb2.Controller.GetProcessLogsResponse:
         """Get controller process logs from the in-memory ring buffer."""
-        if not self._log_buffer:
-            return cluster_pb2.Controller.GetProcessLogsResponse(records=[])
-        prefix = request.prefix or None
-        limit = request.limit if request.limit > 0 else 200
-        records = self._log_buffer.query(prefix=prefix, limit=limit)
-        return cluster_pb2.Controller.GetProcessLogsResponse(
-            records=[
-                cluster_pb2.ProcessLogRecord(
-                    timestamp=r.timestamp,
-                    level=r.level,
-                    logger_name=r.logger_name,
-                    message=r.message,
-                )
-                for r in records
-            ]
-        )
+        records = build_process_log_records(self._log_buffer, request.prefix, request.limit)
+        return cluster_pb2.Controller.GetProcessLogsResponse(records=records)
 
     # --- Worker Detail ---
 
