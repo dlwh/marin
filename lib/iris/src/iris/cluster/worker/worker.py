@@ -59,6 +59,7 @@ class WorkerConfig:
     accelerator_type: int = 0
     accelerator_variant: str = ""
     gpu_count: int = 0
+    preemptible: bool = False
 
 
 def worker_config_from_proto(
@@ -103,6 +104,7 @@ def worker_config_from_proto(
         accelerator_type=proto.accelerator_type,
         accelerator_variant=proto.accelerator_variant,
         gpu_count=proto.gpu_count,
+        preemptible=proto.preemptible,
     )
 
 
@@ -146,6 +148,7 @@ class Worker:
                 accelerator_type=config.accelerator_type,
                 accelerator_variant=config.accelerator_variant,
                 gpu_count_override=config.gpu_count,
+                preemptible=config.preemptible,
                 worker_attributes=config.worker_attributes,
             )
             self._inferred_log_prefix = env.log_prefix()

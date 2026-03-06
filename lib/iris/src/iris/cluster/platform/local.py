@@ -450,6 +450,7 @@ class LocalPlatform:
     ) -> LocalSliceHandle:
         """Spawn real Worker threads for a slice."""
         from iris.cluster.runtime.process import ProcessRuntime
+        from iris.cluster.constraints import WellKnownAttribute
         from iris.cluster.types import get_tpu_topology, gpu_device, tpu_device
         from iris.cluster.worker.worker import Worker, WorkerConfig
 
@@ -479,15 +480,17 @@ class LocalPlatform:
             attributes: dict[str, str | int | float] = {}
             device = None
             if is_tpu and config.accelerator_variant:
-                attributes["tpu-name"] = slice_id
-                attributes["tpu-worker-id"] = tpu_worker_id
-                attributes["tpu-topology"] = config.accelerator_variant
+                attributes[WellKnownAttribute.TPU_NAME] = slice_id
+                attributes[WellKnownAttribute.TPU_WORKER_ID] = tpu_worker_id
+                attributes[WellKnownAttribute.TPU_TOPOLOGY] = config.accelerator_variant
+                attributes[WellKnownAttribute.DEVICE_VARIANT] = config.accelerator_variant
                 topo = get_tpu_topology(config.accelerator_variant)
                 device = tpu_device(config.accelerator_variant, count=topo.chips_per_vm)
             elif is_gpu and config.accelerator_variant:
                 sg_name = config.labels.get(self._iris_labels.iris_scale_group, "")
                 gpu_count = self._gpu_count_by_group.get(sg_name, 1)
                 device = gpu_device(config.accelerator_variant, count=gpu_count)
+                attributes[WellKnownAttribute.DEVICE_VARIANT] = config.accelerator_variant
 
             # Merge worker attributes from scale group config (e.g. region, preemptible).
             # The scale group name is embedded in slice labels by prepare_slice_config().

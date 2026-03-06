@@ -78,8 +78,8 @@ def create_local_autoscaler(
     for name, sg_config in config.scale_groups.items():
         if sg_config.HasField("worker") and sg_config.worker.attributes:
             worker_attributes_by_group[name] = dict(sg_config.worker.attributes)
-        if sg_config.resources.gpu_count > 0:
-            gpu_count_by_group[name] = sg_config.resources.gpu_count
+        if sg_config.resources.device_type == config_pb2.ACCELERATOR_TYPE_GPU and sg_config.resources.device_count > 0:
+            gpu_count_by_group[name] = sg_config.resources.device_count
 
     platform = LocalPlatform(
         label_prefix=label_prefix,
@@ -236,14 +236,12 @@ def make_local_cluster_config(max_workers: int) -> config_pb2.IrisClusterConfig:
         name="local-cpu",
         min_slices=1,
         max_slices=max_workers,
-        accelerator_type=config_pb2.ACCELERATOR_TYPE_CPU,
         num_vms=1,
         resources=config_pb2.ScaleGroupResources(
             cpu_millicores=8000,
             memory_bytes=16 * 1024**3,
             disk_bytes=50 * 1024**3,
-            gpu_count=0,
-            tpu_count=0,
+            device_type=config_pb2.ACCELERATOR_TYPE_CPU,
         ),
     )
     base_config.scale_groups["local-cpu"].CopyFrom(sg)

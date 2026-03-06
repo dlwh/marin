@@ -32,7 +32,8 @@ from iris.cluster.platform.base import (
     SliceStatus,
     WorkerStatus,
 )
-from iris.cluster.types import REGION_ATTRIBUTE_KEY, ZONE_ATTRIBUTE_KEY, DeviceType, VmWorkerStatus
+from iris.cluster.constraints import WellKnownAttribute
+from iris.cluster.types import DeviceType, NormalizedConstraints, VmWorkerStatus
 from iris.rpc import cluster_pb2, config_pb2, vm_pb2
 from iris.time_utils import Duration, Timestamp
 from tests.cluster.platform.fakes import FailureMode, FakePlatform, FakePlatformConfig
@@ -45,21 +46,33 @@ def make_demand_entries(
     *,
     device_type: DeviceType = DeviceType.TPU,
     device_variant: str | None = "v5p-8",
+    device_variants: frozenset[str] | None = None,
     preemptible: bool | None = None,
+    required_regions: frozenset[str] | None = None,
+    required_zones: frozenset[str] | None = None,
     task_prefix: str = "task",
 ) -> list[DemandEntry]:
     if count <= 0:
         return []
     resources = cluster_pb2.ResourceSpecProto(cpu_millicores=1000, memory_bytes=1024)
+    # Convert device_variant to device_variants if not explicitly provided
+    effective_variants = device_variants
+    if effective_variants is None and device_variant is not None:
+        effective_variants = frozenset({device_variant})
+    normalized = NormalizedConstraints(
+        device_type=device_type,
+        device_variants=effective_variants,
+        preemptible=preemptible,
+        required_regions=required_regions,
+        required_zones=required_zones,
+    )
     return [
         DemandEntry(
             task_ids=[f"{task_prefix}-{i}"],
             coschedule_group_id=None,
-            device_type=device_type,
-            device_variant=device_variant,
+            normalized=normalized,
             constraints=[],
             resources=resources,
-            preemptible=preemptible,
         )
         for i in range(count)
     ]
@@ -69,8 +82,9 @@ DEFAULT_RESOURCES = config_pb2.ScaleGroupResources(
     cpu_millicores=128000,
     memory_bytes=128 * 1024**3,
     disk_bytes=100 * 1024**3,
-    gpu_count=8,
-    tpu_count=8,
+    device_type=config_pb2.ACCELERATOR_TYPE_TPU,
+    device_variant="v5p-8",
+    device_count=8,
 )
 
 
@@ -83,17 +97,20 @@ def ensure_scale_group_resources(config: config_pb2.ScaleGroupConfig) -> config_
 
 
 def make_scale_group_config(**kwargs: object) -> config_pb2.ScaleGroupConfig:
-    if "accelerator_type" not in kwargs:
-        kwargs["accelerator_type"] = config_pb2.ACCELERATOR_TYPE_TPU
-    if "accelerator_variant" not in kwargs:
-        kwargs["accelerator_variant"] = "v5p-8"
+    # Extract accelerator fields that now live on resources, not ScaleGroupConfig
+    accelerator_type = kwargs.pop("accelerator_type", config_pb2.ACCELERATOR_TYPE_TPU)
+    accelerator_variant = kwargs.pop("accelerator_variant", "v5p-8")
     # Extract fields that moved to slice_template
     runtime_version = kwargs.pop("runtime_version", None)
     zones = kwargs.pop("zones", None)
     preemptible = kwargs.pop("preemptible", None)
     config = ensure_scale_group_resources(config_pb2.ScaleGroupConfig(**kwargs))
+    config.resources.device_type = accelerator_type
+    if accelerator_variant:
+        config.resources.device_variant = accelerator_variant
     if preemptible is not None:
         config.slice_template.preemptible = preemptible
+        config.resources.preemptible = preemptible
     if runtime_version or zones:
         gcp = config.slice_template.gcp
         if runtime_version:
@@ -237,8 +254,6 @@ def scale_group_config() -> config_pb2.ScaleGroupConfig:
         name="test-group",
         min_slices=0,
         max_slices=5,
-        accelerator_type=config_pb2.ACCELERATOR_TYPE_TPU,
-        accelerator_variant="v5p-8",
         runtime_version="v2-alpha-tpuv5",
         zones=["us-central1-a"],
     )
@@ -389,8 +404,6 @@ class TestAutoscalerScaleUp:
             name="test-group",
             min_slices=2,
             max_slices=5,
-            accelerator_type=config_pb2.ACCELERATOR_TYPE_TPU,
-            accelerator_variant="v5p-8",
             runtime_version="v2-alpha-tpuv5",
             zones=["us-central1-a"],
         )
@@ -411,8 +424,6 @@ class TestAutoscalerScaleUp:
             name="test-group",
             min_slices=2,
             max_slices=5,
-            accelerator_type=config_pb2.ACCELERATOR_TYPE_TPU,
-            accelerator_variant="v5p-8",
             runtime_version="v2-alpha-tpuv5",
             zones=["us-central1-a"],
         )
@@ -473,8 +484,6 @@ class TestAutoscalerScaleDown:
             name="test-group",
             min_slices=2,
             max_slices=5,
-            accelerator_type=config_pb2.ACCELERATOR_TYPE_TPU,
-            accelerator_variant="v5p-8",
             runtime_version="v2-alpha-tpuv5",
             zones=["us-central2-b"],
         )
@@ -862,8 +871,6 @@ class TestWaterfallRouting:
         config_high = make_scale_group_config(name="high-priority", max_slices=5, priority=10)
         config_low = make_scale_group_config(
             name="low-priority",
-            accelerator_type=config_pb2.ACCELERATOR_TYPE_GPU,
-            accelerator_variant="A100",
             max_slices=5,
             priority=20,
         )
@@ -954,6 +961,37 @@ class TestWaterfallRouting:
         groups_in_decisions = {d.scale_group for d in decisions}
         assert "v5p-group" in groups_in_decisions
         assert "v5lite-group" in groups_in_decisions
+
+    def test_flexible_variant_routes_to_matching_group(self):
+        """Demand with multiple device_variants routes to any matching group."""
+        config_v4 = make_scale_group_config(name="v4-group", accelerator_variant="v4-8", max_slices=5, priority=10)
+        config_v5p = make_scale_group_config(name="v5p-group", accelerator_variant="v5p-8", max_slices=5, priority=20)
+
+        group_v4 = ScalingGroup(config_v4, make_mock_platform(), scale_up_cooldown=Duration.from_ms(0))
+        group_v5p = ScalingGroup(config_v5p, make_mock_platform(), scale_up_cooldown=Duration.from_ms(0))
+
+        autoscaler = make_autoscaler({"v4-group": group_v4, "v5p-group": group_v5p})
+
+        # Demand accepts either v4-8 or v5p-8; should route to v4-group (higher priority)
+        demand = make_demand_entries(2, device_type=DeviceType.TPU, device_variants=frozenset({"v4-8", "v5p-8"}))
+        decisions = autoscaler.evaluate(demand)
+
+        assert len(decisions) >= 1
+        group_names = {d.scale_group for d in decisions}
+        assert "v4-group" in group_names
+
+    def test_flexible_variant_no_match_for_missing_variant(self):
+        """Flexible demand with no matching groups is unmet."""
+        config_v4 = make_scale_group_config(name="v4-group", accelerator_variant="v4-8", max_slices=5, priority=10)
+
+        group_v4 = ScalingGroup(config_v4, make_mock_platform(), scale_up_cooldown=Duration.from_ms(0))
+
+        autoscaler = make_autoscaler({"v4-group": group_v4})
+
+        # Demand requires v5p-8 or v5litepod-4, but only v4-8 group exists
+        demand = make_demand_entries(1, device_type=DeviceType.TPU, device_variants=frozenset({"v5p-8", "v5litepod-4"}))
+        decisions = autoscaler.evaluate(demand)
+        assert len(decisions) == 0
 
     def test_backoff_group_falls_through_to_fallback(self):
         """When primary group is in BACKOFF, demand falls through to fallback."""
@@ -1141,17 +1179,20 @@ class TestPreemptibleRouting:
 class TestRegionRouting:
     def test_route_demand_filters_by_required_region(self):
         config_west = make_scale_group_config(name="west", max_slices=5, priority=10, zones=["us-west4-b"])
-        config_west.worker.attributes[REGION_ATTRIBUTE_KEY] = "us-west4"
+        config_west.worker.attributes[WellKnownAttribute.REGION] = "us-west4"
 
         config_eu = make_scale_group_config(name="eu", max_slices=5, priority=10, zones=["europe-west4-b"])
-        config_eu.worker.attributes[REGION_ATTRIBUTE_KEY] = "europe-west4"
+        config_eu.worker.attributes[WellKnownAttribute.REGION] = "europe-west4"
 
         west = ScalingGroup(config_west, make_mock_platform())
         eu = ScalingGroup(config_eu, make_mock_platform())
 
-        demand = make_demand_entries(2, device_type=DeviceType.TPU, device_variant="v5p-8")
-        for entry in demand:
-            entry.required_regions = frozenset({"us-west4"})
+        demand = make_demand_entries(
+            2,
+            device_type=DeviceType.TPU,
+            device_variant="v5p-8",
+            required_regions=frozenset({"us-west4"}),
+        )
 
         result = route_demand([west, eu], demand)
 
@@ -1161,11 +1202,15 @@ class TestRegionRouting:
 
     def test_route_demand_unmet_when_no_group_matches_region(self):
         config_eu = make_scale_group_config(name="eu", max_slices=5, priority=10, zones=["europe-west4-b"])
-        config_eu.worker.attributes[REGION_ATTRIBUTE_KEY] = "europe-west4"
+        config_eu.worker.attributes[WellKnownAttribute.REGION] = "europe-west4"
         eu = ScalingGroup(config_eu, make_mock_platform())
 
-        demand = make_demand_entries(1, device_type=DeviceType.TPU, device_variant="v5p-8")
-        demand[0].required_regions = frozenset({"us-west4"})
+        demand = make_demand_entries(
+            1,
+            device_type=DeviceType.TPU,
+            device_variant="v5p-8",
+            required_regions=frozenset({"us-west4"}),
+        )
 
         result = route_demand([eu], demand)
 
@@ -1179,25 +1224,29 @@ class TestRegionRouting:
         config_west_preemptible = make_scale_group_config(
             name="west-preemptible", max_slices=5, priority=10, zones=["us-west4-b"], preemptible=True
         )
-        config_west_preemptible.worker.attributes[REGION_ATTRIBUTE_KEY] = "us-west4"
+        config_west_preemptible.worker.attributes[WellKnownAttribute.REGION] = "us-west4"
 
         config_west_ondemand = make_scale_group_config(
             name="west-ondemand", max_slices=5, priority=10, zones=["us-west4-b"], preemptible=False
         )
-        config_west_ondemand.worker.attributes[REGION_ATTRIBUTE_KEY] = "us-west4"
+        config_west_ondemand.worker.attributes[WellKnownAttribute.REGION] = "us-west4"
 
         config_eu_preemptible = make_scale_group_config(
             name="eu-preemptible", max_slices=5, priority=10, zones=["europe-west4-b"], preemptible=True
         )
-        config_eu_preemptible.worker.attributes[REGION_ATTRIBUTE_KEY] = "europe-west4"
+        config_eu_preemptible.worker.attributes[WellKnownAttribute.REGION] = "europe-west4"
 
         west_preemptible = ScalingGroup(config_west_preemptible, make_mock_platform())
         west_ondemand = ScalingGroup(config_west_ondemand, make_mock_platform())
         eu_preemptible = ScalingGroup(config_eu_preemptible, make_mock_platform())
 
-        demand = make_demand_entries(2, device_type=DeviceType.TPU, device_variant="v5p-8", preemptible=True)
-        for entry in demand:
-            entry.required_regions = frozenset({"us-west4"})
+        demand = make_demand_entries(
+            2,
+            device_type=DeviceType.TPU,
+            device_variant="v5p-8",
+            preemptible=True,
+            required_regions=frozenset({"us-west4"}),
+        )
 
         result = route_demand([west_preemptible, west_ondemand, eu_preemptible], demand)
 
@@ -1210,19 +1259,22 @@ class TestRegionRouting:
 class TestZoneRouting:
     def test_route_demand_filters_by_required_zone(self):
         config_a = make_scale_group_config(name="zone-a", max_slices=5, priority=10, zones=["us-central2-a"])
-        config_a.worker.attributes[REGION_ATTRIBUTE_KEY] = "us-central2"
-        config_a.worker.attributes[ZONE_ATTRIBUTE_KEY] = "us-central2-a"
+        config_a.worker.attributes[WellKnownAttribute.REGION] = "us-central2"
+        config_a.worker.attributes[WellKnownAttribute.ZONE] = "us-central2-a"
 
         config_b = make_scale_group_config(name="zone-b", max_slices=5, priority=10, zones=["us-central2-b"])
-        config_b.worker.attributes[REGION_ATTRIBUTE_KEY] = "us-central2"
-        config_b.worker.attributes[ZONE_ATTRIBUTE_KEY] = "us-central2-b"
+        config_b.worker.attributes[WellKnownAttribute.REGION] = "us-central2"
+        config_b.worker.attributes[WellKnownAttribute.ZONE] = "us-central2-b"
 
         zone_a = ScalingGroup(config_a, make_mock_platform())
         zone_b = ScalingGroup(config_b, make_mock_platform())
 
-        demand = make_demand_entries(2, device_type=DeviceType.TPU, device_variant="v5p-8")
-        for entry in demand:
-            entry.required_zones = frozenset({"us-central2-b"})
+        demand = make_demand_entries(
+            2,
+            device_type=DeviceType.TPU,
+            device_variant="v5p-8",
+            required_zones=frozenset({"us-central2-b"}),
+        )
 
         result = route_demand([zone_a, zone_b], demand)
 
@@ -1232,12 +1284,16 @@ class TestZoneRouting:
 
     def test_route_demand_unmet_when_no_group_matches_zone(self):
         config_a = make_scale_group_config(name="zone-a", max_slices=5, priority=10, zones=["us-central2-a"])
-        config_a.worker.attributes[REGION_ATTRIBUTE_KEY] = "us-central2"
-        config_a.worker.attributes[ZONE_ATTRIBUTE_KEY] = "us-central2-a"
+        config_a.worker.attributes[WellKnownAttribute.REGION] = "us-central2"
+        config_a.worker.attributes[WellKnownAttribute.ZONE] = "us-central2-a"
         zone_a = ScalingGroup(config_a, make_mock_platform())
 
-        demand = make_demand_entries(1, device_type=DeviceType.TPU, device_variant="v5p-8")
-        demand[0].required_zones = frozenset({"us-central2-b"})
+        demand = make_demand_entries(
+            1,
+            device_type=DeviceType.TPU,
+            device_variant="v5p-8",
+            required_zones=frozenset({"us-central2-b"}),
+        )
 
         result = route_demand([zone_a], demand)
 
@@ -1249,12 +1305,16 @@ class TestZoneRouting:
     def test_zone_typo_suggests_close_match(self):
         """A zone typo like 'europe-west4b' triggers a 'did you mean' suggestion."""
         config = make_scale_group_config(name="eu", max_slices=5, priority=10, zones=["europe-west4-b"])
-        config.worker.attributes[REGION_ATTRIBUTE_KEY] = "europe-west4"
-        config.worker.attributes[ZONE_ATTRIBUTE_KEY] = "europe-west4-b"
+        config.worker.attributes[WellKnownAttribute.REGION] = "europe-west4"
+        config.worker.attributes[WellKnownAttribute.ZONE] = "europe-west4-b"
         eu = ScalingGroup(config, make_mock_platform())
 
-        demand = make_demand_entries(1, device_type=DeviceType.TPU, device_variant="v5p-8")
-        demand[0].required_zones = frozenset({"europe-west4b"})
+        demand = make_demand_entries(
+            1,
+            device_type=DeviceType.TPU,
+            device_variant="v5p-8",
+            required_zones=frozenset({"europe-west4b"}),
+        )
 
         result = route_demand([eu], demand)
 
@@ -1271,7 +1331,7 @@ class TestZoneRouting:
             priority=10,
             zones=["us-central1-a"],
             accelerator_type=config_pb2.ACCELERATOR_TYPE_GPU,
-            accelerator_variant="a100",
+            accelerator_variant="H100",
         )
         gpu_group = ScalingGroup(config, make_mock_platform())
 
@@ -1295,11 +1355,15 @@ class TestZoneRouting:
                 priority=10,
                 zones=[zone],
             )
-            config.worker.attributes[ZONE_ATTRIBUTE_KEY] = zone
+            config.worker.attributes[WellKnownAttribute.ZONE] = zone
             groups.append(ScalingGroup(config, make_mock_platform()))
 
-        demand = make_demand_entries(1, device_type=DeviceType.TPU, device_variant="v5p-8")
-        demand[0].required_zones = frozenset({"nonexistent-zone-z"})
+        demand = make_demand_entries(
+            1,
+            device_type=DeviceType.TPU,
+            device_variant="v5p-8",
+            required_zones=frozenset({"nonexistent-zone-z"}),
+        )
 
         result = route_demand(groups, demand)
 
@@ -1482,12 +1546,18 @@ class TestAutoscalerWaterfallEndToEnd:
         )
 
         big_resources = cluster_pb2.ResourceSpecProto(cpu_millicores=128000, memory_bytes=128 * 1024**3)
+        normalized = NormalizedConstraints(
+            device_type=DeviceType.TPU,
+            device_variants=frozenset({"v5p-8"}),
+            preemptible=None,
+            required_regions=None,
+            required_zones=None,
+        )
         demand = [
             DemandEntry(
                 task_ids=[f"task-{i}"],
                 coschedule_group_id=None,
-                device_type=DeviceType.TPU,
-                device_variant="v5p-8",
+                normalized=normalized,
                 constraints=[],
                 resources=big_resources,
             )
@@ -1873,7 +1943,9 @@ class TestCommittedBudgetRouting:
             cpu_millicores=1000,
             memory_bytes=1024,
             disk_bytes=1024,
-            tpu_count=8,
+            device_count=8,
+            device_type=config_pb2.ACCELERATOR_TYPE_TPU,
+            device_variant="v5p-8",
         )
         config_v6e = make_scale_group_config(name="v6e", max_slices=2, priority=10, num_vms=1)
         config_v6e.resources.CopyFrom(small_resources)
@@ -2198,8 +2270,8 @@ class TestPerGroupWorkerConfig:
             controller_address="controller:10000",
         )
         sg_config = make_scale_group_config(name="west-group", max_slices=5)
-        sg_config.worker.attributes["region"] = "us-west4"
-        sg_config.worker.attributes["preemptible"] = "true"
+        sg_config.worker.attributes[WellKnownAttribute.REGION] = "us-west4"
+        sg_config.worker.attributes[WellKnownAttribute.PREEMPTIBLE] = "true"
         sg_config.worker.env["IRIS_REGION"] = "us-west4"
 
         group = ScalingGroup(sg_config, make_mock_platform())
@@ -2209,8 +2281,8 @@ class TestPerGroupWorkerConfig:
 
         assert wc is not None
         assert wc.docker_image == "test:latest"
-        assert wc.worker_attributes["region"] == "us-west4"
-        assert wc.worker_attributes["preemptible"] == "true"
+        assert wc.worker_attributes[WellKnownAttribute.REGION] == "us-west4"
+        assert wc.worker_attributes[WellKnownAttribute.PREEMPTIBLE] == "true"
         assert wc.default_task_env["IRIS_REGION"] == "us-west4"
         assert wc.worker_attributes["scale-group"] == "west-group"
         assert wc.accelerator_type == config_pb2.ACCELERATOR_TYPE_TPU
@@ -2230,7 +2302,7 @@ class TestPerGroupWorkerConfig:
             accelerator_type=config_pb2.ACCELERATOR_TYPE_GPU,
             accelerator_variant="H100",
         )
-        sg_config.resources.gpu_count = 8
+        sg_config.resources.device_count = 8
         group = ScalingGroup(sg_config, make_mock_platform())
         autoscaler = make_autoscaler({"plain-group": group}, base_worker_config=base_wc)
 
@@ -2246,7 +2318,7 @@ class TestPerGroupWorkerConfig:
     def test_returns_none_without_base(self):
         """Without a base worker config, returns None."""
         sg_config = make_scale_group_config(name="test-group", max_slices=5)
-        sg_config.worker.attributes["region"] = "us-west4"
+        sg_config.worker.attributes[WellKnownAttribute.REGION] = "us-west4"
         group = ScalingGroup(sg_config, make_mock_platform())
         autoscaler = make_autoscaler({"test-group": group}, base_worker_config=None)
 
@@ -2262,14 +2334,14 @@ class TestPerGroupWorkerConfig:
             controller_address="controller:10000",
         )
         sg_config = make_scale_group_config(name="west-group", max_slices=5)
-        sg_config.worker.attributes["region"] = "us-west4"
+        sg_config.worker.attributes[WellKnownAttribute.REGION] = "us-west4"
 
         group = ScalingGroup(sg_config, make_mock_platform())
         autoscaler = make_autoscaler({"west-group": group}, base_worker_config=base_wc)
 
         autoscaler._per_group_worker_config(group)
 
-        assert "region" not in base_wc.worker_attributes
+        assert WellKnownAttribute.REGION not in base_wc.worker_attributes
 
     def test_worker_attributes_injected(self):
         """Worker attributes are injected into WorkerConfig."""
@@ -2279,7 +2351,7 @@ class TestPerGroupWorkerConfig:
             controller_address="controller:10000",
         )
         sg_config = make_scale_group_config(name="eu-group", max_slices=5, zones=["europe-west4-b"])
-        sg_config.worker.attributes["region"] = "europe-west4"
+        sg_config.worker.attributes[WellKnownAttribute.REGION] = "europe-west4"
 
         group = ScalingGroup(sg_config, make_mock_platform())
         autoscaler = make_autoscaler({"eu-group": group}, base_worker_config=base_wc)
@@ -2287,7 +2359,7 @@ class TestPerGroupWorkerConfig:
         wc = autoscaler._per_group_worker_config(group)
 
         assert wc is not None
-        assert wc.worker_attributes["region"] == "europe-west4"
+        assert wc.worker_attributes[WellKnownAttribute.REGION] == "europe-west4"
 
 
 class TestGpuScaleGroupBugs:
@@ -2312,8 +2384,6 @@ class TestGpuScaleGroupBugs:
         """
         config = make_scale_group_config(
             name="h100-8x",
-            accelerator_type=config_pb2.ACCELERATOR_TYPE_GPU,
-            accelerator_variant="H100",
             min_slices=0,
             max_slices=1,
         )
@@ -2361,8 +2431,6 @@ class TestGpuScaleGroupBugs:
         """
         config = make_scale_group_config(
             name="h100-8x",
-            accelerator_type=config_pb2.ACCELERATOR_TYPE_GPU,
-            accelerator_variant="H100",
             min_slices=0,
             max_slices=2,
         )
@@ -2417,7 +2485,7 @@ def _make_big_demand_entries(
     memory_bytes: int = 32 * 1024**3,
     disk_bytes: int = 0,
     device_type: DeviceType = DeviceType.CPU,
-    device_variant: str | None = None,
+    device_variants: frozenset[str] | None = None,
     task_prefix: str = "task",
     coschedule_group_id: str | None = None,
 ) -> list[DemandEntry]:
@@ -2427,14 +2495,20 @@ def _make_big_demand_entries(
         memory_bytes=memory_bytes,
         disk_bytes=disk_bytes,
     )
+    normalized = NormalizedConstraints(
+        device_type=device_type,
+        device_variants=device_variants,
+        preemptible=None,
+        required_regions=None,
+        required_zones=None,
+    )
     if coschedule_group_id:
         # Coscheduled entries use count as num tasks
         return [
             DemandEntry(
                 task_ids=[f"{task_prefix}-{i}" for i in range(count)],
                 coschedule_group_id=coschedule_group_id,
-                device_type=device_type,
-                device_variant=device_variant,
+                normalized=normalized,
                 constraints=[],
                 resources=resources,
             )
@@ -2443,8 +2517,7 @@ def _make_big_demand_entries(
         DemandEntry(
             task_ids=[f"{task_prefix}-{i}"],
             coschedule_group_id=None,
-            device_type=device_type,
-            device_variant=device_variant,
+            normalized=normalized,
             constraints=[],
             resources=resources,
         )
@@ -2536,7 +2609,7 @@ class TestComputeRequiredSlices:
             cpu_millicores=128000,
             memory_bytes=128 * 1024**3,
             device_type=DeviceType.TPU,
-            device_variant="v5p-8",
+            device_variants=frozenset({"v5p-8"}),
         )
         assert compute_required_slices(group, entries) == 3
 
@@ -2555,7 +2628,7 @@ class TestComputeRequiredSlices:
             cpu_millicores=128000,
             memory_bytes=128 * 1024**3,
             device_type=DeviceType.TPU,
-            device_variant="v5p-8",
+            device_variants=frozenset({"v5p-8"}),
         )
         assert compute_required_slices(group, entries) == 1
 
@@ -2573,7 +2646,7 @@ class TestComputeRequiredSlices:
             cpu_millicores=128000,
             memory_bytes=128 * 1024**3,
             device_type=DeviceType.TPU,
-            device_variant="v5p-8",
+            device_variants=frozenset({"v5p-8"}),
         )
         assert compute_required_slices(group, entries) == 2
 
@@ -2591,7 +2664,7 @@ class TestComputeRequiredSlices:
             cpu_millicores=1000,
             memory_bytes=1024,
             device_type=DeviceType.TPU,
-            device_variant="v5p-8",
+            device_variants=frozenset({"v5p-8"}),
             coschedule_group_id="job-1",
         )
         assert len(entries) == 1
@@ -2611,7 +2684,7 @@ class TestComputeRequiredSlices:
             cpu_millicores=1000,
             memory_bytes=1024,
             device_type=DeviceType.TPU,
-            device_variant="v5p-8",
+            device_variants=frozenset({"v5p-8"}),
             coschedule_group_id="job-1",
         )
         # 4 entries at 64GiB each → 2 VMs → ceil(2/4) = 1 slice
@@ -2620,7 +2693,7 @@ class TestComputeRequiredSlices:
             cpu_millicores=64000,
             memory_bytes=64 * 1024**3,
             device_type=DeviceType.TPU,
-            device_variant="v5p-8",
+            device_variants=frozenset({"v5p-8"}),
             task_prefix="noncsc",
         )
         entries = coscheduled + non_coscheduled
@@ -2632,8 +2705,6 @@ class TestComputeRequiredSlices:
         config = config_pb2.ScaleGroupConfig(
             name="no-resources",
             max_slices=5,
-            accelerator_type=config_pb2.ACCELERATOR_TYPE_TPU,
-            accelerator_variant="v5p-8",
         )
         # Explicitly don't set resources
         group = ScalingGroup(config, make_mock_platform())
@@ -2680,7 +2751,7 @@ class TestPackingRouting:
             cpu_millicores=32000,
             memory_bytes=32 * 1024**3,
             device_type=DeviceType.TPU,
-            device_variant="v5p-8",
+            device_variants=frozenset({"v5p-8"}),
         )
         decisions = autoscaler.evaluate(entries)
 
@@ -2726,7 +2797,7 @@ class TestPackingRouting:
             cpu_millicores=32000,
             memory_bytes=32 * 1024**3,
             device_type=DeviceType.TPU,
-            device_variant="v5p-8",
+            device_variants=frozenset({"v5p-8"}),
         )
         decisions = autoscaler.evaluate(entries)
 
@@ -2758,7 +2829,7 @@ class TestPackingRouting:
             cpu_millicores=128000,
             memory_bytes=128 * 1024**3,
             device_type=DeviceType.TPU,
-            device_variant="v5p-8",
+            device_variants=frozenset({"v5p-8"}),
         )
         decisions = autoscaler.evaluate(small_demand)
         assert len(decisions) == 0
@@ -2769,7 +2840,7 @@ class TestPackingRouting:
             cpu_millicores=128000,
             memory_bytes=128 * 1024**3,
             device_type=DeviceType.TPU,
-            device_variant="v5p-8",
+            device_variants=frozenset({"v5p-8"}),
             task_prefix="big",
         )
         decisions = autoscaler.evaluate(big_demand)
@@ -2806,7 +2877,7 @@ class TestPackingRouting:
             cpu_millicores=32000,
             memory_bytes=32 * 1024**3,
             device_type=DeviceType.TPU,
-            device_variant="v5p-8",
+            device_variants=frozenset({"v5p-8"}),
         )
 
         # First run to set current_demand (required_slices=1)
@@ -2848,7 +2919,7 @@ class TestPackingRouting:
             cpu_millicores=32000,
             memory_bytes=32 * 1024**3,
             device_type=DeviceType.TPU,
-            device_variant="v5p-8",
+            device_variants=frozenset({"v5p-8"}),
         )
         result = route_demand([group], entries)
         assert result.group_to_launch.get("test-group") == 1
@@ -2876,7 +2947,7 @@ class TestPackingRouting:
             cpu_millicores=32000,
             memory_bytes=32 * 1024**3,
             device_type=DeviceType.TPU,
-            device_variant="v5p-8",
+            device_variants=frozenset({"v5p-8"}),
         )
         result = route_demand([group], entries)
         assert result.group_to_launch.get("test-group", 0) == 0
@@ -2899,7 +2970,7 @@ class TestMultiSliceScaleUp:
             cpu_millicores=128000,
             memory_bytes=128 * 1024**3,
             device_type=DeviceType.TPU,
-            device_variant="v5p-8",
+            device_variants=frozenset({"v5p-8"}),
         )
         decisions = autoscaler.evaluate(demand)
 
@@ -2921,7 +2992,7 @@ class TestMultiSliceScaleUp:
             cpu_millicores=128000,
             memory_bytes=128 * 1024**3,
             device_type=DeviceType.TPU,
-            device_variant="v5p-8",
+            device_variants=frozenset({"v5p-8"}),
         )
         decisions = autoscaler.evaluate(demand)
 
@@ -2951,7 +3022,7 @@ class TestMultiSliceScaleUp:
             cpu_millicores=128000,
             memory_bytes=128 * 1024**3,
             device_type=DeviceType.TPU,
-            device_variant="v5p-8",
+            device_variants=frozenset({"v5p-8"}),
         )
         decisions = autoscaler.evaluate(demand, timestamp=ts)
 
@@ -3016,7 +3087,7 @@ class TestMultiSliceScaleUp:
             cpu_millicores=128000,
             memory_bytes=128 * 1024**3,
             device_type=DeviceType.TPU,
-            device_variant="v5p-8",
+            device_variants=frozenset({"v5p-8"}),
             task_prefix="phase1",
         )
         autoscaler.run_once(demand_4, {})
@@ -3033,7 +3104,7 @@ class TestMultiSliceScaleUp:
             cpu_millicores=128000,
             memory_bytes=128 * 1024**3,
             device_type=DeviceType.TPU,
-            device_variant="v5p-8",
+            device_variants=frozenset({"v5p-8"}),
             task_prefix="phase2",
         )
         decisions = autoscaler.evaluate(demand_12)
@@ -3089,7 +3160,7 @@ class TestMultiSliceScaleUp:
                 cpu_millicores=128000,
                 memory_bytes=128 * 1024**3,
                 device_type=DeviceType.TPU,
-                device_variant="v5p-8",
+                device_variants=frozenset({"v5p-8"}),
             )
 
         def advance(ts):
@@ -3223,15 +3294,14 @@ class TestRoutingBinPacking:
             cpu_millicores=128000,
             memory_bytes=memory_bytes,
             disk_bytes=100 * 1024**3,
-            gpu_count=8,
-            tpu_count=8,
+            device_count=8,
+            device_type=config_pb2.ACCELERATOR_TYPE_TPU,
+            device_variant="v5p-8",
         )
         config = config_pb2.ScaleGroupConfig(
             name=name,
             max_slices=max_slices,
             priority=priority,
-            accelerator_type=config_pb2.ACCELERATOR_TYPE_TPU,
-            accelerator_variant="v5p-8",
             **kwargs,
         )
         config.resources.CopyFrom(resources)
@@ -3241,12 +3311,18 @@ class TestRoutingBinPacking:
 
     def _make_entries(self, count: int, memory_bytes: int = 32 * 1024**3) -> list[DemandEntry]:
         resources = cluster_pb2.ResourceSpecProto(cpu_millicores=1000, memory_bytes=memory_bytes)
+        normalized = NormalizedConstraints(
+            device_type=DeviceType.TPU,
+            device_variants=frozenset({"v5p-8"}),
+            preemptible=None,
+            required_regions=None,
+            required_zones=None,
+        )
         return [
             DemandEntry(
                 task_ids=[f"task-{i}"],
                 coschedule_group_id=None,
-                device_type=DeviceType.TPU,
-                device_variant="v5p-8",
+                normalized=normalized,
                 constraints=[],
                 resources=resources,
             )
@@ -3314,8 +3390,6 @@ class TestRoutingBinPacking:
             name="csc-group",
             max_slices=3,
             priority=10,
-            accelerator_type=config_pb2.ACCELERATOR_TYPE_TPU,
-            accelerator_variant="v5p-8",
             num_vms=2,
         )
         config.resources.CopyFrom(DEFAULT_RESOURCES)
@@ -3323,20 +3397,25 @@ class TestRoutingBinPacking:
         group = ScalingGroup(config, make_mock_platform(), scale_up_cooldown=Duration.from_ms(0))
 
         resources = cluster_pb2.ResourceSpecProto(cpu_millicores=1000, memory_bytes=1024)
+        normalized = NormalizedConstraints(
+            device_type=DeviceType.TPU,
+            device_variants=frozenset({"v5p-8"}),
+            preemptible=None,
+            required_regions=None,
+            required_zones=None,
+        )
         entries = [
             DemandEntry(
                 task_ids=["t0", "t1"],
                 coschedule_group_id="job-1",
-                device_type=DeviceType.TPU,
-                device_variant="v5p-8",
+                normalized=normalized,
                 constraints=[],
                 resources=resources,
             ),
             DemandEntry(
                 task_ids=["t2", "t3"],
                 coschedule_group_id="job-2",
-                device_type=DeviceType.TPU,
-                device_variant="v5p-8",
+                normalized=normalized,
                 constraints=[],
                 resources=resources,
             ),
@@ -3353,8 +3432,6 @@ class TestRoutingBinPacking:
             name="mixed",
             max_slices=5,
             priority=10,
-            accelerator_type=config_pb2.ACCELERATOR_TYPE_TPU,
-            accelerator_variant="v5p-8",
             num_vms=2,
         )
         config.resources.CopyFrom(DEFAULT_RESOURCES)
@@ -3362,13 +3439,19 @@ class TestRoutingBinPacking:
         group = ScalingGroup(config, make_mock_platform(), scale_up_cooldown=Duration.from_ms(0))
 
         resources = cluster_pb2.ResourceSpecProto(cpu_millicores=1000, memory_bytes=1024)
+        normalized = NormalizedConstraints(
+            device_type=DeviceType.TPU,
+            device_variants=frozenset({"v5p-8"}),
+            preemptible=None,
+            required_regions=None,
+            required_zones=None,
+        )
         entries = [
             # 1 coscheduled entry (needs 1 slice = 2 VMs)
             DemandEntry(
                 task_ids=["t0", "t1"],
                 coschedule_group_id="job-1",
-                device_type=DeviceType.TPU,
-                device_variant="v5p-8",
+                normalized=normalized,
                 constraints=[],
                 resources=resources,
             ),
@@ -3377,8 +3460,7 @@ class TestRoutingBinPacking:
                 DemandEntry(
                     task_ids=[f"t-pack-{i}"],
                     coschedule_group_id=None,
-                    device_type=DeviceType.TPU,
-                    device_variant="v5p-8",
+                    normalized=normalized,
                     constraints=[],
                     resources=resources,
                 )
@@ -3411,7 +3493,7 @@ class TestScaleUpRateLimiting:
             cpu_millicores=128000,
             memory_bytes=128 * 1024**3,
             device_type=DeviceType.TPU,
-            device_variant="v5p-8",
+            device_variants=frozenset({"v5p-8"}),
         )
         ts = Timestamp.from_ms(100_000)
         decisions = autoscaler.evaluate(demand, timestamp=ts)
@@ -3445,7 +3527,7 @@ class TestScaleUpRateLimiting:
             cpu_millicores=128000,
             memory_bytes=128 * 1024**3,
             device_type=DeviceType.TPU,
-            device_variant="v5p-8",
+            device_variants=frozenset({"v5p-8"}),
         )
 
         # Cycle 1: 6 decisions, only 2 pass rate limit
@@ -3484,7 +3566,7 @@ class TestScaleUpRateLimiting:
             cpu_millicores=128000,
             memory_bytes=128 * 1024**3,
             device_type=DeviceType.TPU,
-            device_variant="v5p-8",
+            device_variants=frozenset({"v5p-8"}),
         )
         ts = Timestamp.from_ms(100_000)
         decisions = autoscaler.evaluate(demand, timestamp=ts)

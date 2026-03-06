@@ -21,23 +21,18 @@ See:
 - No new scale-down behavior beyond existing idle logic.
 - No inference about task duration or cost optimization.
 
-## Current Behavior (v0)
+## Current Behavior (v0, historical)
 
-The autoscaler currently:
-- Accepts `DemandEntry` with `device_type`, `device_variant`, `count`, and preemptible preference.
-- Routes demand to groups by accelerator type/variant, preemptible, and priority. This produces `allocations` per group.
-- For each group, computes a single `ScalingDecision` if demand exceeds capacity or min_slices is violated.
-- Executes scale-up in a background thread (`scale_up` per group) and relies on group-level state for scale-down.
+The original autoscaler:
+- Accepted `DemandEntry` with separate `device_type`, `device_variant`, `preemptible` fields.
+- Routed demand to groups by accelerator type/variant, preemptible, and priority.
+- For each group, computed a single `ScalingDecision` if demand exceeded capacity or min_slices was violated.
 
-Important details in `lib/iris/src/iris/cluster/controller/autoscaler.py`:
-- The routing logic is `route_demand`, which chooses groups by matching device type/variant and preemptible, then uses priority and available headroom.
-- The evaluate step only produces at most one scale-up per group per tick.
-- `DemandEntry.total_cpu` and `.total_memory_bytes` exist but are unused in routing.
+This design lacked fine-grained constraint matching, a clear pending-capacity model, and visibility into why demand was unmet.
 
-This is conceptually simple but lacks:
-- Fine-grained demand-to-group resource matching based on attribute constraints.
-- A clear model for “pending” capacity and in-flight slices.
-- A way to communicate to users why demand is not being satisfied.
+## Implemented Design (v2)
+
+The current implementation follows the v2 design described below.
 
 ## Proposed Design (v2)
 
@@ -52,13 +47,13 @@ This makes behavior predictable and explainable, and it mirrors the scheduler’
 
 ### Data Model
 
-Extend `DemandEntry` (or derive a new type) to include:
-- `device_type` and optional `device_variant`.
-- `constraints`: list of attribute constraints (reuse `cluster_pb2.Constraint` if it covers needs).
+`DemandEntry` carries:
+- `normalized`: a `NormalizedConstraints` object holding device type, device variants, preemptible preference, and region/zone requirements — derived from the task's constraints.
 - `resources`: cpu, memory, and device-specific resource requirements.
-- `preemptible` preference (optional).
+- `raw_constraints`: the original `Constraint` list (passed through to the scheduler).
 - `coschedule_group_id`: identifier for coscheduled tasks (None for non-coscheduled entries).
 - `task_ids`: list of task ids included in this demand entry (size 1 for non-coscheduled).
+- `invalid_reason`: set if the demand entry cannot be routed (e.g., conflicting constraints).
 
 Introduce a `PendingGroup` accounting model:
 - Tracks scale group name.
@@ -141,11 +136,10 @@ added to the demand model, and all call sites updated.
 # DemandEntry:
 #   - task_ids: list[str]
 #   - coschedule_group_id: str | None
-#   - device_type: DeviceType
-#   - device_variant: str | None
-#   - constraints: list[cluster_pb2.Constraint]
+#   - normalized: NormalizedConstraints  # device_type, device_variants, preemptible, regions, zones
 #   - resources: ResourceSpec
-#   - preemptible: bool | None
+#   - raw_constraints: list[cluster_pb2.Constraint]
+#   - invalid_reason: str | None
 #
 # PendingGroup:
 #   - name: str
@@ -181,14 +175,13 @@ def build_demand_entries(unscheduled_tasks):
     for _, tasks in groups.items():
         # All tasks in a group share resource requirements and constraints.
         # If they do not, fail fast and mark unmet with a reason.
+        normalized = normalize_constraints(tasks[0].constraints)
         entry = DemandEntry(
             task_ids=[t.task_id for t in tasks],
             coschedule_group_id=tasks[0].coschedule_group_id,
-            device_type=tasks[0].device_type,
-            device_variant=tasks[0].device_variant,
-            constraints=tasks[0].constraints,
+            normalized=normalized,       # NormalizedConstraints: device_type, device_variants, preemptible, etc.
             resources=tasks[0].resources,
-            preemptible=tasks[0].preemptible,
+            raw_constraints=tasks[0].constraints,
         )
         entries.append(entry)
     return entries
@@ -203,14 +196,11 @@ def route_demand(groups, demand_entries, timestamp):
 
     def can_fit(capacity_view, entry):
         # capacity_view may be a scale group or a pending group. The interface is the same:
-        # - matches_device_requirement
-        # - preemptible
+        # - matches_demand(normalized)
         # - can_accept_demand(timestamp)
         # - remaining_* resource fields
         # - remaining_slices
-        if not capacity_view.matches_device_requirement(entry.device_type, entry.device_variant):
-            return False
-        if entry.preemptible is not None and capacity_view.preemptible != entry.preemptible:
+        if not capacity_view.matches_demand(entry.normalized):
             return False
         if not capacity_view.can_accept_demand(timestamp):
             return False
@@ -354,17 +344,11 @@ status proto. The JS client can then render it without further Python changes.
 
 - How should we validate that all tasks in a coschedule group have identical resource/constraint requirements, and how should we report mismatches to the user?
 
-## Implementation Sketch
+## Implementation Notes (as built)
 
-Suggested code changes:
-- Extend `DemandEntry` to include `constraints` and `resources`.
-- Add a `PendingGroup` struct in `autoscaler.py` for capacity tracking.
-- Replace `route_demand` with a new `route_demand_v2` that processes entries with the pending-first strategy.
-- Add structured log events for each demand entry routing decision.
-- Update `vm_pb2.AutoscalerStatus` and dashboard to include per-slice state and unmet demand reasons.
-
-## Migration Strategy
-
-- Implement v2 routing behind a config flag or new autoscaler mode.
-- Validate with the smoke test and with synthetic demand scenarios.
-- Update dashboard to show the new per-group and per-slice visibility.
+Key deviations from the original sketch:
+- `DemandEntry.normalized` (`NormalizedConstraints`) carries device type, variants, preemptible, and zone/region requirements. There is no separate `constraints` field on `DemandEntry` — raw constraints are in `raw_constraints` and passed through to the scheduler.
+- `ScalingGroup.matches_demand(normalized)` replaces the old `matches_device_requirement()` + separate preemptible/zone checks.
+- `RoutingDecision` and `PendingGroup` are implemented in `autoscaler.py` as described.
+- `vm.proto` `DemandEntryStatus` carries `device_type`, `device_variant`, `preemptible` as human-readable display strings for the dashboard.
+- No config flag or migration strategy was needed: the implementation replaces the old routing directly.

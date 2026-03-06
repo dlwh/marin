@@ -31,14 +31,15 @@ def _make_cold_start_scaleup_config() -> config_pb2.IrisClusterConfig:
 
     sg = config.scale_groups["tpu_v5e_16"]
     sg.name = "tpu_v5e_16"
-    sg.accelerator_type = config_pb2.ACCELERATOR_TYPE_TPU
-    sg.accelerator_variant = "v5litepod-16"
     sg.num_vms = 1
     sg.min_slices = 0
     sg.max_slices = 2
     sg.resources.cpu_millicores = 128000
     sg.resources.memory_bytes = 128 * 1024**3
     sg.resources.disk_bytes = 1024 * 1024**3
+    sg.resources.device_type = config_pb2.ACCELERATOR_TYPE_TPU
+    sg.resources.device_variant = "v5litepod-16"
+    sg.resources.preemptible = True
     sg.slice_template.preemptible = True
     sg.slice_template.num_vms = 1
     sg.slice_template.accelerator_type = config_pb2.ACCELERATOR_TYPE_TPU

@@ -646,21 +646,19 @@ class Namespace(str):
         return cls(job_id.namespace)
 
 
-PREEMPTIBLE_ATTRIBUTE_KEY = "preemptible"
-REGION_ATTRIBUTE_KEY = "region"
-ZONE_ATTRIBUTE_KEY = "zone"
+from iris.cluster.constraints import WellKnownAttribute  # noqa: E402 — must follow class defs above
 
 
 def preemptible_constraint(preemptible: bool = True) -> Constraint:
     """Constraint requiring workers to be preemptible (or not)."""
-    return Constraint(key=PREEMPTIBLE_ATTRIBUTE_KEY, op=ConstraintOp.EQ, value=str(preemptible).lower())
+    return Constraint(key=WellKnownAttribute.PREEMPTIBLE, op=ConstraintOp.EQ, value=str(preemptible).lower())
 
 
 def zone_constraint(zone: str) -> Constraint:
     """Constraint requiring workers to be in a given zone."""
     if not zone:
         raise ValueError("zone must be non-empty")
-    return Constraint(key=ZONE_ATTRIBUTE_KEY, op=ConstraintOp.EQ, value=zone)
+    return Constraint(key=WellKnownAttribute.ZONE, op=ConstraintOp.EQ, value=zone)
 
 
 def region_constraint(regions: list[str]) -> Constraint:
@@ -684,14 +682,45 @@ def region_constraint(regions: list[str]) -> Constraint:
         if not r:
             raise ValueError("region must be non-empty")
     if len(regions) == 1:
-        return Constraint(key=REGION_ATTRIBUTE_KEY, op=ConstraintOp.EQ, value=regions[0])
-    return Constraint(key=REGION_ATTRIBUTE_KEY, op=ConstraintOp.IN, values=tuple(regions))
+        return Constraint(key=WellKnownAttribute.REGION, op=ConstraintOp.EQ, value=regions[0])
+    return Constraint(key=WellKnownAttribute.REGION, op=ConstraintOp.IN, values=tuple(regions))
+
+
+def device_variant_constraint(variants: Sequence[str]) -> Constraint:
+    """Constraint requiring scheduling on workers with one of the given device variants.
+
+    Args:
+        variants: Non-empty sequence of device variant strings (e.g., ["v4-8", "v5p-8"]).
+
+    Raises:
+        TypeError: If variants is a string (common mistake — pass [variant] instead).
+        ValueError: If variants is empty or contains empty strings.
+    """
+    if isinstance(variants, str):
+        raise TypeError(
+            "device_variant_constraint() requires a sequence of strings, not a bare string. Use [variant] instead."
+        )
+    if not variants:
+        raise ValueError("variants must be non-empty")
+    for v in variants:
+        if not v:
+            raise ValueError("variant must be non-empty")
+    if len(variants) == 1:
+        return Constraint(key=WellKnownAttribute.DEVICE_VARIANT, op=ConstraintOp.EQ, value=variants[0])
+    return Constraint(key=WellKnownAttribute.DEVICE_VARIANT, op=ConstraintOp.IN, values=tuple(variants))
 
 
 @dataclass(frozen=True)
 class NormalizedConstraints:
-    """Normalized canonical placement constraints derived from proto constraints."""
+    """Normalized canonical placement constraints derived from proto constraints.
 
+    Combines device type, device variant, preemptible preference, and
+    region/zone requirements into a single object for demand routing.
+    The autoscaler uses this instead of carrying separate fields.
+    """
+
+    device_type: DeviceType | None
+    device_variants: frozenset[str] | None
     preemptible: bool | None
     required_regions: frozenset[str] | None
     required_zones: frozenset[str] | None
@@ -710,7 +739,7 @@ def preemptible_preference_from_constraints(constraints: Sequence[cluster_pb2.Co
     """
     values: set[bool] = set()
     for constraint in constraints:
-        if constraint.key != PREEMPTIBLE_ATTRIBUTE_KEY:
+        if constraint.key != WellKnownAttribute.PREEMPTIBLE:
             continue
         if constraint.op != cluster_pb2.CONSTRAINT_OP_EQ:
             raise ValueError("preemptible constraint must use EQ")
@@ -742,7 +771,7 @@ def required_regions_from_constraints(constraints: Sequence[cluster_pb2.Constrai
     regions: set[str] = set()
     has_in = False
     for constraint in constraints:
-        if constraint.key != REGION_ATTRIBUTE_KEY:
+        if constraint.key != WellKnownAttribute.REGION:
             continue
         if constraint.op == cluster_pb2.CONSTRAINT_OP_IN:
             if not constraint.values:
@@ -783,7 +812,7 @@ def required_zones_from_constraints(constraints: Sequence[cluster_pb2.Constraint
     zones: set[str] = set()
     has_in = False
     for constraint in constraints:
-        if constraint.key != ZONE_ATTRIBUTE_KEY:
+        if constraint.key != WellKnownAttribute.ZONE:
             continue
         if constraint.op == cluster_pb2.CONSTRAINT_OP_IN:
             if not constraint.values:
@@ -811,9 +840,86 @@ def required_zones_from_constraints(constraints: Sequence[cluster_pb2.Constraint
     return frozenset(zones) if zones else None
 
 
+def device_type_from_constraints(constraints: Sequence[cluster_pb2.Constraint]) -> DeviceType | None:
+    """Extract device type from constraints.
+
+    Returns:
+        DeviceType when a device-type constraint is present, otherwise None.
+
+    Raises:
+        ValueError: If device-type constraints use invalid operators/values or
+            contain conflicting values.
+    """
+    values: set[str] = set()
+    for constraint in constraints:
+        if constraint.key != WellKnownAttribute.DEVICE_TYPE:
+            continue
+        if constraint.op == cluster_pb2.CONSTRAINT_OP_EQ:
+            if not constraint.value.HasField("string_value"):
+                raise ValueError("device-type constraint requires string value")
+            values.add(constraint.value.string_value.strip().lower())
+        elif constraint.op == cluster_pb2.CONSTRAINT_OP_IN:
+            if not constraint.values:
+                raise ValueError("IN device-type constraint requires at least one value")
+            for av in constraint.values:
+                if not av.HasField("string_value"):
+                    raise ValueError("device-type constraint requires string value")
+                values.add(av.string_value.strip().lower())
+        else:
+            raise ValueError(f"device-type constraint must use EQ or IN, got {constraint.op}")
+
+    if not values:
+        return None
+    if len(values) > 1:
+        raise ValueError(f"conflicting device-type constraints: {values}")
+
+    raw = next(iter(values))
+    try:
+        return DeviceType(raw)
+    except ValueError as e:
+        raise ValueError(f"unknown device type: {raw}") from e
+
+
+def required_device_variants_from_constraints(constraints: Sequence[cluster_pb2.Constraint]) -> frozenset[str] | None:
+    """Extract required device variants from constraints.
+
+    Returns:
+        Set of required device variants when specified, otherwise None.
+
+    Raises:
+        ValueError: If device-variant constraints use invalid operators/values.
+    """
+    variants: set[str] = set()
+    for constraint in constraints:
+        if constraint.key != WellKnownAttribute.DEVICE_VARIANT:
+            continue
+        if constraint.op == cluster_pb2.CONSTRAINT_OP_IN:
+            if not constraint.values:
+                raise ValueError("IN device-variant constraint requires at least one value")
+            for av in constraint.values:
+                if not av.HasField("string_value"):
+                    raise ValueError("device-variant constraint requires string value")
+                variant = av.string_value.strip()
+                if not variant:
+                    raise ValueError("device-variant constraint must be non-empty")
+                variants.add(variant)
+        elif constraint.op == cluster_pb2.CONSTRAINT_OP_EQ:
+            if not constraint.value.HasField("string_value"):
+                raise ValueError("device-variant constraint requires string value")
+            variant = constraint.value.string_value.strip()
+            if not variant:
+                raise ValueError("device-variant constraint must be non-empty")
+            variants.add(variant)
+        else:
+            raise ValueError(f"device-variant constraint must use EQ or IN, got {constraint.op}")
+    return frozenset(variants) if variants else None
+
+
 def normalize_constraints(constraints: Sequence[cluster_pb2.Constraint]) -> NormalizedConstraints:
     """Normalize canonical placement constraints from protobuf constraints."""
     return NormalizedConstraints(
+        device_type=device_type_from_constraints(constraints),
+        device_variants=required_device_variants_from_constraints(constraints),
         preemptible=preemptible_preference_from_constraints(constraints),
         required_regions=required_regions_from_constraints(constraints),
         required_zones=required_zones_from_constraints(constraints),
@@ -827,13 +933,19 @@ def merge_constraints(parent: Sequence[Constraint], child: Sequence[Constraint])
     for constraint in parent:
         merged_by_key.setdefault(constraint.key, []).append(constraint)
 
-    for key in (REGION_ATTRIBUTE_KEY, PREEMPTIBLE_ATTRIBUTE_KEY):
+    _CANONICAL_KEYS = (
+        WellKnownAttribute.DEVICE_TYPE,
+        WellKnownAttribute.DEVICE_VARIANT,
+        WellKnownAttribute.PREEMPTIBLE,
+        WellKnownAttribute.REGION,
+    )
+    for key in _CANONICAL_KEYS:
         child_for_key = [constraint for constraint in child if constraint.key == key]
         if child_for_key:
             merged_by_key[key] = child_for_key
 
     for constraint in child:
-        if constraint.key in (REGION_ATTRIBUTE_KEY, PREEMPTIBLE_ATTRIBUTE_KEY):
+        if constraint.key in _CANONICAL_KEYS:
             continue
         existing = merged_by_key.setdefault(constraint.key, [])
         if constraint not in existing:
@@ -944,39 +1056,34 @@ def get_tpu_topology(tpu_type: str) -> TpuTopologyInfo:
     raise ValueError(f"Unknown TPU type: {tpu_type}")
 
 
-def validate_tpu_replicas(device: "cluster_pb2.DeviceConfig | None", replicas: int) -> None:
-    """Validate that replicas match the TPU topology's vm_count.
+def adjust_tpu_replicas(device: "cluster_pb2.DeviceConfig | None", replicas: int) -> int:
+    """Adjust replicas for multi-host TPU topologies.
 
     Multi-host TPU topologies (e.g. v6e-32 with vm_count=8) require one task
-    per VM. This function checks that ``replicas`` is a positive multiple of
-    the topology's ``vm_count`` so that every VM in every slice has exactly
-    one task. A mismatch (e.g. replicas=1 for a v6e-32) would cause JAX
-    distributed initialization to time out waiting for missing workers.
+    per VM. When ``replicas`` is 1 (the default), this auto-scales to
+    ``vm_count`` so callers don't need to know the topology. For explicitly
+    set replicas (>1) that don't align, raises ``ValueError``.
 
-    Args:
-        device: DeviceConfig from the resource spec. ``None`` or non-TPU
-            devices are silently accepted.
-        replicas: Number of replicas requested for the job.
-
-    Raises:
-        ValueError: If the TPU topology is known and ``replicas`` is not a
-            positive multiple of ``vm_count``.
+    Returns:
+        The (possibly adjusted) replica count.
     """
     if device is None or not device.HasField("tpu"):
-        return
+        return replicas
 
     variant = device.tpu.variant
     if not variant:
-        return
+        return replicas
 
     try:
         topo = get_tpu_topology(variant)
     except ValueError:
-        # Unknown topology — nothing to validate.
-        return
+        return replicas
 
     if topo.vm_count <= 1:
-        return
+        return replicas
+
+    if replicas == 1:
+        return topo.vm_count
 
     if replicas % topo.vm_count != 0:
         raise ValueError(
@@ -985,6 +1092,8 @@ def validate_tpu_replicas(device: "cluster_pb2.DeviceConfig | None", replicas: i
             f"For a single slice, use replicas={topo.vm_count}. "
             f"For N slices, use replicas=N*{topo.vm_count}."
         )
+
+    return replicas
 
 
 class Entrypoint:

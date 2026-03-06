@@ -16,11 +16,11 @@ from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 
 from iris.cluster.platform.base import Labels, Platform, SliceHandle
+from iris.cluster.constraints import WellKnownAttribute
 from iris.cluster.types import (
     DeviceType,
-    REGION_ATTRIBUTE_KEY,
+    NormalizedConstraints,
     VmWorkerStatusMap,
-    ZONE_ATTRIBUTE_KEY,
     get_gpu_count,
     get_tpu_count,
 )
@@ -118,8 +118,10 @@ def prepare_slice_config(
     """Build a SliceConfig for platform.create_slice() from a template.
 
     Copies the template and sets the name_prefix and managed/scale-group labels.
-    Propagates accelerator_type, accelerator_variant, num_vms, and resource
-    fields from the parent ScaleGroupConfig when the template doesn't set them.
+    Propagates num_vms from the parent ScaleGroupConfig when the template
+    doesn't set it. accelerator_type, accelerator_variant, preemptible,
+    gpu_count, and disk_size_gb are already derived from resources onto the
+    template by _derive_slice_config_from_resources() during config loading.
     """
     labels = Labels(label_prefix)
     config = config_pb2.SliceConfig()
@@ -130,17 +132,6 @@ def prepare_slice_config(
 
     if not config.num_vms and parent_config.HasField("num_vms"):
         config.num_vms = parent_config.num_vms
-
-    if not config.accelerator_type and parent_config.accelerator_type:
-        config.accelerator_type = parent_config.accelerator_type
-    if not config.accelerator_variant and parent_config.accelerator_variant:
-        config.accelerator_variant = parent_config.accelerator_variant
-
-    if parent_config.HasField("resources"):
-        config.gpu_count = parent_config.resources.gpu_count
-        disk_bytes = parent_config.resources.disk_bytes
-        if disk_bytes:
-            config.disk_size_gb = disk_bytes // (1024**3)
 
     return config
 
@@ -304,7 +295,7 @@ class ScalingGroup:
     def region(self) -> str | None:
         """Region derived from worker attributes or slice template."""
         if self._config.HasField("worker"):
-            region = self._config.worker.attributes.get(REGION_ATTRIBUTE_KEY, "").strip()
+            region = self._config.worker.attributes.get(WellKnownAttribute.REGION, "").strip()
             if region:
                 return region
         template = self._config.slice_template
@@ -318,7 +309,7 @@ class ScalingGroup:
     def zone(self) -> str | None:
         """Zone derived from worker attributes or slice template."""
         if self._config.HasField("worker"):
-            zone = self._config.worker.attributes.get(ZONE_ATTRIBUTE_KEY, "").strip()
+            zone = self._config.worker.attributes.get(WellKnownAttribute.ZONE, "").strip()
             if zone:
                 return zone
         template = self._config.slice_template
@@ -533,13 +524,9 @@ class ScalingGroup:
             have_gb = sg_resources.disk_bytes / (1024**3)
             return f"disk: need {need_gb:.1f}GB, group '{self.name}' has {have_gb:.1f}GB"
 
-        gpu_count = get_gpu_count(resources.device)
-        if gpu_count > sg_resources.gpu_count:
-            return f"gpu: need {gpu_count}, group '{self.name}' has {sg_resources.gpu_count}"
-
-        tpu_count = get_tpu_count(resources.device)
-        if tpu_count > sg_resources.tpu_count:
-            return f"tpu: need {tpu_count}, group '{self.name}' has {sg_resources.tpu_count}"
+        device_count = get_gpu_count(resources.device) + get_tpu_count(resources.device)
+        if device_count > sg_resources.device_count:
+            return f"device: need {device_count}, group '{self.name}' has {sg_resources.device_count}"
 
         return None
 
@@ -773,30 +760,49 @@ class ScalingGroup:
                 counts[state.lifecycle] += 1
         return counts
 
-    def matches_device_requirement(self, device_type: DeviceType, device_variant: str | None) -> bool:
+    def matches_device_requirement(self, device_type: DeviceType, device_variants: frozenset[str] | None) -> bool:
         """Check if this group can satisfy the given device requirements.
 
         Matching rules:
         - CPU demand: matches ANY group (all VMs have CPUs)
-        - GPU/TPU with variant=None: matches any group of the same device type
-        - GPU/TPU with specific variant: requires exact variant match
+        - GPU/TPU with device_variants=None: matches any group of the same device type
+        - GPU/TPU with specific variants: group variant must be in the set (case-insensitive)
         """
         if device_type == DeviceType.CPU:
             return True  # CPU jobs can run on ANY group
 
-        # Check device type matches
         group_type = self._get_device_type()
         if group_type != device_type:
             return False
 
-        # None variant = any group of this type; specific variant = case-insensitive match
-        if device_variant is None:
+        if device_variants is None:
             return True
-        return self._config.accelerator_variant.lower() == device_variant.lower()
+        group_variant = self._config.resources.device_variant if self._config.HasField("resources") else ""
+        return group_variant.lower() in {v.lower() for v in device_variants}
+
+    def matches_demand(self, normalized: NormalizedConstraints) -> bool:
+        """Check if this group satisfies the given normalized constraints.
+
+        Combines device type/variant matching with preemptible preference
+        and region/zone filtering. Does NOT check resource capacity or
+        accept-demand readiness.
+        """
+        device_type = normalized.device_type or DeviceType.CPU
+        if not self.matches_device_requirement(device_type, normalized.device_variants):
+            return False
+        if normalized.preemptible is not None and self.config.resources.preemptible != normalized.preemptible:
+            return False
+        if normalized.required_regions and self.region not in normalized.required_regions:
+            return False
+        if normalized.required_zones and self.zone not in normalized.required_zones:
+            return False
+        return True
 
     def _get_device_type(self) -> DeviceType:
-        """Get device type from config."""
-        accel = self._config.accelerator_type
+        """Get device type from resources."""
+        if not self._config.HasField("resources"):
+            return DeviceType.CPU
+        accel = self._config.resources.device_type
         if accel == config_pb2.ACCELERATOR_TYPE_GPU:
             return DeviceType.GPU
         elif accel == config_pb2.ACCELERATOR_TYPE_TPU:

@@ -60,6 +60,7 @@ import click
 import fsspec
 from iris.client import IrisClient
 from iris.cluster.config import load_config
+from iris.cluster.constraints import WellKnownAttribute
 from iris.cluster.types import (
     Constraint,
     CoschedulingConfig,
@@ -67,6 +68,7 @@ from iris.cluster.types import (
     EnvironmentSpec,
     ReservationEntry,
     ResourceSpec,
+    device_variant_constraint,
     gpu_device,
     preemptible_constraint,
     region_constraint,
@@ -155,7 +157,8 @@ def detect_accelerator(config_path: Path) -> AcceleratorConfig:
     for _name, sg in config.scale_groups.items():
         if sg.HasField("max_slices") and sg.max_slices <= 0:
             continue
-        if sg.accelerator_type not in (config_pb2.ACCELERATOR_TYPE_GPU, config_pb2.ACCELERATOR_TYPE_TPU):
+        resources = sg.resources
+        if resources.device_type not in (config_pb2.ACCELERATOR_TYPE_GPU, config_pb2.ACCELERATOR_TYPE_TPU):
             continue
 
         template = sg.slice_template
@@ -167,19 +170,19 @@ def detect_accelerator(config_path: Path) -> AcceleratorConfig:
         elif platform == "gcp" and template.gcp.zone:
             region = template.gcp.zone.rsplit("-", 1)[0]
 
-        if sg.accelerator_type == config_pb2.ACCELERATOR_TYPE_GPU:
+        if resources.device_type == config_pb2.ACCELERATOR_TYPE_GPU:
             return AcceleratorConfig(
                 device_type="gpu",
-                variant=sg.accelerator_variant,
-                count=sg.resources.gpu_count or 1,
+                variant=resources.device_variant,
+                count=resources.device_count or 1,
                 num_vms=sg.num_vms,
                 region=region,
             )
 
         return AcceleratorConfig(
             device_type="tpu",
-            variant=sg.accelerator_variant,
-            count=sg.resources.tpu_count,
+            variant=resources.device_variant,
+            count=resources.device_count,
             num_vms=sg.num_vms,
             region=region,
         )
@@ -410,12 +413,12 @@ def _assert_region_child(expected_region: str):
 
     def _child_check_region():
         from iris.cluster.client import get_job_info
-        from iris.cluster.types import REGION_ATTRIBUTE_KEY as RK
+        from iris.cluster.constraints import WellKnownAttribute as _WKA
 
         info = get_job_info()
         if info is None:
             raise RuntimeError("Not running in an Iris job context")
-        region_constraints = [c for c in info.constraints if c.key == RK]
+        region_constraints = [c for c in info.constraints if c.key == _WKA.REGION]
         if not region_constraints:
             raise RuntimeError(f"No region constraint found. constraints={info.constraints}")
         actual = region_constraints[0].value
@@ -964,6 +967,9 @@ class SmokeTestRunner:
 
         tests.append(SmokeTestCase(f"Reserved job ({a.label()})", self._run_reserved_job))
 
+        if a.is_tpu:
+            tests.append(SmokeTestCase(f"Flexible device variant ({a.variant})", self._run_flexible_device_variant_job))
+
         return tests
 
     def _run_test_cases_parallel(self, controller_url: str, tests: list[SmokeTestCase]) -> None:
@@ -1002,7 +1008,7 @@ class SmokeTestRunner:
         for sg in self._cluster_config.scale_groups.values():
             if sg.HasField("max_slices") and sg.max_slices <= 0:
                 continue
-            if sg.accelerator_type != config_pb2.ACCELERATOR_TYPE_CPU:
+            if sg.resources.device_type != config_pb2.ACCELERATOR_TYPE_CPU:
                 continue
             if sg.slice_template.preemptible:
                 continue
@@ -1107,7 +1113,7 @@ class SmokeTestRunner:
             entrypoint=Entrypoint.from_callable(_distributed_work_job),
             job_name=f"smoke-coscheduled-{self._run_id}",
             resources=ResourceSpec(device=self._accel.make_device()),
-            coscheduling=CoschedulingConfig(group_by="tpu-name"),
+            coscheduling=CoschedulingConfig(group_by=WellKnownAttribute.TPU_NAME),
             replicas=self._accel.num_vms,
         )
 
@@ -1124,7 +1130,7 @@ class SmokeTestRunner:
             job_name=f"smoke-jax-tpu-{self._run_id}",
             resources=ResourceSpec(device=self._accel.make_device()),
             environment=EnvironmentSpec(pip_packages=["jax[tpu]"]),
-            coscheduling=CoschedulingConfig(group_by="tpu-name"),
+            coscheduling=CoschedulingConfig(group_by=WellKnownAttribute.TPU_NAME),
             replicas=self._accel.num_vms,
         )
 
@@ -1183,6 +1189,23 @@ class SmokeTestRunner:
             job_name=f"smoke-non-preemptible-cpu-{self._run_id}",
             resources=ResourceSpec(cpu=1, memory="1GB", disk="1GB"),
             constraints=[preemptible_constraint(False)],
+        )
+
+    def _run_flexible_device_variant_job(self, client: IrisClient) -> TestResult:
+        """Run a job requesting either the real TPU variant or a non-existent one.
+
+        The constraint lists the cluster's actual variant alongside a fake variant
+        ("v0-fake-8"). The autoscaler should route the job to the real group since
+        no scale group matches the fake variant.
+        """
+        a = self._accel
+        return self._run_job_test(
+            client=client,
+            test_name=f"Flexible device variant ({a.variant} + v0-fake-8)",
+            entrypoint=Entrypoint.from_callable(_hello_job),
+            job_name=f"smoke-flexible-variant-{self._run_id}",
+            resources=ResourceSpec(device=a.make_device()),
+            constraints=[device_variant_constraint([a.variant, "v0-fake-8"])],
         )
 
     # ----- Diagnostics and cleanup -----

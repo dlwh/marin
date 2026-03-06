@@ -95,13 +95,17 @@ def convert_resources(resources: ResourceConfig) -> ResourceSpec:
 
 def convert_constraints(resources: ResourceConfig) -> list[Constraint]:
     """Build Iris scheduling constraints from fray v2 ResourceConfig."""
-    from iris.cluster.types import preemptible_constraint, region_constraint
+    from iris.cluster.types import device_variant_constraint, preemptible_constraint, region_constraint
 
     constraints: list[Constraint] = []
     if not resources.preemptible:
         constraints.append(preemptible_constraint(False))
     if resources.regions:
         constraints.append(region_constraint(resources.regions))
+    if resources.device_alternatives:
+        if isinstance(resources.device, (TpuConfig, GpuConfig)):
+            all_variants = [resources.device.variant, *resources.device_alternatives]
+            constraints.append(device_variant_constraint(all_variants))
     return constraints
 
 

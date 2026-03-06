@@ -332,6 +332,7 @@ class ResourceConfig:
     preemptible: bool = True
     regions: Sequence[str] | None = None
     replicas: int = 1
+    device_alternatives: Sequence[str] | None = None
 
     def chip_count(self) -> int:
         """Total accelerator chips across all replicas."""
@@ -364,6 +365,29 @@ class ResourceConfig:
     @staticmethod
     def with_cpu(**kwargs: Any) -> ResourceConfig:
         return ResourceConfig(device=CpuConfig(), **kwargs)
+
+    @staticmethod
+    def with_tpu_flexible(tpu_types: Sequence[str], *, slice_count: int = 1, **kwargs: Any) -> ResourceConfig:
+        """Create a resource config that accepts any of the given TPU types.
+
+        The first type is canonical (used for chip_count, env_vars, resource sizing).
+        All types must have the same vm_count so replicas are consistent across alternatives.
+        """
+        if not tpu_types:
+            raise ValueError("tpu_types must be non-empty")
+        vm_counts = {t: get_tpu_topology(t).vm_count for t in tpu_types}
+        if len(set(vm_counts.values())) != 1:
+            raise ValueError(f"All TPU types must have the same vm_count for flexible scheduling. Got: {vm_counts}")
+        primary = tpu_types[0]
+        alternatives = list(tpu_types[1:]) or None
+        device = TpuConfig(variant=primary)
+        topo = get_tpu_topology(primary)
+        replicas = slice_count * topo.vm_count
+        kwargs = dict(kwargs)
+        kwargs.setdefault("cpu", 32)
+        kwargs.setdefault("ram", "128g")
+        kwargs.setdefault("disk", "50g")
+        return ResourceConfig(device=device, replicas=replicas, device_alternatives=alternatives, **kwargs)
 
 
 @dataclass

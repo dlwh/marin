@@ -25,6 +25,7 @@ from enum import Enum
 from threading import RLock
 from typing import NamedTuple
 
+from iris.cluster.constraints import WellKnownAttribute
 from iris.cluster.controller.logs import ControllerLogStore
 from iris.cluster.controller.events import (
     Event,
@@ -809,12 +810,27 @@ class ControllerWorker:
 
     @property
     def device_type(self) -> str:
-        """Device type from worker metadata."""
+        """Device type string from worker attributes.
+
+        Prefers the attribute value (set from config via _build_worker_attributes)
+        over the legacy metadata.device field. Falls back to metadata for workers
+        that haven't been updated yet.
+        """
+        attr = self.attributes.get(WellKnownAttribute.DEVICE_TYPE)
+        if attr is not None:
+            return str(attr.value)
         return get_device_type(self.metadata.device)
 
     @property
     def device_variant(self) -> str | None:
-        """Device variant from worker metadata."""
+        """Device variant string from worker attributes.
+
+        Prefers the attribute value (set from config via _build_worker_attributes)
+        over the legacy metadata.device field.
+        """
+        attr = self.attributes.get(WellKnownAttribute.DEVICE_VARIANT)
+        if attr is not None:
+            return str(attr.value)
         return get_device_variant(self.metadata.device)
 
 
