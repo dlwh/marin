@@ -1935,6 +1935,13 @@ class ControllerState:
             running = []
             for tid in worker.running_tasks:
                 task = self._tasks.get(tid)
+                # Skip holder tasks — they are virtual (never dispatched to the
+                # worker), so including them in expected_tasks would cause the
+                # worker to report "not found" and trigger a worker_failed loop.
+                if task:
+                    job = self._jobs.get(task.job_id)
+                    if job and job.is_reservation_holder:
+                        continue
                 running.append(RunningTaskEntry(tid, task.current_attempt_id if task else 0))
             return HeartbeatSnapshot(
                 worker_id=worker.worker_id,

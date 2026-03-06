@@ -2659,6 +2659,37 @@ def test_holder_tasks_excluded_from_building_counts():
     assert building_counts.get(wid, 0) == 0
 
 
+def test_holder_tasks_excluded_from_heartbeat_expected_tasks():
+    """Holder tasks must not appear in heartbeat expected_tasks.
+
+    Holder tasks are virtual — never dispatched to the worker. If included
+    in expected_tasks the worker reports "Task not found on worker", causing
+    a worker_failed → retry loop (GH-3178).
+    """
+    state = ControllerState()
+
+    req = _make_reservation_job_request(
+        task_device=_h100_device(),
+        reservation_devices=[_h100_device()],
+        replicas=1,
+    )
+    submit_job(state, "j1", req)
+
+    wid = register_worker(state, "w1", "10.0.0.1:8080", _gpu_worker_metadata())
+    holder_job_id = JobName.root("test-user", "j1").child(":reservation:")
+    holder_tasks = state.get_job_tasks(holder_job_id)
+    assert len(holder_tasks) == 1
+
+    # Assign holder task to worker
+    state.handle_event(TaskAssignedEvent(task_id=holder_tasks[0].task_id, worker_id=wid))
+
+    # Heartbeat snapshot must NOT include the holder task
+    snapshot = state.begin_heartbeat(wid)
+    assert snapshot is not None
+    running_task_ids = {entry.task_id for entry in snapshot.running_tasks}
+    assert holder_tasks[0].task_id not in running_task_ids
+
+
 def test_snapshot_round_trip_preserves_reservation_holder():
     """Snapshot save/restore round-trip preserves is_reservation_holder flag."""
     from iris.cluster.controller.snapshot import create_snapshot, restore_snapshot

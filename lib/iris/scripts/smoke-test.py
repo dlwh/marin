@@ -796,7 +796,8 @@ class SmokeTestRunner:
         should still establish a dashboard tunnel.
         """
         # build and push images first
-        _run_iris(["build", "all", "--push"])
+        if not self.config.local:
+            _run_iris("build", "all", "--push", config_path=self.config.config_path)
 
         args = ["cluster", "start"]
         if self.config.local:
