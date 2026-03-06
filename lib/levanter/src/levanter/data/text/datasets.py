@@ -56,7 +56,9 @@ from levanter.compat.hf_checkpoints import load_tokenizer
 from levanter.utils.logging import silence_transformer_nag
 
 if TYPE_CHECKING:
-    from haliax import Axis
+    import haliax as hax
+
+    Axis = hax.Axis
 else:
     Axis = Any
 

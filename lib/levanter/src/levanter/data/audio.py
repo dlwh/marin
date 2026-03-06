@@ -50,7 +50,7 @@ from transformers import (  # noqa
 logger = logging.getLogger("levanter.data.audio")
 
 if TYPE_CHECKING:
-    from haliax import Axis
+    Axis = hax.Axis
 else:
     Axis = Any
 

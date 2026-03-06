@@ -32,7 +32,7 @@ from .formats import ChatProcessor, LmDatasetFormatBase
 logger = logging.getLogger("levanter.data.text.preference")
 
 if TYPE_CHECKING:
-    from haliax import Axis
+    Axis = hax.Axis
 else:
     Axis = Any
 

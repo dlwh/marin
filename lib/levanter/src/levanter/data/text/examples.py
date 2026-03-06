@@ -18,7 +18,7 @@ from levanter.models.lm_model import LmExample
 from levanter.utils.partitioning import axis, batch_axis as make_batch_axis
 
 if TYPE_CHECKING:
-    from haliax import Axis
+    Axis = hax.Axis
 else:
     Axis = Any
 
