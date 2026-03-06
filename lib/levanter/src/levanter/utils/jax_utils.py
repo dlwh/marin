@@ -27,7 +27,7 @@ from levanter.utils.mesh import (
     create_mesh_from_axis_specs,
     get_active_mesh,
 )
-from levanter.utils.partitioning import current_thread_local_mapping, pspec_for, shard
+from levanter.utils.partitioning import pspec_for, shard
 from levanter.utils.py_utils import index_where
 from levanter.utils.tree_utils import key_path_to_str, tree_flatten_one_level_with_keys
 from levanter.utils.types import ResourceMapping
@@ -626,7 +626,7 @@ def sharded_tree_size(
     Returns the size of a sharded tree, in bytes. If the tree is sharded, this returns the size of a per-device shard.
 
     If mesh is None, uses the current mesh.
-    If mapping is None, uses the current mapping.
+    If mapping is None, assumes no axis mapping.
 
     For named arrays, this uses the provided mesh and mapping to determine the sharding.
     For real jax.Arrays, uses their existing sharding.
@@ -641,7 +641,7 @@ def sharded_tree_size(
         mesh = jax.sharding.get_abstract_mesh()
 
     if mapping is None:
-        mapping = current_thread_local_mapping()
+        mapping = {}
 
     def _mesh_axis_size(axis_name) -> int:
         if mesh is None:
