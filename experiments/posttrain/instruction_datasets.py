@@ -686,6 +686,87 @@ INSTRUCTION_DATASET_NAME_TO_CONFIG = {
         name="marin-community/open-thoughts-4-30k-math-qwq-32b-annotated-32768-tokens",
         max_parallelism=32,
     ),
+    "marin-community/open-thoughts-4-30k-math-qwen3-4b-annotated-32768-tokens": InstructionDatasetConfig(
+        hf_dataset_id="marin-community/open-thoughts-4-30k-math-qwen3-4b-annotated-32768-tokens",
+        revision="0c6336a",
+        adapter=instruction_response_adapter(
+            instruction_column="instruction_seed",
+            response_column="generated_text",
+        ),
+        metadata_columns=["_source", "__original_row_idx", "ms_id"],
+        name="marin-community/open-thoughts-4-30k-math-qwen3-4b-annotated-32768-tokens",
+        max_parallelism=32,
+    ),
+    "marin-community/open-thoughts-4-30k-math-qwen3-4b-annotated-32768-tokens-n8-reformatted": InstructionDatasetConfig(
+        hf_dataset_id="marin-community/open-thoughts-4-30k-math-qwen3-4b-annotated-32768-tokens-n8-reformatted",
+        revision="b992e4a",
+        adapter=instruction_response_adapter(
+            instruction_column="instruction_seed",
+            response_column="generated_text",
+        ),
+        metadata_columns=["_source", "__original_row_idx", "ms_id"],
+        name="marin-community/open-thoughts-4-30k-math-qwen3-4b-annotated-32768-tokens-n8-reformatted",
+        max_parallelism=32,
+    ),
+    # Rejection sampling filtered subsets of the Qwen3-4B n8 dataset, using Qwen3-32B answers as ground truth:
+    # Approach 1: 1 sample per prompt, preferring the one matching Qwen3-32B (29963 rows)
+    "marin-community/open-thoughts-4-30k-math-qwen3-4b-annotated-32768-tokens-n1-rejection-sampling-quantity-match": InstructionDatasetConfig(
+        hf_dataset_id="marin-community/open-thoughts-4-30k-math-qwen3-4b-annotated-32768-tokens-n1-rejection-sampling-quantity-match",
+        revision="3cf26ce",
+        adapter=instruction_response_adapter(
+            instruction_column="instruction_seed",
+            response_column="generated_text",
+        ),
+        metadata_columns=["_source", "__original_row_idx", "ms_id"],
+        name="marin-community/open-thoughts-4-30k-math-qwen3-4b-annotated-32768-tokens-n1-rejection-sampling-quantity-match",
+        max_parallelism=32,
+    ),
+    # Approach 2: Keep only samples matching Qwen3-32B, discard prompts with no match (90946 rows)
+    "marin-community/open-thoughts-4-30k-math-qwen3-4b-annotated-32768-tokens-n8-rejection-sampling-strict-match": InstructionDatasetConfig(
+        hf_dataset_id="marin-community/open-thoughts-4-30k-math-qwen3-4b-annotated-32768-tokens-n8-rejection-sampling-strict-match",
+        revision="81868c6",
+        adapter=instruction_response_adapter(
+            instruction_column="instruction_seed",
+            response_column="generated_text",
+        ),
+        metadata_columns=["_source", "__original_row_idx", "ms_id"],
+        name="marin-community/open-thoughts-4-30k-math-qwen3-4b-annotated-32768-tokens-n8-rejection-sampling-strict-match",
+        max_parallelism=32,
+    ),
+    # Approach 3: Keep matching samples if any match; keep all 8 if no match or verifier N/A (187194 rows)
+    "marin-community/open-thoughts-4-30k-math-qwen3-4b-annotated-32768-tokens-n8-rejection-sampling-soft-match": InstructionDatasetConfig(
+        hf_dataset_id="marin-community/open-thoughts-4-30k-math-qwen3-4b-annotated-32768-tokens-n8-rejection-sampling-soft-match",
+        revision="1f21b77",
+        adapter=instruction_response_adapter(
+            instruction_column="instruction_seed",
+            response_column="generated_text",
+        ),
+        metadata_columns=["_source", "__original_row_idx", "ms_id"],
+        name="marin-community/open-thoughts-4-30k-math-qwen3-4b-annotated-32768-tokens-n8-rejection-sampling-soft-match",
+        max_parallelism=32,
+    ),
+    "marin-community/open-thoughts-4-30k-math-qwen3-235b-a22b-annotated-32768-tokens": InstructionDatasetConfig(
+        hf_dataset_id="marin-community/open-thoughts-4-30k-math-qwen3-235b-a22b-annotated-32768-tokens",
+        revision="9cce111",
+        adapter=instruction_response_adapter(
+            instruction_column="instruction_seed",
+            response_column="qwen235b_generated_text",
+        ),
+        metadata_columns=["_source", "__original_row_idx", "ms_id"],
+        name="marin-community/open-thoughts-4-30k-math-qwen3-235b-a22b-annotated-32768-tokens",
+        max_parallelism=32,
+    ),
+    "marin-community/open-thoughts-4-30k-math-qwen3-32b-annotated-32768-tokens-n1-rejection-sampling-quantity-match": InstructionDatasetConfig(
+        hf_dataset_id="marin-community/open-thoughts-4-30k-math-qwen3-32b-annotated-32768-tokens-n1-rejection-sampling-quantity-match",
+        revision="91cc31a",
+        adapter=instruction_response_adapter(
+            instruction_column="instruction_seed",
+            response_column="generated_text",
+        ),
+        metadata_columns=["_source", "__original_row_idx", "ms_id"],
+        name="marin-community/open-thoughts-4-30k-math-qwen3-32b-annotated-32768-tokens-n1-rejection-sampling-quantity-match",
+        max_parallelism=32,
+    ),
     # nvidia/OpenMathReasoning - CoT split (Chain of Thought reasoning)
     "nvidia/OpenMathReasoning/cot": InstructionDatasetConfig(
         hf_dataset_id="nvidia/OpenMathReasoning",
