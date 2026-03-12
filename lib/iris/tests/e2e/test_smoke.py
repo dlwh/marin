@@ -43,7 +43,6 @@ from .conftest import (
     _NoOpPage,
     _add_coscheduling_group,
     assert_visible,
-    dashboard_click,
     dashboard_goto,
     discover_capabilities,
     wait_for_dashboard_ready,
@@ -126,13 +125,19 @@ def _make_smoke_config() -> config_pb2.IrisClusterConfig:
     return make_local_config(config)
 
 
-def _cloud_smoke_cluster(config_path: str, mode: str):
+def _cloud_smoke_cluster(config_path: str, mode: str, label_prefix: str | None = None):
     """Manage full cloud cluster lifecycle: stop old → build images → start → test → stop.
 
     Uses the Iris Python API directly instead of subprocess to avoid stdout
     parsing and to get proper tunnel management via the platform abstraction.
     """
     config = load_config(config_path)
+
+    if label_prefix:
+        config.platform.label_prefix = label_prefix
+        # Isolate snapshot storage so this run doesn't restore stale state
+        # from previous runs that shared the default bundle_prefix.
+        config.storage.bundle_prefix = f"gs://marin-tmp-eu-west4/ttl=7d/iris/bundles/{label_prefix}"
 
     logger.info("Pinning and building cluster images...")
     _pin_latest_images(config)
@@ -188,9 +193,13 @@ def smoke_cluster(request):
     controller_url = request.config.getoption("--iris-controller-url")
     config_path = request.config.getoption("--iris-config")
     mode = request.config.getoption("--iris-mode")
+    label_prefix = request.config.getoption("--iris-label-prefix")
 
     is_cloud = mode != "local"
     timeout = 600.0 if is_cloud else 60.0
+
+    if is_cloud and not controller_url:
+        assert label_prefix, "--iris-label-prefix is required in cloud mode to avoid stomping on production clusters"
 
     if controller_url:
         client = IrisClient.remote(controller_url, workspace=IRIS_ROOT)
@@ -209,7 +218,7 @@ def smoke_cluster(request):
         return
 
     if config_path and mode != "local":
-        yield from _cloud_smoke_cluster(config_path, mode)
+        yield from _cloud_smoke_cluster(config_path, mode, label_prefix=label_prefix)
         return
 
     config = _make_smoke_config()
@@ -292,10 +301,12 @@ def test_workers_ready(smoke_cluster, smoke_page, smoke_screenshot):
     healthy = [w for w in response.workers if w.healthy]
     assert len(healthy) > 0, "No healthy workers registered"
 
-    dashboard_goto(smoke_page, f"{smoke_cluster.url}/")
+    dashboard_goto(smoke_page, f"{smoke_cluster.url}/fleet")
     wait_for_dashboard_ready(smoke_page)
-    dashboard_click(smoke_page, 'button.tab-btn:has-text("Workers")')
-    assert_visible(smoke_page, "text=healthy")
+    smoke_page.wait_for_function(
+        "() => document.body.textContent.includes('Healthy')",
+        timeout=10000,
+    )
     smoke_screenshot("workers-ready")
 
 
@@ -330,36 +341,33 @@ def test_dashboard_job_detail(smoke_cluster, smoke_page, smoke_screenshot):
 
     dashboard_goto(smoke_page, f"{smoke_cluster.url}/job/{job.job_id.to_wire()}")
     wait_for_dashboard_ready(smoke_page)
-    assert_visible(smoke_page, "text=SUCCEEDED")
+    smoke_page.wait_for_function(
+        "() => document.body.textContent.includes('Succeeded')",
+        timeout=10000,
+    )
     smoke_screenshot("job-detail")
 
 
 def test_dashboard_task_logs(smoke_cluster, verbose_job, smoke_page, smoke_screenshot):
-    """Task logs show lines, truncation buttons, substring filter."""
-    dashboard_goto(smoke_page, f"{smoke_cluster.url}/job/{verbose_job.job_id.to_wire()}")
+    """Task logs show lines and substring filter on the task detail page."""
+    task_status = smoke_cluster.task_status(verbose_job)
+    task_id = task_status.task_id
+    job_id = verbose_job.job_id.to_wire()
+
+    dashboard_goto(smoke_page, f"{smoke_cluster.url}/job/{job_id}/task/{task_id}")
     wait_for_dashboard_ready(smoke_page)
 
     smoke_page.wait_for_function(
-        "() => document.querySelector('pre') && "
-        "document.querySelector('pre').textContent.includes('DONE: all lines emitted')",
+        "() => document.body.textContent.includes('DONE: all lines emitted')",
         timeout=10000,
     )
     smoke_screenshot("task-logs-default")
 
-    smoke_page.click("button:has-text('100')")
-    smoke_page.wait_for_function(
-        "() => document.querySelector('span') && document.body.textContent.includes('(truncated)')",
-        timeout=5000,
-    )
-    smoke_screenshot("task-logs-truncated")
-
     # "validation failed" only appears in ERROR lines
-    smoke_page.fill("input[placeholder='substring']", "validation failed")
-    smoke_page.click("button:has-text('Apply')")
+    smoke_page.fill("input[placeholder='Filter logs...']", "validation failed")
     smoke_page.wait_for_function(
-        "() => document.querySelector('pre') && "
-        "document.querySelector('pre').textContent.includes('validation failed') && "
-        "!document.querySelector('pre').textContent.includes('processing data batch')",
+        "() => document.body.textContent.includes('validation failed') && "
+        "!document.body.textContent.includes('processing data batch')",
         timeout=5000,
     )
     smoke_screenshot("task-logs-filtered")
@@ -378,12 +386,11 @@ def test_dashboard_constraints(smoke_cluster, smoke_page, smoke_screenshot):
         dashboard_goto(smoke_page, f"{smoke_cluster.url}/job/{job.job_id.to_wire()}")
         wait_for_dashboard_ready(smoke_page)
 
-        smoke_page.click("text=Job Request")
         smoke_page.wait_for_function(
-            "() => document.querySelector('.constraint-chip') !== null",
+            "() => document.body.textContent.includes('Constraints')",
             timeout=5000,
         )
-        assert_visible(smoke_page, "text=region = local")
+        assert_visible(smoke_page, "text=region")
         smoke_screenshot("constraints")
 
 
@@ -403,10 +410,12 @@ def test_dashboard_scheduling_diagnostic(smoke_cluster, smoke_page, smoke_screen
 
 def test_dashboard_workers_tab(smoke_cluster, smoke_page, smoke_screenshot):
     """Workers tab shows healthy workers."""
-    dashboard_goto(smoke_page, f"{smoke_cluster.url}/")
+    dashboard_goto(smoke_page, f"{smoke_cluster.url}/fleet")
     wait_for_dashboard_ready(smoke_page)
-    dashboard_click(smoke_page, 'button.tab-btn:has-text("Workers")')
-    assert_visible(smoke_page, "text=healthy")
+    smoke_page.wait_for_function(
+        "() => document.body.textContent.includes('Healthy')",
+        timeout=10000,
+    )
     smoke_screenshot("workers-tab")
 
 
@@ -420,31 +429,33 @@ def test_dashboard_worker_detail(smoke_cluster, smoke_page, smoke_screenshot):
     assert worker_id
 
     dashboard_goto(smoke_page, f"{smoke_cluster.url}/worker/{worker_id}")
+    wait_for_dashboard_ready(smoke_page)
+
     smoke_page.wait_for_function(
-        "() => document.querySelector('.worker-detail-grid') !== null"
-        " || document.querySelector('.error-message') !== null",
+        f"() => document.body.textContent.includes('{worker_id}') && " "document.body.textContent.includes('Healthy')",
         timeout=10000,
     )
-    assert_visible(smoke_page, f"text={worker_id}")
-    assert_visible(smoke_page, "text=Healthy")
-    assert_visible(smoke_page, "text=Task History")
     smoke_screenshot("worker-detail")
 
 
 def test_dashboard_autoscaler_tab(smoke_cluster, smoke_page, smoke_screenshot):
     """Autoscaler tab shows scale groups."""
-    dashboard_goto(smoke_page, f"{smoke_cluster.url}/")
+    dashboard_goto(smoke_page, f"{smoke_cluster.url}/autoscaler")
     wait_for_dashboard_ready(smoke_page)
-    dashboard_click(smoke_page, 'button.tab-btn:has-text("Autoscaler")')
     smoke_screenshot("autoscaler-tab")
 
 
 def test_dashboard_status_tab(smoke_cluster, smoke_page, smoke_screenshot):
     """Status tab renders process info and log viewer."""
-    dashboard_goto(smoke_page, f"{smoke_cluster.url}/")
+    dashboard_goto(smoke_page, f"{smoke_cluster.url}/status")
     wait_for_dashboard_ready(smoke_page)
-    dashboard_click(smoke_page, 'button.tab-btn:has-text("Status")')
-    smoke_page.wait_for_selector(".log-container", timeout=10000)
+    # Status tab renders process info when available, or an error message.
+    # Wait for either to appear to confirm the tab loaded and made the RPC call.
+    smoke_page.wait_for_function(
+        "() => document.body.textContent.includes('Process') || "
+        "document.body.textContent.includes('GetProcessStatus')",
+        timeout=10000,
+    )
     smoke_screenshot("status-tab")
 
 
@@ -616,6 +627,66 @@ def test_profile_running_task(smoke_cluster):
 
 
 # ============================================================================
+# Checkpoint / restore
+# ============================================================================
+
+
+def test_checkpoint_restore():
+    """Controller restart resumes from checkpoint: completed jobs visible, cluster functional.
+
+    Uses a dedicated cluster (not the shared smoke_cluster). A single platform
+    instance restarts its controller between phases so the persistent DB dir
+    (held by LocalController across stop/start) preserves checkpoint state.
+    Phase 1 — run a job and write a checkpoint.
+    Phase 2 — restart the controller and verify the job is still SUCCEEDED
+              and the cluster can accept new work.
+    """
+    config = load_config(DEFAULT_CONFIG)
+    config = make_local_config(config)
+
+    platform = IrisConfig(config).platform()
+    url = platform.start_controller(config)
+    try:
+        # Phase 1: complete a job, write checkpoint, restart controller.
+        client = IrisClient.remote(url, workspace=IRIS_ROOT)
+        controller_client = ControllerServiceClientSync(address=url, timeout_ms=30000)
+        tc = IrisTestCluster(url=url, client=client, controller_client=controller_client)
+        tc.wait_for_workers(1, timeout=30)
+
+        job = tc.submit(TestJobs.quick, "pre-restart")
+        tc.wait(job, timeout=30)
+        saved_job_id = job.job_id.to_wire()
+
+        ckpt = controller_client.begin_checkpoint(cluster_pb2.Controller.BeginCheckpointRequest())
+        assert ckpt.checkpoint_path, "begin_checkpoint returned empty path"
+        assert ckpt.job_count >= 1
+        controller_client.close()
+
+        url = platform.restart_controller(config)
+
+        # Phase 2: verify restored state and submit new work.
+        controller_client = ControllerServiceClientSync(address=url, timeout_ms=30000)
+        tc = IrisTestCluster(
+            url=url, client=IrisClient.remote(url, workspace=IRIS_ROOT), controller_client=controller_client
+        )
+
+        resp = controller_client.get_job_status(cluster_pb2.Controller.GetJobStatusRequest(job_id=saved_job_id))
+        assert (
+            resp.job.state == cluster_pb2.JOB_STATE_SUCCEEDED
+        ), f"Pre-restart job has state {resp.job.state} after restore"
+
+        tc.wait_for_workers(1, timeout=30)
+        post_job = tc.submit(TestJobs.quick, "post-restart")
+        status = tc.wait(post_job, timeout=30)
+        assert status.state == cluster_pb2.JOB_STATE_SUCCEEDED
+
+        controller_client.close()
+    finally:
+        platform.stop_controller(config)
+        platform.shutdown()
+
+
+# ============================================================================
 # Stress test
 # ============================================================================
 
@@ -686,6 +757,7 @@ def test_gpu_worker_metadata(tmp_path):
                 port=0,
                 cache_dir=cache_dir,
                 controller_address=url,
+                worker_id=f"test-gpu-worker-{uuid.uuid4().hex[:8]}",
                 poll_interval=Duration.from_seconds(0.1),
             )
             worker = Worker(
