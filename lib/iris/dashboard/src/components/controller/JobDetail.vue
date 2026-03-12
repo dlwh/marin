@@ -15,6 +15,7 @@ import StatusBadge from '@/components/shared/StatusBadge.vue'
 import InfoCard from '@/components/shared/InfoCard.vue'
 import InfoRow from '@/components/shared/InfoRow.vue'
 import EmptyState from '@/components/shared/EmptyState.vue'
+import LogViewer from '@/components/shared/LogViewer.vue'
 
 const props = defineProps<{
   jobId: string
@@ -374,21 +375,21 @@ async function handleProfile(taskId: string, profilerType: string, format: strin
                     :disabled="profilingTaskId === task.taskId"
                     @click="handleProfile(task.taskId, 'cpu', 'SPEEDSCOPE')"
                   >
-                    {{ profilingTaskId === task.taskId ? '\u23F3' : 'CPU' }}
+                    {{ profilingTaskId === task.taskId ? '⏳' : 'CPU' }}
                   </button>
                   <button
                     class="px-2 py-0.5 text-[11px] font-semibold rounded bg-status-success text-white hover:opacity-80 disabled:opacity-50"
                     :disabled="profilingTaskId === task.taskId"
                     @click="handleProfile(task.taskId, 'memory', 'FLAMEGRAPH')"
                   >
-                    {{ profilingTaskId === task.taskId ? '\u23F3' : 'MEM' }}
+                    {{ profilingTaskId === task.taskId ? '⏳' : 'MEM' }}
                   </button>
                   <button
                     class="px-2 py-0.5 text-[11px] font-semibold rounded bg-accent text-white hover:opacity-80 disabled:opacity-50"
                     :disabled="profilingTaskId === task.taskId"
                     @click="handleProfile(task.taskId, 'threads', null)"
                   >
-                    {{ profilingTaskId === task.taskId ? '\u23F3' : 'THR' }}
+                    {{ profilingTaskId === task.taskId ? '⏳' : 'THR' }}
                   </button>
                 </div>
                 <span v-else class="text-text-muted">&mdash;</span>
@@ -396,6 +397,14 @@ async function handleProfile(taskId: string, profilerType: string, format: strin
             </tr>
           </tbody>
         </table>
+      </div>
+
+      <!-- Job logs -->
+      <div class="mt-6 mb-6">
+        <h3 class="text-sm font-semibold uppercase tracking-wider text-text-secondary mb-3">
+          Job Logs
+        </h3>
+        <LogViewer :task-id="jobId" />
       </div>
     </template>
   </PageShell>
