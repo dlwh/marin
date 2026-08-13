@@ -9,7 +9,16 @@ import json
 from typing import Any
 
 import pytest
-from target1_abi10_h100_forward_contract import BACKEND_PAIRS, load_contract, validate_observation
+from target1_abi10_h100_forward_contract import (
+    BACKEND_PAIRS,
+    EMPTY_SHA256,
+    FINAL_MODULE_SHA256,
+    GENERATED_BUNDLE_SHA256,
+    TUNING_SHA256,
+    UNSUPPORTED_EMPTY_SHA256,
+    load_contract,
+    validate_observation,
+)
 
 REVISION = "b" * 40
 
@@ -23,14 +32,15 @@ def _canonical_digest(value: object) -> str:
 
 
 def _collector() -> dict[str, object]:
-    return {
+    value = {
         "schema_version": 1,
         "marin_revision": REVISION,
         "runner_binary_sha256": _digest("runner"),
         "harness_sha256": _digest("harness"),
         "build_manifest_sha256": _digest("build-manifest"),
-        "artifact_manifest_sha256": _digest("artifact-manifest"),
+        "artifact_manifest_sha256": "pending",
     }
+    return value
 
 
 def _te_execution_identity() -> dict[str, object]:
@@ -129,19 +139,28 @@ def _subject(*, shuttle: bool) -> dict[str, object]:
             "registration": "real_cuda_plugin_ffi_handlers_through_pjrt_passed",
             "observer": {
                 "invocation_id": 7,
+                "phase_invocation_ids": [7, 7, 7],
                 "phases": ["algebra_coverage", "generated_bundle", "final_erasure"],
                 "policy": "source_ordered",
                 "compiler_options_sha256": contract["compiler"]["canonical_options_sha256"],
-                "tuning_sha256": _digest("canonical-tuning"),
+                "tuning_sha256": TUNING_SHA256,
                 "complete_source_results": 20,
                 "excluded_source_results": 0,
                 "coverage_manifest_sha256": _digest("coverage-manifest"),
-                "phase_coverage_manifest_sha256": [_digest("coverage-manifest")] * 3,
-                "unsupported_fingerprint_sha256": _digest("unsupported-empty"),
+                "phase_coverage_manifest_sha256": [
+                    _digest("coverage-manifest"),
+                    _digest("coverage-manifest"),
+                    EMPTY_SHA256,
+                ],
+                "unsupported_fingerprint_sha256": [
+                    UNSUPPORTED_EMPTY_SHA256,
+                    UNSUPPORTED_EMPTY_SHA256,
+                    EMPTY_SHA256,
+                ],
                 "failure_pass": "",
                 "final_no_shuttle_semantics": True,
-                "final_module_sha256": _digest("final-module"),
-                "generated_bundle_artifact_sha256": _digest("generated-bundle"),
+                "final_module_sha256": FINAL_MODULE_SHA256,
+                "generated_bundle_artifact_sha256": GENERATED_BUNDLE_SHA256,
             },
             "custom_call": {
                 "target": "shuttle.gpu.executable_bundle.v1",
@@ -173,7 +192,7 @@ def _subject(*, shuttle: bool) -> dict[str, object]:
             },
             "cache": {
                 "compiler_options_sha256": contract["compiler"]["canonical_options_sha256"],
-                "generated_bundle_artifact_sha256": _digest("generated-bundle"),
+                "generated_bundle_artifact_sha256": GENERATED_BUNDLE_SHA256,
                 "populate_worker_id": _digest("populate-worker"),
                 "reuse_worker_id": _digest("reuse-worker"),
                 "populate_process_id": 101,
@@ -203,15 +222,20 @@ def _subject(*, shuttle: bool) -> dict[str, object]:
                 "populate_hits": 0,
                 "reuse_hits": 1,
                 "reuse_observer_events": [],
+                "cache_trace_artifact_sha256": "pending",
             },
             "direct_and_jax_bitwise_equal": True,
         }
+        cache = value["architecture"]["cache"]
+        cache["cache_trace_artifact_sha256"] = _canonical_digest(
+            {key: item for key, item in cache.items() if key != "cache_trace_artifact_sha256"}
+        )
     return value
 
 
 def _valid_observation() -> dict[str, object]:
     contract = load_contract()
-    return {
+    observation = {
         "schema_version": 1,
         "contract_id": contract["contract_id"],
         "status": "sealed_untimed_hardware_observation",
@@ -239,17 +263,36 @@ def _valid_observation() -> dict[str, object]:
         "performance_status": "not_started",
         "scorecard_effect": contract["scorecard_effect"],
     }
+    collector = observation["collector"]
+    collector["artifact_manifest_sha256"] = _canonical_digest(
+        {
+            "collector": {key: value for key, value in collector.items() if key != "artifact_manifest_sha256"},
+            "te_result_artifacts": [result["result_artifact_sha256"] for result in observation["te_results"]],
+        }
+    )
+    return observation
 
 
 def _te_result(pair: tuple[str, str]) -> dict[str, object]:
     contract = load_contract()
     identity = _te_execution_identity()
-    return {
+    index = BACKEND_PAIRS.index(pair)
+    value = {
         "backend_pair": list(pair),
         "qualified_against_reference": True,
         "execution_identity_sha256": _canonical_digest(identity),
         "execution_identity": identity,
-        "result_artifact_sha256": _digest(f"te-result:{pair[0]}:{pair[1]}"),
+        "result_artifact_sha256": "pending",
+        "sealed_run": {
+            "plan_id": "shape_boundary_backend_alternating_v1",
+            "plan_sha256": _digest("te-run-plan"),
+            "position": index,
+            "result_path": f"result-{index:02d}.json",
+            "shape": [2048, 4096],
+            "boundary": "forward",
+            "forward_backend": pair[0],
+            "backward_backend": pair[1],
+        },
         "input_raw_sha256": {
             "x": contract["inputs"]["raw_sha256"][0],
             "gamma": contract["inputs"]["raw_sha256"][1],
@@ -257,6 +300,10 @@ def _te_result(pair: tuple[str, str]) -> dict[str, object]:
         "reference_output_array_digest": contract["reference"]["output_array_digest"],
         "output": _output(f"te-output:{pair[0]}:{pair[1]}"),
     }
+    value["result_artifact_sha256"] = _canonical_digest(
+        {key: item for key, item in value.items() if key != "result_artifact_sha256"}
+    )
+    return value
 
 
 def test_contract_accepts_only_complete_untimed_forward_evidence() -> None:
@@ -304,17 +351,20 @@ def test_contract_rejects_self_consistent_coordinate_and_type_drift(
         ("timing", "fields differ"),
         ("abi", "pipeline_abi_version"),
         ("missing_te", "all four"),
-        ("duplicate_te", "duplicate TE"),
+        ("duplicate_te", "sealed_run.forward_backend"),
         ("output_drift", "bitwise ordinary-JAX"),
         ("repeatability", "not bitwise repeatable"),
         ("observer", "phases"),
         ("observer_splice", "phase_coverage_manifest_sha256"),
+        ("observer_artifact", "generated_bundle_artifact_sha256"),
         ("collector", "runner_binary_sha256"),
         ("te_identity", "runner_binary_sha256"),
+        ("te_relabel", "sealed_run.position"),
         ("bundle", "temporary_bytes"),
-        ("cache", "reuse_hits"),
+        ("cache", "cache_trace_artifact_sha256"),
         ("cache_same_worker", "workers must be distinct"),
         ("cache_mutation", "reuse_after"),
+        ("cache_relabel", "cache_trace_artifact_sha256"),
         ("spill", "zero spill bytes"),
         ("reference", "independent-reference limit"),
         ("input_identity", "observation.inputs"),
@@ -342,12 +392,21 @@ def test_observation_rejects_acceptance_shortcuts(mutation: str, diagnostic: str
         observation["shuttle"]["architecture"]["observer"]["phases"].pop(1)
     elif mutation == "observer_splice":
         observation["shuttle"]["architecture"]["observer"]["phase_coverage_manifest_sha256"][1] = "c" * 64
+    elif mutation == "observer_artifact":
+        observer = observation["shuttle"]["architecture"]["observer"]
+        observer["generated_bundle_artifact_sha256"] = "c" * 64
+        observation["shuttle"]["architecture"]["cache"]["generated_bundle_artifact_sha256"] = "c" * 64
     elif mutation == "collector":
         observation["collector"]["runner_binary_sha256"] = "c" * 64
     elif mutation == "te_identity":
         identity = observation["te_results"][0]["execution_identity"]
         identity["runner_binary_sha256"] = "c" * 64
         observation["te_results"][0]["execution_identity_sha256"] = _canonical_digest(identity)
+    elif mutation == "te_relabel":
+        first = copy.deepcopy(observation["te_results"][0])
+        second_pair = BACKEND_PAIRS[1]
+        first["backend_pair"] = list(second_pair)
+        observation["te_results"][1] = first
     elif mutation == "bundle":
         observation["shuttle"]["architecture"]["bundle"]["temporary_bytes"] -= 1
     elif mutation == "cache":
@@ -357,6 +416,12 @@ def test_observation_rejects_acceptance_shortcuts(mutation: str, diagnostic: str
         cache["reuse_worker_id"] = cache["populate_worker_id"]
     elif mutation == "cache_mutation":
         observation["shuttle"]["architecture"]["cache"]["reuse_after"][0]["sha256"] = "c" * 64
+    elif mutation == "cache_relabel":
+        cache = observation["shuttle"]["architecture"]["cache"]
+        unrelated = {"key": "unrelated-cache-entry", "sha256": "e" * 64, "size": 1}
+        cache["populate_after"] = [unrelated]
+        cache["reuse_before"] = [unrelated]
+        cache["reuse_after"] = [unrelated]
     elif mutation == "spill":
         observation["shuttle"]["architecture"]["ptx"]["spill_bytes_per_slice"][3] = 4
     elif mutation == "reference":

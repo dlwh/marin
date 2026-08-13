@@ -45,6 +45,12 @@ INPUT_RAW_SHA256 = (
 )
 REFERENCE_OUTPUT_ARRAY_DIGEST = "fe18afac66306e065ebf824c52cc6d95776e49521ed6209e405b58e40c934bdd"
 TRANSFORMER_ENGINE_COMMIT = "2e559f062497bef768dfbe9d7e45548fadeca80a"
+TE_PLAN_ID = "shape_boundary_backend_alternating_v1"
+TUNING_SHA256 = "50db16cae6ad71d7d22f104f0477945ae0ec470957496b26904e17bdf0dcd7eb"
+EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
+UNSUPPORTED_EMPTY_SHA256 = hashlib.sha256(b"[]").hexdigest()
+GENERATED_BUNDLE_SHA256 = "910b4192a0fc9d04986ca941d1508ffb7352430526f615e30b242aadc3ae4bf7"
+FINAL_MODULE_SHA256 = "a7a977e017eb62dd277d2fe56db3dff3e2fff6ce6538e64d69821ed0dce23914"
 REFERENCE_LIMITS = {
     "max_absolute_error": 0.0078125,
     "mean_absolute_error": 0.0023046755673821195,
@@ -249,6 +255,16 @@ def validate_observation(document: object, contract: Mapping[str, Any] | None = 
                 raise AssertionError(f"Shuttle {metric} exceeds a matched TE forward result")
     if seen != set(BACKEND_PAIRS):
         raise ValueError("TE forward backend-pair set is incomplete")
+    _equal(
+        collector["artifact_manifest_sha256"],
+        _canonical_sha256(
+            {
+                "collector": {key: value for key, value in collector.items() if key != "artifact_manifest_sha256"},
+                "te_result_artifacts": [result["result_artifact_sha256"] for result in results],
+            }
+        ),
+        "collector.artifact_manifest_sha256",
+    )
     return root
 
 
@@ -321,6 +337,7 @@ def _architecture(value: object, contract: Mapping[str, Any]) -> dict[str, Any]:
         architecture["observer"],
         {
             "invocation_id",
+            "phase_invocation_ids",
             "phases",
             "policy",
             "compiler_options_sha256",
@@ -340,6 +357,11 @@ def _architecture(value: object, contract: Mapping[str, Any]) -> dict[str, Any]:
     if _integer(observer["invocation_id"], "shuttle.architecture.observer.invocation_id") == 0:
         raise ValueError("observer invocation id must be positive")
     _equal(
+        observer["phase_invocation_ids"],
+        [observer["invocation_id"]] * 3,
+        "shuttle.architecture.observer.phase_invocation_ids",
+    )
+    _equal(
         observer["phases"],
         ["algebra_coverage", "generated_bundle", "final_erasure"],
         "shuttle.architecture.observer.phases",
@@ -350,20 +372,28 @@ def _architecture(value: object, contract: Mapping[str, Any]) -> dict[str, Any]:
         contract["compiler"]["canonical_options_sha256"],
         "shuttle.architecture.observer.compiler_options_sha256",
     )
-    _sha(observer["tuning_sha256"], "shuttle.architecture.observer.tuning_sha256")
+    _equal(observer["tuning_sha256"], TUNING_SHA256, "shuttle.architecture.observer.tuning_sha256")
     _equal(observer["complete_source_results"], 20, "shuttle.architecture.observer.complete_source_results")
     _equal(observer["excluded_source_results"], 0, "shuttle.architecture.observer.excluded_source_results")
     coverage = _sha(observer["coverage_manifest_sha256"], "shuttle.architecture.observer.coverage_manifest_sha256")
     _equal(
         observer["phase_coverage_manifest_sha256"],
-        [coverage, coverage, coverage],
+        [coverage, coverage, EMPTY_SHA256],
         "shuttle.architecture.observer.phase_coverage_manifest_sha256",
     )
-    _sha(observer["unsupported_fingerprint_sha256"], "shuttle.architecture.observer.unsupported_fingerprint_sha256")
+    _equal(
+        observer["unsupported_fingerprint_sha256"],
+        [UNSUPPORTED_EMPTY_SHA256, UNSUPPORTED_EMPTY_SHA256, EMPTY_SHA256],
+        "shuttle.architecture.observer.unsupported_fingerprint_sha256",
+    )
     _equal(observer["failure_pass"], "", "shuttle.architecture.observer.failure_pass")
     _equal(observer["final_no_shuttle_semantics"], True, "shuttle.architecture.observer.final_no_shuttle_semantics")
-    _sha(observer["final_module_sha256"], "shuttle.architecture.observer.final_module_sha256")
-    _sha(observer["generated_bundle_artifact_sha256"], "shuttle.architecture.observer.generated_bundle_artifact_sha256")
+    _equal(observer["final_module_sha256"], FINAL_MODULE_SHA256, "shuttle.architecture.observer.final_module_sha256")
+    _equal(
+        observer["generated_bundle_artifact_sha256"],
+        GENERATED_BUNDLE_SHA256,
+        "shuttle.architecture.observer.generated_bundle_artifact_sha256",
+    )
     compiler = contract["compiler"]
     custom_call = _closed(
         architecture["custom_call"],
@@ -444,6 +474,7 @@ def _architecture(value: object, contract: Mapping[str, Any]) -> dict[str, Any]:
             "populate_after",
             "reuse_before",
             "reuse_after",
+            "cache_trace_artifact_sha256",
             "populate_hits",
             "reuse_hits",
             "reuse_observer_events",
@@ -478,6 +509,11 @@ def _architecture(value: object, contract: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("cache population must add exactly one entry")
     _equal(reuse_before, populate_after, "shuttle.architecture.cache.reuse_before")
     _equal(reuse_after, populate_after, "shuttle.architecture.cache.reuse_after")
+    _equal(
+        cache["cache_trace_artifact_sha256"],
+        _canonical_sha256({key: value for key, value in cache.items() if key != "cache_trace_artifact_sha256"}),
+        "shuttle.architecture.cache.cache_trace_artifact_sha256",
+    )
     _equal(cache["populate_hits"], 0, "shuttle.architecture.cache.populate_hits")
     _equal(cache["reuse_hits"], 1, "shuttle.architecture.cache.reuse_hits")
     _equal(cache["reuse_observer_events"], [], "shuttle.architecture.cache.reuse_observer_events")
@@ -501,6 +537,7 @@ def _te_result(
             "execution_identity_sha256",
             "execution_identity",
             "result_artifact_sha256",
+            "sealed_run",
             "input_raw_sha256",
             "reference_output_array_digest",
             "output",
@@ -517,7 +554,28 @@ def _te_result(
         _canonical_sha256(identity),
         f"{name}.execution_identity_sha256",
     )
-    _sha(result["result_artifact_sha256"], f"{name}.result_artifact_sha256")
+    sealed_run = _closed(
+        result["sealed_run"],
+        {
+            "plan_id",
+            "plan_sha256",
+            "position",
+            "result_path",
+            "shape",
+            "boundary",
+            "forward_backend",
+            "backward_backend",
+        },
+        f"{name}.sealed_run",
+    )
+    _equal(sealed_run["plan_id"], TE_PLAN_ID, f"{name}.sealed_run.plan_id")
+    _sha(sealed_run["plan_sha256"], f"{name}.sealed_run.plan_sha256")
+    _equal(sealed_run["position"], index, f"{name}.sealed_run.position")
+    _equal(sealed_run["result_path"], f"result-{index:02d}.json", f"{name}.sealed_run.result_path")
+    _equal(sealed_run["shape"], [2048, 4096], f"{name}.sealed_run.shape")
+    _equal(sealed_run["boundary"], "forward", f"{name}.sealed_run.boundary")
+    _equal(sealed_run["forward_backend"], pair[0], f"{name}.sealed_run.forward_backend")
+    _equal(sealed_run["backward_backend"], pair[1], f"{name}.sealed_run.backward_backend")
     _equal(
         result["input_raw_sha256"],
         {"x": INPUT_RAW_SHA256[0], "gamma": INPUT_RAW_SHA256[1]},
@@ -546,6 +604,11 @@ def _te_result(
         f"{name}.execution_identity.device.physical_sm_count",
     )
     _output(result["output"], f"{name}.output", contract)
+    _equal(
+        result["result_artifact_sha256"],
+        _canonical_sha256({key: value for key, value in result.items() if key != "result_artifact_sha256"}),
+        f"{name}.result_artifact_sha256",
+    )
     return result
 
 
