@@ -47,10 +47,10 @@
 // FORWARD-LARGE-COUNT-1: stablehlo.custom_call @shuttle.gpu.executable_bundle.v2
 // FORWARD-LARGE-SAME: api_version = 4 : i32
 // FORWARD-LARGE-SAME: backend_config = {bundle_bytes = "SHUTGPU\00
-// FORWARD-LARGE-SAME: bundle_schema_version = 3 : i64
-// FORWARD-LARGE-SAME: device_schema_version = 4 : i64
-// FORWARD-LARGE-SAME: invocation_abi_schema_version = 4 : i64
-// FORWARD-LARGE-SAME: transport_schema_version = 3 : i64
+// FORWARD-LARGE-SAME: bundle_schema_version = 2 : i64
+// FORWARD-LARGE-SAME: device_schema_version = 3 : i64
+// FORWARD-LARGE-SAME: invocation_abi_schema_version = 3 : i64
+// FORWARD-LARGE-SAME: transport_schema_version = 2 : i64
 // FORWARD-LARGE-SAME: operand_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<0> : tensor<1xindex>, dense<0> : tensor<1xindex>]
 // FORWARD-LARGE-SAME: result_layouts = [dense<[1, 0]> : tensor<2xindex>]
 // FORWARD-LARGE: return

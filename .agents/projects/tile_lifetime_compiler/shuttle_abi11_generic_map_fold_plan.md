@@ -72,13 +72,13 @@ handler.  General projection/count semantics therefore require:
 - pipeline ABI `10 -> 11`;
 - FFI target `shuttle.gpu.executable_bundle.v2`, with no v1 registration in the
   new pipeline;
-- a new invocation ABI schema if the external projection grammar changes;
-- a new device/code-format schema only if the encoded launch grammar or Fold
-  realization changes;
-- transport and bundle schemas remain unchanged only when their byte grammar is
-  byte-for-byte unchanged.
+- transport/device/invocation/bundle schemas remain `2/3/3/2`.  Their byte
+  grammar already carries variable entry, slot, dependency, projection, and
+  reuse-group records.  ABI 11 changes which structurally valid graphs the
+  compiler may emit and how the v2 handler consumes them, not the wire grammar.
 
-The exact schema decision must follow the red transport diff, not precede it.
+Any later wire-field addition requires a separate schema bump and decoder; ABI
+11 must not reinterpret an existing field.
 
 The frozen materialization graphs provide the initial resource boundary:
 
