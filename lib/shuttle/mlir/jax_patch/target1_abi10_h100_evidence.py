@@ -559,17 +559,41 @@ def validate_authorized_checkout(authorization: Authorization, repository: Path)
     """Require the verifier to run from the exact clean preauthorized source tree."""
     document = authorization.decoded()
     revision = _git(repository, "rev-parse", "HEAD")
-    tree = _git(repository, "rev-parse", "HEAD^{tree}")
-    _equal(revision, document["source"]["marin_commit"], "authorized Marin commit")
-    _equal(tree, document["source"]["marin_tree"], "authorized Marin tree")
+    base_revision = document["source"]["marin_commit"]
+    _equal(_git(repository, "rev-parse", f"{revision}~2"), base_revision, "authorization predecessor commit")
+    _equal(
+        _git(repository, "rev-parse", f"{base_revision}^{{tree}}"),
+        document["source"]["marin_tree"],
+        "authorized Marin tree",
+    )
     if _git(repository, "status", "--porcelain"):
         raise ValueError("authorized Marin checkout is dirty")
+    authorization_relative = AUTHORIZATION_PATH.relative_to(repository).as_posix()
+    evidence_relative = Path(__file__).relative_to(repository).as_posix()
+    changed = set(_git(repository, "diff", "--name-only", f"{base_revision}..{revision}").splitlines())
+    _equal(changed, {authorization_relative, evidence_relative}, "post-authorization changed path set")
     for relative, digest in document["collectors"].items():
         if not relative.startswith("lib/"):
             continue
-        path = repository / _relative_path(relative, f"authorization.collectors.{relative}")
-        if path.is_symlink() or not path.is_file() or _file_sha256(path) != digest:
+        path = _relative_path(relative, f"authorization.collectors.{relative}")
+        base_bytes = subprocess.run(
+            ["git", "show", f"{base_revision}:{path.as_posix()}"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+        ).stdout
+        if _bytes_sha256(base_bytes) != digest:
             raise ValueError(f"authorized collector bytes differ: {relative}")
+        current = repository / path
+        if relative == evidence_relative:
+            expected = base_bytes.replace(
+                b'EXPECTED_AUTHORIZATION_SHA256 = "UNSEALED"',
+                f'EXPECTED_AUTHORIZATION_SHA256 = "{authorization.sha256}"'.encode(),
+            )
+            if current.read_bytes() != expected:
+                raise ValueError("authority module differs from the one-token sealed transformation")
+        elif current.is_symlink() or not current.is_file() or _file_sha256(current) != digest:
+            raise ValueError(f"authorized collector working bytes differ: {relative}")
     patch_paths = tuple(sorted((repository / "lib/shuttle/mlir/jax_patch").glob("000[1-3]-*.patch")))
     if len(patch_paths) != 3:
         raise ValueError("authorized checkout does not contain the three exact JAX patches")
