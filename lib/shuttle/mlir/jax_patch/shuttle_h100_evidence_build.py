@@ -182,6 +182,23 @@ def _one_wheel(directory: Path, prefix: str) -> Path:
     return matches[0]
 
 
+def _install_wheels(wheels: dict[str, Path], executed_commands: list[str], authorized_commands: list[str]) -> list[str]:
+    command = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--force-reinstall",
+        "--no-deps",
+        *map(str, wheels.values()),
+    ]
+    command_text = shlex.join(command)
+    if authorized_commands != [*executed_commands, command_text]:
+        raise RuntimeError("wheel install argv differs from the sealed authorization")
+    subprocess.run(command, check=True)
+    return [*executed_commands, command_text]
+
+
 def _wheel_member(wheel: Path, suffix: str) -> bytes:
     with zipfile.ZipFile(wheel) as archive:
         matches = [name for name in archive.namelist() if name.endswith(suffix)]
@@ -308,20 +325,7 @@ def materialize(arguments: argparse.Namespace) -> None:
         "cuda_plugin": _one_wheel(arguments.wheel_output, "jax_cuda13_plugin"),
         "cuda_pjrt": _one_wheel(arguments.wheel_output, "jax_cuda13_pjrt"),
     }
-    install_command = [
-        sys.executable,
-        "-m",
-        "pip",
-        "install",
-        "--force-reinstall",
-        "--no-deps",
-        *map(str, wheels.values()),
-    ]
-    install_command_text = shlex.join(install_command)
-    if document["iris"]["build_commands"] != [*commands, install_command_text]:
-        raise RuntimeError("wheel install argv differs from the sealed authorization")
-    subprocess.run(install_command, check=True)
-    commands.append(install_command_text)
+    commands = _install_wheels(wheels, commands, document["iris"]["build_commands"])
     for key, name in (
         ("jaxlib", "jaxlib.whl"),
         ("cuda_plugin", "jax-cuda13-plugin.whl"),

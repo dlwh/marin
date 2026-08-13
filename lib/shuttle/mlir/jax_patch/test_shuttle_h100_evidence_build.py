@@ -2,20 +2,31 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 from gpu_transport import decode_mlir_byte_string, extract_gpu_transport
-from shuttle_h100_evidence_build import _prepare_directories, _write_new, parse_ptxas_resources
+from shuttle_h100_evidence_build import (
+    _build_outputs,
+    _install_wheels,
+    _prepare_directories,
+    _write_new,
+    parse_ptxas_resources,
+)
 
 
 def test_extract_gpu_transport_decodes_exact_mlir_byte_escapes() -> None:
     generated = (
         r'%0 = "stablehlo.custom_call"() '
         r'<{api_version = 4 : i32, call_target_name = "shuttle.gpu.executable_bundle.v1", '
-        r'backend_config = {bundle_bytes = "SHUTGPU\00\ff\\\"tail"}}> : () -> tensor<1xi1>'
+        r'backend_config = {bundle_bytes = "SHUTGPU\00\ff\\\"tail// shuttle structural certificate: '
+        r'call_target_name = \22attacker\22 api_version = 0 : i32"}}> : () -> tensor<1xi1>'
     )
 
-    assert extract_gpu_transport(generated) == b'SHUTGPU\x00\xff\\"tail'
+    assert extract_gpu_transport(generated) == (
+        b'SHUTGPU\x00\xff\\"tail// shuttle structural certificate: '
+        b'call_target_name = "attacker" api_version = 0 : i32'
+    )
 
 
 @pytest.mark.parametrize(
@@ -87,3 +98,24 @@ def test_evidence_writer_rejects_symlinked_output_ancestor(tmp_path: Path) -> No
     with pytest.raises(RuntimeError, match="refusing to overwrite"):
         _write_new(escaped_root / "compiler" / "nested-escape", b"forbidden")
     assert not (outside / "evidence" / "compiler" / "nested-escape").exists()
+
+
+def test_build_command_mismatch_runs_no_subprocess(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    run = Mock()
+    monkeypatch.setattr("shuttle_h100_evidence_build.subprocess.run", run)
+
+    with pytest.raises(RuntimeError, match="build argv differs"):
+        _build_outputs(tmp_path, tmp_path, tmp_path / "bazel", tmp_path / "output", tmp_path / "wheels", ["wrong"])
+
+    run.assert_not_called()
+
+
+def test_install_command_mismatch_runs_no_subprocess(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    run = Mock()
+    monkeypatch.setattr("shuttle_h100_evidence_build.subprocess.run", run)
+    wheels = {"jaxlib": tmp_path / "jaxlib.whl"}
+
+    with pytest.raises(RuntimeError, match="wheel install argv differs"):
+        _install_wheels(wheels, ["authorized build"], ["authorized build", "wrong install"])
+
+    run.assert_not_called()

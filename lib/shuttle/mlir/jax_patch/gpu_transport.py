@@ -35,7 +35,6 @@ MAXIMUM_I64 = (1 << 63) - 1
 
 _DIGEST = re.compile(rb"[0-9a-f]{64}\Z")
 _HEX_ESCAPE = re.compile(r"[0-9A-Fa-f]{2}\Z")
-_BUNDLE_MARKER = 'bundle_bytes = "'
 _INVALID = "invalid Shuttle GPU executable transport"
 _Enum = TypeVar("_Enum", bound=StrEnum)
 
@@ -207,32 +206,72 @@ def decode_mlir_byte_string(text: str, start: int = 0) -> tuple[bytes, int]:
     raise ValueError("MLIR bundle string is unterminated")
 
 
+def _unquoted_mlir_syntax(text: str) -> str:
+    syntax = list(text)
+    in_string = False
+    position = 0
+    while position < len(text):
+        character = text[position]
+        if not in_string:
+            if character == '"':
+                syntax[position] = " "
+                in_string = True
+            position += 1
+            continue
+        syntax[position] = " "
+        if character == '"':
+            in_string = False
+            position += 1
+            continue
+        if character != "\\":
+            position += 1
+            continue
+        escaped = text[position + 1 : position + 3]
+        escape_length = 2 if len(escaped) == 2 and _HEX_ESCAPE.fullmatch(escaped) is not None else 1
+        for offset in range(1, escape_length + 1):
+            if position + offset < len(syntax):
+                syntax[position + offset] = " "
+        position += escape_length + 1
+    if in_string:
+        raise ValueError("canonical MLIR contains an unterminated string")
+    return "".join(syntax)
+
+
+def _quoted_mlir_attributes(operation: str, syntax: str, name: str) -> list[bytes]:
+    values: list[bytes] = []
+    for match in re.finditer(rf"\b{re.escape(name)}\s*=", syntax):
+        position = match.end()
+        while position < len(operation) and operation[position].isspace():
+            position += 1
+        if position >= len(operation) or operation[position] != '"':
+            raise ValueError(f"canonical MLIR {name} must be a quoted string")
+        value, _ = decode_mlir_byte_string(operation, position + 1)
+        values.append(value)
+    return values
+
+
 def extract_gpu_transport(generated_mlir: str) -> bytes:
     """Extract the bundle from one parser-canonicalized Shuttle custom call."""
     operation_lines = [line for line in generated_mlir.splitlines() if '"stablehlo.custom_call"' in line]
-    if len(operation_lines) != 1 or operation_lines[0].lstrip().startswith("//"):
+    if (
+        len(operation_lines) != 1
+        or re.match(r'^\s*%[A-Za-z0-9_.$-]+\s*=\s*"stablehlo\.custom_call"\s*\(', operation_lines[0]) is None
+    ):
         raise ValueError("canonical MLIR must contain exactly one StableHLO custom call")
     operation = operation_lines[0]
-    if "//" in operation or operation.count("call_target_name = ") != 1:
-        raise ValueError("canonical MLIR custom call contains comments or ambiguous target attributes")
-    if operation.count('call_target_name = "shuttle.gpu.executable_bundle.v1"') != 1:
+    syntax = _unquoted_mlir_syntax(operation)
+    if "//" in syntax:
+        raise ValueError("canonical MLIR custom call contains a trailing comment")
+    targets = _quoted_mlir_attributes(operation, syntax, "call_target_name")
+    if targets != [b"shuttle.gpu.executable_bundle.v1"]:
         raise ValueError("canonical MLIR must contain the exact Shuttle GPU target")
-    if operation.count("api_version = ") != 1 or operation.count("api_version = 4 : i32") != 1:
+    api_versions = re.findall(r"\bapi_version\s*=\s*(-?[0-9]+)\s*:\s*i32\b", syntax)
+    if api_versions != ["4"]:
         raise ValueError("canonical MLIR must contain the API-v4 custom call")
-    starts: list[int] = []
-    position = 0
-    while True:
-        found = operation.find(_BUNDLE_MARKER, position)
-        if found < 0:
-            break
-        starts.append(found + len(_BUNDLE_MARKER))
-        position = starts[-1]
-    if len(starts) != 1:
+    bundles = _quoted_mlir_attributes(operation, syntax, "bundle_bytes")
+    if len(bundles) != 1:
         raise ValueError("generated MLIR must contain exactly one bundle_bytes string")
-    transport, end = decode_mlir_byte_string(operation, starts[0])
-    if operation.find(_BUNDLE_MARKER, end) >= 0:
-        raise ValueError("generated MLIR contains multiple bundle_bytes strings")
-    return transport
+    return bundles[0]
 
 
 class _Reader:

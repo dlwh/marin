@@ -4,8 +4,9 @@
 import copy
 import hashlib
 import json
+import zipfile
 from dataclasses import replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 from shuttle_h100_evidence_subject import worker_command
@@ -15,11 +16,14 @@ from target1_abi10_h100_evidence import (
     WANDB_ARTIFACT_TYPE,
     WANDB_ENTITY,
     WANDB_PROJECT,
+    ArtifactBundle,
+    ArtifactFile,
     IrisJobReceipt,
     WandbArtifactReceipt,
     _load_authorization,
     load_artifact_bundle,
     validate_authority_receipts,
+    validate_gpu_build_artifacts,
     validate_registration_artifacts,
 )
 from target1_abi10_h100_forward_contract import (
@@ -208,6 +212,159 @@ def _artifact(tmp_path: Path, authorization, overrides: dict[str, bytes] | None 
         },
     )
     return load_artifact_bundle(root, authorization)
+
+
+def _write_wheel(path: Path, members: dict[str, bytes]) -> None:
+    with zipfile.ZipFile(path, "w") as wheel:
+        for name, data in members.items():
+            wheel.writestr(name, data)
+
+
+def _gpu_build_artifact(tmp_path: Path, authorization) -> tuple[ArtifactBundle, dict[str, dict[str, bytes]]]:
+    root = tmp_path / "gpu-build-artifact"
+    root.mkdir()
+    wheel_members = {
+        "jaxlib_wheel": {
+            "jaxlib/_jax.so": b"jax extension",
+            "jaxlib/libjax_common.so": b"jax common",
+        },
+        "cuda_plugin_wheel": {
+            "jax_plugins/xla_cuda13/cuda_plugin_extension.so": b"cuda extension",
+            "jax_cuda13_plugin-0.10.1.dist-info/RECORD": b"cuda plugin record",
+        },
+        "cuda_pjrt_wheel": {
+            "jax_plugins/xla_cuda13/xla_cuda_plugin.so": b"cuda pjrt",
+            "jax_cuda13_pjrt-0.10.1.dist-info/RECORD": b"cuda pjrt record",
+        },
+    }
+    paths = {
+        "jaxlib_wheel": root / "jaxlib.whl",
+        "cuda_plugin_wheel": root / "cuda-plugin.whl",
+        "cuda_pjrt_wheel": root / "cuda-pjrt.whl",
+        "jax_extension": root / "jax-extension.so",
+        "jax_common": root / "jax-common.so",
+        "cuda_plugin_extension": root / "cuda-plugin-extension.so",
+        "cuda_pjrt_plugin": root / "cuda-pjrt-plugin.so",
+        "cuda_plugin_record": root / "cuda-plugin-RECORD",
+        "cuda_pjrt_record": root / "cuda-pjrt-RECORD",
+        "gpu_build_manifest": root / "gpu-build-manifest.json",
+    }
+    for role, members in wheel_members.items():
+        _write_wheel(paths[role], members)
+    for role, data in (
+        ("jax_extension", wheel_members["jaxlib_wheel"]["jaxlib/_jax.so"]),
+        ("jax_common", wheel_members["jaxlib_wheel"]["jaxlib/libjax_common.so"]),
+        (
+            "cuda_plugin_extension",
+            wheel_members["cuda_plugin_wheel"]["jax_plugins/xla_cuda13/cuda_plugin_extension.so"],
+        ),
+        ("cuda_pjrt_plugin", wheel_members["cuda_pjrt_wheel"]["jax_plugins/xla_cuda13/xla_cuda_plugin.so"]),
+        (
+            "cuda_plugin_record",
+            wheel_members["cuda_plugin_wheel"]["jax_cuda13_plugin-0.10.1.dist-info/RECORD"],
+        ),
+        ("cuda_pjrt_record", wheel_members["cuda_pjrt_wheel"]["jax_cuda13_pjrt-0.10.1.dist-info/RECORD"]),
+    ):
+        paths[role].write_bytes(data)
+    document = authorization.decoded()
+    manifest = {
+        "schema_version": 1,
+        "jax_commit": document["source"]["jax_commit"],
+        "jax_tree": document["source"]["jax_tree"],
+        "xla_commit": document["source"]["xla_commit"],
+        "jax_patch_sha256": document["source"]["jax_patch_sha256"],
+        "bazel_version": document["toolchain"]["bazel_version"],
+        "bazel_sha256": document["toolchain"]["bazel_sha256"],
+        "ptxas_version": document["toolchain"]["ptxas_version"],
+        "ptxas_sha256": document["toolchain"]["ptxas_sha256"],
+        "commands": document["iris"]["build_commands"],
+    }
+    for field, role in (
+        ("jax_extension_sha256", "jax_extension"),
+        ("jax_common_sha256", "jax_common"),
+        ("cuda_plugin_extension_sha256", "cuda_plugin_extension"),
+        ("cuda_pjrt_plugin_sha256", "cuda_pjrt_plugin"),
+        ("jaxlib_wheel_sha256", "jaxlib_wheel"),
+        ("cuda_plugin_wheel_sha256", "cuda_plugin_wheel"),
+        ("cuda_pjrt_wheel_sha256", "cuda_pjrt_wheel"),
+    ):
+        manifest[field] = hashlib.sha256(paths[role].read_bytes()).hexdigest()
+    _write_json(paths["gpu_build_manifest"], manifest)
+    files = {
+        role: ArtifactFile(
+            role=role,
+            path=PurePosixPath(path.name),
+            size=path.stat().st_size,
+            sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+        for role, path in paths.items()
+    }
+    return ArtifactBundle(root, SHA, files, SUBJECT_JOB), wheel_members
+
+
+def _refresh_gpu_build_artifact(artifact: ArtifactBundle) -> ArtifactBundle:
+    manifest_path = artifact.root / "gpu-build-manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    for field, role in (
+        ("jax_extension_sha256", "jax_extension"),
+        ("jax_common_sha256", "jax_common"),
+        ("cuda_plugin_extension_sha256", "cuda_plugin_extension"),
+        ("cuda_pjrt_plugin_sha256", "cuda_pjrt_plugin"),
+        ("jaxlib_wheel_sha256", "jaxlib_wheel"),
+        ("cuda_plugin_wheel_sha256", "cuda_plugin_wheel"),
+        ("cuda_pjrt_wheel_sha256", "cuda_pjrt_wheel"),
+    ):
+        path = artifact.root / artifact.files[role].path
+        manifest[field] = hashlib.sha256(path.read_bytes()).hexdigest()
+    _write_json(manifest_path, manifest)
+    files = {
+        role: ArtifactFile(
+            role=role,
+            path=record.path,
+            size=(artifact.root / record.path).stat().st_size,
+            sha256=hashlib.sha256((artifact.root / record.path).read_bytes()).hexdigest(),
+        )
+        for role, record in artifact.files.items()
+    }
+    return replace(artifact, files=files)
+
+
+def test_gpu_build_artifacts_match_exact_wheel_members(tmp_path: Path) -> None:
+    authorization = _authorization(tmp_path)
+    artifact, _ = _gpu_build_artifact(tmp_path, authorization)
+
+    validate_gpu_build_artifacts(artifact, authorization)
+
+
+@pytest.mark.parametrize(
+    "role",
+    [
+        "jax_extension",
+        "jax_common",
+        "cuda_plugin_extension",
+        "cuda_pjrt_plugin",
+        "cuda_plugin_record",
+        "cuda_pjrt_record",
+        "jaxlib_wheel",
+        "cuda_plugin_wheel",
+        "cuda_pjrt_wheel",
+    ],
+)
+def test_gpu_build_artifacts_reject_substituted_wheel_or_member(tmp_path: Path, role: str) -> None:
+    authorization = _authorization(tmp_path)
+    artifact, wheel_members = _gpu_build_artifact(tmp_path, authorization)
+    path = artifact.root / artifact.files[role].path
+    if role in wheel_members:
+        changed = dict(wheel_members[role])
+        first = next(iter(changed))
+        changed[first] += b" substituted"
+        _write_wheel(path, changed)
+    else:
+        path.write_bytes(path.read_bytes() + b" substituted")
+    artifact = _refresh_gpu_build_artifact(artifact)
+
+    with pytest.raises(ValueError, match="differs from the exact built wheel member"):
+        validate_gpu_build_artifacts(artifact, authorization)
 
 
 def _iris(role: str, authorization) -> IrisJobReceipt:
