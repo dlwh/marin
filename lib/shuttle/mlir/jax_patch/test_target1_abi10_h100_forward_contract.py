@@ -12,15 +12,19 @@ import pytest
 from target1_abi10_h100_forward_contract import (
     BACKEND_PAIRS,
     EMPTY_SHA256,
+    EVIDENCE_MARIN_REVISION,
     FINAL_MODULE_SHA256,
     GENERATED_BUNDLE_SHA256,
+    TE_BUILD_MANIFEST_SHA256,
+    TE_HARNESS_SHA256,
+    TE_RUNNER_SOURCE_SHA256,
     TUNING_SHA256,
     UNSUPPORTED_EMPTY_SHA256,
     load_contract,
     validate_observation,
 )
 
-REVISION = "b" * 40
+REVISION = EVIDENCE_MARIN_REVISION
 
 
 def _digest(label: str) -> str:
@@ -36,8 +40,10 @@ def _collector() -> dict[str, object]:
         "schema_version": 1,
         "marin_revision": REVISION,
         "runner_binary_sha256": _digest("runner"),
-        "harness_sha256": _digest("harness"),
-        "build_manifest_sha256": _digest("build-manifest"),
+        "runner_source_sha256": TE_RUNNER_SOURCE_SHA256,
+        "harness_sha256": TE_HARNESS_SHA256,
+        "build_manifest_sha256": TE_BUILD_MANIFEST_SHA256,
+        "te_plan_sha256": _digest("te-run-plan"),
         "artifact_manifest_sha256": "pending",
     }
     return value

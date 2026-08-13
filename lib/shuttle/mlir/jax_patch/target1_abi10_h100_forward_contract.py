@@ -51,6 +51,10 @@ EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 UNSUPPORTED_EMPTY_SHA256 = hashlib.sha256(b"[]").hexdigest()
 GENERATED_BUNDLE_SHA256 = "910b4192a0fc9d04986ca941d1508ffb7352430526f615e30b242aadc3ae4bf7"
 FINAL_MODULE_SHA256 = "a7a977e017eb62dd277d2fe56db3dff3e2fff6ce6538e64d69821ed0dce23914"
+EVIDENCE_MARIN_REVISION = "715fa3fd446fe8dc67c32bd5dbc8a5c82fd95373"
+TE_RUNNER_SOURCE_SHA256 = "48f2ccabcbee63e04bae99ae2b0d693eb44cc963ff5a4686ac0d7a36f9208047"
+TE_HARNESS_SHA256 = "38145a79933741427d21b4a369f32d73ab5c6f451c0997f639075f13fcf84b3d"
+TE_BUILD_MANIFEST_SHA256 = "6d8f092dabf566e4d856a83dac61532566c50a6adb75f5ed7c803159d183423b"
 REFERENCE_LIMITS = {
     "max_absolute_error": 0.0078125,
     "mean_absolute_error": 0.0023046755673821195,
@@ -570,6 +574,7 @@ def _te_result(
     )
     _equal(sealed_run["plan_id"], TE_PLAN_ID, f"{name}.sealed_run.plan_id")
     _sha(sealed_run["plan_sha256"], f"{name}.sealed_run.plan_sha256")
+    _equal(sealed_run["plan_sha256"], collector["te_plan_sha256"], f"{name}.sealed_run.plan_sha256")
     _equal(sealed_run["position"], index, f"{name}.sealed_run.position")
     _equal(sealed_run["result_path"], f"result-{index:02d}.json", f"{name}.sealed_run.result_path")
     _equal(sealed_run["shape"], [2048, 4096], f"{name}.sealed_run.shape")
@@ -619,15 +624,20 @@ def _collector(value: object) -> dict[str, Any]:
             "schema_version",
             "marin_revision",
             "runner_binary_sha256",
+            "runner_source_sha256",
             "harness_sha256",
             "build_manifest_sha256",
+            "te_plan_sha256",
             "artifact_manifest_sha256",
         },
         "collector",
     )
     _equal(collector["schema_version"], 1, "collector.schema_version")
-    _revision(collector["marin_revision"], "collector.marin_revision")
-    for field in ("runner_binary_sha256", "harness_sha256", "build_manifest_sha256", "artifact_manifest_sha256"):
+    _equal(collector["marin_revision"], EVIDENCE_MARIN_REVISION, "collector.marin_revision")
+    _equal(collector["runner_source_sha256"], TE_RUNNER_SOURCE_SHA256, "collector.runner_source_sha256")
+    _equal(collector["harness_sha256"], TE_HARNESS_SHA256, "collector.harness_sha256")
+    _equal(collector["build_manifest_sha256"], TE_BUILD_MANIFEST_SHA256, "collector.build_manifest_sha256")
+    for field in ("runner_binary_sha256", "te_plan_sha256", "artifact_manifest_sha256"):
         _sha(collector[field], f"collector.{field}")
     return collector
 
