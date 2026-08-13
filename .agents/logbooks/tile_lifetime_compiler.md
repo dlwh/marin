@@ -4671,3 +4671,51 @@ author: dlwh
 - ABI 10 is now assigned to this GPU boundary. The future large VJP Fold design
   recorded in TLTC-MLIR-015 must use ABI 11 or later if its semantic proof
   closes; the earlier ABI 10 suggestion is historical and not reusable.
+
+### 2026-08-13 - TLTC-MLIR-017 first H100 toolchain preflight
+
+- An Iris reservation on eight H100 80GB devices used GPU 0 only and was
+  released after 14 minutes 26.56 seconds. The source was exact clean commit
+  `e86d298f922f95864106f6b5871f036891aa1060`; no kernel, numerical, cache, or
+  timing run occurred.
+- The pinned JAX 0.10.1 CUDA plugin built in 6,349 actions. Its SHA-256 was
+  `ade2b317c63cdb9a0453ff807d98b030c77888ab20c4c5f9a5eff98f88795561`.
+  The real `ffi_handlers()` to fake-PJRT registration path reported one Shuttle
+  target with API version 1, traits 0, four distinct stage pointers, and five
+  retained upstream handlers. Eleven missing-stage, swapped-stage, API, and
+  traits mutations failed closed.
+- The exact plugin build command was
+  `CUDA_VISIBLE_DEVICES=0 ./bazel-7.4.1-linux-x86_64
+  --output_user_root=/tmp/bazel-shuttle-abi10 build
+  //jaxlib/cuda:cuda_plugin_extension --local_resources=host_cpus=32` from
+  pinned JAX commit `619764c15117fbefc4ba13ab941871cb514c23f6`. Bazel
+  SHA-256 was
+  `c97f02133adce63f0c28678ac1f21d65fa8255c80429b588aeeba8a1fac6202b`;
+  the CUDA-only JAX patch SHA-256 was
+  `86deb315464d5a3349ad52e44448d617e30e6bcfed999bddab791872599c77b5`.
+- Registration ran
+  `shuttle_jaxlib_gpu_ffi_registration.py --plugin-extension <rebuilt-so>`
+  with `CUDA_VISIBLE_DEVICES=0` and returned `REGISTRATION_OK`. The built
+  extension was 7,027,560 bytes. The emitted 19-entry device module was 157,676
+  bytes with SHA-256
+  `73871663a69337afc1bc7824a3e54e3e6b739156828149d2e6f24b667c00eb28`.
+- `ptxas` 13.2.78 at SHA-256
+  `a0212ca1a74ca4877e8d063baa1dd0b075fcd255fb6ab9e8a6bf98a276a2d6e8`
+  accepted generated entries 0 through 2 for `sm_90`, then rejected Fold entry
+  3. The emitter placed `.extern .shared .align 4 .b8 shuttle_smem[];` inside
+  the entry body; PTX requires this declaration at module scope. The failing
+  PTX slice SHA-256 was
+  `ede11188a4f4327a645c5e52559fe42d6b13573356460b3225456bc837e7f09a`.
+  Each independently decoded slice was checked against its closed offset,
+  length, and digest and then invoked as
+  `ptxas -arch=sm_90 -o <entry.cubin> <entry.ptx>`.
+- The terminal compiler defect triggered immediate reservation release. A
+  local behavior regression now requires every launch using dynamic shared
+  memory to place the declaration before `.visible .entry`, and a compiler fix
+  emits it there. The complete 19-slice `ptxas` gate must be rerun before a
+  second device attempt.
+- A separate acceptance audit found that ABI 10 cannot reuse the historical
+  ABI 9 inputs or the full-matrix ABI 5 candidate validator. The first device
+  evidence must be an untimed, sealed `2048x4096` forward SOURCE_ORDERED H100
+  observation using `target1_numerical_oracle.fixed_inputs`. Performance stays
+  `not_started` until a separately reviewed cross-run protocol exists.

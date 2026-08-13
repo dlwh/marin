@@ -353,6 +353,7 @@ cc_test(
 cc_test(
     name = "observer_test_bridge_test",
     srcs = ["test/observer-test-bridge-test.cc"],
+    data = ["test/Inputs/jax-0.10.1-bf16-row_fold_scale_44d152ecc3e9ff18-forward.mlir"],
     deps = [
         ":ShuttleObserverTestBridge",
         ":ShuttlePasses",
@@ -362,6 +363,7 @@ cc_test(
         "@llvm-project//mlir:IR",
         "@llvm-project//mlir:Parser",
         "@stablehlo//:register",
+        "@bazel_tools//tools/cpp/runfiles",
     ],
 )
 

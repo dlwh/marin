@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "contract_id": "target1_rowwise_bf16_abi10_h100_forward_source_ordered_v1",
+  "coordinate": {
+    "target_id": 1,
+    "boundary": "forward",
+    "shape": [2048, 4096],
+    "shape_id": "rmsnorm_bf16_2048x4096",
+    "policy": "source_ordered",
+    "hardware_class": "h100"
+  },
+  "compiler": {
+    "pipeline_abi_version": 10,
+    "canonical_options": "{\"execution_mode\":\"gpu_executable_bundle\",\"numerics\":\"source_ordered\",\"pipeline_abi_version\":10,\"schema_version\":1,\"tuning\":{\"cluster_shape\":[],\"materialization\":\"automatic\",\"maximum_candidates\":1,\"pipeline_stages\":1,\"tile_sizes\":[]}}",
+    "canonical_options_sha256": "30b092ddd553d8ad015f6d17e66c1671877683134db080ec9623ec1ac26c6d18",
+    "custom_call_target": "shuttle.gpu.executable_bundle.v1",
+    "custom_call_api_version": 4,
+    "transport_schema_version": 2,
+    "device_schema_version": 3,
+    "invocation_abi_schema_version": 3,
+    "bundle_schema_version": 2,
+    "completion": "stream_ordered",
+    "launch_count": 19,
+    "slot_count": 21,
+    "temporary_slot_count": 18,
+    "temporary_bytes": 201416716
+  },
+  "inputs": {
+    "generator": "target1_numerical_oracle.fixed_inputs",
+    "array_digests": [
+      "47c7e1bda25abe1f0a2e0f2c34154f0484d367d1309ae2ddb08450ed9eb4b5df",
+      "a69953eeff9555b4a0cf42fbe2c978a4c3559eb76329b437f6bd32cdaa284e7a"
+    ],
+    "raw_sha256": [
+      "0f3b7cfa2054631d63038001deb298b086d0c2baffeaddd6082c4518df91e13c",
+      "e90137a7f830b75f00ee6dae7c89bbd7fba30dfb31ff7951fec129441c170821"
+    ]
+  },
+  "reference": {
+    "implementation": "target1_numerical_oracle.independent_reference",
+    "output_array_digest": "fe18afac66306e065ebf824c52cc6d95776e49521ed6209e405b58e40c934bdd",
+    "limits": {
+      "max_absolute_error": 0.0078125,
+      "mean_absolute_error": 0.0023046755673821195,
+      "relative_linf_error": 0.007751937984496124,
+      "max_bfloat16_ulp_error": 1
+    }
+  },
+  "expert_oracle": {
+    "transformer_engine_version": "2.17.0",
+    "source_commit": "2e559f062497bef768dfbe9d7e45548fadeca80a",
+    "required_forward_backend_pairs": [
+      ["transformer_engine", "transformer_engine"],
+      ["cudnn", "cudnn"],
+      ["transformer_engine", "cudnn"],
+      ["cudnn", "transformer_engine"]
+    ]
+  },
+  "repeatability": {
+    "sequential_invocations": 3,
+    "concurrent_invocations": 2,
+    "rule": "all_output_bytes_bitwise_equal_to_same_device_ordinary_jax"
+  },
+  "performance": {
+    "status": "not_started",
+    "timing_fields_permitted": false,
+    "blocker": "performance_repeatability_contract_missing"
+  },
+  "scorecard_effect": {
+    "on_success": {
+      "cell_status": "partial",
+      "architecture_status": "accepted",
+      "numerical_status": "accepted",
+      "performance_status": "not_started",
+      "blockers": ["performance_evidence_missing"]
+    },
+    "target_status": "blocked"
+  }
+}

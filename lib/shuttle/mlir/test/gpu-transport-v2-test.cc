@@ -476,6 +476,33 @@ TEST(GpuTransportV2Test, IndependentInlineDecoderMatchesPublicDescriptor) {
   EXPECT_FALSE(mlir::shuttle::GpuExecutable::Load(oversized).ok());
 }
 
+TEST(GpuTransportV2Test, FoldDynamicSharedMemoryIsDeclaredAtModuleScope) {
+  auto built = buildFixture();
+  ASSERT_TRUE(built);
+  auto bytes = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+  ASSERT_TRUE(mlir::succeeded(bytes));
+  auto decoded = decodeInlineSchema2(*bytes);
+  ASSERT_TRUE(decoded);
+
+  size_t foldCount = 0;
+  for (const auto &launch : decoded->launches) {
+    if (launch.dynamicSharedMemoryBytes == 0)
+      continue;
+    ++foldCount;
+    llvm::StringRef ptx(reinterpret_cast<const char *>(decoded->code.data() +
+                                                       launch.codeOffset),
+                        launch.codeLength);
+    size_t declaration =
+        ptx.find(".extern .shared .align 4 .b8 shuttle_smem[];");
+    size_t entry = ptx.find(".visible .entry shuttle_entry(");
+    ASSERT_NE(declaration, llvm::StringRef::npos);
+    ASSERT_NE(entry, llvm::StringRef::npos);
+    EXPECT_LT(declaration, entry);
+    EXPECT_EQ(ptx.find(".extern .shared", entry), llvm::StringRef::npos);
+  }
+  EXPECT_EQ(foldCount, 1);
+}
+
 class SyntheticAllocator final
     : public stream_executor::DeviceAddressAllocator {
 public:

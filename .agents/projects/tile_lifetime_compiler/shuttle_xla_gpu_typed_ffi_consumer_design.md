@@ -436,7 +436,7 @@ bytes. A pipeline/code-generator ABI mutation must miss. A bit flip in the
 persisted transport must fail deserialization or instantiation; changing only a
 self-consistent post-lookup payload is not accepted as a cache-key test.
 
-Real device gates remain red until separately authorized and run. On the
+Real device gates remain red until separately reviewed and run. On the
 declared H100 environment they must cover direct XLA execution, ordinary
 `jax.jit`, repeated and concurrent invocations, allocation/load/launch error
 paths, exact output bytes, and fresh-process cache reuse. `SOURCE_ORDERED` must
@@ -465,21 +465,28 @@ source-derived epsilon variant reaches different PTX bytes through the same
 handler target. Historical ABI 9 Host evidence stays versioned and fails
 closed against current ABI 10 options.
 
-The real CUDA plugin cannot be built on the available Darwin arm64 host. The
-exact JAX 0.10.1 build analyzes 270 packages and 11,586 targets, then XLA's
-CUDA stub rules select
-`NOT_IMPLEMENTED_FOR_THIS_PLATFORM_OR_ARCHITECTURE` for `cublas`, `cudart`,
-and `cupti` stub generation. No `cuda_plugin_extension` artifact is produced.
-No local `ptxas` or CUDA SDK is installed, so PTX assembly and the rebuilt
-extension-to-PJRT registration test remain unexecuted. Resume on a supported
-Linux CUDA build host with the pinned JAX/XLA checkout; do not interpret the
-native fake-executor evidence as PTX assembly, CUDA registration, numerical,
-performance, or H100 acceptance.
+A supported Linux H100 preflight built the exact JAX 0.10.1 CUDA plugin and
+passed its real `ffi_handlers()` to fake-PJRT registration boundary. The first
+three generated PTX modules assembled for `sm_90`; Fold entry 3 failed because
+the emitter placed its dynamic-shared declaration inside the entry body rather
+than at PTX module scope. No kernel launched, and the reservation was released
+without numerical, cache, or timing evidence. The compiler now has a
+behavioral regression and fix for that declaration placement; all 19 modules
+must be assembled again before another device attempt.
+
+The GPU pipeline now emits a third observer phase, `generated_bundle`, between
+algebra coverage and final erasure. Its normalized module fingerprint binds
+the source-derived device module, invocation ABI, and executable bundle before
+the replacement pass erases those sidecars. This phase is evidence only and is
+not part of compile or persistent-cache identity.
 
 ## Acceptance boundary
 
 The implemented boundary changes no Target 1 status, cell, gate, or evidence
 record. Compiler, transport, and fake-executor lifecycle gates are green.
-PTX assembly, rebuilt CUDA plugin registration, persistent-cache reuse through
-that plugin, and every real-device gate remain blocked or unexecuted. Only a
-separately reviewed and authorized device run can supply H100 evidence.
+The rebuilt CUDA plugin registration boundary is green. Complete PTX assembly,
+persistent-cache reuse through that plugin, and every real-device correctness
+gate remain blocked or unexecuted. The first allowed H100 artifact is an
+untimed, sealed `2048x4096` forward SOURCE_ORDERED observation under
+`target1_rowwise_bf16_abi10_h100_forward_source_ordered_v1`; performance stays
+`not_started` until a separate cross-run contract is reviewed.

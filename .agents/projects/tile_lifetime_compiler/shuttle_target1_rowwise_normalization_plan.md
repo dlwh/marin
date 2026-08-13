@@ -131,9 +131,12 @@ The declared contiguous row-major public tensors are:
 | `dx` | `[2048, 4096]` | BF16 | input cotangent |
 | `dgamma` | `[4096]` | BF16 | scale cotangent |
 
-`epsilon` is the compile-time FP32 scalar `1e-5`. Test data uses JAX seed
-`20260809`, split into independent standard-normal BF16 `x`, `gamma`, and `dy`
-arrays. The source function is:
+`epsilon` is the compile-time FP32 scalar `1e-5`. The closed test inputs are
+generated without JAX by applying `numpy.linspace` in FP32 and then converting
+to BF16. `x` spans `[-0.75, 0.875]`, `gamma` spans `[-0.625, 1.0]`, and `dy`
+spans `[-0.5, 1.125]`; each range is reshaped to the public tensor shape. The
+exact per-shape and per-boundary digests are pinned by
+`target1-rowwise-bf16-numerical-oracle-v1.json`. The source function is:
 
 ```python
 def row_fold_scale(x, gamma):

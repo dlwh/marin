@@ -50,6 +50,7 @@ shuttlePipelineIdentity(const ShuttlePipelineOptions &options);
 enum class ShuttlePipelinePhase {
   AlgebraCoverage,
   LoweredCoverage,
+  GeneratedBundle,
   FinalErasure,
   Failure,
 };

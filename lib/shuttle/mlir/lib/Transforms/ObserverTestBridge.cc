@@ -20,6 +20,8 @@ const char *phaseName(ShuttlePipelinePhase phase) {
     return "algebra_coverage";
   case ShuttlePipelinePhase::LoweredCoverage:
     return "lowered_coverage";
+  case ShuttlePipelinePhase::GeneratedBundle:
+    return "generated_bundle";
   case ShuttlePipelinePhase::FinalErasure:
     return "final_erasure";
   case ShuttlePipelinePhase::Failure:
@@ -35,10 +37,10 @@ public:
     const ShuttlePipelineIdentity &identity = event.identity();
     events.push_back(ShuttleObserverTestEvent{
         event.invocationId(), phaseName(event.phase()), identity.policy,
-        identity.policyDigest, identity.tuningDigest,
-        event.regionMembership(), event.coverageManifest(),
-        event.unsupportedFingerprint(), event.normalizedModuleFingerprint(),
-        event.noShuttleSemantics(), event.failurePass()});
+        identity.policyDigest, identity.tuningDigest, event.regionMembership(),
+        event.coverageManifest(), event.unsupportedFingerprint(),
+        event.normalizedModuleFingerprint(), event.noShuttleSemantics(),
+        event.failurePass()});
     if (blockNextCallback) {
       blockNextCallback = false;
       callbackBlocked = true;
@@ -83,8 +85,9 @@ private:
 
 class ShuttleObserverTestCapture::Impl {
 public:
-  Impl() : observer(std::make_shared<RecordingObserver>()),
-           subscription(subscribeShuttlePipelineObserver(observer)) {}
+  Impl()
+      : observer(std::make_shared<RecordingObserver>()),
+        subscription(subscribeShuttlePipelineObserver(observer)) {}
 
   void close() {
     std::optional<ShuttleObserverSubscription> closing;

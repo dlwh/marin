@@ -3876,6 +3876,10 @@ FailureOr<int64_t> staticElementCount(RankedTensorType type) {
 struct PtxEmitter {
   explicit PtxEmitter(int64_t arity) : arity(arity), stream(text) {}
 
+  void declareDynamicSharedMemory() {
+    stream << ".extern .shared .align 4 .b8 shuttle_smem[];\n";
+  }
+
   void header(StringRef certificate) {
     stream << ".version 8.0\n.target sm_90\n.address_size 64\n"
               "// shuttle structural certificate: "
@@ -4098,9 +4102,9 @@ FailureOr<std::string> emitFoldPtx(FoldOp fold, ScheduleTaskOp task) {
       task.getWorkgroupThreads() != 256 || task.getScratchBytes() != 1024)
     return failure();
   PtxEmitter ptx(3);
+  ptx.declareDynamicSharedMemory();
   ptx.header(task.getSemanticFingerprint());
-  ptx.stream << "  .extern .shared .align 4 .b8 shuttle_smem[];\n"
-                "  mov.u32 %r0, %tid.x;\n"
+  ptx.stream << "  mov.u32 %r0, %tid.x;\n"
                 "  mov.u32 %r1, %ctaid.x;\n"
                 "  setp.ge.u32 %p0, %r1, 2048;\n"
                 "  @%p0 bra $done;\n"
@@ -5322,7 +5326,8 @@ void emitObserverSnapshot(
   invocation->emit(
       phase, std::move(regionMembership), std::move(coverageManifest),
       std::move(unsupportedFingerprint),
-      phase == ShuttlePipelinePhase::FinalErasure
+      phase == ShuttlePipelinePhase::GeneratedBundle ||
+              phase == ShuttlePipelinePhase::FinalErasure
           ? normalizedModuleFingerprintImpl(module)
           : std::string{},
       phase == ShuttlePipelinePhase::FinalErasure, failurePass.str());
@@ -5438,6 +5443,8 @@ void buildShuttleGpuExecutablePipeline(
   manager.addPass(createBuildGpuExecutableBundlePass());
   manager.addPass(createVerifyGpuExecutableBundlePass());
   manager.addPass(createVerifySourceCoveragePass());
+  manager.addPass(std::make_unique<EmitObserverPass>(
+      ShuttlePipelinePhase::GeneratedBundle, invocation));
   manager.addPass(createReplaceWithGpuExecutableBundlePass());
   manager.addPass(createStripSourceProvenancePass());
   manager.addPass(createVerifyNoShuttleOpsPass());
