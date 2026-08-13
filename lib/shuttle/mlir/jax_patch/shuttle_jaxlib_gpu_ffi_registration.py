@@ -5,7 +5,9 @@
 
 import argparse
 import ctypes
+import hashlib
 import importlib.util
+import json
 from pathlib import Path
 from types import ModuleType
 
@@ -90,7 +92,7 @@ def capsule_pointer(value: object) -> int:
     return int(pointer)
 
 
-def register_through_pjrt(module: ModuleType, bundle: dict[str, object]) -> None:
+def register_through_pjrt(module: ModuleType, bundle: dict[str, object]) -> dict[str, object]:
     observations: list[tuple[str, int, tuple[int, ...]]] = []
 
     @RegisterCustomCall
@@ -141,25 +143,58 @@ def register_through_pjrt(module: ModuleType, bundle: dict[str, object]) -> None
     exported_pointers = tuple(capsule_pointer(bundle[stage]) for stage in STAGES)
     if target != TARGET or api_version != 1 or pointers != exported_pointers:
         raise RuntimeError("CUDA plugin registered the wrong Shuttle typed-FFI bundle")
+    if len(set(pointers)) != len(STAGES) or any(pointer == 0 for pointer in pointers):
+        raise RuntimeError("CUDA plugin exported duplicate or null Shuttle stage pointers")
+    return {
+        "target": target,
+        "api_version": api_version,
+        "traits": 0,
+        "stage_pointers": dict(zip(STAGES, pointers, strict=True)),
+    }
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--plugin-extension", type=Path, required=True)
-    args = parser.parse_args()
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
-    module = load_extension(args.plugin_extension.resolve())
-    handlers = module.ffi_handlers()
-    if TARGET not in handlers:
-        raise RuntimeError(f"missing Shuttle CUDA typed-FFI target: {sorted(handlers)}")
+
+def validated_shuttle_bundle(handlers: object) -> dict[str, object]:
+    if type(handlers) is not dict or TARGET not in handlers:
+        targets = sorted(handlers) if type(handlers) is dict else []
+        raise RuntimeError(f"missing Shuttle CUDA typed-FFI target: {targets}")
     bundle = handlers[TARGET]
-    if set(bundle) != {*STAGES, "api_version", "traits"}:
+    if type(bundle) is not dict or set(bundle) != {*STAGES, "api_version", "traits"}:
         raise RuntimeError("CUDA plugin exported an unknown Shuttle handler field")
     if bundle["api_version"] != 1 or bundle["traits"] != 0:
         raise RuntimeError("CUDA plugin exported the wrong Shuttle typed-FFI metadata")
     if any(bundle[stage] is None for stage in STAGES):
         raise RuntimeError("CUDA plugin did not export one complete Shuttle handler bundle")
-    register_through_pjrt(module, bundle)
+    return bundle
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--plugin-extension", type=Path, required=True)
+    parser.add_argument("--output", type=Path)
+    args = parser.parse_args()
+
+    extension_path = args.plugin_extension.resolve()
+    module = load_extension(extension_path)
+    handlers = module.ffi_handlers()
+    bundle = validated_shuttle_bundle(handlers)
+    registration = register_through_pjrt(module, bundle)
+    result = {
+        "schema_version": 1,
+        "plugin_extension_sha256": file_sha256(extension_path),
+        "exported_targets": sorted(handlers),
+        "upstream_target_count": len(handlers) - 1,
+        "registration": registration,
+    }
+    if args.output is not None:
+        args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
 
 
 if __name__ == "__main__":
