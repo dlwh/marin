@@ -14,16 +14,25 @@ import hashlib
 import json
 import re
 import subprocess
+import sys
+import zipfile
 from pathlib import Path
 
-from gpu_transport import GpuTransport, load_gpu_transport
+from gpu_transport import GpuTransport, extract_gpu_transport, load_gpu_transport
 from target1_abi10_h100_evidence import gpu_transport_descriptor, load_authorization
 
-_BUNDLE_MARKER = 'bundle_bytes = "'
-_HEX_ESCAPE = re.compile(r"[0-9A-Fa-f]{2}\Z")
 _REGISTER_COUNT = re.compile(r"Used ([0-9]+) registers")
 _SPILL_COUNTS = re.compile(r"([0-9]+) bytes spill stores, ([0-9]+) bytes spill loads")
 _MAXIMUM_GENERATED_MLIR_BYTES = 32 * 1024 * 1024
+_JAX_WHEELS = "jaxlib,jax-cuda-plugin,jax-cuda-pjrt"
+_FORWARD_FIXTURE = "lib/shuttle/mlir/test/Inputs/jax-0.10.1-bf16-row_fold_scale_44d152ecc3e9ff18-forward.mlir"
+BUILD_COMMANDS = [
+    "python3.12 build/build.py build --wheels=jaxlib,jax-cuda-plugin,jax-cuda-pjrt "
+    "--cuda_version=13.0.0 --cuda_compute_capabilities=9.0 --disable_nccl "
+    "--repo_env=ML_WHEEL_TYPE=release --override_repository=shuttle_mlir --local_resources=host_cpus=32",
+    "bazel build @shuttle_mlir//:shuttle-test-opt --override_repository=shuttle_mlir --local_resources=host_cpus=32",
+    "python3.12 -m pip install --force-reinstall --no-deps <built-jaxlib> <built-cuda-plugin> <built-cuda-pjrt>",
+]
 
 
 def _sha256(path: Path) -> str:
@@ -36,54 +45,6 @@ def _sha256(path: Path) -> str:
 
 def _canonical_json(value: object) -> str:
     return json.dumps(value, indent=2, sort_keys=True, separators=(",", ": ")) + "\n"
-
-
-def decode_mlir_byte_string(text: str, start: int = 0) -> tuple[bytes, int]:
-    """Decode one MLIR quoted byte string beginning after its opening quote."""
-    decoded = bytearray()
-    position = start
-    while position < len(text):
-        character = text[position]
-        if character == '"':
-            return bytes(decoded), position + 1
-        if character != "\\":
-            codepoint = ord(character)
-            if codepoint < 0x20 or codepoint > 0x7E:
-                raise ValueError("MLIR bundle string contains a non-ASCII literal")
-            decoded.append(codepoint)
-            position += 1
-            continue
-        if position + 1 >= len(text):
-            raise ValueError("MLIR bundle string ends in an incomplete escape")
-        escaped = text[position + 1]
-        if escaped in {'"', "\\"}:
-            decoded.append(ord(escaped))
-            position += 2
-            continue
-        token = text[position + 1 : position + 3]
-        if len(token) != 2 or _HEX_ESCAPE.fullmatch(token) is None:
-            raise ValueError("MLIR bundle string contains an unsupported escape")
-        decoded.append(int(token, 16))
-        position += 3
-    raise ValueError("MLIR bundle string is unterminated")
-
-
-def extract_gpu_transport(generated_mlir: str) -> bytes:
-    """Extract the unique serialized bundle from replacement-pipeline MLIR."""
-    starts: list[int] = []
-    position = 0
-    while True:
-        found = generated_mlir.find(_BUNDLE_MARKER, position)
-        if found < 0:
-            break
-        starts.append(found + len(_BUNDLE_MARKER))
-        position = starts[-1]
-    if len(starts) != 1:
-        raise ValueError("generated MLIR must contain exactly one bundle_bytes string")
-    transport, end = decode_mlir_byte_string(generated_mlir, starts[0])
-    if generated_mlir.find(_BUNDLE_MARKER, end) >= 0:
-        raise ValueError("generated MLIR contains multiple bundle_bytes strings")
-    return transport
 
 
 def parse_ptxas_resources(stderr: str) -> tuple[int, int]:
@@ -99,16 +60,9 @@ def parse_ptxas_resources(stderr: str) -> tuple[int, int]:
 
 
 def _write_new(path: Path, data: bytes) -> None:
-    if path.exists() or path.is_symlink():
+    if path.exists() or path.is_symlink() or path.parent.is_symlink() or not path.parent.is_dir():
         raise RuntimeError(f"refusing to overwrite evidence artifact: {path}")
-    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
-
-
-def _copy_new(source: Path, destination: Path) -> None:
-    if source.is_symlink() or not source.is_file():
-        raise RuntimeError(f"build artifact is not a regular file: {source}")
-    _write_new(destination, source.read_bytes())
 
 
 def _ptxas_version(ptxas: Path) -> str:
@@ -125,6 +79,123 @@ def _bazel_version(bazel: Path) -> str:
     if match is None:
         raise RuntimeError("could not parse the exact Bazel version")
     return match.group(1)
+
+
+def _git(repository: Path, *arguments: str) -> str:
+    return subprocess.run(["git", *arguments], cwd=repository, check=True, capture_output=True, text=True).stdout.strip()
+
+
+def _prepare_directories(output: Path) -> None:
+    for name in ("assembly", "build", "compiler"):
+        path = output / name
+        if path.exists() or path.is_symlink():
+            raise RuntimeError(f"evidence output directory already exists: {path}")
+        path.mkdir()
+
+
+def _require_fresh_output(path: Path, name: str) -> None:
+    if path.exists() or path.is_symlink() or path.parent.is_symlink() or not path.parent.is_dir():
+        raise RuntimeError(f"{name} must be a new path under a real existing parent")
+
+
+def _apply_jax_patches(jax_repository: Path, document: dict[str, object], marin_repository: Path) -> None:
+    source = document["source"]
+    if _git(jax_repository, "rev-parse", "HEAD") != source["jax_commit"]:
+        raise RuntimeError("JAX checkout differs from the sealed commit")
+    if _git(jax_repository, "rev-parse", "HEAD^{tree}") != source["jax_tree"]:
+        raise RuntimeError("JAX checkout differs from the sealed tree")
+    if _git(jax_repository, "status", "--porcelain"):
+        raise RuntimeError("JAX checkout must be clean before applying the sealed patches")
+    patches = sorted((marin_repository / "lib/shuttle/mlir/jax_patch").glob("000[1-3]-*.patch"))
+    if [_sha256(path) for path in patches] != source["jax_patch_sha256"]:
+        raise RuntimeError("JAX patch bytes differ from the sealed authorization")
+    subprocess.run(["git", "apply", "--check", *map(str, patches)], cwd=jax_repository, check=True)
+    subprocess.run(["git", "apply", *map(str, patches)], cwd=jax_repository, check=True)
+
+
+def _build_outputs(
+    jax_repository: Path,
+    marin_repository: Path,
+    bazel: Path,
+    bazel_output_root: Path,
+    wheel_output: Path,
+) -> tuple[list[str], Path]:
+    command = [
+        sys.executable,
+        "build/build.py",
+        "build",
+        f"--wheels={_JAX_WHEELS}",
+        f"--bazel_path={bazel}",
+        f"--output_path={wheel_output}",
+        "--cuda_version=13.0.0",
+        "--cuda_compute_capabilities=9.0",
+        "--disable_nccl",
+        "--bazel_options=--repo_env=ML_WHEEL_TYPE=release",
+        f"--bazel_startup_options=--output_user_root={bazel_output_root}",
+        f"--bazel_options=--override_repository=shuttle_mlir={marin_repository / 'lib/shuttle/mlir'}",
+        "--bazel_options=--local_resources=host_cpus=32",
+    ]
+    subprocess.run(command, cwd=jax_repository, check=True)
+    shuttle_command = [
+        str(bazel),
+        f"--output_user_root={bazel_output_root}",
+        "build",
+        f"--override_repository=shuttle_mlir={marin_repository / 'lib/shuttle/mlir'}",
+        "@shuttle_mlir//:shuttle-test-opt",
+        "--local_resources=host_cpus=32",
+    ]
+    subprocess.run(shuttle_command, cwd=jax_repository, check=True)
+    query = subprocess.run(
+        [
+            str(bazel),
+            f"--output_user_root={bazel_output_root}",
+            "cquery",
+            f"--override_repository=shuttle_mlir={marin_repository / 'lib/shuttle/mlir'}",
+            "@shuttle_mlir//:shuttle-test-opt",
+            "--output=files",
+        ],
+        cwd=jax_repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    paths = [Path(line) for line in query.stdout.splitlines() if line]
+    if len(paths) != 1:
+        raise RuntimeError("Bazel did not identify exactly one shuttle-test-opt output")
+    shuttle_test_opt = paths[0] if paths[0].is_absolute() else jax_repository / paths[0]
+    return BUILD_COMMANDS, shuttle_test_opt
+
+
+def _one_wheel(directory: Path, prefix: str) -> Path:
+    matches = sorted(directory.glob(f"{prefix}-*.whl"))
+    if len(matches) != 1:
+        raise RuntimeError(f"expected exactly one built {prefix} wheel")
+    return matches[0]
+
+
+def _wheel_member(wheel: Path, suffix: str) -> bytes:
+    with zipfile.ZipFile(wheel) as archive:
+        matches = [name for name in archive.namelist() if name.endswith(suffix)]
+        if len(matches) != 1:
+            raise RuntimeError(f"wheel does not contain exactly one {suffix}")
+        return archive.read(matches[0])
+
+
+def _generate_mlir(shuttle_test_opt: Path, fixture: Path) -> str:
+    result = subprocess.run(
+        [
+            str(shuttle_test_opt),
+            str(fixture),
+            "--shuttle-gpu-executable-bundle-pipeline",
+            "--mlir-print-op-generic",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    if len(result.stdout.encode()) > _MAXIMUM_GENERATED_MLIR_BYTES:
+        raise RuntimeError("compiled MLIR exceeds the bounded evidence input size")
+    return result.stdout
 
 
 def assemble_transport(output: Path, transport: GpuTransport, ptxas: Path) -> dict[str, object]:
@@ -165,6 +236,11 @@ def materialize(arguments: argparse.Namespace) -> None:
         raise RuntimeError("builder argv differs from the sealed authorization")
     if not arguments.output.is_dir() or arguments.output.is_symlink():
         raise RuntimeError("builder output must be an existing real directory")
+    _prepare_directories(arguments.output)
+    if arguments.jax_repository.is_symlink() or not arguments.jax_repository.is_dir():
+        raise RuntimeError("JAX repository must be a real directory")
+    _require_fresh_output(arguments.bazel_output_root, "Bazel output root")
+    _require_fresh_output(arguments.wheel_output, "wheel output")
     if arguments.ptxas.is_symlink() or not arguments.ptxas.is_file():
         raise RuntimeError("ptxas must be a regular file")
     if arguments.bazel.is_symlink() or not arguments.bazel.is_file():
@@ -178,11 +254,19 @@ def materialize(arguments: argparse.Namespace) -> None:
     if _ptxas_version(arguments.ptxas) != document["toolchain"]["ptxas_version"]:
         raise RuntimeError("ptxas version differs from the sealed authorization")
 
-    if arguments.compiled_mlir.is_symlink() or not arguments.compiled_mlir.is_file():
-        raise RuntimeError("compiled MLIR must be a regular file")
-    if arguments.compiled_mlir.stat().st_size > _MAXIMUM_GENERATED_MLIR_BYTES:
-        raise RuntimeError("compiled MLIR exceeds the bounded evidence input size")
-    generated_mlir = arguments.compiled_mlir.read_text()
+    marin_repository = Path(__file__).resolve().parents[4]
+    _apply_jax_patches(arguments.jax_repository, document, marin_repository)
+    commands, shuttle_test_opt = _build_outputs(
+        arguments.jax_repository,
+        marin_repository,
+        arguments.bazel,
+        arguments.bazel_output_root,
+        arguments.wheel_output,
+    )
+    if commands != document["iris"]["build_commands"]:
+        raise RuntimeError("executed build commands differ from the sealed authorization")
+    generated_mlir = _generate_mlir(shuttle_test_opt, marin_repository / _FORWARD_FIXTURE)
+    _write_new(arguments.output / "compiler" / "generated.mlir", generated_mlir.encode())
     transport_bytes = extract_gpu_transport(generated_mlir)
     transport_path = arguments.output / "compiler" / "gpu-transport.bin"
     _write_new(transport_path, transport_bytes)
@@ -203,19 +287,43 @@ def materialize(arguments: argparse.Namespace) -> None:
     }
     _write_new(arguments.output / "assembly" / "ptxas-records.json", _canonical_json(records).encode())
 
-    transcript = json.loads(arguments.registration_transcript.read_text())
-    if type(transcript) is not dict or transcript.get("plugin_extension_sha256") != _sha256(
-        arguments.cuda_plugin_extension
-    ):
-        raise RuntimeError("registration transcript is not bound to the supplied CUDA plugin")
-    build_files = {
-        "jax_extension": (arguments.jax_extension, "jax-extension.so"),
-        "jax_common": (arguments.jax_common, "libjax-common.so"),
-        "cuda_plugin_extension": (arguments.cuda_plugin_extension, "cuda-plugin-extension.so"),
+    wheels = {
+        "jaxlib": _one_wheel(arguments.wheel_output, "jaxlib"),
+        "cuda_plugin": _one_wheel(arguments.wheel_output, "jax_cuda13_plugin"),
+        "cuda_pjrt": _one_wheel(arguments.wheel_output, "jax_cuda13_pjrt"),
     }
-    for source, destination in build_files.values():
-        _copy_new(source, arguments.output / "build" / destination)
-    _copy_new(arguments.registration_transcript, arguments.output / "build" / "registration-transcript.json")
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-deps", *map(str, wheels.values())],
+        check=True,
+    )
+    for key, name in (
+        ("jaxlib", "jaxlib.whl"),
+        ("cuda_plugin", "jax-cuda13-plugin.whl"),
+        ("cuda_pjrt", "jax-cuda13-pjrt.whl"),
+    ):
+        _write_new(arguments.output / "build" / name, wheels[key].read_bytes())
+    extracted = {
+        "jax-extension.so": _wheel_member(wheels["jaxlib"], "/_jax.so"),
+        "libjax-common.so": _wheel_member(wheels["jaxlib"], "/libjax_common.so"),
+        "cuda-plugin-extension.so": _wheel_member(wheels["cuda_plugin"], "/cuda_plugin_extension.so"),
+        "xla-cuda-plugin.so": _wheel_member(wheels["cuda_pjrt"], "/xla_cuda_plugin.so"),
+        "cuda-plugin-RECORD": _wheel_member(wheels["cuda_plugin"], ".dist-info/RECORD"),
+        "cuda-pjrt-RECORD": _wheel_member(wheels["cuda_pjrt"], ".dist-info/RECORD"),
+    }
+    for name, data in extracted.items():
+        _write_new(arguments.output / "build" / name, data)
+    transcript_path = arguments.output / "build" / "registration-transcript.json"
+    subprocess.run(
+        [
+            sys.executable,
+            str(marin_repository / "lib/shuttle/mlir/jax_patch/shuttle_jaxlib_gpu_ffi_registration.py"),
+            "--plugin-extension",
+            str(arguments.output / "build" / "cuda-plugin-extension.so"),
+            "--output",
+            str(transcript_path),
+        ],
+        check=True,
+    )
 
     manifest = {
         "schema_version": 1,
@@ -230,7 +338,11 @@ def materialize(arguments: argparse.Namespace) -> None:
         "jax_extension_sha256": _sha256(arguments.output / "build" / "jax-extension.so"),
         "jax_common_sha256": _sha256(arguments.output / "build" / "libjax-common.so"),
         "cuda_plugin_extension_sha256": _sha256(arguments.output / "build" / "cuda-plugin-extension.so"),
-        "commands": document["iris"]["build_commands"],
+        "cuda_pjrt_plugin_sha256": _sha256(arguments.output / "build" / "xla-cuda-plugin.so"),
+        "jaxlib_wheel_sha256": _sha256(arguments.output / "build" / "jaxlib.whl"),
+        "cuda_plugin_wheel_sha256": _sha256(arguments.output / "build" / "jax-cuda13-plugin.whl"),
+        "cuda_pjrt_wheel_sha256": _sha256(arguments.output / "build" / "jax-cuda13-pjrt.whl"),
+        "commands": commands,
     }
     _write_new(arguments.output / "build" / "gpu-build-manifest.json", _canonical_json(manifest).encode())
 
@@ -240,13 +352,11 @@ def main() -> int:
     parser.add_argument("--authorization-sha256", required=True)
     parser.add_argument("--challenge", required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--compiled-mlir", type=Path, required=True)
     parser.add_argument("--ptxas", type=Path, required=True)
     parser.add_argument("--bazel", type=Path, required=True)
-    parser.add_argument("--jax-extension", type=Path, required=True)
-    parser.add_argument("--jax-common", type=Path, required=True)
-    parser.add_argument("--cuda-plugin-extension", type=Path, required=True)
-    parser.add_argument("--registration-transcript", type=Path, required=True)
+    parser.add_argument("--jax-repository", type=Path, required=True)
+    parser.add_argument("--bazel-output-root", type=Path, required=True)
+    parser.add_argument("--wheel-output", type=Path, required=True)
     materialize(parser.parse_args())
     return 0
 

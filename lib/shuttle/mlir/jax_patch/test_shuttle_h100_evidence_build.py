@@ -1,14 +1,18 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
+from pathlib import Path
+
 import pytest
-from shuttle_h100_evidence_build import decode_mlir_byte_string, extract_gpu_transport, parse_ptxas_resources
+from gpu_transport import decode_mlir_byte_string, extract_gpu_transport
+from shuttle_h100_evidence_build import _prepare_directories, _write_new, parse_ptxas_resources
 
 
 def test_extract_gpu_transport_decodes_exact_mlir_byte_escapes() -> None:
     generated = (
-        r"stablehlo.custom_call @shuttle.gpu.executable_bundle.v1 "
-        r'{backend_config = {bundle_bytes = "SHUTGPU\00\ff\\\"tail"}}'
+        r'%0 = "stablehlo.custom_call"() '
+        r'<{api_version = 4 : i32, call_target_name = "shuttle.gpu.executable_bundle.v1", '
+        r'backend_config = {bundle_bytes = "SHUTGPU\00\ff\\\"tail"}}> : () -> tensor<1xi1>'
     )
 
     assert extract_gpu_transport(generated) == b'SHUTGPU\x00\xff\\"tail'
@@ -22,6 +26,10 @@ def test_extract_gpu_transport_decodes_exact_mlir_byte_escapes() -> None:
         r'bundle_bytes = "bad\q"',
         'bundle_bytes = "unterminated',
         'bundle_bytes = "bad\nraw"',
+        '// "stablehlo.custom_call" call_target_name = "shuttle.gpu.executable_bundle.v1" '
+        'api_version = 4 : i32 bundle_bytes = "SHUTGPU"',
+        '"stablehlo.custom_call"() <{api_version = 4 : i32, call_target_name = "attacker", '
+        'bundle_bytes = "SHUTGPU"}> : () -> tensor<1xi1>',
     ],
 )
 def test_extract_gpu_transport_rejects_missing_ambiguous_or_invalid_strings(generated: str) -> None:
@@ -52,3 +60,17 @@ def test_parse_ptxas_resources_requires_one_positive_spill_free_record() -> None
 def test_parse_ptxas_resources_rejects_incomplete_ambiguous_or_spilling_output(output: str) -> None:
     with pytest.raises(ValueError):
         parse_ptxas_resources(output)
+
+
+def test_evidence_writer_rejects_symlinked_output_ancestor(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    output = tmp_path / "output"
+    output.mkdir()
+    (output / "compiler").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="already exists"):
+        _prepare_directories(output)
+    with pytest.raises(RuntimeError, match="refusing to overwrite"):
+        _write_new(output / "compiler" / "escaped", b"forbidden")
+    assert not (outside / "escaped").exists()

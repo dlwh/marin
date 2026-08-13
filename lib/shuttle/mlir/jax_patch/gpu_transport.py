@@ -34,6 +34,8 @@ MAXIMUM_BLOCK_THREADS = 1024
 MAXIMUM_I64 = (1 << 63) - 1
 
 _DIGEST = re.compile(rb"[0-9a-f]{64}\Z")
+_HEX_ESCAPE = re.compile(r"[0-9A-Fa-f]{2}\Z")
+_BUNDLE_MARKER = 'bundle_bytes = "'
 _INVALID = "invalid Shuttle GPU executable transport"
 _Enum = TypeVar("_Enum", bound=StrEnum)
 
@@ -173,6 +175,62 @@ class GpuTransport:
 
 class _InvalidTransport(Exception):
     pass
+
+
+def decode_mlir_byte_string(text: str, start: int = 0) -> tuple[bytes, int]:
+    """Decode one MLIR quoted byte string beginning after its opening quote."""
+    decoded = bytearray()
+    position = start
+    while position < len(text):
+        character = text[position]
+        if character == '"':
+            return bytes(decoded), position + 1
+        if character != "\\":
+            codepoint = ord(character)
+            if codepoint < 0x20 or codepoint > 0x7E:
+                raise ValueError("MLIR bundle string contains a non-ASCII literal")
+            decoded.append(codepoint)
+            position += 1
+            continue
+        if position + 1 >= len(text):
+            raise ValueError("MLIR bundle string ends in an incomplete escape")
+        escaped = text[position + 1]
+        if escaped in {'"', "\\"}:
+            decoded.append(ord(escaped))
+            position += 2
+            continue
+        token = text[position + 1 : position + 3]
+        if len(token) != 2 or _HEX_ESCAPE.fullmatch(token) is None:
+            raise ValueError("MLIR bundle string contains an unsupported escape")
+        decoded.append(int(token, 16))
+        position += 3
+    raise ValueError("MLIR bundle string is unterminated")
+
+
+def extract_gpu_transport(generated_mlir: str) -> bytes:
+    """Extract the bundle from one parser-canonicalized Shuttle custom call."""
+    operation_lines = [line for line in generated_mlir.splitlines() if '"stablehlo.custom_call"' in line]
+    if len(operation_lines) != 1 or operation_lines[0].lstrip().startswith("//"):
+        raise ValueError("canonical MLIR must contain exactly one StableHLO custom call")
+    operation = operation_lines[0]
+    if operation.count('call_target_name = "shuttle.gpu.executable_bundle.v1"') != 1:
+        raise ValueError("canonical MLIR must contain the exact Shuttle GPU target")
+    if operation.count("api_version = 4 : i32") != 1:
+        raise ValueError("canonical MLIR must contain the API-v4 custom call")
+    starts: list[int] = []
+    position = 0
+    while True:
+        found = operation.find(_BUNDLE_MARKER, position)
+        if found < 0:
+            break
+        starts.append(found + len(_BUNDLE_MARKER))
+        position = starts[-1]
+    if len(starts) != 1:
+        raise ValueError("generated MLIR must contain exactly one bundle_bytes string")
+    transport, end = decode_mlir_byte_string(operation, starts[0])
+    if operation.find(_BUNDLE_MARKER, end) >= 0:
+        raise ValueError("generated MLIR contains multiple bundle_bytes strings")
+    return transport
 
 
 class _Reader:

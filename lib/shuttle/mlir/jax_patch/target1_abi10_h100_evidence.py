@@ -16,7 +16,7 @@ from typing import Any
 import ml_dtypes
 import numpy as np
 from acceptance_contract import EVENT_FIELDS, ObserverIdentity
-from gpu_transport import GpuTransport, load_gpu_transport
+from gpu_transport import GpuTransport, extract_gpu_transport, load_gpu_transport
 from target1_abi10_h100_forward_contract import (
     CANONICAL_OPTIONS,
     FINAL_MODULE_SHA256,
@@ -608,6 +608,9 @@ def validate_gpu_artifacts(artifact: ArtifactBundle, authorization: Authorizatio
     """Join the independent decoder, PTX files, cubins, and ptxas records."""
     document = authorization.decoded()
     transport = load_gpu_transport(artifact.path_for("gpu_transport"))
+    generated_mlir = artifact.path_for("compiled_mlir").read_text()
+    if extract_gpu_transport(generated_mlir) != artifact.path_for("gpu_transport").read_bytes():
+        raise ValueError("generated MLIR custom call differs from the sealed GPU transport")
     expected = document["generated_bundle"]
     _equal(transport.transport_root, expected["transport_sha256"], "GPU transport SHA-256")
     _equal(transport.device_root, expected["device_fingerprint"], "GPU device fingerprint")
@@ -704,6 +707,9 @@ def validate_observer_and_cache_artifacts(artifact: ArtifactBundle, authorizatio
         "jax_extension_sha256": _file_sha256(artifact.path_for("jax_extension")),
         "jax_common_sha256": _file_sha256(artifact.path_for("jax_common")),
         "cuda_plugin_extension_sha256": _file_sha256(artifact.path_for("cuda_plugin_extension")),
+        "cuda_pjrt_plugin_sha256": _file_sha256(artifact.path_for("cuda_pjrt_plugin")),
+        "cuda_plugin_record_sha256": _file_sha256(artifact.path_for("cuda_plugin_record")),
+        "cuda_pjrt_record_sha256": _file_sha256(artifact.path_for("cuda_pjrt_record")),
     }
     for name, report in reports.items():
         identity = _closed(
@@ -831,6 +837,10 @@ def validate_gpu_build_artifacts(artifact: ArtifactBundle, authorization: Author
             "jax_extension_sha256",
             "jax_common_sha256",
             "cuda_plugin_extension_sha256",
+            "cuda_pjrt_plugin_sha256",
+            "jaxlib_wheel_sha256",
+            "cuda_plugin_wheel_sha256",
+            "cuda_pjrt_wheel_sha256",
             "commands",
         },
         "GPU build manifest",
@@ -855,6 +865,13 @@ def validate_gpu_build_artifacts(artifact: ArtifactBundle, authorization: Author
         _file_sha256(artifact.path_for("cuda_plugin_extension")),
         "rebuilt CUDA plugin extension SHA-256",
     )
+    for field, role in (
+        ("cuda_pjrt_plugin_sha256", "cuda_pjrt_plugin"),
+        ("jaxlib_wheel_sha256", "jaxlib_wheel"),
+        ("cuda_plugin_wheel_sha256", "cuda_plugin_wheel"),
+        ("cuda_pjrt_wheel_sha256", "cuda_pjrt_wheel"),
+    ):
+        _equal(manifest[field], _file_sha256(artifact.path_for(role)), f"GPU build manifest.{field}")
     _equal(manifest["bazel_version"], document["toolchain"]["bazel_version"], "GPU build manifest.bazel_version")
     _equal(manifest["bazel_sha256"], document["toolchain"]["bazel_sha256"], "GPU build manifest.bazel_sha256")
     commands = _sequence(manifest["commands"], "GPU build manifest.commands")

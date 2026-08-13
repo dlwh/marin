@@ -8,6 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from shuttle_h100_evidence_subject import worker_command
 from target1_abi10_h100_evidence import (
     AUTHORIZATION_ID,
     REQUIRED_ARTIFACT_ROLES,
@@ -38,6 +39,14 @@ REVISION = "b" * 40
 PTX_SLICES = [hashlib.sha256(f"ptx-{index}".encode()).hexdigest() for index in range(19)]
 SUBJECT_JOB = f"/dlwh/abi10-h100-{CHALLENGE[:12]}-subject-123456789abc"
 VERIFIER_JOB = f"/dlwh/abi10-h100-{CHALLENGE[:12]}-verify-123456789abc"
+
+
+def test_worker_command_propagates_the_sealed_authorization(tmp_path: Path) -> None:
+    command = worker_command("populate", tmp_path, tmp_path / "cache", tmp_path / "report", SHA, CHALLENGE)
+
+    assert command[command.index("--authorization-sha256") + 1] == SHA
+    assert command[command.index("--challenge") + 1] == CHALLENGE
+    assert command[command.index("--worker") + 1] == "populate"
 
 
 def _write_json(path: Path, value: object) -> None:

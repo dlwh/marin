@@ -5,6 +5,7 @@
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
 import os
 import shutil
@@ -78,15 +79,42 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _mapped_files() -> set[Path]:
+    maps = Path("/proc/self/maps")
+    if not maps.is_file():
+        raise RuntimeError("H100 evidence requires Linux /proc/self/maps")
+    paths = set()
+    for line in maps.read_text().splitlines():
+        fields = line.split(maxsplit=5)
+        if len(fields) == 6 and fields[5].startswith("/"):
+            path = Path(fields[5].removesuffix(" (deleted)")).resolve()
+            if path.is_file() and not path.is_symlink():
+                paths.add(path)
+    return paths
+
+
+def _one_mapped(mapped: set[Path], name: str) -> Path:
+    matches = [path for path in mapped if path.name == name]
+    if len(matches) != 1:
+        raise RuntimeError(f"expected exactly one mapped {name}")
+    return matches[0]
+
+
+def _distribution_record(distribution: importlib.metadata.Distribution) -> Path:
+    files = distribution.files
+    if files is None:
+        raise RuntimeError("CUDA plugin distribution file roster is missing")
+    records = [file for file in files if file.name == "RECORD" and ".dist-info" in file.as_posix()]
+    if len(records) != 1:
+        raise RuntimeError("CUDA plugin distribution has no unique RECORD")
+    return Path(distribution.locate_file(records[0])).resolve()
+
+
 def _runtime_binary_identity() -> dict[str, str]:
+    mapped = _mapped_files()
     extension = Path(_jax.__file__).resolve()
-    common_candidates = [
-        extension.parent / "libjax_common.so",
-        extension.parent / "libjax_common.dylib",
-    ]
-    common = [path for path in common_candidates if path.is_file() and not path.is_symlink()]
-    if len(common) != 1:
-        raise RuntimeError("could not identify exactly one loaded JAX common library")
+    if extension not in mapped:
+        raise RuntimeError("jaxlib._jax module file is not mapped")
     plugin_package = sys.modules.get("jax_plugins.cuda")
     plugin_module = getattr(plugin_package, "cuda_plugin_extension", None)
     plugin_file = getattr(plugin_module, "__file__", None)
@@ -95,10 +123,25 @@ def _runtime_binary_identity() -> dict[str, str]:
     plugin = Path(plugin_file).resolve()
     if plugin.is_symlink() or not plugin.is_file():
         raise RuntimeError("loaded CUDA plugin extension is not a regular file")
+    if plugin not in mapped:
+        raise RuntimeError("CUDA plugin extension module file is not mapped")
+    common = _one_mapped(mapped, "libjax_common.so")
+    pjrt = _one_mapped(mapped, "xla_cuda_plugin.so")
+    plugin_distribution = importlib.metadata.distribution("jax-cuda13-plugin")
+    pjrt_distribution = importlib.metadata.distribution("jax-cuda13-pjrt")
+    if plugin_distribution.version != JAXLIB_VERSION or pjrt_distribution.version != JAXLIB_VERSION:
+        raise RuntimeError("CUDA plugin distributions differ from exact JAX 0.10.1")
+    plugin_record = _distribution_record(plugin_distribution)
+    pjrt_record = _distribution_record(pjrt_distribution)
+    if not plugin_record.is_file() or not pjrt_record.is_file():
+        raise RuntimeError("CUDA plugin distribution RECORD is missing")
     return {
         "jax_extension_sha256": _sha256(extension),
-        "jax_common_sha256": _sha256(common[0]),
+        "jax_common_sha256": _sha256(common),
         "cuda_plugin_extension_sha256": _sha256(plugin),
+        "cuda_pjrt_plugin_sha256": _sha256(pjrt),
+        "cuda_plugin_record_sha256": _sha256(plugin_record),
+        "cuda_pjrt_record_sha256": _sha256(pjrt_record),
     }
 
 
@@ -214,7 +257,40 @@ def run_worker(worker: str, output: Path, cache_directory: Path) -> dict[str, ob
     raise ValueError(f"unknown H100 evidence worker: {worker}")
 
 
-def run_orchestrator(output: Path, collector_job_id: str, role_paths_path: Path) -> dict[str, object]:
+def worker_command(
+    worker: str,
+    output: Path,
+    cache_directory: Path,
+    report_path: Path,
+    authorization_sha256: str,
+    challenge: str,
+) -> list[str]:
+    """Return the exact authorization-bound child-process command."""
+    return [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--authorization-sha256",
+        authorization_sha256,
+        "--challenge",
+        challenge,
+        "--worker",
+        worker,
+        "--output",
+        str(output),
+        "--cache-directory",
+        str(cache_directory),
+        "--report",
+        str(report_path),
+    ]
+
+
+def run_orchestrator(
+    output: Path,
+    collector_job_id: str,
+    role_paths_path: Path,
+    authorization_sha256: str,
+    challenge: str,
+) -> dict[str, object]:
     if not output.is_dir() or output.is_symlink():
         raise RuntimeError("subject output must be a prepopulated real directory")
     cache_directory = output / "persistent-cache"
@@ -224,18 +300,7 @@ def run_orchestrator(output: Path, collector_job_id: str, role_paths_path: Path)
     for worker in WORKERS:
         report_path = output / (f"cache_{worker}_report" if worker != "baseline" else "baseline_report")
         subprocess.run(
-            [
-                sys.executable,
-                str(Path(__file__).resolve()),
-                "--worker",
-                worker,
-                "--output",
-                str(output),
-                "--cache-directory",
-                str(cache_directory),
-                "--report",
-                str(report_path),
-            ],
+            worker_command(worker, output, cache_directory, report_path, authorization_sha256, challenge),
             check=True,
             env=environment,
         )
@@ -267,11 +332,22 @@ def main() -> int:
     parser.add_argument("--collector-job-id")
     parser.add_argument("--role-paths", type=Path)
     arguments = parser.parse_args()
-    del arguments.authorization_sha256, arguments.challenge
+    authorization = load_authorization()
+    if (
+        arguments.authorization_sha256 != authorization.sha256
+        or arguments.challenge != authorization.decoded()["challenge"]
+    ):
+        raise RuntimeError("subject argv differs from the sealed authorization")
     if arguments.worker is None:
         if arguments.collector_job_id is None or arguments.role_paths is None:
             parser.error("orchestrator mode requires --collector-job-id and --role-paths")
-        result = run_orchestrator(arguments.output, arguments.collector_job_id, arguments.role_paths)
+        result = run_orchestrator(
+            arguments.output,
+            arguments.collector_job_id,
+            arguments.role_paths,
+            arguments.authorization_sha256,
+            arguments.challenge,
+        )
     else:
         if arguments.cache_directory is None or arguments.report is None:
             parser.error("worker mode requires --cache-directory and --report")
