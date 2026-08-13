@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 import subprocess
+import zipfile
 from collections.abc import Mapping
 from contextlib import chdir
 from dataclasses import dataclass
@@ -152,6 +153,13 @@ REQUIRED_ARTIFACT_ROLES = frozenset(
         "jax_extension",
         "jax_common",
         "cuda_plugin_extension",
+        "cuda_pjrt_plugin",
+        "cuda_plugin_record",
+        "cuda_pjrt_record",
+        "jaxlib_wheel",
+        "cuda_plugin_wheel",
+        "cuda_pjrt_wheel",
+        "compiled_mlir",
         "registration_transcript",
         "observer_populate",
         "observer_reuse",
@@ -872,6 +880,26 @@ def validate_gpu_build_artifacts(artifact: ArtifactBundle, authorization: Author
         ("cuda_pjrt_wheel_sha256", "cuda_pjrt_wheel"),
     ):
         _equal(manifest[field], _file_sha256(artifact.path_for(role)), f"GPU build manifest.{field}")
+    for wheel_role, suffix, extracted_role in (
+        ("jaxlib_wheel", "/_jax.so", "jax_extension"),
+        ("jaxlib_wheel", "/libjax_common.so", "jax_common"),
+        ("cuda_plugin_wheel", "/cuda_plugin_extension.so", "cuda_plugin_extension"),
+        ("cuda_plugin_wheel", ".dist-info/RECORD", "cuda_plugin_record"),
+        ("cuda_pjrt_wheel", "/xla_cuda_plugin.so", "cuda_pjrt_plugin"),
+        ("cuda_pjrt_wheel", ".dist-info/RECORD", "cuda_pjrt_record"),
+    ):
+        wheel_path = artifact.path_for(wheel_role)
+        extracted_path = artifact.path_for(extracted_role)
+        if wheel_path.stat().st_size > 512 * 1024 * 1024 or extracted_path.stat().st_size > 512 * 1024 * 1024:
+            raise ValueError("GPU wheel evidence exceeds the bounded artifact size")
+        with zipfile.ZipFile(wheel_path) as wheel:
+            members = [name for name in wheel.namelist() if name.endswith(suffix)]
+            if (
+                len(members) != 1
+                or wheel.getinfo(members[0]).file_size != extracted_path.stat().st_size
+                or wheel.read(members[0]) != extracted_path.read_bytes()
+            ):
+                raise ValueError(f"{extracted_role} differs from the exact built wheel member")
     _equal(manifest["bazel_version"], document["toolchain"]["bazel_version"], "GPU build manifest.bazel_version")
     _equal(manifest["bazel_sha256"], document["toolchain"]["bazel_sha256"], "GPU build manifest.bazel_sha256")
     commands = _sequence(manifest["commands"], "GPU build manifest.commands")

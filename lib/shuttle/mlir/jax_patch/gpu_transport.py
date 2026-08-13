@@ -213,9 +213,11 @@ def extract_gpu_transport(generated_mlir: str) -> bytes:
     if len(operation_lines) != 1 or operation_lines[0].lstrip().startswith("//"):
         raise ValueError("canonical MLIR must contain exactly one StableHLO custom call")
     operation = operation_lines[0]
+    if "//" in operation or operation.count("call_target_name = ") != 1:
+        raise ValueError("canonical MLIR custom call contains comments or ambiguous target attributes")
     if operation.count('call_target_name = "shuttle.gpu.executable_bundle.v1"') != 1:
         raise ValueError("canonical MLIR must contain the exact Shuttle GPU target")
-    if operation.count("api_version = 4 : i32") != 1:
+    if operation.count("api_version = ") != 1 or operation.count("api_version = 4 : i32") != 1:
         raise ValueError("canonical MLIR must contain the API-v4 custom call")
     starts: list[int] = []
     position = 0

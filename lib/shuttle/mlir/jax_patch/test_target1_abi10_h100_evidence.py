@@ -49,6 +49,12 @@ def test_worker_command_propagates_the_sealed_authorization(tmp_path: Path) -> N
     assert command[command.index("--worker") + 1] == "populate"
 
 
+def test_role_path_map_covers_the_exact_required_roster() -> None:
+    path = Path(__file__).with_name("target1-abi10-h100-forward-role-paths-v1.json")
+
+    assert set(json.loads(path.read_text())) == REQUIRED_ARTIFACT_ROLES
+
+
 def _write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
 

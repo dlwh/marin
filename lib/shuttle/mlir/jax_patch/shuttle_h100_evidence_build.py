@@ -3,16 +3,17 @@
 
 """Materialize bounded ABI 10 GPU compiler and assembly evidence.
 
-This collector does not build JAX, upload artifacts, or execute GPU kernels. It
-extracts the serialized transport from already-generated MLIR, validates it
-with the independent decoder, assembles every decoded PTX slice with the
-authorized ptxas binary, and records the exact supplied build artifacts.
+This collector builds the authorized JAX wheels and Shuttle compiler, extracts
+the serialized transport from parser-canonical MLIR, validates it with the
+independent decoder, and assembles every decoded PTX slice with the authorized
+ptxas binary. It does not upload artifacts or execute GPU kernels.
 """
 
 import argparse
 import hashlib
 import json
 import re
+import shlex
 import subprocess
 import sys
 import zipfile
@@ -26,13 +27,6 @@ _SPILL_COUNTS = re.compile(r"([0-9]+) bytes spill stores, ([0-9]+) bytes spill l
 _MAXIMUM_GENERATED_MLIR_BYTES = 32 * 1024 * 1024
 _JAX_WHEELS = "jaxlib,jax-cuda-plugin,jax-cuda-pjrt"
 _FORWARD_FIXTURE = "lib/shuttle/mlir/test/Inputs/jax-0.10.1-bf16-row_fold_scale_44d152ecc3e9ff18-forward.mlir"
-BUILD_COMMANDS = [
-    "python3.12 build/build.py build --wheels=jaxlib,jax-cuda-plugin,jax-cuda-pjrt "
-    "--cuda_version=13.0.0 --cuda_compute_capabilities=9.0 --disable_nccl "
-    "--repo_env=ML_WHEEL_TYPE=release --override_repository=shuttle_mlir --local_resources=host_cpus=32",
-    "bazel build @shuttle_mlir//:shuttle-test-opt --override_repository=shuttle_mlir --local_resources=host_cpus=32",
-    "python3.12 -m pip install --force-reinstall --no-deps <built-jaxlib> <built-cuda-plugin> <built-cuda-pjrt>",
-]
 
 
 def _sha256(path: Path) -> str:
@@ -60,7 +54,12 @@ def parse_ptxas_resources(stderr: str) -> tuple[int, int]:
 
 
 def _write_new(path: Path, data: bytes) -> None:
-    if path.exists() or path.is_symlink() or path.parent.is_symlink() or not path.parent.is_dir():
+    if (
+        path.exists()
+        or path.is_symlink()
+        or any(parent.is_symlink() for parent in path.parents)
+        or not path.parent.is_dir()
+    ):
         raise RuntimeError(f"refusing to overwrite evidence artifact: {path}")
     path.write_bytes(data)
 
@@ -94,7 +93,12 @@ def _prepare_directories(output: Path) -> None:
 
 
 def _require_fresh_output(path: Path, name: str) -> None:
-    if path.exists() or path.is_symlink() or path.parent.is_symlink() or not path.parent.is_dir():
+    if (
+        path.exists()
+        or path.is_symlink()
+        or any(parent.is_symlink() for parent in path.parents)
+        or not path.parent.is_dir()
+    ):
         raise RuntimeError(f"{name} must be a new path under a real existing parent")
 
 
@@ -119,6 +123,7 @@ def _build_outputs(
     bazel: Path,
     bazel_output_root: Path,
     wheel_output: Path,
+    authorized_commands: list[str],
 ) -> tuple[list[str], Path]:
     command = [
         sys.executable,
@@ -135,7 +140,7 @@ def _build_outputs(
         f"--bazel_options=--override_repository=shuttle_mlir={marin_repository / 'lib/shuttle/mlir'}",
         "--bazel_options=--local_resources=host_cpus=32",
     ]
-    subprocess.run(command, cwd=jax_repository, check=True)
+    command_text = shlex.join(command)
     shuttle_command = [
         str(bazel),
         f"--output_user_root={bazel_output_root}",
@@ -144,6 +149,10 @@ def _build_outputs(
         "@shuttle_mlir//:shuttle-test-opt",
         "--local_resources=host_cpus=32",
     ]
+    shuttle_command_text = shlex.join(shuttle_command)
+    if authorized_commands[:2] != [command_text, shuttle_command_text]:
+        raise RuntimeError("build argv differs from the sealed authorization")
+    subprocess.run(command, cwd=jax_repository, check=True)
     subprocess.run(shuttle_command, cwd=jax_repository, check=True)
     query = subprocess.run(
         [
@@ -163,7 +172,7 @@ def _build_outputs(
     if len(paths) != 1:
         raise RuntimeError("Bazel did not identify exactly one shuttle-test-opt output")
     shuttle_test_opt = paths[0] if paths[0].is_absolute() else jax_repository / paths[0]
-    return BUILD_COMMANDS, shuttle_test_opt
+    return [command_text, shuttle_command_text], shuttle_test_opt
 
 
 def _one_wheel(directory: Path, prefix: str) -> Path:
@@ -234,10 +243,18 @@ def materialize(arguments: argparse.Namespace) -> None:
     document = authorization.decoded()
     if arguments.authorization_sha256 != authorization.sha256 or arguments.challenge != document["challenge"]:
         raise RuntimeError("builder argv differs from the sealed authorization")
-    if not arguments.output.is_dir() or arguments.output.is_symlink():
+    if (
+        not arguments.output.is_dir()
+        or arguments.output.is_symlink()
+        or any(parent.is_symlink() for parent in arguments.output.parents)
+    ):
         raise RuntimeError("builder output must be an existing real directory")
     _prepare_directories(arguments.output)
-    if arguments.jax_repository.is_symlink() or not arguments.jax_repository.is_dir():
+    if (
+        arguments.jax_repository.is_symlink()
+        or any(parent.is_symlink() for parent in arguments.jax_repository.parents)
+        or not arguments.jax_repository.is_dir()
+    ):
         raise RuntimeError("JAX repository must be a real directory")
     _require_fresh_output(arguments.bazel_output_root, "Bazel output root")
     _require_fresh_output(arguments.wheel_output, "wheel output")
@@ -262,9 +279,8 @@ def materialize(arguments: argparse.Namespace) -> None:
         arguments.bazel,
         arguments.bazel_output_root,
         arguments.wheel_output,
+        document["iris"]["build_commands"],
     )
-    if commands != document["iris"]["build_commands"]:
-        raise RuntimeError("executed build commands differ from the sealed authorization")
     generated_mlir = _generate_mlir(shuttle_test_opt, marin_repository / _FORWARD_FIXTURE)
     _write_new(arguments.output / "compiler" / "generated.mlir", generated_mlir.encode())
     transport_bytes = extract_gpu_transport(generated_mlir)
@@ -292,10 +308,20 @@ def materialize(arguments: argparse.Namespace) -> None:
         "cuda_plugin": _one_wheel(arguments.wheel_output, "jax_cuda13_plugin"),
         "cuda_pjrt": _one_wheel(arguments.wheel_output, "jax_cuda13_pjrt"),
     }
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-deps", *map(str, wheels.values())],
-        check=True,
-    )
+    install_command = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--force-reinstall",
+        "--no-deps",
+        *map(str, wheels.values()),
+    ]
+    install_command_text = shlex.join(install_command)
+    if document["iris"]["build_commands"] != [*commands, install_command_text]:
+        raise RuntimeError("wheel install argv differs from the sealed authorization")
+    subprocess.run(install_command, check=True)
+    commands.append(install_command_text)
     for key, name in (
         ("jaxlib", "jaxlib.whl"),
         ("cuda_plugin", "jax-cuda13-plugin.whl"),

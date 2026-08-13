@@ -30,6 +30,9 @@ def test_extract_gpu_transport_decodes_exact_mlir_byte_escapes() -> None:
         'api_version = 4 : i32 bundle_bytes = "SHUTGPU"',
         '"stablehlo.custom_call"() <{api_version = 4 : i32, call_target_name = "attacker", '
         'bundle_bytes = "SHUTGPU"}> : () -> tensor<1xi1>',
+        '%0 = "stablehlo.custom_call"() <{api_version = 0 : i32, call_target_name = "attacker"}> '
+        ': () -> tensor<1xi1> // call_target_name = "shuttle.gpu.executable_bundle.v1" '
+        'api_version = 4 : i32 bundle_bytes = "SHUTGPU\\00evil"',
     ],
 )
 def test_extract_gpu_transport_rejects_missing_ambiguous_or_invalid_strings(generated: str) -> None:
@@ -74,3 +77,13 @@ def test_evidence_writer_rejects_symlinked_output_ancestor(tmp_path: Path) -> No
     with pytest.raises(RuntimeError, match="refusing to overwrite"):
         _write_new(output / "compiler" / "escaped", b"forbidden")
     assert not (outside / "escaped").exists()
+
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / "link").symlink_to(outside, target_is_directory=True)
+    escaped_root = nested / "link" / "evidence"
+    escaped_root.mkdir()
+    (escaped_root / "compiler").mkdir()
+    with pytest.raises(RuntimeError, match="refusing to overwrite"):
+        _write_new(escaped_root / "compiler" / "nested-escape", b"forbidden")
+    assert not (outside / "evidence" / "compiler" / "nested-escape").exists()
