@@ -23,6 +23,7 @@
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
 #include "shuttle/IR/ShuttleDialect.h"
+#include "shuttle/IR/ShuttleOps.h"
 #include "shuttle/Runtime/GpuExecutable.h"
 #include "shuttle/Runtime/GpuFfi.h"
 #include "shuttle/Transforms/Passes.h"
@@ -494,13 +495,71 @@ TEST(GpuTransportV2Test, FoldDynamicSharedMemoryIsDeclaredAtModuleScope) {
                         launch.codeLength);
     size_t declaration =
         ptx.find(".extern .shared .align 4 .b8 shuttle_smem[];");
+    size_t version = ptx.find(".version 8.0");
+    size_t target = ptx.find(".target sm_90");
+    size_t addressSize = ptx.find(".address_size 64");
     size_t entry = ptx.find(".visible .entry shuttle_entry(");
+    ASSERT_EQ(version, 0);
+    ASSERT_NE(target, llvm::StringRef::npos);
+    ASSERT_NE(addressSize, llvm::StringRef::npos);
     ASSERT_NE(declaration, llvm::StringRef::npos);
     ASSERT_NE(entry, llvm::StringRef::npos);
+    EXPECT_LT(version, target);
+    EXPECT_LT(target, addressSize);
+    EXPECT_LT(addressSize, declaration);
     EXPECT_LT(declaration, entry);
     EXPECT_EQ(ptx.find(".extern .shared", entry), llvm::StringRef::npos);
   }
   EXPECT_EQ(foldCount, 1);
+}
+
+TEST(GpuTransportV2Test, GeneratedBundleFingerprintBindsEveryClosedRoot) {
+  auto built = buildFixture();
+  ASSERT_TRUE(built);
+  auto device = *built->module->getOps<mlir::shuttle::DeviceModuleOp>().begin();
+  auto entry =
+      *device.getBody().front().getOps<mlir::shuttle::DeviceEntryOp>().begin();
+  auto abi = *built->module->getOps<mlir::shuttle::InvocationAbiOp>().begin();
+  auto slot =
+      *abi.getBody().front().getOps<mlir::shuttle::InvocationSlotOp>().begin();
+  auto bundle =
+      *built->module->getOps<mlir::shuttle::ExecutableBundleOp>().begin();
+  const std::string baseline =
+      mlir::shuttle::generatedGpuBundleFingerprint(*built->module);
+  ASSERT_FALSE(baseline.empty());
+
+  auto expectMutationChangesFingerprint = [&](mlir::Operation *operation,
+                                              mlir::StringRef attribute,
+                                              mlir::Attribute mutation) {
+    mlir::Attribute original = operation->getAttr(attribute);
+    ASSERT_TRUE(original);
+    operation->setAttr(attribute, mutation);
+    EXPECT_NE(mlir::shuttle::generatedGpuBundleFingerprint(*built->module),
+              baseline);
+    operation->setAttr(attribute, original);
+    EXPECT_EQ(mlir::shuttle::generatedGpuBundleFingerprint(*built->module),
+              baseline);
+  };
+
+  llvm::SmallVector<int8_t> code(device.getCode());
+  code.front() ^= 1;
+  expectMutationChangesFingerprint(
+      device, "code", mlir::DenseI8ArrayAttr::get(built->context.get(), code));
+  expectMutationChangesFingerprint(
+      device, "schema_version",
+      mlir::IntegerAttr::get(mlir::IntegerType::get(built->context.get(), 64),
+                             device.getSchemaVersion() + 1));
+  llvm::SmallVector<int64_t> grid(*entry.getGrid());
+  ++grid.front();
+  expectMutationChangesFingerprint(
+      entry, "grid", mlir::DenseI64ArrayAttr::get(built->context.get(), grid));
+  expectMutationChangesFingerprint(
+      slot, "required_bytes",
+      mlir::IntegerAttr::get(mlir::IntegerType::get(built->context.get(), 64),
+                             slot.getRequiredBytes() + 1));
+  expectMutationChangesFingerprint(
+      bundle, "device_module_fingerprint",
+      mlir::StringAttr::get(built->context.get(), std::string(64, '0')));
 }
 
 class SyntheticAllocator final

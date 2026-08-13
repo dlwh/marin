@@ -2785,6 +2785,22 @@ std::string normalizedModuleFingerprintImpl(ModuleOp module) {
   return sha256(normalized);
 }
 
+std::string generatedGpuBundleFingerprintImpl(ModuleOp module) {
+  SmallVector<DeviceModuleOp> devices(module.getOps<DeviceModuleOp>());
+  SmallVector<InvocationAbiOp> abis(module.getOps<InvocationAbiOp>());
+  SmallVector<ExecutableBundleOp> bundles(module.getOps<ExecutableBundleOp>());
+  if (devices.size() != 1 || abis.size() != 1 || bundles.size() != 1)
+    return {};
+  std::string normalized;
+  llvm::raw_string_ostream stream(normalized);
+  stream << "device_module:" << deviceModuleFingerprint(devices.front())
+         << "\ninvocation_abi:" << invocationAbiFingerprint(abis.front())
+         << "\nexecutable_bundle:"
+         << executableBundleFingerprint(bundles.front()) << '\n';
+  stream.flush();
+  return sha256(normalized);
+}
+
 bool isMaterializationFingerprintProvenance(StringRef name) {
   return name == kSourceRefsAttribute || name == kSelectedAttribute ||
          name == kFunctionOrdinalAttribute || name == kOperationRefAttribute ||
@@ -3876,14 +3892,12 @@ FailureOr<int64_t> staticElementCount(RankedTensorType type) {
 struct PtxEmitter {
   explicit PtxEmitter(int64_t arity) : arity(arity), stream(text) {}
 
-  void declareDynamicSharedMemory() {
-    stream << ".extern .shared .align 4 .b8 shuttle_smem[];\n";
-  }
-
-  void header(StringRef certificate) {
-    stream << ".version 8.0\n.target sm_90\n.address_size 64\n"
-              "// shuttle structural certificate: "
-           << certificate << "\n.visible .entry shuttle_entry(";
+  void header(StringRef certificate, bool usesDynamicSharedMemory = false) {
+    stream << ".version 8.0\n.target sm_90\n.address_size 64\n";
+    if (usesDynamicSharedMemory)
+      stream << ".extern .shared .align 4 .b8 shuttle_smem[];\n";
+    stream << "// shuttle structural certificate: " << certificate
+           << "\n.visible .entry shuttle_entry(";
     for (int64_t index = 0; index < arity; ++index) {
       if (index)
         stream << ", ";
@@ -4102,8 +4116,7 @@ FailureOr<std::string> emitFoldPtx(FoldOp fold, ScheduleTaskOp task) {
       task.getWorkgroupThreads() != 256 || task.getScratchBytes() != 1024)
     return failure();
   PtxEmitter ptx(3);
-  ptx.declareDynamicSharedMemory();
-  ptx.header(task.getSemanticFingerprint());
+  ptx.header(task.getSemanticFingerprint(), /*usesDynamicSharedMemory=*/true);
   ptx.stream << "  mov.u32 %r0, %tid.x;\n"
                 "  mov.u32 %r1, %ctaid.x;\n"
                 "  setp.ge.u32 %p0, %r1, 2048;\n"
@@ -5326,8 +5339,9 @@ void emitObserverSnapshot(
   invocation->emit(
       phase, std::move(regionMembership), std::move(coverageManifest),
       std::move(unsupportedFingerprint),
-      phase == ShuttlePipelinePhase::GeneratedBundle ||
-              phase == ShuttlePipelinePhase::FinalErasure
+      phase == ShuttlePipelinePhase::GeneratedBundle
+          ? generatedGpuBundleFingerprintImpl(module)
+      : phase == ShuttlePipelinePhase::FinalErasure
           ? normalizedModuleFingerprintImpl(module)
           : std::string{},
       phase == ShuttlePipelinePhase::FinalErasure, failurePass.str());
@@ -5508,6 +5522,10 @@ private:
 
 std::string normalizedStablehloFingerprint(ModuleOp module) {
   return normalizedModuleFingerprintImpl(module);
+}
+
+std::string generatedGpuBundleFingerprint(ModuleOp module) {
+  return generatedGpuBundleFingerprintImpl(module);
 }
 
 std::unique_ptr<Pass> createAnnotateSourcePass() {

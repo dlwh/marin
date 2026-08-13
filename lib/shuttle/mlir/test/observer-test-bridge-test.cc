@@ -122,9 +122,9 @@ TEST(ShuttleObserverTestBridgeTest,
   EXPECT_FALSE(events[1].noShuttleSemantics);
   EXPECT_TRUE(events[2].noShuttleSemantics);
   EXPECT_EQ(events[1].normalizedModuleFingerprint,
-            "fbdca3266a5a927e0f27813b53df7f37305e9a1561f5e295d560c2e66a9c0cdb");
+            "910b4192a0fc9d04986ca941d1508ffb7352430526f615e30b242aadc3ae4bf7");
   EXPECT_EQ(events[2].normalizedModuleFingerprint,
-            "a81d64b4bfe67da8865ab686918a88bdd3b008f1c7d7b9f0d5a871413310086c");
+            "a7a977e017eb62dd277d2fe56db3dff3e2fff6ce6538e64d69821ed0dce23914");
 }
 
 TEST(ShuttleObserverTestBridgeTest,

@@ -44,6 +44,7 @@ std::unique_ptr<Pass> createVerifyGpuExecutableBundlePass();
 std::unique_ptr<Pass> createReplaceWithGpuExecutableBundlePass();
 
 std::string normalizedStablehloFingerprint(ModuleOp module);
+std::string generatedGpuBundleFingerprint(ModuleOp module);
 
 void buildShuttleStablehloPipeline(
     OpPassManager &manager, const ShuttlePipelineOptions &options,

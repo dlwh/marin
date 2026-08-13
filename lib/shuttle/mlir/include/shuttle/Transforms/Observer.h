@@ -48,11 +48,11 @@ ShuttlePipelineIdentity
 shuttlePipelineIdentity(const ShuttlePipelineOptions &options);
 
 enum class ShuttlePipelinePhase {
-  AlgebraCoverage,
-  LoweredCoverage,
-  GeneratedBundle,
-  FinalErasure,
-  Failure,
+  AlgebraCoverage = 0,
+  LoweredCoverage = 1,
+  FinalErasure = 2,
+  Failure = 3,
+  GeneratedBundle = 4,
 };
 
 namespace detail {

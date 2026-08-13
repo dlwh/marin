@@ -11,6 +11,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, cast
 
+from target1_te_oracle_harness import validate_execution_identity
+
 CONTRACT_PATH = Path(__file__).with_name("target1-rowwise-bf16-abi10-h100-forward-source-ordered-v1.json")
 CONTRACT_ID = "target1_rowwise_bf16_abi10_h100_forward_source_ordered_v1"
 SCHEMA_VERSION = 1
@@ -42,6 +44,7 @@ INPUT_RAW_SHA256 = (
     "e90137a7f830b75f00ee6dae7c89bbd7fba30dfb31ff7951fec129441c170821",
 )
 REFERENCE_OUTPUT_ARRAY_DIGEST = "fe18afac66306e065ebf824c52cc6d95776e49521ed6209e405b58e40c934bdd"
+TRANSFORMER_ENGINE_COMMIT = "2e559f062497bef768dfbe9d7e45548fadeca80a"
 REFERENCE_LIMITS = {
     "max_absolute_error": 0.0078125,
     "mean_absolute_error": 0.0023046755673821195,
@@ -152,7 +155,7 @@ def load_contract(path: Path = CONTRACT_PATH) -> dict[str, Any]:
         "expert_oracle",
     )
     _equal(expert["transformer_engine_version"], "2.17.0", "expert_oracle.transformer_engine_version")
-    _revision(expert["source_commit"], "expert_oracle.source_commit")
+    _equal(expert["source_commit"], TRANSFORMER_ENGINE_COMMIT, "expert_oracle.source_commit")
     _equal(
         expert["required_forward_backend_pairs"],
         [list(pair) for pair in BACKEND_PAIRS],
@@ -182,7 +185,10 @@ def load_contract(path: Path = CONTRACT_PATH) -> dict[str, Any]:
 
 def validate_observation(document: object, contract: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Validate one sealed, untimed H100 observation for the exact ABI 10 cell."""
-    contract = load_contract() if contract is None else dict(contract)
+    sealed_contract = load_contract()
+    if contract is not None:
+        _equal(dict(contract), sealed_contract, "contract")
+    contract = sealed_contract
     root = _closed(
         document,
         {
@@ -190,6 +196,9 @@ def validate_observation(document: object, contract: Mapping[str, Any] | None = 
             "contract_id",
             "status",
             "coordinate",
+            "inputs",
+            "reference_output_array_digest",
+            "collector",
             "provenance",
             "ordinary_jax",
             "shuttle",
@@ -203,12 +212,22 @@ def validate_observation(document: object, contract: Mapping[str, Any] | None = 
     _equal(root["contract_id"], CONTRACT_ID, "observation.contract_id")
     _equal(root["status"], "sealed_untimed_hardware_observation", "observation.status")
     _equal(root["coordinate"], contract["coordinate"], "observation.coordinate")
+    _equal(root["inputs"], contract["inputs"], "observation.inputs")
+    _equal(
+        root["reference_output_array_digest"],
+        contract["reference"]["output_array_digest"],
+        "observation.reference_output_array_digest",
+    )
     _equal(root["performance_status"], "not_started", "observation.performance_status")
     _equal(root["scorecard_effect"], contract["scorecard_effect"], "observation.scorecard_effect")
+    collector = _collector(root["collector"])
     provenance = _provenance(root["provenance"])
+    if collector["marin_revision"] != provenance["marin_revision"]:
+        raise ValueError("collector revision differs from hardware provenance")
     ordinary = _subject(root["ordinary_jax"], "ordinary_jax", contract)
     shuttle = _subject(root["shuttle"], "shuttle", contract)
     _equal(shuttle["output"]["raw_sha256"], ordinary["output"]["raw_sha256"], "Shuttle bitwise ordinary-JAX parity")
+    _equal(shuttle["output"]["array_digest"], ordinary["output"]["array_digest"], "Shuttle array ordinary-JAX parity")
     architecture = _architecture(shuttle["architecture"], contract)
     if architecture["marin_revision"] != provenance["marin_revision"]:
         raise ValueError("Shuttle architecture revision differs from hardware provenance")
@@ -217,7 +236,7 @@ def validate_observation(document: object, contract: Mapping[str, Any] | None = 
         raise ValueError("te_results must contain all four predeclared forward backend pairs")
     seen: set[tuple[str, str]] = set()
     for index, value in enumerate(results):
-        result = _te_result(value, index, contract)
+        result = _te_result(value, index, contract, collector, provenance)
         pair = tuple(result["backend_pair"])
         if pair in seen:
             raise ValueError("duplicate TE forward backend pair")
@@ -301,22 +320,47 @@ def _architecture(value: object, contract: Mapping[str, Any]) -> dict[str, Any]:
     observer = _closed(
         architecture["observer"],
         {
+            "invocation_id",
             "phases",
+            "policy",
+            "compiler_options_sha256",
+            "tuning_sha256",
             "complete_source_results",
             "excluded_source_results",
+            "coverage_manifest_sha256",
+            "phase_coverage_manifest_sha256",
+            "unsupported_fingerprint_sha256",
+            "failure_pass",
             "final_no_shuttle_semantics",
             "final_module_sha256",
             "generated_bundle_artifact_sha256",
         },
         "shuttle.architecture.observer",
     )
+    if _integer(observer["invocation_id"], "shuttle.architecture.observer.invocation_id") == 0:
+        raise ValueError("observer invocation id must be positive")
     _equal(
         observer["phases"],
         ["algebra_coverage", "generated_bundle", "final_erasure"],
         "shuttle.architecture.observer.phases",
     )
+    _equal(observer["policy"], "source_ordered", "shuttle.architecture.observer.policy")
+    _equal(
+        observer["compiler_options_sha256"],
+        contract["compiler"]["canonical_options_sha256"],
+        "shuttle.architecture.observer.compiler_options_sha256",
+    )
+    _sha(observer["tuning_sha256"], "shuttle.architecture.observer.tuning_sha256")
     _equal(observer["complete_source_results"], 20, "shuttle.architecture.observer.complete_source_results")
     _equal(observer["excluded_source_results"], 0, "shuttle.architecture.observer.excluded_source_results")
+    coverage = _sha(observer["coverage_manifest_sha256"], "shuttle.architecture.observer.coverage_manifest_sha256")
+    _equal(
+        observer["phase_coverage_manifest_sha256"],
+        [coverage, coverage, coverage],
+        "shuttle.architecture.observer.phase_coverage_manifest_sha256",
+    )
+    _sha(observer["unsupported_fingerprint_sha256"], "shuttle.architecture.observer.unsupported_fingerprint_sha256")
+    _equal(observer["failure_pass"], "", "shuttle.architecture.observer.failure_pass")
     _equal(observer["final_no_shuttle_semantics"], True, "shuttle.architecture.observer.final_no_shuttle_semantics")
     _sha(observer["final_module_sha256"], "shuttle.architecture.observer.final_module_sha256")
     _sha(observer["generated_bundle_artifact_sha256"], "shuttle.architecture.observer.generated_bundle_artifact_sha256")
@@ -390,38 +434,158 @@ def _architecture(value: object, contract: Mapping[str, Any]) -> dict[str, Any]:
     cache = _closed(
         architecture["cache"],
         {
+            "compiler_options_sha256",
+            "generated_bundle_artifact_sha256",
+            "populate_worker_id",
+            "reuse_worker_id",
+            "populate_process_id",
+            "reuse_process_id",
+            "populate_before",
+            "populate_after",
+            "reuse_before",
+            "reuse_after",
             "populate_hits",
             "reuse_hits",
-            "entry_key",
-            "entry_sha256",
-            "entry_size",
             "reuse_observer_events",
-            "bytes_immutable",
         },
         "shuttle.architecture.cache",
     )
+    _equal(
+        cache["compiler_options_sha256"],
+        contract["compiler"]["canonical_options_sha256"],
+        "shuttle.architecture.cache.compiler_options_sha256",
+    )
+    _equal(
+        cache["generated_bundle_artifact_sha256"],
+        observer["generated_bundle_artifact_sha256"],
+        "shuttle.architecture.cache.generated_bundle_artifact_sha256",
+    )
+    populate_worker = _sha(cache["populate_worker_id"], "shuttle.architecture.cache.populate_worker_id")
+    reuse_worker = _sha(cache["reuse_worker_id"], "shuttle.architecture.cache.reuse_worker_id")
+    if populate_worker == reuse_worker:
+        raise ValueError("cache populate and reuse workers must be distinct")
+    populate_process = _integer(cache["populate_process_id"], "shuttle.architecture.cache.populate_process_id")
+    reuse_process = _integer(cache["reuse_process_id"], "shuttle.architecture.cache.reuse_process_id")
+    if populate_process == 0 or reuse_process == 0 or populate_process == reuse_process:
+        raise ValueError("cache populate and reuse processes must be distinct and positive")
+    populate_before = _cache_snapshot(cache["populate_before"], "shuttle.architecture.cache.populate_before")
+    populate_after = _cache_snapshot(cache["populate_after"], "shuttle.architecture.cache.populate_after")
+    reuse_before = _cache_snapshot(cache["reuse_before"], "shuttle.architecture.cache.reuse_before")
+    reuse_after = _cache_snapshot(cache["reuse_after"], "shuttle.architecture.cache.reuse_after")
+    if populate_before:
+        raise ValueError("cache population must start from an empty cache")
+    if len(populate_after) != 1:
+        raise ValueError("cache population must add exactly one entry")
+    _equal(reuse_before, populate_after, "shuttle.architecture.cache.reuse_before")
+    _equal(reuse_after, populate_after, "shuttle.architecture.cache.reuse_after")
     _equal(cache["populate_hits"], 0, "shuttle.architecture.cache.populate_hits")
     _equal(cache["reuse_hits"], 1, "shuttle.architecture.cache.reuse_hits")
-    _string(cache["entry_key"], "shuttle.architecture.cache.entry_key")
-    _sha(cache["entry_sha256"], "shuttle.architecture.cache.entry_sha256")
-    if _integer(cache["entry_size"], "shuttle.architecture.cache.entry_size") <= 0:
-        raise ValueError("cache entry size must be positive")
     _equal(cache["reuse_observer_events"], [], "shuttle.architecture.cache.reuse_observer_events")
-    _equal(cache["bytes_immutable"], True, "shuttle.architecture.cache.bytes_immutable")
     _equal(architecture["direct_and_jax_bitwise_equal"], True, "shuttle.architecture.direct_and_jax_bitwise_equal")
     return architecture
 
 
-def _te_result(value: object, index: int, contract: Mapping[str, Any]) -> dict[str, Any]:
+def _te_result(
+    value: object,
+    index: int,
+    contract: Mapping[str, Any],
+    collector: Mapping[str, Any],
+    provenance: Mapping[str, Any],
+) -> dict[str, Any]:
     name = f"te_results[{index}]"
-    result = _closed(value, {"backend_pair", "qualified_against_reference", "subject_identity_sha256", "output"}, name)
+    result = _closed(
+        value,
+        {
+            "backend_pair",
+            "qualified_against_reference",
+            "execution_identity_sha256",
+            "execution_identity",
+            "result_artifact_sha256",
+            "input_raw_sha256",
+            "reference_output_array_digest",
+            "output",
+        },
+        name,
+    )
     pair = _sequence(result["backend_pair"], f"{name}.backend_pair")
     if len(pair) != 2 or tuple(pair) not in BACKEND_PAIRS:
         raise ValueError(f"{name}.backend_pair is not predeclared")
     _equal(result["qualified_against_reference"], True, f"{name}.qualified_against_reference")
-    _sha(result["subject_identity_sha256"], f"{name}.subject_identity_sha256")
+    identity = validate_execution_identity(result["execution_identity"])
+    _equal(
+        result["execution_identity_sha256"],
+        _canonical_sha256(identity),
+        f"{name}.execution_identity_sha256",
+    )
+    _sha(result["result_artifact_sha256"], f"{name}.result_artifact_sha256")
+    _equal(
+        result["input_raw_sha256"],
+        {"x": INPUT_RAW_SHA256[0], "gamma": INPUT_RAW_SHA256[1]},
+        f"{name}.input_raw_sha256",
+    )
+    _equal(
+        result["reference_output_array_digest"],
+        REFERENCE_OUTPUT_ARRAY_DIGEST,
+        f"{name}.reference_output_array_digest",
+    )
+    _equal(identity["hardware_class"], "h100", f"{name}.execution_identity.hardware_class")
+    _equal(identity["marin_revision"], provenance["marin_revision"], f"{name}.execution_identity.marin_revision")
+    for field in ("runner_binary_sha256", "harness_sha256", "build_manifest_sha256"):
+        _equal(identity[field], collector[field], f"{name}.execution_identity.{field}")
+    device = identity["device"]
+    _equal(device["model"], provenance["device_model"], f"{name}.execution_identity.device.model")
+    _equal(device["uuid"], provenance["device_uuid"], f"{name}.execution_identity.device.uuid")
+    _equal(
+        device["compute_capability"],
+        provenance["compute_capability"],
+        f"{name}.execution_identity.device.compute_capability",
+    )
+    _equal(
+        device["physical_sm_count"],
+        provenance["physical_sm_count"],
+        f"{name}.execution_identity.device.physical_sm_count",
+    )
     _output(result["output"], f"{name}.output", contract)
     return result
+
+
+def _collector(value: object) -> dict[str, Any]:
+    collector = _closed(
+        value,
+        {
+            "schema_version",
+            "marin_revision",
+            "runner_binary_sha256",
+            "harness_sha256",
+            "build_manifest_sha256",
+            "artifact_manifest_sha256",
+        },
+        "collector",
+    )
+    _equal(collector["schema_version"], 1, "collector.schema_version")
+    _revision(collector["marin_revision"], "collector.marin_revision")
+    for field in ("runner_binary_sha256", "harness_sha256", "build_manifest_sha256", "artifact_manifest_sha256"):
+        _sha(collector[field], f"collector.{field}")
+    return collector
+
+
+def _cache_snapshot(value: object, name: str) -> list[dict[str, Any]]:
+    records = _sequence(value, name)
+    keys: set[str] = set()
+    for index, value in enumerate(records):
+        record = _closed(value, {"key", "sha256", "size"}, f"{name}[{index}]")
+        key = _string(record["key"], f"{name}[{index}].key")
+        if key in keys:
+            raise ValueError(f"{name} contains duplicate keys")
+        keys.add(key)
+        _sha(record["sha256"], f"{name}[{index}].sha256")
+        if _integer(record["size"], f"{name}[{index}].size") == 0:
+            raise ValueError(f"{name}[{index}].size must be positive")
+    return records
+
+
+def _canonical_sha256(value: object) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def _provenance(value: object) -> dict[str, Any]:
