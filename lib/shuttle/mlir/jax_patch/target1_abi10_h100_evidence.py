@@ -618,7 +618,7 @@ def validate_gpu_artifacts(artifact: ArtifactBundle, authorization: Authorizatio
         expected["ptx_slice_sha256"],
         "ordered GPU PTX slice digests",
     )
-    descriptor = _canonical_json(_gpu_descriptor(transport))
+    descriptor = _canonical_json(gpu_transport_descriptor(transport))
     if artifact.path_for("decoded_descriptor").read_text() != descriptor:
         raise ValueError("decoded GPU descriptor differs from the independent decoder")
     records = _closed(
@@ -661,15 +661,37 @@ def validate_observer_and_cache_artifacts(artifact: ArtifactBundle, authorizatio
         role: _load_json(artifact.path_for(role))
         for role in ("baseline_report", "cache_populate_report", "cache_reuse_report")
     }
-    baseline = _closed(reports["baseline_report"], {"worker", "pid", "observer_events"}, "baseline report")
+    baseline = _closed(
+        reports["baseline_report"],
+        {"worker", "pid", "observer_events", "runtime_binaries"},
+        "baseline report",
+    )
     populate = _closed(
         reports["cache_populate_report"],
-        {"worker", "pid", "cache_hits", "cache_name", "cache_size", "cache_sha256", "observer_event_count"},
+        {
+            "worker",
+            "pid",
+            "cache_hits",
+            "cache_name",
+            "cache_size",
+            "cache_sha256",
+            "observer_event_count",
+            "runtime_binaries",
+        },
         "cache populate report",
     )
     reuse = _closed(
         reports["cache_reuse_report"],
-        {"worker", "pid", "cache_hits", "cache_name", "cache_size", "cache_sha256", "observer_event_count"},
+        {
+            "worker",
+            "pid",
+            "cache_hits",
+            "cache_name",
+            "cache_size",
+            "cache_sha256",
+            "observer_event_count",
+            "runtime_binaries",
+        },
         "cache reuse report",
     )
     _equal(baseline["worker"], "baseline", "baseline report.worker")
@@ -678,6 +700,18 @@ def validate_observer_and_cache_artifacts(artifact: ArtifactBundle, authorizatio
     pids = [baseline["pid"], populate["pid"], reuse["pid"]]
     if any(type(pid) is not int or pid <= 0 for pid in pids) or len(set(pids)) != 3:
         raise ValueError("baseline, populate, and reuse reports must name distinct positive process IDs")
+    expected_binaries = {
+        "jax_extension_sha256": _file_sha256(artifact.path_for("jax_extension")),
+        "jax_common_sha256": _file_sha256(artifact.path_for("jax_common")),
+        "cuda_plugin_extension_sha256": _file_sha256(artifact.path_for("cuda_plugin_extension")),
+    }
+    for name, report in reports.items():
+        identity = _closed(
+            report["runtime_binaries"],
+            set(expected_binaries),
+            f"{name}.runtime_binaries",
+        )
+        _equal(identity, expected_binaries, f"{name}.runtime_binaries")
     _equal(baseline["observer_events"], 0, "baseline report.observer_events")
     _equal(populate["cache_hits"], 0, "cache populate report.cache_hits")
     _equal(reuse["cache_hits"], 1, "cache reuse report.cache_hits")
@@ -821,8 +855,8 @@ def validate_gpu_build_artifacts(artifact: ArtifactBundle, authorization: Author
         _file_sha256(artifact.path_for("cuda_plugin_extension")),
         "rebuilt CUDA plugin extension SHA-256",
     )
-    _equal(manifest["bazel_version"], "7.4.1", "GPU build manifest.bazel_version")
-    _sha(manifest["bazel_sha256"], "GPU build manifest.bazel_sha256")
+    _equal(manifest["bazel_version"], document["toolchain"]["bazel_version"], "GPU build manifest.bazel_version")
+    _equal(manifest["bazel_sha256"], document["toolchain"]["bazel_sha256"], "GPU build manifest.bazel_sha256")
     commands = _sequence(manifest["commands"], "GPU build manifest.commands")
     if commands != document["iris"]["build_commands"]:
         raise ValueError("GPU build commands differ from the pre-hardware authorization")
@@ -960,6 +994,7 @@ def _validate_authorized_collectors(value: object) -> None:
         {
             "lib/shuttle/mlir/jax_patch/target1_abi10_h100_evidence.py",
             "lib/shuttle/mlir/jax_patch/shuttle_h100_evidence_subject.py",
+            "lib/shuttle/mlir/jax_patch/shuttle_h100_evidence_build.py",
             "lib/shuttle/mlir/jax_patch/shuttle_h100_evidence_verify.py",
             "lib/shuttle/mlir/jax_patch/gpu_transport.py",
             "lib/shuttle/mlir/jax_patch/shuttle_jaxlib_gpu_ffi_registration.py",
@@ -998,7 +1033,17 @@ def _validate_authorized_bundle(value: object) -> None:
 
 
 def _validate_authorized_toolchain(value: object) -> None:
-    toolchain = _closed(value, {"ptxas_version", "ptxas_sha256", "target"}, "authorization.toolchain")
+    toolchain = _closed(
+        value,
+        {"bazel_version", "bazel_sha256", "ptxas_version", "ptxas_sha256", "target"},
+        "authorization.toolchain",
+    )
+    _equal(toolchain["bazel_version"], "7.4.1", "authorization.toolchain.bazel_version")
+    _equal(
+        toolchain["bazel_sha256"],
+        "c97f02133adce63f0c28678ac1f21d65fa8255c80429b588aeeba8a1fac6202b",
+        "authorization.toolchain.bazel_sha256",
+    )
     _equal(toolchain["ptxas_version"], "13.2.78", "authorization.toolchain.ptxas_version")
     _sha(toolchain["ptxas_sha256"], "authorization.toolchain.ptxas_sha256")
     _equal(toolchain["target"], "sm_90", "authorization.toolchain.target")
@@ -1184,7 +1229,8 @@ def _bytes_sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def _gpu_descriptor(transport: GpuTransport) -> dict[str, object]:
+def gpu_transport_descriptor(transport: GpuTransport) -> dict[str, object]:
+    """Return the canonical JSON-ready projection stored beside raw transport."""
     return {
         "schema_version": 1,
         "transport_root": transport.transport_root,

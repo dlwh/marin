@@ -97,6 +97,8 @@ def _authorization_document() -> dict[str, object]:
             "ptx_slice_sha256": PTX_SLICES,
         },
         "toolchain": {
+            "bazel_version": "7.4.1",
+            "bazel_sha256": "c97f02133adce63f0c28678ac1f21d65fa8255c80429b588aeeba8a1fac6202b",
             "ptxas_version": "13.2.78",
             "ptxas_sha256": "a0212ca1a74ca4877e8d063baa1dd0b075fcd255fb6ab9e8a6bf98a276a2d6e8",
             "target": "sm_90",
@@ -104,6 +106,7 @@ def _authorization_document() -> dict[str, object]:
         "collectors": {
             "lib/shuttle/mlir/jax_patch/target1_abi10_h100_evidence.py": SHA,
             "lib/shuttle/mlir/jax_patch/shuttle_h100_evidence_subject.py": SHA,
+            "lib/shuttle/mlir/jax_patch/shuttle_h100_evidence_build.py": SHA,
             "lib/shuttle/mlir/jax_patch/shuttle_h100_evidence_verify.py": SHA,
             "lib/shuttle/mlir/jax_patch/gpu_transport.py": SHA,
             "lib/shuttle/mlir/jax_patch/shuttle_jaxlib_gpu_ffi_registration.py": SHA,

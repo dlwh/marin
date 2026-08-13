@@ -4,6 +4,7 @@
 """Collect untimed ordinary-JAX ABI 10 H100 forward evidence as raw files."""
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -69,6 +70,38 @@ def _report(path: Path, value: object) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _runtime_binary_identity() -> dict[str, str]:
+    extension = Path(_jax.__file__).resolve()
+    common_candidates = [
+        extension.parent / "libjax_common.so",
+        extension.parent / "libjax_common.dylib",
+    ]
+    common = [path for path in common_candidates if path.is_file() and not path.is_symlink()]
+    if len(common) != 1:
+        raise RuntimeError("could not identify exactly one loaded JAX common library")
+    plugin_package = sys.modules.get("jax_plugins.cuda")
+    plugin_module = getattr(plugin_package, "cuda_plugin_extension", None)
+    plugin_file = getattr(plugin_module, "__file__", None)
+    if type(plugin_file) is not str:
+        raise RuntimeError("could not identify the loaded CUDA plugin extension")
+    plugin = Path(plugin_file).resolve()
+    if plugin.is_symlink() or not plugin.is_file():
+        raise RuntimeError("loaded CUDA plugin extension is not a regular file")
+    return {
+        "jax_extension_sha256": _sha256(extension),
+        "jax_common_sha256": _sha256(common[0]),
+        "cuda_plugin_extension_sha256": _sha256(plugin),
+    }
+
+
 def _inputs() -> tuple[np.ndarray, np.ndarray]:
     values = fixed_inputs(2048, 4096, "forward")
     if len(values) != 2:
@@ -87,7 +120,12 @@ def run_baseline(output: Path) -> dict[str, object]:
     (output / "input_gamma").write_bytes(gamma.tobytes(order="C"))
     _write_bfloat16(output / "reference_output", reference, "reference_output")
     _write_bfloat16(output / "ordinary_jax_output", ordinary, "ordinary_jax_output")
-    return {"worker": "baseline", "pid": os.getpid(), "observer_events": 0}
+    return {
+        "worker": "baseline",
+        "pid": os.getpid(),
+        "observer_events": 0,
+        "runtime_binaries": _runtime_binary_identity(),
+    }
 
 
 def _compile_and_run(x: np.ndarray, gamma: np.ndarray):
@@ -128,6 +166,7 @@ def run_populate(output: Path, cache_directory: Path) -> dict[str, object]:
         "cache_size": cache_size,
         "cache_sha256": cache_sha256,
         "observer_event_count": len(events),
+        "runtime_binaries": _runtime_binary_identity(),
     }
 
 
@@ -157,6 +196,7 @@ def run_reuse(output: Path, cache_directory: Path) -> dict[str, object]:
         "cache_size": cache_size,
         "cache_sha256": cache_sha256,
         "observer_event_count": len(events),
+        "runtime_binaries": _runtime_binary_identity(),
     }
 
 
