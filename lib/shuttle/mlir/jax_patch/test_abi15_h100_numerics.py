@@ -2,15 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from fractions import Fraction
+from typing import cast
 
 import pytest
 from abi15_h100_numerics import (
     COLUMNS,
     REDUCTION,
     ROWS,
+    AlgebraOutputs,
     Inputs,
     ReductionPolicy,
     dense_inputs,
+    error_metrics,
+    exact_algebra,
     f32_bits_to_fraction,
     fraction_to_bf16_bits,
     fraction_to_f32_bits,
@@ -48,6 +52,49 @@ def test_dense_reference_closes_all_public_result_shapes() -> None:
     assert len(set(outputs.primal)) > 16
     assert len(set(outputs.lhs_cotangent)) > 16
     assert len(set(outputs.rhs_cotangent)) > 16
+
+
+def _round_algebra(outputs: AlgebraOutputs) -> tuple[tuple[int, ...], ...]:
+    return (
+        tuple(fraction_to_bf16_bits(value) for value in outputs.primal),
+        tuple(fraction_to_bf16_bits(value) for value in outputs.lhs_cotangent),
+        tuple(fraction_to_bf16_bits(value) for value in outputs.rhs_cotangent),
+    )
+
+
+def test_schedule_oracle_matches_independent_exact_algebra_when_rounding_is_exact() -> None:
+    dense = dense_inputs()
+    expected_dense = _round_algebra(exact_algebra(dense))
+    for policy in ReductionPolicy:
+        outputs = reference(dense, policy)
+        assert (outputs.primal, outputs.lhs_cotangent, outputs.rhs_cotangent) == expected_dense
+
+    sparse = sparse_policy_inputs()
+    expected_sparse = _round_algebra(exact_algebra(sparse))
+    fast = reference(sparse, ReductionPolicy.FAST)
+    assert (fast.primal, fast.lhs_cotangent, fast.rhs_cotangent) == expected_sparse
+
+
+def test_exact_algebra_reports_schedule_error_without_float_aggregation() -> None:
+    sparse = sparse_policy_inputs()
+    exact = exact_algebra(sparse)
+    source_ordered = reference(sparse, ReductionPolicy.SOURCE_ORDERED)
+    fast = reference(sparse, ReductionPolicy.FAST)
+    source_metrics = error_metrics(source_ordered.lhs_cotangent, exact.lhs_cotangent)
+    fast_metrics = error_metrics(fast.lhs_cotangent, exact.lhs_cotangent)
+    assert source_metrics.maximum_absolute_error == 1
+    assert source_metrics.mean_absolute_error == Fraction(1, ROWS * REDUCTION)
+    assert source_metrics.relative_linf_error == Fraction(1, 1 << 25)
+    assert source_metrics.maximum_bf16_ulp_error > 0
+    assert fast_metrics.maximum_absolute_error == 0
+    assert fast_metrics.mean_absolute_error == 0
+    assert fast_metrics.relative_linf_error == 0
+    assert fast_metrics.maximum_bf16_ulp_error == 0
+
+
+def test_reference_rejects_untyped_policy() -> None:
+    with pytest.raises(TypeError, match="ReductionPolicy"):
+        reference(dense_inputs(), cast(ReductionPolicy, "fast"))
 
 
 @pytest.mark.parametrize(

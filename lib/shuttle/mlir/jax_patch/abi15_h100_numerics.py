@@ -33,6 +33,21 @@ class Outputs:
     rhs_cotangent: tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class AlgebraOutputs:
+    primal: tuple[Fraction, ...]
+    lhs_cotangent: tuple[Fraction, ...]
+    rhs_cotangent: tuple[Fraction, ...]
+
+
+@dataclass(frozen=True)
+class ErrorMetrics:
+    maximum_absolute_error: Fraction
+    mean_absolute_error: Fraction
+    relative_linf_error: Fraction
+    maximum_bf16_ulp_error: int
+
+
 def bf16_sha256(values: tuple[int, ...]) -> str:
     """Return the SHA-256 of little-endian raw BF16 storage."""
     return hashlib.sha256(struct.pack(f"<{len(values)}H", *values)).hexdigest()
@@ -183,14 +198,81 @@ def sparse_policy_inputs() -> Inputs:
     return Inputs(tuple(lhs), tuple(rhs), tuple(output_cotangent))
 
 
-def reference(inputs: Inputs, policy: ReductionPolicy) -> Outputs:
-    """Evaluate the composed matmul and VJP with the selected closed reduction."""
+def exact_algebra(inputs: Inputs) -> AlgebraOutputs:
+    """Evaluate the real-valued matmul and VJP without schedule rounding."""
+    _validate_shapes(inputs)
+    lhs = tuple(bf16_bits_to_fraction(value) for value in inputs.lhs)
+    rhs = tuple(bf16_bits_to_fraction(value) for value in inputs.rhs)
+    output_cotangent = tuple(bf16_bits_to_fraction(value) for value in inputs.output_cotangent)
+    primal = tuple(
+        sum(
+            (lhs[row * REDUCTION + reduction] * rhs[reduction * COLUMNS + column] for reduction in range(REDUCTION)),
+            start=Fraction(),
+        )
+        for row in range(ROWS)
+        for column in range(COLUMNS)
+    )
+    lhs_cotangent = tuple(
+        sum(
+            (output_cotangent[row * COLUMNS + column] * rhs[reduction * COLUMNS + column] for column in range(COLUMNS)),
+            start=Fraction(),
+        )
+        for row in range(ROWS)
+        for reduction in range(REDUCTION)
+    )
+    rhs_cotangent = tuple(
+        sum(
+            (lhs[row * REDUCTION + reduction] * output_cotangent[row * COLUMNS + column] for row in range(ROWS)),
+            start=Fraction(),
+        )
+        for reduction in range(REDUCTION)
+        for column in range(COLUMNS)
+    )
+    return AlgebraOutputs(primal, lhs_cotangent, rhs_cotangent)
+
+
+def error_metrics(actual: tuple[int, ...], exact: tuple[Fraction, ...]) -> ErrorMetrics:
+    """Return exact aggregate error metrics for one public BF16 result."""
+    if not actual or len(actual) != len(exact):
+        raise ValueError("actual and exact results must have the same nonzero size")
+    absolute_errors = tuple(
+        abs(bf16_bits_to_fraction(observed) - expected) for observed, expected in zip(actual, exact, strict=True)
+    )
+    maximum_absolute_error = max(absolute_errors)
+    reference_scale = max(abs(value) for value in exact)
+    relative_linf_error = maximum_absolute_error / reference_scale if reference_scale else Fraction()
+
+    def ordered_bf16(bits: int) -> int:
+        if not 0 <= bits <= 0xFFFF:
+            raise ValueError("BF16 result contains an invalid bit pattern")
+        return bits ^ (0xFFFF if bits & 0x8000 else 0x8000)
+
+    maximum_bf16_ulp_error = max(
+        abs(ordered_bf16(observed) - ordered_bf16(fraction_to_bf16_bits(expected)))
+        for observed, expected in zip(actual, exact, strict=True)
+    )
+    return ErrorMetrics(
+        maximum_absolute_error=maximum_absolute_error,
+        mean_absolute_error=sum(absolute_errors, start=Fraction()) / len(actual),
+        relative_linf_error=relative_linf_error,
+        maximum_bf16_ulp_error=maximum_bf16_ulp_error,
+    )
+
+
+def _validate_shapes(inputs: Inputs) -> None:
     if len(inputs.lhs) != ROWS * REDUCTION:
         raise ValueError("lhs shape mismatch")
     if len(inputs.rhs) != REDUCTION * COLUMNS:
         raise ValueError("rhs shape mismatch")
     if len(inputs.output_cotangent) != ROWS * COLUMNS:
         raise ValueError("output cotangent shape mismatch")
+
+
+def reference(inputs: Inputs, policy: ReductionPolicy) -> Outputs:
+    """Evaluate the composed matmul and VJP with the selected closed reduction."""
+    _validate_shapes(inputs)
+    if type(policy) is not ReductionPolicy:
+        raise TypeError("policy must be a ReductionPolicy value")
 
     primal = []
     for row in range(ROWS):

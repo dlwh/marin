@@ -26,4 +26,4 @@ test = [
 timeout = 30
 timeout_method = "thread"
 addopts = "--durations=10 -v --import-mode=importlib"
-pythonpath = ["src", "tests"]
+pythonpath = ["src", "tests", "mlir/jax_patch"]
