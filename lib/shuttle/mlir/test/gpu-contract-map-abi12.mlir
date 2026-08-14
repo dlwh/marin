@@ -56,6 +56,6 @@
 // DESCRIPTOR-NOT: shuttle.contract
 
 // FAST: ABI12 GPU Contract requires source_ordered numerics
-// MATERIALIZATION-MUTATION: has an invalid task lifetime interval
+// MATERIALIZATION-MUTATION: producer is outside the task range
 // SCHEDULE-DEPENDENCY: schedule dependencies must equal the materialization task
 // SCHEDULE-ORDER: Contract reduction order must equal serial ascending fma.rn.f32 semantics
