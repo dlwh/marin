@@ -677,7 +677,7 @@ buildFixture(llvm::StringRef source,
   manager.addPass(mlir::shuttle::createAnnotateSourcePass());
   if (!canonicalOptions.empty()) {
     manager.addPass(mlir::shuttle::createFormStructuralRegionsPass(
-        policy, canonicalOptions,
+        policy, canonicalOptions.str(),
         R"json({"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json"));
   } else if (policy == mlir::shuttle::NumericalPolicy::Fast) {
     manager.addPass(mlir::shuttle::createFormStructuralRegionsPass(
@@ -1302,10 +1302,12 @@ TEST(GpuTransportV2Test,
   EXPECT_EQ(sourceDecoded->policy, 0);
   EXPECT_EQ(fastDecoded->policy, 1);
   EXPECT_NE(sourceDecoded->code, fastDecoded->code);
-  EXPECT_NE(sourceBytes->slice(sourceDecoded->deviceRootPayloadOffset, 64),
-            fastBytes->slice(fastDecoded->deviceRootPayloadOffset, 64));
-  EXPECT_NE(sourceBytes->slice(sourceDecoded->bundleRootPayloadOffset, 64),
-            fastBytes->slice(fastDecoded->bundleRootPayloadOffset, 64));
+  llvm::ArrayRef<uint8_t> sourcePayload(*sourceBytes);
+  llvm::ArrayRef<uint8_t> fastPayload(*fastBytes);
+  EXPECT_NE(sourcePayload.slice(sourceDecoded->deviceRootPayloadOffset, 64),
+            fastPayload.slice(fastDecoded->deviceRootPayloadOffset, 64));
+  EXPECT_NE(sourcePayload.slice(sourceDecoded->bundleRootPayloadOffset, 64),
+            fastPayload.slice(fastDecoded->bundleRootPayloadOffset, 64));
   EXPECT_NE(mlir::shuttle::gpuExecutableBundleDigest(*sourceBytes),
             mlir::shuttle::gpuExecutableBundleDigest(*fastBytes));
 
