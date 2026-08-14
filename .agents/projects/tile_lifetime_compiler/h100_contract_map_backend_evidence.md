@@ -181,15 +181,25 @@ and manifest digests. A wrong acknowledgement cannot release it.
 
 While the Iris task is still running, the controller must record the job
 request, task attempt, and log sequence metadata, retrieve `EXPORT_READY`, the
-manifest, and every named part through `iris task exec`, and use the exact local
-source revision to run `verify-export`. That command rejects extra, missing, or
+manifest, and every named part through `iris task exec`. It must invoke the
+exact transported launcher's `read-export` command with an explicit filename
+and 256 KiB-aligned offset. Each invocation emits one canonical JSON record
+whose payload is ASCII base64; binary `cat` output is never used. The local
+`decode-export-record` command strictly decodes one record, verifies its size
+and digest, and permits only contiguous windows. This keeps every RPC below one
+raw 256 KiB window and makes missing, duplicated, or reordered windows fatal.
+
+After all files are present, the controller uses the exact local source
+revision to run `verify-export`. That command rejects extra, missing, or
 changed retrieval files, rechecks the authorized capsule identity, reconstructs
 the archive, validates every tar member, and writes the only acceptable ACK.
-The controller then transfers those exact ACK bytes into `EXPORT_ACK`. Only
-after the task exits with the sealed wrapper status may the terminal Iris
-metadata and evidence archive be recorded. A timeout, task termination before
-ACK, retrieval mismatch, or verifier failure seals one launch failure and does
-not authorize a retry.
+The controller invokes the remote `ack-export` command with those verified
+archive and manifest digests; the launcher compares them to READY and
+atomically creates `EXPORT_ACK`. No binary controller-to-task copy or shell
+redirection is part of the protocol. Only after the task exits with the sealed
+wrapper status may the terminal Iris metadata and evidence archive be
+recorded. A timeout, task termination before ACK, retrieval mismatch, or
+verifier failure seals one launch failure and does not authorize a retry.
 
 A future launch must use the default container profile, one explicit
 `H100x1`, no UV sync against the partial capsule, a fresh artifact path outside

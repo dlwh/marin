@@ -4,6 +4,8 @@
 """Prepare and restore an exact source capsule for the H100 evidence runner."""
 
 import argparse
+import base64
+import binascii
 import gzip
 import hashlib
 import json
@@ -13,6 +15,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
@@ -34,6 +37,8 @@ ARTIFACT_EXPORT_READY_FILENAME = "EXPORT_READY"
 ARTIFACT_EXPORT_ACK_FILENAME = "EXPORT_ACK"
 ARTIFACT_EXPORT_CHUNK_BYTES = 256 * 1024
 MAX_ARTIFACT_EXPORT_READY_BYTES = 16 * 1024
+MAX_ARTIFACT_EXPORT_MANIFEST_BYTES = 1024 * 1024
+MAX_ARTIFACT_EXPORT_RECORD_BYTES = 2 * 1024 * 1024
 MAX_ARTIFACT_EXPORT_BYTES = 8 * 1024 * 1024 * 1024
 MAX_ARTIFACT_EXPORT_MEMBERS = 100_000
 MAX_ARTIFACT_EXPORT_PARTS = MAX_ARTIFACT_EXPORT_BYTES // ARTIFACT_EXPORT_CHUNK_BYTES
@@ -47,6 +52,7 @@ MAX_MEMBER_BYTES = 8 * 1024 * 1024
 MAX_MEMBERS = 10_000
 SHA1_PATTERN = re.compile(r"[0-9a-f]{40}")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+ARTIFACT_EXPORT_PART_PATTERN = re.compile(r"h100-evidence-artifacts\.tar\.gz\.part\.[0-9]{6}")
 FORBIDDEN_PARTS = frozenset({".git", ".ssh", ".aws", ".gnupg", "__pycache__"})
 FORBIDDEN_NAMES = frozenset(
     {
@@ -658,8 +664,10 @@ def prepare_artifact_export(
     source_sha = _require_sha(source_sha, SHA1_PATTERN, "source SHA")
     source_tree = _require_sha(source_tree, SHA1_PATTERN, "source tree")
     source_manifest_sha256 = _require_sha(source_manifest_sha256, SHA256_PATTERN, "source manifest SHA-256")
-    artifact_directory = artifact_directory.resolve()
-    export_directory = export_directory.resolve()
+    artifact_directory = artifact_directory.absolute()
+    export_directory = export_directory.absolute()
+    if artifact_directory.is_symlink():
+        raise ValueError("artifact directory must not be a symlink")
     if export_directory.exists():
         raise ValueError(f"artifact export directory already exists: {export_directory}")
     if export_directory.is_relative_to(artifact_directory) or artifact_directory.is_relative_to(export_directory):
@@ -698,6 +706,8 @@ def prepare_artifact_export(
         }
         manifest_path = temporary / ARTIFACT_EXPORT_MANIFEST_FILENAME
         manifest_path.write_bytes(_canonical_json(manifest))
+        if manifest_path.stat().st_size > MAX_ARTIFACT_EXPORT_MANIFEST_BYTES:
+            raise ValueError("artifact export manifest exceeds the transport metadata bound")
         ready = {
             "accepted_bundle_present": accepted is not None,
             "archive_sha256": archive["sha256"],
@@ -715,8 +725,39 @@ def prepare_artifact_export(
     return ready
 
 
+def _validate_artifact_export_ready(ready: dict[str, Any]) -> None:
+    if set(ready) != {
+        "accepted_bundle_present",
+        "archive_sha256",
+        "archive_size",
+        "manifest_sha256",
+        "part_count",
+        "ready_filename",
+        "runner_exit_code",
+        "schema_version",
+        "wrapper_exit_code",
+    }:
+        raise ValueError("artifact export READY has unexpected fields")
+    if type(ready.get("accepted_bundle_present")) is not bool:
+        raise ValueError("artifact export READY accepted-bundle status must be boolean")
+    if type(ready.get("archive_size")) is not int or not 0 < ready["archive_size"] <= MAX_ARTIFACT_EXPORT_BYTES:
+        raise ValueError("artifact export READY archive size is invalid")
+    if type(ready.get("part_count")) is not int or not 1 <= ready["part_count"] <= MAX_ARTIFACT_EXPORT_PARTS:
+        raise ValueError("artifact export READY part count is invalid")
+    if ready.get("ready_filename") != ARTIFACT_EXPORT_READY_FILENAME:
+        raise ValueError("artifact export READY filename identity is invalid")
+    for name in ("runner_exit_code", "wrapper_exit_code"):
+        if type(ready.get(name)) is not int or not 0 <= ready[name] <= 255:
+            raise ValueError(f"artifact export READY {name} is invalid")
+    if type(ready.get("schema_version")) is not int or ready["schema_version"] != ARTIFACT_EXPORT_SCHEMA_VERSION:
+        raise ValueError("artifact export READY has an unsupported schema")
+    _require_sha(ready.get("archive_sha256"), SHA256_PATTERN, "archive SHA-256")
+    _require_sha(ready.get("manifest_sha256"), SHA256_PATTERN, "export manifest SHA-256")
+
+
 def artifact_export_ack(ready: dict[str, Any]) -> bytes:
     """Return the exact acknowledgement bytes for a validated export."""
+    _validate_artifact_export_ready(ready)
     return _canonical_json(
         {
             "archive_sha256": _require_sha(ready.get("archive_sha256"), SHA256_PATTERN, "archive SHA-256"),
@@ -724,6 +765,175 @@ def artifact_export_ack(ready: dict[str, Any]) -> bytes:
             "schema_version": ARTIFACT_EXPORT_SCHEMA_VERSION,
         }
     )
+
+
+def _artifact_export_transport_bound(filename: str) -> int:
+    if filename == ARTIFACT_EXPORT_READY_FILENAME:
+        return MAX_ARTIFACT_EXPORT_READY_BYTES
+    if filename == ARTIFACT_EXPORT_MANIFEST_FILENAME:
+        return MAX_ARTIFACT_EXPORT_MANIFEST_BYTES
+    if ARTIFACT_EXPORT_PART_PATTERN.fullmatch(filename):
+        return ARTIFACT_EXPORT_CHUNK_BYTES
+    raise ValueError(f"artifact export filename is not transportable: {filename!r}")
+
+
+def read_artifact_export_record(export_directory: Path, filename: str, *, offset: int = 0) -> bytes:
+    """Encode one bounded export-file window as canonical base64-safe text for Iris exec."""
+    bound = _artifact_export_transport_bound(filename)
+    if type(offset) is not int or offset < 0 or offset % ARTIFACT_EXPORT_CHUNK_BYTES != 0:
+        raise ValueError("artifact export read offset must be a nonnegative chunk boundary")
+    export_directory = export_directory.absolute()
+    if export_directory.is_symlink() or not export_directory.is_dir():
+        raise ValueError("artifact export directory must be a regular directory")
+    path = export_directory / filename
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"artifact export file is missing or not regular: {filename}")
+    total_size = path.stat().st_size
+    if total_size > bound or offset >= total_size:
+        raise ValueError(f"artifact export file exceeds its transport bound: {filename}")
+    with path.open("rb") as stream:
+        stream.seek(offset)
+        contents = stream.read(ARTIFACT_EXPORT_CHUNK_BYTES)
+    end = offset + len(contents)
+    return _canonical_json(
+        {
+            "contents_base64": base64.b64encode(contents).decode("ascii"),
+            "eof": end == total_size,
+            "filename": filename,
+            "offset": offset,
+            "schema_version": ARTIFACT_EXPORT_SCHEMA_VERSION,
+            "sha256": hashlib.sha256(contents).hexdigest(),
+            "size": len(contents),
+            "total_size": total_size,
+        }
+    )
+
+
+def decode_artifact_export_record(record_path: Path, retrieval_directory: Path) -> dict[str, Any]:
+    """Strictly decode one controller-captured text record into a fresh retrieval file."""
+    record_path = record_path.absolute()
+    if (
+        record_path.is_symlink()
+        or not record_path.is_file()
+        or record_path.stat().st_size > MAX_ARTIFACT_EXPORT_RECORD_BYTES
+    ):
+        raise ValueError("artifact export transport record is missing, non-regular, or oversized")
+    raw = record_path.read_bytes()
+    record = json.loads(raw)
+    if not isinstance(record, dict) or raw != _canonical_json(record):
+        raise ValueError("artifact export transport record must use canonical JSON")
+    if set(record) != {
+        "contents_base64",
+        "eof",
+        "filename",
+        "offset",
+        "schema_version",
+        "sha256",
+        "size",
+        "total_size",
+    }:
+        raise ValueError("artifact export transport record has unexpected fields")
+    if type(record.get("schema_version")) is not int or record["schema_version"] != ARTIFACT_EXPORT_SCHEMA_VERSION:
+        raise ValueError("artifact export transport record has an unsupported schema")
+    filename = record.get("filename")
+    if not isinstance(filename, str):
+        raise ValueError("artifact export transport filename must be a string")
+    bound = _artifact_export_transport_bound(filename)
+    offset = record.get("offset")
+    total_size = record.get("total_size")
+    eof = record.get("eof")
+    if (
+        type(offset) is not int
+        or offset < 0
+        or offset % ARTIFACT_EXPORT_CHUNK_BYTES != 0
+        or type(total_size) is not int
+        or not 0 < total_size <= bound
+        or type(eof) is not bool
+    ):
+        raise ValueError("artifact export transport window identity is invalid")
+    encoded = record.get("contents_base64")
+    if not isinstance(encoded, str):
+        raise ValueError("artifact export contents must be base64 text")
+    try:
+        contents = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise ValueError("artifact export contents are not canonical base64") from error
+    if base64.b64encode(contents).decode("ascii") != encoded:
+        raise ValueError("artifact export contents are not canonical base64")
+    size = record.get("size")
+    if type(size) is not int or not 0 < size <= ARTIFACT_EXPORT_CHUNK_BYTES or size != len(contents):
+        raise ValueError("artifact export transport size is invalid")
+    end = offset + size
+    if end > total_size or eof is not (end == total_size) or (not eof and size != ARTIFACT_EXPORT_CHUNK_BYTES):
+        raise ValueError("artifact export transport window is not contiguous with the declared file")
+    if hashlib.sha256(contents).hexdigest() != _require_sha(
+        record.get("sha256"), SHA256_PATTERN, "transport record SHA-256"
+    ):
+        raise ValueError("artifact export transport digest mismatch")
+    retrieval_directory = retrieval_directory.absolute()
+    if retrieval_directory.exists():
+        if retrieval_directory.is_symlink() or not retrieval_directory.is_dir():
+            raise ValueError("artifact retrieval directory must be a regular directory")
+    else:
+        retrieval_directory.mkdir(parents=True)
+    output = retrieval_directory / filename
+    partial = retrieval_directory / f".{filename}.partial"
+    if output.exists() or output.is_symlink():
+        raise ValueError(f"artifact retrieval output already exists: {filename}")
+    if offset == 0:
+        if partial.exists() or partial.is_symlink():
+            raise ValueError(f"artifact retrieval partial output already exists: {filename}")
+        partial.write_bytes(contents)
+    else:
+        if partial.is_symlink() or not partial.is_file() or partial.stat().st_size != offset:
+            raise ValueError("artifact export transport windows are missing, duplicated, or reordered")
+        with partial.open("ab") as stream:
+            stream.write(contents)
+    if eof:
+        partial.replace(output)
+    return {
+        "eof": eof,
+        "filename": filename,
+        "next_offset": end,
+        "sha256": record["sha256"],
+        "size": size,
+        "total_size": total_size,
+    }
+
+
+def write_artifact_export_ack(
+    export_directory: Path,
+    *,
+    archive_sha256: str,
+    manifest_sha256: str,
+) -> dict[str, Any]:
+    """Atomically acknowledge only the exact READY identities supplied by the controller."""
+    archive_sha256 = _require_sha(archive_sha256, SHA256_PATTERN, "archive SHA-256")
+    manifest_sha256 = _require_sha(manifest_sha256, SHA256_PATTERN, "manifest SHA-256")
+    export_directory = export_directory.absolute()
+    ready_path = export_directory / ARTIFACT_EXPORT_READY_FILENAME
+    if (
+        ready_path.is_symlink()
+        or not ready_path.is_file()
+        or ready_path.stat().st_size > MAX_ARTIFACT_EXPORT_READY_BYTES
+    ):
+        raise ValueError("artifact export READY is missing, non-regular, or oversized")
+    raw = ready_path.read_bytes()
+    ready = json.loads(raw)
+    if not isinstance(ready, dict) or raw != _canonical_json(ready):
+        raise ValueError("artifact export READY must use canonical JSON")
+    expected = artifact_export_ack(ready)
+    if ready.get("archive_sha256") != archive_sha256 or ready.get("manifest_sha256") != manifest_sha256:
+        raise ValueError("artifact acknowledgement does not bind the exact export identities")
+    ack_path = export_directory / ARTIFACT_EXPORT_ACK_FILENAME
+    if ack_path.exists() or ack_path.is_symlink():
+        raise ValueError("artifact acknowledgement already exists")
+    temporary = export_directory / f".{ARTIFACT_EXPORT_ACK_FILENAME}.tmp"
+    if temporary.exists() or temporary.is_symlink():
+        raise ValueError("artifact acknowledgement temporary path already exists")
+    temporary.write_bytes(expected)
+    temporary.replace(ack_path)
+    return {"ack_sha256": _sha256(ack_path), "archive_sha256": archive_sha256, "manifest_sha256": manifest_sha256}
 
 
 def validate_retrieved_artifact_export(
@@ -740,8 +950,8 @@ def validate_retrieved_artifact_export(
     expected_source_manifest_sha256 = _require_sha(
         expected_source_manifest_sha256, SHA256_PATTERN, "source manifest SHA-256"
     )
-    retrieval_directory = retrieval_directory.resolve()
-    archive_output = archive_output.resolve()
+    retrieval_directory = retrieval_directory.absolute()
+    archive_output = archive_output.absolute()
     if retrieval_directory.is_symlink() or not retrieval_directory.is_dir():
         raise ValueError("artifact retrieval directory must be a regular directory")
     if archive_output.exists() or archive_output.is_relative_to(retrieval_directory):
@@ -754,7 +964,7 @@ def validate_retrieved_artifact_export(
             raise ValueError(f"artifact export {name} must be a regular file")
     if ready_path.stat().st_size > MAX_ARTIFACT_EXPORT_READY_BYTES:
         raise ValueError("artifact export READY exceeds the metadata size bound")
-    if manifest_path.stat().st_size > MAX_MANIFEST_BYTES:
+    if manifest_path.stat().st_size > MAX_ARTIFACT_EXPORT_MANIFEST_BYTES:
         raise ValueError("artifact export manifest exceeds the metadata size bound")
     ready = json.loads(ready_path.read_bytes())
     manifest = json.loads(manifest_path.read_bytes())
@@ -762,18 +972,7 @@ def validate_retrieved_artifact_export(
         raise ValueError("artifact export READY must use canonical JSON")
     if not isinstance(manifest, dict) or manifest_path.read_bytes() != _canonical_json(manifest):
         raise ValueError("artifact export manifest must use canonical JSON")
-    if set(ready) != {
-        "accepted_bundle_present",
-        "archive_sha256",
-        "archive_size",
-        "manifest_sha256",
-        "part_count",
-        "ready_filename",
-        "runner_exit_code",
-        "schema_version",
-        "wrapper_exit_code",
-    }:
-        raise ValueError("artifact export READY has unexpected fields")
+    _validate_artifact_export_ready(ready)
     if set(manifest) != {
         "accepted_bundle",
         "archive",
@@ -787,10 +986,6 @@ def validate_retrieved_artifact_export(
         raise ValueError("artifact export manifest has unexpected fields")
     if _sha256(manifest_path) != _require_sha(ready.get("manifest_sha256"), SHA256_PATTERN, "export manifest SHA-256"):
         raise ValueError("artifact export READY does not bind the retrieved manifest")
-    if type(ready.get("schema_version")) is not int or ready["schema_version"] != ARTIFACT_EXPORT_SCHEMA_VERSION:
-        raise ValueError("artifact export READY has an unsupported schema")
-    if ready.get("ready_filename") != ARTIFACT_EXPORT_READY_FILENAME:
-        raise ValueError("artifact export READY filename identity is invalid")
     if type(manifest.get("schema_version")) is not int or manifest["schema_version"] != ARTIFACT_EXPORT_SCHEMA_VERSION:
         raise ValueError("artifact export manifest has an unsupported schema")
     expected_source = {
@@ -928,7 +1123,12 @@ def validate_retrieved_artifact_export(
     if wrapper_exit_code != expected_wrapper_exit:
         temporary_archive.unlink(missing_ok=True)
         raise ValueError("artifact export wrapper exit code is inconsistent")
-    if ready.get("runner_exit_code") != runner_exit_code or ready.get("wrapper_exit_code") != wrapper_exit_code:
+    if (
+        type(ready.get("runner_exit_code")) is not int
+        or ready["runner_exit_code"] != runner_exit_code
+        or type(ready.get("wrapper_exit_code")) is not int
+        or ready["wrapper_exit_code"] != wrapper_exit_code
+    ):
         temporary_archive.unlink(missing_ok=True)
         raise ValueError("artifact export READY exit status is inconsistent")
     temporary_archive.replace(archive_output)
@@ -948,7 +1148,7 @@ def wait_for_artifact_ack(
     if isinstance(poll_seconds, bool) or not isinstance(poll_seconds, (int, float)) or poll_seconds <= 0:
         raise ValueError("artifact acknowledgement polling interval must be positive")
     expected = artifact_export_ack(ready)
-    ack_path = export_directory.resolve() / ARTIFACT_EXPORT_ACK_FILENAME
+    ack_path = export_directory.absolute() / ARTIFACT_EXPORT_ACK_FILENAME
     deadline = time.monotonic() + timeout_seconds
     observed_mismatch = False
     while time.monotonic() < deadline:
@@ -991,6 +1191,19 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     verify.add_argument("--source-sha", required=True)
     verify.add_argument("--source-tree", required=True)
     verify.add_argument("--source-manifest-sha256", required=True)
+    read_export = subparsers.add_parser("read-export")
+    read_export.add_argument("--launcher-sha256", required=True)
+    read_export.add_argument("--export-directory", type=Path, required=True)
+    read_export.add_argument("--filename", required=True)
+    read_export.add_argument("--offset", type=int, required=True)
+    decode_export = subparsers.add_parser("decode-export-record")
+    decode_export.add_argument("--record", type=Path, required=True)
+    decode_export.add_argument("--retrieval-directory", type=Path, required=True)
+    ack_export = subparsers.add_parser("ack-export")
+    ack_export.add_argument("--launcher-sha256", required=True)
+    ack_export.add_argument("--export-directory", type=Path, required=True)
+    ack_export.add_argument("--archive-sha256", required=True)
+    ack_export.add_argument("--manifest-sha256", required=True)
     for command in ("run", "run-export"):
         run = subparsers.add_parser(command)
         run.add_argument("--workspace", type=Path, required=True)
@@ -1038,7 +1251,26 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
         )
         return
+    if args.command == "decode-export-record":
+        print(json.dumps(decode_artifact_export_record(args.record, args.retrieval_directory), sort_keys=True))
+        return
     verify_launcher_identity(Path(__file__).resolve(), args.launcher_sha256)
+    if args.command == "read-export":
+        sys.stdout.buffer.write(read_artifact_export_record(args.export_directory, args.filename, offset=args.offset))
+        sys.stdout.buffer.flush()
+        return
+    if args.command == "ack-export":
+        print(
+            json.dumps(
+                write_artifact_export_ack(
+                    args.export_directory,
+                    archive_sha256=args.archive_sha256,
+                    manifest_sha256=args.manifest_sha256,
+                ),
+                sort_keys=True,
+            )
+        )
+        return
     workspace = args.workspace.resolve()
     source_root, _manifest = restore_and_verify_source_payload(
         workspace,

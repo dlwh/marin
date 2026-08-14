@@ -492,14 +492,21 @@ runner that did not create `accepted_bundle.json` is converted to failure. The
 task remains alive until it observes `EXPORT_ACK` with the exact archive and
 manifest identities; malformed acknowledgements do not release it.
 
-The matching controller-side `verify-export` command requires the authorized
-source commit, tree, and capsule-manifest digest. It accepts only READY,
-manifest, and the complete contiguous part set, reconstructs and hashes the
-archive, validates every tar member without extracting it, and writes the ACK
-bytes. Behavior tests cover the live process barrier, wrong then correct ACK,
-missing accepted output, corrupt or missing parts, extra retrieval files, and
-wrong source identity. This closes transport and lifecycle integrity only; it
-does not authorize a cluster submission or qualify benchmark evidence.
+The remote `read-export` command emits exactly one 256 KiB-or-smaller window as
+canonical JSON with ASCII base64, offset, total size, and digest. The local
+`decode-export-record` command strictly decodes those records and accepts only
+contiguous windows. The matching controller-side `verify-export` command
+requires the authorized source commit, tree, and capsule-manifest digest. It
+accepts only READY, manifest, and the complete contiguous part set,
+reconstructs and hashes the archive, validates every tar member without
+extracting it, and writes the ACK bytes. Remote `ack-export` accepts the two
+verified digests and atomically publishes ACK only when they match READY.
+Behavior tests cover the live process barrier, remote text-safe read and ACK
+commands, wrong then correct ACK, missing accepted output, invalid base64,
+multipart order, metadata bounds, status types, corrupt or missing parts,
+extra retrieval files, and wrong source identity. This closes transport and
+lifecycle integrity only; it does not authorize a cluster submission or
+qualify benchmark evidence.
 
 The earlier capsule identities are superseded because the launcher changed.
 A future v34 submission requires a new clean source commit, a new reviewed

@@ -401,13 +401,14 @@ def test_source_capsule_artifact_export_is_closed_and_requires_exact_ack(tmp_pat
     archive = b"".join((export / part["filename"]).read_bytes() for part in manifest["parts"])
     assert hashlib.sha256(archive).hexdigest() == manifest["archive"]["sha256"]
     retrieval = tmp_path / "retrieval"
-    retrieval.mkdir()
     for filename in (
         payload.ARTIFACT_EXPORT_READY_FILENAME,
         payload.ARTIFACT_EXPORT_MANIFEST_FILENAME,
         *(part["filename"] for part in manifest["parts"]),
     ):
-        (retrieval / filename).write_bytes((export / filename).read_bytes())
+        record_path = tmp_path / f"{filename}.record"
+        record_path.write_bytes(payload.read_artifact_export_record(export, filename))
+        payload.decode_artifact_export_record(record_path, retrieval)
     archive_path = tmp_path / "retrieved.tar.gz"
     ack_path = tmp_path / "retrieved.ack"
     payload.main(
@@ -441,11 +442,40 @@ def test_source_capsule_artifact_export_is_closed_and_requires_exact_ack(tmp_pat
     (export / payload.ARTIFACT_EXPORT_ACK_FILENAME).write_text("wrong\n")
     with pytest.raises(ValueError, match="exact export identities"):
         payload.wait_for_artifact_ack(export, ready, timeout_seconds=0.01, poll_seconds=0.001)
-    (export / payload.ARTIFACT_EXPORT_ACK_FILENAME).write_bytes(payload.artifact_export_ack(ready))
+    (export / payload.ARTIFACT_EXPORT_ACK_FILENAME).unlink()
+    payload.write_artifact_export_ack(
+        export,
+        archive_sha256=ready["archive_sha256"],
+        manifest_sha256=ready["manifest_sha256"],
+    )
     payload.wait_for_artifact_ack(export, ready, timeout_seconds=0.01, poll_seconds=0.001)
 
 
-@pytest.mark.parametrize("mutation", ["corrupt_part", "missing_part", "extra_file", "wrong_source", "boolean_schema"])
+def test_source_capsule_export_record_rejects_invalid_base64(tmp_path):
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    (artifacts / "accepted_bundle.json").write_text('{"accepted":true}\n')
+    export = tmp_path / "export"
+    payload.prepare_artifact_export(
+        artifacts,
+        export,
+        runner_exit_code=0,
+        source_sha="1" * 40,
+        source_tree="2" * 40,
+        source_manifest_sha256="3" * 64,
+    )
+    record = json.loads(payload.read_artifact_export_record(export, payload.ARTIFACT_EXPORT_READY_FILENAME))
+    record["contents_base64"] += "!"
+    record_path = tmp_path / "record"
+    record_path.write_bytes(payload._canonical_json(record))
+
+    with pytest.raises(ValueError, match="base64"):
+        payload.decode_artifact_export_record(record_path, tmp_path / "retrieval")
+
+
+@pytest.mark.parametrize(
+    "mutation", ["corrupt_part", "missing_part", "extra_file", "wrong_source", "boolean_schema", "boolean_status"]
+)
 def test_source_capsule_retrieved_export_rejects_transport_drift(tmp_path, mutation):
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()
@@ -478,7 +508,7 @@ def test_source_capsule_retrieved_export_rejects_transport_drift(tmp_path, mutat
         (retrieval / "unsealed").write_text("extra")
     elif mutation == "wrong_source":
         expected_source = "4" * 40
-    else:
+    elif mutation == "boolean_schema":
         manifest_path = retrieval / payload.ARTIFACT_EXPORT_MANIFEST_FILENAME
         mutated_manifest = json.loads(manifest_path.read_bytes())
         mutated_manifest["schema_version"] = True
@@ -487,6 +517,12 @@ def test_source_capsule_retrieved_export_rejects_transport_drift(tmp_path, mutat
         mutated_ready = json.loads(ready_path.read_bytes())
         mutated_ready["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
         mutated_ready["schema_version"] = True
+        ready_path.write_bytes(payload._canonical_json(mutated_ready))
+    else:
+        ready_path = retrieval / payload.ARTIFACT_EXPORT_READY_FILENAME
+        mutated_ready = json.loads(ready_path.read_bytes())
+        mutated_ready["runner_exit_code"] = False
+        mutated_ready["wrapper_exit_code"] = False
         ready_path.write_bytes(payload._canonical_json(mutated_ready))
 
     with pytest.raises(ValueError):
@@ -499,6 +535,78 @@ def test_source_capsule_retrieved_export_rejects_transport_drift(tmp_path, mutat
         )
 
 
+def test_source_capsule_artifact_export_rejects_rehashed_multipart_reorder(tmp_path, monkeypatch):
+    monkeypatch.setattr(payload, "ARTIFACT_EXPORT_CHUNK_BYTES", 64)
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    (artifacts / "accepted_bundle.json").write_text('{"accepted":true}\n')
+    (artifacts / "profile.bin").write_bytes(bytes(range(256)) * 16)
+    export = tmp_path / "export"
+    payload.prepare_artifact_export(
+        artifacts,
+        export,
+        runner_exit_code=0,
+        source_sha="1" * 40,
+        source_tree="2" * 40,
+        source_manifest_sha256="3" * 64,
+    )
+    manifest_path = export / payload.ARTIFACT_EXPORT_MANIFEST_FILENAME
+    manifest = json.loads(manifest_path.read_bytes())
+    assert len(manifest["parts"]) > 1
+    retrieval = tmp_path / "retrieval"
+    for filename in (
+        payload.ARTIFACT_EXPORT_READY_FILENAME,
+        payload.ARTIFACT_EXPORT_MANIFEST_FILENAME,
+        *(part["filename"] for part in manifest["parts"]),
+    ):
+        offset = 0
+        window_index = 0
+        while True:
+            record_path = tmp_path / f"{filename}.record-{window_index:04d}"
+            record_path.write_bytes(payload.read_artifact_export_record(export, filename, offset=offset))
+            decoded = payload.decode_artifact_export_record(record_path, retrieval)
+            if decoded["eof"]:
+                break
+            offset = decoded["next_offset"]
+            window_index += 1
+    retrieved_manifest_path = retrieval / payload.ARTIFACT_EXPORT_MANIFEST_FILENAME
+    mutated_manifest = json.loads(retrieved_manifest_path.read_bytes())
+    mutated_manifest["parts"].reverse()
+    retrieved_manifest_path.write_bytes(payload._canonical_json(mutated_manifest))
+    ready_path = retrieval / payload.ARTIFACT_EXPORT_READY_FILENAME
+    mutated_ready = json.loads(ready_path.read_bytes())
+    mutated_ready["manifest_sha256"] = hashlib.sha256(retrieved_manifest_path.read_bytes()).hexdigest()
+    ready_path.write_bytes(payload._canonical_json(mutated_ready))
+
+    with pytest.raises(ValueError, match="canonical and contiguous"):
+        payload.validate_retrieved_artifact_export(
+            retrieval,
+            tmp_path / "retrieved.tar.gz",
+            expected_source_sha="1" * 40,
+            expected_source_tree="2" * 40,
+            expected_source_manifest_sha256="3" * 64,
+        )
+
+
+def test_source_capsule_artifact_export_rejects_manifest_above_transport_bound(tmp_path, monkeypatch):
+    monkeypatch.setattr(payload, "MAX_ARTIFACT_EXPORT_MANIFEST_BYTES", 64)
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    (artifacts / "accepted_bundle.json").write_text('{"accepted":true}\n')
+    export = tmp_path / "export"
+
+    with pytest.raises(ValueError, match="transport metadata bound"):
+        payload.prepare_artifact_export(
+            artifacts,
+            export,
+            runner_exit_code=0,
+            source_sha="1" * 40,
+            source_tree="2" * 40,
+            source_manifest_sha256="3" * 64,
+        )
+    assert not export.exists()
+
+
 def test_source_capsule_artifact_export_rejects_noncanonical_file_mode(tmp_path):
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()
@@ -509,6 +617,24 @@ def test_source_capsule_artifact_export_rejects_noncanonical_file_mode(tmp_path)
     with pytest.raises(ValueError, match="noncanonical mode"):
         payload.prepare_artifact_export(
             artifacts,
+            tmp_path / "export",
+            runner_exit_code=0,
+            source_sha="1" * 40,
+            source_tree="2" * 40,
+            source_manifest_sha256="3" * 64,
+        )
+
+
+def test_source_capsule_artifact_export_rejects_symlinked_artifact_root(tmp_path):
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    (artifacts / "accepted_bundle.json").write_text('{"accepted":true}\n')
+    linked = tmp_path / "linked"
+    linked.symlink_to(artifacts, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="must not be a symlink"):
+        payload.prepare_artifact_export(
+            linked,
             tmp_path / "export",
             runner_exit_code=0,
             source_sha="1" * 40,
@@ -581,10 +707,55 @@ def test_source_capsule_run_export_keeps_process_alive_until_exact_ack(tmp_path)
     assert ready_path.is_file()
     assert process.poll() is None
     ready = json.loads(ready_path.read_bytes())
-    (export / payload.ARTIFACT_EXPORT_ACK_FILENAME).write_text("wrong\n")
-    time.sleep(0.05)
+    read_ready = subprocess.run(
+        (
+            sys.executable,
+            str(remote / payload.LAUNCHER_FILENAME),
+            "read-export",
+            "--launcher-sha256",
+            result["launcher_sha256"],
+            "--export-directory",
+            str(export),
+            "--filename",
+            payload.ARTIFACT_EXPORT_READY_FILENAME,
+            "--offset",
+            "0",
+        ),
+        cwd=remote,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert read_ready.returncode == 0, read_ready.stderr
+    assert read_ready.stdout.encode() == payload.read_artifact_export_record(
+        export, payload.ARTIFACT_EXPORT_READY_FILENAME
+    )
+    ack_command = (
+        sys.executable,
+        str(remote / payload.LAUNCHER_FILENAME),
+        "ack-export",
+        "--launcher-sha256",
+        result["launcher_sha256"],
+        "--export-directory",
+        str(export),
+        "--archive-sha256",
+        ready["archive_sha256"],
+        "--manifest-sha256",
+        "f" * 64,
+    )
+    wrong_ack = subprocess.run(ack_command, cwd=remote, env=environment, check=False, capture_output=True, text=True)
+    assert wrong_ack.returncode != 0
     assert process.poll() is None
-    (export / payload.ARTIFACT_EXPORT_ACK_FILENAME).write_bytes(payload.artifact_export_ack(ready))
+    correct_ack = subprocess.run(
+        (*ack_command[:-1], ready["manifest_sha256"]),
+        cwd=remote,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert correct_ack.returncode == 0, correct_ack.stderr
 
     stdout, stderr = process.communicate(timeout=10)
 
