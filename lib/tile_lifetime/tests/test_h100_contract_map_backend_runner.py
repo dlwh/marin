@@ -550,6 +550,7 @@ def test_runner_ncu_parser_bounds_and_decodes_input_before_csv_parsing(tmp_path:
     "variant",
     (
         "valid",
+        "direct-instruction-table",
         "missing-top-level",
         "private-line1",
         "wide-separator",
@@ -600,7 +601,17 @@ def test_runner_ncu_profile_parses_real_public_exports_at_process_boundary(
             (_NCU_KERNEL_A, ("0000000000000000 MOV R1, R2",)),
             separator_widths=separator_widths,
         )
-        if variant == "missing-top-level":
+        if variant == "direct-instruction-table":
+            direct_instruction = _ncu_sass_fixed_column_row(
+                ("0000000abcdefa", "MOV R1, c[0x0][0x28]", "1", "2", "3", "4"),
+                column_widths=separator_widths,
+            )
+            source = source.replace("0000000000000000 MOV R1, R2", direct_instruction).replace(
+                _ncu_sass_metric_labels_row(separator_widths) + "\n" + _ncu_sass_separator(separator_widths) + "\n",
+                _ncu_sass_metric_labels_row(separator_widths) + "\n",
+                1,
+            )
+        elif variant == "missing-top-level":
             source = source.split("\n", maxsplit=1)[1]
         elif variant == "private-line1":
             source = private_line1 + "\n" + source
@@ -859,6 +870,86 @@ def test_runner_ncu_sass_parser_requires_valid_instruction_rows_for_exact_kernel
     assert tuple(record.name for record in records) == (_NCU_KERNEL_A, _NCU_KERNEL_B)
     assert tuple(instruction.mnemonic for instruction in records[0].instructions) == ("MOV", "EXIT")
     assert records[1].instructions == (runner.NcuSassInstruction(address=0x20, mnemonic="FFMA"),)
+
+
+@pytest.mark.parametrize("separator_widths", (_NCU_SASS_COLUMN_WIDTHS, _NCU_SASS_WIDE_COLUMN_WIDTHS))
+@pytest.mark.parametrize("metric_label_count", (1, 5, 9))
+@pytest.mark.parametrize(
+    ("source_field", "mnemonic"), (("MOV R1, c[0x0][0x28]", "MOV"), ("FFMA R3, R4, R5, R6", "FFMA"))
+)
+def test_runner_ncu_sass_parser_accepts_instruction_immediately_after_metric_labels(
+    separator_widths: tuple[int, ...],
+    metric_label_count: int,
+    source_field: str,
+    mnemonic: str,
+) -> None:
+    instruction = _ncu_sass_fixed_column_row(
+        ("0000000abcdefa", source_field, "1", "2", "3", "4"),
+        column_widths=separator_widths,
+    )
+    metric_rows = (_ncu_sass_metric_labels_row(separator_widths),) * metric_label_count
+    if metric_label_count == 9:
+        metric_rows = (
+            *metric_rows[:-1],
+            _ncu_sass_metric_labels_row(separator_widths, columns=("", "", "a", "b", "c", "d")),
+        )
+    source = _ncu_sass_with_metric_label_rows(
+        _ncu_sass_export((_NCU_KERNEL_A, (instruction,)), separator_widths=separator_widths),
+        metric_rows,
+        separator_widths,
+    ).replace(
+        _ncu_sass_metric_labels_row(separator_widths) + "\n" + _ncu_sass_separator(separator_widths) + "\n",
+        _ncu_sass_metric_labels_row(separator_widths) + "\n",
+        1,
+    )
+
+    records = runner.parse_ncu_sass(source, (_NCU_KERNEL_A,))
+
+    assert records == (
+        runner.NcuSassKernel(
+            name=_NCU_KERNEL_A,
+            instructions=(runner.NcuSassInstruction(address=0x0000000ABCDEFA, mnemonic=mnemonic),),
+        ),
+    )
+
+
+def test_runner_ncu_sass_parser_rejects_instruction_before_any_metric_label() -> None:
+    instruction = _ncu_sass_fixed_column_row(("00000000000000", "MOV R1, c[0x0][0x28]", "1", "2", "3", "4"))
+    source = _ncu_sass_export((_NCU_KERNEL_A, (instruction,))).replace(
+        _ncu_sass_metric_labels_row() + "\n" + _NCU_SASS_SEPARATOR + "\n",
+        "",
+        1,
+    )
+
+    with pytest.raises(ValueError) as failure:
+        runner.parse_ncu_sass(source, (_NCU_KERNEL_A,))
+
+    assert _ncu_sass_diagnostic(failure.value)["line_number"] == 5
+
+
+@pytest.mark.parametrize(
+    ("source_field", "metric_fields", "message"),
+    (
+        ("NOTREAL R1, R2", ("1", "2", "3", "4"), "unrecognized SASS instruction mnemonic"),
+        ("MOV R1, R2", ("10", "2", "3", "4"), "unrecognized Nsight Compute SASS export record"),
+    ),
+)
+def test_runner_ncu_sass_parser_rejects_invalid_direct_instruction_transition(
+    source_field: str,
+    metric_fields: tuple[str, ...],
+    message: str,
+) -> None:
+    instruction = _ncu_sass_fixed_column_row(
+        ("0000000abcdefa", source_field, *metric_fields),
+    )
+    source = _ncu_sass_export((_NCU_KERNEL_A, (instruction,))).replace(
+        _ncu_sass_metric_labels_row() + "\n" + _NCU_SASS_SEPARATOR + "\n",
+        _ncu_sass_metric_labels_row() + "\n",
+        1,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        runner.parse_ncu_sass(source, (_NCU_KERNEL_A,))
 
 
 def test_runner_ncu_sass_parser_accepts_exact_colonless_padded_kernel_identity() -> None:
@@ -1526,7 +1617,7 @@ def test_runner_ncu_sass_instruction_diagnostic_fits_selected_width_record_bound
 ) -> None:
     private_source_field = "MOV private-token"
     record = _ncu_sass_fixed_column_row(
-        ("00000000000000af", private_source_field, "0", "1", "2", "3"),
+        ("00000000000000af", private_source_field, "10", "1", "2", "3"),
         column_widths=separator_widths,
     )
     source = _ncu_sass_export(

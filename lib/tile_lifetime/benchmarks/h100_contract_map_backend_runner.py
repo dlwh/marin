@@ -1125,18 +1125,18 @@ def parse_ncu_sass(source: str, expected_names: Sequence[str]) -> tuple[NcuSassK
     header_seen = False
     metric_label_row_count = 0
     metric_label_bytes = (0, 0, 0, 0)
-    separator_seen = False
+    instruction_table_started = False
 
     def finish_section() -> None:
         nonlocal current_name, instructions, identity_separator_seen, header_seen, metric_label_row_count
-        nonlocal metric_label_bytes, separator_seen
+        nonlocal metric_label_bytes, instruction_table_started
         if current_name is None:
             return
         if (
             not identity_separator_seen
             or not header_seen
             or not 1 <= metric_label_row_count <= _MAX_NCU_SASS_METRIC_LABEL_ROWS
-            or not separator_seen
+            or not instruction_table_started
             or not instructions
         ):
             raise ValueError(f"Nsight Compute SASS section {current_name!r} is structurally incomplete")
@@ -1147,7 +1147,40 @@ def parse_ncu_sass(source: str, expected_names: Sequence[str]) -> tuple[NcuSassK
         header_seen = False
         metric_label_row_count = 0
         metric_label_bytes = (0, 0, 0, 0)
-        separator_seen = False
+        instruction_table_started = False
+
+    def append_instruction(line: str) -> bool:
+        instruction = _NCU_SASS_INSTRUCTION_PATTERN.match(line)
+        if instruction is None:
+            return False
+        mnemonic = instruction.group("mnemonic")
+        if mnemonic.split(".", maxsplit=1)[0] not in _SASS_OPCODE_BASES:
+            raise ValueError(f"unrecognized SASS instruction mnemonic: {mnemonic!r}")
+        address_text = instruction.group("address")
+        instructions.append(
+            NcuSassInstruction(
+                address=int(address_text.removeprefix("0x"), 16),
+                mnemonic=mnemonic,
+            )
+        )
+        return True
+
+    def append_direct_fixed_column_instruction(line: str) -> bool:
+        columns = _ncu_sass_selected_columns(line, selected_separator_widths)
+        if columns is None:
+            return False
+        trimmed = tuple(column.rstrip(b" ") for column in columns)
+        if any(
+            column != value + b" " * (len(column) - len(value)) for column, value in zip(columns, trimmed, strict=True)
+        ):
+            return False
+        if re.fullmatch(rb"(?:0x)?[0-9A-Fa-f]{4,16}", trimmed[0]) is None:
+            return False
+        if not trimmed[1] or trimmed[1].startswith(b" "):
+            return False
+        if any(re.fullmatch(rb"[0-9]", value) is None for value in trimmed[2:]):
+            return False
+        return append_instruction(line)
 
     for line_number, line in enumerate(lines[1:], start=2):
         if current_name is not None and not identity_separator_seen:
@@ -1162,14 +1195,17 @@ def parse_ncu_sass(source: str, expected_names: Sequence[str]) -> tuple[NcuSassK
                 raise _unrecognized_ncu_sass_record(line_number, line, selected_separator_widths)
             header_seen = True
             continue
-        if current_name is not None and not separator_seen:
+        if current_name is not None and not instruction_table_started:
             if is_selected_separator(line):
                 if metric_label_row_count == 0:
                     raise _unrecognized_ncu_sass_record(line_number, line, selected_separator_widths)
-                separator_seen = True
+                instruction_table_started = True
                 continue
             fragment_bytes = _ncu_sass_metric_label_fragment_bytes(line, selected_separator_widths)
             if fragment_bytes is None:
+                if metric_label_row_count > 0 and append_direct_fixed_column_instruction(line):
+                    instruction_table_started = True
+                    continue
                 raise _unrecognized_ncu_sass_record(line_number, line, selected_separator_widths)
             next_metric_label_bytes = tuple(
                 total + fragment for total, fragment in zip(metric_label_bytes, fragment_bytes, strict=True)
@@ -1190,19 +1226,8 @@ def parse_ncu_sass(source: str, expected_names: Sequence[str]) -> tuple[NcuSassK
             continue
         if is_selected_separator(line):
             raise ValueError(f"misplaced Nsight Compute SASS separator at line {line_number}")
-        instruction = _NCU_SASS_INSTRUCTION_PATTERN.match(line)
-        if instruction is None or current_name is None or not separator_seen:
+        if current_name is None or not instruction_table_started or not append_instruction(line):
             raise _unrecognized_ncu_sass_record(line_number, line, selected_separator_widths)
-        mnemonic = instruction.group("mnemonic")
-        if mnemonic.split(".", maxsplit=1)[0] not in _SASS_OPCODE_BASES:
-            raise ValueError(f"unrecognized SASS instruction mnemonic: {mnemonic!r}")
-        address_text = instruction.group("address")
-        instructions.append(
-            NcuSassInstruction(
-                address=int(address_text.removeprefix("0x"), 16),
-                mnemonic=mnemonic,
-            )
-        )
     finish_section()
 
     actual = tuple(section.name for section in sections)
