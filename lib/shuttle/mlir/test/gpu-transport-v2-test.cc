@@ -1466,7 +1466,32 @@ TEST(GpuTransportV2Test,
     EXPECT_FALSE(sourcePtx.contains("ld.global.u16"));
     EXPECT_EQ(fastPtx.count("ld.global.f32"), 2u);
     EXPECT_FALSE(fastPtx.contains("ld.global.u16"));
+    auto expectMappedAddresses = [&](llvm::StringRef ptx) {
+      if (ordinal == 3) {
+        // lhs=(d2,d0), rhs=(d2,d1), with d2 in %rd10.
+        EXPECT_TRUE(ptx.contains("mad.lo.u64 %rd11, %rd11, 17, %rd10;\n"
+                                 "  mad.lo.u64 %rd11, %rd11, 19, %rd8;"));
+        EXPECT_TRUE(ptx.contains("mad.lo.u64 %rd13, %rd13, 17, %rd10;\n"
+                                 "  mad.lo.u64 %rd13, %rd13, 33, %rd9;"));
+      } else {
+        // lhs=(d0,d2), rhs=(d1,d2), with d2 in %rd10.
+        EXPECT_TRUE(ptx.contains("mad.lo.u64 %rd11, %rd11, 17, %rd8;\n"
+                                 "  mad.lo.u64 %rd11, %rd11, 19, %rd10;"));
+        EXPECT_TRUE(ptx.contains("mad.lo.u64 %rd13, %rd13, 33, %rd9;\n"
+                                 "  mad.lo.u64 %rd13, %rd13, 19, %rd10;"));
+      }
+    };
+    expectMappedAddresses(sourcePtx);
+    expectMappedAddresses(fastPtx);
   }
+  const auto transposeLaunch = sourceDecoded->launches[4];
+  llvm::StringRef transposePtx(
+      reinterpret_cast<const char *>(sourceDecoded->code.data() +
+                                     transposeLaunch.codeOffset),
+      transposeLaunch.codeLength);
+  // The transpose Map consumes its input through (d1,d0), not identity order.
+  EXPECT_TRUE(transposePtx.contains("mad.lo.u64 %rd10, %rd10, 19, %rd9;\n"
+                                    "  mad.lo.u64 %rd10, %rd10, 33, %rd8;"));
 }
 
 TEST(GpuTransportV2Test, FoldDynamicSharedMemoryIsDeclaredAtModuleScope) {
