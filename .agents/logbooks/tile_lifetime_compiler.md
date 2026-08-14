@@ -5039,3 +5039,38 @@ author: dlwh
   collectives, full attention, cap raises, PTX assembly, GPU execution,
   hardware, image, upload, timing, performance, push, integration, and
   scorecard change remain excluded.
+
+### 2026-08-14 - TLTC-MLIR-026 ABI 19 libdevice red contract
+
+- A test-only ABI19 boundary pins the official `nvidia-nvvm==13.2.78`
+  x86-64 and AArch64 wheel URLs, sizes, and SHA-256 values, together with the
+  pinned XLA restricted-license template revision and digest. The selected
+  platform, extracted `libdevice.10.bc` path, bitcode digest and size, and
+  license evidence remain null, so the checkpoint cannot acquire or consume
+  an artifact.
+- The compile-time contract requires StableHLO DEFAULT-accuracy f32
+  exponential through `__nv_expf`, forbids `__nv_fast_expf`, and requires
+  deterministic self-contained PTX 8.0 for `sm_90`, 64-bit addressing,
+  `ftz=false`, and no unresolved device calls. The anonymous positive fixture
+  stays inside the existing terminal additive Fold and exactly-one
+  expanding-singleton boundary. SOURCE_ORDERED and FAST retain distinct ABI
+  identities; this checkpoint makes no numerical or hardware claim.
+- Mutation-sensitive Python checks reject changes to the package version,
+  lock and wheel hashes, sizes and URLs, license provenance, compile contract,
+  or any partial artifact seal. The native test independently freezes the
+  implicit DEFAULT accuracy request, deterministic and renamed-symbol PTX,
+  target preamble, fast-symbol exclusion, FTZ exclusion, and unresolved-call
+  exclusion for both policies.
+- Exact test-only commit `7d152711f77fb30ebde9f737bf150db398591601`,
+  tree `25208f740a60edfd9593c2ca11d746dde4cd80cb`, is based on
+  `f7afc3ee7a7d22273230695fb935fdac7abc3212`. The focused Python census is
+  37 pass and six intended ABI19 rotation failures. Full Shuttle Python is
+  85/91: five intended ABI19 rotation failures and the unchanged accepted-base
+  evaluation-manifest hash failure. The native target compiles and links; its
+  structural DEFAULT-accuracy test passes and its lowering test fails exactly
+  at exponential Map PTX emission. Changed-files precommit passes offline.
+- No NVIDIA artifact was downloaded, unpacked, linked, or executed. No
+  production compiler, runtime schema, cap, hardware, image, upload, network,
+  push, integration, or scorecard state changed. Production remains stopped
+  until a separately authorized acquisition supplies and verifies the exact
+  official artifact and license evidence.
