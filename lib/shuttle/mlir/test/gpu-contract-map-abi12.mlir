@@ -22,6 +22,8 @@
 // MATERIALIZATION: domain_shape = array<i64: 7, 3, 13>
 // MATERIALIZATION-LABEL: module @anonymous_d
 // MATERIALIZATION: domain_shape = array<i64: 11, 17, 3>
+// MATERIALIZATION-LABEL: module @anonymous_e
+// MATERIALIZATION: domain_shape = array<i64: 17, 19, 3>
 
 // SCHEDULE-LABEL: module @anonymous_a
 // SCHEDULE: "shuttle.schedule_plan"() <{{.*}}policy = #shuttle.policy<source_ordered>{{.*}}schema_version = 2
@@ -32,6 +34,8 @@
 // SCHEDULE-LABEL: module @anonymous_c
 // SCHEDULE: #shuttle.schedule_task_kind<contract>
 // SCHEDULE-LABEL: module @anonymous_d
+// SCHEDULE: #shuttle.schedule_task_kind<contract>
+// SCHEDULE-LABEL: module @anonymous_e
 // SCHEDULE: #shuttle.schedule_task_kind<contract>
 
 // DESCRIPTOR-LABEL: module @anonymous_a
@@ -45,6 +49,8 @@
 // DESCRIPTOR-LABEL: module @anonymous_c
 // DESCRIPTOR: stablehlo.custom_call @shuttle.gpu.executable_bundle.v2
 // DESCRIPTOR-LABEL: module @anonymous_d
+// DESCRIPTOR: stablehlo.custom_call @shuttle.gpu.executable_bundle.v2
+// DESCRIPTOR-LABEL: module @anonymous_e
 // DESCRIPTOR: stablehlo.custom_call @shuttle.gpu.executable_bundle.v2
 // DESCRIPTOR-NOT: shuttle.region
 // DESCRIPTOR-NOT: shuttle.contract

@@ -42,3 +42,13 @@ module @anonymous_d {
     return %result : tensor<11x17xbf16>
   }
 }
+
+// -----
+
+module @anonymous_e {
+  func.func public @main(%lhs: tensor<17x3xbf16>, %rhs: tensor<3x19xbf16>) -> tensor<17x19xbf16> {
+    %contract = stablehlo.dot_general %lhs, %rhs, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<17x3xbf16>, tensor<3x19xbf16>) -> tensor<17x19xf32>
+    %result = stablehlo.convert %contract : (tensor<17x19xf32>) -> tensor<17x19xbf16>
+    return %result : tensor<17x19xbf16>
+  }
+}

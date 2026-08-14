@@ -1026,11 +1026,9 @@ TEST(GpuTransportV2Test,
     int64_t columns;
   };
   constexpr Shape shapes[] = {
-      {2, 3, 5},
-      {3, 5, 2},
-      {7, 13, 3},
-      {11, 3, 17},
+      {2, 3, 5}, {3, 5, 2}, {7, 13, 3}, {11, 3, 17}, {17, 3, 19},
   };
+  bool sawMultipleBlocks = false;
   for (const Shape &shape : shapes) {
     SCOPED_TRACE(testing::Message()
                  << "M=" << shape.rows << " K=" << shape.reduction
@@ -1047,12 +1045,20 @@ TEST(GpuTransportV2Test,
 
     ASSERT_EQ(independent->launches.size(), 2);
     ASSERT_EQ((*publicDescriptor)->launches().size(), 2);
+    ASSERT_EQ((*publicDescriptor)->slots().size(), 4);
     EXPECT_EQ(independent->slots, 4);
     EXPECT_EQ(independent->externalSlots, 3);
     EXPECT_EQ(independent->scalarSlots, 0);
     EXPECT_EQ(independent->temporaryGroupOrder.size(), 1);
     EXPECT_EQ(independent->temporaryBytes,
               static_cast<uint64_t>(shape.rows * shape.columns * 4));
+    auto temporaryType = cast<mlir::RankedTensorType>(
+        (*publicDescriptor)->slots()[2].tensorType);
+    EXPECT_EQ(temporaryType.getShape(),
+              llvm::ArrayRef<int64_t>({shape.rows, shape.columns}));
+    EXPECT_TRUE(temporaryType.getElementType().isF32());
+    EXPECT_EQ((*publicDescriptor)->slots()[2].requiredBytes,
+              shape.rows * shape.columns * 4);
     EXPECT_EQ(independent->launches[0].inputSlots,
               (std::vector<int64_t>{0, 1}));
     EXPECT_EQ(independent->launches[0].outputSlots, (std::vector<int64_t>{2}));
@@ -1071,7 +1077,9 @@ TEST(GpuTransportV2Test,
       EXPECT_EQ(launch.block, expectedBlock);
       EXPECT_EQ(launch.dynamicSharedMemoryBytes, 0);
     }
+    sawMultipleBlocks |= expectedGrid[0] > 1;
   }
+  EXPECT_TRUE(sawMultipleBlocks);
 }
 
 TEST(GpuTransportV2Test,

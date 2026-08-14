@@ -1,9 +1,9 @@
 // Copyright The Marin Authors
 // SPDX-License-Identifier: Apache-2.0
 
-#include <string>
 #include <fstream>
 #include <sstream>
+#include <string>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -36,8 +36,6 @@ constexpr char kAbi12ContractSourceOrderedOptions[] =
     R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":12,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
 constexpr char kAbi12ContractFastOptions[] =
     R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":12,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
-constexpr char kAbi12ContractNonDefaultTuningOptions[] =
-    R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":12,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":2,"pipeline_stages":1,"tile_sizes":[64]}})json";
 constexpr char kProgram[] = R"mlir(
 module {
   func.func @main(%arg0: tensor<7xf32>) -> tensor<7xf32> {
@@ -133,14 +131,14 @@ TEST(ShuttleXlaOptionsTest, RejectsAdjacentGpuPipelineAbis) {
               absl::StatusCode::kInvalidArgument);
 }
 
-TEST(ShuttleXlaOptionsTest,
-     Abi12RunsCanonicalSourceOrderedContractMapOptions) {
+TEST(ShuttleXlaOptionsTest, Abi12RunsCanonicalSourceOrderedContractMapOptions) {
   auto options =
       mlir::shuttle::parseShuttleXlaOptions(kAbi12ContractSourceOrderedOptions);
   ASSERT_TRUE(options.ok()) << options.status();
   EXPECT_EQ(options->canonicalOptions, kAbi12ContractSourceOrderedOptions);
-  EXPECT_EQ(options->canonicalTuning,
-            R"json({"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json");
+  EXPECT_EQ(
+      options->canonicalTuning,
+      R"json({"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json");
   EXPECT_EQ(mlir::shuttle::shuttlePipelineIdentity(*options).policyDigest,
             "24b2814b329731c70f7779d90f811b959cbf92a1f2119f88ba746639d341c516");
 
@@ -148,8 +146,8 @@ TEST(ShuttleXlaOptionsTest,
   mlir::OwningOpRef<mlir::ModuleOp> module =
       parseModule(context, kContractMapProgram);
   ASSERT_TRUE(module);
-  ASSERT_TRUE(
-      mlir::succeeded(mlir::shuttle::runShuttleXlaTransform(*module, *options)));
+  ASSERT_TRUE(mlir::succeeded(
+      mlir::shuttle::runShuttleXlaTransform(*module, *options)));
   std::string transformed;
   llvm::raw_string_ostream output(transformed);
   module->print(output);
@@ -160,10 +158,9 @@ TEST(ShuttleXlaOptionsTest,
             std::string::npos);
 }
 
-TEST(ShuttleXlaOptionsTest,
-     Abi12PreservesFastMapFoldAndRejectsFastContract) {
-  auto options = mlir::shuttle::parseShuttleXlaOptions(
-      kAbi12ContractFastOptions);
+TEST(ShuttleXlaOptionsTest, Abi12PreservesFastMapFoldAndRejectsFastContract) {
+  auto options =
+      mlir::shuttle::parseShuttleXlaOptions(kAbi12ContractFastOptions);
   ASSERT_TRUE(options.ok()) << options.status();
 
   std::string error;
@@ -187,20 +184,28 @@ TEST(ShuttleXlaOptionsTest,
   mlir::OwningOpRef<mlir::ModuleOp> contract =
       parseModule(contractContext, kContractMapProgram);
   ASSERT_TRUE(contract);
-  EXPECT_TRUE(mlir::failed(
-      mlir::shuttle::runShuttleXlaTransform(*contract, *options)));
+  EXPECT_TRUE(
+      mlir::failed(mlir::shuttle::runShuttleXlaTransform(*contract, *options)));
 }
 
 TEST(ShuttleXlaOptionsTest, Abi12ContractRejectsNonDefaultTuning) {
-  auto options = mlir::shuttle::parseShuttleXlaOptions(
-      kAbi12ContractNonDefaultTuningOptions);
-  ASSERT_TRUE(options.ok()) << options.status();
-  mlir::MLIRContext context;
-  mlir::OwningOpRef<mlir::ModuleOp> module =
-      parseModule(context, kContractMapProgram);
-  ASSERT_TRUE(module);
-  EXPECT_TRUE(
-      mlir::failed(mlir::shuttle::runShuttleXlaTransform(*module, *options)));
+  constexpr const char *nonDefault[] = {
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":12,"schema_version":1,"tuning":{"cluster_shape":[2,1,1],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":12,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":12,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":2,"pipeline_stages":1,"tile_sizes":[]}})json",
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":12,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":2,"tile_sizes":[]}})json",
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":12,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[64]}})json",
+  };
+  for (const char *serialized : nonDefault) {
+    auto options = mlir::shuttle::parseShuttleXlaOptions(serialized);
+    ASSERT_TRUE(options.ok()) << options.status();
+    mlir::MLIRContext context;
+    mlir::OwningOpRef<mlir::ModuleOp> module =
+        parseModule(context, kContractMapProgram);
+    ASSERT_TRUE(module);
+    EXPECT_TRUE(
+        mlir::failed(mlir::shuttle::runShuttleXlaTransform(*module, *options)));
+  }
 }
 
 TEST(ShuttleXlaOptionsTest, RejectsInvalidOrNoncanonicalWireFormats) {
@@ -277,8 +282,7 @@ TEST(ShuttleXlaOptionsTest, RunsGpuFastPipelineFromSerializedOptions) {
   source << input.rdbuf();
   ASSERT_TRUE(input);
   mlir::MLIRContext context;
-  mlir::OwningOpRef<mlir::ModuleOp> module =
-      parseModule(context, source.str());
+  mlir::OwningOpRef<mlir::ModuleOp> module = parseModule(context, source.str());
   ASSERT_TRUE(module);
   EXPECT_TRUE(mlir::shuttle::runShuttleXlaTransform(
                   *module, kGpuExecutableBundleFastOptions)
