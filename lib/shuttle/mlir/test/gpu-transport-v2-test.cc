@@ -1102,19 +1102,30 @@ TEST(GpuTransportV2Test,
   llvm::StringRef mapPtx(reinterpret_cast<const char *>(decoded->code.data() +
                                                         mapLaunch.codeOffset),
                          mapLaunch.codeLength);
-  size_t zero = contractPtx.find("0f00000000");
-  size_t fma = contractPtx.find("fma.rn.f32");
-  size_t increment = contractPtx.find("add.u64", fma);
-  if (increment == llvm::StringRef::npos)
-    increment = contractPtx.find("add.u32", fma);
-  if (increment == llvm::StringRef::npos)
-    increment = contractPtx.find("add.s64", fma);
-  if (increment == llvm::StringRef::npos)
-    increment = contractPtx.find("add.s32", fma);
-  size_t branch = contractPtx.find("bra", increment);
+  size_t zero = contractPtx.find("mov.f32 %f0, 0f00000000;");
+  size_t induction = contractPtx.find("mov.u64 %rd13, 0;");
+  size_t loop = contractPtx.find("$contract_loop:");
+  size_t bound = contractPtx.find("setp.ge.u64 %p1, %rd13, 13;", loop);
+  size_t lhsIndex =
+      contractPtx.find("mad.lo.u64 %rd14, %rd8, 13, %rd13;", bound);
+  size_t rhsIndex =
+      contractPtx.find("mad.lo.u64 %rd15, %rd13, 3, %rd9;", lhsIndex);
+  size_t fma = contractPtx.find("fma.rn.f32 %f0, %f1, %f2, %f0;", rhsIndex);
+  size_t increment = contractPtx.find("add.u64 %rd13, %rd13, 1;", fma);
+  size_t branch = contractPtx.find("bra $contract_loop;", increment);
   ASSERT_NE(zero, llvm::StringRef::npos);
+  ASSERT_NE(induction, llvm::StringRef::npos);
+  ASSERT_NE(loop, llvm::StringRef::npos);
+  ASSERT_NE(bound, llvm::StringRef::npos);
+  ASSERT_NE(lhsIndex, llvm::StringRef::npos);
+  ASSERT_NE(rhsIndex, llvm::StringRef::npos);
   ASSERT_NE(fma, llvm::StringRef::npos);
-  EXPECT_LT(zero, fma);
+  EXPECT_LT(zero, induction);
+  EXPECT_LT(induction, loop);
+  EXPECT_LT(loop, bound);
+  EXPECT_LT(bound, lhsIndex);
+  EXPECT_LT(lhsIndex, rhsIndex);
+  EXPECT_LT(rhsIndex, fma);
   ASSERT_NE(increment, llvm::StringRef::npos);
   EXPECT_LT(fma, increment);
   ASSERT_NE(branch, llvm::StringRef::npos);
