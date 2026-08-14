@@ -24,7 +24,6 @@ from shuttle_jaxlib_gpu_ffi_registration import (
 )
 
 TARGET = "shuttle.gpu.executable_bundle.v2"
-STALE_TARGET = "shuttle.gpu.executable_bundle.v1"
 
 
 def validated_shuttle_bundle(handlers: object) -> dict[str, object]:
@@ -32,8 +31,9 @@ def validated_shuttle_bundle(handlers: object) -> dict[str, object]:
     if type(handlers) is not dict or TARGET not in handlers:
         targets = sorted(handlers) if type(handlers) is dict else []
         raise RuntimeError(f"missing ABI 11 Shuttle CUDA typed-FFI target: {targets}")
-    if STALE_TARGET in handlers:
-        raise RuntimeError("CUDA plugin retained the stale ABI 10 Shuttle target")
+    extra_shuttle_targets = {target for target in handlers if target.startswith("shuttle.") and target != TARGET}
+    if extra_shuttle_targets:
+        raise RuntimeError(f"CUDA plugin exported another Shuttle target: {sorted(extra_shuttle_targets)}")
     bundle = handlers[TARGET]
     if type(bundle) is not dict or set(bundle) != {*STAGES, "api_version", "traits"}:
         raise RuntimeError("CUDA plugin exported an unknown Shuttle handler field")

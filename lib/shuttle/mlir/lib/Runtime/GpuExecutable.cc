@@ -474,11 +474,14 @@ absl::StatusOr<Parsed> parse(ArrayRef<uint8_t> bytes) {
              bytes.slice(abiSuffixStart, bundleStart - abiSuffixStart)))
     return invalidTransport("invocation closure");
   SmallVector<int64_t> producer(*slotCount, -1);
+  SmallVector<int64_t> firstUse(*slotCount, -1);
   SmallVector<int64_t> finalUse(*slotCount, -1);
   for (const GpuLaunch &launch : parsed.launches) {
     for (int64_t slot : launch.inputSlots) {
       if (slot < 0 || slot >= static_cast<int64_t>(*slotCount))
         return invalidTransport("input slot range");
+      if (firstUse[slot] == -1)
+        firstUse[slot] = launch.taskOrdinal;
       finalUse[slot] = std::max(finalUse[slot], launch.taskOrdinal);
     }
     for (int64_t slot : launch.outputSlots) {
@@ -495,6 +498,7 @@ absl::StatusOr<Parsed> parse(ArrayRef<uint8_t> bytes) {
   for (const GpuSlot &slot : parsed.slots) {
     if (slot.storage == MaterializationStorage::Temporary) {
       if (producer[slot.ordinal] < 0 ||
+          firstUse[slot.ordinal] <= producer[slot.ordinal] ||
           finalUse[slot.ordinal] <= producer[slot.ordinal])
         return invalidTransport("temporary lifetime");
       continue;
@@ -508,7 +512,9 @@ absl::StatusOr<Parsed> parse(ArrayRef<uint8_t> bytes) {
           finalUse[slot.ordinal] < 0)
         return invalidTransport("operand projection");
     } else if (slot.bindingKind == ExecutableBindingKind::Result) {
-      if (slot.bindingIndex != resultIndex++ || producer[slot.ordinal] < 0)
+      if (slot.bindingIndex != resultIndex++ || producer[slot.ordinal] < 0 ||
+          (firstUse[slot.ordinal] != -1 &&
+           firstUse[slot.ordinal] <= producer[slot.ordinal]))
         return invalidTransport("result projection");
     } else {
       return invalidTransport("external binding kind");

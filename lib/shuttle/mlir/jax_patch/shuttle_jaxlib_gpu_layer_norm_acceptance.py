@@ -55,52 +55,52 @@ SHAPES = (
 # from the exact checked-in StableHLO fixtures and pinned XLA pipeline.
 OBSERVER_FINGERPRINTS = {
     ("81928ab3539c0f03", "forward", "source_ordered"): (
-        "9709ec5748d1782201c66b757b277e581c4b6ba7d22e4f7c0dcca6d8671e5a73",
-        "1c3f73a65db2df46631437f30f781de0b7e94e0c04d0cea91285178b681cf0bf",
+        "7c9528eb9f0b70c94398dc88d0ca9299a3fb4f73e4656b0c69f6d4eda29027f4",
+        "e04ef75d200893ec138459d7d197cba47941b4cf2e4718b45cd679772244d4de",
     ),
     ("81928ab3539c0f03", "forward", "fast"): (
-        "38f9c6b58ea83d426a297e0e2e499e547f1ffc6e2af3eac4acdb30fa2f5d6cd3",
-        "64a17a580ab728cfc3ff5eb381508112f9c322a69681c545d288bc7bdb0437fe",
+        "f637184d311568d777f4a06844661560cf35a2f9a7361fb8cf3b8174d5a9e2d9",
+        "ed18f687d1d62283859071c493270c1911e916eb22dd6a836a6b52a4777ea8a4",
     ),
     ("81928ab3539c0f03", "backward", "source_ordered"): (
-        "ddc1f20c8db96585d2ae722a13fcdbdb764b3d965a52a43ebe7c62d6de9d5b76",
-        "6aa2dd0cd4a8bfdfb9e530ff2e7d0ed8c05b1a8fdb924bc91538272f8b062fb1",
+        "a3e917830b43cbe6a6b88ee2b1037c5a1e90329bb6f3e3f3ad1e07fb6f4881b4",
+        "4e65e61b30890170096cf8f38f55eb58bb77b15fe0fe1ddfebe1a454b2d5df3b",
     ),
     ("81928ab3539c0f03", "backward", "fast"): (
-        "139587df1e0fbe5e9c000533c1b1395a4a447c895b82c306831c76639a1dcb3f",
-        "ae00099b7fea645587f925f49e98ba2f344f60e137c20a7941e4fd012e3df000",
+        "59eec815eac7bc70e34d43c989d2de0ef3b0630fca6dd8c8807918ec6cd878fb",
+        "df75fedb775547f2e32e915fbe88053b6305065adbf48491e7cb7eddf3c159a4",
     ),
     ("81928ab3539c0f03", "composed", "source_ordered"): (
-        "6b59d6a04b3e8366571b08e5ed6278ebc8594eba66d5a7dc52749ae6fdd023d4",
-        "966722fb8e7ed4f2fcb8c3747b7e3eb678a71d7fe8a7f3d04658ab89872d8019",
+        "73e7fd2631e83f8fcda2600ace109783175fb312c37a4abfc55dc8741eed127b",
+        "63f722e6e20356c452e03513137d420cce87126902bfbc88d439236c0e3fadf1",
     ),
     ("81928ab3539c0f03", "composed", "fast"): (
-        "539ccc57b4cc30004f6ba3b756c3c09aaf29bfea4d2ab2a9f1d1bfb8a91af551",
-        "e9657c7c406ccb0037bc990287fe5f261f17c994e1e02d78c03b8086cc9b0038",
+        "c6c63421ab8b1be82f0ad7f1c935dbae043b59af428d5c9261c119074feae04e",
+        "669d6168dea3b47713af143255c4940421a5d989ec30b423dcbbf4a562f25475",
     ),
     ("44d152ecc3e9ff18", "forward", "source_ordered"): (
-        "51a675acd6bf1254176267c8a0d01ccd04357710f564233d35a70a14a780fbb5",
-        "4eceb5ea70cd2e919c9823af01be735a5937b3d25b539be050dc81083691a2cd",
+        "14dd27fbea0fb542923447a84c401862972d51b882d437db351f9017b2e9c9a1",
+        "3dea82023efde83bd2f0cc42940eef3ee78c1dd7cbed26c69228ff8e1d08cf06",
     ),
     ("44d152ecc3e9ff18", "forward", "fast"): (
-        "b03a5d84794682f2eca360820fbc937656882f547cc9725395e75b7c8b944d76",
-        "055c5a4bd1e22e71037003cbe85ac2baa2a3589c53be7237acc6c10545d58858",
+        "7ea3cd47aa4ebee558d87b9c38806f1d4aa4d45f8d5d71a300cb11cec0cf94cf",
+        "e5a44e4947fd16d004d5d156f539fa4a2b5e751d6b957dd0b984062141626887",
     ),
     ("44d152ecc3e9ff18", "backward", "source_ordered"): (
-        "3b2f78ad26b3cad2758d78d5adefab0c16756838979469af41733870245bb55d",
-        "fa32168a74fc038ba7a11a768f168eea57d19ae70ac0ac23c6c22a08d02ba9b7",
+        "70212b005312cecc45de474b2572306e895e7429b3783c1c569b00c2ac59c688",
+        "2538cfec50123bcff3c9d13efaa1f262dc972e4fa9d3ef91bc3f86d66f61e71e",
     ),
     ("44d152ecc3e9ff18", "backward", "fast"): (
-        "91c44297721ebcb838332a9826e3fa93c07e55c5506fe16aa30da5e622012597",
-        "18e412711edc31de7fe46375b94ea95692495ae43202e9f257c264e63b04319d",
+        "f81bebdc98bc8db0177bf961809602cb69378ca4689599c07be6a25d30368d6c",
+        "092dfd91fd44248286a518598115f3104881b05755b65d873dfbe296b3c6ca7a",
     ),
     ("44d152ecc3e9ff18", "composed", "source_ordered"): (
-        "8c60d2debd1344bffcd251517f9c05c9b3a886f2780c97377d93ae63be86c865",
-        "537b96019fa2cdc021ff70252f588c8e1eddaabaaa754076e98a4fed6e708a94",
+        "264e568277f36cb22c4ef362b8f37c934f8e05844a53e321f9fce13b12f1716c",
+        "57b365ea9f022632cdc127016f65fb884c86e09b3d33c2d2ce988865003060fb",
     ),
     ("44d152ecc3e9ff18", "composed", "fast"): (
-        "a6fea4448ad3a907dcec72e94013132d370ee5c9fc58966912856eac5a8db954",
-        "74a606047a0a88279adae7efa80d4eaca9c614957fc806e75eb63601277e8961",
+        "bac6f333ae444eab24b9fbfb286a4d1eac2be780f1c0469adcb8a7a0426a73b1",
+        "feb4450affed2cefe1a60a631fa368fc2e8417534f5e232e2b844639aee90511",
     ),
 }
 
@@ -130,7 +130,11 @@ def layer_norm(x: jax.Array, gamma: jax.Array, beta: jax.Array) -> jax.Array:
 
 def boundary_function(boundary: str):
     if boundary == "forward":
-        return layer_norm
+
+        def forward(x, gamma, beta):
+            return layer_norm(x, gamma, beta)
+
+        return forward
     if boundary == "backward":
 
         def backward(x, gamma, dy):
@@ -477,7 +481,7 @@ def run_orchestrator(work_directory: Path) -> dict[str, object]:
     if reports["reuse"]["cache_hits"] != len(cell_identities()):
         raise AssertionError("reuse process omitted an ABI 11 cache hit")
     return {
-        "classification": "untimed_generic_gpu_layer_norm_correctness_and_cache_only",
+        "classification": "untimed_cuda_sm90_layer_norm_correctness_and_cache_only",
         "timing_collected": False,
         "scorecard_status_changed": False,
         "workers": reports,

@@ -3995,6 +3995,7 @@ struct PtxEmitter {
 
   int64_t nextF32() { return f32++; }
   int64_t nextU64() { return u64++; }
+  int64_t nextBF16() { return bf16++; }
 
   void finish() {
     stream.flush();
@@ -4011,8 +4012,8 @@ struct PtxEmitter {
     }
     output << ")\n{\n"
               "  .reg .pred %p<16>;\n"
-              "  .reg .b16 %h<16>;\n"
-              "  .reg .b32 %r<64>;\n"
+           << "  .reg .b16 %h<" << std::max<int64_t>(16, bf16) << ">;\n"
+           << "  .reg .b32 %r<64>;\n"
            << "  .reg .b64 %rd<" << std::max<int64_t>(128, u64) << ">;\n"
            << "  .reg .f32 %f<" << std::max<int64_t>(128, f32) << ">;\n"
            << body << "$done:\n  ret;\n}\n";
@@ -4022,6 +4023,7 @@ struct PtxEmitter {
   int64_t arity;
   int64_t f32 = 0;
   int64_t u64 = 8;
+  int64_t bf16 = 2;
   std::string certificate;
   bool usesDynamicSharedMemory = false;
   std::string body;
@@ -4122,6 +4124,10 @@ FailureOr<int64_t> emitScalarBody(PtxEmitter &ptx, Block &body,
   for (auto [argument, reg] : llvm::zip_equal(body.getArguments(), arguments))
     values[argument] = reg;
   for (Operation &operation : body.without_terminator()) {
+    if (operation.getNumResults() != 1 ||
+        (!isa<ScalarConvertOp>(operation) &&
+         !operation.getResult(0).getType().isF32()))
+      return failure();
     int64_t result = ptx.nextF32();
     if (auto constant = dyn_cast<arith::ConstantOp>(operation)) {
       auto value = dyn_cast<FloatAttr>(constant.getValue());
@@ -4131,8 +4137,23 @@ FailureOr<int64_t> emitScalarBody(PtxEmitter &ptx, Block &body,
       ptx.stream << "  mov.b32 %f" << result << ", 0f"
                  << llvm::utohexstr(bits, /*LowerCase=*/false, /*Width=*/8)
                  << ";\n";
-    } else if (isa<ScalarConvertOp>(operation)) {
-      result = values.lookup(operation.getOperand(0));
+    } else if (auto convert = dyn_cast<ScalarConvertOp>(operation)) {
+      Type inputType = convert.getInput().getType();
+      Type resultType = convert.getResult().getType();
+      int64_t operand = values.lookup(convert.getInput());
+      if ((inputType.isF32() && resultType.isF32()) ||
+          (inputType.isBF16() && resultType.isF32())) {
+        result = operand;
+      } else if (inputType.isF32() && resultType.isBF16() &&
+                 convert.getSemantics() ==
+                     ScalarConvertSemantics::RoundNearestEven) {
+        int64_t rounded = ptx.nextBF16();
+        ptx.stream << "  cvt.rn.bf16.f32 %h" << rounded << ", %f" << operand
+                   << ";\n  cvt.f32.bf16 %f" << result << ", %h" << rounded
+                   << ";\n";
+      } else {
+        return failure();
+      }
     } else if (auto add = dyn_cast<arith::AddFOp>(operation)) {
       ptx.stream << "  add.rn.f32 %f" << result << ", %f"
                  << values.lookup(add.getLhs()) << ", %f"
@@ -4155,8 +4176,8 @@ FailureOr<int64_t> emitScalarBody(PtxEmitter &ptx, Block &body,
     } else if (auto rsqrt = dyn_cast<math::RsqrtOp>(operation)) {
       int64_t root = ptx.nextF32();
       ptx.stream << "  sqrt.rn.f32 %f" << root << ", %f"
-                 << values.lookup(rsqrt.getOperand()) << ";\n  rcp.rn.f32 %f"
-                 << result << ", %f" << root << ";\n";
+                 << values.lookup(rsqrt.getOperand()) << ";\n  div.rn.f32 %f"
+                 << result << ", 0f3F800000, %f" << root << ";\n";
     } else {
       return failure();
     }
@@ -4219,7 +4240,7 @@ FailureOr<std::string> emitMapPtx(MapOp map, ScheduleTaskOp task) {
     ptx.stream << "  st.global.f32 [%rd" << outputPointer << "], %f" << *result
                << ";\n";
   }
-  if (ptx.f32 > 128 || ptx.u64 > 128)
+  if (ptx.f32 > 128 || ptx.u64 > 128 || ptx.bf16 > 16)
     return failure();
   ptx.finish();
   return ptx.text;
@@ -4231,6 +4252,19 @@ FailureOr<std::string> emitFoldPtx(FoldOp fold, ScheduleTaskOp task) {
       task.getDomainShape().size() != 2 ||
       task.getDomainShape() !=
           cast<RankedTensorType>(fold.getInputs()[0].getType()).getShape())
+    return failure();
+  auto initializer = fold.getInitializers()[0].getDefiningOp<MapOp>();
+  if (!initializer || !initializer.getInputs().empty() ||
+      initializer.getBody().empty())
+    return failure();
+  Block &initializerBody = initializer.getBody().front();
+  auto constant = initializerBody.getOperations().size() == 2
+                      ? dyn_cast<arith::ConstantOp>(initializerBody.front())
+                      : arith::ConstantOp{};
+  auto value =
+      constant ? dyn_cast<FloatAttr>(constant.getValue()) : FloatAttr{};
+  if (!value || !value.getType().isF32() || !value.getValue().isZero() ||
+      value.getValue().isNegative())
     return failure();
   const int64_t reductionAxis = fold.getReductionDimensions().front();
   const int64_t outputAxis = 1 - reductionAxis;
