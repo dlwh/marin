@@ -1,6 +1,7 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 from dataclasses import replace
 from typing import cast
 
@@ -119,13 +120,29 @@ def test_execution_modes_have_distinct_cache_identity() -> None:
     )
 
 
-def test_gpu_executable_mode_rejects_fast_policy() -> None:
-    with pytest.raises(ValueError, match="GPU executable bundle requires source_ordered"):
-        compiler_options(
-            execution_mode=ExecutionMode.GPU_EXECUTABLE_BUNDLE,
-            numerics=Numerics.FAST,
-            tuning=_tuning(),
-        )
+def test_gpu_executable_mode_has_distinct_source_ordered_and_fast_cache_identities() -> None:
+    source_ordered = compiler_options(
+        execution_mode=ExecutionMode.GPU_EXECUTABLE_BUNDLE,
+        numerics=Numerics.SOURCE_ORDERED,
+        tuning=_tuning(),
+    )
+    fast = compiler_options(
+        execution_mode=ExecutionMode.GPU_EXECUTABLE_BUNDLE,
+        numerics=Numerics.FAST,
+        tuning=_tuning(),
+    )
+
+    assert source_ordered["xla_shuttle_options"] != fast["xla_shuttle_options"]
+    assert json.loads(fast["xla_shuttle_options"])["numerics"] == "fast"
+    assert options_digest(
+        execution_mode=ExecutionMode.GPU_EXECUTABLE_BUNDLE,
+        numerics=Numerics.SOURCE_ORDERED,
+        tuning=_tuning(),
+    ) != options_digest(
+        execution_mode=ExecutionMode.GPU_EXECUTABLE_BUNDLE,
+        numerics=Numerics.FAST,
+        tuning=_tuning(),
+    )
 
 
 def test_cpu_executable_mode_has_distinct_source_ordered_and_fast_cache_identities() -> None:

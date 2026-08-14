@@ -13,6 +13,7 @@
 // RUN: shuttle-test-opt %S/Inputs/jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-forward.mlir --shuttle-gpu-executable-bundle-pipeline | FileCheck %s --check-prefix=FORWARD-SMALL
 // RUN: shuttle-test-opt %S/Inputs/jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-backward.mlir --shuttle-gpu-executable-bundle-pipeline | FileCheck %s --check-prefix=BACKWARD-SMALL
 // RUN: shuttle-test-opt %S/Inputs/jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-composed.mlir --shuttle-gpu-executable-bundle-pipeline | FileCheck %s --check-prefix=COMPOSED-SMALL
+// RUN: shuttle-test-opt %S/Inputs/jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-composed.mlir --shuttle-gpu-executable-bundle-fast-pipeline | FileCheck %s --check-prefix=COMPOSED-SMALL
 
 // These fixtures constrain a generic connected Map/Fold graph.  The compiler
 // must not select behavior from function names, fixture digests, task counts,
@@ -60,14 +61,14 @@
 // BACKWARD-LARGE-LABEL: module @jit_backward
 // BACKWARD-LARGE-COUNT-1: stablehlo.custom_call @shuttle.gpu.executable_bundle.v2
 // BACKWARD-LARGE-SAME: operand_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<0> : tensor<1xindex>, dense<[1, 0]> : tensor<2xindex>]
-// BACKWARD-LARGE-SAME: result_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<0> : tensor<1xindex>, dense<0> : tensor<1xindex>]
-// BACKWARD-LARGE: return
+// BACKWARD-LARGE-SAME: result_layouts = [dense<0> : tensor<1xindex>, dense<0> : tensor<1xindex>, dense<[1, 0]> : tensor<2xindex>]
+// BACKWARD-LARGE: return %{{.*}}#2, %{{.*}}#1, %{{.*}}#0 : tensor<2048x4096xbf16>, tensor<4096xbf16>, tensor<4096xbf16>
 
 // COMPOSED-LARGE-LABEL: module @jit_composed
 // COMPOSED-LARGE-COUNT-1: stablehlo.custom_call @shuttle.gpu.executable_bundle.v2
 // COMPOSED-LARGE-SAME: operand_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<0> : tensor<1xindex>, dense<0> : tensor<1xindex>, dense<[1, 0]> : tensor<2xindex>]
-// COMPOSED-LARGE-SAME: result_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<[1, 0]> : tensor<2xindex>, dense<0> : tensor<1xindex>, dense<0> : tensor<1xindex>]
-// COMPOSED-LARGE: return
+// COMPOSED-LARGE-SAME: result_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<0> : tensor<1xindex>, dense<0> : tensor<1xindex>, dense<[1, 0]> : tensor<2xindex>]
+// COMPOSED-LARGE: return %{{.*}}#0, %{{.*}}#3, %{{.*}}#2, %{{.*}}#1 : tensor<2048x4096xbf16>, tensor<2048x4096xbf16>, tensor<4096xbf16>, tensor<4096xbf16>
 
 // FORWARD-SMALL-LABEL: module @jit_forward
 // FORWARD-SMALL-COUNT-1: stablehlo.custom_call @shuttle.gpu.executable_bundle.v2
@@ -77,9 +78,9 @@
 // BACKWARD-SMALL-LABEL: module @jit_backward
 // BACKWARD-SMALL-COUNT-1: stablehlo.custom_call @shuttle.gpu.executable_bundle.v2
 // BACKWARD-SMALL-SAME: operand_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<0> : tensor<1xindex>, dense<[1, 0]> : tensor<2xindex>]
-// BACKWARD-SMALL-SAME: result_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<0> : tensor<1xindex>, dense<0> : tensor<1xindex>]
+// BACKWARD-SMALL-SAME: result_layouts = [dense<0> : tensor<1xindex>, dense<0> : tensor<1xindex>, dense<[1, 0]> : tensor<2xindex>]
 
 // COMPOSED-SMALL-LABEL: module @jit_composed
 // COMPOSED-SMALL-COUNT-1: stablehlo.custom_call @shuttle.gpu.executable_bundle.v2
 // COMPOSED-SMALL-SAME: operand_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<0> : tensor<1xindex>, dense<0> : tensor<1xindex>, dense<[1, 0]> : tensor<2xindex>]
-// COMPOSED-SMALL-SAME: result_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<[1, 0]> : tensor<2xindex>, dense<0> : tensor<1xindex>, dense<0> : tensor<1xindex>]
+// COMPOSED-SMALL-SAME: result_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<0> : tensor<1xindex>, dense<0> : tensor<1xindex>, dense<[1, 0]> : tensor<2xindex>]

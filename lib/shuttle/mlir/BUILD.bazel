@@ -353,7 +353,15 @@ cc_test(
 cc_test(
     name = "observer_test_bridge_test",
     srcs = ["test/observer-test-bridge-test.cc"],
-    data = ["test/Inputs/jax-0.10.1-bf16-row_fold_scale_44d152ecc3e9ff18-forward.mlir"],
+    data = [
+        "test/Inputs/jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-backward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-composed.mlir",
+        "test/Inputs/jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-forward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-backward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-composed.mlir",
+        "test/Inputs/jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-forward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-row_fold_scale_44d152ecc3e9ff18-forward.mlir",
+    ],
     deps = [
         ":ShuttleObserverTestBridge",
         ":ShuttlePasses",
@@ -400,6 +408,12 @@ cc_test(
     name = "gpu_transport_v2_test",
     srcs = ["test/gpu-transport-v2-test.cc"],
     data = [
+        "test/Inputs/jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-backward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-composed.mlir",
+        "test/Inputs/jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-forward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-backward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-composed.mlir",
+        "test/Inputs/jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-forward.mlir",
         "test/Inputs/jax-0.10.1-bf16-row_fold_scale_44d152ecc3e9ff18-forward.mlir",
     ],
     deps = [

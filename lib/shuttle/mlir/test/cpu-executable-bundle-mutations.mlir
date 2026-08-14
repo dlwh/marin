@@ -31,7 +31,7 @@
 // SLOT: slot and source buffer ordinals must be contiguous
 // STRIDE: required bytes and strides must encode contiguous row-major storage
 // STORAGE: closed CPU ABI requires host storage, zero offset, and natural alignment
-// ALIAS: closed CPU ABI forbids aliasing and reuse
+// ALIAS: closed executable ABI forbids aliasing
 // DEPENDENCY: dependencies must equal entrypoint buffer producers
 // CLOSED: invalid closed CPU executable bundle
 // DIGEST: code SHA-256 does not match code bytes

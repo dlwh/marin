@@ -131,12 +131,27 @@ bool isDigest(llvm::StringRef value) {
 struct Decoded {
   llvm::SmallVector<uint8_t> code;
   llvm::SmallVector<mlir::shuttle::GpuLaunch> launches;
+  llvm::SmallVector<int64_t> slotReuseGroups;
+  llvm::SmallVector<uint64_t> slotReuseOffsets;
+  llvm::SmallVector<uint8_t> slotStorage;
+  llvm::SmallVector<int64_t> slotProducers;
+  llvm::SmallVector<int64_t> slotFinalUses;
+  llvm::SmallVector<int64_t> temporaryGroupOrder;
+  llvm::SmallVector<uint64_t> temporaryGroupBytes;
   int64_t slots = 0;
+  uint64_t temporaryBytes = 0;
+  int64_t scalarSlots = 0;
+  int64_t externalSlots = 0;
   uint64_t deviceRootOffset = 0;
   uint64_t deviceRootPayloadOffset = 0;
   uint64_t deviceSuffixStart = 0;
   uint64_t invocationStart = 0;
+  uint64_t invocationRootOffset = 0;
+  uint64_t invocationRootPayloadOffset = 0;
+  uint64_t invocationSuffixStart = 0;
+  uint64_t bundleStart = 0;
   uint64_t bundleDeviceRootPayloadOffset = 0;
+  uint64_t bundleInvocationRootPayloadOffset = 0;
   uint64_t bundleRootOffset = 0;
   uint64_t bundleRootPayloadOffset = 0;
   llvm::SmallVector<uint64_t> launchGridOffsets;
@@ -150,7 +165,7 @@ std::optional<Decoded> decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes) {
     if (reader.u8() != static_cast<uint8_t>(expected))
       return std::nullopt;
   if (reader.u32() != 2 || reader.i64() != 3 || reader.u8() != 2 ||
-      reader.u8() != 0)
+      reader.u8() > 1)
     return std::nullopt;
   constexpr uint64_t deviceStart = 12;
   llvm::StringRef schedule = reader.text();
@@ -163,14 +178,16 @@ std::optional<Decoded> decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes) {
   uint64_t deviceRootPayloadOffset = 0;
   llvm::StringRef deviceRoot = reader.text(&deviceRootPayloadOffset);
   uint64_t deviceSuffixStart = reader.position();
-  if (!isDigest(deviceRoot) || reader.u64() != 19)
+  uint64_t entryCount = reader.u64();
+  if (!isDigest(deviceRoot) || entryCount == 0 || entryCount > 256)
     return std::nullopt;
 
   llvm::SmallVector<mlir::shuttle::GpuLaunch> launches;
   llvm::SmallVector<uint64_t> launchGridOffsets;
   int64_t nextOffset = 0;
-  int64_t taskPositions = 0;
-  for (int64_t ordinal = 0; ordinal < 19; ++ordinal) {
+  uint64_t taskPositions = 0;
+  for (int64_t ordinal = 0; ordinal < static_cast<int64_t>(entryCount);
+       ++ordinal) {
     if (reader.i64() != ordinal || reader.i64() != ordinal ||
         reader.i64() != nextOffset)
       return std::nullopt;
@@ -180,10 +197,8 @@ std::optional<Decoded> decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes) {
       return std::nullopt;
     auto inputs = reader.integers();
     auto outputs = reader.integers();
-    if (llvm::any_of(inputs,
-                     [](int64_t slot) { return slot < 0 || slot >= 21; }) ||
-        llvm::any_of(outputs,
-                     [](int64_t slot) { return slot < 0 || slot >= 21; }))
+    if (llvm::any_of(inputs, [](int64_t slot) { return slot < 0; }) ||
+        llvm::any_of(outputs, [](int64_t slot) { return slot < 0; }))
       return std::nullopt;
     if (reader.u64() != inputs.size())
       return std::nullopt;
@@ -218,7 +233,7 @@ std::optional<Decoded> decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes) {
         block[0] * block[1] * block[2] > 1024 || shared > 16 * 1024 ||
         reader.u16() != inputs.size() + outputs.size())
       return std::nullopt;
-    constexpr uint64_t maximumTaskPositions = 67129347;
+    constexpr uint64_t maximumTaskPositions = 256 * 1024 * 1024;
     uint64_t positions = 1;
     for (uint64_t extent : llvm::concat<uint64_t>(grid, block)) {
       if (extent > maximumTaskPositions / positions)
@@ -252,14 +267,25 @@ std::optional<Decoded> decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes) {
       !isDigest(reader.text()) || reader.text() != schedule)
     return std::nullopt;
   uint64_t invocationRootOffset = reader.position();
-  llvm::StringRef invocationRoot = reader.text();
+  uint64_t invocationRootPayloadOffset = 0;
+  llvm::StringRef invocationRoot = reader.text(&invocationRootPayloadOffset);
   uint64_t invocationSuffixStart = reader.position();
-  if (!isDigest(invocationRoot) || reader.u64() != 21)
+  uint64_t slotCount = reader.u64();
+  if (!isDigest(invocationRoot) || slotCount == 0 || slotCount > 256)
     return std::nullopt;
-  int64_t temporaryBytes = 0;
+  uint64_t temporaryBytes = 0;
   int64_t scalarSlots = 0;
   int64_t externalSlots = 0;
-  for (int64_t ordinal = 0; ordinal < 21; ++ordinal) {
+  llvm::SmallVector<int64_t> slotReuseGroups;
+  llvm::SmallVector<uint64_t> slotReuseOffsets;
+  llvm::SmallVector<int64_t> temporaryGroupOrder;
+  llvm::SmallVector<uint64_t> temporaryGroupBytes;
+  llvm::DenseMap<int64_t, size_t> temporaryGroupIndexes;
+  llvm::SmallVector<uint8_t> slotStorage;
+  llvm::SmallVector<uint8_t> slotBinding;
+  llvm::SmallVector<int64_t> slotBindingIndex;
+  for (int64_t ordinal = 0; ordinal < static_cast<int64_t>(slotCount);
+       ++ordinal) {
     if (reader.i64() != ordinal || reader.i64() != ordinal)
       return std::nullopt;
     uint8_t elementType = reader.u8();
@@ -280,30 +306,53 @@ std::optional<Decoded> decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes) {
     }
     int64_t required = reader.i64();
     auto strides = reader.integers();
+    int64_t offset = reader.i64();
+    int64_t alignment = reader.i64();
+    uint8_t addressSpace = reader.u8();
+    uint8_t access = reader.u8();
     if (required != expectedBytes || required > 32 * 1024 * 1024 ||
-        strides.size() != rank || reader.i64() != 0 ||
-        reader.i64() != (elementType == 0 ? 2 : 4) || reader.u8() != 1 ||
-        reader.u8() > 2)
+        strides.size() != rank || offset != 0 ||
+        alignment != (elementType == 0 ? 2 : 4) || addressSpace != 1 ||
+        access > 2)
       return std::nullopt;
     uint8_t storage = reader.u8();
-    if (storage > 1 || reader.i64() != ordinal || reader.i64() != ordinal)
+    int64_t aliasGroup = reader.i64();
+    uint64_t reuseOffset = reader.position();
+    int64_t reuseGroup = reader.i64();
+    if (storage > 1 || aliasGroup != ordinal || reuseGroup < 0)
       return std::nullopt;
+    slotReuseGroups.push_back(reuseGroup);
+    slotReuseOffsets.push_back(reuseOffset);
     uint8_t binding = reader.u8();
     uint8_t hasBindingIndex = reader.u8();
     if (binding > 2 || hasBindingIndex > 1)
       return std::nullopt;
     int64_t bindingIndex = hasBindingIndex ? reader.i64() : -1;
+    slotStorage.push_back(storage);
+    slotBinding.push_back(binding);
+    slotBindingIndex.push_back(bindingIndex);
     if (rank == 0)
       ++scalarSlots;
     if (storage == 1) {
-      if (binding != 0 || hasBindingIndex)
+      if (binding != 0 || hasBindingIndex || access != 2)
         return std::nullopt;
-      temporaryBytes += required;
+      auto inserted = temporaryGroupIndexes.try_emplace(
+          reuseGroup, temporaryGroupOrder.size());
+      if (inserted.second) {
+        temporaryGroupOrder.push_back(reuseGroup);
+        temporaryGroupBytes.push_back(required);
+        temporaryBytes += required;
+      } else if (static_cast<uint64_t>(required) >
+                 temporaryGroupBytes[inserted.first->second]) {
+        temporaryBytes +=
+            required - temporaryGroupBytes[inserted.first->second];
+        temporaryGroupBytes[inserted.first->second] = required;
+      }
     } else {
       ++externalSlots;
-      if (!((ordinal == 0 && binding == 1 && bindingIndex == 0) ||
-            (ordinal == 1 && binding == 1 && bindingIndex == 1) ||
-            (ordinal == 20 && binding == 2 && bindingIndex == 0)))
+      if (reuseGroup != ordinal || binding == 0 || !hasBindingIndex ||
+          (binding == 1 && access != 0) || (binding == 2 && access != 1) ||
+          elementType != 0 || rank == 0 || rank > 2)
         return std::nullopt;
     }
   }
@@ -314,26 +363,94 @@ std::optional<Decoded> decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes) {
           bytes.slice(invocationSuffixStart,
                       bundleStart - invocationSuffixStart)))
     return std::nullopt;
-  if (temporaryBytes != 201416716 || scalarSlots != 3 || externalSlots != 3 ||
-      reader.i64() != 2 || reader.text() != schedule)
+  if (temporaryBytes == 0 || temporaryBytes > 256 * 1024 * 1024 ||
+      externalSlots == 0 || reader.i64() != 2 || reader.text() != schedule)
     return std::nullopt;
   uint64_t bundleDeviceRootPayloadOffset = 0;
-  if (reader.text(&bundleDeviceRootPayloadOffset) != deviceRoot ||
-      reader.text() != invocationRoot || reader.u8() != 1)
+  if (reader.text(&bundleDeviceRootPayloadOffset) != deviceRoot)
+    return std::nullopt;
+  uint64_t bundleInvocationRootPayloadOffset = 0;
+  if (reader.text(&bundleInvocationRootPayloadOffset) != invocationRoot ||
+      reader.u8() != 1)
     return std::nullopt;
   uint64_t rootOffset = reader.position();
   uint64_t bundleRootPayloadOffset = 0;
   llvm::StringRef bundleRoot = reader.text(&bundleRootPayloadOffset);
   if (!reader.done() || bundleRoot != sha256(bytes.take_front(rootOffset)))
     return std::nullopt;
+  llvm::SmallVector<int64_t> producers(slotCount, -1);
+  llvm::SmallVector<int64_t> finalUses(slotCount, -1);
+  for (const auto &launch : launches) {
+    for (int64_t slot : launch.inputSlots) {
+      if (slot >= static_cast<int64_t>(slotCount))
+        return std::nullopt;
+      finalUses[slot] = std::max(finalUses[slot], launch.taskOrdinal);
+    }
+    for (int64_t slot : launch.outputSlots) {
+      if (slot >= static_cast<int64_t>(slotCount) || producers[slot] != -1)
+        return std::nullopt;
+      producers[slot] = launch.taskOrdinal;
+      finalUses[slot] = std::max(finalUses[slot], launch.taskOrdinal);
+    }
+  }
+  int64_t operandIndex = 0;
+  int64_t resultIndex = 0;
+  for (int64_t ordinal = 0; ordinal < static_cast<int64_t>(slotCount);
+       ++ordinal) {
+    if (slotStorage[ordinal] == 1) {
+      if (producers[ordinal] < 0 || finalUses[ordinal] <= producers[ordinal])
+        return std::nullopt;
+      continue;
+    }
+    if (slotBinding[ordinal] == 1) {
+      if (slotBindingIndex[ordinal] != operandIndex++ ||
+          producers[ordinal] != -1 || finalUses[ordinal] < 0)
+        return std::nullopt;
+    } else if (slotBinding[ordinal] == 2) {
+      if (slotBindingIndex[ordinal] != resultIndex++ || producers[ordinal] < 0)
+        return std::nullopt;
+    } else {
+      return std::nullopt;
+    }
+  }
+  if (operandIndex == 0 || resultIndex == 0)
+    return std::nullopt;
+  for (int64_t left = 0; left < static_cast<int64_t>(slotCount); ++left) {
+    if (slotStorage[left] != 1)
+      continue;
+    for (int64_t right = left + 1; right < static_cast<int64_t>(slotCount);
+         ++right) {
+      if (slotStorage[right] != 1 ||
+          slotReuseGroups[left] != slotReuseGroups[right])
+        continue;
+      if (producers[left] <= finalUses[right] &&
+          producers[right] <= finalUses[left])
+        return std::nullopt;
+    }
+  }
   return Decoded{llvm::SmallVector<uint8_t>(code),
                  std::move(launches),
-                 21,
+                 std::move(slotReuseGroups),
+                 std::move(slotReuseOffsets),
+                 std::move(slotStorage),
+                 std::move(producers),
+                 std::move(finalUses),
+                 std::move(temporaryGroupOrder),
+                 std::move(temporaryGroupBytes),
+                 static_cast<int64_t>(slotCount),
+                 temporaryBytes,
+                 scalarSlots,
+                 externalSlots,
                  deviceRootOffset,
                  deviceRootPayloadOffset,
                  deviceSuffixStart,
                  invocationStart,
+                 invocationRootOffset,
+                 invocationRootPayloadOffset,
+                 invocationSuffixStart,
+                 bundleStart,
                  bundleDeviceRootPayloadOffset,
+                 bundleInvocationRootPayloadOffset,
                  rootOffset,
                  bundleRootPayloadOffset,
                  std::move(launchGridOffsets)};
@@ -341,6 +458,12 @@ std::optional<Decoded> decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes) {
 
 void writeU32(llvm::MutableArrayRef<uint8_t> bytes, uint64_t offset,
               uint32_t value) {
+  for (unsigned byte = 0; byte < sizeof(value); ++byte)
+    bytes[offset + byte] = static_cast<uint8_t>(value >> (byte * 8));
+}
+
+void writeU64(llvm::MutableArrayRef<uint8_t> bytes, uint64_t offset,
+              uint64_t value) {
   for (unsigned byte = 0; byte < sizeof(value); ++byte)
     bytes[offset + byte] = static_cast<uint8_t>(value >> (byte * 8));
 }
@@ -363,6 +486,19 @@ void rehashDeviceAndBundle(llvm::MutableArrayRef<uint8_t> bytes,
               sha256(bytes.take_front(decoded.bundleRootOffset)));
 }
 
+void rehashInvocationAndBundle(llvm::MutableArrayRef<uint8_t> bytes,
+                               const Decoded &decoded) {
+  std::string invocationRoot =
+      sha256(bytes.slice(decoded.invocationStart, decoded.invocationRootOffset -
+                                                      decoded.invocationStart),
+             bytes.slice(decoded.invocationSuffixStart,
+                         decoded.bundleStart - decoded.invocationSuffixStart));
+  writeDigest(bytes, decoded.invocationRootPayloadOffset, invocationRoot);
+  writeDigest(bytes, decoded.bundleInvocationRootPayloadOffset, invocationRoot);
+  writeDigest(bytes, decoded.bundleRootPayloadOffset,
+              sha256(bytes.take_front(decoded.bundleRootOffset)));
+}
+
 llvm::SmallVector<uint8_t> oversizedLaunchGrid(llvm::ArrayRef<uint8_t> bytes,
                                                const Decoded &decoded) {
   llvm::SmallVector<uint8_t> result(bytes);
@@ -374,19 +510,41 @@ llvm::SmallVector<uint8_t> oversizedLaunchGrid(llvm::ArrayRef<uint8_t> bytes,
   return result;
 }
 
+llvm::SmallVector<uint8_t>
+overlappingTemporaryReuse(llvm::ArrayRef<uint8_t> bytes,
+                          const Decoded &decoded) {
+  for (size_t left = 0; left < decoded.slotStorage.size(); ++left) {
+    if (decoded.slotStorage[left] != 1)
+      continue;
+    for (size_t right = left + 1; right < decoded.slotStorage.size(); ++right) {
+      if (decoded.slotStorage[right] != 1 ||
+          decoded.slotReuseGroups[left] == decoded.slotReuseGroups[right])
+        continue;
+      if (decoded.slotProducers[left] > decoded.slotFinalUses[right] ||
+          decoded.slotProducers[right] > decoded.slotFinalUses[left])
+        continue;
+      llvm::SmallVector<uint8_t> result(bytes);
+      writeU64(result, decoded.slotReuseOffsets[right],
+               decoded.slotReuseGroups[left]);
+      rehashInvocationAndBundle(result, decoded);
+      return result;
+    }
+  }
+  return {};
+}
+
 struct BuiltBundle {
   std::unique_ptr<mlir::MLIRContext> context;
   mlir::OwningOpRef<mlir::ModuleOp> module;
 };
 
-std::optional<std::string> fixtureSource() {
+std::optional<std::string> fixtureSource(llvm::StringRef filename) {
   std::string error;
   auto runfiles = bazel::tools::cpp::runfiles::Runfiles::CreateForTest(&error);
   if (!runfiles)
     return std::nullopt;
-  std::ifstream input(runfiles->Rlocation(
-      "shuttle_mlir/test/Inputs/"
-      "jax-0.10.1-bf16-row_fold_scale_44d152ecc3e9ff18-forward.mlir"));
+  std::ifstream input(
+      runfiles->Rlocation(("shuttle_mlir/test/Inputs/" + filename).str()));
   std::ostringstream source;
   source << input.rdbuf();
   if (!input)
@@ -394,7 +552,10 @@ std::optional<std::string> fixtureSource() {
   return source.str();
 }
 
-std::unique_ptr<BuiltBundle> buildFixture(llvm::StringRef source) {
+std::unique_ptr<BuiltBundle>
+buildFixture(llvm::StringRef source,
+             mlir::shuttle::NumericalPolicy policy =
+                 mlir::shuttle::NumericalPolicy::SourceOrdered) {
   mlir::DialectRegistry registry;
   mlir::stablehlo::registerAllDialects(registry);
   registry.insert<mlir::arith::ArithDialect, mlir::func::FuncDialect,
@@ -407,7 +568,14 @@ std::unique_ptr<BuiltBundle> buildFixture(llvm::StringRef source) {
     return {};
   mlir::PassManager manager(result->context.get());
   manager.addPass(mlir::shuttle::createAnnotateSourcePass());
-  manager.addPass(mlir::shuttle::createFormStructuralRegionsPass());
+  if (policy == mlir::shuttle::NumericalPolicy::Fast) {
+    manager.addPass(mlir::shuttle::createFormStructuralRegionsPass(
+        policy,
+        R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":11,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
+        R"json({"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json"));
+  } else {
+    manager.addPass(mlir::shuttle::createFormStructuralRegionsPass());
+  }
   manager.addPass(mlir::shuttle::createConvertStablehloToAlgebraPass());
   manager.addPass(mlir::shuttle::createPlanRowFoldMaterializationPass());
   manager.addPass(mlir::shuttle::createPlanSimt32RowFoldSchedulePass());
@@ -419,14 +587,16 @@ std::unique_ptr<BuiltBundle> buildFixture(llvm::StringRef source) {
 }
 
 std::unique_ptr<BuiltBundle> buildFixture() {
-  auto source = fixtureSource();
+  auto source = fixtureSource(
+      "jax-0.10.1-bf16-row_fold_scale_44d152ecc3e9ff18-forward.mlir");
   if (!source)
     return {};
   return buildFixture(*source);
 }
 
 std::unique_ptr<BuiltBundle> buildAlternateFixture() {
-  auto source = fixtureSource();
+  auto source = fixtureSource(
+      "jax-0.10.1-bf16-row_fold_scale_44d152ecc3e9ff18-forward.mlir");
   if (!source)
     return {};
   constexpr llvm::StringLiteral original = "9.99999974E-6";
@@ -451,6 +621,10 @@ TEST(GpuTransportV2Test, IndependentInlineDecoderMatchesPublicDescriptor) {
   ASSERT_EQ(independent->launches.size(), 19);
   ASSERT_EQ((*publicDescriptor)->launches().size(), 19);
   EXPECT_EQ(independent->slots, 21);
+  EXPECT_EQ(independent->temporaryGroupOrder.size(), 4);
+  EXPECT_EQ(independent->temporaryBytes, 100671488);
+  EXPECT_EQ(independent->scalarSlots, 3);
+  EXPECT_EQ(independent->externalSlots, 3);
   EXPECT_EQ(llvm::ArrayRef<uint8_t>(independent->code),
             (*publicDescriptor)->codeBytes());
   for (auto [decoded, loaded] : llvm::zip_equal(
@@ -475,6 +649,83 @@ TEST(GpuTransportV2Test, IndependentInlineDecoderMatchesPublicDescriptor) {
   auto oversized = oversizedLaunchGrid(*bytes, *independent);
   EXPECT_FALSE(decodeInlineSchema2(oversized));
   EXPECT_FALSE(mlir::shuttle::GpuExecutable::Load(oversized).ok());
+
+  auto overlappingReuse = overlappingTemporaryReuse(*bytes, *independent);
+  ASSERT_FALSE(overlappingReuse.empty());
+  EXPECT_FALSE(decodeInlineSchema2(overlappingReuse));
+  EXPECT_FALSE(mlir::shuttle::GpuExecutable::Load(overlappingReuse).ok());
+}
+
+TEST(GpuTransportV2Test, GenericLayerNormGraphsHaveClosedDynamicDescriptors) {
+  struct Case {
+    const char *filename;
+    int64_t launches;
+    int64_t slots;
+    int64_t externalSlots;
+    int64_t temporaryGroups;
+    uint64_t temporaryBytes;
+  };
+  constexpr Case cases[] = {
+      {"jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-forward.mlir", 31, 34, 4, 4,
+       100671488},
+      {"jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-backward.mlir", 73, 76, 6,
+       9, 167804932},
+      {"jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-composed.mlir", 80, 84, 8,
+       9, 167804932},
+      {"jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-forward.mlir", 31, 34, 4, 4,
+       1120},
+      {"jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-backward.mlir", 73, 76, 6,
+       9, 1932},
+      {"jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-composed.mlir", 80, 84, 8,
+       9, 1932},
+  };
+  for (const Case &test : cases) {
+    SCOPED_TRACE(test.filename);
+    auto source = fixtureSource(test.filename);
+    ASSERT_TRUE(source);
+    auto built = buildFixture(*source);
+    ASSERT_TRUE(built);
+    auto bytes = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+    ASSERT_TRUE(mlir::succeeded(bytes));
+    auto independent = decodeInlineSchema2(*bytes);
+    ASSERT_TRUE(independent);
+    auto publicDescriptor = mlir::shuttle::GpuExecutable::Load(*bytes);
+    ASSERT_TRUE(publicDescriptor.ok()) << publicDescriptor.status();
+    EXPECT_EQ(independent->launches.size(), test.launches);
+    EXPECT_EQ(independent->slots, test.slots);
+    EXPECT_EQ(independent->externalSlots, test.externalSlots);
+    EXPECT_EQ(independent->temporaryGroupOrder.size(), test.temporaryGroups);
+    EXPECT_EQ(independent->temporaryBytes, test.temporaryBytes);
+    ASSERT_EQ((*publicDescriptor)->slots().size(), independent->slots);
+    EXPECT_EQ((*publicDescriptor)->externalBindings().size(),
+              independent->externalSlots);
+    for (auto [slot, reuse] : llvm::zip_equal((*publicDescriptor)->slots(),
+                                              independent->slotReuseGroups))
+      EXPECT_EQ(slot.reuseGroup, reuse);
+  }
+}
+
+TEST(GpuTransportV2Test, FastPolicyChangesClosureWithoutSelectingCode) {
+  auto source =
+      fixtureSource("jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-forward.mlir");
+  ASSERT_TRUE(source);
+  auto sourceOrdered = buildFixture(*source);
+  auto fast = buildFixture(*source, mlir::shuttle::NumericalPolicy::Fast);
+  ASSERT_TRUE(sourceOrdered);
+  ASSERT_TRUE(fast);
+  auto sourceOrderedBytes =
+      mlir::shuttle::serializeGpuExecutableBundle(*sourceOrdered->module);
+  auto fastBytes = mlir::shuttle::serializeGpuExecutableBundle(*fast->module);
+  ASSERT_TRUE(mlir::succeeded(sourceOrderedBytes));
+  ASSERT_TRUE(mlir::succeeded(fastBytes));
+  auto sourceOrderedDecoded = decodeInlineSchema2(*sourceOrderedBytes);
+  auto fastDecoded = decodeInlineSchema2(*fastBytes);
+  ASSERT_TRUE(sourceOrderedDecoded);
+  ASSERT_TRUE(fastDecoded);
+  EXPECT_EQ(sourceOrderedDecoded->code, fastDecoded->code);
+  EXPECT_NE(*sourceOrderedBytes, *fastBytes);
+  EXPECT_NE(mlir::shuttle::gpuExecutableBundleDigest(*sourceOrderedBytes),
+            mlir::shuttle::gpuExecutableBundleDigest(*fastBytes));
 }
 
 TEST(GpuTransportV2Test, FoldDynamicSharedMemoryIsDeclaredAtModuleScope) {
@@ -744,6 +995,23 @@ void expectKernelLaunches(const Decoded &decoded, const ExecutionTrace &trace,
   }
 }
 
+llvm::DenseMap<int64_t, uintptr_t>
+slotAddresses(const Decoded &decoded, const SyntheticAllocator &allocator,
+              uintptr_t allocationBase) {
+  llvm::DenseMap<int64_t, uintptr_t> groups;
+  uintptr_t address = allocationBase;
+  for (auto [group, bytes] :
+       llvm::zip_equal(decoded.temporaryGroupOrder, allocator.sizes)) {
+    address += bytes + 256;
+    groups[group] = address;
+  }
+  llvm::DenseMap<int64_t, uintptr_t> slots{
+      {0, 0x40000000}, {1, 0x50000000}, {20, 0x60000000}};
+  for (int64_t ordinal = 2; ordinal < 20; ++ordinal)
+    slots[ordinal] = groups.lookup(decoded.slotReuseGroups[ordinal]);
+  return slots;
+}
+
 TEST(GpuTransportV2Test, ExportedFfiBundleOwnsEveryLifecycleStage) {
   auto built = buildFixture();
   ASSERT_TRUE(built);
@@ -799,8 +1067,9 @@ TEST(GpuTransportV2Test, ExportedFfiBundleOwnsEveryLifecycleStage) {
   ASSERT_TRUE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(), handlers.prepare,
                                frame, context, XLA_FFI_ExecutionStage_PREPARE)
                   .ok());
-  ASSERT_EQ(allocator.sizes.size(), 18);
-  EXPECT_EQ(llvm::accumulate(allocator.sizes, uint64_t{0}), 201416716);
+  ASSERT_EQ(allocator.sizes.size(), decoded->temporaryGroupOrder.size());
+  EXPECT_EQ(allocator.sizes, decoded->temporaryGroupBytes);
+  EXPECT_EQ(llvm::accumulate(allocator.sizes, uint64_t{0}), 100671488);
   ASSERT_TRUE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(), handlers.initialize,
                                frame, context,
                                XLA_FFI_ExecutionStage_INITIALIZE)
@@ -810,14 +1079,8 @@ TEST(GpuTransportV2Test, ExportedFfiBundleOwnsEveryLifecycleStage) {
                                frame, context, XLA_FFI_ExecutionStage_EXECUTE)
                   .ok());
   EXPECT_EQ(trace->launchAttempts.load(), 19);
-  llvm::DenseMap<int64_t, uintptr_t> firstSlots{
-      {0, 0x40000000}, {1, 0x50000000}, {20, 0x60000000}};
-  ASSERT_EQ(allocator.sizes.size(), 18);
-  uintptr_t temporaryAddress = 0x10000000;
-  for (int64_t slot = 2; slot < 20; ++slot) {
-    temporaryAddress += allocator.sizes[slot - 2] + 256;
-    firstSlots[slot] = temporaryAddress;
-  }
+  llvm::DenseMap<int64_t, uintptr_t> firstSlots =
+      slotAddresses(*decoded, allocator, 0x10000000);
   expectKernelLaunches(*decoded, *trace, 0, firstSlots);
 
   trace->launchAttempts.store(0);
@@ -861,13 +1124,8 @@ TEST(GpuTransportV2Test, ExportedFfiBundleOwnsEveryLifecycleStage) {
   EXPECT_TRUE(first.get().ok());
   EXPECT_TRUE(second.get().ok());
   EXPECT_EQ(trace->launchAttempts.load(), 38);
-  llvm::DenseMap<int64_t, uintptr_t> secondSlots{
-      {0, 0x40000000}, {1, 0x50000000}, {20, 0x60000000}};
-  temporaryAddress = 0x70000000;
-  for (int64_t slot = 2; slot < 20; ++slot) {
-    temporaryAddress += secondAllocator.sizes[slot - 2] + 256;
-    secondSlots[slot] = temporaryAddress;
-  }
+  llvm::DenseMap<int64_t, uintptr_t> secondSlots =
+      slotAddresses(*decoded, secondAllocator, 0x70000000);
   // Independent allocators must yield distinct invocation-local addresses.
   EXPECT_NE(firstSlots.lookup(2), secondSlots.lookup(2));
   llvm::SmallVector<int64_t> firstLaunchesPerOrdinal(19);
@@ -943,7 +1201,7 @@ TEST(GpuTransportV2Test, ExportedFfiBundleOwnsEveryLifecycleStage) {
                    .ok());
 
   SyntheticAllocator failingAllocator;
-  failingAllocator.failAt = 5;
+  failingAllocator.failAt = 2;
   xla::ffi::ExecutionState failedPrepare;
   context.backend_context = xla::ffi::InvokeContext::GpuContext{
       &stream, &failingAllocator, nullptr, nullptr,
@@ -952,8 +1210,8 @@ TEST(GpuTransportV2Test, ExportedFfiBundleOwnsEveryLifecycleStage) {
   EXPECT_FALSE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(), handlers.prepare,
                                 frame, context, XLA_FFI_ExecutionStage_PREPARE)
                    .ok());
-  EXPECT_EQ(failingAllocator.sizes.size(), 5);
-  EXPECT_EQ(failingAllocator.deallocations, 5);
+  EXPECT_EQ(failingAllocator.sizes.size(), 2);
+  EXPECT_EQ(failingAllocator.deallocations, 2);
 }
 
 } // namespace
