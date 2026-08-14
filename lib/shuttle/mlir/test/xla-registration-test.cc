@@ -8,6 +8,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/Parser/Parser.h"
@@ -31,6 +32,8 @@ constexpr char kCpuExecutableBundleOptions[] =
     R"json({"execution_mode":"cpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":18,"schema_version":1,"tuning":{"cluster_shape":[2,1,1],"materialization":"prefer_fusion","maximum_candidates":16,"pipeline_stages":3,"tile_sizes":[64,128]}})json";
 constexpr char kCpuExecutableBundleFastOptions[] =
     R"json({"execution_mode":"cpu_executable_bundle","numerics":"fast","pipeline_abi_version":18,"schema_version":1,"tuning":{"cluster_shape":[2,1,1],"materialization":"prefer_fusion","maximum_candidates":16,"pipeline_stages":3,"tile_sizes":[64,128]}})json";
+constexpr char kAbi18DefaultCpuExecutableBundleOptions[] =
+    R"json({"execution_mode":"cpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":18,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
 constexpr char kGpuExecutableBundleOptions[] =
     R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":18,"schema_version":1,"tuning":{"cluster_shape":[2,1,1],"materialization":"prefer_fusion","maximum_candidates":16,"pipeline_stages":3,"tile_sizes":[64,128]}})json";
 constexpr char kGpuExecutableBundleFastOptions[] =
@@ -466,13 +469,22 @@ TEST(ShuttleXlaOptionsTest,
   module->print(beforeOutput);
   beforeOutput.flush();
 
+  std::string diagnostics;
+  mlir::ScopedDiagnosticHandler diagnosticHandler(
+      &context, [&](mlir::Diagnostic &diagnostic) {
+        llvm::raw_string_ostream output(diagnostics);
+        diagnostic.print(output);
+        output << '\n';
+        output.flush();
+        return mlir::success();
+      });
   absl::Status status = mlir::shuttle::runShuttleXlaTransform(
-      *module, kCpuExecutableBundleOptions);
+      *module, kAbi18DefaultCpuExecutableBundleOptions);
   EXPECT_FALSE(status.ok());
-  EXPECT_NE(status.message().find(
+  EXPECT_NE(diagnostics.find(
                 "requires a bounded generated Map/Fold CPU bytecode subset"),
             std::string::npos)
-      << status;
+      << diagnostics;
   std::string after;
   llvm::raw_string_ostream afterOutput(after);
   module->print(afterOutput);
@@ -501,13 +513,22 @@ TEST(ShuttleXlaOptionsTest,
   module->print(beforeOutput);
   beforeOutput.flush();
 
+  std::string diagnostics;
+  mlir::ScopedDiagnosticHandler diagnosticHandler(
+      &context, [&](mlir::Diagnostic &diagnostic) {
+        llvm::raw_string_ostream output(diagnostics);
+        diagnostic.print(output);
+        output << '\n';
+        output.flush();
+        return mlir::success();
+      });
   absl::Status status = mlir::shuttle::runShuttleXlaTransform(
-      *module, kCpuExecutableBundleOptions);
+      *module, kAbi18DefaultCpuExecutableBundleOptions);
   EXPECT_FALSE(status.ok());
-  EXPECT_NE(status.message().find(
+  EXPECT_NE(diagnostics.find(
                 "requires a bounded generated Map/Fold CPU bytecode subset"),
             std::string::npos)
-      << status;
+      << diagnostics;
   std::string after;
   llvm::raw_string_ostream afterOutput(after);
   module->print(afterOutput);
