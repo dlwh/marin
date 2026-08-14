@@ -898,8 +898,8 @@ def test_runner_ncu_sass_parser_accepts_instruction_immediately_after_metric_lab
         metric_rows,
         separator_widths,
     ).replace(
-        _ncu_sass_metric_labels_row(separator_widths) + "\n" + _ncu_sass_separator(separator_widths) + "\n",
-        _ncu_sass_metric_labels_row(separator_widths) + "\n",
+        metric_rows[-1] + "\n" + _ncu_sass_separator(separator_widths) + "\n",
+        metric_rows[-1] + "\n",
         1,
     )
 
