@@ -1,0 +1,133 @@
+{
+  "boundary": "ordinary_jax_composed_matmul_vjp",
+  "compiler": {
+    "pipeline_abi_version": 15,
+    "production_commit": "d31a88cb9a93e591469fa8edfcf9dacada90c7b4",
+    "production_tree": "66175cbd89dcac0857ee2fbc456f7715170d239c",
+    "test_hardening_commit": "c11c81ff1b24e6ba4c0e3dfc7d843333fcb43919",
+    "test_hardening_tree": "6b30c04473b562482a8ac2f42749fe4991cdb1e2"
+  },
+  "contract_id": "shuttle_abi15_h100_composed_matmul_vjp_prerun_v1",
+  "datasets": {
+    "dense": {
+      "inputs": {
+        "lhs_sha256": "2e4d17e208256e43d0e2623f7cad7684b2c685eb4e2b039eda65ec759d119148",
+        "output_cotangent_sha256": "0fd15511211c7f32f27af8a0d60f98e984bd8148c4e679665268a34fcfc22453",
+        "rhs_sha256": "ea9e3703bed85c07bb71f56c6d065304826c5c3b864620bac0bf9462ef340fe5"
+      },
+      "outputs": {
+        "fast": {
+          "lhs_cotangent_sha256": "fff6e18b8f3f8ac1f6483a4644640dff15fd64de0fb832d11775d8548ad3f06a",
+          "primal_sha256": "22c90fb5fad7cfa58700492a1a1a4d8f6fa7b8225f7c3d41c27d99b4be9321f8",
+          "rhs_cotangent_sha256": "76e3814ebe9ad71f02940aac832de684b5e8131cd323faeb65040cb5249f3bb9"
+        },
+        "source_ordered": {
+          "lhs_cotangent_sha256": "fff6e18b8f3f8ac1f6483a4644640dff15fd64de0fb832d11775d8548ad3f06a",
+          "primal_sha256": "22c90fb5fad7cfa58700492a1a1a4d8f6fa7b8225f7c3d41c27d99b4be9321f8",
+          "rhs_cotangent_sha256": "76e3814ebe9ad71f02940aac832de684b5e8131cd323faeb65040cb5249f3bb9"
+        }
+      }
+    },
+    "sparse_policy_discriminator": {
+      "inputs": {
+        "lhs_sha256": "a02036d1790cec3cd21f849e519a1aba1f806154ffbf26df9faa51748d4bc914",
+        "output_cotangent_sha256": "49ec80d2e5957ff4bf9c5f79f3eb6843786749ee7752a295677a8a1116a0fb82",
+        "rhs_sha256": "2aa3b8501982d4bbf32dc5c0607aaf7957535c398c602bbabc589133c00c5599"
+      },
+      "outputs": {
+        "fast": {
+          "lhs_cotangent_sha256": "12d84bcce42d0b2fb4cdbd0aab6ceb0ad0f563bcc5acfb52a370dce748752aa9",
+          "primal_sha256": "79f9d0613435cda9e1f62b8da4af4cc757912f2447f702ed7905821efd973f25",
+          "rhs_cotangent_sha256": "7db0fc07f90c4570f581e9ac40737c89924fd2a8311826f71f0b334cdb47b74d"
+        },
+        "source_ordered": {
+          "lhs_cotangent_sha256": "9d05ef9fdb860e3093224eb1c467d484ec9166459e26669a6704339d9274eb6d",
+          "primal_sha256": "79f9d0613435cda9e1f62b8da4af4cc757912f2447f702ed7905821efd973f25",
+          "rhs_cotangent_sha256": "8e3fd7b6e35377362a37e11325c01621e589b8f4ce92c00f04b4aefde8a81b2b"
+        }
+      },
+      "selected_bits": {
+        "fast": {
+          "lhs_cotangent_0_0": "0x3f80",
+          "rhs_cotangent_0_0": "0x3f80"
+        },
+        "source_ordered": {
+          "lhs_cotangent_0_0": "0x0000",
+          "rhs_cotangent_0_0": "0x0000"
+        }
+      }
+    }
+  },
+  "fixture": {
+    "columns": 34,
+    "filename": "jax-0.10.1-bf16-matmul-vjp-33x2x34-composed.mlir",
+    "jax_version": "0.10.1",
+    "jaxlib_version": "0.10.1",
+    "reduction": 2,
+    "rows": 33,
+    "sha256": "f82300541a6009beb1d3785d42cf613eb338c8c1d91b331c162e0a4e2c3c7e4e"
+  },
+  "hardware_authority": {
+    "image_digest": null,
+    "launch_authorization_sha256": null,
+    "source_capsule_sha256": null,
+    "status": "not_authorized"
+  },
+  "policies": {
+    "fast": {
+      "final_fingerprint": "9b8de0ccb413b410c0176acd9bd6b7ac1bbca1759c1fab8e3bee60fd18e4beaa",
+      "generated_fingerprint": "96e8a120c055843446523819aa1e085f1391c7c790cb6f607c5c4339bd6cb571",
+      "options_sha256": "57e8e203b5515d4996f0b7a359d5a299ece2ffb00844bbb4e5426c5fa4c58041"
+    },
+    "source_ordered": {
+      "final_fingerprint": "036085a583909874d0c4e6c134926880af03d5b54ceffb3084d838362fe13fcc",
+      "generated_fingerprint": "d5f91111b5e05c7cdf4af807702287b1dc55233e697269c04769af438b4f8540",
+      "options_sha256": "eb76511f92eba13b902374a3448cb1c8d3fa3ac97ee16c37843be6aef2845c1b"
+    }
+  },
+  "process_contract": {
+    "cache_entries_after_populate": 2,
+    "phases_per_populate_policy": [
+      "algebra_coverage",
+      "generated_bundle",
+      "final_erasure"
+    ],
+    "populate_hits": 0,
+    "processes": [
+      "baseline",
+      "populate",
+      "reuse"
+    ],
+    "reuse_hits": 2,
+    "reuse_observer_events": 0
+  },
+  "schemas": {
+    "bundle": 2,
+    "device": 3,
+    "invocation": 3,
+    "materialization": 2,
+    "schedule": 2,
+    "transport": 2
+  },
+  "status": "local_prerun_fixture_oracle_sealed_build_and_hardware_unexecuted",
+  "target": "shuttle.gpu.executable_bundle.v2",
+  "topology": {
+    "calls_per_policy": 2,
+    "forward": {
+      "external_bindings": 3,
+      "launches": 2,
+      "slots": 4
+    },
+    "backward": {
+      "contract_ordinals": [
+        3,
+        8
+      ],
+      "external_bindings": 5,
+      "launches": 10,
+      "slots": 13,
+      "transpose_ordinal": 4
+    },
+    "ptx_slices_across_policies": 24
+  }
+}

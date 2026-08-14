@@ -221,65 +221,81 @@ TEST(ShuttleObserverTestBridgeTest,
   std::string error;
   auto runfiles = bazel::tools::cpp::runfiles::Runfiles::CreateForTest(&error);
   ASSERT_TRUE(runfiles) << error;
-  std::ifstream input(
-      runfiles->Rlocation("shuttle_mlir/test/Inputs/"
-                          "jax-0.10.1-bf16-matmul-vjp-17x33x19-composed.mlir"));
-  std::ostringstream source;
-  source << input.rdbuf();
-  ASSERT_TRUE(input);
 
   struct Fingerprints {
     const char *policy;
     const char *generated;
     const char *final;
   };
-  constexpr std::array<Fingerprints, 2> fingerprints = {{
-      {"source_ordered",
-       "458d941bc3a5cd636b4a836bc2c4b515246add12d17180205c0524343dfd7ae0",
-       "22d4520b8a9337ccb192272126323e7d1b8a3629007ba02de5342a7026b198ca"},
-      {"fast",
-       "6b5d9bc0141c4555a8397aae21c6bb097d3637d2fab957713a82ebf6dc863eec",
-       "b5746a610b98f683f28378090ff48d163b27e0d92bee20af8f5f144e95b1acf4"},
+  struct FixtureFingerprints {
+    const char *fixture;
+    std::array<Fingerprints, 2> policies;
+  };
+  constexpr std::array<FixtureFingerprints, 2> fixtures = {{
+      {"jax-0.10.1-bf16-matmul-vjp-17x33x19-composed.mlir",
+       {{{"source_ordered",
+          "458d941bc3a5cd636b4a836bc2c4b515246add12d17180205c0524343dfd7ae0",
+          "22d4520b8a9337ccb192272126323e7d1b8a3629007ba02de5342a7026b198ca"},
+         {"fast",
+          "6b5d9bc0141c4555a8397aae21c6bb097d3637d2fab957713a82ebf6dc863eec",
+          "b5746a610b98f683f28378090ff48d163b27e0d92bee20af8f5f144e95b1acf"
+          "4"}}}},
+      {"jax-0.10.1-bf16-matmul-vjp-33x2x34-composed.mlir",
+       {{{"source_ordered",
+          "d5f91111b5e05c7cdf4af807702287b1dc55233e697269c04769af438b4f8540",
+          "036085a583909874d0c4e6c134926880af03d5b54ceffb3084d838362fe13fcc"},
+         {"fast",
+          "96e8a120c055843446523819aa1e085f1391c7c790cb6f607c5c4339bd6cb571",
+          "9b8de0ccb413b410c0176acd9bd6b7ac1bbca1759c1fab8e3bee60fd18e4bea"
+          "a"}}}},
   }};
-  for (const Fingerprints &expected : fingerprints) {
-    auto capture = mlir::shuttle::testing::subscribeShuttleObserverForTesting();
-    mlir::DialectRegistry registry;
-    mlir::stablehlo::registerAllDialects(registry);
-    registry.insert<mlir::func::FuncDialect>();
-    mlir::MLIRContext context(registry);
-    auto module =
-        mlir::parseSourceString<mlir::ModuleOp>(source.str(), &context);
-    ASSERT_TRUE(module);
-    mlir::shuttle::ShuttlePipelineOptions options;
-    options.executionMode = mlir::shuttle::ExecutionMode::GpuExecutableBundle;
-    options.numerics = expected.policy == std::string("fast")
-                           ? mlir::shuttle::NumericalPolicy::Fast
-                           : mlir::shuttle::NumericalPolicy::SourceOrdered;
-    options.canonicalOptions =
-        std::string("{\"execution_mode\":\"gpu_executable_bundle\","
-                    "\"numerics\":\"") +
-        expected.policy +
-        "\",\"pipeline_abi_version\":15,\"schema_version\":1,"
-        "\"tuning\":{\"cluster_shape\":[],\"materialization\":"
-        "\"automatic\",\"maximum_candidates\":1,\"pipeline_stages\":1,"
-        "\"tile_sizes\":[]}}";
-    ASSERT_TRUE(mlir::succeeded(
-        mlir::shuttle::runShuttleXlaTransform(*module, options)));
-    auto events = capture->snapshot();
-    ASSERT_EQ(events.size(), 3);
-    EXPECT_EQ(events[0].phase, "algebra_coverage");
-    EXPECT_EQ(events[1].phase, "generated_bundle");
-    EXPECT_EQ(events[2].phase, "final_erasure");
-    EXPECT_EQ(events[0].invocationId, events[1].invocationId);
-    EXPECT_EQ(events[1].invocationId, events[2].invocationId);
-    EXPECT_EQ(events[0].policy, expected.policy);
-    EXPECT_EQ(events[1].policy, expected.policy);
-    EXPECT_EQ(events[2].policy, expected.policy);
-    EXPECT_EQ(events[0].coverageManifest, events[1].coverageManifest);
-    EXPECT_FALSE(events[1].noShuttleSemantics);
-    EXPECT_TRUE(events[2].noShuttleSemantics);
-    EXPECT_EQ(events[1].normalizedModuleFingerprint, expected.generated);
-    EXPECT_EQ(events[2].normalizedModuleFingerprint, expected.final);
+  for (const FixtureFingerprints &fixture : fixtures) {
+    std::ifstream input(runfiles->Rlocation(
+        std::string("shuttle_mlir/test/Inputs/") + fixture.fixture));
+    std::ostringstream source;
+    source << input.rdbuf();
+    ASSERT_TRUE(input);
+    for (const Fingerprints &expected : fixture.policies) {
+      auto capture =
+          mlir::shuttle::testing::subscribeShuttleObserverForTesting();
+      mlir::DialectRegistry registry;
+      mlir::stablehlo::registerAllDialects(registry);
+      registry.insert<mlir::func::FuncDialect>();
+      mlir::MLIRContext context(registry);
+      auto module =
+          mlir::parseSourceString<mlir::ModuleOp>(source.str(), &context);
+      ASSERT_TRUE(module);
+      mlir::shuttle::ShuttlePipelineOptions options;
+      options.executionMode = mlir::shuttle::ExecutionMode::GpuExecutableBundle;
+      options.numerics = expected.policy == std::string("fast")
+                             ? mlir::shuttle::NumericalPolicy::Fast
+                             : mlir::shuttle::NumericalPolicy::SourceOrdered;
+      options.canonicalOptions =
+          std::string("{\"execution_mode\":\"gpu_executable_bundle\","
+                      "\"numerics\":\"") +
+          expected.policy +
+          "\",\"pipeline_abi_version\":15,\"schema_version\":1,"
+          "\"tuning\":{\"cluster_shape\":[],\"materialization\":"
+          "\"automatic\",\"maximum_candidates\":1,"
+          "\"pipeline_stages\":1,\"tile_sizes\":[]}}";
+      ASSERT_TRUE(mlir::succeeded(
+          mlir::shuttle::runShuttleXlaTransform(*module, options)));
+      auto events = capture->snapshot();
+      ASSERT_EQ(events.size(), 3);
+      EXPECT_EQ(events[0].phase, "algebra_coverage");
+      EXPECT_EQ(events[1].phase, "generated_bundle");
+      EXPECT_EQ(events[2].phase, "final_erasure");
+      EXPECT_EQ(events[0].invocationId, events[1].invocationId);
+      EXPECT_EQ(events[1].invocationId, events[2].invocationId);
+      EXPECT_EQ(events[0].policy, expected.policy);
+      EXPECT_EQ(events[1].policy, expected.policy);
+      EXPECT_EQ(events[2].policy, expected.policy);
+      EXPECT_EQ(events[0].coverageManifest, events[1].coverageManifest);
+      EXPECT_FALSE(events[1].noShuttleSemantics);
+      EXPECT_TRUE(events[2].noShuttleSemantics);
+      EXPECT_EQ(events[1].normalizedModuleFingerprint, expected.generated);
+      EXPECT_EQ(events[2].normalizedModuleFingerprint, expected.final);
+    }
   }
 }
 
