@@ -71,6 +71,8 @@ def _validate_source_contract(payload: dict[str, object]) -> None:
         wheel = _closed(value, f"source.wheels[{index}]", {"platform", "sha256", "size", "url"})
         if not isinstance(wheel["sha256"], str) or _SHA256.fullmatch(wheel["sha256"]) is None:
             raise ValueError(f"source.wheels[{index}].sha256 must be lowercase SHA-256")
+        if type(wheel["size"]) is not int:
+            raise ValueError(f"source.wheels[{index}].size must be an integer")
         decoded_wheels.add((wheel["platform"], wheel["sha256"], wheel["size"], wheel["url"]))
     if decoded_wheels != _EXPECTED_WHEELS:
         raise ValueError("source.wheels do not match the locked NVIDIA artifacts")
@@ -180,6 +182,7 @@ def test_abi19_source_contract_pins_official_nvvm_and_default_exp() -> None:
         (("source", "version"), "13.2.79", "source.version"),
         (("source", "wheels", 0, "sha256"), "0" * 64, "source.wheels"),
         (("source", "wheels", 0, "size"), 64279463, "source.wheels"),
+        (("source", "wheels", 0, "size"), 64279462.0, "must be an integer"),
         (("source", "wheels", 1, "url"), "https://example.invalid/nvvm.whl", "source.wheels"),
         (("license", "classification"), "notice", "license.classification"),
         (("license", "source_sha256"), "0" * 64, "license.source_sha256"),

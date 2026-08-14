@@ -5,6 +5,7 @@
 #include <fstream>
 #include <memory>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -54,7 +55,8 @@ std::optional<std::string> fixtureSource() {
 
 std::unique_ptr<BuiltModule>
 buildAbi19Exp(llvm::StringRef source,
-              mlir::shuttle::NumericalPolicy policy) {
+              mlir::shuttle::NumericalPolicy policy,
+              bool buildBundle = true) {
   mlir::DialectRegistry registry;
   mlir::stablehlo::registerAllDialects(registry);
   registry.insert<mlir::arith::ArithDialect, mlir::func::FuncDialect,
@@ -76,8 +78,10 @@ buildAbi19Exp(llvm::StringRef source,
   manager.addPass(mlir::shuttle::createConvertStablehloToAlgebraPass());
   manager.addPass(mlir::shuttle::createPlanRowFoldMaterializationPass());
   manager.addPass(mlir::shuttle::createPlanSimt32RowFoldSchedulePass());
-  manager.addPass(mlir::shuttle::createBuildGpuExecutableBundlePass());
-  manager.addPass(mlir::shuttle::createVerifyGpuExecutableBundlePass());
+  if (buildBundle) {
+    manager.addPass(mlir::shuttle::createBuildGpuExecutableBundlePass());
+    manager.addPass(mlir::shuttle::createVerifyGpuExecutableBundlePass());
+  }
   if (mlir::failed(manager.run(*result->module)))
     return {};
   return result;
@@ -103,6 +107,128 @@ std::vector<std::string> ptxSlices(mlir::ModuleOp module) {
   return slices;
 }
 
+size_t skipBalancedParentheses(llvm::StringRef text, size_t position) {
+  int64_t depth = 0;
+  for (; position < text.size(); ++position) {
+    if (text[position] == '(')
+      ++depth;
+    else if (text[position] == ')' && --depth == 0)
+      return position + 1;
+  }
+  return llvm::StringRef::npos;
+}
+
+std::optional<std::string> functionName(llvm::StringRef text, size_t position) {
+  position = text.find_first_not_of(" \t\r\n", position);
+  if (position == llvm::StringRef::npos)
+    return std::nullopt;
+  if (text[position] == '(') {
+    position = skipBalancedParentheses(text, position);
+    if (position == llvm::StringRef::npos)
+      return std::nullopt;
+    position = text.find_first_not_of(" \t\r\n,", position);
+  }
+  if (position == llvm::StringRef::npos)
+    return std::nullopt;
+  size_t end = text.find_first_of(" \t\r\n,(", position);
+  if (end == llvm::StringRef::npos)
+    end = text.size();
+  if (end == position)
+    return std::nullopt;
+  return text.slice(position, end).str();
+}
+
+std::set<std::string> definedFunctions(llvm::StringRef ptx) {
+  std::set<std::string> names;
+  size_t position = 0;
+  while ((position = ptx.find(".func", position)) != llvm::StringRef::npos) {
+    auto name = functionName(ptx, position + 5);
+    if (!name)
+      break;
+    const size_t body = ptx.find('{', position);
+    const size_t declaration = ptx.find(';', position);
+    if (body != llvm::StringRef::npos &&
+        (declaration == llvm::StringRef::npos || body < declaration))
+      names.insert(*name);
+    position += 5;
+  }
+  return names;
+}
+
+testing::AssertionResult hasClosedCalls(llvm::StringRef ptx) {
+  const std::set<std::string> definitions = definedFunctions(ptx);
+  size_t position = 0;
+  while ((position = ptx.find("call", position)) != llvm::StringRef::npos) {
+    size_t suffix = position + 4;
+    if (ptx.substr(suffix).starts_with(".uni"))
+      suffix += 4;
+    auto target = functionName(ptx, suffix);
+    if (!target)
+      return testing::AssertionFailure() << "malformed call";
+    if (definitions.find(*target) == definitions.end())
+      return testing::AssertionFailure() << "undefined call target " << *target;
+    position = suffix;
+  }
+  return testing::AssertionSuccess();
+}
+
+std::optional<std::string> firstOperand(llvm::StringRef instruction) {
+  const size_t space = instruction.find_first_of(" \t");
+  if (space == llvm::StringRef::npos)
+    return std::nullopt;
+  const size_t start = instruction.find_first_not_of(" \t", space);
+  const size_t comma = instruction.find(',', start);
+  if (start == llvm::StringRef::npos || comma == llvm::StringRef::npos)
+    return std::nullopt;
+  return instruction.slice(start, comma).trim().str();
+}
+
+testing::AssertionResult hasExpResultStoreDataflow(llvm::StringRef ptx) {
+  const size_t call = ptx.find("call.uni (");
+  if (call == llvm::StringRef::npos)
+    return testing::AssertionFailure() << "missing __nv_expf return call";
+  const size_t returnStart = call + llvm::StringRef("call.uni (").size();
+  const size_t returnEnd = ptx.find(')', returnStart);
+  if (returnEnd == llvm::StringRef::npos ||
+      !ptx.substr(returnEnd).starts_with("), __nv_expf,"))
+    return testing::AssertionFailure() << "missing __nv_expf return call";
+  const std::string returned = ptx.slice(returnStart, returnEnd).trim().str();
+
+  const size_t load = ptx.find("ld.param", returnEnd);
+  const size_t loadEnd = ptx.find(';', load);
+  if (load == llvm::StringRef::npos || loadEnd == llvm::StringRef::npos)
+    return testing::AssertionFailure() << "missing __nv_expf return load";
+  const llvm::StringRef loadInstruction = ptx.slice(load, loadEnd);
+  if (!loadInstruction.contains("[" + returned + "]"))
+    return testing::AssertionFailure() << "missing __nv_expf return load";
+  auto f32Result = firstOperand(loadInstruction);
+  if (!f32Result)
+    return testing::AssertionFailure() << "malformed __nv_expf return load";
+
+  const size_t conversion = ptx.find("cvt.rn.bf16.f32", loadEnd);
+  const size_t conversionEnd = ptx.find(';', conversion);
+  if (conversion == llvm::StringRef::npos ||
+      conversionEnd == llvm::StringRef::npos)
+    return testing::AssertionFailure()
+           << "__nv_expf result does not feed BF16 conversion";
+  const llvm::StringRef conversionInstruction =
+      ptx.slice(conversion, conversionEnd);
+  if (!conversionInstruction.ends_with(", " + *f32Result))
+    return testing::AssertionFailure()
+           << "__nv_expf result does not feed BF16 conversion";
+  auto bf16Result = firstOperand(conversionInstruction);
+  if (!bf16Result)
+    return testing::AssertionFailure() << "malformed BF16 conversion";
+
+  const size_t store = ptx.find("st.global", conversionEnd);
+  const size_t storeEnd = ptx.find(';', store);
+  if (store == llvm::StringRef::npos || storeEnd == llvm::StringRef::npos ||
+      !ptx.slice(store, storeEnd).ends_with(", " + *bf16Result))
+    return testing::AssertionFailure()
+           << "converted __nv_expf result does not feed output store";
+  return testing::AssertionSuccess();
+}
+
 testing::AssertionResult isClosedDefaultExpPtx(llvm::StringRef ptx) {
   if (!ptx.starts_with(
           ".version 8.0\n.target sm_90\n.address_size 64\n"))
@@ -115,6 +241,15 @@ testing::AssertionResult isClosedDefaultExpPtx(llvm::StringRef ptx) {
     return testing::AssertionFailure() << "flush-to-zero instruction";
   if (!ptx.contains(".visible .entry shuttle_entry("))
     return testing::AssertionFailure() << "missing Shuttle entry";
+  const std::set<std::string> definitions = definedFunctions(ptx);
+  if (definitions.find("__nv_expf") == definitions.end())
+    return testing::AssertionFailure() << "missing linked __nv_expf definition";
+  testing::AssertionResult closedCalls = hasClosedCalls(ptx);
+  if (!closedCalls)
+    return closedCalls;
+  testing::AssertionResult expDataflow = hasExpResultStoreDataflow(ptx);
+  if (!expDataflow)
+    return expDataflow;
   return testing::AssertionSuccess();
 }
 
@@ -128,7 +263,7 @@ std::string replaceOnce(llvm::StringRef text, llvm::StringRef before,
 }
 
 TEST(Abi19LibdeviceContractTest,
-     FixtureRequestsOneImplicitDefaultAccuracyExponential) {
+     FixtureRequestsTwoImplicitDefaultAccuracyExponentials) {
   auto source = fixtureSource();
   ASSERT_TRUE(source);
   mlir::DialectRegistry registry;
@@ -145,7 +280,57 @@ TEST(Abi19LibdeviceContractTest,
     ++exponentials;
     EXPECT_FALSE(operation->getAttr("result_accuracy"));
   });
-  EXPECT_EQ(exponentials, 1);
+  EXPECT_EQ(exponentials, 2);
+}
+
+TEST(Abi19LibdeviceContractTest,
+     ScheduledAlgebraRetainsBothExponentialBodiesForBothPolicies) {
+  auto source = fixtureSource();
+  ASSERT_TRUE(source);
+  for (mlir::shuttle::NumericalPolicy policy :
+       {mlir::shuttle::NumericalPolicy::SourceOrdered,
+        mlir::shuttle::NumericalPolicy::Fast}) {
+    auto scheduled = buildAbi19Exp(*source, policy, false);
+    ASSERT_TRUE(scheduled);
+    int64_t exponentials = 0;
+    scheduled->module->walk([&](mlir::math::ExpOp exponential) {
+      EXPECT_TRUE(exponential->getParentOfType<mlir::shuttle::MapOp>());
+      ++exponentials;
+    });
+    EXPECT_EQ(exponentials, 2);
+  }
+}
+
+TEST(Abi19LibdeviceContractTest, ClosedPtxOracleRejectsSemanticMutations) {
+  constexpr llvm::StringLiteral ptx = R"ptx(.version 8.0
+.target sm_90
+.address_size 64
+.func (.param .b32 __ret) __nv_expf(.param .b32 __arg) {
+  ret;
+}
+.visible .entry shuttle_entry() {
+  .param .b32 __exp_input;
+  .param .b32 __exp_return;
+  st.param.b32 [__exp_input], %f1;
+  call.uni (__exp_return), __nv_expf, (__exp_input);
+  ld.param.b32 %f2, [__exp_return];
+  cvt.rn.bf16.f32 %rs1, %f2;
+  st.global.u16 [%rd1], %rs1;
+  ret;
+}
+)ptx";
+  ASSERT_TRUE(isClosedDefaultExpPtx(ptx));
+  EXPECT_FALSE(isClosedDefaultExpPtx(
+      replaceOnce(ptx, "call.uni (__exp_return), __nv_expf, (__exp_input);",
+                  "mov.f32 %f2, %f1;")));
+  EXPECT_FALSE(isClosedDefaultExpPtx(
+      replaceOnce(ptx, "cvt.rn.bf16.f32 %rs1, %f2;",
+                  "cvt.rn.bf16.f32 %rs1, %f1;")));
+  EXPECT_FALSE(isClosedDefaultExpPtx(replaceOnce(
+      ptx, "call.uni (__exp_return), __nv_expf, (__exp_input);",
+      "call.uni (__exp_return), __shuttle_missing, (__exp_input);")));
+  EXPECT_FALSE(isClosedDefaultExpPtx(
+      replaceOnce(ptx, "__nv_expf", "__nv_fast_expf")));
 }
 
 TEST(Abi19LibdeviceContractTest,
