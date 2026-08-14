@@ -54,6 +54,26 @@ def test_contract_rejects_caller_rewritten_authority(tmp_path, path, value) -> N
             "selected-bit",
         ),
         (("policies", "fast", "options_sha256"), "f" * 64, "options"),
+        (
+            ("policies", "source_ordered", "generated_fingerprint"),
+            "f" * 64,
+            "generated fingerprint",
+        ),
+        (
+            ("policies", "source_ordered", "final_fingerprint"),
+            "f" * 64,
+            "final fingerprint",
+        ),
+        (
+            ("policies", "fast", "generated_fingerprint"),
+            "f" * 64,
+            "generated fingerprint",
+        ),
+        (
+            ("policies", "fast", "final_fingerprint"),
+            "f" * 64,
+            "final fingerprint",
+        ),
     ],
 )
 def test_semantic_validator_rejects_self_consistent_field_substitution(path, value, message) -> None:

@@ -81,15 +81,22 @@ def test_exact_algebra_reports_schedule_error_without_float_aggregation() -> Non
     source_ordered = reference(sparse, ReductionPolicy.SOURCE_ORDERED)
     fast = reference(sparse, ReductionPolicy.FAST)
     source_metrics = error_metrics(source_ordered.lhs_cotangent, exact.lhs_cotangent)
+    source_rhs_metrics = error_metrics(source_ordered.rhs_cotangent, exact.rhs_cotangent)
     fast_metrics = error_metrics(fast.lhs_cotangent, exact.lhs_cotangent)
+    fast_rhs_metrics = error_metrics(fast.rhs_cotangent, exact.rhs_cotangent)
     assert source_metrics.maximum_absolute_error == 1
     assert source_metrics.mean_absolute_error == Fraction(1, ROWS * REDUCTION)
     assert source_metrics.relative_linf_error == Fraction(1, 1 << 25)
-    assert source_metrics.maximum_bf16_ulp_error > 0
-    assert fast_metrics.maximum_absolute_error == 0
-    assert fast_metrics.mean_absolute_error == 0
-    assert fast_metrics.relative_linf_error == 0
-    assert fast_metrics.maximum_bf16_ulp_error == 0
+    assert source_metrics.maximum_bf16_ulp_error == 16_256
+    assert source_rhs_metrics.maximum_absolute_error == 1
+    assert source_rhs_metrics.mean_absolute_error == Fraction(1, REDUCTION * COLUMNS)
+    assert source_rhs_metrics.relative_linf_error == Fraction(1, 1 << 25)
+    assert source_rhs_metrics.maximum_bf16_ulp_error == 16_256
+    for metrics in (fast_metrics, fast_rhs_metrics):
+        assert metrics.maximum_absolute_error == 0
+        assert metrics.mean_absolute_error == 0
+        assert metrics.relative_linf_error == 0
+        assert metrics.maximum_bf16_ulp_error == 0
 
 
 def test_reference_rejects_untyped_policy() -> None:
