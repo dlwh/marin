@@ -143,10 +143,10 @@ The output contains only the deterministic capsule ZIP, canonical manifest,
 and stdlib-only launcher, and reports the SHA-256 of both manifest and launcher.
 The eventual submitted command must use trusted image tooling to verify both
 identities before invoking `/opt/h100-evidence-runtime/bin/python` by absolute
-path. The `run` command requires that same absolute path through
+path. The `run-export` command requires that same absolute path through
 `--runtime-python`; it never resolves or falls back to an unqualified `python`
 from `PATH`. Launcher self-verification cannot establish its own trust. As
-defense in depth, `run` also requires the expected launcher SHA-256 explicitly
+defense in depth, `run-export` also requires the expected launcher SHA-256 explicitly
 before it verifies the trusted manifest hash,
 commit and tree, archive hash, exact member set, bounds, paths, modes, symlinks,
 and member hashes before starting the runner. Runner preflight repeats the
@@ -161,16 +161,39 @@ An image built before this interpreter contract is not accepted for another
 launch. A rebuilt image must be published under its full-Git-SHA tag, resolved
 to an OCI digest, and independently reviewed together with the source capsule.
 The task command must invoke both the launcher and runner with the exact frozen
-interpreter:
+interpreter and a fresh export directory outside the evidence directory:
 
 ```text
-/opt/h100-evidence-runtime/bin/python h100_contract_map_source_payload.py run \
-  --runtime-python /opt/h100-evidence-runtime/bin/python ...
+/opt/h100-evidence-runtime/bin/python h100_contract_map_source_payload.py run-export \
+  --runtime-python /opt/h100-evidence-runtime/bin/python \
+  --export-directory /tmp/shuttle-h100-contract-map-v34-export \
+  --ack-timeout-seconds 1800 ...
 ```
+
+`run-export` executes the runner as a child instead of replacing the launcher.
+When the runner stops, the launcher closes the artifact tree into a
+deterministic tar archive, a canonical manifest, and contiguous 256 KiB parts.
+Every regular artifact is bound by path, mode, size, and SHA-256; symlinks and
+other file types are rejected. A zero runner status without
+`accepted_bundle.json` becomes a failure. The launcher atomically publishes
+`EXPORT_READY` and remains alive for an acknowledgement that binds the archive
+and manifest digests. A wrong acknowledgement cannot release it.
+
+While the Iris task is still running, the controller must record the job
+request, task attempt, and log sequence metadata, retrieve `EXPORT_READY`, the
+manifest, and every named part through `iris task exec`, and use the exact local
+source revision to run `verify-export`. That command rejects extra, missing, or
+changed retrieval files, rechecks the authorized capsule identity, reconstructs
+the archive, validates every tar member, and writes the only acceptable ACK.
+The controller then transfers those exact ACK bytes into `EXPORT_ACK`. Only
+after the task exits with the sealed wrapper status may the terminal Iris
+metadata and evidence archive be recorded. A timeout, task termination before
+ACK, retrieval mismatch, or verifier failure seals one launch failure and does
+not authorize a retry.
 
 A future launch must use the default container profile, one explicit
 `H100x1`, no UV sync against the partial capsule, a fresh artifact path outside
-the capsule, and `max_retries=0`. Nsight Compute permission failure remains a
+the capsule, a fresh export path, and `max_retries=0`. Nsight Compute permission failure remains a
 fail-closed runtime result; this plan does not enable the privileged profile.
 
 ## Reused prototype evidence

@@ -474,3 +474,35 @@ No v34 job, image build, source-capsule upload, GPU execution, retry, or
 relaunch was performed for this parser repair. A future v34 submission must use
 a fresh capsule from its final clean source commit and keep zero failure
 retries.
+
+## V34 artifact handoff prerequisite
+
+The reviewed parser capsule was not launched. Iris task execution is available
+only while a task is running, and the controller has no post-terminal artifact
+download API. The prior launcher replaced itself with the runner, so a terminal
+success or failure could close the only retrieval window before the complete
+evidence tree reached the controller. Polling that launcher would have created
+an unbounded race and could not support an accepted evidence claim.
+
+The source payload now has a `run-export` lifecycle. It runs the evidence
+runner as a child, deterministically archives every regular artifact, records
+the exact path, mode, size, and digest of every member, splits the archive into
+bounded transport parts, and atomically publishes `EXPORT_READY`. A successful
+runner that did not create `accepted_bundle.json` is converted to failure. The
+task remains alive until it observes `EXPORT_ACK` with the exact archive and
+manifest identities; malformed acknowledgements do not release it.
+
+The matching controller-side `verify-export` command requires the authorized
+source commit, tree, and capsule-manifest digest. It accepts only READY,
+manifest, and the complete contiguous part set, reconstructs and hashes the
+archive, validates every tar member without extracting it, and writes the ACK
+bytes. Behavior tests cover the live process barrier, wrong then correct ACK,
+missing accepted output, corrupt or missing parts, extra retrieval files, and
+wrong source identity. This closes transport and lifecycle integrity only; it
+does not authorize a cluster submission or qualify benchmark evidence.
+
+The earlier capsule identities are superseded because the launcher changed.
+A future v34 submission requires a new clean source commit, a new reviewed
+capsule, and explicit authorization for that exact capsule, immutable image,
+external destination, and one-H100 resource ceiling. No v34 job, image build,
+upload, GPU execution, retry, or relaunch was performed for this handoff.

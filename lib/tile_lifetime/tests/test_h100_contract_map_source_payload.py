@@ -9,6 +9,8 @@ import os
 import stat
 import subprocess
 import sys
+import tarfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -70,6 +72,9 @@ artifact_directory.mkdir(parents=True)
         },
         sort_keys=True,
     )
+)
+(artifact_directory / "accepted_bundle.json").write_text(
+    json.dumps({"schema": "capsule-test-accepted-bundle"}, sort_keys=True)
 )
 """
             )
@@ -224,7 +229,7 @@ def test_source_capsule_rejects_traversal_with_matching_transport_hashes(tmp_pat
     manifest["members"].insert(
         0,
         {
-            "mode": "100644",
+            "mode": "0644",
             "path": "../credential",
             "sha256": hashlib.sha256(b"secret").hexdigest(),
             "size": 6,
@@ -355,6 +360,208 @@ def test_source_capsule_launcher_uses_selected_runtime_without_path_fallback(tmp
     assert imports["numpy"]
     assert imports["shuttle"] == "0.1.0"
     assert not marker.exists()
+
+
+def test_source_capsule_artifact_export_is_closed_and_requires_exact_ack(tmp_path, capsys):
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    (artifacts / "accepted_bundle.json").write_text('{"accepted":true}\n')
+    nested = artifacts / "profiles"
+    nested.mkdir()
+    (nested / "kernel.sass").write_bytes(b"exact-sass\n")
+    export = tmp_path / "export"
+
+    ready = payload.prepare_artifact_export(
+        artifacts,
+        export,
+        runner_exit_code=0,
+        source_sha="1" * 40,
+        source_tree="2" * 40,
+        source_manifest_sha256="3" * 64,
+    )
+
+    assert ready["runner_exit_code"] == 0
+    assert ready["wrapper_exit_code"] == 0
+    manifest_path = export / payload.ARTIFACT_EXPORT_MANIFEST_FILENAME
+    manifest = json.loads(manifest_path.read_bytes())
+    assert manifest["members"] == [
+        {
+            "mode": "0644",
+            "path": "accepted_bundle.json",
+            "sha256": hashlib.sha256(b'{"accepted":true}\n').hexdigest(),
+            "size": 18,
+        },
+        {
+            "mode": "0644",
+            "path": "profiles/kernel.sass",
+            "sha256": hashlib.sha256(b"exact-sass\n").hexdigest(),
+            "size": 11,
+        },
+    ]
+    archive = b"".join((export / part["filename"]).read_bytes() for part in manifest["parts"])
+    assert hashlib.sha256(archive).hexdigest() == manifest["archive"]["sha256"]
+    retrieval = tmp_path / "retrieval"
+    retrieval.mkdir()
+    for filename in (
+        payload.ARTIFACT_EXPORT_READY_FILENAME,
+        payload.ARTIFACT_EXPORT_MANIFEST_FILENAME,
+        *(part["filename"] for part in manifest["parts"]),
+    ):
+        (retrieval / filename).write_bytes((export / filename).read_bytes())
+    archive_path = tmp_path / "retrieved.tar.gz"
+    ack_path = tmp_path / "retrieved.ack"
+    payload.main(
+        (
+            "verify-export",
+            "--retrieval-directory",
+            str(retrieval),
+            "--archive-output",
+            str(archive_path),
+            "--ack-output",
+            str(ack_path),
+            "--source-sha",
+            "1" * 40,
+            "--source-tree",
+            "2" * 40,
+            "--source-manifest-sha256",
+            "3" * 64,
+        )
+    )
+    validation_summary = json.loads(capsys.readouterr().out)
+    assert validation_summary["archive_sha256"] == ready["archive_sha256"]
+    assert validation_summary["manifest_sha256"] == ready["manifest_sha256"]
+    assert archive_path.read_bytes() == archive
+    assert ack_path.read_bytes() == payload.artifact_export_ack(ready)
+    with tarfile.open(archive_path, "r:gz") as tar:
+        assert tuple(member.name for member in tar.getmembers()) == (
+            "accepted_bundle.json",
+            "profiles/kernel.sass",
+        )
+
+    (export / payload.ARTIFACT_EXPORT_ACK_FILENAME).write_text("wrong\n")
+    with pytest.raises(ValueError, match="exact export identities"):
+        payload.wait_for_artifact_ack(export, ready, timeout_seconds=0.01, poll_seconds=0.001)
+    (export / payload.ARTIFACT_EXPORT_ACK_FILENAME).write_bytes(payload.artifact_export_ack(ready))
+    payload.wait_for_artifact_ack(export, ready, timeout_seconds=0.01, poll_seconds=0.001)
+
+
+@pytest.mark.parametrize("mutation", ["corrupt_part", "missing_part", "extra_file", "wrong_source"])
+def test_source_capsule_retrieved_export_rejects_transport_drift(tmp_path, mutation):
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    (artifacts / "accepted_bundle.json").write_text('{"accepted":true}\n')
+    export = tmp_path / "export"
+    payload.prepare_artifact_export(
+        artifacts,
+        export,
+        runner_exit_code=0,
+        source_sha="1" * 40,
+        source_tree="2" * 40,
+        source_manifest_sha256="3" * 64,
+    )
+    manifest = json.loads((export / payload.ARTIFACT_EXPORT_MANIFEST_FILENAME).read_bytes())
+    retrieval = tmp_path / "retrieval"
+    retrieval.mkdir()
+    filenames = [
+        payload.ARTIFACT_EXPORT_READY_FILENAME,
+        payload.ARTIFACT_EXPORT_MANIFEST_FILENAME,
+        *(part["filename"] for part in manifest["parts"]),
+    ]
+    for filename in filenames:
+        (retrieval / filename).write_bytes((export / filename).read_bytes())
+    expected_source = "1" * 40
+    if mutation == "corrupt_part":
+        (retrieval / manifest["parts"][0]["filename"]).write_bytes(b"corrupt")
+    elif mutation == "missing_part":
+        (retrieval / manifest["parts"][0]["filename"]).unlink()
+    elif mutation == "extra_file":
+        (retrieval / "unsealed").write_text("extra")
+    else:
+        expected_source = "4" * 40
+
+    with pytest.raises(ValueError):
+        payload.validate_retrieved_artifact_export(
+            retrieval,
+            tmp_path / "retrieved.tar.gz",
+            expected_source_sha=expected_source,
+            expected_source_tree="2" * 40,
+            expected_source_manifest_sha256="3" * 64,
+        )
+
+
+def test_source_capsule_artifact_export_turns_missing_success_bundle_into_failure(tmp_path):
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+
+    ready = payload.prepare_artifact_export(
+        artifacts,
+        tmp_path / "export",
+        runner_exit_code=0,
+        source_sha="1" * 40,
+        source_tree="2" * 40,
+        source_manifest_sha256="3" * 64,
+    )
+
+    assert ready["runner_exit_code"] == 0
+    assert ready["wrapper_exit_code"] != 0
+    assert ready["accepted_bundle_present"] is False
+
+
+def test_source_capsule_run_export_keeps_process_alive_until_exact_ack(tmp_path):
+    remote, result, commit, tree = _prepared_remote(tmp_path)
+    artifacts = tmp_path / "artifacts"
+    export = tmp_path / "export"
+    environment = dict(os.environ)
+    environment["JAX_PLATFORMS"] = "cpu"
+    environment.pop("PYTHONPATH", None)
+    process = subprocess.Popen(
+        (
+            sys.executable,
+            str(remote / payload.LAUNCHER_FILENAME),
+            "run-export",
+            "--workspace",
+            str(remote),
+            "--launcher-sha256",
+            result["launcher_sha256"],
+            "--manifest-sha256",
+            result["manifest_sha256"],
+            "--source-sha",
+            commit,
+            "--source-tree",
+            tree,
+            "--artifact-directory",
+            str(artifacts),
+            "--export-directory",
+            str(export),
+            "--ack-timeout-seconds",
+            "10",
+            "--require-jax-version",
+            "0.10.1",
+            "--runtime-python",
+            sys.executable,
+        ),
+        cwd=remote,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    ready_path = export / payload.ARTIFACT_EXPORT_READY_FILENAME
+    deadline = time.monotonic() + 10
+    while not ready_path.is_file() and process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert ready_path.is_file()
+    assert process.poll() is None
+    ready = json.loads(ready_path.read_bytes())
+    (export / payload.ARTIFACT_EXPORT_ACK_FILENAME).write_text("wrong\n")
+    time.sleep(0.05)
+    assert process.poll() is None
+    (export / payload.ARTIFACT_EXPORT_ACK_FILENAME).write_bytes(payload.artifact_export_ack(ready))
+
+    stdout, stderr = process.communicate(timeout=10)
+
+    assert process.returncode == 0, stderr
+    assert payload.ARTIFACT_EXPORT_READY_FILENAME in stdout
 
 
 def test_source_capsule_python_path_prefers_capsule_package_and_benchmark_roots(tmp_path):

@@ -4,6 +4,7 @@
 """Prepare and restore an exact source capsule for the H100 evidence runner."""
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -12,7 +13,9 @@ import re
 import shutil
 import stat
 import subprocess
+import tarfile
 import tempfile
+import time
 import zipfile
 from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
@@ -24,6 +27,16 @@ CAPSULE_FILENAME = "h100-evidence-source-capsule.zip"
 MANIFEST_FILENAME = "h100-evidence-source-manifest.json"
 LAUNCHER_FILENAME = "h100_contract_map_source_payload.py"
 RUNNER_RELATIVE_PATH = Path("lib/tile_lifetime/benchmarks/h100_contract_map_backend_runner.py")
+ARTIFACT_EXPORT_SCHEMA_VERSION = 1
+ARTIFACT_EXPORT_ARCHIVE_FILENAME = "h100-evidence-artifacts.tar.gz"
+ARTIFACT_EXPORT_MANIFEST_FILENAME = "h100-evidence-artifact-manifest.json"
+ARTIFACT_EXPORT_READY_FILENAME = "EXPORT_READY"
+ARTIFACT_EXPORT_ACK_FILENAME = "EXPORT_ACK"
+ARTIFACT_EXPORT_CHUNK_BYTES = 256 * 1024
+MAX_ARTIFACT_EXPORT_BYTES = 8 * 1024 * 1024 * 1024
+MAX_ARTIFACT_EXPORT_MEMBERS = 100_000
+MAX_ARTIFACT_EXPORT_PARTS = MAX_ARTIFACT_EXPORT_BYTES // ARTIFACT_EXPORT_CHUNK_BYTES
+MISSING_ACCEPTED_BUNDLE_EXIT_CODE = 70
 CUDA_BIN = Path("/usr/local/cuda-13.2/bin")
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 MAX_CAPSULE_BYTES = 20 * 1024 * 1024
@@ -552,6 +565,370 @@ def runner_arguments(
     )
 
 
+def _artifact_file_records(artifact_directory: Path) -> list[dict[str, Any]]:
+    if artifact_directory.is_symlink() or not artifact_directory.is_dir():
+        return []
+    records: list[dict[str, Any]] = []
+    for path in sorted(artifact_directory.rglob("*")):
+        if path.is_symlink():
+            raise ValueError(f"artifact export rejects symlinks: {path}")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise ValueError(f"artifact export rejects non-regular files: {path}")
+        relative = path.relative_to(artifact_directory).as_posix()
+        _validate_relative_path(relative, "artifact export path")
+        mode = stat.S_IMODE(path.stat().st_mode)
+        records.append(
+            {
+                "mode": f"{mode:04o}",
+                "path": relative,
+                "sha256": _sha256(path),
+                "size": path.stat().st_size,
+            }
+        )
+    return records
+
+
+def _write_artifact_archive(
+    path: Path,
+    artifact_directory: Path,
+    records: Sequence[dict[str, Any]],
+) -> None:
+    with path.open("wb") as raw_stream:
+        with gzip.GzipFile(filename="", mode="wb", compresslevel=9, fileobj=raw_stream, mtime=0) as compressed:
+            with tarfile.open(fileobj=compressed, mode="w|", format=tarfile.GNU_FORMAT) as archive:
+                for record in records:
+                    source = artifact_directory / record["path"]
+                    info = tarfile.TarInfo(record["path"])
+                    info.size = record["size"]
+                    info.mode = int(record["mode"], 8)
+                    info.uid = 0
+                    info.gid = 0
+                    info.uname = ""
+                    info.gname = ""
+                    info.mtime = 0
+                    with source.open("rb") as stream:
+                        archive.addfile(info, stream)
+
+
+def _split_artifact_archive(path: Path, export_directory: Path) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    with path.open("rb") as stream:
+        for index, contents in enumerate(iter(lambda: stream.read(ARTIFACT_EXPORT_CHUNK_BYTES), b"")):
+            filename = f"{ARTIFACT_EXPORT_ARCHIVE_FILENAME}.part.{index:06d}"
+            part = export_directory / filename
+            part.write_bytes(contents)
+            records.append(
+                {
+                    "filename": filename,
+                    "index": index,
+                    "sha256": hashlib.sha256(contents).hexdigest(),
+                    "size": len(contents),
+                }
+            )
+    if not records:
+        raise ValueError("artifact export archive must produce at least one transport part")
+    return records
+
+
+def prepare_artifact_export(
+    artifact_directory: Path,
+    export_directory: Path,
+    *,
+    runner_exit_code: int,
+    source_sha: str,
+    source_tree: str,
+    source_manifest_sha256: str,
+) -> dict[str, Any]:
+    """Seal task-local evidence into bounded chunks before the Iris task exits."""
+    if type(runner_exit_code) is not int or not 0 <= runner_exit_code <= 255:
+        raise ValueError("runner exit code must be an integer in [0, 255]")
+    source_sha = _require_sha(source_sha, SHA1_PATTERN, "source SHA")
+    source_tree = _require_sha(source_tree, SHA1_PATTERN, "source tree")
+    source_manifest_sha256 = _require_sha(source_manifest_sha256, SHA256_PATTERN, "source manifest SHA-256")
+    artifact_directory = artifact_directory.resolve()
+    export_directory = export_directory.resolve()
+    if export_directory.exists():
+        raise ValueError(f"artifact export directory already exists: {export_directory}")
+    if export_directory.is_relative_to(artifact_directory) or artifact_directory.is_relative_to(export_directory):
+        raise ValueError("artifact and export directories must not contain one another")
+
+    records = _artifact_file_records(artifact_directory)
+    accepted = next((record for record in records if record["path"] == "accepted_bundle.json"), None)
+    wrapper_exit_code = runner_exit_code
+    if runner_exit_code == 0 and accepted is None:
+        wrapper_exit_code = MISSING_ACCEPTED_BUNDLE_EXIT_CODE
+    export_directory.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=f".{export_directory.name}.", dir=export_directory.parent) as temp_name:
+        temporary = Path(temp_name) / "export"
+        temporary.mkdir()
+        archive_path = temporary / ARTIFACT_EXPORT_ARCHIVE_FILENAME
+        _write_artifact_archive(archive_path, artifact_directory, records)
+        archive = {
+            "filename": ARTIFACT_EXPORT_ARCHIVE_FILENAME,
+            "sha256": _sha256(archive_path),
+            "size": archive_path.stat().st_size,
+        }
+        parts = _split_artifact_archive(archive_path, temporary)
+        manifest = {
+            "accepted_bundle": accepted,
+            "archive": archive,
+            "members": records,
+            "parts": parts,
+            "runner_exit_code": runner_exit_code,
+            "schema_version": ARTIFACT_EXPORT_SCHEMA_VERSION,
+            "source": {
+                "commit": source_sha,
+                "manifest_sha256": source_manifest_sha256,
+                "tree": source_tree,
+            },
+            "wrapper_exit_code": wrapper_exit_code,
+        }
+        manifest_path = temporary / ARTIFACT_EXPORT_MANIFEST_FILENAME
+        manifest_path.write_bytes(_canonical_json(manifest))
+        ready = {
+            "accepted_bundle_present": accepted is not None,
+            "archive_sha256": archive["sha256"],
+            "archive_size": archive["size"],
+            "manifest_sha256": _sha256(manifest_path),
+            "part_count": len(parts),
+            "ready_filename": ARTIFACT_EXPORT_READY_FILENAME,
+            "runner_exit_code": runner_exit_code,
+            "schema_version": ARTIFACT_EXPORT_SCHEMA_VERSION,
+            "wrapper_exit_code": wrapper_exit_code,
+        }
+        ready_path = temporary / ARTIFACT_EXPORT_READY_FILENAME
+        ready_path.write_bytes(_canonical_json(ready))
+        temporary.replace(export_directory)
+    return ready
+
+
+def artifact_export_ack(ready: dict[str, Any]) -> bytes:
+    """Return the exact acknowledgement bytes for a validated export."""
+    return _canonical_json(
+        {
+            "archive_sha256": _require_sha(ready.get("archive_sha256"), SHA256_PATTERN, "archive SHA-256"),
+            "manifest_sha256": _require_sha(ready.get("manifest_sha256"), SHA256_PATTERN, "export manifest SHA-256"),
+            "schema_version": ARTIFACT_EXPORT_SCHEMA_VERSION,
+        }
+    )
+
+
+def validate_retrieved_artifact_export(
+    retrieval_directory: Path,
+    archive_output: Path,
+    *,
+    expected_source_sha: str,
+    expected_source_tree: str,
+    expected_source_manifest_sha256: str,
+) -> dict[str, Any]:
+    """Validate controller-retrieved export parts and reconstruct the exact archive."""
+    expected_source_sha = _require_sha(expected_source_sha, SHA1_PATTERN, "source SHA")
+    expected_source_tree = _require_sha(expected_source_tree, SHA1_PATTERN, "source tree")
+    expected_source_manifest_sha256 = _require_sha(
+        expected_source_manifest_sha256, SHA256_PATTERN, "source manifest SHA-256"
+    )
+    retrieval_directory = retrieval_directory.resolve()
+    archive_output = archive_output.resolve()
+    if retrieval_directory.is_symlink() or not retrieval_directory.is_dir():
+        raise ValueError("artifact retrieval directory must be a regular directory")
+    if archive_output.exists() or archive_output.is_relative_to(retrieval_directory):
+        raise ValueError("artifact archive output must be fresh and outside the retrieval directory")
+
+    ready_path = retrieval_directory / ARTIFACT_EXPORT_READY_FILENAME
+    manifest_path = retrieval_directory / ARTIFACT_EXPORT_MANIFEST_FILENAME
+    for path, name in ((ready_path, "READY"), (manifest_path, "manifest")):
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"artifact export {name} must be a regular file")
+    ready = json.loads(ready_path.read_bytes())
+    manifest = json.loads(manifest_path.read_bytes())
+    if not isinstance(ready, dict) or ready_path.read_bytes() != _canonical_json(ready):
+        raise ValueError("artifact export READY must use canonical JSON")
+    if not isinstance(manifest, dict) or manifest_path.read_bytes() != _canonical_json(manifest):
+        raise ValueError("artifact export manifest must use canonical JSON")
+    if set(ready) != {
+        "accepted_bundle_present",
+        "archive_sha256",
+        "archive_size",
+        "manifest_sha256",
+        "part_count",
+        "ready_filename",
+        "runner_exit_code",
+        "schema_version",
+        "wrapper_exit_code",
+    }:
+        raise ValueError("artifact export READY has unexpected fields")
+    if set(manifest) != {
+        "accepted_bundle",
+        "archive",
+        "members",
+        "parts",
+        "runner_exit_code",
+        "schema_version",
+        "source",
+        "wrapper_exit_code",
+    }:
+        raise ValueError("artifact export manifest has unexpected fields")
+    if _sha256(manifest_path) != _require_sha(ready.get("manifest_sha256"), SHA256_PATTERN, "export manifest SHA-256"):
+        raise ValueError("artifact export READY does not bind the retrieved manifest")
+    if ready.get("schema_version") != ARTIFACT_EXPORT_SCHEMA_VERSION:
+        raise ValueError("artifact export READY has an unsupported schema")
+    if ready.get("ready_filename") != ARTIFACT_EXPORT_READY_FILENAME:
+        raise ValueError("artifact export READY filename identity is invalid")
+    if manifest.get("schema_version") != ARTIFACT_EXPORT_SCHEMA_VERSION:
+        raise ValueError("artifact export manifest has an unsupported schema")
+    expected_source = {
+        "commit": expected_source_sha,
+        "manifest_sha256": expected_source_manifest_sha256,
+        "tree": expected_source_tree,
+    }
+    if manifest.get("source") != expected_source:
+        raise ValueError("artifact export source identity differs from the authorized capsule")
+
+    parts = manifest.get("parts")
+    if not isinstance(parts, list) or not 1 <= len(parts) <= MAX_ARTIFACT_EXPORT_PARTS:
+        raise ValueError("artifact export has an invalid part count")
+    expected_files = {ARTIFACT_EXPORT_READY_FILENAME, ARTIFACT_EXPORT_MANIFEST_FILENAME}
+    total_size = 0
+    archive_output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        prefix=f".{archive_output.name}.", dir=archive_output.parent, delete=False
+    ) as stream:
+        temporary_archive = Path(stream.name)
+        try:
+            for index, record in enumerate(parts):
+                expected_filename = f"{ARTIFACT_EXPORT_ARCHIVE_FILENAME}.part.{index:06d}"
+                if not isinstance(record, dict) or set(record) != {"filename", "index", "sha256", "size"}:
+                    raise ValueError("artifact export part record has unexpected fields")
+                if record.get("filename") != expected_filename or record.get("index") != index:
+                    raise ValueError("artifact export parts are not canonical and contiguous")
+                size = record.get("size")
+                if type(size) is not int or not 0 < size <= ARTIFACT_EXPORT_CHUNK_BYTES:
+                    raise ValueError("artifact export part has an invalid size")
+                part = retrieval_directory / expected_filename
+                if part.is_symlink() or not part.is_file() or part.stat().st_size != size:
+                    raise ValueError("artifact export part is missing or has the wrong size")
+                if _sha256(part) != _require_sha(record.get("sha256"), SHA256_PATTERN, "part SHA-256"):
+                    raise ValueError("artifact export part digest mismatch")
+                with part.open("rb") as part_stream:
+                    shutil.copyfileobj(part_stream, stream)
+                expected_files.add(expected_filename)
+                total_size += size
+                if total_size > MAX_ARTIFACT_EXPORT_BYTES:
+                    raise ValueError("artifact export archive exceeds the size bound")
+        except Exception:
+            temporary_archive.unlink(missing_ok=True)
+            raise
+    actual_files = {path.name for path in retrieval_directory.iterdir() if path.is_file() and not path.is_symlink()}
+    if actual_files != expected_files or any(
+        path.is_symlink() or not path.is_file() for path in retrieval_directory.iterdir()
+    ):
+        temporary_archive.unlink(missing_ok=True)
+        raise ValueError("artifact retrieval file set differs from the sealed export")
+
+    archive = manifest.get("archive")
+    if not isinstance(archive, dict) or set(archive) != {"filename", "sha256", "size"}:
+        temporary_archive.unlink(missing_ok=True)
+        raise ValueError("artifact export archive record has unexpected fields")
+    if archive.get("filename") != ARTIFACT_EXPORT_ARCHIVE_FILENAME or archive.get("size") != total_size:
+        temporary_archive.unlink(missing_ok=True)
+        raise ValueError("artifact export archive size or name mismatch")
+    archive_sha256 = _require_sha(archive.get("sha256"), SHA256_PATTERN, "archive SHA-256")
+    if _sha256(temporary_archive) != archive_sha256 or ready.get("archive_sha256") != archive_sha256:
+        temporary_archive.unlink(missing_ok=True)
+        raise ValueError("artifact export archive digest mismatch")
+    if ready.get("archive_size") != total_size or ready.get("part_count") != len(parts):
+        temporary_archive.unlink(missing_ok=True)
+        raise ValueError("artifact export READY does not bind the archive layout")
+
+    members = manifest.get("members")
+    if not isinstance(members, list) or len(members) > MAX_ARTIFACT_EXPORT_MEMBERS:
+        temporary_archive.unlink(missing_ok=True)
+        raise ValueError("artifact export has an invalid member count")
+    member_paths: list[str] = []
+    try:
+        with tarfile.open(temporary_archive, "r:gz") as archive_stream:
+            tar_members = archive_stream.getmembers()
+            if len(tar_members) != len(members):
+                raise ValueError("artifact archive member count differs from the manifest")
+            for record, member in zip(members, tar_members, strict=True):
+                if not isinstance(record, dict) or set(record) != {"mode", "path", "sha256", "size"}:
+                    raise ValueError("artifact export member record has unexpected fields")
+                member_path = str(_validate_relative_path(record.get("path"), "artifact member path"))
+                if member_path != member.name or not member.isfile():
+                    raise ValueError("artifact archive member path or type differs from the manifest")
+                if record.get("mode") not in {"0644", "0755"} or member.mode != int(record["mode"], 8):
+                    raise ValueError("artifact archive member mode differs from the manifest")
+                size = record.get("size")
+                if type(size) is not int or size < 0 or member.size != size:
+                    raise ValueError("artifact archive member size differs from the manifest")
+                extracted = archive_stream.extractfile(member)
+                if extracted is None:
+                    raise ValueError("artifact archive member cannot be read")
+                digest = hashlib.sha256()
+                while block := extracted.read(1024 * 1024):
+                    digest.update(block)
+                if digest.hexdigest() != _require_sha(record.get("sha256"), SHA256_PATTERN, "member SHA-256"):
+                    raise ValueError("artifact archive member digest differs from the manifest")
+                member_paths.append(member_path)
+    except Exception:
+        temporary_archive.unlink(missing_ok=True)
+        raise
+    if member_paths != sorted(set(member_paths)):
+        temporary_archive.unlink(missing_ok=True)
+        raise ValueError("artifact archive member paths are not sorted and unique")
+    accepted = next((record for record in members if record["path"] == "accepted_bundle.json"), None)
+    if manifest.get("accepted_bundle") != accepted or ready.get("accepted_bundle_present") is not (accepted is not None):
+        temporary_archive.unlink(missing_ok=True)
+        raise ValueError("artifact export does not bind the accepted bundle record")
+    runner_exit_code = manifest.get("runner_exit_code")
+    wrapper_exit_code = manifest.get("wrapper_exit_code")
+    if type(runner_exit_code) is not int or not 0 <= runner_exit_code <= 255:
+        temporary_archive.unlink(missing_ok=True)
+        raise ValueError("artifact export runner exit code is invalid")
+    expected_wrapper_exit = (
+        MISSING_ACCEPTED_BUNDLE_EXIT_CODE if runner_exit_code == 0 and accepted is None else runner_exit_code
+    )
+    if wrapper_exit_code != expected_wrapper_exit:
+        temporary_archive.unlink(missing_ok=True)
+        raise ValueError("artifact export wrapper exit code is inconsistent")
+    if ready.get("runner_exit_code") != runner_exit_code or ready.get("wrapper_exit_code") != wrapper_exit_code:
+        temporary_archive.unlink(missing_ok=True)
+        raise ValueError("artifact export READY exit status is inconsistent")
+    temporary_archive.replace(archive_output)
+    return {"manifest": manifest, "ready": ready}
+
+
+def wait_for_artifact_ack(
+    export_directory: Path,
+    ready: dict[str, Any],
+    *,
+    timeout_seconds: float,
+    poll_seconds: float = 1.0,
+) -> None:
+    """Keep the task alive until the controller acknowledges exact retrieved bytes."""
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
+        raise ValueError("artifact acknowledgement timeout must be positive")
+    if isinstance(poll_seconds, bool) or not isinstance(poll_seconds, (int, float)) or poll_seconds <= 0:
+        raise ValueError("artifact acknowledgement polling interval must be positive")
+    expected = artifact_export_ack(ready)
+    ack_path = export_directory.resolve() / ARTIFACT_EXPORT_ACK_FILENAME
+    deadline = time.monotonic() + timeout_seconds
+    observed_mismatch = False
+    while time.monotonic() < deadline:
+        if ack_path.is_symlink():
+            raise ValueError("artifact acknowledgement must be a regular file")
+        if ack_path.is_file():
+            if ack_path.read_bytes() == expected:
+                return
+            observed_mismatch = True
+        time.sleep(poll_seconds)
+    if observed_mismatch:
+        raise ValueError("artifact acknowledgement does not bind the exact export identities")
+    raise TimeoutError("timed out waiting for artifact export acknowledgement")
+
+
 def capsule_python_path(source_root: Path, inherited: str | None) -> str:
     """Return the closed capsule import roots followed by any image paths."""
     roots = (str(source_root), str(source_root / "lib/tile_lifetime/src"))
@@ -572,15 +949,26 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     prepare.add_argument("--source-root", type=Path, required=True)
     prepare.add_argument("--source-sha", required=True)
     prepare.add_argument("--output-directory", type=Path, required=True)
-    run = subparsers.add_parser("run")
-    run.add_argument("--workspace", type=Path, required=True)
-    run.add_argument("--launcher-sha256", required=True)
-    run.add_argument("--manifest-sha256", required=True)
-    run.add_argument("--source-sha", required=True)
-    run.add_argument("--source-tree", required=True)
-    run.add_argument("--artifact-directory", type=Path, required=True)
-    run.add_argument("--require-jax-version", required=True)
-    run.add_argument("--runtime-python", type=Path, required=True)
+    verify = subparsers.add_parser("verify-export")
+    verify.add_argument("--retrieval-directory", type=Path, required=True)
+    verify.add_argument("--archive-output", type=Path, required=True)
+    verify.add_argument("--ack-output", type=Path, required=True)
+    verify.add_argument("--source-sha", required=True)
+    verify.add_argument("--source-tree", required=True)
+    verify.add_argument("--source-manifest-sha256", required=True)
+    for command in ("run", "run-export"):
+        run = subparsers.add_parser(command)
+        run.add_argument("--workspace", type=Path, required=True)
+        run.add_argument("--launcher-sha256", required=True)
+        run.add_argument("--manifest-sha256", required=True)
+        run.add_argument("--source-sha", required=True)
+        run.add_argument("--source-tree", required=True)
+        run.add_argument("--artifact-directory", type=Path, required=True)
+        run.add_argument("--require-jax-version", required=True)
+        run.add_argument("--runtime-python", type=Path, required=True)
+        if command == "run-export":
+            run.add_argument("--export-directory", type=Path, required=True)
+            run.add_argument("--ack-timeout-seconds", type=float, required=True)
     return parser.parse_args(argv)
 
 
@@ -589,6 +977,30 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.command == "prepare":
         print(
             json.dumps(prepare_source_payload(args.source_root, args.source_sha, args.output_directory), sort_keys=True)
+        )
+        return
+    if args.command == "verify-export":
+        validated = validate_retrieved_artifact_export(
+            args.retrieval_directory,
+            args.archive_output,
+            expected_source_sha=args.source_sha,
+            expected_source_tree=args.source_tree,
+            expected_source_manifest_sha256=args.source_manifest_sha256,
+        )
+        ack_output = args.ack_output.resolve()
+        if ack_output.exists():
+            raise ValueError(f"artifact acknowledgement output already exists: {ack_output}")
+        ack_output.parent.mkdir(parents=True, exist_ok=True)
+        ack_output.write_bytes(artifact_export_ack(validated["ready"]))
+        print(
+            json.dumps(
+                {
+                    "ack_sha256": _sha256(ack_output),
+                    "archive_sha256": validated["ready"]["archive_sha256"],
+                    "manifest_sha256": validated["ready"]["manifest_sha256"],
+                },
+                sort_keys=True,
+            )
         )
         return
     verify_launcher_identity(Path(__file__).resolve(), args.launcher_sha256)
@@ -611,7 +1023,24 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.artifact_directory.resolve(),
         args.require_jax_version,
     )
-    os.execv(arguments[0], arguments)
+    if args.command == "run":
+        os.execv(arguments[0], arguments)
+    export_directory = args.export_directory.resolve()
+    if export_directory.exists():
+        raise ValueError(f"artifact export directory already exists: {export_directory}")
+    completed = subprocess.run(arguments, check=False)
+    runner_exit_code = completed.returncode if completed.returncode >= 0 else min(255, 128 - completed.returncode)
+    ready = prepare_artifact_export(
+        args.artifact_directory,
+        export_directory,
+        runner_exit_code=runner_exit_code,
+        source_sha=args.source_sha,
+        source_tree=args.source_tree,
+        source_manifest_sha256=args.manifest_sha256,
+    )
+    print(json.dumps({"export_ready": ready}, sort_keys=True), flush=True)
+    wait_for_artifact_ack(export_directory, ready, timeout_seconds=args.ack_timeout_seconds)
+    raise SystemExit(ready["wrapper_exit_code"])
 
 
 if __name__ == "__main__":
