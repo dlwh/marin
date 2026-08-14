@@ -539,6 +539,95 @@ def _semantic_digest(value: object) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+_PTX_DECLARATIONS = (
+    re.compile(r"\.version\s+[0-9]+\.[0-9]+"),
+    re.compile(r"\.target\s+sm_90(?:\s*,\s*[A-Za-z0-9_]+)*"),
+    re.compile(r"\.address_size\s+64"),
+    re.compile(r"(?:\.visible\s+)?\.entry\s+[A-Za-z_$][A-Za-z0-9_$]*(?:\(\))?(?:\s*\()?\s*\{?"),
+    re.compile(r"\.reg\s+\.(?:pred|[busf][0-9]+)\s+%[A-Za-z][A-Za-z0-9]*(?:<[0-9]+>)?;"),
+    re.compile(r"\.param\s+\.(?:[busf][0-9]+|align\s+[0-9]+\s+\.b8)\s+[A-Za-z_$][A-Za-z0-9_$]*(?:\[[0-9]+\])?,?"),
+    re.compile(r"\.(?:maxntid|minnctapersm|maxnreg)\s+[0-9]+(?:\s*,\s*[0-9]+){0,2}"),
+)
+
+
+def _normalized_instruction_sequence(text: str) -> tuple[str, ...]:
+    sequence = []
+    for raw_line in text.splitlines():
+        line = raw_line.split("//", maxsplit=1)[0].strip()
+        if not line or line in {"{", "}", "(", ")", "){", ") {"}:
+            continue
+        if re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$]*:", line):
+            sequence.append("label")
+            continue
+        if line.startswith("."):
+            _require(any(pattern.fullmatch(line) is not None for pattern in _PTX_DECLARATIONS))
+            continue
+        instruction = re.fullmatch(
+            r"(?:@!?%p[0-9]+\s+)?([A-Za-z][A-Za-z0-9_.]*)(?:\s+.+)?;",
+            line,
+        )
+        _require(instruction is not None)
+        sequence.append(instruction.group(1))
+    return tuple(sequence)
+
+
+def _expected_contract_instruction_sequence(
+    policy: NumericalPolicy,
+    *,
+    input_bf16: bool,
+) -> tuple[str, ...]:
+    sequence = [
+        "div.u64",
+        "rem.u64",
+        "div.u64",
+        "rem.u64",
+        "cvt.u64.u32" if policy is NumericalPolicy.FAST else "mov.u64",
+        "mov.f32",
+        "label",
+    ]
+    for _ in range(2):
+        sequence.extend(
+            (
+                "mov.u64",
+                "mad.lo.u64",
+                "mad.lo.u64",
+                "ld.param.u64",
+                "mad.lo.u64",
+                "ld.global.u16" if input_bf16 else "ld.global.f32",
+            )
+        )
+        if input_bf16:
+            sequence.append("cvt.f32.bf16")
+    sequence.extend(("fma.rn.f32", "add.u64", "setp.lt.u64", "bra"))
+    if policy is NumericalPolicy.FAST:
+        for _ in range(5):
+            sequence.extend(("mov.b32", "shfl.sync.down.b32", "mov.b32", "add.rn.f32"))
+    sequence.extend(("ld.param.u64", "mad.lo.u64", "st.global.f32", "ret"))
+    return tuple(sequence)
+
+
+def _expected_map_instruction_sequence(input_slot: GpuSlot, output_slot: GpuSlot) -> tuple[str, ...]:
+    sequence = [
+        "div.u64",
+        "rem.u64",
+        "div.u64",
+        "rem.u64",
+        "mov.u64",
+        "mad.lo.u64",
+        "mad.lo.u64",
+        "ld.param.u64",
+        "mad.lo.u64",
+        "ld.global.u16" if input_slot.element_type is ElementType.BF16 else "ld.global.f32",
+    ]
+    if input_slot.element_type is ElementType.BF16:
+        sequence.append("cvt.f32.bf16")
+    sequence.extend(("ld.param.u64", "mad.lo.u64"))
+    if output_slot.element_type is ElementType.BF16:
+        sequence.append("cvt.rn.bf16.f32")
+    sequence.extend(("st.global.u16" if output_slot.element_type is ElementType.BF16 else "st.global.f32", "ret"))
+    return tuple(sequence)
+
+
 def _validate_contract_ptx(ptx: bytes, coordinate: TransportCoordinate, ordinal: int) -> None:
     if coordinate.call_role is CallRole.FORWARD:
         output_shape, expected = (33, 34), {0: (0, 2), 1: (2, 1)}
@@ -549,11 +638,15 @@ def _validate_contract_ptx(ptx: bytes, coordinate: TransportCoordinate, ordinal:
     observed_maps = _address_maps(ptx, output_shape, reduction=True)
     _require(observed_maps == expected)
     text = ptx.decode("ascii")
+    input_bf16 = coordinate.call_role is CallRole.FORWARD
+    _require(
+        _normalized_instruction_sequence(text)
+        == _expected_contract_instruction_sequence(coordinate.policy, input_bf16=input_bf16)
+    )
     _require("atom." not in text and "mma." not in text)
     _require(len(re.findall(r"\bld\.param\.u64\b", text)) == 3)
     _require(len(re.findall(r"\bst\.global\.f32\b", text)) == 1)
     _require(len(re.findall(r"\bmov\.f32\b", text)) == 1)
-    input_bf16 = coordinate.call_role is CallRole.FORWARD
     _require(len(re.findall(r"\bld\.global\.f32\b", text)) == (0 if input_bf16 else 2))
     _require(len(re.findall(r"\bld\.global\.u16\b", text)) == (2 if input_bf16 else 0))
     _require("st.global.u16" not in text)
@@ -670,6 +763,7 @@ def _validate_map_ptx(ptx: bytes, input_slot: GpuSlot, output_slot: GpuSlot, kin
     observed_maps = _address_maps(ptx, output_slot.dimensions, reduction=False)
     _require(observed_maps == {0: expected_map})
     text = ptx.decode("ascii")
+    _require(_normalized_instruction_sequence(text) == _expected_map_instruction_sequence(input_slot, output_slot))
     _require("fma.rn.f32" not in text and "shfl." not in text and "atom." not in text and "mma." not in text)
     _require("mov.f32" not in text)
     _require(re.search(r"\b(?:add|sub|mul)\.(?:rn\.)?f(?:16|32|64)\b", text) is None)

@@ -302,10 +302,33 @@ def _build_transport(
             "predicate": (b"setp.lt.u64", b"setp.ge.u64"),
             "shuffle_def_use": (b"shfl.sync.down.b32 %r6, %r5, 16", b"shfl.sync.down.b32 %r6, %r9, 16"),
             "decoy": (b"  fma.rn.f32", b"  mov.f32 %f9, %f9;\n  fma.rn.f32"),
+            "clobber": (
+                b"  st.global.f32 [%rd22], %f0;",
+                b"  mul.rn.f32 %f0, %f0, %f1;\n  st.global.f32 [%rd22], %f0;",
+            ),
         }
-        if contract_mutation == "reorder":
+        if contract_mutation == "init_inside_loop":
+            instruction = b"  mov.f32 %f0, 0f00000000;\n"
+            mutated = contract.replace(instruction, b"").replace(b"L_reduction:\n", b"L_reduction:\n" + instruction)
+        elif contract_mutation == "load_after_fma":
+            instruction = b"  ld.global.u16 %h0, [%rd20];\n"
+            mutated = contract.replace(instruction, b"").replace(
+                b"  fma.rn.f32 %f0, %f1, %f2, %f0;\n",
+                b"  fma.rn.f32 %f0, %f1, %f2, %f0;\n" + instruction,
+            )
+        elif contract_mutation == "reorder":
             instruction = b"  fma.rn.f32 %f0, %f1, %f2, %f0;\n"
             mutated = contract.replace(instruction, b"").replace(b"L_reduction:\n", instruction + b"L_reduction:\n")
+        elif contract_mutation == "shuffle_before_branch":
+            shuffle_block = (
+                b"  mov.b32 %r5, %f0;\n"
+                b"  shfl.sync.down.b32 %r6, %r5, 16, 31, 0xffffffff;\n"
+                b"  mov.b32 %f3, %r6;\n"
+                b"  add.rn.f32 %f0, %f0, %f3;\n"
+            )
+            mutated = contract.replace(shuffle_block, b"", 1).replace(
+                b"  @%p1 bra L_reduction;\n", shuffle_block + b"  @%p1 bra L_reduction;\n"
+            )
         else:
             before, after = replacements[contract_mutation]
             mutated = contract.replace(before, after, 1)
@@ -335,6 +358,13 @@ def _build_transport(
         ptx_slices = (mutated, *ptx_slices[1:])
     elif map_mutation == "decoy":
         mutated = ptx_slices[0].replace(b"  ret;", b"  add.rn.f32 %f9, %f9, 0f00000000;\n  ret;")
+        assert mutated != ptx_slices[0]
+        ptx_slices = (mutated, *ptx_slices[1:])
+    elif map_mutation == "clobber":
+        mutated = ptx_slices[0].replace(
+            b"  st.global.f32 [%rd21], %f0;",
+            b"  neg.f32 %f0, %f0;\n  st.global.f32 [%rd21], %f0;",
+        )
         assert mutated != ptx_slices[0]
         ptx_slices = (mutated, *ptx_slices[1:])
     elif map_mutation == "reorder":
@@ -502,7 +532,10 @@ def test_load_gpu_transport_rejects_affine_map_mutation_with_valid_transport_roo
         load_gpu_transport(path, coordinate)
 
 
-@pytest.mark.parametrize("mutation", ["decoy", "output_address", "reorder", "store", "transpose", "value"])
+@pytest.mark.parametrize(
+    "mutation",
+    ["clobber", "decoy", "output_address", "reorder", "store", "transpose", "value"],
+)
 def test_load_gpu_transport_rejects_map_semantic_mutation_with_valid_roots(
     tmp_path: Path,
     mutation: str,
@@ -517,7 +550,20 @@ def test_load_gpu_transport_rejects_map_semantic_mutation_with_valid_roots(
 
 @pytest.mark.parametrize(
     "mutation",
-    ["branch", "decoy", "fma_input", "init", "missing_load", "missing_store", "output_address", "predicate", "reorder"],
+    [
+        "branch",
+        "clobber",
+        "decoy",
+        "fma_input",
+        "init",
+        "init_inside_loop",
+        "load_after_fma",
+        "missing_load",
+        "missing_store",
+        "output_address",
+        "predicate",
+        "reorder",
+    ],
 )
 def test_load_gpu_transport_rejects_contract_dataflow_mutation_with_valid_roots(
     tmp_path: Path,
@@ -535,6 +581,15 @@ def test_load_gpu_transport_rejects_fast_shuffle_def_use_decoy_with_valid_roots(
     coordinate = TransportCoordinate(NumericalPolicy.FAST, CallRole.FORWARD)
     path = tmp_path / "bundle.bin"
     path.write_bytes(_build_transport(coordinate, contract_mutation="shuffle_def_use").data)
+
+    with pytest.raises(ValueError):
+        load_gpu_transport(path, coordinate)
+
+
+def test_load_gpu_transport_rejects_fast_shuffle_before_loop_branch_with_valid_roots(tmp_path: Path) -> None:
+    coordinate = TransportCoordinate(NumericalPolicy.FAST, CallRole.FORWARD)
+    path = tmp_path / "bundle.bin"
+    path.write_bytes(_build_transport(coordinate, contract_mutation="shuffle_before_branch").data)
 
     with pytest.raises(ValueError):
         load_gpu_transport(path, coordinate)
