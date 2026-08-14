@@ -379,7 +379,7 @@ def _validate_contract(contract: dict[str, Any]) -> None:
     }
     assert contract["schema_version"] == 1
     assert contract["contract_id"] == "abi11_layernorm_bf16_te_2_17_oracle_red_v1"
-    assert contract["status"] == "test_only_red_runner_implementation_absent"
+    assert contract["status"] == "runner_implemented_hardware_unexecuted_unsealed"
     assert contract["source_base"] == EXPECTED_SOURCE_BASE
     assert contract["provider"] == EXPECTED_PROVIDER
     assert contract["api"] == {
@@ -866,7 +866,7 @@ def test_layernorm_te_runner_executes_one_fake_record_and_binds_artifacts(
     assert set(result["output_artifacts"]) == output_roles
     assert result["contract_identity"] == {
         "contract_id": contract["contract_id"],
-        "sha256": "5a3391f00bf5453d735cfe4359d8e8dff73fb70ccdf7908a0d19b592c413d005",
+        "sha256": "05475e373ce7c2196e61d6e59e8e8f0221119edd035122825cb59f1930ef3109",
     }
     assert result["plan_identity"] == {
         "sha256": "f42f251961131e5b1c870161f48da14e018001e4aa762752d82d0a7a8c1a6965",

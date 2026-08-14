@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "contract_id": "abi11_layernorm_bf16_te_2_17_oracle_red_v1",
-  "status": "test_only_red_runner_implementation_absent",
+  "status": "runner_implemented_hardware_unexecuted_unsealed",
   "source_base": {
     "marin_commit": "5a126aeb6e6069e854d7b3b32709a94eccb26a29",
     "marin_tree": "0571572dda7c61f238086afc569314363b289d25"

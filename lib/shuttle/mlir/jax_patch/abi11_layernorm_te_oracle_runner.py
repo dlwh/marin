@@ -18,7 +18,7 @@ from typing import Any
 import ml_dtypes
 import numpy as np
 
-CONTRACT_SHA256 = "5a3391f00bf5453d735cfe4359d8e8dff73fb70ccdf7908a0d19b592c413d005"
+CONTRACT_SHA256 = "05475e373ce7c2196e61d6e59e8e8f0221119edd035122825cb59f1930ef3109"
 PLAN_SHA256 = "f42f251961131e5b1c870161f48da14e018001e4aa762752d82d0a7a8c1a6965"
 ADAPTER = Path(__file__).with_name("abi11_layernorm_te_oracle_adapter.cpp")
 ADAPTER_SHA256 = "0d88f0e41cf19f11535d45f54c86ee49ba2f7965a0ef2a1de9121060eb4c0bf8"
