@@ -3022,7 +3022,13 @@ bool isClosedContractMapRegion(ArrayRef<Operation *> algebra) {
   auto map = dyn_cast<MapOp>(algebra[1]);
   if (!contract || !map || !isClosedRankTwoContract(contract) ||
       map.getInputs().size() != 1 || map.getNumResults() != 1 ||
-      map.getInputs()[0] != contract.getResult(0)) {
+      map.getInputs()[0] != contract.getResult(0) ||
+      !contract.getResult(0).hasOneUse()) {
+    return false;
+  }
+  auto region = contract->getParentOfType<RegionOp>();
+  if (!region || region.getInputs().size() != 2 ||
+      region.getResults().size() != 1) {
     return false;
   }
   auto input = dyn_cast<RankedTensorType>(map.getInputs()[0].getType());
@@ -3042,11 +3048,14 @@ bool isClosedContractMapRegion(ArrayRef<Operation *> algebra) {
   }
   auto convert = dyn_cast<ScalarConvertOp>(body.front());
   auto yield = dyn_cast<YieldOp>(body.back());
-  return convert && yield && convert.getInput() == body.getArgument(0) &&
+  auto regionYield = dyn_cast<YieldOp>(region.getBody().front().getTerminator());
+  return convert && yield && regionYield && map.getResult(0).hasOneUse() &&
+         convert.getInput() == body.getArgument(0) &&
          convert.getInput().getType().isF32() &&
          convert.getResult().getType().isBF16() &&
          convert.getSemantics() == ScalarConvertSemantics::RoundNearestEven &&
-         yield.getValues() == ValueRange{convert.getResult()};
+         yield.getValues() == ValueRange{convert.getResult()} &&
+         regionYield.getValues() == ValueRange{map.getResult(0)};
 }
 
 bool isClosedRankTwoFold(FoldOp fold) {

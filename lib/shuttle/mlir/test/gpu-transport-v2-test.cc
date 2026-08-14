@@ -647,6 +647,16 @@ std::string contractMapModule(int64_t rows, int64_t reduction, int64_t columns,
   return source;
 }
 
+constexpr llvm::StringLiteral kContractMapWithLiveF32Result = R"mlir(
+module @live_f32_and_bf16 {
+  func.func @main(%lhs: tensor<3x5xbf16>, %rhs: tensor<5x2xbf16>) -> (tensor<3x2xf32>, tensor<3x2xbf16>) {
+    %contract = stablehlo.dot_general %lhs, %rhs, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<3x5xbf16>, tensor<5x2xbf16>) -> tensor<3x2xf32>
+    %result = stablehlo.convert %contract : (tensor<3x2xf32>) -> tensor<3x2xbf16>
+    return %contract, %result : tensor<3x2xf32>, tensor<3x2xbf16>
+  }
+}
+)mlir";
+
 std::unique_ptr<BuiltBundle>
 buildFixture(llvm::StringRef source,
              mlir::shuttle::NumericalPolicy policy =
@@ -1201,6 +1211,7 @@ module @f32_inputs {
       buildFixture(contractMapModule(3, 5, 2, "high_precision", "HIGH", true)));
   EXPECT_FALSE(buildFixture(
       contractMapModule(3, 5, 2, "external_f32", "DEFAULT", false)));
+  EXPECT_FALSE(buildFixture(kContractMapWithLiveF32Result));
   EXPECT_FALSE(buildFixture(batched));
   EXPECT_FALSE(buildFixture(multipleContractDimensions));
   EXPECT_FALSE(buildFixture(f32Inputs));
