@@ -2367,9 +2367,9 @@ TEST(GpuTransportV2Test,
        347156},
   };
   constexpr Boundary boundaries[] = {
-      {"forward", 6, 1, 0, 1, 2},
-      {"backward", 13, 2, 1, 1, 3},
-      {"composed", 16, 2, 1, 2, 4},
+      {"forward", 7, 1, 0, 1, 2},
+      {"backward", 16, 2, 1, 1, 3},
+      {"composed", 19, 2, 1, 2, 4},
   };
 
   for (const Shape &shape : shapes) {
@@ -2478,8 +2478,12 @@ TEST(GpuTransportV2Test,
           if (launch.dynamicSharedMemoryBytes != 0) {
             EXPECT_EQ(launch.grid,
                       (std::array<uint64_t, 3>{shape.foldGrid, 1, 1}));
-            ASSERT_EQ(launch.inputSlots.size(), 1);
+            ASSERT_EQ(launch.inputSlots.size(), 2);
             const int64_t input = launch.inputSlots.front();
+            const int64_t initializer = launch.inputSlots.back();
+            EXPECT_TRUE(decoded->slotDimensions[initializer].empty());
+            EXPECT_TRUE(decoded->slotStrides[initializer].empty());
+            EXPECT_EQ(decoded->slotRequiredBytes[initializer], 4);
             if (decoded->slotDimensions[input] ==
                 llvm::ArrayRef<int64_t>(shape.fullShape)) {
               ++fullFoldLaunches;
@@ -3618,7 +3622,7 @@ TEST(GpuTransportV2Test,
   ASSERT_TRUE(mlir::succeeded(transport));
   auto decoded = decodeInlineSchema2(*transport);
   ASSERT_TRUE(decoded);
-  ASSERT_EQ(decoded->launches.size(), 6);
+  ASSERT_EQ(decoded->launches.size(), 7);
   auto executable = mlir::shuttle::GpuExecutable::Load(*transport);
   ASSERT_TRUE(executable.ok()) << executable.status();
   ASSERT_EQ((*executable)->externalBindings().size(), 2);
@@ -3637,7 +3641,7 @@ TEST(GpuTransportV2Test,
   auto trace = std::make_shared<ExecutionTrace>();
   EXPECT_CALL(stream, parent()).WillRepeatedly(testing::Return(&executor));
   EXPECT_CALL(executor, LoadKernel(testing::_))
-      .Times(6)
+      .Times(7)
       .WillRepeatedly([trace](const stream_executor::KernelLoaderSpec &spec) {
         return recordLoadedKernel(spec, trace);
       });
@@ -3670,7 +3674,7 @@ TEST(GpuTransportV2Test,
                                dynamicFrame->frame, context,
                                XLA_FFI_ExecutionStage_EXECUTE)
                   .ok());
-  EXPECT_EQ(trace->launchAttempts.load(), 6);
+  EXPECT_EQ(trace->launchAttempts.load(), 7);
   auto slots = dynamicSlotAddresses(*decoded, allocator, 0xd0000000,
                                     dynamicFrame->externalSlots);
   expectKernelLaunches(*decoded, *trace, 0, slots);
