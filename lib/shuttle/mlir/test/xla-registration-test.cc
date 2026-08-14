@@ -302,6 +302,48 @@ TEST(ShuttleXlaOptionsTest,
   }
 }
 
+TEST(ShuttleXlaOptionsTest,
+     RunsOrdinaryJaxComposedMatmulAsTwoGenericCalls) {
+  std::string error;
+  auto runfiles = bazel::tools::cpp::runfiles::Runfiles::CreateForTest(&error);
+  ASSERT_TRUE(runfiles) << error;
+  std::ifstream input(
+      runfiles->Rlocation("shuttle_mlir/test/Inputs/"
+                          "jax-0.10.1-bf16-matmul-vjp-17x33x19-composed.mlir"));
+  std::ostringstream source;
+  source << input.rdbuf();
+  ASSERT_TRUE(input);
+
+  constexpr const char *serializedPolicies[] = {
+      kAbi14ContractSourceOrderedOptions,
+      kAbi14ContractFastOptions,
+  };
+  for (const char *serialized : serializedPolicies) {
+    auto options = mlir::shuttle::parseShuttleXlaOptions(serialized);
+    ASSERT_TRUE(options.ok()) << options.status();
+    mlir::MLIRContext context;
+    mlir::OwningOpRef<mlir::ModuleOp> module =
+        parseModule(context, source.str());
+    ASSERT_TRUE(module);
+    ASSERT_TRUE(mlir::succeeded(
+        mlir::shuttle::runShuttleXlaTransform(*module, *options)));
+    std::string transformed;
+    llvm::raw_string_ostream output(transformed);
+    module->print(output);
+    output.flush();
+    constexpr llvm::StringLiteral target =
+        "shuttle.gpu.executable_bundle.v2";
+    size_t first = transformed.find(target.str());
+    ASSERT_NE(first, std::string::npos);
+    size_t second = transformed.find(target.str(), first + target.size());
+    ASSERT_NE(second, std::string::npos);
+    EXPECT_EQ(transformed.find(target.str(), second + target.size()),
+              std::string::npos);
+    EXPECT_EQ(transformed.find("shuttle.region"), std::string::npos);
+    EXPECT_EQ(transformed.find("stablehlo.dot_general"), std::string::npos);
+  }
+}
+
 TEST(ShuttleXlaOptionsTest, RejectsInvalidOrNoncanonicalWireFormats) {
   constexpr const char *invalidOptions[] =
       {
