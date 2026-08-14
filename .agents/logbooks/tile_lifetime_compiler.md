@@ -4902,3 +4902,37 @@ author: dlwh
 - Next action: obtain explicit approval for the controller receipt trust root,
   then implement the task-side verifier and controller-side persistent signer
   red-to-green. Capsule transfer and H100 launch remain separate approvals.
+
+### 2026-08-14 14:10 PDT - TLTC-MLIR-027 ABI 15 receipt contract closure
+
+- The controller receipt red contract now binds deterministic
+  `LaunchJobRequest` protobuf bytes rather than a caller-supplied launch
+  digest. The request requires one task, controller-minted attempt zero,
+  failure/preemption/task-failure retries all zero, and error-on-existing
+  behavior. Test fixtures persist the request through a real `ControllerDB`,
+  reconstruct it byte-for-byte, and use the UID minted when Iris inserts the
+  attempt.
+- Controller issuance accepts retrieved evidence paths, invokes an internal
+  verifier over the actual archive and export manifest, derives job/task/
+  attempt state from one database snapshot, and signs digests of the exact
+  request, READY record, archive, export manifest, verifier, and returned
+  report. The test contract rejects persisted request substitutions, changed
+  evidence/report bytes, invalid READY/TERMINAL identities, nonzero retries,
+  cross-attempt state, and partial or non-idempotent receipt persistence.
+  Issued ACK and TERMINAL bytes must pass the task-side verifier end to end.
+- Exact local series: initial red contract
+  `7ed55cef5549042e17f5b00bde794b3d5277b38f`; persistent controller-state
+  checkpoint `2a0ddf060e1953cc74db9e365ef1bcfae7411de3`; launch/request repair
+  `52f9d4b3f1ba5fac5ca7e7c155e9d3313351bce0`; issuance-join repair
+  `10439382eb104b07d49ad00b26ff404cbcb9873e`; reviewed final red contract
+  `c618559b1a6e55c2e6ef8f3e8427af3cb224f66b`, tree
+  `ecc6c4985d154cd899a7dbcbeca7e1122fa6e2d7`. Independent strict review
+  returned GO with no P1 or P2 findings.
+- The final red census collects 89 cases: two controller/request controls pass
+  and 87 fail only because the task verifier and controller receipt modules do
+  not exist. The unchanged ABI15 pre-image harness passes 157/157. Required
+  changed-files precommit passes with the existing local environment.
+- This is not receipt authority or launch approval. Controller integration,
+  secret projection, trust-root approval, image transfer, hardware launch, and
+  the two implementation modules remain absent or null. No network, image,
+  Iris, hardware, upload, push, or integration action occurred.
