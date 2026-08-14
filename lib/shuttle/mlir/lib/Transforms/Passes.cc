@@ -79,7 +79,7 @@ ShuttlePipelineOptions commandLinePipelineOptions(NumericalPolicy numerics) {
   options.numerics = numerics;
   if (numerics == NumericalPolicy::Fast) {
     options.canonicalOptions =
-        R"json({"execution_mode":"stablehlo_round_trip","numerics":"fast","pipeline_abi_version":15,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+        R"json({"execution_mode":"stablehlo_round_trip","numerics":"fast","pipeline_abi_version":16,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
   }
   return options;
 }
@@ -2959,7 +2959,7 @@ FailureOr<SmallVector<int64_t>> contractDomainShape(ContractOp contract) {
   return domain;
 }
 
-bool isClosedRankTwoContract(ContractOp contract) {
+bool isClosedProjectedContract(ContractOp contract) {
   auto lhs = contract.getInputs().size() == 2
                  ? dyn_cast<RankedTensorType>(contract.getInputs()[0].getType())
                  : RankedTensorType{};
@@ -2971,11 +2971,16 @@ bool isClosedRankTwoContract(ContractOp contract) {
           ? dyn_cast<RankedTensorType>(contract.getResult(0).getType())
           : RankedTensorType{};
   FailureOr<SmallVector<int64_t>> domain = contractDomainShape(contract);
-  if (!lhs || !rhs || !result || failed(domain) || lhs.getRank() != 2 ||
-      rhs.getRank() != 2 || result.getRank() != 2 ||
+  constexpr int64_t kMaximumContractRank = 8;
+  if (!lhs || !rhs || !result || failed(domain) || lhs.getRank() < 2 ||
+      rhs.getRank() < 2 || result.getRank() < 2 ||
+      lhs.getRank() > kMaximumContractRank ||
+      rhs.getRank() > kMaximumContractRank ||
+      result.getRank() > kMaximumContractRank ||
       lhs.getElementType() != rhs.getElementType() ||
       (!lhs.getElementType().isBF16() && !lhs.getElementType().isF32()) ||
-      !result.getElementType().isF32() || domain->size() != 3 ||
+      !result.getElementType().isF32() ||
+      domain->size() != static_cast<size_t>(result.getRank() + 1) ||
       contract.getAlgorithm() != "dot_general" ||
       contract.getAccumulatorTypes().size() != 1 ||
       cast<TypeAttr>(contract.getAccumulatorTypes()[0]).getValue() !=
@@ -3003,7 +3008,7 @@ bool isClosedRankTwoContract(ContractOp contract) {
       return false;
     }
   }
-  if (reduction != 2) {
+  if (reduction != static_cast<int64_t>(domain->size()) - 1) {
     return false;
   }
   AffineMap lhsMap =
@@ -3013,10 +3018,13 @@ bool isClosedRankTwoContract(ContractOp contract) {
   AffineMap resultMap =
       cast<AffineMapAttr>(contract.getIndexingMaps()[2]).getValue();
   MLIRContext *context = contract.getContext();
-  if (resultMap != AffineMap::get(3, 0,
-                                  {getAffineDimExpr(0, context),
-                                   getAffineDimExpr(1, context)},
-                                  context)) {
+  SmallVector<AffineExpr> expectedResultExpressions;
+  expectedResultExpressions.reserve(result.getRank());
+  for (int64_t dimension = 0; dimension < result.getRank(); ++dimension) {
+    expectedResultExpressions.push_back(getAffineDimExpr(dimension, context));
+  }
+  if (resultMap !=
+      AffineMap::get(domain->size(), 0, expectedResultExpressions, context)) {
     return false;
   }
   for (unsigned dimension = 0; dimension < domain->size(); ++dimension) {
@@ -3027,7 +3035,7 @@ bool isClosedRankTwoContract(ContractOp contract) {
       if (!inLhs || !inRhs || inResult) {
         return false;
       }
-    } else if (inLhs == inRhs || !inResult) {
+    } else if ((!inLhs && !inRhs) || !inResult) {
       return false;
     }
   }
@@ -3037,8 +3045,8 @@ bool isClosedRankTwoContract(ContractOp contract) {
 bool isClosedContractMapRegion(RegionOp region, ArrayRef<Operation *> algebra) {
   auto isExternalType = [](Type type) {
     auto tensor = dyn_cast<RankedTensorType>(type);
-    return tensor && tensor.hasStaticShape() && tensor.getRank() == 2 &&
-           tensor.getElementType().isBF16() &&
+    return tensor && tensor.hasStaticShape() && tensor.getRank() >= 2 &&
+           tensor.getRank() <= 8 && tensor.getElementType().isBF16() &&
            llvm::all_of(tensor.getShape(),
                         [](int64_t extent) { return extent > 0; });
   };
@@ -3052,7 +3060,7 @@ bool isClosedContractMapRegion(RegionOp region, ArrayRef<Operation *> algebra) {
   }
   return llvm::all_of(algebra, [](Operation *operation) {
     if (auto contract = dyn_cast<ContractOp>(operation)) {
-      return isClosedRankTwoContract(contract);
+      return isClosedProjectedContract(contract);
     }
     return isa<MapOp>(operation);
   });
@@ -3186,7 +3194,7 @@ FailureOr<DerivedPlan> deriveGpuPlan(RegionOp region) {
                              .getShape()
                              .end());
     } else if (auto contract = dyn_cast<ContractOp>(operation)) {
-      if (!isClosedRankTwoContract(contract)) {
+      if (!isClosedProjectedContract(contract)) {
         return failure();
       }
       ++contractCount;
@@ -3341,7 +3349,7 @@ public:
         auto tuning = manifest ? manifest.getAs<StringAttr>("canonical_tuning")
                                : StringAttr{};
         if (!tuning || tuning.getValue() != kDefaultCanonicalTuning) {
-          module.emitError("ABI15 GPU Contract requires exact default tuning");
+          module.emitError("ABI16 GPU Contract requires exact default tuning");
           return signalPassFailure();
         }
       }
@@ -3687,30 +3695,32 @@ FailureOr<ScheduledGeometry> deriveSimt32Geometry(ScheduleTaskKind kind,
                              std::nullopt};
   }
   if (kind == ScheduleTaskKind::Contract) {
-    if (domain.size() != 3 || domain[0] <= 0 || domain[1] <= 0 ||
-        domain[2] <= 0 ||
-        domain[0] > std::numeric_limits<int64_t>::max() / domain[1]) {
+    if (domain.size() < 3 || domain.size() > 9) {
       return failure();
     }
-    const int64_t outputs = domain[0] * domain[1];
+    FailureOr<int64_t> outputs = scheduleElementCount(domain.drop_back());
+    if (failed(outputs) || *outputs > UINT32_MAX || domain.back() <= 0) {
+      return failure();
+    }
+    const int64_t reductionAxis = domain.size() - 1;
     if (policy == NumericalPolicy::Fast) {
-      const int64_t outputsPerBlock = std::min<int64_t>(outputs, 8);
-      return ScheduledGeometry{{ceilDivPositive(outputs, outputsPerBlock)},
+      const int64_t outputsPerBlock = std::min<int64_t>(*outputs, 8);
+      return ScheduledGeometry{{ceilDivPositive(*outputs, outputsPerBlock)},
                                {outputsPerBlock},
-                               ceilDivPositive(domain[2], kSubgroup),
+                               ceilDivPositive(domain.back(), kSubgroup),
                                outputsPerBlock * kSubgroup,
                                kSubgroup,
                                0,
-                               2};
+                               reductionAxis};
     }
-    const int64_t tile = std::min(outputs, kMaxThreads);
-    return ScheduledGeometry{{ceilDivPositive(outputs, tile)},
+    const int64_t tile = std::min(*outputs, kMaxThreads);
+    return ScheduledGeometry{{ceilDivPositive(*outputs, tile)},
                              {tile},
-                             domain[2],
+                             domain.back(),
                              scheduleThreads(tile),
                              kSubgroup,
                              0,
-                             2};
+                             reductionAxis};
   }
   if (domain.size() != 2 || domain[0] <= 0 || domain[1] <= 0) {
     return failure();
@@ -4375,6 +4385,10 @@ LogicalResult emitLinearThread(PtxEmitter &ptx, int64_t elements) {
 
 FailureOr<SmallVector<int64_t>> emitOutputCoordinates(PtxEmitter &ptx,
                                                       RankedTensorType type) {
+  FailureOr<int64_t> elements = staticElementCount(type);
+  if (failed(elements) || *elements > UINT32_MAX) {
+    return failure();
+  }
   SmallVector<int64_t> coordinates;
   int64_t stride = 1;
   SmallVector<int64_t> strides(type.getRank());
@@ -4579,25 +4593,26 @@ FailureOr<std::string> emitContractPtx(ContractOp contract,
                                        ScheduleTaskOp task) {
   const bool fast =
       task.getReductionOrder() == ScheduleReductionOrder::LeafOrderFree;
-  if (!isClosedRankTwoContract(contract) ||
+  FailureOr<SmallVector<int64_t>> contractDomain =
+      contractDomainShape(contract);
+  if (!isClosedProjectedContract(contract) || failed(contractDomain) ||
       task.getKind() != ScheduleTaskKind::Contract ||
-      task.getDomainShape().size() != 3 || task.getReductionAxis() != 2 ||
+      task.getDomainShape() != ArrayRef<int64_t>(*contractDomain) ||
+      task.getReductionAxis() !=
+          static_cast<int64_t>(task.getDomainShape().size()) - 1 ||
       (!fast && task.getReductionOrder() !=
                     ScheduleReductionOrder::SerialAscendingFmaRnF32) ||
       task.getInputBuffers().size() != 2 ||
       task.getOutputBuffers().size() != 1 || task.getScratchBytes() != 0) {
     return failure();
   }
-  const int64_t rows = task.getDomainShape()[0];
-  const int64_t columns = task.getDomainShape()[1];
-  const int64_t reduction = task.getDomainShape()[2];
-  if (rows > std::numeric_limits<int64_t>::max() / columns) {
+  FailureOr<int64_t> outputCount =
+      scheduleElementCount(task.getDomainShape().drop_back());
+  if (failed(outputCount) || *outputCount > UINT32_MAX) {
     return failure();
   }
-  const int64_t outputs = rows * columns;
-  if (outputs > UINT32_MAX) {
-    return failure();
-  }
+  const int64_t outputs = *outputCount;
+  const int64_t reduction = task.getDomainShape().back();
   AffineMap lhsMap =
       cast<AffineMapAttr>(contract.getIndexingMaps()[0]).getValue();
   AffineMap rhsMap =
@@ -4632,7 +4647,8 @@ FailureOr<std::string> emitContractPtx(ContractOp contract,
     auto result = cast<RankedTensorType>(contract.getResult(0).getType());
     FailureOr<SmallVector<int64_t>> coordinates =
         emitOutputCoordinates(ptx, result);
-    if (failed(coordinates) || coordinates->size() != 2) {
+    if (failed(coordinates) ||
+        coordinates->size() + 1 != task.getDomainShape().size()) {
       return failure();
     }
     int64_t accumulator = ptx.nextF32();
@@ -4648,8 +4664,8 @@ FailureOr<std::string> emitContractPtx(ContractOp contract,
                << ";\n"
                   "  @%p1 bra $contract_fast_reduce;\n"
                   "";
-    SmallVector<int64_t> domainCoordinates{(*coordinates)[0], (*coordinates)[1],
-                                           reductionCoordinate};
+    SmallVector<int64_t> domainCoordinates(*coordinates);
+    domainCoordinates.push_back(reductionCoordinate);
     FailureOr<int64_t> lhs =
         emitMapInput(ptx, 0, lhsType, lhsMap, domainCoordinates);
     FailureOr<int64_t> rhs =
@@ -4707,7 +4723,8 @@ FailureOr<std::string> emitContractPtx(ContractOp contract,
   auto result = cast<RankedTensorType>(contract.getResult(0).getType());
   FailureOr<SmallVector<int64_t>> coordinates =
       emitOutputCoordinates(ptx, result);
-  if (failed(coordinates) || coordinates->size() != 2) {
+  if (failed(coordinates) ||
+      coordinates->size() + 1 != task.getDomainShape().size()) {
     return failure();
   }
   int64_t accumulator = ptx.nextF32();
@@ -4720,8 +4737,8 @@ FailureOr<std::string> emitContractPtx(ContractOp contract,
              << reductionCoordinate << ", " << reduction
              << ";\n  @%p1 bra $contract_done;\n"
                 "";
-  SmallVector<int64_t> domainCoordinates{(*coordinates)[0], (*coordinates)[1],
-                                         reductionCoordinate};
+  SmallVector<int64_t> domainCoordinates(*coordinates);
+  domainCoordinates.push_back(reductionCoordinate);
   FailureOr<int64_t> lhs =
       emitMapInput(ptx, 0, lhsType, lhsMap, domainCoordinates);
   FailureOr<int64_t> rhs =
@@ -6095,7 +6112,7 @@ FailureOr<PreparedGpuCall> prepareGpuCall(ModuleOp module, RegionOp region,
   auto closedExternalType = [](Value value) {
     auto tensor = dyn_cast<RankedTensorType>(value.getType());
     return tensor && tensor.hasStaticShape() && tensor.getRank() >= 1 &&
-           tensor.getRank() <= 2 && tensor.getElementType().isBF16();
+           tensor.getRank() <= 8 && tensor.getElementType().isBF16();
   };
   if (!llvm::all_of(region.getInputs(), closedExternalType) ||
       !llvm::all_of(region.getResults(), closedExternalType))
@@ -6585,7 +6602,7 @@ void registerShuttleStablehloPipelines() {
             commandLinePipelineOptions(NumericalPolicy::SourceOrdered);
         options.executionMode = ExecutionMode::CpuExecutableBundle;
         options.canonicalOptions =
-            R"json({"execution_mode":"cpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":15,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+            R"json({"execution_mode":"cpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":16,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
         buildShuttleStablehloPipeline(manager, options);
       });
   PassPipelineRegistration<>(
@@ -6596,7 +6613,7 @@ void registerShuttleStablehloPipelines() {
             commandLinePipelineOptions(NumericalPolicy::Fast);
         options.executionMode = ExecutionMode::CpuExecutableBundle;
         options.canonicalOptions =
-            R"json({"execution_mode":"cpu_executable_bundle","numerics":"fast","pipeline_abi_version":15,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+            R"json({"execution_mode":"cpu_executable_bundle","numerics":"fast","pipeline_abi_version":16,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
         buildShuttleStablehloPipeline(manager, options);
       });
   PassPipelineRegistration<>(
@@ -6608,7 +6625,7 @@ void registerShuttleStablehloPipelines() {
             commandLinePipelineOptions(NumericalPolicy::SourceOrdered);
         options.executionMode = ExecutionMode::GpuExecutableBundle;
         options.canonicalOptions =
-            R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":15,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+            R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":16,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
         buildShuttleStablehloPipeline(manager, options);
       });
   PassPipelineRegistration<>(
@@ -6619,7 +6636,7 @@ void registerShuttleStablehloPipelines() {
             commandLinePipelineOptions(NumericalPolicy::Fast);
         options.executionMode = ExecutionMode::GpuExecutableBundle;
         options.canonicalOptions =
-            R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":15,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+            R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":16,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
         buildShuttleStablehloPipeline(manager, options);
       });
 }

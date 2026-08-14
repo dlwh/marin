@@ -718,6 +718,53 @@ std::string materializationPlanFingerprint(MaterializationPlanOp plan) {
   return llvm::toHex(digest.final(), true);
 }
 
+SmallVector<unsigned> projectedDomainMasks(RankedTensorType type,
+                                           ArrayRef<int64_t> domain,
+                                           unsigned reductionAxis) {
+  SmallVector<unsigned> masks{0};
+  for (int64_t extent : type.getShape()) {
+    llvm::SmallDenseSet<unsigned> next;
+    for (unsigned mask : masks) {
+      for (auto [axis, domainExtent] : llvm::enumerate(domain)) {
+        const unsigned bit = 1u << axis;
+        if ((mask & bit) == 0 && extent == domainExtent) {
+          next.insert(mask | bit);
+        }
+      }
+    }
+    masks.assign(next.begin(), next.end());
+  }
+  llvm::erase_if(masks, [reductionAxis](unsigned mask) {
+    return (mask & (1u << reductionAxis)) == 0;
+  });
+  return masks;
+}
+
+bool inputShapesBindContractDomain(RankedTensorType lhs, RankedTensorType rhs,
+                                   ArrayRef<int64_t> domain) {
+  if (domain.size() < 3 || domain.size() > 9 || lhs.getRank() < 2 ||
+      rhs.getRank() < 2 || lhs.getRank() > 8 || rhs.getRank() > 8) {
+    return false;
+  }
+  const unsigned reductionAxis = domain.size() - 1;
+  SmallVector<unsigned> lhsMasks =
+      projectedDomainMasks(lhs, domain, reductionAxis);
+  SmallVector<unsigned> rhsMasks =
+      projectedDomainMasks(rhs, domain, reductionAxis);
+  const unsigned fullMask = (1u << domain.size()) - 1;
+  return llvm::any_of(lhsMasks, [&](unsigned lhsMask) {
+    return llvm::any_of(rhsMasks, [&](unsigned rhsMask) {
+      return (lhsMask | rhsMask) == fullMask;
+    });
+  });
+}
+
+StringRef cardinalName(size_t value) {
+  constexpr StringLiteral names[] = {"zero", "one", "two",   "three", "four",
+                                     "five", "six", "seven", "eight"};
+  return value < 9 ? StringRef(names[value]) : StringRef{};
+}
+
 LogicalResult MaterializationPlanOp::verifyRegions() {
   if (!getOperation()->getDiscardableAttrs().empty()) {
     return emitOpError("does not permit discardable attributes");
@@ -898,13 +945,16 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
       }
     } else if (task.getKind() == MaterializationTaskKind::Contract) {
       ++contractCount;
-      if (task.getReductionDimensions() != ArrayRef<int64_t>({2}) ||
-          task.getOrderFree() || task.getDomainShape().size() != 3 ||
-          task.getInputBuffers().size() != 2 ||
+      ArrayRef<int64_t> domain = task.getDomainShape();
+      const int64_t reductionAxis = domain.size() - 1;
+      if (domain.size() < 3 || domain.size() > 9 ||
+          task.getReductionDimensions() != ArrayRef<int64_t>({reductionAxis}) ||
+          task.getOrderFree() || task.getInputBuffers().size() != 2 ||
           task.getOutputBuffers().size() != 1) {
-        return task.emitOpError(
-            "Contract tasks require rank-three domain, reduction dimension "
-            "two, two inputs, and one output");
+        return task.emitOpError()
+               << "Contract tasks require rank-three through rank-nine "
+                  "domain, final reduction dimension, two inputs, and one "
+                  "output";
       }
       auto lhs = cast<RankedTensorType>(
           buffers[task.getInputBuffers()[0]].getTensorType());
@@ -912,25 +962,18 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
           buffers[task.getInputBuffers()[1]].getTensorType());
       auto result = cast<RankedTensorType>(
           buffers[task.getOutputBuffers()[0]].getTensorType());
-      ArrayRef<int64_t> domain = task.getDomainShape();
-      auto matchesInputShape = [&](RankedTensorType type,
-                                   int64_t parallelAxis) {
-        return type.getShape() ==
-                   ArrayRef<int64_t>({domain[parallelAxis], domain[2]}) ||
-               type.getShape() ==
-                   ArrayRef<int64_t>({domain[2], domain[parallelAxis]});
-      };
-      const bool inputsBindDistinctParallelAxes =
-          (matchesInputShape(lhs, 0) && matchesInputShape(rhs, 1)) ||
-          (matchesInputShape(lhs, 1) && matchesInputShape(rhs, 0));
-      if (lhs.getRank() != 2 || rhs.getRank() != 2 || result.getRank() != 2 ||
+      ArrayRef<int64_t> expectedResultShape = domain.drop_back();
+      if (result.getRank() < 2 || result.getRank() > 8 ||
           lhs.getElementType() != rhs.getElementType() ||
           (!lhs.getElementType().isBF16() && !lhs.getElementType().isF32()) ||
-          !result.getElementType().isF32() || !inputsBindDistinctParallelAxes ||
-          result.getShape() != ArrayRef<int64_t>({domain[0], domain[1]})) {
-        return task.emitOpError(
-            "Contract buffers must bind two distinct parallel axes and one "
-            "reduction axis with equal bf16 or f32 input types");
+          !result.getElementType().isF32() ||
+          !inputShapesBindContractDomain(lhs, rhs, domain) ||
+          result.getShape() != expectedResultShape) {
+        return task.emitOpError()
+               << "Contract buffers must bind "
+               << cardinalName(domain.size() - 1)
+               << " distinct parallel axes and one reduction axis with "
+                  "equal bf16 or f32 input types";
       }
     } else {
       if (!task.getReductionDimensions().empty() || task.getOrderFree()) {
@@ -1066,30 +1109,32 @@ FailureOr<Simt32Geometry> simt32Geometry(ScheduleTaskKind kind,
                           std::nullopt};
   }
   if (kind == ScheduleTaskKind::Contract) {
-    if (domain.size() != 3 || domain[0] <= 0 || domain[1] <= 0 ||
-        domain[2] <= 0 ||
-        domain[0] > std::numeric_limits<int64_t>::max() / domain[1]) {
+    if (domain.size() < 3 || domain.size() > 9) {
       return failure();
     }
-    const int64_t outputs = domain[0] * domain[1];
+    FailureOr<int64_t> outputs = staticElementCount(domain.drop_back());
+    if (failed(outputs) || *outputs > UINT32_MAX || domain.back() <= 0) {
+      return failure();
+    }
+    const int64_t reductionAxis = domain.size() - 1;
     if (policy == NumericalPolicy::Fast) {
-      const int64_t outputsPerBlock = std::min<int64_t>(outputs, 8);
-      return Simt32Geometry{{ceilDivPositive(outputs, outputsPerBlock)},
+      const int64_t outputsPerBlock = std::min<int64_t>(*outputs, 8);
+      return Simt32Geometry{{ceilDivPositive(*outputs, outputsPerBlock)},
                             {outputsPerBlock},
-                            ceilDivPositive(domain[2], kSubgroup),
+                            ceilDivPositive(domain.back(), kSubgroup),
                             outputsPerBlock * kSubgroup,
                             kSubgroup,
                             0,
-                            2};
+                            reductionAxis};
     }
-    const int64_t tile = std::min(outputs, kMaxThreads);
-    return Simt32Geometry{{ceilDivPositive(outputs, tile)},
+    const int64_t tile = std::min(*outputs, kMaxThreads);
+    return Simt32Geometry{{ceilDivPositive(*outputs, tile)},
                           {tile},
-                          domain[2],
+                          domain.back(),
                           roundUpToSubgroup(tile),
                           kSubgroup,
                           0,
-                          2};
+                          reductionAxis};
   }
   if (domain.size() != 2 || domain[0] <= 0 || domain[1] <= 0) {
     return failure();

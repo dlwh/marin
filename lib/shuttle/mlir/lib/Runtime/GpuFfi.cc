@@ -75,7 +75,7 @@ absl::Status projectBindings(ArrayRef<GpuExternalBinding> bindings,
     auto type = dyn_cast<RankedTensorType>(binding.tensorType);
     int64_t elements = 1;
     if (!type || !type.getElementType().isBF16() || !type.hasStaticShape() ||
-        type.getRank() < 1 || type.getRank() > 2 || binding.slotOrdinal < 0 ||
+        type.getRank() < 1 || type.getRank() > 8 || binding.slotOrdinal < 0 ||
         !slots.insert(binding.slotOrdinal).second || binding.alignment != 2)
       return invalid("GPU executable external projection type is invalid");
     for (int64_t extent : type.getShape()) {
