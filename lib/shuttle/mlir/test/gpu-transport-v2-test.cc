@@ -616,16 +616,16 @@ std::optional<std::string> fixtureSource(llvm::StringRef filename) {
   return source.str();
 }
 
-std::string contractMapModule(int64_t rows, int64_t reduction,
-                              int64_t columns, llvm::StringRef moduleSymbol,
+std::string contractMapModule(int64_t rows, int64_t reduction, int64_t columns,
+                              llvm::StringRef moduleSymbol,
                               llvm::StringRef precision = "DEFAULT",
                               bool convertToBf16 = true) {
   std::string source;
   llvm::raw_string_ostream stream(source);
   stream << "module @" << moduleSymbol << " {\n"
-         << "  func.func public @main(%lhs: tensor<" << rows << "x"
-         << reduction << "xbf16>, %rhs: tensor<" << reduction << "x"
-         << columns << "xbf16>) -> tensor<" << rows << "x" << columns
+         << "  func.func public @main(%lhs: tensor<" << rows << "x" << reduction
+         << "xbf16>, %rhs: tensor<" << reduction << "x" << columns
+         << "xbf16>) -> tensor<" << rows << "x" << columns
          << (convertToBf16 ? "xbf16" : "xf32") << "> {\n"
          << "    %contract = stablehlo.dot_general %lhs, %rhs, "
             "contracting_dims = [1] x [0], precision = ["
@@ -634,8 +634,8 @@ std::string contractMapModule(int64_t rows, int64_t reduction,
          << "xbf16>) -> tensor<" << rows << "x" << columns << "xf32>\n";
   if (convertToBf16) {
     stream << "    %result = stablehlo.convert %contract : (tensor<" << rows
-           << "x" << columns << "xf32>) -> tensor<" << rows << "x"
-           << columns << "xbf16>\n"
+           << "x" << columns << "xf32>) -> tensor<" << rows << "x" << columns
+           << "xbf16>\n"
            << "    return %result : tensor<" << rows << "x" << columns
            << "xbf16>\n";
   } else {
@@ -1035,8 +1035,8 @@ TEST(GpuTransportV2Test,
     SCOPED_TRACE(testing::Message()
                  << "M=" << shape.rows << " K=" << shape.reduction
                  << " N=" << shape.columns);
-    auto built = buildFixture(contractMapModule(
-        shape.rows, shape.reduction, shape.columns, "anonymous"));
+    auto built = buildFixture(contractMapModule(shape.rows, shape.reduction,
+                                                shape.columns, "anonymous"));
     ASSERT_TRUE(built);
     auto bytes = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
     ASSERT_TRUE(mlir::succeeded(bytes));
@@ -1054,16 +1054,12 @@ TEST(GpuTransportV2Test,
     EXPECT_EQ(independent->temporaryBytes,
               static_cast<uint64_t>(shape.rows * shape.columns * 4));
     EXPECT_EQ(independent->launches[0].inputSlots,
-              (llvm::SmallVector<int64_t>{0, 1}));
-    EXPECT_EQ(independent->launches[0].outputSlots,
-              (llvm::SmallVector<int64_t>{2}));
+              (std::vector<int64_t>{0, 1}));
+    EXPECT_EQ(independent->launches[0].outputSlots, (std::vector<int64_t>{2}));
     EXPECT_TRUE(independent->launches[0].dependencies.empty());
-    EXPECT_EQ(independent->launches[1].inputSlots,
-              (llvm::SmallVector<int64_t>{2}));
-    EXPECT_EQ(independent->launches[1].outputSlots,
-              (llvm::SmallVector<int64_t>{3}));
-    EXPECT_EQ(independent->launches[1].dependencies,
-              (llvm::SmallVector<int64_t>{0}));
+    EXPECT_EQ(independent->launches[1].inputSlots, (std::vector<int64_t>{2}));
+    EXPECT_EQ(independent->launches[1].outputSlots, (std::vector<int64_t>{3}));
+    EXPECT_EQ(independent->launches[1].dependencies, (std::vector<int64_t>{0}));
     const uint64_t outputElements = shape.rows * shape.columns;
     const uint64_t workgroupThreads =
         std::min<uint64_t>(256, ((outputElements + 31) / 32) * 32);
@@ -1103,10 +1099,9 @@ TEST(GpuTransportV2Test,
                                      contractLaunch.codeOffset),
       contractLaunch.codeLength);
   const auto &mapLaunch = decoded->launches[1];
-  llvm::StringRef mapPtx(
-      reinterpret_cast<const char *>(decoded->code.data() +
-                                     mapLaunch.codeOffset),
-      mapLaunch.codeLength);
+  llvm::StringRef mapPtx(reinterpret_cast<const char *>(decoded->code.data() +
+                                                        mapLaunch.codeOffset),
+                         mapLaunch.codeLength);
   size_t zero = contractPtx.find("0f00000000");
   size_t fma = contractPtx.find("fma.rn.f32");
   size_t increment = contractPtx.find("add.u64", fma);
@@ -1124,8 +1119,7 @@ TEST(GpuTransportV2Test,
   EXPECT_LT(fma, increment);
   ASSERT_NE(branch, llvm::StringRef::npos);
   EXPECT_LT(increment, branch);
-  EXPECT_EQ(contractPtx.find("fma.rn.f32", fma + 1),
-            llvm::StringRef::npos);
+  EXPECT_EQ(contractPtx.find("fma.rn.f32", fma + 1), llvm::StringRef::npos);
   EXPECT_FALSE(contractPtx.contains("mul.rn.f32"));
   EXPECT_TRUE(mapPtx.contains("cvt.rn.bf16.f32"));
   EXPECT_FALSE(mapPtx.contains("fma.rn.f32"));
@@ -1182,11 +1176,10 @@ module @f32_inputs {
   }
 }
 )mlir";
-  EXPECT_FALSE(buildFixture(contractMapModule(
-      3, 5, 2, "fast", "DEFAULT", true),
+  EXPECT_FALSE(buildFixture(contractMapModule(3, 5, 2, "fast", "DEFAULT", true),
                             mlir::shuttle::NumericalPolicy::Fast));
-  EXPECT_FALSE(buildFixture(
-      contractMapModule(3, 5, 2, "high_precision", "HIGH", true)));
+  EXPECT_FALSE(
+      buildFixture(contractMapModule(3, 5, 2, "high_precision", "HIGH", true)));
   EXPECT_FALSE(buildFixture(
       contractMapModule(3, 5, 2, "external_f32", "DEFAULT", false)));
   EXPECT_FALSE(buildFixture(batched));
