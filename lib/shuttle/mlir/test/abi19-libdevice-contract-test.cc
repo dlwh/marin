@@ -11,6 +11,8 @@
 #include <vector>
 
 #include "gtest/gtest.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -87,10 +89,42 @@ buildAbi19Exp(llvm::StringRef source,
   return result;
 }
 
-std::vector<std::string> ptxSlices(mlir::ModuleOp module) {
-  std::vector<std::string> slices;
+using TaggedPtx = std::pair<std::string, bool>;
+
+std::vector<TaggedPtx> ptxSlices(mlir::ModuleOp module) {
+  llvm::DenseSet<mlir::Attribute> exponentialSources;
+  module.walk([&](mlir::shuttle::MapOp map) {
+    bool hasExponential = false;
+    map.walk([&](mlir::math::ExpOp) { hasExponential = true; });
+    if (hasExponential)
+      exponentialSources.insert(map.getSource());
+  });
+
+  std::vector<TaggedPtx> slices;
   for (mlir::shuttle::DeviceModuleOp device :
        module.getOps<mlir::shuttle::DeviceModuleOp>()) {
+    mlir::shuttle::SchedulePlanOp schedule;
+    for (mlir::shuttle::SchedulePlanOp candidate :
+         module.getOps<mlir::shuttle::SchedulePlanOp>()) {
+      if (candidate.getFingerprint() == device.getSourceScheduleFingerprint())
+        schedule = candidate;
+    }
+    if (!schedule)
+      return {};
+    mlir::shuttle::MaterializationPlanOp materialization;
+    for (mlir::shuttle::MaterializationPlanOp candidate :
+         module.getOps<mlir::shuttle::MaterializationPlanOp>()) {
+      if (candidate.getFingerprint() == schedule.getSourcePlanFingerprint())
+        materialization = candidate;
+    }
+    if (!materialization)
+      return {};
+    llvm::SmallVector<mlir::shuttle::ScheduleTaskOp> scheduleTasks(
+        schedule.getBody().front().getOps<mlir::shuttle::ScheduleTaskOp>());
+    llvm::SmallVector<mlir::shuttle::MaterializationTaskOp>
+        materializationTasks(
+            materialization.getBody().front().getOps<
+                mlir::shuttle::MaterializationTaskOp>());
     llvm::ArrayRef<int8_t> code = device.getCode();
     for (mlir::shuttle::DeviceEntryOp entry :
          device.getBody().front().getOps<mlir::shuttle::DeviceEntryOp>()) {
@@ -100,8 +134,23 @@ std::vector<std::string> ptxSlices(mlir::ModuleOp module) {
           static_cast<uint64_t>(offset) > code.size() ||
           static_cast<uint64_t>(length) > code.size() - offset)
         return {};
-      slices.emplace_back(reinterpret_cast<const char *>(code.data() + offset),
-                          length);
+      const int64_t scheduleOrdinal = entry.getSourceTask();
+      if (scheduleOrdinal < 0 ||
+          scheduleOrdinal >= static_cast<int64_t>(scheduleTasks.size()))
+        return {};
+      const int64_t materializationOrdinal =
+          scheduleTasks[scheduleOrdinal].getSourceTask();
+      if (materializationOrdinal < 0 ||
+          materializationOrdinal >=
+              static_cast<int64_t>(materializationTasks.size()))
+        return {};
+      const bool isExponential =
+          exponentialSources.count(
+              materializationTasks[materializationOrdinal].getSource()) != 0;
+      slices.emplace_back(
+          std::string(reinterpret_cast<const char *>(code.data() + offset),
+                      length),
+          isExponential);
     }
   }
   return slices;
@@ -184,13 +233,28 @@ std::optional<std::string> firstOperand(llvm::StringRef instruction) {
 }
 
 testing::AssertionResult hasExpResultStoreDataflow(llvm::StringRef ptx) {
-  const size_t call = ptx.find("call.uni (");
-  if (call == llvm::StringRef::npos)
+  const size_t entry = ptx.find(".visible .entry shuttle_entry(");
+  if (entry == llvm::StringRef::npos)
+    return testing::AssertionFailure() << "missing Shuttle entry";
+  size_t call = entry;
+  size_t suffix = llvm::StringRef::npos;
+  while ((call = ptx.find("call", call)) != llvm::StringRef::npos) {
+    suffix = call + 4;
+    if (ptx.substr(suffix).starts_with(".uni"))
+      suffix += 4;
+    auto target = functionName(ptx, suffix);
+    if (target && *target == "__nv_expf")
+      break;
+    call = suffix;
+  }
+  if (call == llvm::StringRef::npos || suffix == llvm::StringRef::npos)
     return testing::AssertionFailure() << "missing __nv_expf return call";
-  const size_t returnStart = call + llvm::StringRef("call.uni (").size();
+  const size_t returnOpen = ptx.find('(', suffix);
+  if (returnOpen == llvm::StringRef::npos)
+    return testing::AssertionFailure() << "missing __nv_expf return call";
+  const size_t returnStart = returnOpen + 1;
   const size_t returnEnd = ptx.find(')', returnStart);
-  if (returnEnd == llvm::StringRef::npos ||
-      !ptx.substr(returnEnd).starts_with("), __nv_expf,"))
+  if (returnEnd == llvm::StringRef::npos)
     return testing::AssertionFailure() << "missing __nv_expf return call";
   const std::string returned = ptx.slice(returnStart, returnEnd).trim().str();
 
@@ -229,7 +293,7 @@ testing::AssertionResult hasExpResultStoreDataflow(llvm::StringRef ptx) {
   return testing::AssertionSuccess();
 }
 
-testing::AssertionResult isClosedDefaultExpPtx(llvm::StringRef ptx) {
+testing::AssertionResult isClosedPtx(llvm::StringRef ptx) {
   if (!ptx.starts_with(
           ".version 8.0\n.target sm_90\n.address_size 64\n"))
     return testing::AssertionFailure() << "wrong PTX target preamble";
@@ -241,12 +305,19 @@ testing::AssertionResult isClosedDefaultExpPtx(llvm::StringRef ptx) {
     return testing::AssertionFailure() << "flush-to-zero instruction";
   if (!ptx.contains(".visible .entry shuttle_entry("))
     return testing::AssertionFailure() << "missing Shuttle entry";
-  const std::set<std::string> definitions = definedFunctions(ptx);
-  if (definitions.find("__nv_expf") == definitions.end())
-    return testing::AssertionFailure() << "missing linked __nv_expf definition";
   testing::AssertionResult closedCalls = hasClosedCalls(ptx);
   if (!closedCalls)
     return closedCalls;
+  return testing::AssertionSuccess();
+}
+
+testing::AssertionResult isClosedDefaultExpPtx(llvm::StringRef ptx) {
+  testing::AssertionResult closed = isClosedPtx(ptx);
+  if (!closed)
+    return closed;
+  const std::set<std::string> definitions = definedFunctions(ptx);
+  if (definitions.find("__nv_expf") == definitions.end())
+    return testing::AssertionFailure() << "missing linked __nv_expf definition";
   testing::AssertionResult expDataflow = hasExpResultStoreDataflow(ptx);
   if (!expDataflow)
     return expDataflow;
@@ -329,8 +400,9 @@ TEST(Abi19LibdeviceContractTest, ClosedPtxOracleRejectsSemanticMutations) {
   EXPECT_FALSE(isClosedDefaultExpPtx(replaceOnce(
       ptx, "call.uni (__exp_return), __nv_expf, (__exp_input);",
       "call.uni (__exp_return), __shuttle_missing, (__exp_input);")));
-  EXPECT_FALSE(isClosedDefaultExpPtx(
-      replaceOnce(ptx, "__nv_expf", "__nv_fast_expf")));
+  EXPECT_FALSE(isClosedDefaultExpPtx(replaceOnce(
+      ptx, ".visible .entry shuttle_entry()",
+      ".func __nv_fast_expf() { ret; }\n.visible .entry shuttle_entry()")));
 }
 
 TEST(Abi19LibdeviceContractTest,
@@ -345,8 +417,8 @@ TEST(Abi19LibdeviceContractTest,
         << "ABI19 remains red until the official libdevice artifact is sealed";
     auto second = buildAbi19Exp(*source, policy);
     ASSERT_TRUE(second);
-    std::vector<std::string> firstPtx = ptxSlices(*first->module);
-    std::vector<std::string> secondPtx = ptxSlices(*second->module);
+    std::vector<TaggedPtx> firstPtx = ptxSlices(*first->module);
+    std::vector<TaggedPtx> secondPtx = ptxSlices(*second->module);
     ASSERT_FALSE(firstPtx.empty());
     ASSERT_EQ(firstPtx, secondPtx);
 
@@ -357,7 +429,14 @@ TEST(Abi19LibdeviceContractTest,
     ASSERT_TRUE(renamedBuild);
     EXPECT_EQ(firstPtx, ptxSlices(*renamedBuild->module));
 
-    for (const std::string &ptx : firstPtx) {
+    int64_t exponentialEntries = 0;
+    for (const auto &[ptx, isExponential] : firstPtx) {
+      ASSERT_TRUE(isClosedPtx(ptx));
+      if (!isExponential) {
+        EXPECT_FALSE(llvm::StringRef(ptx).contains("__nv_expf"));
+        continue;
+      }
+      ++exponentialEntries;
       ASSERT_TRUE(isClosedDefaultExpPtx(ptx));
 
       EXPECT_FALSE(isClosedDefaultExpPtx(
@@ -369,6 +448,7 @@ TEST(Abi19LibdeviceContractTest,
                       ".address_size 64\n.extern .func "
                       "__shuttle_unresolved();\n")));
     }
+    EXPECT_EQ(exponentialEntries, 2);
   }
 }
 
