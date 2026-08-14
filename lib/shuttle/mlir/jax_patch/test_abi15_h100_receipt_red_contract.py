@@ -375,7 +375,6 @@ def test_task_verifier_accepts_exact_ack_and_terminal_chain() -> None:
         ("job_id", "/attacker/job"),
         ("task_id", "/attacker/job/0"),
         ("attempt_id", 1),
-        ("attempt_uid", "fedcba9876543210"),
         ("launch_request_sha256", "8" * 64),
         ("image_digest", "sha256:" + "8" * 64),
         ("bundle_sha256", "8" * 64),
@@ -402,6 +401,14 @@ def test_task_verifier_rejects_wrong_signature_domain_prefix() -> None:
     contract = _contract()
     with pytest.raises(ValueError):
         receipts.verify_ack_receipt(_signed(_ack_payload(contract), signing_domain="attacker.receipt.v1"), contract)
+
+
+def test_task_verifier_accepts_controller_minted_attempt_uid() -> None:
+    receipts = _receipt_module()
+    contract = _contract()
+    payload = _ack_payload(contract, attempt_uid="fedcba9876543210")
+
+    assert receipts.verify_ack_receipt(_signed(payload), contract)["attempt_uid"] == "fedcba9876543210"
 
 
 def test_task_verifier_uses_only_the_current_pinned_key_during_real_rotation() -> None:
