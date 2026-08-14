@@ -9,7 +9,7 @@
 // changes no 32 MiB slot, 256 MiB temporary/position, 16 KiB shared-memory,
 // 256-record, 512 KiB entry, 8 MiB code, 16 MiB transport, or rank-eight cap.
 
-// ABI18-COUNT-7: requires a bounded set of independently connected static GPU algebra regions
+// ABI18-COUNT-8: requires a bounded set of independently connected static GPU algebra regions
 // ABI17-COUNT-7: requires a bounded set of independently connected static GPU algebra regions
 // ABI17: must be statically shaped
 // ABI17-COUNT-3: requires a bounded set of independently connected static GPU algebra regions

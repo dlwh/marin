@@ -70,6 +70,24 @@ module @map_only {
 
 // -----
 
+// A Fold elsewhere in the connected region does not drive an expansion from
+// an independent public singleton operand.
+module @connected_unrelated_fold {
+  func.func public @main(%x: tensor<2x7x19xbf16>, %singleton: tensor<2x7x1xbf16>) -> tensor<2x7x19xbf16> {
+    %f = stablehlo.convert %x : (tensor<2x7x19xbf16>) -> tensor<2x7x19xf32>
+    %singleton_f32 = stablehlo.convert %singleton : (tensor<2x7x1xbf16>) -> tensor<2x7x1xf32>
+    %z = stablehlo.constant dense<0.0> : tensor<f32>
+    %r = stablehlo.reduce(%f init: %z) applies stablehlo.add across dimensions = [2] : (tensor<2x7x19xf32>, tensor<f32>) -> tensor<2x7xf32>
+    %p = stablehlo.broadcast_in_dim %r, dims = [0, 1] : (tensor<2x7xf32>) -> tensor<2x7x19xf32>
+    %b = stablehlo.broadcast_in_dim %singleton_f32, dims = [0, 1, 2] : (tensor<2x7x1xf32>) -> tensor<2x7x19xf32>
+    %m = stablehlo.multiply %p, %b : tensor<2x7x19xf32>
+    %o = stablehlo.convert %m : (tensor<2x7x19xf32>) -> tensor<2x7x19xbf16>
+    return %o : tensor<2x7x19xbf16>
+  }
+}
+
+// -----
+
 // Contract and rank-N Fold remain separate closed region families.
 module @mixed_contract_fold {
   func.func public @main(%lhs: tensor<2x7x5xbf16>, %rhs: tensor<2x5x19xbf16>) -> tensor<2x7x19xbf16> {
