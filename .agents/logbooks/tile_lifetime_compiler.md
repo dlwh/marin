@@ -5061,13 +5061,16 @@ author: dlwh
   implicit DEFAULT accuracy request, deterministic and renamed-symbol PTX,
   target preamble, fast-symbol exclusion, FTZ exclusion, and unresolved-call
   exclusion for both policies.
-- Exact test-only commit `7d152711f77fb30ebde9f737bf150db398591601`,
-  tree `25208f740a60edfd9593c2ca11d746dde4cd80cb`, is based on
+- Exact initial test-only commit
+  `7d152711f7a4502f7abc9bc9f87fc9d611a2e27d`, tree
+  `25208f740a60edfd9593c2ca11d746dde4cd80cb`, and independent-review repair
+  `77edf150bd5e7d43e48cfb37352307b134674e15`, tree
+  `90af5dd9afc7e6b153ae854ed6a56db59c9d5c2c`, are based on
   `f7afc3ee7a7d22273230695fb935fdac7abc3212`. The focused Python census is
-  37 pass and six intended ABI19 rotation failures. Full Shuttle Python is
-  85/91: five intended ABI19 rotation failures and the unchanged accepted-base
+  38 pass and six intended ABI19 rotation failures. Full Shuttle Python is
+  86/92: five intended ABI19 rotation failures and the unchanged accepted-base
   evaluation-manifest hash failure. The native target compiles and links; its
-  structural DEFAULT-accuracy test passes and its lowering test fails exactly
+  three structural and mutation tests pass and its lowering test fails exactly
   at exponential Map PTX emission. Changed-files precommit passes offline.
 - No NVIDIA artifact was downloaded, unpacked, linked, or executed. No
   production compiler, runtime schema, cap, hardware, image, upload, network,
