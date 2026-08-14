@@ -9,6 +9,7 @@
 // RUN: diff %t.original %t.renamed
 // RUN: not shuttle-test-opt %S/Inputs/abi12-bf16-contract-map-sweep.mlir --split-input-file --shuttle-gpu-executable-bundle-fast-pipeline 2>&1 | FileCheck %s --check-prefix=FAST
 // RUN: not shuttle-test-opt %S/Inputs/abi12-bf16-contract-map-sweep.mlir --split-input-file --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-plan-row-fold-materialization --shuttle-test-delete-materialization-task --shuttle-verify-materialization-plan 2>&1 | FileCheck %s --check-prefix=MATERIALIZATION-MUTATION
+// RUN: not shuttle-test-opt %S/Inputs/abi12-bf16-contract-map-sweep.mlir --split-input-file --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-plan-row-fold-materialization --shuttle-test-mutate-contract-materialization-shape --shuttle-verify-materialization-plan 2>&1 | FileCheck %s --check-prefix=MATERIALIZATION-SHAPE
 // RUN: not shuttle-test-opt %S/Inputs/abi12-bf16-contract-map-sweep.mlir --split-input-file --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-plan-row-fold-materialization --shuttle-plan-simt32-row-fold-schedule --shuttle-test-mutate-schedule-dependency --shuttle-verify-simt32-row-fold-schedule 2>&1 | FileCheck %s --check-prefix=SCHEDULE-DEPENDENCY
 // RUN: not shuttle-test-opt %S/Inputs/abi12-bf16-contract-map-sweep.mlir --split-input-file --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-plan-row-fold-materialization --shuttle-plan-simt32-row-fold-schedule --shuttle-test-mutate-schedule-order --shuttle-verify-simt32-row-fold-schedule 2>&1 | FileCheck %s --check-prefix=SCHEDULE-ORDER
 
@@ -57,5 +58,6 @@
 
 // FAST: ABI12 GPU Contract requires source_ordered numerics
 // MATERIALIZATION-MUTATION: producer is outside the task range
+// MATERIALIZATION-SHAPE: Contract buffers must equal the bound MxK, KxN, and MxN shapes
 // SCHEDULE-DEPENDENCY: schedule dependencies must equal the materialization task
 // SCHEDULE-ORDER: Contract reduction order must equal serial ascending fma.rn.f32 semantics

@@ -1260,6 +1260,36 @@ public:
   }
 };
 
+class MaterializationContractShapePass
+    : public MutationPass<MaterializationContractShapePass> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(MaterializationContractShapePass)
+  StringRef getArgument() const final {
+    return "shuttle-test-mutate-contract-materialization-shape";
+  }
+  void runOnOperation() override {
+    MaterializationPlanOp plan = materializationPlan(getOperation());
+    if (plan) {
+      for (MaterializationTaskOp task :
+           plan.getBody().front().getOps<MaterializationTaskOp>()) {
+        if (task.getKind() != MaterializationTaskKind::Contract ||
+            task.getDomainShape().size() != 3) {
+          continue;
+        }
+        SmallVector<int64_t> domain(task.getDomainShape().begin(),
+                                    task.getDomainShape().end());
+        ++domain[0];
+        task->setAttr("domain_shape",
+                      DenseI64ArrayAttr::get(task.getContext(), domain));
+        refreshMaterializationFingerprint(plan);
+        return;
+      }
+    }
+    getOperation().emitError("test fixture has no Contract materialization task");
+    signalPassFailure();
+  }
+};
+
 class ReportScheduleFingerprintPass
     : public MutationPass<ReportScheduleFingerprintPass> {
 public:
@@ -1902,6 +1932,7 @@ void registerMutationPasses() {
   PassRegistration<MaterializationReplaySourcePass>();
   PassRegistration<MaterializationDuplicateAlgebraSourcePass>();
   PassRegistration<MaterializationSwapSameTypeEdgesPass>();
+  PassRegistration<MaterializationContractShapePass>();
   PassRegistration<MaterializationDomainPass<true>>();
   PassRegistration<MaterializationDomainPass<false>>();
   PassRegistration<MaterializationUnknownAttributePass>();

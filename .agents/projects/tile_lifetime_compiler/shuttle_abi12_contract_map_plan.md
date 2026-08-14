@@ -68,14 +68,16 @@ projection, slot, launch, and lifecycle contracts are unchanged.
    ascending `K` loop, `K`-derived LHS/RHS addresses, `fma.rn.f32`, unit
    induction, and backedge. A recurrence permutation must fail the test.
 4. Public serialization and an independent decoder agree on all roots, slots,
-   bindings, code slices, launch geometry, and dependencies. Rehashed slot,
-   code, root, and future-produced-input mutations fail closed.
+   bindings, code slices, launch geometry, and dependencies. Rehashed
+   launch-geometry and future-produced-input mutations fail closed; direct code
+   or root corruption breaks the integrity seal. The loader does not claim
+   semantic validation of a fully recomputed self-consistent PTX rewrite.
 5. The existing fake pinned-XLA lifecycle loads and launches both entries from
    decoded state; malformed projection, allocation, load, and launch behavior
    propagates failure.
 6. Mutations reject FAST Contract, batching, multiple contracting dimensions,
    HIGH precision, FP32 external boundaries, live FP32 output, non-default
-   tuning one field at a time, wrong schedule order, and schema crossing.
+   tuning one field at a time, and wrong schedule order.
 7. Historical schema-1 Map/Fold SOURCE_ORDERED and FAST gates remain green.
 
 ## Evidence boundary
