@@ -8,9 +8,11 @@ import csv
 import hashlib
 import io
 import json
+import re
 import struct
 import zipfile
 from collections.abc import Mapping
+from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -45,7 +47,9 @@ from abi15_h100_numerics import (
     reference,
     sparse_policy_inputs,
 )
-from acceptance_contract import EVENT_FIELDS
+from acceptance_contract import EVENT_FIELDS, FixtureExpectation, ObserverIdentity
+
+from shuttle import ExecutionMode, Materialization, Numerics, Tuning, compiler_options
 
 OUTPUT_ROLES = ("primal", "lhs_cotangent", "rhs_cotangent")
 DATASETS = {"dense": dense_inputs, "sparse_policy_discriminator": sparse_policy_inputs}
@@ -55,6 +59,47 @@ SHAPES = {
     "rhs_cotangent": REDUCTION * COLUMNS,
 }
 RUNS = ("first", "sequential", "thread_0", "thread_1", "reuse")
+
+
+@lru_cache(maxsize=2)
+def _observer_contract(policy: str) -> tuple[ObserverIdentity, FixtureExpectation]:
+    tuning = Tuning(
+        tile_sizes=(),
+        cluster_shape=(),
+        pipeline_stages=1,
+        materialization=Materialization.AUTOMATIC,
+        maximum_candidates=1,
+    )
+    numerics = Numerics.SOURCE_ORDERED if policy == "source_ordered" else Numerics.FAST
+    options = compiler_options(
+        execution_mode=ExecutionMode.GPU_EXECUTABLE_BUNDLE,
+        numerics=numerics,
+        tuning=tuning,
+    )
+    canonical_options = options.get("xla_shuttle_options")
+    if type(canonical_options) is not str:
+        raise ValueError("ABI15 observer options are not canonical text")
+    canonical_tuning = json.dumps(json.loads(canonical_options)["tuning"], sort_keys=True, separators=(",", ":"))
+    identity = ObserverIdentity(
+        policy=policy,
+        policy_digest=hashlib.sha256(canonical_options.encode()).hexdigest(),
+        tuning_digest=hashlib.sha256(canonical_tuning.encode()).hexdigest(),
+        canonical_options=canonical_options,
+        canonical_tuning=canonical_tuning,
+    )
+    contract = load_contract()
+    expected_policy = contract.source_ordered if policy == "source_ordered" else contract.fast
+    if identity.policy_digest != expected_policy.options_sha256:
+        raise ValueError("ABI15 observer policy options differ from the immutable contract")
+    fixture = FixtureExpectation(
+        name="jax-0.10.1-bf16-matmul-vjp-33x2x34-composed",
+        complete_operations=tuple(range(12)),
+        selected_regions=((0, 1), tuple(range(2, 12))),
+        excluded_manifest="[]",
+        function_result_anchors=(1, 11, 7),
+        final_normalized_fingerprint=expected_policy.final_fingerprint,
+    )
+    return identity, fixture
 
 
 def _canonical_json(value: object) -> bytes:
@@ -166,7 +211,8 @@ def _process_report(path: Path, expected_process: str) -> ProcessReport:
         raise ValueError(f"{expected_process} report identity or cache schema drift")
     mappings = value["runtime_mappings"]
     if type(mappings) is not list or any(
-        type(item) is not dict or set(item) != {"end", "path", "role", "start"} for item in mappings
+        type(item) is not dict or set(item) != {"device", "end", "inode", "path", "role", "sha256", "start"}
+        for item in mappings
     ):
         raise ValueError(f"{expected_process} report loaded mapping schema drift")
     return ProcessReport(
@@ -179,7 +225,18 @@ def _process_report(path: Path, expected_process: str) -> ProcessReport:
         runtime_binaries=(
             tuple(sorted(value["runtime_binaries"].items())) if type(value["runtime_binaries"]) is dict else ()
         ),
-        runtime_mappings=tuple((item["role"], item["path"], item["start"], item["end"]) for item in mappings),
+        runtime_mappings=tuple(
+            (
+                item["role"],
+                item["path"],
+                item["device"],
+                item["inode"],
+                item["start"],
+                item["end"],
+                item["sha256"],
+            )
+            for item in mappings
+        ),
     )
 
 
@@ -231,53 +288,91 @@ def validate_observer_and_process_files(root: Path, roles: Mapping[str, str]) ->
         raise ValueError("cache snapshots must contain exactly two entries")
     snapshot_digests = []
     filenames = []
+    snapshot_records = []
     for record in populate_after:
         if type(record) is not dict or set(record) != {"filename", "sha256", "size"}:
             raise ValueError("cache snapshot entry uses an open schema")
-        if type(record["filename"]) is not str or type(record["size"]) is not int or record["size"] <= 0:
+        if (
+            type(record["filename"]) is not str
+            or re.fullmatch(r"jit_composed-[0-9a-f]{64}-cache", record["filename"]) is None
+            or type(record["size"]) is not int
+            or record["size"] <= 0
+            or type(record["sha256"]) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", record["sha256"]) is None
+        ):
             raise ValueError("cache snapshot filename or size drift")
         filenames.append(record["filename"])
         snapshot_digests.append(record["sha256"])
+        snapshot_records.append((record["filename"], record["size"], record["sha256"]))
     if filenames != sorted(set(filenames)):
         raise ValueError("cache snapshot filenames are duplicate or reordered")
     entry_by_policy = {
-        policy: _sha256((root / roles[f"cache_entry_{policy}"]).read_bytes()) for policy in ("fast", "source_ordered")
+        policy: (
+            (root / roles[f"cache_entry_{policy}"]).stat().st_size,
+            _sha256((root / roles[f"cache_entry_{policy}"]).read_bytes()),
+        )
+        for policy in ("fast", "source_ordered")
     }
-    if sorted(snapshot_digests) != sorted(entry_by_policy.values()) or dict(reports[1].cache_after) != entry_by_policy:
+    report_by_policy = {policy: (filename, size, digest) for policy, filename, size, digest in reports[1].cache_after}
+    if (
+        sorted(snapshot_records) != sorted(report_by_policy.values())
+        or any(report_by_policy[policy][1:] != entry_by_policy[policy] for policy in entry_by_policy)
+        or sorted(snapshot_digests) != sorted(digest for _, digest in entry_by_policy.values())
+    ):
         raise ValueError("cache snapshots, copied entries, and process attribution differ")
-    contract = load_contract()
     for policy in ("source_ordered", "fast"):
         populate_path = root / roles[f"observer_populate_{policy}"]
         records = tuple(json.loads(line) for line in populate_path.read_text().splitlines())
         if any(type(record) is not list or len(record) != len(EVENT_FIELDS) for record in records):
             raise ValueError(f"{policy} observer record schema drift")
         events = tuple(dict(zip(EVENT_FIELDS, record, strict=True)) for record in records)
+        if any(
+            type(event["invocation_id"]) is not int
+            or event["invocation_id"] <= 0
+            or type(event["phase"]) is not str
+            or type(event["policy"]) is not str
+            or type(event["policy_digest"]) is not str
+            or type(event["tuning_digest"]) is not str
+            or type(event["region_membership"]) is not str
+            or type(event["coverage_manifest"]) is not str
+            or type(event["unsupported_fingerprint"]) is not str
+            or type(event["normalized_module_fingerprint"]) is not str
+            or type(event["no_shuttle_semantics"]) is not bool
+            or type(event["failure_pass"]) is not str
+            for event in events
+        ):
+            raise ValueError(f"{policy} observer event field type drift")
         if tuple(event["phase"] for event in events) != (
             "algebra_coverage",
             "generated_bundle",
             "final_erasure",
         ):
             raise ValueError(f"{policy} observer phase order drift")
-        identity = contract.source_ordered if policy == "source_ordered" else contract.fast
-        if any(event["policy"] != policy or event["policy_digest"] != identity.options_sha256 for event in events):
+        identity, fixture = _observer_contract(policy)
+        if any(event["policy"] != policy or event["policy_digest"] != identity.policy_digest for event in events):
             raise ValueError(f"{policy} observer policy identity drift")
-        if len({event["invocation_id"] for event in events}) != 1 or any(event["failure_pass"] for event in events):
+        if len({event["invocation_id"] for event in events}) != 1 or any(
+            event["failure_pass"] != "" for event in events
+        ):
             raise ValueError(f"{policy} observer invocation or failure state drift")
-        tuning = {event["tuning_digest"] for event in events}
-        if len(tuning) != 1 or any(type(value) is not str or len(value) != 64 for value in tuning):
+        if any(event["tuning_digest"] != identity.tuning_digest for event in events):
             raise ValueError(f"{policy} observer tuning identity drift")
+        coverage_manifest = fixture.coverage_manifest(identity)
         for event in events[:2]:
             if (
-                not event["region_membership"]
-                or not event["coverage_manifest"]
-                or not event["unsupported_fingerprint"]
+                event["region_membership"] != fixture.region_membership
+                or event["coverage_manifest"] != coverage_manifest
+                or event["unsupported_fingerprint"] != fixture.unsupported_fingerprint
                 or event["no_shuttle_semantics"] is not False
             ):
                 raise ValueError(f"{policy} observer structural fields drift")
-        if events[1]["normalized_module_fingerprint"] != identity.generated_fingerprint:
+        if events[0]["normalized_module_fingerprint"] != "":
+            raise ValueError(f"{policy} algebra observer fingerprint must be empty")
+        expected_policy = load_contract().source_ordered if policy == "source_ordered" else load_contract().fast
+        if events[1]["normalized_module_fingerprint"] != expected_policy.generated_fingerprint:
             raise ValueError(f"{policy} generated fingerprint drift")
         if (
-            events[2]["normalized_module_fingerprint"] != identity.final_fingerprint
+            events[2]["normalized_module_fingerprint"] != fixture.final_normalized_fingerprint
             or events[2]["no_shuttle_semantics"] is not True
             or events[2]["region_membership"]
             or events[2]["coverage_manifest"]
@@ -314,7 +409,7 @@ def _validate_record(record: Path, suffix: str, extracted: Path, name: str) -> N
         raise ValueError(f"{name} RECORD does not bind the extracted runtime member")
 
 
-def _validate_registration_pointers(registered: object, mappings: object) -> None:
+def _validate_registration_pointers(registered: object, mappings: object, expected_plugin_sha256: str) -> None:
     if (
         type(registered) is not dict
         or set(registered) != {"api_version", "stage_pointers", "target", "traits"}
@@ -332,18 +427,29 @@ def _validate_registration_pointers(registered: object, mappings: object) -> Non
     if type(mappings) is not list or not mappings:
         raise ValueError("registration transcript lacks plugin mapping ranges")
     ranges = []
+    identities = set()
     for mapping in mappings:
-        if type(mapping) is not dict or set(mapping) != {"end", "path", "start"}:
+        if type(mapping) is not dict or set(mapping) != {"device", "end", "inode", "path", "sha256", "start"}:
             raise ValueError("registration plugin mapping uses an open schema")
         if (
             type(mapping["path"]) is not str
             or not mapping["path"].startswith("/")
+            or str(PurePosixPath(mapping["path"])) != mapping["path"]
+            or Path(mapping["path"]).name != "cuda_plugin_extension.so"
+            or type(mapping["device"]) is not str
+            or re.fullmatch(r"[0-9a-f]+:[0-9a-f]+", mapping["device"]) is None
+            or type(mapping["inode"]) is not int
+            or mapping["inode"] <= 0
+            or mapping["sha256"] != expected_plugin_sha256
             or type(mapping["start"]) is not int
             or type(mapping["end"]) is not int
             or not 0 < mapping["start"] < mapping["end"]
         ):
             raise ValueError("registration plugin mapping range drift")
+        identities.add((mapping["path"], mapping["device"], mapping["inode"], mapping["sha256"]))
         ranges.append((mapping["start"], mapping["end"]))
+    if len(identities) != 1:
+        raise ValueError("registration plugin mapping identity drift")
     if any(not any(start <= pointer < end for start, end in ranges) for pointer in pointer_values):
         raise ValueError("registration stage pointer lies outside loaded plugin mappings")
 
@@ -401,7 +507,7 @@ def validate_build_and_transport_files(
         or registration.get("upstream_target_count") != len(targets) - 1
     ):
         raise ValueError("registration transcript lacks one ABI15 v2 target")
-    _validate_registration_pointers(registration.get("registration"), registration["plugin_mappings"])
+    _validate_registration_pointers(registration.get("registration"), registration["plugin_mappings"], expected_plugin)
     _validate_wheel_member(
         root / roles["jaxlib_wheel"],
         "/_jax.so",

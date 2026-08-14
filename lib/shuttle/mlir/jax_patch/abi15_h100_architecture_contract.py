@@ -10,7 +10,7 @@ from typing import Any
 from abi15_h100_composed_contract import FIXTURE_SHA256, PRODUCTION_COMMIT, PRODUCTION_TREE, load_contract
 
 FILENAME = "abi15-h100-architecture-build-contract-v1.json"
-CONTRACT_SHA256 = "e19eca4159597140b3e24cbe6280cfc8a82f7bf0f53db6b5c66bd216b097363b"
+CONTRACT_SHA256 = "b93db1880eba19e41322780d29f14bb9b200cc7418165e8201264788f953ce72"
 STATUS = "local_unsealed_non_authoritative_architecture_build_design"
 JAX_COMMIT = "619764c15117fbefc4ba13ab941871cb514c23f6"
 JAX_TREE = "56d186bccb48075374f32e46d2e090731b66e1ea"
@@ -268,7 +268,18 @@ def load_architecture_build_contract(path: Path | None = None) -> dict[str, Any]
         raise ValueError("ABI15 build source or ordered patch identity drift")
     outputs = _closed(
         policy["future_outputs"],
-        {"ack_trust_root", "authorization_sha256", "cubin_roots", "image_digest", "ptx_roots", "wheel_sha256"},
+        {
+            "ack_trust_root",
+            "authorization_sha256",
+            "bazel_path",
+            "bazel_sha256",
+            "cubin_roots",
+            "image_digest",
+            "ptxas_path",
+            "ptxas_sha256",
+            "ptx_roots",
+            "wheel_sha256",
+        },
         "future outputs",
     )
     if any(value is not None for value in outputs.values()):

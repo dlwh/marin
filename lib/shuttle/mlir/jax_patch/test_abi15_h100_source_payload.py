@@ -5,9 +5,13 @@
 
 import hashlib
 import json
+import os
 import shutil
+import stat
 import subprocess
+import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import abi15_h100_source_payload
 import pytest
@@ -83,10 +87,51 @@ def test_source_capsule_round_trip_binds_exact_commit_tree_and_files(
         expected_source_commit=commit,
         expected_source_tree=_git(repository, "rev-parse", "HEAD^{tree}"),
     )
-
     assert sorted(path.relative_to(restored).as_posix() for path in restored.rglob("*") if path.is_file()) == list(
         REQUIRED_EXACT_PATHS
     )
+
+
+@pytest.mark.parametrize("mutation", ["late_bytes", "late_mode"])
+def test_source_capsule_validates_every_member_before_atomic_restore(tmp_path: Path, mutation: str) -> None:
+    repository, commit = _source_repository(tmp_path)
+    capsule = tmp_path / "capsule"
+    prepared = prepare_source_capsule(repository, commit, capsule)
+    archive_path = capsule / prepared["archive"]["filename"]
+    with zipfile.ZipFile(archive_path) as archive:
+        entries = [(info, archive.read(info)) for info in archive.infolist()]
+    last_info, last_contents = entries[-1]
+    if mutation == "late_bytes":
+        entries[-1] = (last_info, last_contents + b"drift")
+    else:
+        last_info.external_attr = 0o100600 << 16
+    rebuilt = capsule / "rebuilt.zip"
+    with zipfile.ZipFile(rebuilt, "w") as archive:
+        for info, contents in entries:
+            archive.writestr(info, contents)
+    rebuilt.replace(archive_path)
+    manifest_path = capsule / prepared["manifest_filename"]
+    manifest = json.loads(manifest_path.read_text())
+    manifest["archive"] = {
+        "filename": archive_path.name,
+        "sha256": hashlib.sha256(archive_path.read_bytes()).hexdigest(),
+        "size": archive_path.stat().st_size,
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    output = tmp_path / "restored"
+
+    with pytest.raises(ValueError):
+        restore_source_capsule(
+            archive_path,
+            manifest_path,
+            output,
+            expected_manifest_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+            expected_source_commit=commit,
+            expected_source_tree=_git(repository, "rev-parse", "HEAD^{tree}"),
+        )
+
+    assert not output.exists()
+    assert not tuple(tmp_path.glob(".abi15-capsule-restore-*"))
 
 
 def test_source_capsule_rejects_dirty_checkout_and_allowlist_drift(
@@ -228,8 +273,13 @@ def test_retrieved_export_rejects_rehashed_or_transport_mutation(tmp_path: Path,
     assert not (tmp_path / ".archive.tar.gz.unverified").exists()
 
 
-@pytest.mark.parametrize("mutation", ["ready_field", "manifest_field", "directory", "symlink", "ack", "case_alias"])
-def test_retrieved_export_rejects_open_schema_or_nonregular_transport_entry(tmp_path: Path, mutation: str) -> None:
+@pytest.mark.parametrize(
+    "mutation",
+    ["ready_field", "manifest_field", "directory", "symlink", "fifo", "socket", "ack", "case_alias"],
+)
+def test_retrieved_export_rejects_open_schema_or_nonregular_transport_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
     artifact = tmp_path / "artifact"
     _raw_artifact(artifact)
     export = tmp_path / "export"
@@ -254,6 +304,17 @@ def test_retrieved_export_rejects_open_schema_or_nonregular_transport_entry(tmp_
         (retrieval / "extra").mkdir()
     elif mutation == "symlink":
         (retrieval / "extra").symlink_to(retrieval / READY_FILENAME)
+    elif mutation == "fifo":
+        os.mkfifo(retrieval / "extra")
+    elif mutation == "socket":
+        extra = retrieval / "extra"
+        extra.write_bytes(b"socket-placeholder")
+        real_lstat = os.lstat
+        monkeypatch.setattr(
+            abi15_h100_source_payload.os,
+            "lstat",
+            lambda path: (SimpleNamespace(st_mode=stat.S_IFSOCK | 0o600) if Path(path) == extra else real_lstat(path)),
+        )
     elif mutation == "ack":
         (retrieval / "RAW_EXPORT_ACK").write_text("{}\n")
     else:
@@ -274,14 +335,29 @@ def test_retrieved_export_rejects_open_schema_or_nonregular_transport_entry(tmp_
     assert not (tmp_path / ".archive.tar.gz.unverified").exists()
 
 
-@pytest.mark.parametrize("mutation", ["empty_directory", "symlink"])
-def test_raw_export_rejects_unrepresented_or_nonregular_artifact_entry(tmp_path: Path, mutation: str) -> None:
+@pytest.mark.parametrize("mutation", ["empty_directory", "symlink", "fifo", "socket"])
+def test_raw_export_rejects_unrepresented_or_nonregular_artifact_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
     artifact = tmp_path / "artifact"
     _raw_artifact(artifact)
     if mutation == "empty_directory":
         (artifact / "empty").mkdir()
-    else:
+    elif mutation == "symlink":
         (artifact / "alias").symlink_to(artifact / "raw-artifact-manifest.json")
+    elif mutation == "fifo":
+        os.mkfifo(artifact / "fifo")
+    else:
+        socket_path = artifact / "socket"
+        socket_path.write_bytes(b"socket-placeholder")
+        real_lstat = os.lstat
+        monkeypatch.setattr(
+            abi15_h100_source_payload.os,
+            "lstat",
+            lambda path: (
+                SimpleNamespace(st_mode=stat.S_IFSOCK | 0o600) if Path(path) == socket_path else real_lstat(path)
+            ),
+        )
 
     with pytest.raises(ValueError):
         prepare_raw_export(

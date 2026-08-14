@@ -72,7 +72,10 @@ def _contract_ptx(policy: NumericalPolicy, maps: tuple[tuple[int, ...], tuple[in
     shuffle = ""
     if policy is NumericalPolicy.FAST:
         shuffle = "".join(
-            f"  shfl.sync.down.b32 %r6, %r5, {offset}, 31, 0xffffffff;\n" "  add.rn.f32 %f0, %f0, %f3;\n"
+            "  mov.b32 %r5, %f0;\n"
+            f"  shfl.sync.down.b32 %r6, %r5, {offset}, 31, 0xffffffff;\n"
+            "  mov.b32 %f3, %r6;\n"
+            "  add.rn.f32 %f0, %f0, %f3;\n"
             for offset in (16, 8, 4, 2, 1)
         )
     output_shape = (33, 34) if reduction == 2 else ((34, 2) if reduction == 33 else (33, 2))
@@ -90,10 +93,13 @@ def _contract_ptx(policy: NumericalPolicy, maps: tuple[tuple[int, ...], tuple[in
         "  div.u64 %rd2, %rd0, 1;",
         f"  rem.u64 %rd2, %rd2, {output_shape[1]};",
         lane.rstrip(),
+        "  mov.f32 %f0, 0f00000000;",
+        "L_reduction:",
     ]
     coordinate_registers = {0: "%rd1", 1: "%rd2", 2: "%rd4"}
     next_linear = 10
     next_pointer = 20
+    input_bf16 = reduction == 2
     for parameter, (shape, affine_map) in enumerate(zip(input_shapes, maps, strict=True)):
         lines.append(f"  mov.u64 %rd{next_linear}, 0;")
         for extent, dimension in zip(shape, affine_map, strict=True):
@@ -103,17 +109,28 @@ def _contract_ptx(policy: NumericalPolicy, maps: tuple[tuple[int, ...], tuple[in
         lines.extend(
             [
                 f"  ld.param.u64 %rd{next_pointer}, [p{parameter}];",
-                f"  mad.lo.u64 %rd{next_pointer}, %rd{next_linear}, 2, %rd{next_pointer};",
+                f"  mad.lo.u64 %rd{next_pointer}, %rd{next_linear}, {2 if input_bf16 else 4}, %rd{next_pointer};",
+                (
+                    f"  ld.global.u16 %h{parameter}, [%rd{next_pointer}];"
+                    if input_bf16
+                    else f"  ld.global.f32 %f{parameter + 1}, [%rd{next_pointer}];"
+                ),
             ]
         )
+        if input_bf16:
+            lines.append(f"  cvt.f32.bf16 %f{parameter + 1}, %h{parameter};")
         next_linear += 1
         next_pointer += 1
     lines.extend(
         [
             "  fma.rn.f32 %f0, %f1, %f2, %f0;",
             f"  add.u64 %rd4, %rd4, {step};",
+            f"  setp.lt.u64 %p1, %rd4, {reduction};",
+            "  @%p1 bra L_reduction;",
             shuffle.rstrip(),
-            f"  setp.ge.u64 %p1, %rd4, {reduction};",
+            "  ld.param.u64 %rd22, [p2];",
+            "  mad.lo.u64 %rd22, %rd0, 4, %rd22;",
+            "  st.global.f32 [%rd22], %f0;",
             "  ret;",
             "}",
         ]
@@ -258,6 +275,7 @@ def _build_transport(
     coordinate: TransportCoordinate,
     *,
     affine_mutation: bool = False,
+    contract_mutation: str | None = None,
     map_mutation: str | None = None,
 ) -> _BuiltTransport:
     policy_byte = 0 if coordinate.policy is NumericalPolicy.SOURCE_ORDERED else 1
@@ -271,6 +289,28 @@ def _build_transport(
         )
         assert len(mutated) == len(ptx_slices[3]) and mutated != ptx_slices[3]
         ptx_slices = (*ptx_slices[:3], mutated, *ptx_slices[4:])
+    if contract_mutation is not None:
+        contract_ordinal = 0 if coordinate.call_role is CallRole.FORWARD else 3
+        contract = ptx_slices[contract_ordinal]
+        replacements = {
+            "branch": (b"@%p1 bra L_reduction;", b"@%p2 bra L_reduction;"),
+            "fma_input": (b"%f1, %f2, %f0;", b"%f1, %f9, %f0;"),
+            "init": (b"mov.f32 %f0, 0f00000000;", b"mov.f32 %f0, 0f3f800000;"),
+            "missing_load": (b"  ld.global.u16 %h0, [%rd20];\n", b""),
+            "missing_store": (b"  st.global.f32 [%rd22], %f0;\n", b""),
+            "output_address": (b"mad.lo.u64 %rd22, %rd0, 4, %rd22;", b"mad.lo.u64 %rd22, %rd1, 4, %rd22;"),
+            "predicate": (b"setp.lt.u64", b"setp.ge.u64"),
+            "shuffle_def_use": (b"shfl.sync.down.b32 %r6, %r5, 16", b"shfl.sync.down.b32 %r6, %r9, 16"),
+            "decoy": (b"  fma.rn.f32", b"  mov.f32 %f9, %f9;\n  fma.rn.f32"),
+        }
+        if contract_mutation == "reorder":
+            instruction = b"  fma.rn.f32 %f0, %f1, %f2, %f0;\n"
+            mutated = contract.replace(instruction, b"").replace(b"L_reduction:\n", instruction + b"L_reduction:\n")
+        else:
+            before, after = replacements[contract_mutation]
+            mutated = contract.replace(before, after, 1)
+        assert mutated != contract
+        ptx_slices = (*ptx_slices[:contract_ordinal], mutated, *ptx_slices[contract_ordinal + 1 :])
     if map_mutation == "store":
         mutated = ptx_slices[0].replace(b"st.global.f32", b"ld.global.f32")
         assert len(mutated) == len(ptx_slices[0]) and mutated != ptx_slices[0]
@@ -282,6 +322,26 @@ def _build_transport(
         )
         assert len(mutated) == len(ptx_slices[4]) and mutated != ptx_slices[4]
         ptx_slices = (*ptx_slices[:4], mutated, *ptx_slices[5:])
+    elif map_mutation == "value":
+        mutated = ptx_slices[0].replace(b"st.global.f32 [%rd21], %f0", b"st.global.f32 [%rd21], %f9")
+        assert mutated != ptx_slices[0]
+        ptx_slices = (mutated, *ptx_slices[1:])
+    elif map_mutation == "output_address":
+        mutated = ptx_slices[0].replace(
+            b"mad.lo.u64 %rd21, %rd0, 4, %rd21",
+            b"mad.lo.u64 %rd21, %rd10, 4, %rd21",
+        )
+        assert mutated != ptx_slices[0]
+        ptx_slices = (mutated, *ptx_slices[1:])
+    elif map_mutation == "decoy":
+        mutated = ptx_slices[0].replace(b"  ret;", b"  add.rn.f32 %f9, %f9, 0f00000000;\n  ret;")
+        assert mutated != ptx_slices[0]
+        ptx_slices = (mutated, *ptx_slices[1:])
+    elif map_mutation == "reorder":
+        instruction = b"  ld.global.u16 %h0, [%rd20];\n"
+        mutated = ptx_slices[0].replace(instruction, b"").replace(b"  ret;", instruction + b"  ret;")
+        assert mutated != ptx_slices[0]
+        ptx_slices = (mutated, *ptx_slices[1:])
     code = b"".join(ptx_slices)
     slot_specs = _bindings(coordinate)
 
@@ -442,7 +502,7 @@ def test_load_gpu_transport_rejects_affine_map_mutation_with_valid_transport_roo
         load_gpu_transport(path, coordinate)
 
 
-@pytest.mark.parametrize("mutation", ["store", "transpose"])
+@pytest.mark.parametrize("mutation", ["decoy", "output_address", "reorder", "store", "transpose", "value"])
 def test_load_gpu_transport_rejects_map_semantic_mutation_with_valid_roots(
     tmp_path: Path,
     mutation: str,
@@ -450,6 +510,31 @@ def test_load_gpu_transport_rejects_map_semantic_mutation_with_valid_roots(
     coordinate = TransportCoordinate(NumericalPolicy.FAST, CallRole.BACKWARD)
     path = tmp_path / "bundle.bin"
     path.write_bytes(_build_transport(coordinate, map_mutation=mutation).data)
+
+    with pytest.raises(ValueError):
+        load_gpu_transport(path, coordinate)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["branch", "decoy", "fma_input", "init", "missing_load", "missing_store", "output_address", "predicate", "reorder"],
+)
+def test_load_gpu_transport_rejects_contract_dataflow_mutation_with_valid_roots(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    coordinate = TransportCoordinate(NumericalPolicy.SOURCE_ORDERED, CallRole.FORWARD)
+    path = tmp_path / "bundle.bin"
+    path.write_bytes(_build_transport(coordinate, contract_mutation=mutation).data)
+
+    with pytest.raises(ValueError):
+        load_gpu_transport(path, coordinate)
+
+
+def test_load_gpu_transport_rejects_fast_shuffle_def_use_decoy_with_valid_roots(tmp_path: Path) -> None:
+    coordinate = TransportCoordinate(NumericalPolicy.FAST, CallRole.FORWARD)
+    path = tmp_path / "bundle.bin"
+    path.write_bytes(_build_transport(coordinate, contract_mutation="shuffle_def_use").data)
 
     with pytest.raises(ValueError):
         load_gpu_transport(path, coordinate)

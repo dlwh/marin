@@ -245,15 +245,28 @@ def restore_source_capsule(
     }:
         raise ValueError("source capsule archive identity drift")
     members = manifest["members"]
-    if type(members) is not list or [record.get("path") for record in members] != list(REQUIRED_EXACT_PATHS):
+    if (
+        type(members) is not list
+        or any(type(record) is not dict or set(record) != {"mode", "path", "sha256", "size"} for record in members)
+        or [record["path"] for record in members] != list(REQUIRED_EXACT_PATHS)
+    ):
         raise ValueError("source capsule member roster drift")
-    output.mkdir(parents=True)
+    verified_members = []
+    total_size = 0
     with zipfile.ZipFile(archive_path) as archive:
         infos = archive.infolist()
         if [info.filename for info in infos] != list(REQUIRED_EXACT_PATHS):
             raise ValueError("source capsule ZIP member roster drift")
         for info, record in zip(infos, members, strict=True):
-            if info.is_dir() or info.file_size != record["size"] or info.file_size > MAX_CAPSULE_MEMBER_BYTES:
+            if (
+                record["mode"] not in {"100644", "100755"}
+                or type(record["size"]) is not int
+                or record["size"] < 0
+                or _sha(record["sha256"], _SHA256, "capsule member SHA-256") != record["sha256"]
+                or info.is_dir()
+                or info.file_size != record["size"]
+                or info.file_size > MAX_CAPSULE_MEMBER_BYTES
+            ):
                 raise ValueError("source capsule ZIP member metadata drift")
             contents = archive.read(info)
             if _sha256_bytes(contents) != record["sha256"]:
@@ -263,10 +276,20 @@ def restore_source_capsule(
             if mode != expected_mode:
                 raise ValueError("source capsule member mode drift")
             relative = _relative_path(info.filename, "capsule member")
-            target = output / relative
+            verified_members.append((relative, contents, 0o755 if record["mode"] == "100755" else 0o644))
+            total_size += len(contents)
+            if total_size > MAX_CAPSULE_BYTES:
+                raise ValueError("source capsule exceeds its total size bound")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".abi15-capsule-restore-", dir=output.parent) as temporary:
+        restored = Path(temporary) / "restored"
+        restored.mkdir()
+        for relative, contents, mode in verified_members:
+            target = restored / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(contents)
-            target.chmod(0o755 if record["mode"] == "100755" else 0o644)
+            target.chmod(mode)
+        restored.replace(output)
 
 
 def _artifact_records(root: Path) -> list[dict[str, Any]]:

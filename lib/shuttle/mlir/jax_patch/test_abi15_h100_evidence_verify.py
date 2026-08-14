@@ -13,6 +13,7 @@ from abi15_h100_evidence import expected_role_paths, load_role_manifest
 from abi15_h100_evidence_verify import (
     OUTPUT_ROLES,
     RUNS,
+    _observer_contract,
     _validate_record,
     _validate_registration_pointers,
     validate_numerical_files,
@@ -84,10 +85,11 @@ def _observer_fixture(root: Path) -> dict[str, str]:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(contents)
         digest = hashlib.sha256(contents).hexdigest()
-        cache.append((policy, digest))
+        filename = f"jit_composed-{index:064x}-cache"
+        cache.append((policy, filename, len(contents), digest))
         snapshots.append(
             {
-                "filename": f"jit_composed-{index:064x}-cache",
+                "filename": filename,
                 "sha256": digest,
                 "size": len(contents),
             }
@@ -127,35 +129,43 @@ def _observer_fixture(root: Path) -> dict[str, str]:
                 "runtime_binaries": runtime,
                 "runtime_mappings": [
                     {
+                        "device": "00:1a",
                         "end": pid * 0x10000 + (index + 1) * 0x1000,
+                        "inode": 1000 + index,
                         "path": f"/runtime/{filename}",
                         "role": role,
+                        "sha256": runtime[digest_field],
                         "start": pid * 0x10000 + index * 0x1000,
                     }
-                    for index, (role, filename) in enumerate(
+                    for index, (role, filename, digest_field) in enumerate(
                         (
-                            ("cuda_pjrt_plugin", "xla_cuda_plugin.so"),
-                            ("cuda_plugin_extension", "cuda_plugin_extension.so"),
-                            ("jax_common", "libjax_common.so"),
-                            ("jax_extension", "_jax.so"),
+                            ("cuda_pjrt_plugin", "xla_cuda_plugin.so", "cuda_pjrt_plugin_sha256"),
+                            (
+                                "cuda_plugin_extension",
+                                "cuda_plugin_extension.so",
+                                "cuda_plugin_extension_sha256",
+                            ),
+                            ("jax_common", "libjax_common.so", "jax_common_sha256"),
+                            ("jax_extension", "_jax.so", "jax_extension_sha256"),
                         ),
                         1,
                     )
                 ],
             },
         )
-    contract = load_contract()
     for policy in ("source_ordered", "fast"):
-        identity = contract.source_ordered if policy == "source_ordered" else contract.fast
+        identity, fixture = _observer_contract(policy)
+        contract = load_contract()
+        policy_contract = contract.source_ordered if policy == "source_ordered" else contract.fast
         common = [
-            "invocation",
+            17,
             None,
             policy,
-            identity.options_sha256,
-            "d" * 64,
-            "region",
-            "coverage",
-            "unsupported",
+            identity.policy_digest,
+            identity.tuning_digest,
+            fixture.region_membership,
+            fixture.coverage_manifest(identity),
+            fixture.unsupported_fingerprint,
         ]
         records = [
             [*common[:1], "algebra_coverage", *common[2:], "", False, ""],
@@ -163,20 +173,20 @@ def _observer_fixture(root: Path) -> dict[str, str]:
                 *common[:1],
                 "generated_bundle",
                 *common[2:],
-                identity.generated_fingerprint,
+                policy_contract.generated_fingerprint,
                 False,
                 "",
             ],
             [
-                "invocation",
+                17,
                 "final_erasure",
                 policy,
-                identity.options_sha256,
-                "d" * 64,
+                identity.policy_digest,
+                identity.tuning_digest,
                 "",
                 "",
                 "",
-                identity.final_fingerprint,
+                policy_contract.final_fingerprint,
                 True,
                 "",
             ],
@@ -231,7 +241,10 @@ def test_observer_verifier_binds_processes_policy_fingerprints_and_empty_reuse(
     assert report == {"observer_events": 6, "populate_hits": 0, "reuse_hits": 2}
 
 
-@pytest.mark.parametrize("mutation", ["pointer", "duplicate", "mapping", "extra"])
+@pytest.mark.parametrize(
+    "mutation",
+    ["pointer", "duplicate", "mapping", "extra", "device", "inode", "path", "sha256"],
+)
 def test_registration_pointer_ranges_reject_semantic_mutation(mutation: str) -> None:
     registered = {
         "api_version": 1,
@@ -239,19 +252,37 @@ def test_registration_pointer_ranges_reject_semantic_mutation(mutation: str) -> 
         "target": "shuttle.gpu.executable_bundle.v2",
         "traits": 0,
     }
-    mappings = [{"end": 0x2000, "path": "/runtime/cuda_plugin_extension.so", "start": 0x1000}]
-    _validate_registration_pointers(registered, mappings)
+    expected_sha256 = "a" * 64
+    mappings = [
+        {
+            "device": "00:1a",
+            "end": 0x2000,
+            "inode": 123,
+            "path": "/runtime/cuda_plugin_extension.so",
+            "sha256": expected_sha256,
+            "start": 0x1000,
+        }
+    ]
+    _validate_registration_pointers(registered, mappings, expected_sha256)
     if mutation == "pointer":
         registered["stage_pointers"]["execute"] = 0x3000
     elif mutation == "duplicate":
         registered["stage_pointers"]["execute"] = 0x1200
     elif mutation == "mapping":
         mappings[0]["start"] = 0x2000
+    elif mutation == "device":
+        mappings[0]["device"] = "device"
+    elif mutation == "inode":
+        mappings[0]["inode"] = 0
+    elif mutation == "path":
+        mappings[0]["path"] = "/runtime/same-basename/cuda_plugin_extension.so/../other.so"
+    elif mutation == "sha256":
+        mappings[0]["sha256"] = "b" * 64
     else:
         mappings[0]["extra"] = None
 
     with pytest.raises(ValueError):
-        _validate_registration_pointers(registered, mappings)
+        _validate_registration_pointers(registered, mappings, expected_sha256)
 
 
 def test_wheel_record_binds_exact_runtime_member_and_rejects_digest_mutation(tmp_path: Path) -> None:
@@ -268,7 +299,29 @@ def test_wheel_record_binds_exact_runtime_member_and_rejects_digest_mutation(tmp
         _validate_record(record, "/cuda_plugin_extension.so", extension, "CUDA plugin")
 
 
-@pytest.mark.parametrize("mutation", ["generated", "policy", "reuse", "cache_swap", "mapping"])
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "algebra",
+        "bool_type",
+        "cache_duplicate",
+        "cache_name",
+        "cache_size",
+        "cache_swap",
+        "coverage",
+        "failure",
+        "final_structural",
+        "generated",
+        "invocation_type",
+        "mapping",
+        "phase",
+        "policy",
+        "region",
+        "reuse",
+        "tuning",
+        "unsupported",
+    ],
+)
 def test_observer_verifier_rejects_fingerprint_policy_or_reuse_mutation(tmp_path: Path, mutation: str) -> None:
     roles = _observer_fixture(tmp_path)
     populate = tmp_path / roles["observer_populate_fast"]
@@ -280,6 +333,31 @@ def test_observer_verifier_rejects_fingerprint_policy_or_reuse_mutation(tmp_path
         fast_bytes, source_ordered_bytes = fast.read_bytes(), source_ordered.read_bytes()
         fast.write_bytes(source_ordered_bytes)
         source_ordered.write_bytes(fast_bytes)
+    elif mutation in {"cache_duplicate", "cache_name", "cache_size"}:
+        snapshot_roles = ("cache_populate_after", "cache_reuse_before", "cache_reuse_after")
+        snapshots = json.loads((tmp_path / roles[snapshot_roles[0]]).read_text())
+        if mutation == "cache_duplicate":
+            snapshots[1]["filename"] = snapshots[0]["filename"]
+        elif mutation == "cache_name":
+            snapshots[0]["filename"] = "private-cache-key"
+        else:
+            snapshots[0]["size"] += 1
+        for role in snapshot_roles:
+            _write_json(tmp_path / roles[role], snapshots)
+        for role in ("populate_report", "reuse_report"):
+            report_path = tmp_path / roles[role]
+            report = json.loads(report_path.read_text())
+            if report["cache_after"]:
+                report["cache_after"] = [
+                    [policy, snapshot["filename"], snapshot["size"], digest]
+                    for (policy, _, _, digest), snapshot in zip(report["cache_after"], snapshots, strict=True)
+                ]
+            if report["cache_before"]:
+                report["cache_before"] = [
+                    [policy, snapshot["filename"], snapshot["size"], digest]
+                    for (policy, _, _, digest), snapshot in zip(report["cache_before"], snapshots, strict=True)
+                ]
+            _write_json(report_path, report)
     elif mutation == "mapping":
         report = tmp_path / roles["reuse_report"]
         value = json.loads(report.read_text())
@@ -289,8 +367,28 @@ def test_observer_verifier_rejects_fingerprint_policy_or_reuse_mutation(tmp_path
         records = [json.loads(line) for line in populate.read_text().splitlines()]
         if mutation == "generated":
             records[1][8] = "f" * 64
-        else:
+        elif mutation == "policy":
             records[0][2] = "source_ordered"
+        elif mutation == "algebra":
+            records[0][8] = "f" * 64
+        elif mutation == "bool_type":
+            records[0][9] = 0
+        elif mutation == "coverage":
+            records[0][6] += "drift"
+        elif mutation == "failure":
+            records[1][10] = "pass"
+        elif mutation == "final_structural":
+            records[2][5] = "retained"
+        elif mutation == "invocation_type":
+            records[0][0] = "17"
+        elif mutation == "phase":
+            records[0][1] = "generated_bundle"
+        elif mutation == "region":
+            records[1][5] += "drift"
+        elif mutation == "tuning":
+            records[0][4] = "f" * 64
+        else:
+            records[1][7] = "f" * 64
         populate.write_text("".join(json.dumps(record) + "\n" for record in records))
 
     with pytest.raises(ValueError):

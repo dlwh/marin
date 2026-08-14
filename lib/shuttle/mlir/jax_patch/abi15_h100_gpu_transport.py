@@ -4,6 +4,7 @@
 """Independent decoder for the closed ABI15 composed H100 transports."""
 
 import hashlib
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ TARGET = b"shuttle.gpu.executable_bundle.v2"
 _DIGEST = re.compile(rb"[0-9a-f]{64}\Z")
 _HEX_ESCAPE = re.compile(r"[0-9A-Fa-f]{2}\Z")
 _REGISTER = r"%rd[0-9]+"
+_VALUE_REGISTER = r"%[fhr][0-9]+"
 _INVALID = "invalid ABI15 Shuttle GPU executable transport"
 _Enum = TypeVar("_Enum", bound=StrEnum)
 
@@ -517,6 +519,26 @@ def _address_maps(ptx: bytes, output_shape: tuple[int, int], reduction: bool) ->
     return parameter_maps
 
 
+def _one_match(pattern: str, text: str) -> re.Match[str]:
+    matches = tuple(re.finditer(pattern, text, re.MULTILINE))
+    _require(len(matches) == 1)
+    return matches[0]
+
+
+def _pointer_index(text: str, parameter: int, element_bytes: int) -> tuple[str, str]:
+    pointer = _one_match(rf"^\s*ld\.param\.u64\s+({_REGISTER}),\s*\[p{parameter}\];\s*$", text).group(1)
+    index = _one_match(
+        rf"^\s*mad\.lo\.u64\s+{re.escape(pointer)},\s*({_REGISTER}),\s*{element_bytes},\s*{re.escape(pointer)};\s*$",
+        text,
+    ).group(1)
+    return pointer, index
+
+
+def _semantic_digest(value: object) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _validate_contract_ptx(ptx: bytes, coordinate: TransportCoordinate, ordinal: int) -> None:
     if coordinate.call_role is CallRole.FORWARD:
         output_shape, expected = (33, 34), {0: (0, 2), 1: (2, 1)}
@@ -524,38 +546,199 @@ def _validate_contract_ptx(ptx: bytes, coordinate: TransportCoordinate, ordinal:
         output_shape, expected = (34, 2), {0: (2, 0), 1: (2, 1)}
     else:
         output_shape, expected = (33, 2), {0: (0, 2), 1: (1, 2)}
-    _require(_address_maps(ptx, output_shape, reduction=True) == expected)
+    observed_maps = _address_maps(ptx, output_shape, reduction=True)
+    _require(observed_maps == expected)
     text = ptx.decode("ascii")
-    _require(text.count("fma.rn.f32") == 1 and "atom." not in text and "mma." not in text)
-    if coordinate.policy is NumericalPolicy.SOURCE_ORDERED:
-        _require("shfl.sync.down.b32" not in text and re.search(r"add\.u64 .*?, 1;", text) is not None)
+    _require("atom." not in text and "mma." not in text)
+    _require(len(re.findall(r"\bld\.param\.u64\b", text)) == 3)
+    _require(len(re.findall(r"\bst\.global\.f32\b", text)) == 1)
+    _require(len(re.findall(r"\bmov\.f32\b", text)) == 1)
+    input_bf16 = coordinate.call_role is CallRole.FORWARD
+    _require(len(re.findall(r"\bld\.global\.f32\b", text)) == (0 if input_bf16 else 2))
+    _require(len(re.findall(r"\bld\.global\.u16\b", text)) == (2 if input_bf16 else 0))
+    _require("st.global.u16" not in text)
+    input_values = []
+    for parameter in (0, 1):
+        pointer, _ = _pointer_index(text, parameter, 2 if input_bf16 else 4)
+        if input_bf16:
+            raw_value = _one_match(
+                rf"^\s*ld\.global\.u16\s+(%h[0-9]+),\s*\[{re.escape(pointer)}\];\s*$",
+                text,
+            ).group(1)
+            value = _one_match(
+                rf"^\s*cvt\.f32\.bf16\s+(%f[0-9]+),\s*{re.escape(raw_value)};\s*$",
+                text,
+            ).group(1)
+        else:
+            value = _one_match(
+                rf"^\s*ld\.global\.f32\s+(%f[0-9]+),\s*\[{re.escape(pointer)}\];\s*$",
+                text,
+            ).group(1)
+        input_values.append(value)
+    accumulator = _one_match(r"^\s*mov\.f32\s+(%f[0-9]+),\s*0f00000000;\s*$", text).group(1)
+    fma = _one_match(
+        r"^\s*fma\.rn\.f32\s+(%f[0-9]+),\s*(%f[0-9]+),\s*(%f[0-9]+),\s*(%f[0-9]+);\s*$",
+        text,
+    )
+    _require(fma.groups() == (accumulator, input_values[0], input_values[1], accumulator))
+    output_pointer, output_index = _pointer_index(text, 2, 4)
+    _require(output_index == "%rd0")
+    store = _one_match(
+        rf"^\s*st\.global\.f32\s+\[{re.escape(output_pointer)}\],\s*(%f[0-9]+);\s*$",
+        text,
+    )
+    _require(store.group(1) == accumulator)
+    step = 32 if coordinate.policy is NumericalPolicy.FAST else 1
+    reduction_extent = 2 if output_shape == (33, 34) else 33 if output_shape == (34, 2) else 34
+    step_match = _one_match(
+        rf"^\s*add\.u64\s+({_REGISTER}),\s*\1,\s*{step};\s*$",
+        text,
+    )
+    reduction_init = step_match.group(1)
+    if coordinate.policy is NumericalPolicy.FAST:
+        _one_match(rf"^\s*cvt\.u64\.u32\s+{re.escape(reduction_init)},\s*%r2;\s*$", text)
     else:
-        _require(re.search(r"add\.u64 .*?, 32;", text) is not None)
-        cursor = text.find("fma.rn.f32")
+        _one_match(rf"^\s*mov\.u64\s+{re.escape(reduction_init)},\s*0;\s*$", text)
+    predicate_match = _one_match(
+        rf"^\s*setp\.lt\.u64\s+(%p[0-9]+),\s*{re.escape(reduction_init)},\s*{reduction_extent};\s*$",
+        text,
+    )
+    predicate = predicate_match.group(1)
+    label_match = _one_match(r"^\s*([A-Za-z_][A-Za-z0-9_]*):\s*$", text)
+    label = label_match.group(1)
+    branch = _one_match(rf"^\s*@{re.escape(predicate)}\s+bra\s+{re.escape(label)};\s*$", text)
+    input_parameters = []
+    for parameter in (0, 1):
+        pointer = _pointer_index(text, parameter, 2 if input_bf16 else 4)[0]
+        input_parameters.append(_one_match(rf"^\s*ld\.param\.u64\s+{re.escape(pointer)},\s*\[p{parameter}\];\s*$", text))
+    _require(
+        label_match.start()
+        < input_parameters[0].start()
+        < input_parameters[1].start()
+        < fma.start()
+        < step_match.start()
+        < predicate_match.start()
+        < branch.start()
+        < store.start()
+    )
+    if coordinate.policy is NumericalPolicy.SOURCE_ORDERED:
+        _require("shfl.sync.down.b32" not in text and "add.rn.f32" not in text)
+    else:
+        _require(len(re.findall(r"\bshfl\.sync\.down\.b32\b", text)) == 5)
+        _require(len(re.findall(r"\badd\.rn\.f32\b", text)) == 5)
+        cursor = text.find("setp.lt.u64")
         for offset in (16, 8, 4, 2, 1):
-            shuffle = text.find("shfl.sync.down.b32", cursor)
-            _require(shuffle >= 0 and f", {offset}, 31, 0xffffffff;" in text[shuffle:])
-            add = text.find("add.rn.f32", shuffle)
-            _require(add > shuffle)
-            cursor = add + 1
+            block = re.search(
+                rf"mov\.b32\s+(%r[0-9]+),\s*{re.escape(accumulator)};\s*"
+                rf"shfl\.sync\.down\.b32\s+(%r[0-9]+),\s*\1,\s*{offset},\s*31,\s*0xffffffff;\s*"
+                rf"mov\.b32\s+(%f[0-9]+),\s*\2;\s*"
+                rf"add\.rn\.f32\s+{re.escape(accumulator)},\s*{re.escape(accumulator)},\s*\3;",
+                text[cursor:],
+            )
+            _require(block is not None)
+            cursor += block.end()
+        _require(cursor <= store.start())
+    expected_semantics = {
+        "address_maps": {str(parameter): list(mapping) for parameter, mapping in expected.items()},
+        "input_types": ["bf16", "bf16"] if input_bf16 else ["f32", "f32"],
+        "loop": {
+            "predicate": "lt",
+            "reduction": reduction_extent,
+            "step": step,
+        },
+        "operation": "contract_fma_rn_f32",
+        "output_type": "f32",
+        "policy": coordinate.policy.value,
+    }
+    observed_semantics = {
+        "address_maps": {str(parameter): list(mapping) for parameter, mapping in observed_maps.items()},
+        "input_types": ["bf16", "bf16"] if input_bf16 else ["f32", "f32"],
+        "loop": {
+            "predicate": "lt",
+            "reduction": reduction_extent,
+            "step": step,
+        },
+        "operation": "contract_fma_rn_f32",
+        "output_type": "f32",
+        "policy": coordinate.policy.value,
+    }
+    _require(_semantic_digest(observed_semantics) == _semantic_digest(expected_semantics))
 
 
 def _validate_map_ptx(ptx: bytes, input_slot: GpuSlot, output_slot: GpuSlot, kind: str) -> None:
     expected_map = (1, 0) if kind == "map_f32_transpose_d1_d0" else (0, 1)
-    _require(_address_maps(ptx, output_slot.dimensions, reduction=False) == {0: expected_map})
+    observed_maps = _address_maps(ptx, output_slot.dimensions, reduction=False)
+    _require(observed_maps == {0: expected_map})
     text = ptx.decode("ascii")
     _require("fma.rn.f32" not in text and "shfl." not in text and "atom." not in text and "mma." not in text)
-    _require(text.count("ld.param.u64") == 2)
+    _require("mov.f32" not in text)
+    _require(re.search(r"\b(?:add|sub|mul)\.(?:rn\.)?f(?:16|32|64)\b", text) is None)
+    _require(len(re.findall(r"\bld\.param\.u64\b", text)) == 2)
+    input_pointer, _ = _pointer_index(text, 0, 2 if input_slot.element_type is ElementType.BF16 else 4)
+    output_pointer, output_index = _pointer_index(text, 1, 2 if output_slot.element_type is ElementType.BF16 else 4)
+    input_parameter = _one_match(rf"^\s*ld\.param\.u64\s+{re.escape(input_pointer)},\s*\[p0\];\s*$", text)
+    output_parameter = _one_match(rf"^\s*ld\.param\.u64\s+{re.escape(output_pointer)},\s*\[p1\];\s*$", text)
+    _require(output_index == "%rd0" and input_pointer != output_pointer)
     if input_slot.element_type is ElementType.BF16:
-        _require(text.count("ld.global.u16") == 1 and text.count("cvt.f32.bf16") == 1)
+        load_match = _one_match(
+            rf"^\s*ld\.global\.u16\s+(%h[0-9]+),\s*\[{re.escape(input_pointer)}\];\s*$",
+            text,
+        )
+        load = load_match.group(1)
+        conversion_match = _one_match(
+            rf"^\s*cvt\.f32\.bf16\s+(%f[0-9]+),\s*{re.escape(load)};\s*$",
+            text,
+        )
+        converted = conversion_match.group(1)
         _require("ld.global.f32" not in text)
     else:
-        _require(text.count("ld.global.f32") == 1 and "ld.global.u16" not in text)
+        load_match = _one_match(
+            rf"^\s*ld\.global\.f32\s+(%f[0-9]+),\s*\[{re.escape(input_pointer)}\];\s*$",
+            text,
+        )
+        converted = load_match.group(1)
+        conversion_match = load_match
+        _require("ld.global.u16" not in text and "cvt.f32.bf16" not in text)
     if output_slot.element_type is ElementType.BF16:
-        _require(text.count("cvt.rn.bf16.f32") == 1 and text.count("st.global.u16") == 1)
+        output_conversion = _one_match(
+            rf"^\s*cvt\.rn\.bf16\.f32\s+(%h[0-9]+),\s*{re.escape(converted)};\s*$",
+            text,
+        )
+        output_value = output_conversion.group(1)
+        store_match = _one_match(
+            rf"^\s*st\.global\.u16\s+\[{re.escape(output_pointer)}\],\s*{re.escape(output_value)};\s*$",
+            text,
+        )
         _require("st.global.f32" not in text)
     else:
-        _require(text.count("st.global.f32") == 1 and "st.global.u16" not in text)
+        output_conversion = output_parameter
+        store_match = _one_match(
+            rf"^\s*st\.global\.f32\s+\[{re.escape(output_pointer)}\],\s*{re.escape(converted)};\s*$",
+            text,
+        )
+        _require("st.global.u16" not in text and "cvt.rn.bf16.f32" not in text)
+    _require(len(re.findall(r"\bld\.global\.", text)) == 1 and len(re.findall(r"\bst\.global\.", text)) == 1)
+    _require(
+        input_parameter.start()
+        < load_match.start()
+        <= conversion_match.start()
+        < output_parameter.start()
+        <= output_conversion.start()
+        < store_match.start()
+    )
+    expected_semantics = {
+        "address_map": list(expected_map),
+        "input_type": input_slot.element_type.value,
+        "operation": kind,
+        "output_type": output_slot.element_type.value,
+    }
+    observed_semantics = {
+        "address_map": list(observed_maps[0]),
+        "input_type": input_slot.element_type.value,
+        "operation": kind,
+        "output_type": output_slot.element_type.value,
+    }
+    _require(_semantic_digest(observed_semantics) == _semantic_digest(expected_semantics))
 
 
 def _validate_architecture(

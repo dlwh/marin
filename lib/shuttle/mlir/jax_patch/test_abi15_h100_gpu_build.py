@@ -8,13 +8,31 @@ from pathlib import Path
 
 import pytest
 from abi15_h100_architecture_contract import load_architecture_build_contract
-from abi15_h100_gpu_build import assemble_transports, parse_ptxas_resources, validate_build_candidate
+from abi15_h100_gpu_build import (
+    _validate_build_candidate_against_policy,
+    assemble_transports,
+    parse_ptxas_resources,
+    validate_build_candidate,
+)
 
 SHA = "a" * 64
 
 
-def _candidate() -> dict[str, object]:
-    build_policy = load_architecture_build_contract()["build_policy"]
+def _sealed_policy() -> dict[str, object]:
+    build_policy = deepcopy(load_architecture_build_contract()["build_policy"])
+    build_policy["future_outputs"].update(
+        {
+            "bazel_path": "/tools/bazel",
+            "bazel_sha256": "9" * 64,
+            "ptxas_path": "/cuda/bin/ptxas",
+            "ptxas_sha256": "a" * 64,
+        }
+    )
+    return build_policy
+
+
+def _candidate(build_policy: dict[str, object] | None = None) -> dict[str, object]:
+    build_policy = _sealed_policy() if build_policy is None else build_policy
     pinned_source = build_policy["source"]
     transports = []
     for policy_index, policy in enumerate(("source_ordered", "fast")):
@@ -59,9 +77,11 @@ def _candidate() -> dict[str, object]:
         },
         "status": "pre_hardware_build_candidate_not_authority",
         "toolchain": {
-            "bazel_sha256": "9" * 64,
+            "bazel_path": build_policy["future_outputs"]["bazel_path"],
+            "bazel_sha256": build_policy["future_outputs"]["bazel_sha256"],
             "bazel_version": build_policy["tool_constraints"]["bazel_version"],
-            "ptxas_sha256": "a" * 64,
+            "ptxas_path": build_policy["future_outputs"]["ptxas_path"],
+            "ptxas_sha256": build_policy["future_outputs"]["ptxas_sha256"],
             "ptxas_version": build_policy["tool_constraints"]["ptxas_version"],
             "target": build_policy["tool_constraints"]["ptx_target"],
         },
@@ -85,12 +105,18 @@ def test_parse_ptxas_resources_requires_one_register_and_zero_or_reported_spills
 
 
 def test_build_candidate_closes_four_transports_and_twenty_four_assemblies() -> None:
-    candidate = _candidate()
+    policy = _sealed_policy()
+    candidate = _candidate(policy)
 
-    validated = validate_build_candidate(candidate)
+    validated = _validate_build_candidate_against_policy(candidate, policy)
 
     assert sum(len(item["ptx_slices"]) for item in validated["transports"]) == 24
     assert validated["status"] == "pre_hardware_build_candidate_not_authority"
+
+
+def test_build_candidate_stops_while_bazel_and_ptxas_identity_are_unsealed() -> None:
+    with pytest.raises(RuntimeError, match="explicitly unsealed"):
+        validate_build_candidate(_candidate())
 
 
 def test_assembly_stops_before_directory_write_or_ptxas_while_unsealed(tmp_path: Path) -> None:
@@ -104,7 +130,8 @@ def test_assembly_stops_before_directory_write_or_ptxas_while_unsealed(tmp_path:
 
 @pytest.mark.parametrize("mutation", ["status", "policy", "slice", "spill", "toolchain", "source", "command"])
 def test_build_candidate_rejects_self_consistent_semantic_drift(mutation: str) -> None:
-    candidate = deepcopy(_candidate())
+    policy = _sealed_policy()
+    candidate = deepcopy(_candidate(policy))
     if mutation == "status":
         candidate["status"] = "sealed"
     elif mutation == "policy":
@@ -122,4 +149,14 @@ def test_build_candidate_rejects_self_consistent_semantic_drift(mutation: str) -
         candidate["commands"][0].append("--drift")
 
     with pytest.raises(ValueError):
-        validate_build_candidate(candidate)
+        _validate_build_candidate_against_policy(candidate, policy)
+
+
+@pytest.mark.parametrize("field", ["bazel_path", "bazel_sha256", "ptxas_path", "ptxas_sha256"])
+def test_build_candidate_requires_controller_pinned_tool_identity(field: str) -> None:
+    policy = _sealed_policy()
+    candidate = _candidate(policy)
+    candidate["toolchain"][field] = "/different/tool" if field.endswith("path") else "b" * 64
+
+    with pytest.raises(ValueError):
+        _validate_build_candidate_against_policy(candidate, policy)

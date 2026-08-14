@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import ctypes
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -64,14 +65,25 @@ def test_abi15_registration_transcript_rotates_pipeline_identity_and_binds_plugi
     plugin = tmp_path / "cuda_plugin_extension.so"
     plugin.write_bytes(b"plugin")
 
-    transcript = registration_transcript(_plugin(), plugin, ((0x1000, 0x5000),))
+    plugin_stat = plugin.stat()
+    device = f"{os.major(plugin_stat.st_dev):02x}:{os.minor(plugin_stat.st_dev):02x}"
+    transcript = registration_transcript(_plugin(), plugin, ((0x1000, 0x5000, device, plugin_stat.st_ino),))
 
     assert transcript["pipeline_abi_version"] == 15
     assert transcript["plugin_extension_sha256"] == "5e689e2b01672bf33996e75d5e372ff60c536ce1599a1458e867cd8f4bef5160"
     assert transcript["exported_targets"] == [TARGET, "upstream"]
     assert transcript["upstream_target_count"] == 1
     assert transcript["registration"]["target"] == TARGET
-    assert transcript["plugin_mappings"] == [{"end": 0x5000, "path": str(plugin), "start": 0x1000}]
+    assert transcript["plugin_mappings"] == [
+        {
+            "device": device,
+            "end": 0x5000,
+            "inode": plugin_stat.st_ino,
+            "path": str(plugin),
+            "sha256": transcript["plugin_extension_sha256"],
+            "start": 0x1000,
+        }
+    ]
 
 
 def test_abi15_registration_main_stops_before_loading_or_writing_while_unsealed(tmp_path: Path) -> None:

@@ -24,8 +24,12 @@ def test_architecture_design_derives_exact_four_policy_coordinates_without_autho
     assert document["build_policy"]["future_outputs"] == {
         "ack_trust_root": None,
         "authorization_sha256": None,
+        "bazel_path": None,
+        "bazel_sha256": None,
         "cubin_roots": None,
         "image_digest": None,
+        "ptxas_path": None,
+        "ptxas_sha256": None,
         "ptx_roots": None,
         "wheel_sha256": None,
     }

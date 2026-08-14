@@ -7,7 +7,7 @@ import hashlib
 import re
 import subprocess
 from collections.abc import Mapping
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from abi15_h100_architecture_contract import load_architecture_build_contract
@@ -109,6 +109,14 @@ def assemble_transports(
 def validate_build_candidate(value: object) -> dict[str, Any]:
     """Validate an unsealed pre-hardware build candidate without accepting it."""
     policy = load_architecture_build_contract()["build_policy"]
+    return _validate_build_candidate_against_policy(value, policy)
+
+
+def _validate_build_candidate_against_policy(value: object, policy: dict[str, Any]) -> dict[str, Any]:
+    future = policy["future_outputs"]
+    tool_identity = tuple(future[field] for field in ("bazel_path", "bazel_sha256", "ptxas_path", "ptxas_sha256"))
+    if any(item is None for item in tool_identity):
+        raise RuntimeError("ABI15 Bazel/ptxas identity is explicitly unsealed")
     root = _closed(
         value,
         {
@@ -162,7 +170,7 @@ def validate_build_candidate(value: object) -> dict[str, Any]:
         raise ValueError("build source differs from the three ordered JAX patches")
     toolchain = _closed(
         root["toolchain"],
-        {"bazel_sha256", "bazel_version", "ptxas_sha256", "ptxas_version", "target"},
+        {"bazel_path", "bazel_sha256", "bazel_version", "ptxas_path", "ptxas_sha256", "ptxas_version", "target"},
         "toolchain",
     )
     constraints = policy["tool_constraints"]
@@ -170,8 +178,19 @@ def validate_build_candidate(value: object) -> dict[str, Any]:
         toolchain["target"] != constraints["ptx_target"]
         or toolchain["bazel_version"] != constraints["bazel_version"]
         or toolchain["ptxas_version"] != constraints["ptxas_version"]
+        or toolchain["bazel_path"] != future["bazel_path"]
+        or toolchain["ptxas_path"] != future["ptxas_path"]
+        or toolchain["bazel_sha256"] != future["bazel_sha256"]
+        or toolchain["ptxas_sha256"] != future["ptxas_sha256"]
     ):
-        raise ValueError("build toolchain version or target drift")
+        raise ValueError("build toolchain path, digest, version, or target drift")
+    if any(
+        type(toolchain[field]) is not str
+        or not toolchain[field].startswith("/")
+        or str(PurePosixPath(toolchain[field])) != toolchain[field]
+        for field in ("bazel_path", "ptxas_path")
+    ):
+        raise ValueError("build toolchain path must be canonical and absolute")
     _sha(toolchain["bazel_sha256"], "Bazel digest")
     _sha(toolchain["ptxas_sha256"], "ptxas digest")
     commands = root["commands"]

@@ -21,9 +21,13 @@
     "future_outputs": {
       "ack_trust_root": null,
       "authorization_sha256": null,
+      "bazel_path": null,
+      "bazel_sha256": null,
       "cubin_roots": null,
       "image_digest": null,
       "ptx_roots": null,
+      "ptxas_path": null,
+      "ptxas_sha256": null,
       "wheel_sha256": null
     },
     "source": {

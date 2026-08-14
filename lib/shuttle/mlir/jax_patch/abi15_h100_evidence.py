@@ -5,7 +5,9 @@
 
 import hashlib
 import json
+import os
 import re
+import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -89,10 +91,10 @@ class ProcessReport:
     pid: int
     cache_hits: int
     observer_events: int
-    cache_before: tuple[tuple[str, str], ...]
-    cache_after: tuple[tuple[str, str], ...]
+    cache_before: tuple[tuple[str, str, int, str], ...]
+    cache_after: tuple[tuple[str, str, int, str], ...]
     runtime_binaries: tuple[tuple[str, str], ...]
-    runtime_mappings: tuple[tuple[str, str, int, int], ...]
+    runtime_mappings: tuple[tuple[str, str, str, int, int, int, str], ...]
 
 
 def _canonical_json(value: object) -> bytes:
@@ -337,7 +339,11 @@ def load_raw_artifact(root: Path, *, expected_harness_commit: str, expected_harn
         path = root / relative
         size = record["size"]
         digest = _require_sha(record["sha256"], f"role {role} digest")
-        if type(size) is not int or size < 0 or path.is_symlink() or not path.is_file():
+        try:
+            mode = os.lstat(path).st_mode
+        except FileNotFoundError as error:
+            raise ValueError(f"raw artifact role is missing or invalid: {role}") from error
+        if type(size) is not int or size < 0 or not stat.S_ISREG(mode):
             raise ValueError(f"raw artifact role is missing or invalid: {role}")
         if path.stat().st_size != size or _sha256_file(path) != digest:
             raise ValueError(f"raw artifact role bytes drifted: {role}")
@@ -346,9 +352,10 @@ def load_raw_artifact(root: Path, *, expected_harness_commit: str, expected_harn
     if set(files) != set(expected):
         raise ValueError("raw artifact role roster drift")
     all_paths = tuple(root.rglob("*"))
-    if any(path.is_symlink() for path in all_paths):
-        raise ValueError("raw artifact rejects symlinks")
-    actual = {path.relative_to(root).as_posix() for path in all_paths if path.is_file()}
+    classified = [(path, os.lstat(path).st_mode) for path in all_paths]
+    if any(not stat.S_ISREG(mode) and not stat.S_ISDIR(mode) for _, mode in classified):
+        raise ValueError("raw artifact rejects symlinks and non-regular entries")
+    actual = {path.relative_to(root).as_posix() for path, mode in classified if stat.S_ISREG(mode)}
     if actual != covered:
         raise ValueError("raw artifact contains an unmanifested or missing file")
     expected_directories = {
@@ -357,7 +364,7 @@ def load_raw_artifact(root: Path, *, expected_harness_commit: str, expected_harn
         for parent in PurePosixPath(relative).parents
         if parent != PurePosixPath(".")
     }
-    actual_directories = {path.relative_to(root).as_posix() for path in all_paths if path.is_dir()}
+    actual_directories = {path.relative_to(root).as_posix() for path, mode in classified if stat.S_ISDIR(mode)}
     if actual_directories != expected_directories:
         raise ValueError("raw artifact contains an empty or unmanifested directory")
     if (
@@ -384,14 +391,24 @@ def validate_process_reports(reports: tuple[ProcessReport, ...]) -> None:
         raise ValueError("baseline must not use Shuttle observer or persistent cache")
     if populate.cache_hits != 0 or populate.observer_events != 6 or populate.cache_before:
         raise ValueError("populate must start empty, miss twice, and record six observer phases")
-    if tuple(key for key, _ in populate.cache_after) != expected_keys:
+    if tuple(record[0] for record in populate.cache_after) != expected_keys:
         raise ValueError("populate must create exactly the FAST and SOURCE_ORDERED cache entries")
     if reuse.cache_hits != 2 or reuse.observer_events != 0:
         raise ValueError("reuse must hit twice without observer activity")
     if reuse.cache_before != populate.cache_after or reuse.cache_after != populate.cache_after:
         raise ValueError("reuse must preserve the exact populated cache bytes")
     for report in reports:
-        for _, digest in (*report.cache_before, *report.cache_after):
+        for record in (*report.cache_before, *report.cache_after):
+            if (
+                len(record) != 4
+                or type(record[0]) is not str
+                or type(record[1]) is not str
+                or re.fullmatch(r"jit_composed-[0-9a-f]{64}-cache", record[1]) is None
+                or type(record[2]) is not int
+                or record[2] <= 0
+            ):
+                raise ValueError("cache entry policy, public key, or size drift")
+            digest = record[3]
             _require_sha(digest, "cache entry digest")
     runtime_keys = (
         "cuda_pjrt_plugin_sha256",
@@ -410,17 +427,39 @@ def validate_process_reports(reports: tuple[ProcessReport, ...]) -> None:
     for report in reports:
         if tuple(item[0] for item in report.runtime_mappings) != mapping_roles:
             raise ValueError("process report loaded mapping role roster drift")
-        for role, path, start, end in report.runtime_mappings:
-            if not path.startswith("/") or type(start) is not int or type(end) is not int or not 0 < start < end:
+        for role, path, device, inode, start, end, sha256 in report.runtime_mappings:
+            if (
+                not path.startswith("/")
+                or str(PurePosixPath(path)) != path
+                or re.fullmatch(r"[0-9a-f]+:[0-9a-f]+", device) is None
+                or type(inode) is not int
+                or inode <= 0
+                or type(start) is not int
+                or type(end) is not int
+                or not 0 < start < end
+            ):
                 raise ValueError(f"process report loaded mapping range drift: {role}")
-    mapping_paths = [tuple((role, path) for role, path, _, _ in report.runtime_mappings) for report in reports]
+            _require_sha(sha256, "loaded mapping digest")
+    mapping_paths = [
+        tuple((role, path, device, inode, sha256) for role, path, device, inode, _, _, sha256 in report.runtime_mappings)
+        for report in reports
+    ]
     if len(set(mapping_paths)) != 1:
-        raise ValueError("process reports loaded different runtime mapping paths")
+        raise ValueError("process reports loaded different runtime file identities")
     expected_names = {
         "cuda_pjrt_plugin": "xla_cuda_plugin.so",
         "cuda_plugin_extension": "cuda_plugin_extension.so",
         "jax_common": "libjax_common.so",
         "jax_extension": "_jax.so",
     }
-    if any(Path(path).name != expected_names[role] for role, path in mapping_paths[0]):
+    if any(Path(path).name != expected_names[role] for role, path, _, _, _ in mapping_paths[0]):
         raise ValueError("process report loaded mapping filename drift")
+    digest_keys = {
+        "cuda_pjrt_plugin": "cuda_pjrt_plugin_sha256",
+        "cuda_plugin_extension": "cuda_plugin_extension_sha256",
+        "jax_common": "jax_common_sha256",
+        "jax_extension": "jax_extension_sha256",
+    }
+    binaries = dict(identities[0])
+    if any(sha256 != binaries[digest_keys[role]] for role, _, _, _, sha256 in mapping_paths[0]):
+        raise ValueError("process loaded mapping digest differs from its exact runtime role")

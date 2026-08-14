@@ -3,7 +3,6 @@
 
 """Collect raw untimed ABI15 ordinary-JAX H100 evidence."""
 
-import argparse
 import hashlib
 import importlib.metadata
 import json
@@ -18,7 +17,6 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
-import jaxlib
 import ml_dtypes
 import numpy as np
 from abi15_h100_composed_contract import load_contract
@@ -49,7 +47,6 @@ from shuttle_jaxlib_target1_acceptance import (
 
 from shuttle import ExecutionMode, Materialization, Numerics, Tuning, compiler_options
 
-JAX_VERSION = "0.10.1"
 JAXLIB_VERSION = "0.10.1"
 WORKERS = ("baseline", "populate", "reuse")
 DATASETS = {"dense": dense_inputs, "sparse_policy_discriminator": sparse_policy_inputs}
@@ -148,26 +145,50 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _mapped_files() -> dict[Path, tuple[tuple[int, int], ...]]:
+def _mapped_files() -> dict[Path, tuple[tuple[int, int, str, int], ...]]:
     maps = Path("/proc/self/maps")
     if not maps.is_file():
         raise RuntimeError("ABI15 H100 evidence requires Linux /proc/self/maps")
-    paths: dict[Path, list[tuple[int, int]]] = {}
+    paths: dict[Path, list[tuple[int, int, str, int]]] = {}
     for line in maps.read_text().splitlines():
         fields = line.split(maxsplit=5)
         if len(fields) == 6 and fields[5].startswith("/"):
             path = Path(fields[5].removesuffix(" (deleted)")).resolve()
             if path.is_file() and not path.is_symlink():
                 start_text, end_text = fields[0].split("-", maxsplit=1)
-                paths.setdefault(path, []).append((int(start_text, 16), int(end_text, 16)))
+                paths.setdefault(path, []).append((int(start_text, 16), int(end_text, 16), fields[3], int(fields[4])))
     return {path: tuple(ranges) for path, ranges in paths.items()}
 
 
-def _one_mapped(mapped: dict[Path, tuple[tuple[int, int], ...]], name: str) -> Path:
+def _one_mapped(mapped: dict[Path, tuple[tuple[int, int, str, int], ...]], name: str) -> Path:
     matches = [path for path in mapped if path.name == name]
     if len(matches) != 1:
         raise RuntimeError(f"expected exactly one mapped {name}")
     return matches[0]
+
+
+def _mapping_record(
+    role: str,
+    path: Path,
+    ranges: tuple[tuple[int, int, str, int], ...],
+) -> tuple[str, str, str, int, int, int, str]:
+    if path.is_symlink() or not path.is_file() or not ranges:
+        raise RuntimeError(f"loaded {role} mapping is not one existing regular file")
+    devices = {device for _, _, device, _ in ranges}
+    inodes = {inode for _, _, _, inode in ranges}
+    file_stat = path.stat()
+    expected_device = f"{os.major(file_stat.st_dev):02x}:{os.minor(file_stat.st_dev):02x}"
+    if devices != {expected_device} or inodes != {file_stat.st_ino}:
+        raise RuntimeError(f"mapped device/inode identity differs from loaded {role} bytes")
+    return (
+        role,
+        str(path),
+        expected_device,
+        file_stat.st_ino,
+        min(start for start, _, _, _ in ranges),
+        max(end for _, end, _, _ in ranges),
+        _sha256_file(path),
+    )
 
 
 def _distribution_record(distribution: importlib.metadata.Distribution) -> Path:
@@ -180,7 +201,10 @@ def _distribution_record(distribution: importlib.metadata.Distribution) -> Path:
     return Path(distribution.locate_file(records[0])).resolve()
 
 
-def _runtime_binary_identity() -> tuple[tuple[tuple[str, str], ...], tuple[tuple[str, str, int, int], ...]]:
+def _runtime_binary_identity() -> tuple[
+    tuple[tuple[str, str], ...],
+    tuple[tuple[str, str, str, int, int, int, str], ...],
+]:
     mapped = _mapped_files()
     extension = Path(_jax.__file__).resolve()
     plugin_package = sys.modules.get("jax_plugins.cuda")
@@ -214,15 +238,7 @@ def _runtime_binary_identity() -> tuple[tuple[tuple[str, str], ...], tuple[tuple
     }
     mappings = []
     for role, path in sorted(mapping_paths.items()):
-        ranges = mapped[path]
-        mappings.append(
-            (
-                role,
-                str(path),
-                min(start for start, _ in ranges),
-                max(end for _, end in ranges),
-            )
-        )
+        mappings.append(_mapping_record(role, path, mapped[path]))
     return digests, tuple(mappings)
 
 
@@ -278,7 +294,8 @@ def run_populate(output: Path, cache_directory: Path) -> ProcessReport:
         if len(new_entries) != 1:
             raise RuntimeError("each ABI15 policy must add one cache entry")
         name = new_entries.pop()
-        policy_entries[policy] = after[name][1]
+        size, digest = after[name]
+        policy_entries[policy] = (name, size, digest)
         cache_output = output / roles[f"cache_entry_{policy}"]
         cache_output.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(cache_directory / name, cache_output)
@@ -294,7 +311,7 @@ def run_populate(output: Path, cache_directory: Path) -> ProcessReport:
         counter.count,
         observer_events,
         (),
-        tuple(sorted(policy_entries.items())),
+        tuple((policy, *record) for policy, record in sorted(policy_entries.items())),
         binaries,
         mappings,
     )
@@ -327,7 +344,16 @@ def run_reuse(output: Path, cache_directory: Path) -> ProcessReport:
         raise RuntimeError("ABI15 reuse must hit twice without observer or cache mutation")
     _write_json(output / roles["cache_reuse_before"], _cache_record(before))
     _write_json(output / roles["cache_reuse_after"], _cache_record(after))
-    entries = tuple(sorted((policy, digest) for policy, digest in _policy_cache_digests(output, roles).items()))
+    copied = _policy_cache_digests(output, roles)
+    snapshot_by_digest = {digest: (name, size) for name, (size, digest) in before.items()}
+    if len(snapshot_by_digest) != len(before) or set(copied.values()) != set(snapshot_by_digest):
+        raise RuntimeError("ABI15 reuse cache bytes do not map uniquely to both policy entries")
+    entries = tuple(
+        sorted(
+            (policy, snapshot_by_digest[digest][0], snapshot_by_digest[digest][1], digest)
+            for policy, digest in copied.items()
+        )
+    )
     binaries, mappings = _runtime_binary_identity()
     return ProcessReport(
         "reuse",
@@ -358,8 +384,16 @@ def _report_value(report: ProcessReport) -> dict[str, object]:
         "process": report.process,
         "runtime_binaries": dict(report.runtime_binaries),
         "runtime_mappings": [
-            {"end": end, "path": path, "role": role, "start": start}
-            for role, path, start, end in report.runtime_mappings
+            {
+                "device": device,
+                "end": end,
+                "inode": inode,
+                "path": path,
+                "role": role,
+                "sha256": sha256,
+                "start": start,
+            }
+            for role, path, device, inode, start, end, sha256 in report.runtime_mappings
         ],
     }
 
@@ -372,9 +406,10 @@ def worker_command(
     authorization_sha256: str,
 ) -> list[str]:
     """Return the exact fresh-process worker argv."""
+    launcher = Path(__file__).with_name("abi15_h100_evidence_launcher.py")
     return [
         sys.executable,
-        str(Path(__file__).resolve()),
+        str(launcher.resolve()),
         "--authorization-sha256",
         authorization_sha256,
         "--cache-directory",
@@ -457,7 +492,18 @@ def run_orchestrator(
                 tuple(tuple(item) for item in value["cache_before"]),
                 tuple(tuple(item) for item in value["cache_after"]),
                 tuple(sorted(value["runtime_binaries"].items())),
-                tuple((item["role"], item["path"], item["start"], item["end"]) for item in value["runtime_mappings"]),
+                tuple(
+                    (
+                        item["role"],
+                        item["path"],
+                        item["device"],
+                        item["inode"],
+                        item["start"],
+                        item["end"],
+                        item["sha256"],
+                    )
+                    for item in value["runtime_mappings"]
+                ),
             )
         )
     validate_process_reports(tuple(reports))
@@ -470,28 +516,3 @@ def run_orchestrator(
         harness_commit=harness_commit,
         harness_tree=harness_tree,
     )
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--authorization-sha256", required=True)
-    parser.add_argument("--cache-directory", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--report", type=Path, required=True)
-    parser.add_argument("--worker", choices=WORKERS, required=True)
-    arguments = parser.parse_args()
-    require_sealed_hardware_authority()
-    if jax.__version__ != JAX_VERSION or jaxlib.__version__ != JAXLIB_VERSION or jax.default_backend() != "gpu":
-        raise RuntimeError("ABI15 subject requires exact JAX 0.10.1 on the CUDA backend")
-    if arguments.worker == "baseline":
-        report = run_baseline(arguments.output)
-    elif arguments.worker == "populate":
-        report = run_populate(arguments.output, arguments.cache_directory)
-    else:
-        report = run_reuse(arguments.output, arguments.cache_directory)
-    _write_json(arguments.report, _report_value(report))
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
