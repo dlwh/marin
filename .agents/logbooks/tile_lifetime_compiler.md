@@ -4827,3 +4827,41 @@ author: dlwh
   Changed-files precommit passes. No push, integration, PTX assembly, CUDA
   execution, numerical or persistent-cache acceptance, timing, profiling,
   hardware reservation, upload, or scorecard change occurred.
+
+### 2026-08-14 - TLTC-MLIR-021 ABI 15 composed H100 local pre-run checkpoint
+
+- A local pre-run contract now freezes one ordinary-JAX 0.10.1 composed
+  matmul-plus-VJP cell at `(M,K,N)=(33,2,34)` for both SOURCE_ORDERED and
+  FAST. The public boundary is `(lhs,rhs,dy)->(y,dLHS,dRHS)` with BF16 inputs
+  and results. Pairwise-distinct dimensions expose both noncanonical VJP
+  Contract maps and the transpose Map; the reduction extent crosses the FAST
+  warp boundary in each gradient Contract.
+- The dense dyadic input set has exact rational real-algebra and binary32-FMA
+  oracles. A sparse cancellation set distinguishes the two reduction
+  policies: SOURCE_ORDERED produces selected zero gradient elements while
+  FAST produces BF16 `1.0`. Exact aggregate errors are computed without host
+  floating-point aggregation. The sealed JSON and ordinary-JAX fixture
+  SHA-256 values are
+  `7b681b7a74eef86a3ce257f396dab442150a5cca41580f953f745add741849ba`
+  and `f82300541a6009beb1d3785d42cf613eb338c8c1d91b331c162e0a4e2c3c7e4e`.
+- The contract binds pipeline ABI 15, target
+  `shuttle.gpu.executable_bundle.v2`, schemas `2/2/2/3/3/2`, two custom calls
+  and twelve launches per policy, an expected twenty-four PTX slices across
+  policies, the three-process baseline/populate/reuse shape, public option
+  digests, and both generated and final observer fingerprints. A
+  semantics-only validator recomputes these joins; it does not establish an
+  external authority root.
+- Exact local series: pre-run checkpoint
+  `05a5272df33e563d07f62588d92d56d575c175a2`; semantic-join repair
+  `7f0ed2e80a4f0c4dd8496d46b3489b5f24c7c6e2`; mutation-sensitive test
+  closure `1fea57ed951c0a563cc7e217859cc0c550470a45`, tree
+  `13dfbcf4c23d3daa98e5e9d10b1c89fcfa3e81f0`. Independent review returned
+  strict GO with no P1 or P2 findings. Normal-path focused coverage passes
+  24/24 and the complete JAX-patch suite passes 475/475. Changed-files
+  precommit passes.
+- This is a sealed local fixture/oracle checkpoint only. Hardware authority is
+  null. It does not contain a source-derived Linux CUDA build, real plugin
+  registration receipt, SM90 assembly, loaded runtime identities, observer
+  capture, persistent-cache process transition, artifact retrieval receipt,
+  timing, upload, or H100 execution. No image build, network action, hardware
+  reservation, push, integration, or scorecard change occurred.
