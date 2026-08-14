@@ -4,7 +4,7 @@
 from shuttle import ExecutionMode, Materialization, Numerics, Tuning, compiler_options, options_digest
 
 
-def test_abi15_gpu_contract_options_have_a_distinct_default_cache_identity() -> None:
+def test_abi16_gpu_contract_options_have_a_distinct_default_cache_identity() -> None:
     tuning = Tuning(
         tile_sizes=(),
         cluster_shape=(),
@@ -20,7 +20,7 @@ def test_abi15_gpu_contract_options_have_a_distinct_default_cache_identity() -> 
 
     assert options["xla_shuttle_options"] == (
         '{"execution_mode":"gpu_executable_bundle","numerics":"source_ordered",'
-        '"pipeline_abi_version":15,"schema_version":1,'
+        '"pipeline_abi_version":16,"schema_version":1,'
         '"tuning":{"cluster_shape":[],"materialization":"automatic",'
         '"maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}}'
     )
@@ -30,5 +30,5 @@ def test_abi15_gpu_contract_options_have_a_distinct_default_cache_identity() -> 
             numerics=Numerics.SOURCE_ORDERED,
             tuning=tuning,
         )
-        == "eb76511f92eba13b902374a3448cb1c8d3fa3ac97ee16c37843be6aef2845c1b"
+        == "7575b915652e127025c055d6a456e8e260d07d75b623d2fbe6a9e2b1958b209d"
     )
