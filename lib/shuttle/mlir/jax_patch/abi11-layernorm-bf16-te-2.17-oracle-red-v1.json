@@ -56,11 +56,79 @@
       "zero_centered_gamma": false
     }
   },
+  "execution": {
+    "epsilon": 0.00001,
+    "tensor_scaling_mode": "NVTE_DELAYED_TENSOR_SCALING",
+    "tensor_layout": "row_major_contiguous_c_order",
+    "backend_control": {
+      "scope": "process_global",
+      "isolation": "one_fresh_process_per_plan_record",
+      "order": [
+        "select_current_cuda_device",
+        "read_cudaDeviceProp.multiProcessorCount",
+        "nvte_enable_cudnn_norm_fwd(forward_backend_equals_cudnn)",
+        "nvte_enable_cudnn_norm_bwd(backward_backend_equals_cudnn_null_maps_false)",
+        "query_each_required_workspace_in_boundary_call_order",
+        "execute_boundary_calls_in_declared_order"
+      ]
+    },
+    "workspace": {
+      "query": "call_same_nvte_entry_point_once_with_empty_workspace_tensor",
+      "query_effect": "no_operation_workspace_shape_and_dtype_only",
+      "required_dtype": "kNVTEByte",
+      "allocation": "allocate_exact_returned_shape_and_dtype",
+      "execution": "call_same_nvte_entry_point_again_with_allocated_workspace"
+    },
+    "multiprocessor_count": {
+      "source": "cudaDeviceProp.multiProcessorCount",
+      "device": "same_current_cuda_device_as_all_record_tensors_and_stream",
+      "capture": "record_integer_before_workspace_query_and_execution"
+    }
+  },
+  "tensors": {
+    "x": {"shape": ["rows", "columns"], "dtype": "kNVTEBFloat16", "layout": "row_major_contiguous_c_order"},
+    "gamma": {"shape": ["columns"], "dtype": "kNVTEBFloat16", "layout": "row_major_contiguous_c_order"},
+    "beta": {"shape": ["columns"], "dtype": "kNVTEBFloat16", "layout": "row_major_contiguous_c_order"},
+    "dy": {"shape": ["rows", "columns"], "dtype": "kNVTEBFloat16", "layout": "row_major_contiguous_c_order"},
+    "y": {"shape": ["rows", "columns"], "dtype": "kNVTEBFloat16", "layout": "row_major_contiguous_c_order"},
+    "dx": {"shape": ["rows", "columns"], "dtype": "kNVTEBFloat16", "layout": "row_major_contiguous_c_order"},
+    "dgamma": {"shape": ["columns"], "dtype": "kNVTEBFloat16", "layout": "row_major_contiguous_c_order"},
+    "dbeta": {"shape": ["columns"], "dtype": "kNVTEBFloat16", "layout": "row_major_contiguous_c_order"},
+    "mu": {"shape": ["rows"], "dtype": "kNVTEFloat32", "layout": "row_major_contiguous_c_order"},
+    "rsigma": {"shape": ["rows"], "dtype": "kNVTEFloat32", "layout": "row_major_contiguous_c_order"},
+    "zero_beta": {"shape": ["columns"], "dtype": "kNVTEBFloat16", "layout": "row_major_contiguous_c_order", "value": "all_zero_bits"},
+    "throwaway_y": {"shape": ["rows", "columns"], "dtype": "kNVTEBFloat16", "layout": "row_major_contiguous_c_order"},
+    "forward_workspace": {"shape": "exact_forward_query_result", "dtype": "kNVTEByte", "layout": "row_major_contiguous_c_order"},
+    "backward_workspace": {"shape": "exact_backward_query_result", "dtype": "kNVTEByte", "layout": "row_major_contiguous_c_order"}
+  },
   "runner": {
     "path": "lib/shuttle/mlir/jax_patch/abi11_layernorm_te_oracle_runner.py",
     "dry_run_argv": ["--contract", "abi11-layernorm-bf16-te-2.17-oracle-red-v1.json", "--print-plan"],
     "dry_run_requires_cuda": false,
-    "expected_plan_records": 20
+    "expected_plan_records": 20,
+    "canonical_plan_sha256": "f42f251961131e5b1c870161f48da14e018001e4aa762752d82d0a7a8c1a6965",
+    "canonical_plan": [
+      {"ordinal": 0, "shape": [2048, 4096], "boundary": "forward", "forward_backend": "transformer_engine", "backward_backend": null},
+      {"ordinal": 1, "shape": [2048, 4096], "boundary": "forward", "forward_backend": "cudnn", "backward_backend": null},
+      {"ordinal": 2, "shape": [2048, 4096], "boundary": "backward_recompute", "forward_backend": "transformer_engine", "backward_backend": "transformer_engine"},
+      {"ordinal": 3, "shape": [2048, 4096], "boundary": "backward_recompute", "forward_backend": "transformer_engine", "backward_backend": "cudnn"},
+      {"ordinal": 4, "shape": [2048, 4096], "boundary": "backward_recompute", "forward_backend": "cudnn", "backward_backend": "transformer_engine"},
+      {"ordinal": 5, "shape": [2048, 4096], "boundary": "backward_recompute", "forward_backend": "cudnn", "backward_backend": "cudnn"},
+      {"ordinal": 6, "shape": [2048, 4096], "boundary": "composed", "forward_backend": "transformer_engine", "backward_backend": "transformer_engine"},
+      {"ordinal": 7, "shape": [2048, 4096], "boundary": "composed", "forward_backend": "transformer_engine", "backward_backend": "cudnn"},
+      {"ordinal": 8, "shape": [2048, 4096], "boundary": "composed", "forward_backend": "cudnn", "backward_backend": "transformer_engine"},
+      {"ordinal": 9, "shape": [2048, 4096], "boundary": "composed", "forward_backend": "cudnn", "backward_backend": "cudnn"},
+      {"ordinal": 10, "shape": [7, 13], "boundary": "forward", "forward_backend": "transformer_engine", "backward_backend": null},
+      {"ordinal": 11, "shape": [7, 13], "boundary": "forward", "forward_backend": "cudnn", "backward_backend": null},
+      {"ordinal": 12, "shape": [7, 13], "boundary": "backward_recompute", "forward_backend": "transformer_engine", "backward_backend": "transformer_engine"},
+      {"ordinal": 13, "shape": [7, 13], "boundary": "backward_recompute", "forward_backend": "transformer_engine", "backward_backend": "cudnn"},
+      {"ordinal": 14, "shape": [7, 13], "boundary": "backward_recompute", "forward_backend": "cudnn", "backward_backend": "transformer_engine"},
+      {"ordinal": 15, "shape": [7, 13], "boundary": "backward_recompute", "forward_backend": "cudnn", "backward_backend": "cudnn"},
+      {"ordinal": 16, "shape": [7, 13], "boundary": "composed", "forward_backend": "transformer_engine", "backward_backend": "transformer_engine"},
+      {"ordinal": 17, "shape": [7, 13], "boundary": "composed", "forward_backend": "transformer_engine", "backward_backend": "cudnn"},
+      {"ordinal": 18, "shape": [7, 13], "boundary": "composed", "forward_backend": "cudnn", "backward_backend": "transformer_engine"},
+      {"ordinal": 19, "shape": [7, 13], "boundary": "composed", "forward_backend": "cudnn", "backward_backend": "cudnn"}
+    ]
   },
   "coordinates": {
     "shapes": [[2048, 4096], [7, 13]],
