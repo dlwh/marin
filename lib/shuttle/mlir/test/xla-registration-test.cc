@@ -36,6 +36,10 @@ constexpr char kAbi12ContractSourceOrderedOptions[] =
     R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":12,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
 constexpr char kAbi12ContractFastOptions[] =
     R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":12,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+constexpr char kAbi13ContractSourceOrderedOptions[] =
+    R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":13,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+constexpr char kAbi13ContractFastOptions[] =
+    R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":13,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
 constexpr char kProgram[] = R"mlir(
 module {
   func.func @main(%arg0: tensor<7xf32>) -> tensor<7xf32> {
@@ -205,6 +209,60 @@ TEST(ShuttleXlaOptionsTest, Abi12ContractRejectsNonDefaultTuning) {
     ASSERT_TRUE(module);
     EXPECT_TRUE(
         mlir::failed(mlir::shuttle::runShuttleXlaTransform(*module, *options)));
+  }
+}
+
+TEST(ShuttleXlaOptionsTest,
+     Abi13ParsesSeparateSourceOrderedAndFastContractCacheIdentities) {
+  auto sourceOrdered =
+      mlir::shuttle::parseShuttleXlaOptions(kAbi13ContractSourceOrderedOptions);
+  auto fast = mlir::shuttle::parseShuttleXlaOptions(kAbi13ContractFastOptions);
+  ASSERT_TRUE(sourceOrdered.ok()) << sourceOrdered.status();
+  ASSERT_TRUE(fast.ok()) << fast.status();
+  EXPECT_EQ(sourceOrdered->canonicalOptions,
+            kAbi13ContractSourceOrderedOptions);
+  EXPECT_EQ(fast->canonicalOptions, kAbi13ContractFastOptions);
+  EXPECT_EQ(mlir::shuttle::shuttlePipelineIdentity(*sourceOrdered).policyDigest,
+            "432ecf5407e7c81d32a8b3515c050681e02f2f7f90d24988eee35ea449ccb5bd");
+  EXPECT_EQ(mlir::shuttle::shuttlePipelineIdentity(*fast).policyDigest,
+            "ca8b645b98c7a601ec26a037f7dcd661d2082a9602af76d9d9f845d9bf11da51");
+  EXPECT_NE(mlir::shuttle::shuttlePipelineIdentity(*sourceOrdered).policyDigest,
+            mlir::shuttle::shuttlePipelineIdentity(*fast).policyDigest);
+}
+
+TEST(ShuttleXlaOptionsTest, Abi13RejectsAdjacentContractPipelineAbis) {
+  constexpr const char *invalid[] = {
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":12,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":14,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
+  };
+  for (const char *serialized : invalid)
+    EXPECT_EQ(mlir::shuttle::parseShuttleXlaOptions(serialized).status().code(),
+              absl::StatusCode::kInvalidArgument);
+}
+
+TEST(ShuttleXlaOptionsTest,
+     Abi13RunsOrdinaryJaxContractMapThroughBothPolicyEntries) {
+  constexpr const char *serializedPolicies[] = {
+      kAbi13ContractSourceOrderedOptions,
+      kAbi13ContractFastOptions,
+  };
+  for (const char *serialized : serializedPolicies) {
+    auto options = mlir::shuttle::parseShuttleXlaOptions(serialized);
+    ASSERT_TRUE(options.ok()) << options.status();
+    mlir::MLIRContext context;
+    mlir::OwningOpRef<mlir::ModuleOp> module =
+        parseModule(context, kContractMapProgram);
+    ASSERT_TRUE(module);
+    ASSERT_TRUE(mlir::succeeded(
+        mlir::shuttle::runShuttleXlaTransform(*module, *options)));
+    std::string transformed;
+    llvm::raw_string_ostream output(transformed);
+    module->print(output);
+    output.flush();
+    EXPECT_EQ(transformed.find("shuttle.region"), std::string::npos);
+    EXPECT_EQ(transformed.find("stablehlo.dot_general"), std::string::npos);
+    EXPECT_NE(transformed.find("shuttle.gpu.executable_bundle.v2"),
+              std::string::npos);
   }
 }
 

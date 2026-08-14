@@ -1285,7 +1285,8 @@ public:
         return;
       }
     }
-    getOperation().emitError("test fixture has no Contract materialization task");
+    getOperation().emitError(
+        "test fixture has no Contract materialization task");
     signalPassFailure();
   }
 };
@@ -1654,16 +1655,74 @@ public:
            plan.getBody().front().getOps<ScheduleTaskOp>()) {
         if (task.getKind() == ScheduleTaskKind::RowFold ||
             task.getKind() == ScheduleTaskKind::Contract) {
-          task->setAttr(
-              "reduction_order",
-              ScheduleReductionOrderAttr::get(
-                  task.getContext(), ScheduleReductionOrder::LeafOrderFree));
+          ScheduleReductionOrder replacement =
+              task.getReductionOrder() == ScheduleReductionOrder::LeafOrderFree
+                  ? ScheduleReductionOrder::SerialAscendingFmaRnF32
+                  : ScheduleReductionOrder::LeafOrderFree;
+          task->setAttr("reduction_order", ScheduleReductionOrderAttr::get(
+                                               task.getContext(), replacement));
           refreshScheduleFingerprint(plan);
           return;
         }
       }
     }
     getOperation().emitError("test fixture has no reducible schedule task");
+    signalPassFailure();
+  }
+};
+
+class ContractScheduleMutationPass
+    : public MutationPass<ContractScheduleMutationPass> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ContractScheduleMutationPass)
+  ContractScheduleMutationPass() = default;
+  ContractScheduleMutationPass(const ContractScheduleMutationPass &other)
+      : MutationPass<ContractScheduleMutationPass>(other) {}
+  Option<std::string> kind{*this, "kind", llvm::cl::desc("Mutation kind"),
+                           llvm::cl::init("")};
+  StringRef getArgument() const final {
+    return "shuttle-test-mutate-contract-schedule";
+  }
+  void runOnOperation() override {
+    SchedulePlanOp plan = schedulePlan(getOperation());
+    if (!plan) {
+      getOperation().emitError("test fixture has no schedule plan");
+      return signalPassFailure();
+    }
+    for (ScheduleTaskOp task :
+         plan.getBody().front().getOps<ScheduleTaskOp>()) {
+      if (task.getKind() != ScheduleTaskKind::Contract) {
+        continue;
+      }
+      StringRef mutation = kind;
+      if (mutation == "grid") {
+        SmallVector<int64_t> grid(task.getGridShape());
+        ++grid.front();
+        task->setAttr("grid_shape",
+                      DenseI64ArrayAttr::get(task.getContext(), grid));
+      } else if (mutation == "tile") {
+        SmallVector<int64_t> tile(task.getTileShape());
+        ++tile.front();
+        task->setAttr("tile_shape",
+                      DenseI64ArrayAttr::get(task.getContext(), tile));
+      } else if (mutation == "serial") {
+        task.setSerialTiles(task.getSerialTiles() + 1);
+      } else if (mutation == "threads") {
+        task.setWorkgroupThreads(task.getWorkgroupThreads() + 32);
+      } else if (mutation == "subgroup") {
+        task.setSubgroupSize(64);
+      } else if (mutation == "axis") {
+        task->setAttr(
+            "reduction_axis",
+            IntegerAttr::get(task.getReductionAxisAttr().getType(), 1));
+      } else {
+        getOperation().emitError("unknown Contract schedule mutation kind");
+        return signalPassFailure();
+      }
+      refreshScheduleFingerprint(plan);
+      return;
+    }
+    getOperation().emitError("test fixture has no Contract schedule task");
     signalPassFailure();
   }
 };
@@ -1813,6 +1872,16 @@ public:
       device.setCodeAttr(DenseI8ArrayAttr::get(module.getContext(), code));
       refreshExecutableBundle(module, true);
       return;
+    } else if (mutation == "contract-body") {
+      DeviceEntryOp contract = entries.front();
+      SmallVector<int8_t> code(device.getCode());
+      code[contract.getCodeOffset() + contract.getCodeLength() - 1] ^= 1;
+      device.setCodeAttr(DenseI8ArrayAttr::get(module.getContext(), code));
+      device.setCodeDigest(executableCodeDigest(device.getCode()));
+      contract.setCodeDigest(executableCodeDigest(device.getCode().slice(
+          contract.getCodeOffset(), contract.getCodeLength())));
+      refreshExecutableBundle(module, false);
+      return;
     } else if (mutation == "output-binding") {
       SmallVector<InvocationSlotOp> outputs;
       for (InvocationSlotOp slot : slots) {
@@ -1953,6 +2022,7 @@ void registerMutationPasses() {
   PassRegistration<ScheduleTaskUnknownAttributePass>();
   PassRegistration<ScheduleTargetProfilePass>();
   PassRegistration<ScheduleReductionOrderPass>();
+  PassRegistration<ContractScheduleMutationPass>();
   PassRegistration<ScheduleLifetimePass>();
   PassRegistration<RenameSymbolsPass>();
   PassRegistration<SetFastRegionPolicyPass>();
