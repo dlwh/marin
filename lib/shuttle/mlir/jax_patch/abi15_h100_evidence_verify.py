@@ -3,14 +3,20 @@
 
 """Independently verify one raw, untimed ABI15 H100 subject artifact."""
 
+import base64
+import csv
 import hashlib
+import io
 import json
 import struct
 import zipfile
 from collections.abc import Mapping
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
+from abi15_h100_architecture_contract import (
+    FILENAME as ARCHITECTURE_BUILD_CONTRACT_FILENAME,
+)
 from abi15_h100_composed_contract import load_contract
 from abi15_h100_evidence import (
     ProcessReport,
@@ -26,6 +32,7 @@ from abi15_h100_gpu_transport import (
     CallRole,
     NumericalPolicy,
     TransportCoordinate,
+    extract_gpu_transports,
     gpu_transport_descriptor,
     load_gpu_transport,
 )
@@ -63,6 +70,14 @@ def _load_json(path: Path, name: str) -> dict[str, Any]:
     value = json.loads(raw)
     if type(value) is not dict or raw != _canonical_json(value):
         raise ValueError(f"{name} must be one canonical JSON object")
+    return value
+
+
+def _load_json_value(path: Path, name: str) -> object:
+    raw = path.read_bytes()
+    value = json.loads(raw)
+    if raw != _canonical_json(value):
+        raise ValueError(f"{name} must use canonical JSON")
     return value
 
 
@@ -139,6 +154,8 @@ def _process_report(path: Path, expected_process: str) -> ProcessReport:
         "observer_events",
         "pid",
         "process",
+        "runtime_binaries",
+        "runtime_mappings",
     }:
         raise ValueError(f"{expected_process} report uses an open schema")
     if (
@@ -147,6 +164,11 @@ def _process_report(path: Path, expected_process: str) -> ProcessReport:
         or type(value["cache_after"]) is not list
     ):
         raise ValueError(f"{expected_process} report identity or cache schema drift")
+    mappings = value["runtime_mappings"]
+    if type(mappings) is not list or any(
+        type(item) is not dict or set(item) != {"end", "path", "role", "start"} for item in mappings
+    ):
+        raise ValueError(f"{expected_process} report loaded mapping schema drift")
     return ProcessReport(
         process=value["process"],
         pid=value["pid"],
@@ -154,6 +176,10 @@ def _process_report(path: Path, expected_process: str) -> ProcessReport:
         observer_events=value["observer_events"],
         cache_before=tuple(tuple(item) for item in value["cache_before"]),
         cache_after=tuple(tuple(item) for item in value["cache_after"]),
+        runtime_binaries=(
+            tuple(sorted(value["runtime_binaries"].items())) if type(value["runtime_binaries"]) is dict else ()
+        ),
+        runtime_mappings=tuple((item["role"], item["path"], item["start"], item["end"]) for item in mappings),
     )
 
 
@@ -163,6 +189,62 @@ def validate_observer_and_process_files(root: Path, roles: Mapping[str, str]) ->
         _process_report(root / roles[f"{process}_report"], process) for process in ("baseline", "populate", "reuse")
     )
     validate_process_reports(reports)
+    expected_runtime = tuple(
+        sorted(
+            (
+                (
+                    "cuda_pjrt_plugin_sha256",
+                    _sha256((root / roles["cuda_pjrt_plugin"]).read_bytes()),
+                ),
+                (
+                    "cuda_pjrt_record_sha256",
+                    _sha256((root / roles["cuda_pjrt_record"]).read_bytes()),
+                ),
+                (
+                    "cuda_plugin_extension_sha256",
+                    _sha256((root / roles["cuda_plugin_extension"]).read_bytes()),
+                ),
+                (
+                    "cuda_plugin_record_sha256",
+                    _sha256((root / roles["cuda_plugin_record"]).read_bytes()),
+                ),
+                (
+                    "jax_common_sha256",
+                    _sha256((root / roles["jax_common"]).read_bytes()),
+                ),
+                (
+                    "jax_extension_sha256",
+                    _sha256((root / roles["jax_extension"]).read_bytes()),
+                ),
+            )
+        )
+    )
+    if any(report.runtime_binaries != expected_runtime for report in reports):
+        raise ValueError("process loaded runtime bytes differ from manifested runtime roles")
+    populate_before = _load_json_value(root / roles["cache_populate_before"], "populate cache before")
+    populate_after = _load_json_value(root / roles["cache_populate_after"], "populate cache after")
+    reuse_before = _load_json_value(root / roles["cache_reuse_before"], "reuse cache before")
+    reuse_after = _load_json_value(root / roles["cache_reuse_after"], "reuse cache after")
+    if populate_before != [] or populate_after != reuse_before or populate_after != reuse_after:
+        raise ValueError("cache snapshot transition drift")
+    if type(populate_after) is not list or len(populate_after) != 2:
+        raise ValueError("cache snapshots must contain exactly two entries")
+    snapshot_digests = []
+    filenames = []
+    for record in populate_after:
+        if type(record) is not dict or set(record) != {"filename", "sha256", "size"}:
+            raise ValueError("cache snapshot entry uses an open schema")
+        if type(record["filename"]) is not str or type(record["size"]) is not int or record["size"] <= 0:
+            raise ValueError("cache snapshot filename or size drift")
+        filenames.append(record["filename"])
+        snapshot_digests.append(record["sha256"])
+    if filenames != sorted(set(filenames)):
+        raise ValueError("cache snapshot filenames are duplicate or reordered")
+    entry_by_policy = {
+        policy: _sha256((root / roles[f"cache_entry_{policy}"]).read_bytes()) for policy in ("fast", "source_ordered")
+    }
+    if sorted(snapshot_digests) != sorted(entry_by_policy.values()) or dict(reports[1].cache_after) != entry_by_policy:
+        raise ValueError("cache snapshots, copied entries, and process attribution differ")
     contract = load_contract()
     for policy in ("source_ordered", "fast"):
         populate_path = root / roles[f"observer_populate_{policy}"]
@@ -181,11 +263,25 @@ def validate_observer_and_process_files(root: Path, roles: Mapping[str, str]) ->
             raise ValueError(f"{policy} observer policy identity drift")
         if len({event["invocation_id"] for event in events}) != 1 or any(event["failure_pass"] for event in events):
             raise ValueError(f"{policy} observer invocation or failure state drift")
+        tuning = {event["tuning_digest"] for event in events}
+        if len(tuning) != 1 or any(type(value) is not str or len(value) != 64 for value in tuning):
+            raise ValueError(f"{policy} observer tuning identity drift")
+        for event in events[:2]:
+            if (
+                not event["region_membership"]
+                or not event["coverage_manifest"]
+                or not event["unsupported_fingerprint"]
+                or event["no_shuttle_semantics"] is not False
+            ):
+                raise ValueError(f"{policy} observer structural fields drift")
         if events[1]["normalized_module_fingerprint"] != identity.generated_fingerprint:
             raise ValueError(f"{policy} generated fingerprint drift")
         if (
             events[2]["normalized_module_fingerprint"] != identity.final_fingerprint
             or events[2]["no_shuttle_semantics"] is not True
+            or events[2]["region_membership"]
+            or events[2]["coverage_manifest"]
+            or events[2]["unsupported_fingerprint"]
         ):
             raise ValueError(f"{policy} final fingerprint or erasure drift")
         reuse_path = root / roles[f"observer_reuse_{policy}"]
@@ -203,9 +299,72 @@ def _validate_wheel_member(wheel: Path, suffix: str, extracted: Path, name: str)
             raise ValueError(f"{name} differs from its exact wheel member")
 
 
-def validate_build_and_transport_files(root: Path, roles: Mapping[str, str]) -> dict[str, object]:
+def _validate_record(record: Path, suffix: str, extracted: Path, name: str) -> None:
+    rows = tuple(csv.reader(io.StringIO(record.read_text())))
+    if any(
+        len(row) != 3 or PurePosixPath(row[0]).is_absolute() or ".." in PurePosixPath(row[0]).parts for row in rows
+    ) or len({row[0] for row in rows}) != len(rows):
+        raise ValueError(f"{name} RECORD is malformed or repeats a path")
+    matches = [row for row in rows if row[0].endswith(suffix)]
+    digest = base64.urlsafe_b64encode(hashlib.sha256(extracted.read_bytes()).digest()).rstrip(b"=").decode()
+    if len(matches) != 1 or matches[0][1:] != [
+        f"sha256={digest}",
+        str(extracted.stat().st_size),
+    ]:
+        raise ValueError(f"{name} RECORD does not bind the extracted runtime member")
+
+
+def _validate_registration_pointers(registered: object, mappings: object) -> None:
+    if (
+        type(registered) is not dict
+        or set(registered) != {"api_version", "stage_pointers", "target", "traits"}
+        or registered.get("target") != "shuttle.gpu.executable_bundle.v2"
+        or registered.get("api_version") != 1
+        or registered.get("traits") != 0
+    ):
+        raise ValueError("registration target drift")
+    pointers = registered.get("stage_pointers")
+    if type(pointers) is not dict or set(pointers) != {"instantiate", "prepare", "initialize", "execute"}:
+        raise ValueError("registration stage schema drift")
+    pointer_values = list(pointers.values())
+    if any(type(value) is not int or value <= 0 for value in pointer_values) or len(set(pointer_values)) != 4:
+        raise ValueError("registration stages must be distinct nonzero pointers")
+    if type(mappings) is not list or not mappings:
+        raise ValueError("registration transcript lacks plugin mapping ranges")
+    ranges = []
+    for mapping in mappings:
+        if type(mapping) is not dict or set(mapping) != {"end", "path", "start"}:
+            raise ValueError("registration plugin mapping uses an open schema")
+        if (
+            type(mapping["path"]) is not str
+            or not mapping["path"].startswith("/")
+            or type(mapping["start"]) is not int
+            or type(mapping["end"]) is not int
+            or not 0 < mapping["start"] < mapping["end"]
+        ):
+            raise ValueError("registration plugin mapping range drift")
+        ranges.append((mapping["start"], mapping["end"]))
+    if any(not any(start <= pointer < end for start, end in ranges) for pointer in pointer_values):
+        raise ValueError("registration stage pointer lies outside loaded plugin mappings")
+
+
+def validate_build_and_transport_files(
+    root: Path,
+    roles: Mapping[str, str],
+    *,
+    expected_harness_commit: str,
+    expected_harness_tree: str,
+) -> dict[str, object]:
     """Join build manifest, v2 registration, decoded transports, PTX, and cubins."""
     build = validate_build_candidate(_load_json(root / roles["build_manifest"], "build manifest"))
+    if (
+        build["source"]["harness_commit"] != expected_harness_commit
+        or build["source"]["harness_tree"] != expected_harness_tree
+    ):
+        raise ValueError("build manifest differs from the raw artifact harness identity")
+    architecture = root / roles["architecture_build_contract"]
+    if architecture.read_bytes() != Path(__file__).with_name(ARCHITECTURE_BUILD_CONTRACT_FILENAME).read_bytes():
+        raise ValueError("raw architecture/build contract bytes drift")
     for wheel_name, role in (
         ("jaxlib", "jaxlib_wheel"),
         ("cuda_plugin", "cuda_plugin_wheel"),
@@ -215,6 +374,20 @@ def validate_build_and_transport_files(root: Path, roles: Mapping[str, str]) -> 
         if build["wheels"][wheel_name] != {"sha256": _sha256(raw), "size": len(raw)}:
             raise ValueError(f"{wheel_name} wheel differs from the build manifest")
     registration = _load_json(root / roles["registration_transcript"], "registration transcript")
+    if (
+        set(registration)
+        != {
+            "exported_targets",
+            "pipeline_abi_version",
+            "plugin_extension_sha256",
+            "plugin_mappings",
+            "registration",
+            "schema_version",
+            "upstream_target_count",
+        }
+        or registration["schema_version"] != 1
+    ):
+        raise ValueError("registration transcript uses an open schema")
     if build["registration_transcript_sha256"] != _sha256(_canonical_json(registration)):
         raise ValueError("registration transcript differs from the build manifest")
     expected_plugin = _sha256((root / roles["cuda_plugin_extension"]).read_bytes())
@@ -228,26 +401,7 @@ def validate_build_and_transport_files(root: Path, roles: Mapping[str, str]) -> 
         or registration.get("upstream_target_count") != len(targets) - 1
     ):
         raise ValueError("registration transcript lacks one ABI15 v2 target")
-    registered = registration.get("registration")
-    if (
-        type(registered) is not dict
-        or set(registered) != {"api_version", "stage_pointers", "target", "traits"}
-        or registered.get("target") != "shuttle.gpu.executable_bundle.v2"
-        or registered.get("api_version") != 1
-        or registered.get("traits") != 0
-    ):
-        raise ValueError("registration target drift")
-    pointers = registered.get("stage_pointers")
-    if type(pointers) is not dict or set(pointers) != {
-        "instantiate",
-        "prepare",
-        "initialize",
-        "execute",
-    }:
-        raise ValueError("registration stage schema drift")
-    pointer_values = list(pointers.values())
-    if any(type(value) is not int or value <= 0 for value in pointer_values) or len(set(pointer_values)) != 4:
-        raise ValueError("registration stages must be distinct nonzero pointers")
+    _validate_registration_pointers(registration.get("registration"), registration["plugin_mappings"])
     _validate_wheel_member(
         root / roles["jaxlib_wheel"],
         "/_jax.so",
@@ -284,6 +438,43 @@ def validate_build_and_transport_files(root: Path, roles: Mapping[str, str]) -> 
         root / roles["cuda_pjrt_record"],
         "CUDA PJRT RECORD",
     )
+    _validate_record(
+        root / roles["cuda_plugin_record"],
+        "/cuda_plugin_extension.so",
+        root / roles["cuda_plugin_extension"],
+        "CUDA plugin",
+    )
+    _validate_record(
+        root / roles["cuda_pjrt_record"],
+        "/xla_cuda_plugin.so",
+        root / roles["cuda_pjrt_plugin"],
+        "CUDA PJRT plugin",
+    )
+    for policy in (NumericalPolicy.SOURCE_ORDERED, NumericalPolicy.FAST):
+        generated = (root / roles[f"compiled_mlir_{policy.value}"]).read_text()
+        forward, backward = extract_gpu_transports(generated)
+        if (
+            forward != (root / roles[f"transport_{policy.value}_forward"]).read_bytes()
+            or backward != (root / roles[f"transport_{policy.value}_backward"]).read_bytes()
+        ):
+            raise ValueError(f"{policy.value} generated MLIR and transport bytes differ")
+    expected_ptxas_records = []
+    for transport_record in build["transports"]:
+        for slice_record in transport_record["ptx_slices"]:
+            expected_ptxas_records.append(
+                {
+                    "call": transport_record["call"],
+                    "cubin_sha256": slice_record["cubin_sha256"],
+                    "ordinal": slice_record["ordinal"],
+                    "policy": transport_record["policy"],
+                    "ptx_sha256": slice_record["ptx_sha256"],
+                    "registers": slice_record["registers"],
+                    "spill_bytes": slice_record["spill_bytes"],
+                }
+            )
+    ptxas_records = _load_json_value(root / roles["ptxas_records"], "ptxas records")
+    if ptxas_records != expected_ptxas_records:
+        raise ValueError("PTXAS aggregate records differ from the 24 build slices")
     for transport_record in build["transports"]:
         policy = NumericalPolicy(transport_record["policy"])
         call = CallRole(transport_record["call"])
@@ -320,7 +511,7 @@ def validate_build_and_transport_files(root: Path, roles: Mapping[str, str]) -> 
 
 
 def verify_raw_artifact(root: Path, *, expected_harness_commit: str, expected_harness_tree: str) -> dict[str, object]:
-    """Return a controller-side report without authoring an accepted envelope."""
+    """Return a local semantic report without authoring or claiming acceptance."""
     artifact: RawArtifact = load_raw_artifact(
         root,
         expected_harness_commit=expected_harness_commit,
@@ -329,12 +520,17 @@ def verify_raw_artifact(root: Path, *, expected_harness_commit: str, expected_ha
     roles = expected_role_paths(load_role_manifest())
     report = {
         "artifact_manifest_sha256": artifact.manifest_sha256,
-        "build": validate_build_and_transport_files(artifact.root, roles),
+        "build": validate_build_and_transport_files(
+            artifact.root,
+            roles,
+            expected_harness_commit=expected_harness_commit,
+            expected_harness_tree=expected_harness_tree,
+        ),
         "numerical": validate_numerical_files(artifact.root, roles),
         "observer_cache": validate_observer_and_process_files(artifact.root, roles),
         "performance_status": "not_started",
         "schema_version": 1,
-        "status": "controller_verified_raw_artifact_untimed",
+        "status": "local_semantic_verification_only_not_accepted",
     }
     if (root / "accepted_bundle.json").exists():
         raise ValueError("raw verifier must not consume a task-authored acceptance envelope")

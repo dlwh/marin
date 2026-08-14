@@ -1,6 +1,8 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
+import base64
+import hashlib
 import json
 import struct
 from pathlib import Path
@@ -11,6 +13,8 @@ from abi15_h100_evidence import expected_role_paths, load_role_manifest
 from abi15_h100_evidence_verify import (
     OUTPUT_ROLES,
     RUNS,
+    _validate_record,
+    _validate_registration_pointers,
     validate_numerical_files,
     validate_observer_and_process_files,
 )
@@ -72,7 +76,40 @@ def _write_json(path: Path, value: object) -> None:
 
 def _observer_fixture(root: Path) -> dict[str, str]:
     roles = expected_role_paths(load_role_manifest())
-    cache = [("fast", "a" * 64), ("source_ordered", "b" * 64)]
+    cache = []
+    snapshots = []
+    for index, policy in enumerate(("fast", "source_ordered")):
+        contents = f"{policy}-cache".encode()
+        path = root / roles[f"cache_entry_{policy}"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(contents)
+        digest = hashlib.sha256(contents).hexdigest()
+        cache.append((policy, digest))
+        snapshots.append(
+            {
+                "filename": f"jit_composed-{index:064x}-cache",
+                "sha256": digest,
+                "size": len(contents),
+            }
+        )
+    _write_json(root / roles["cache_populate_before"], [])
+    _write_json(root / roles["cache_populate_after"], snapshots)
+    _write_json(root / roles["cache_reuse_before"], snapshots)
+    _write_json(root / roles["cache_reuse_after"], snapshots)
+    runtime_roles = {
+        "cuda_pjrt_plugin_sha256": "cuda_pjrt_plugin",
+        "cuda_pjrt_record_sha256": "cuda_pjrt_record",
+        "cuda_plugin_extension_sha256": "cuda_plugin_extension",
+        "cuda_plugin_record_sha256": "cuda_plugin_record",
+        "jax_common_sha256": "jax_common",
+        "jax_extension_sha256": "jax_extension",
+    }
+    runtime = {}
+    for field, role in runtime_roles.items():
+        path = root / roles[role]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(role.encode())
+        runtime[field] = hashlib.sha256(role.encode()).hexdigest()
     for process, pid, hits, event_count, before, after in (
         ("baseline", 100, 0, 0, [], []),
         ("populate", 101, 0, 6, [], cache),
@@ -87,6 +124,24 @@ def _observer_fixture(root: Path) -> dict[str, str]:
                 "observer_events": event_count,
                 "pid": pid,
                 "process": process,
+                "runtime_binaries": runtime,
+                "runtime_mappings": [
+                    {
+                        "end": pid * 0x10000 + (index + 1) * 0x1000,
+                        "path": f"/runtime/{filename}",
+                        "role": role,
+                        "start": pid * 0x10000 + index * 0x1000,
+                    }
+                    for index, (role, filename) in enumerate(
+                        (
+                            ("cuda_pjrt_plugin", "xla_cuda_plugin.so"),
+                            ("cuda_plugin_extension", "cuda_plugin_extension.so"),
+                            ("jax_common", "libjax_common.so"),
+                            ("jax_extension", "_jax.so"),
+                        ),
+                        1,
+                    )
+                ],
             },
         )
     contract = load_contract()
@@ -97,7 +152,7 @@ def _observer_fixture(root: Path) -> dict[str, str]:
             None,
             policy,
             identity.options_sha256,
-            "tuning",
+            "d" * 64,
             "region",
             "coverage",
             "unsupported",
@@ -113,9 +168,14 @@ def _observer_fixture(root: Path) -> dict[str, str]:
                 "",
             ],
             [
-                *common[:1],
+                "invocation",
                 "final_erasure",
-                *common[2:],
+                policy,
+                identity.options_sha256,
+                "d" * 64,
+                "",
+                "",
+                "",
                 identity.final_fingerprint,
                 True,
                 "",
@@ -171,12 +231,60 @@ def test_observer_verifier_binds_processes_policy_fingerprints_and_empty_reuse(
     assert report == {"observer_events": 6, "populate_hits": 0, "reuse_hits": 2}
 
 
-@pytest.mark.parametrize("mutation", ["generated", "policy", "reuse"])
+@pytest.mark.parametrize("mutation", ["pointer", "duplicate", "mapping", "extra"])
+def test_registration_pointer_ranges_reject_semantic_mutation(mutation: str) -> None:
+    registered = {
+        "api_version": 1,
+        "stage_pointers": {"execute": 0x1300, "initialize": 0x1200, "instantiate": 0x1000, "prepare": 0x1100},
+        "target": "shuttle.gpu.executable_bundle.v2",
+        "traits": 0,
+    }
+    mappings = [{"end": 0x2000, "path": "/runtime/cuda_plugin_extension.so", "start": 0x1000}]
+    _validate_registration_pointers(registered, mappings)
+    if mutation == "pointer":
+        registered["stage_pointers"]["execute"] = 0x3000
+    elif mutation == "duplicate":
+        registered["stage_pointers"]["execute"] = 0x1200
+    elif mutation == "mapping":
+        mappings[0]["start"] = 0x2000
+    else:
+        mappings[0]["extra"] = None
+
+    with pytest.raises(ValueError):
+        _validate_registration_pointers(registered, mappings)
+
+
+def test_wheel_record_binds_exact_runtime_member_and_rejects_digest_mutation(tmp_path: Path) -> None:
+    extension = tmp_path / "cuda_plugin_extension.so"
+    extension.write_bytes(b"extension")
+    digest = base64.urlsafe_b64encode(hashlib.sha256(extension.read_bytes()).digest()).rstrip(b"=").decode()
+    record = tmp_path / "RECORD"
+    record.write_text(f"jax_plugins/cuda/cuda_plugin_extension.so,sha256={digest},{extension.stat().st_size}\n")
+
+    _validate_record(record, "/cuda_plugin_extension.so", extension, "CUDA plugin")
+
+    record.write_text("jax_plugins/cuda/cuda_plugin_extension.so,sha256=wrong,9\n")
+    with pytest.raises(ValueError):
+        _validate_record(record, "/cuda_plugin_extension.so", extension, "CUDA plugin")
+
+
+@pytest.mark.parametrize("mutation", ["generated", "policy", "reuse", "cache_swap", "mapping"])
 def test_observer_verifier_rejects_fingerprint_policy_or_reuse_mutation(tmp_path: Path, mutation: str) -> None:
     roles = _observer_fixture(tmp_path)
     populate = tmp_path / roles["observer_populate_fast"]
     if mutation == "reuse":
         (tmp_path / roles["observer_reuse_fast"]).write_text("[]\n")
+    elif mutation == "cache_swap":
+        fast = tmp_path / roles["cache_entry_fast"]
+        source_ordered = tmp_path / roles["cache_entry_source_ordered"]
+        fast_bytes, source_ordered_bytes = fast.read_bytes(), source_ordered.read_bytes()
+        fast.write_bytes(source_ordered_bytes)
+        source_ordered.write_bytes(fast_bytes)
+    elif mutation == "mapping":
+        report = tmp_path / roles["reuse_report"]
+        value = json.loads(report.read_text())
+        value["runtime_mappings"][0]["path"] = "/runtime/different.so"
+        _write_json(report, value)
     else:
         records = [json.loads(line) for line in populate.read_text().splitlines()]
         if mutation == "generated":

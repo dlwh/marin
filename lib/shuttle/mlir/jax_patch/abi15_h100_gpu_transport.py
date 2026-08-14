@@ -11,6 +11,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TypeVar
 
+from abi15_h100_architecture_contract import load_architecture_build_contract
 from gpu_transport import decode_mlir_byte_string
 
 MAGIC = b"SHUTGPU\0"
@@ -467,8 +468,8 @@ def _require_bindings(coordinate: TransportCoordinate, bindings: tuple[GpuExtern
             (BindingKind.OPERAND, 0, (33, 34)),
             (BindingKind.OPERAND, 1, (33, 2)),
             (BindingKind.OPERAND, 2, (2, 34)),
-            (BindingKind.RESULT, 0, (33, 2)),
             (BindingKind.RESULT, 1, (2, 34)),
+            (BindingKind.RESULT, 0, (33, 2)),
         )
     observed = tuple((binding.kind, binding.index, binding.dimensions) for binding in bindings)
     _require(observed == expected and all(binding.element_type is ElementType.BF16 for binding in bindings))
@@ -539,7 +540,67 @@ def _validate_contract_ptx(ptx: bytes, coordinate: TransportCoordinate, ordinal:
             cursor = add + 1
 
 
-def _validate_ptx(coordinate: TransportCoordinate, launches: tuple[GpuLaunch, ...]) -> None:
+def _validate_map_ptx(ptx: bytes, input_slot: GpuSlot, output_slot: GpuSlot, kind: str) -> None:
+    expected_map = (1, 0) if kind == "map_f32_transpose_d1_d0" else (0, 1)
+    _require(_address_maps(ptx, output_slot.dimensions, reduction=False) == {0: expected_map})
+    text = ptx.decode("ascii")
+    _require("fma.rn.f32" not in text and "shfl." not in text and "atom." not in text and "mma." not in text)
+    _require(text.count("ld.param.u64") == 2)
+    if input_slot.element_type is ElementType.BF16:
+        _require(text.count("ld.global.u16") == 1 and text.count("cvt.f32.bf16") == 1)
+        _require("ld.global.f32" not in text)
+    else:
+        _require(text.count("ld.global.f32") == 1 and "ld.global.u16" not in text)
+    if output_slot.element_type is ElementType.BF16:
+        _require(text.count("cvt.rn.bf16.f32") == 1 and text.count("st.global.u16") == 1)
+        _require("st.global.f32" not in text)
+    else:
+        _require(text.count("st.global.f32") == 1 and "st.global.u16" not in text)
+
+
+def _validate_architecture(
+    coordinate: TransportCoordinate,
+    launches: tuple[GpuLaunch, ...],
+    slots: tuple[GpuSlot, ...],
+) -> None:
+    design = load_architecture_build_contract()
+    expected = design["coordinates"][coordinate.call_role.value]
+    for slot, spec in zip(slots, expected["slots"], strict=True):
+        _require(
+            slot.ordinal == spec["ordinal"]
+            and slot.element_type.value == spec["element_type"]
+            and list(slot.dimensions) == spec["dimensions"]
+            and slot.access.value == spec["access"]
+            and slot.storage.value == spec["storage"]
+            and slot.binding_kind.value == spec["binding_kind"]
+            and slot.binding_index == spec["binding_index"]
+        )
+    for launch, spec in zip(launches, expected["launches"], strict=True):
+        _require(
+            launch.ordinal == spec["ordinal"]
+            and list(launch.input_slots) == spec["input_slots"]
+            and list(launch.output_slots) == spec["output_slots"]
+            and list(launch.dependencies) == spec["dependencies"]
+        )
+        kind = spec["kind"]
+        if kind.startswith("contract_"):
+            expected_order = (
+                ReductionOrder.SERIAL_ASCENDING_FMA_RN_F32
+                if coordinate.policy is NumericalPolicy.SOURCE_ORDERED
+                else ReductionOrder.LEAF_ORDER_FREE
+            )
+            _require(launch.reduction_order is expected_order)
+            _validate_contract_ptx(launch.code, coordinate, launch.ordinal)
+        else:
+            _require(launch.reduction_order is None)
+            _validate_map_ptx(launch.code, slots[launch.input_slots[0]], slots[launch.output_slots[0]], kind)
+
+
+def _validate_ptx(
+    coordinate: TransportCoordinate,
+    launches: tuple[GpuLaunch, ...],
+    slots: tuple[GpuSlot, ...],
+) -> None:
     contract_ordinals = (0,) if coordinate.call_role is CallRole.FORWARD else (3, 8)
     for ordinal in contract_ordinals:
         expected_order = (
@@ -552,6 +613,7 @@ def _validate_ptx(coordinate: TransportCoordinate, launches: tuple[GpuLaunch, ..
     if coordinate.call_role is CallRole.BACKWARD:
         transpose = _address_maps(launches[4].code, (2, 34), reduction=False)
         _require(transpose.get(0) == (1, 0))
+    _validate_architecture(coordinate, launches, slots)
 
 
 def _parse_transport(data: bytes, coordinate: TransportCoordinate) -> GpuTransport:
@@ -604,7 +666,7 @@ def _parse_transport(data: bytes, coordinate: TransportCoordinate) -> GpuTranspo
     bundle_root_offset = reader.position
     bundle_root = _digest_text(reader.text())
     _require(bundle_root == _sha256(data[:bundle_root_offset]) and reader.position == len(data))
-    _validate_ptx(coordinate, launches)
+    _validate_ptx(coordinate, launches, slots)
     return GpuTransport(
         coordinate,
         schedule,

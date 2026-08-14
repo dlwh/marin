@@ -1,0 +1,450 @@
+{
+  "build_policy": {
+    "commands": [
+      [
+        "bazel",
+        "build",
+        "--config=cuda",
+        "--repo_env=HERMETIC_CUDA_COMPUTE_CAPABILITIES=9.0",
+        "//jaxlib/tools:build_wheel",
+        "//jax_plugins/cuda:build_wheel"
+      ],
+      [
+        "ptxas",
+        "-arch=sm_90",
+        "-v",
+        "-o",
+        "${CUBIN}",
+        "${PTX}"
+      ]
+    ],
+    "future_outputs": {
+      "ack_trust_root": null,
+      "authorization_sha256": null,
+      "cubin_roots": null,
+      "image_digest": null,
+      "ptx_roots": null,
+      "wheel_sha256": null
+    },
+    "source": {
+      "harness_commit": null,
+      "harness_tree": null,
+      "jax_commit": "619764c15117fbefc4ba13ab941871cb514c23f6",
+      "jax_patches": [
+        {
+          "path": "lib/shuttle/mlir/jax_patch/0001-link-shuttle-xla-registry-adapter.patch",
+          "sha256": "1e8b1400ee05bf8c8037277046113e1f1b1fae5ef56077899b7e853855e3424e"
+        },
+        {
+          "path": "lib/shuttle/mlir/jax_patch/0002-add-acceptance-observer-bridge.patch",
+          "sha256": "c4d5bc4aaa4b72ee7e2ecb44d28719be99da8defcf01ebd107308df41cb71942"
+        },
+        {
+          "path": "lib/shuttle/mlir/jax_patch/0003-link-shuttle-cuda-ffi.patch",
+          "sha256": "a98f04ac7afc6e5d8df63f2679cf89bc7cd0b29509a393da86f352cb6ba2ec9f"
+        }
+      ],
+      "jax_tree": "56d186bccb48075374f32e46d2e090731b66e1ea",
+      "production_commit": "d31a88cb9a93e591469fa8edfcf9dacada90c7b4",
+      "production_tree": "66175cbd89dcac0857ee2fbc456f7715170d239c",
+      "task_entrypoint": "lib/shuttle/mlir/jax_patch/abi15_h100_evidence_launcher.py",
+      "xla_commit": "9b635916ecc6df6efee62d8e4b0c7ef87ef84d69"
+    },
+    "tool_constraints": {
+      "bazel_version": "7.4.1",
+      "ptx_target": "sm_90",
+      "ptxas_version": "13.2.78"
+    }
+  },
+  "coordinates": {
+    "backward": {
+      "launches": [
+        {
+          "dependencies": [],
+          "input_slots": [
+            0
+          ],
+          "kind": "map_bf16_to_f32_identity",
+          "ordinal": 0,
+          "output_slots": [
+            3
+          ]
+        },
+        {
+          "dependencies": [
+            0
+          ],
+          "input_slots": [
+            3
+          ],
+          "kind": "map_f32_identity",
+          "ordinal": 1,
+          "output_slots": [
+            4
+          ]
+        },
+        {
+          "dependencies": [],
+          "input_slots": [
+            1
+          ],
+          "kind": "map_bf16_to_f32_identity",
+          "ordinal": 2,
+          "output_slots": [
+            5
+          ]
+        },
+        {
+          "dependencies": [
+            1,
+            2
+          ],
+          "input_slots": [
+            4,
+            5
+          ],
+          "kind": "contract_lhs_d2_d0_rhs_d2_d1",
+          "ordinal": 3,
+          "output_slots": [
+            6
+          ]
+        },
+        {
+          "dependencies": [
+            3
+          ],
+          "input_slots": [
+            6
+          ],
+          "kind": "map_f32_transpose_d1_d0",
+          "ordinal": 4,
+          "output_slots": [
+            7
+          ]
+        },
+        {
+          "dependencies": [
+            4
+          ],
+          "input_slots": [
+            7
+          ],
+          "kind": "map_f32_to_bf16_identity",
+          "ordinal": 5,
+          "output_slots": [
+            8
+          ]
+        },
+        {
+          "dependencies": [
+            0
+          ],
+          "input_slots": [
+            3
+          ],
+          "kind": "map_f32_identity",
+          "ordinal": 6,
+          "output_slots": [
+            9
+          ]
+        },
+        {
+          "dependencies": [],
+          "input_slots": [
+            2
+          ],
+          "kind": "map_bf16_to_f32_identity",
+          "ordinal": 7,
+          "output_slots": [
+            10
+          ]
+        },
+        {
+          "dependencies": [
+            6,
+            7
+          ],
+          "input_slots": [
+            9,
+            10
+          ],
+          "kind": "contract_lhs_d0_d2_rhs_d1_d2",
+          "ordinal": 8,
+          "output_slots": [
+            11
+          ]
+        },
+        {
+          "dependencies": [
+            8
+          ],
+          "input_slots": [
+            11
+          ],
+          "kind": "map_f32_to_bf16_identity",
+          "ordinal": 9,
+          "output_slots": [
+            12
+          ]
+        }
+      ],
+      "slots": [
+        {
+          "access": "read",
+          "binding_index": 0,
+          "binding_kind": "operand",
+          "dimensions": [
+            33,
+            34
+          ],
+          "element_type": "bf16",
+          "ordinal": 0,
+          "storage": "external"
+        },
+        {
+          "access": "read",
+          "binding_index": 1,
+          "binding_kind": "operand",
+          "dimensions": [
+            33,
+            2
+          ],
+          "element_type": "bf16",
+          "ordinal": 1,
+          "storage": "external"
+        },
+        {
+          "access": "read",
+          "binding_index": 2,
+          "binding_kind": "operand",
+          "dimensions": [
+            2,
+            34
+          ],
+          "element_type": "bf16",
+          "ordinal": 2,
+          "storage": "external"
+        },
+        {
+          "access": "read_write",
+          "binding_index": null,
+          "binding_kind": "none",
+          "dimensions": [
+            33,
+            34
+          ],
+          "element_type": "f32",
+          "ordinal": 3,
+          "storage": "temporary"
+        },
+        {
+          "access": "read_write",
+          "binding_index": null,
+          "binding_kind": "none",
+          "dimensions": [
+            33,
+            34
+          ],
+          "element_type": "f32",
+          "ordinal": 4,
+          "storage": "temporary"
+        },
+        {
+          "access": "read_write",
+          "binding_index": null,
+          "binding_kind": "none",
+          "dimensions": [
+            33,
+            2
+          ],
+          "element_type": "f32",
+          "ordinal": 5,
+          "storage": "temporary"
+        },
+        {
+          "access": "read_write",
+          "binding_index": null,
+          "binding_kind": "none",
+          "dimensions": [
+            34,
+            2
+          ],
+          "element_type": "f32",
+          "ordinal": 6,
+          "storage": "temporary"
+        },
+        {
+          "access": "read_write",
+          "binding_index": null,
+          "binding_kind": "none",
+          "dimensions": [
+            2,
+            34
+          ],
+          "element_type": "f32",
+          "ordinal": 7,
+          "storage": "temporary"
+        },
+        {
+          "access": "write",
+          "binding_index": 1,
+          "binding_kind": "result",
+          "dimensions": [
+            2,
+            34
+          ],
+          "element_type": "bf16",
+          "ordinal": 8,
+          "storage": "external"
+        },
+        {
+          "access": "read_write",
+          "binding_index": null,
+          "binding_kind": "none",
+          "dimensions": [
+            33,
+            34
+          ],
+          "element_type": "f32",
+          "ordinal": 9,
+          "storage": "temporary"
+        },
+        {
+          "access": "read_write",
+          "binding_index": null,
+          "binding_kind": "none",
+          "dimensions": [
+            2,
+            34
+          ],
+          "element_type": "f32",
+          "ordinal": 10,
+          "storage": "temporary"
+        },
+        {
+          "access": "read_write",
+          "binding_index": null,
+          "binding_kind": "none",
+          "dimensions": [
+            33,
+            2
+          ],
+          "element_type": "f32",
+          "ordinal": 11,
+          "storage": "temporary"
+        },
+        {
+          "access": "write",
+          "binding_index": 0,
+          "binding_kind": "result",
+          "dimensions": [
+            33,
+            2
+          ],
+          "element_type": "bf16",
+          "ordinal": 12,
+          "storage": "external"
+        }
+      ]
+    },
+    "forward": {
+      "launches": [
+        {
+          "dependencies": [],
+          "input_slots": [
+            0,
+            1
+          ],
+          "kind": "contract_lhs_d0_d2_rhs_d2_d1",
+          "ordinal": 0,
+          "output_slots": [
+            2
+          ]
+        },
+        {
+          "dependencies": [
+            0
+          ],
+          "input_slots": [
+            2
+          ],
+          "kind": "map_f32_to_bf16_identity",
+          "ordinal": 1,
+          "output_slots": [
+            3
+          ]
+        }
+      ],
+      "slots": [
+        {
+          "access": "read",
+          "binding_index": 0,
+          "binding_kind": "operand",
+          "dimensions": [
+            33,
+            2
+          ],
+          "element_type": "bf16",
+          "ordinal": 0,
+          "storage": "external"
+        },
+        {
+          "access": "read",
+          "binding_index": 1,
+          "binding_kind": "operand",
+          "dimensions": [
+            2,
+            34
+          ],
+          "element_type": "bf16",
+          "ordinal": 1,
+          "storage": "external"
+        },
+        {
+          "access": "read_write",
+          "binding_index": null,
+          "binding_kind": "none",
+          "dimensions": [
+            33,
+            34
+          ],
+          "element_type": "f32",
+          "ordinal": 2,
+          "storage": "temporary"
+        },
+        {
+          "access": "write",
+          "binding_index": 0,
+          "binding_kind": "result",
+          "dimensions": [
+            33,
+            34
+          ],
+          "element_type": "bf16",
+          "ordinal": 3,
+          "storage": "external"
+        }
+      ]
+    }
+  },
+  "derivation": {
+    "fixture_sha256": "f82300541a6009beb1d3785d42cf613eb338c8c1d91b331c162e0a4e2c3c7e4e",
+    "generic_semantics": [
+      "deriveGpuPlan assigns input slots before one output slot per source-ordered algebra operation",
+      "dependencies are the sorted producers of input slots",
+      "live-ins are external read operands, live-outs are external write results, intermediates are read_write temporaries",
+      "Map PTX follows its affine indexing map and scalar conversion; Contract PTX follows policy reduction order"
+    ]
+  },
+  "design_stops": {
+    "ack_trust_root": null,
+    "ack_verification": null,
+    "controller_accepted_envelope": null,
+    "controller_process_receipts": null,
+    "launch_readiness": null,
+    "task_success_exit": null,
+    "terminal_receipt": null
+  },
+  "schema_version": 1,
+  "status": "local_unsealed_non_authoritative_architecture_build_design"
+}

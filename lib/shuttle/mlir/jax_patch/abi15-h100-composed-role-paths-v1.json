@@ -41,6 +41,7 @@
   ],
   "schema_version": 1,
   "static_roles": {
+    "architecture_build_contract": "contract/architecture-build.json",
     "baseline_report": "process/baseline.json",
     "build_manifest": "build/build-manifest.json",
     "cache_populate_after": "cache/populate-after.json",

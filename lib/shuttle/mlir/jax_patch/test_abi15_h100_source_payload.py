@@ -9,19 +9,17 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import abi15_h100_source_payload
 import pytest
 from abi15_h100_source_payload import (
-    ACK_FILENAME,
     READY_FILENAME,
     REQUIRED_EXACT_PATHS,
-    controller_ack,
     decode_export_record,
     prepare_raw_export,
     prepare_source_capsule,
     read_export_record,
     restore_source_capsule,
     validate_retrieved_export,
-    write_task_ack,
 )
 
 SHA = "a" * 64
@@ -66,8 +64,7 @@ def _raw_artifact(root: Path) -> None:
 def _copy_transport(export: Path, retrieval: Path) -> None:
     retrieval.mkdir()
     for path in export.iterdir():
-        if path.name != ACK_FILENAME:
-            shutil.copyfile(path, retrieval / path.name)
+        shutil.copyfile(path, retrieval / path.name)
 
 
 def test_source_capsule_round_trip_binds_exact_commit_tree_and_files(
@@ -110,7 +107,7 @@ def test_source_capsule_rejects_dirty_checkout_and_allowlist_drift(
         prepare_source_capsule(repository, _git(repository, "rev-parse", "HEAD"), tmp_path / "drift")
 
 
-def test_raw_export_round_trip_requires_controller_verification_before_ack(
+def test_raw_export_round_trip_stops_at_controller_verifiable_ready(
     tmp_path: Path,
 ) -> None:
     artifact = tmp_path / "artifact"
@@ -137,16 +134,26 @@ def test_raw_export_round_trip_requires_controller_verification_before_ack(
         expected_source_manifest_sha256="d" * 64,
         expected_authorization_sha256="e" * 64,
     )
-    ack = controller_ack(
-        ready,
-        verification_report_sha256="f" * 64,
-        verifier_sha256="1" * 64,
-    )
-    write_task_ack(export, ack)
-
     assert verified["archive"]["sha256"] == ready["archive_sha256"]
-    assert json.loads((export / ACK_FILENAME).read_text()) == ack
+    assert not (export / "RAW_EXPORT_ACK").exists()
     assert not (artifact / "accepted_bundle.json").exists()
+
+
+@pytest.mark.parametrize("exit_code", [1, 255, -1])
+def test_raw_export_rejects_any_nonzero_runner_exit(tmp_path: Path, exit_code: int) -> None:
+    artifact = tmp_path / "artifact"
+    _raw_artifact(artifact)
+
+    with pytest.raises(ValueError, match="exact runner success"):
+        prepare_raw_export(
+            artifact,
+            tmp_path / "export",
+            runner_exit_code=exit_code,
+            source_commit="b" * 40,
+            source_tree="c" * 40,
+            source_manifest_sha256="d" * 64,
+            authorization_sha256="e" * 64,
+        )
 
 
 def test_raw_export_rejects_task_authored_acceptance(tmp_path: Path) -> None:
@@ -164,6 +171,11 @@ def test_raw_export_rejects_task_authored_acceptance(tmp_path: Path) -> None:
             source_manifest_sha256="d" * 64,
             authorization_sha256="e" * 64,
         )
+
+
+def test_task_capsule_exposes_no_ack_or_accepted_envelope_authoring_api() -> None:
+    assert not hasattr(abi15_h100_source_payload, "controller_ack")
+    assert not hasattr(abi15_h100_source_payload, "write_task_ack")
 
 
 @pytest.mark.parametrize("mutation", ["part", "order", "manifest"])
@@ -202,14 +214,84 @@ def test_retrieved_export_rejects_rehashed_or_transport_mutation(tmp_path: Path,
         ready["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
         ready_path.write_text(json.dumps(ready, indent=2, sort_keys=True) + "\n")
 
+    archive_output = tmp_path / "archive.tar.gz"
     with pytest.raises(ValueError):
         validate_retrieved_export(
             retrieval,
-            tmp_path / "archive.tar.gz",
+            archive_output,
             expected_source_commit="b" * 40,
             expected_source_tree="c" * 40,
             expected_source_manifest_sha256="d" * 64,
             expected_authorization_sha256="e" * 64,
+        )
+    assert not archive_output.exists()
+    assert not (tmp_path / ".archive.tar.gz.unverified").exists()
+
+
+@pytest.mark.parametrize("mutation", ["ready_field", "manifest_field", "directory", "symlink", "ack", "case_alias"])
+def test_retrieved_export_rejects_open_schema_or_nonregular_transport_entry(tmp_path: Path, mutation: str) -> None:
+    artifact = tmp_path / "artifact"
+    _raw_artifact(artifact)
+    export = tmp_path / "export"
+    prepare_raw_export(
+        artifact,
+        export,
+        runner_exit_code=0,
+        source_commit="b" * 40,
+        source_tree="c" * 40,
+        source_manifest_sha256="d" * 64,
+        authorization_sha256="e" * 64,
+    )
+    retrieval = tmp_path / "retrieval"
+    _copy_transport(export, retrieval)
+    if mutation in {"ready_field", "manifest_field"}:
+        name = READY_FILENAME if mutation == "ready_field" else "RAW_EXPORT_MANIFEST"
+        path = retrieval / name
+        value = json.loads(path.read_text())
+        value["extra"] = None
+        path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    elif mutation == "directory":
+        (retrieval / "extra").mkdir()
+    elif mutation == "symlink":
+        (retrieval / "extra").symlink_to(retrieval / READY_FILENAME)
+    elif mutation == "ack":
+        (retrieval / "RAW_EXPORT_ACK").write_text("{}\n")
+    else:
+        (retrieval / "raw_export_ready").write_text("{}\n")
+    archive_output = tmp_path / "archive.tar.gz"
+
+    with pytest.raises(ValueError):
+        validate_retrieved_export(
+            retrieval,
+            archive_output,
+            expected_source_commit="b" * 40,
+            expected_source_tree="c" * 40,
+            expected_source_manifest_sha256="d" * 64,
+            expected_authorization_sha256="e" * 64,
+        )
+
+    assert not archive_output.exists()
+    assert not (tmp_path / ".archive.tar.gz.unverified").exists()
+
+
+@pytest.mark.parametrize("mutation", ["empty_directory", "symlink"])
+def test_raw_export_rejects_unrepresented_or_nonregular_artifact_entry(tmp_path: Path, mutation: str) -> None:
+    artifact = tmp_path / "artifact"
+    _raw_artifact(artifact)
+    if mutation == "empty_directory":
+        (artifact / "empty").mkdir()
+    else:
+        (artifact / "alias").symlink_to(artifact / "raw-artifact-manifest.json")
+
+    with pytest.raises(ValueError):
+        prepare_raw_export(
+            artifact,
+            tmp_path / "export",
+            runner_exit_code=0,
+            source_commit="b" * 40,
+            source_tree="c" * 40,
+            source_manifest_sha256="d" * 64,
+            authorization_sha256="e" * 64,
         )
 
 

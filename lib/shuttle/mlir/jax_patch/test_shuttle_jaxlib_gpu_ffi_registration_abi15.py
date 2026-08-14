@@ -5,6 +5,7 @@ import ctypes
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from shuttle_jaxlib_gpu_ffi_registration import (
     STAGES,
     PjrtApiPrefix,
@@ -13,7 +14,7 @@ from shuttle_jaxlib_gpu_ffi_registration import (
     capsule,
     capsule_pointer,
 )
-from shuttle_jaxlib_gpu_ffi_registration_abi15 import TARGET, registration_transcript
+from shuttle_jaxlib_gpu_ffi_registration_abi15 import TARGET, main, registration_transcript
 
 
 def _bundle() -> dict[str, object]:
@@ -63,10 +64,18 @@ def test_abi15_registration_transcript_rotates_pipeline_identity_and_binds_plugi
     plugin = tmp_path / "cuda_plugin_extension.so"
     plugin.write_bytes(b"plugin")
 
-    transcript = registration_transcript(_plugin(), plugin)
+    transcript = registration_transcript(_plugin(), plugin, ((0x1000, 0x5000),))
 
     assert transcript["pipeline_abi_version"] == 15
     assert transcript["plugin_extension_sha256"] == "5e689e2b01672bf33996e75d5e372ff60c536ce1599a1458e867cd8f4bef5160"
     assert transcript["exported_targets"] == [TARGET, "upstream"]
     assert transcript["upstream_target_count"] == 1
     assert transcript["registration"]["target"] == TARGET
+    assert transcript["plugin_mappings"] == [{"end": 0x5000, "path": str(plugin), "start": 0x1000}]
+
+
+def test_abi15_registration_main_stops_before_loading_or_writing_while_unsealed(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="explicitly unsealed"):
+        main()
+
+    assert not any(tmp_path.iterdir())

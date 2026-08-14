@@ -1,7 +1,7 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Closed raw-evidence and controller-acceptance schemas for ABI15 H100."""
+"""Closed raw-evidence schemas for the non-authoritative ABI15 H100 checkpoint."""
 
 import hashlib
 import json
@@ -11,12 +11,42 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from abi15_h100_architecture_contract import (
+    CONTRACT_SHA256 as ARCHITECTURE_BUILD_CONTRACT_SHA256,
+)
+from abi15_h100_architecture_contract import (
+    load_architecture_build_contract,
+)
 from abi15_h100_composed_contract import CONTRACT_SHA256, FIXTURE_SHA256, load_contract
 
 RAW_MANIFEST_FILENAME = "raw-artifact-manifest.json"
 ROLE_MANIFEST_FILENAME = "abi15-h100-composed-role-paths-v1.json"
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _REVISION = re.compile(r"[0-9a-f]{40}\Z")
+_STATIC_ROLES = {
+    "architecture_build_contract": "contract/architecture-build.json",
+    "baseline_report": "process/baseline.json",
+    "build_manifest": "build/build-manifest.json",
+    "cache_populate_after": "cache/populate-after.json",
+    "cache_populate_before": "cache/populate-before.json",
+    "cache_reuse_after": "cache/reuse-after.json",
+    "cache_reuse_before": "cache/reuse-before.json",
+    "cuda_pjrt_plugin": "runtime/xla-cuda-plugin.so",
+    "cuda_pjrt_record": "runtime/cuda-pjrt-RECORD",
+    "cuda_pjrt_wheel": "runtime/jax-cuda13-pjrt.whl",
+    "cuda_plugin_extension": "runtime/cuda-plugin-extension.so",
+    "cuda_plugin_record": "runtime/cuda-plugin-RECORD",
+    "cuda_plugin_wheel": "runtime/jax-cuda13-plugin.whl",
+    "fixture": "contract/fixture.mlir",
+    "jax_common": "runtime/libjax-common.so",
+    "jax_extension": "runtime/jax-extension.so",
+    "jaxlib_wheel": "runtime/jaxlib.whl",
+    "populate_report": "process/populate.json",
+    "prerun_contract": "contract/prerun.json",
+    "ptxas_records": "assembly/ptxas-records.json",
+    "registration_transcript": "runtime/registration.json",
+    "reuse_report": "process/reuse.json",
+}
 
 
 @dataclass(frozen=True)
@@ -61,27 +91,8 @@ class ProcessReport:
     observer_events: int
     cache_before: tuple[tuple[str, str], ...]
     cache_after: tuple[tuple[str, str], ...]
-
-
-@dataclass(frozen=True)
-class IrisTerminalReceipt:
-    """Controller-observed terminal task identity used after ACK."""
-
-    cluster: str
-    job_id: str
-    bundle_id: str
-    authorization_sha256: str
-    task_image: str
-    gpu_count: int
-    gpu_variant: str
-    replicas: int
-    max_retries_failure: int
-    max_retries_preemption: int
-    attempt_uid: str
-    task_state: str
-    ready_log_seq: int
-    ack_log_seq: int
-    terminal_log_seq: int
+    runtime_binaries: tuple[tuple[str, str], ...]
+    runtime_mappings: tuple[tuple[str, str, int, int], ...]
 
 
 def _canonical_json(value: object) -> bytes:
@@ -169,8 +180,8 @@ def load_role_manifest(path: Path | None = None) -> RoleManifest:
     if calls != {"backward": list(range(10)), "forward": [0, 1]}:
         raise ValueError("ABI15 call ordinals drift")
     static = root["static_roles"]
-    if type(static) is not dict or not static or list(static) != sorted(static):
-        raise ValueError("ABI15 static roles must be a nonempty sorted mapping")
+    if static != _STATIC_ROLES or list(static) != sorted(static):
+        raise ValueError("ABI15 static roles differ from the exact sorted mapping")
     normalized = tuple(
         (role, _relative_path(relative, f"static role {role}").as_posix()) for role, relative in static.items()
     )
@@ -340,8 +351,22 @@ def load_raw_artifact(root: Path, *, expected_harness_commit: str, expected_harn
     actual = {path.relative_to(root).as_posix() for path in all_paths if path.is_file()}
     if actual != covered:
         raise ValueError("raw artifact contains an unmanifested or missing file")
-    if files["prerun_contract"].sha256 != CONTRACT_SHA256 or files["fixture"].sha256 != FIXTURE_SHA256:
-        raise ValueError("raw artifact changed the immutable contract or fixture")
+    expected_directories = {
+        parent.as_posix()
+        for relative in covered
+        for parent in PurePosixPath(relative).parents
+        if parent != PurePosixPath(".")
+    }
+    actual_directories = {path.relative_to(root).as_posix() for path in all_paths if path.is_dir()}
+    if actual_directories != expected_directories:
+        raise ValueError("raw artifact contains an empty or unmanifested directory")
+    if (
+        files["prerun_contract"].sha256 != CONTRACT_SHA256
+        or files["fixture"].sha256 != FIXTURE_SHA256
+        or files["architecture_build_contract"].sha256 != ARCHITECTURE_BUILD_CONTRACT_SHA256
+    ):
+        raise ValueError("raw artifact changed an immutable contract or fixture")
+    load_architecture_build_contract(root / files["architecture_build_contract"].path)
     return RawArtifact(root.resolve(), _sha256_bytes(raw), files)
 
 
@@ -368,52 +393,34 @@ def validate_process_reports(reports: tuple[ProcessReport, ...]) -> None:
     for report in reports:
         for _, digest in (*report.cache_before, *report.cache_after):
             _require_sha(digest, "cache entry digest")
-
-
-def _validate_terminal_receipt(receipt: IrisTerminalReceipt) -> None:
-    _require_sha(receipt.bundle_id, "Iris bundle ID")
-    _require_sha(receipt.authorization_sha256, "authorization digest")
-    if not re.fullmatch(r"[^@]+@sha256:[0-9a-f]{64}", receipt.task_image):
-        raise ValueError("Iris task image must be digest pinned")
-    if (
-        receipt.cluster != "cw-us-east-02a"
-        or receipt.gpu_count != 1
-        or receipt.gpu_variant != "H100"
-        or receipt.replicas != 1
-        or receipt.max_retries_failure != 0
-        or receipt.max_retries_preemption != 0
-        or receipt.task_state != "SUCCEEDED"
-    ):
-        raise ValueError("Iris receipt differs from the one-H100 zero-retry terminal contract")
-    if not receipt.job_id or not receipt.attempt_uid:
-        raise ValueError("Iris receipt lacks job or attempt identity")
-    if not (0 <= receipt.ready_log_seq < receipt.ack_log_seq < receipt.terminal_log_seq):
-        raise ValueError("Iris READY, ACK, and terminal log sequence is invalid")
-
-
-def controller_accepted_envelope(
-    *,
-    archive_sha256: str,
-    export_manifest_sha256: str,
-    verification_report_sha256: str,
-    verifier_sha256: str,
-    receipt: IrisTerminalReceipt,
-) -> dict[str, Any]:
-    """Construct the post-terminal controller envelope; task code must not call this."""
-    _validate_terminal_receipt(receipt)
-    return {
-        "archive_sha256": _require_sha(archive_sha256, "archive digest"),
-        "authorization_sha256": receipt.authorization_sha256,
-        "export_manifest_sha256": _require_sha(export_manifest_sha256, "export manifest digest"),
-        "iris": {
-            "attempt_uid": receipt.attempt_uid,
-            "bundle_id": receipt.bundle_id,
-            "job_id": receipt.job_id,
-            "terminal_log_seq": receipt.terminal_log_seq,
-        },
-        "performance_status": "not_started",
-        "schema_version": 1,
-        "status": "controller_verified_terminal_untimed",
-        "verification_report_sha256": _require_sha(verification_report_sha256, "verification report digest"),
-        "verifier_sha256": _require_sha(verifier_sha256, "verifier digest"),
+    runtime_keys = (
+        "cuda_pjrt_plugin_sha256",
+        "cuda_pjrt_record_sha256",
+        "cuda_plugin_extension_sha256",
+        "cuda_plugin_record_sha256",
+        "jax_common_sha256",
+        "jax_extension_sha256",
+    )
+    identities = [report.runtime_binaries for report in reports]
+    if any(tuple(key for key, _ in identity) != runtime_keys for identity in identities) or len(set(identities)) != 1:
+        raise ValueError("process reports must bind the same exact loaded runtime bytes")
+    for _, digest in identities[0]:
+        _require_sha(digest, "loaded runtime digest")
+    mapping_roles = ("cuda_pjrt_plugin", "cuda_plugin_extension", "jax_common", "jax_extension")
+    for report in reports:
+        if tuple(item[0] for item in report.runtime_mappings) != mapping_roles:
+            raise ValueError("process report loaded mapping role roster drift")
+        for role, path, start, end in report.runtime_mappings:
+            if not path.startswith("/") or type(start) is not int or type(end) is not int or not 0 < start < end:
+                raise ValueError(f"process report loaded mapping range drift: {role}")
+    mapping_paths = [tuple((role, path) for role, path, _, _ in report.runtime_mappings) for report in reports]
+    if len(set(mapping_paths)) != 1:
+        raise ValueError("process reports loaded different runtime mapping paths")
+    expected_names = {
+        "cuda_pjrt_plugin": "xla_cuda_plugin.so",
+        "cuda_plugin_extension": "cuda_plugin_extension.so",
+        "jax_common": "libjax_common.so",
+        "jax_extension": "_jax.so",
     }
+    if any(Path(path).name != expected_names[role] for role, path in mapping_paths[0]):
+        raise ValueError("process report loaded mapping filename drift")

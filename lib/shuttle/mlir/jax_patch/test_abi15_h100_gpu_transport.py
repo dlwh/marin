@@ -122,8 +122,12 @@ def _contract_ptx(policy: NumericalPolicy, maps: tuple[tuple[int, ...], tuple[in
 
 
 def _map_ptx(
-    input_shape: tuple[int, int] | None = None,
-    affine_map: tuple[int, int] | None = None,
+    output_shape: tuple[int, int],
+    input_shape: tuple[int, int],
+    affine_map: tuple[int, int],
+    *,
+    input_bf16: bool,
+    output_bf16: bool,
 ) -> bytes:
     lines = [
         ".version 8.0",
@@ -131,27 +135,57 @@ def _map_ptx(
         ".address_size 64",
         ".visible .entry shuttle_entry()",
         "{",
-        "  div.u64 %rd1, %rd0, 34;",
-        "  rem.u64 %rd1, %rd1, 2;",
+        f"  div.u64 %rd1, %rd0, {output_shape[1]};",
+        f"  rem.u64 %rd1, %rd1, {output_shape[0]};",
         "  div.u64 %rd2, %rd0, 1;",
-        "  rem.u64 %rd2, %rd2, 34;",
+        f"  rem.u64 %rd2, %rd2, {output_shape[1]};",
     ]
-    if input_shape is not None and affine_map is not None:
-        registers = {0: "%rd1", 1: "%rd2"}
-        lines.append("  mov.u64 %rd10, 0;")
-        for extent, dimension in zip(input_shape, affine_map, strict=True):
-            lines.append(f"  mad.lo.u64 %rd10, %rd10, {extent}, {registers[dimension]};")
-        lines.extend(["  ld.param.u64 %rd20, [p0];", "  mad.lo.u64 %rd20, %rd10, 4, %rd20;"])
-    lines.extend(["  cvt.rn.bf16.f32 %h1, %f0;", "  ret;", "}"])
+    registers = {0: "%rd1", 1: "%rd2"}
+    lines.append("  mov.u64 %rd10, 0;")
+    for extent, dimension in zip(input_shape, affine_map, strict=True):
+        lines.append(f"  mad.lo.u64 %rd10, %rd10, {extent}, {registers[dimension]};")
+    lines.extend(
+        [
+            "  ld.param.u64 %rd20, [p0];",
+            f"  mad.lo.u64 %rd20, %rd10, {2 if input_bf16 else 4}, %rd20;",
+            "  ld.global.u16 %h0, [%rd20];" if input_bf16 else "  ld.global.f32 %f0, [%rd20];",
+        ]
+    )
+    if input_bf16:
+        lines.append("  cvt.f32.bf16 %f0, %h0;")
+    lines.extend(
+        [
+            "  ld.param.u64 %rd21, [p1];",
+            f"  mad.lo.u64 %rd21, %rd0, {2 if output_bf16 else 4}, %rd21;",
+        ]
+    )
+    if output_bf16:
+        lines.extend(["  cvt.rn.bf16.f32 %h1, %f0;", "  st.global.u16 [%rd21], %h1;"])
+    else:
+        lines.append("  st.global.f32 [%rd21], %f0;")
+    lines.extend(["  ret;", "}"])
     return ("\n".join(lines) + "\n").encode()
 
 
 def _ptx_slices(coordinate: TransportCoordinate) -> tuple[bytes, ...]:
     if coordinate.call_role is CallRole.FORWARD:
-        return (_contract_ptx(coordinate.policy, ((0, 2), (2, 1))), _map_ptx())
-    slices = [_map_ptx() for _ in range(10)]
+        return (
+            _contract_ptx(coordinate.policy, ((0, 2), (2, 1))),
+            _map_ptx((33, 34), (33, 34), (0, 1), input_bf16=False, output_bf16=True),
+        )
+    slices = [
+        _map_ptx((33, 34), (33, 34), (0, 1), input_bf16=True, output_bf16=False),
+        _map_ptx((33, 34), (33, 34), (0, 1), input_bf16=False, output_bf16=False),
+        _map_ptx((33, 2), (33, 2), (0, 1), input_bf16=True, output_bf16=False),
+        b"",
+        _map_ptx((2, 34), (34, 2), (1, 0), input_bf16=False, output_bf16=False),
+        _map_ptx((2, 34), (2, 34), (0, 1), input_bf16=False, output_bf16=True),
+        _map_ptx((33, 34), (33, 34), (0, 1), input_bf16=False, output_bf16=False),
+        _map_ptx((2, 34), (2, 34), (0, 1), input_bf16=True, output_bf16=False),
+        b"",
+        _map_ptx((33, 2), (33, 2), (0, 1), input_bf16=False, output_bf16=True),
+    ]
     slices[3] = _contract_ptx(coordinate.policy, ((2, 0), (2, 1)))
-    slices[4] = _map_ptx((34, 2), (1, 0))
     slices[8] = _contract_ptx(coordinate.policy, ((0, 2), (1, 2)))
     return tuple(slices)
 
@@ -166,14 +200,21 @@ def _bindings(
             (1, (33, 34), 2, 0, None),
             (0, (33, 34), 1, 2, 0),
         )
-    values = [
+    return (
         (0, (33, 34), 0, 1, 0),
         (0, (33, 2), 0, 1, 1),
         (0, (2, 34), 0, 1, 2),
-    ]
-    values.extend((1, (1,), 2, 0, None) for _ in range(8))
-    values.extend(((0, (33, 2), 1, 2, 0), (0, (2, 34), 1, 2, 1)))
-    return tuple(values)
+        (1, (33, 34), 2, 0, None),
+        (1, (33, 34), 2, 0, None),
+        (1, (33, 2), 2, 0, None),
+        (1, (34, 2), 2, 0, None),
+        (1, (2, 34), 2, 0, None),
+        (0, (2, 34), 1, 2, 1),
+        (1, (33, 34), 2, 0, None),
+        (1, (2, 34), 2, 0, None),
+        (1, (33, 2), 2, 0, None),
+        (0, (33, 2), 1, 2, 0),
+    )
 
 
 def _write_slot(
@@ -213,7 +254,12 @@ def _write_slot(
         writer.i64(binding_index)
 
 
-def _build_transport(coordinate: TransportCoordinate, *, affine_mutation: bool = False) -> _BuiltTransport:
+def _build_transport(
+    coordinate: TransportCoordinate,
+    *,
+    affine_mutation: bool = False,
+    map_mutation: str | None = None,
+) -> _BuiltTransport:
     policy_byte = 0 if coordinate.policy is NumericalPolicy.SOURCE_ORDERED else 1
     schedule = _sha256(f"{coordinate.policy}:{coordinate.call_role}".encode())
     plan = _sha256(f"plan:{coordinate.call_role}".encode())
@@ -225,6 +271,17 @@ def _build_transport(coordinate: TransportCoordinate, *, affine_mutation: bool =
         )
         assert len(mutated) == len(ptx_slices[3]) and mutated != ptx_slices[3]
         ptx_slices = (*ptx_slices[:3], mutated, *ptx_slices[4:])
+    if map_mutation == "store":
+        mutated = ptx_slices[0].replace(b"st.global.f32", b"ld.global.f32")
+        assert len(mutated) == len(ptx_slices[0]) and mutated != ptx_slices[0]
+        ptx_slices = (mutated, *ptx_slices[1:])
+    elif map_mutation == "transpose":
+        mutated = ptx_slices[4].replace(
+            b"mad.lo.u64 %rd10, %rd10, 34, %rd2",
+            b"mad.lo.u64 %rd10, %rd10, 34, %rd1",
+        )
+        assert len(mutated) == len(ptx_slices[4]) and mutated != ptx_slices[4]
+        ptx_slices = (*ptx_slices[:4], mutated, *ptx_slices[5:])
     code = b"".join(ptx_slices)
     slot_specs = _bindings(coordinate)
 
@@ -238,22 +295,35 @@ def _build_transport(coordinate: TransportCoordinate, *, affine_mutation: bool =
     device_suffix = _Writer()
     device_suffix.u64(len(ptx_slices))
     offset = 0
-    producers: dict[int, int] = {}
+    if coordinate.call_role is CallRole.FORWARD:
+        graph = (((0, 1), (2,), ()), ((2,), (3,), (0,)))
+    else:
+        graph = (
+            ((0,), (3,), ()),
+            ((3,), (4,), (0,)),
+            ((1,), (5,), ()),
+            ((4, 5), (6,), (1, 2)),
+            ((6,), (7,), (3,)),
+            ((7,), (8,), (4,)),
+            ((3,), (9,), (0,)),
+            ((2,), (10,), ()),
+            ((9, 10), (11,), (6, 7)),
+            ((11,), (12,), (8,)),
+        )
     for ordinal, ptx in enumerate(ptx_slices):
-        inputs = (0, 1) if ordinal == 0 else (min(ordinal + 1, len(slot_specs) - 1),)
-        output = min(ordinal + 2, len(slot_specs) - 1)
-        dependencies = tuple(sorted({producers[value] for value in inputs if value in producers}))
+        inputs, outputs, dependencies = graph[ordinal]
         device_suffix.i64(ordinal)
         device_suffix.i64(ordinal)
         device_suffix.i64(offset)
         device_suffix.i64(len(ptx))
         device_suffix.integers(inputs)
-        device_suffix.integers((output,))
+        device_suffix.integers(outputs)
         device_suffix.u64(len(inputs))
         for _ in inputs:
             device_suffix.u8(0)
-        device_suffix.u64(1)
-        device_suffix.u8(1)
+        device_suffix.u64(len(outputs))
+        for _ in outputs:
+            device_suffix.u8(1)
         device_suffix.integers(dependencies)
         device_suffix.u8(0)
         contract = ordinal in ({0} if coordinate.call_role is CallRole.FORWARD else {3, 8})
@@ -266,8 +336,7 @@ def _build_transport(coordinate: TransportCoordinate, *, affine_mutation: bool =
         for extent in (32, 1, 1):
             device_suffix.u16(extent)
         device_suffix.u32(0)
-        device_suffix.u16(len(inputs) + 1)
-        producers[output] = ordinal
+        device_suffix.u16(len(inputs) + len(outputs))
         offset += len(ptx)
     device_root = _sha256(device_prefix.data, device_suffix.data)
 
@@ -368,6 +437,19 @@ def test_load_gpu_transport_rejects_affine_map_mutation_with_valid_transport_roo
     coordinate = TransportCoordinate(NumericalPolicy.FAST, CallRole.BACKWARD)
     path = tmp_path / "bundle.bin"
     path.write_bytes(_build_transport(coordinate, affine_mutation=True).data)
+
+    with pytest.raises(ValueError):
+        load_gpu_transport(path, coordinate)
+
+
+@pytest.mark.parametrize("mutation", ["store", "transpose"])
+def test_load_gpu_transport_rejects_map_semantic_mutation_with_valid_roots(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    coordinate = TransportCoordinate(NumericalPolicy.FAST, CallRole.BACKWARD)
+    path = tmp_path / "bundle.bin"
+    path.write_bytes(_build_transport(coordinate, map_mutation=mutation).data)
 
     with pytest.raises(ValueError):
         load_gpu_transport(path, coordinate)

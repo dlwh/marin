@@ -10,9 +10,7 @@ from pathlib import Path
 import pytest
 from abi15_h100_composed_contract import CONTRACT_SHA256, FIXTURE_SHA256
 from abi15_h100_evidence import (
-    IrisTerminalReceipt,
     ProcessReport,
-    controller_accepted_envelope,
     expected_role_paths,
     load_raw_artifact,
     load_role_manifest,
@@ -25,6 +23,29 @@ from abi15_h100_evidence import (
 SHA = "a" * 64
 COMMIT = "b" * 40
 TREE = "c" * 40
+RUNTIME = tuple(
+    (name, SHA)
+    for name in (
+        "cuda_pjrt_plugin_sha256",
+        "cuda_pjrt_record_sha256",
+        "cuda_plugin_extension_sha256",
+        "cuda_plugin_record_sha256",
+        "jax_common_sha256",
+        "jax_extension_sha256",
+    )
+)
+MAPPINGS = tuple(
+    (role, f"/runtime/{filename}", 0x1000 * index, 0x1000 * (index + 1))
+    for index, (role, filename) in enumerate(
+        (
+            ("cuda_pjrt_plugin", "xla_cuda_plugin.so"),
+            ("cuda_plugin_extension", "cuda_plugin_extension.so"),
+            ("jax_common", "libjax_common.so"),
+            ("jax_extension", "_jax.so"),
+        ),
+        1,
+    )
+)
 
 
 def _materialize_raw_artifact(root: Path) -> dict[str, str]:
@@ -32,7 +53,10 @@ def _materialize_raw_artifact(root: Path) -> dict[str, str]:
     for role, relative in roles.items():
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
-        if role == "prerun_contract":
+        if role == "architecture_build_contract":
+            source = Path(__file__).with_name("abi15-h100-architecture-build-contract-v1.json")
+            path.write_bytes(source.read_bytes())
+        elif role == "prerun_contract":
             source = (
                 Path(__file__).parents[4]
                 / ".agents/projects/tile_lifetime_compiler/shuttle_abi15_h100_composed_prerun_v1.json"
@@ -108,8 +132,8 @@ def test_prerun_contract_remains_explicitly_unsealed() -> None:
 
 def test_process_reports_bind_distinct_processes_two_entry_cache_and_observer_state() -> None:
     reports = (
-        ProcessReport("baseline", 100, 0, 0, (), ()),
-        ProcessReport("populate", 101, 0, 6, (), (("fast", "b" * 64), ("source_ordered", SHA))),
+        ProcessReport("baseline", 100, 0, 0, (), (), RUNTIME, MAPPINGS),
+        ProcessReport("populate", 101, 0, 6, (), (("fast", "b" * 64), ("source_ordered", SHA)), RUNTIME, MAPPINGS),
         ProcessReport(
             "reuse",
             102,
@@ -117,6 +141,8 @@ def test_process_reports_bind_distinct_processes_two_entry_cache_and_observer_st
             0,
             (("fast", "b" * 64), ("source_ordered", SHA)),
             (("fast", "b" * 64), ("source_ordered", SHA)),
+            RUNTIME,
+            MAPPINGS,
         ),
     )
 
@@ -127,49 +153,12 @@ def test_process_reports_bind_distinct_processes_two_entry_cache_and_observer_st
     with pytest.raises(ValueError):
         validate_process_reports((reports[0], reports[1], replace(reports[2], observer_events=1)))
     with pytest.raises(ValueError):
+        validate_process_reports((reports[0], reports[1], replace(reports[2], runtime_mappings=MAPPINGS[:-1])))
+    with pytest.raises(ValueError):
         validate_process_reports(
             (
                 reports[0],
                 reports[1],
                 replace(reports[2], cache_after=(("source_ordered", SHA),)),
             )
-        )
-
-
-def test_controller_accepted_envelope_requires_verified_archive_and_terminal_receipt() -> None:
-    receipt = IrisTerminalReceipt(
-        cluster="cw-us-east-02a",
-        job_id="/dlwh/abi15-h100-aabbccddeeff",
-        bundle_id=SHA,
-        authorization_sha256="b" * 64,
-        task_image="ghcr.io/marin-community/iris-task-h100-evidence:a@sha256:" + "c" * 64,
-        gpu_count=1,
-        gpu_variant="H100",
-        replicas=1,
-        max_retries_failure=0,
-        max_retries_preemption=0,
-        attempt_uid="d" * 32,
-        task_state="SUCCEEDED",
-        ready_log_seq=10,
-        ack_log_seq=11,
-        terminal_log_seq=12,
-    )
-
-    envelope = controller_accepted_envelope(
-        archive_sha256=SHA,
-        export_manifest_sha256="e" * 64,
-        verification_report_sha256="f" * 64,
-        verifier_sha256="1" * 64,
-        receipt=receipt,
-    )
-
-    assert envelope["status"] == "controller_verified_terminal_untimed"
-    assert envelope["performance_status"] == "not_started"
-    with pytest.raises(ValueError):
-        controller_accepted_envelope(
-            archive_sha256=SHA,
-            export_manifest_sha256="e" * 64,
-            verification_report_sha256="f" * 64,
-            verifier_sha256="1" * 64,
-            receipt=replace(receipt, task_state="RUNNING"),
         )

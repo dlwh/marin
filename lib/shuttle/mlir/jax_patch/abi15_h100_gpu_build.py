@@ -10,6 +10,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from abi15_h100_architecture_contract import load_architecture_build_contract
+from abi15_h100_evidence import require_sealed_hardware_authority
 from abi15_h100_gpu_transport import GpuTransport, TransportCoordinate
 
 _REGISTER_COUNT = re.compile(r"Used ([0-9]+) registers")
@@ -63,6 +65,7 @@ def assemble_transports(
     ptxas: Path,
 ) -> list[dict[str, object]]:
     """Assemble the exact four transports without loading or executing a GPU."""
+    require_sealed_hardware_authority()
     expected = {
         ("source_ordered", "forward"),
         ("source_ordered", "backward"),
@@ -105,6 +108,7 @@ def assemble_transports(
 
 def validate_build_candidate(value: object) -> dict[str, Any]:
     """Validate an unsealed pre-hardware build candidate without accepting it."""
+    policy = load_architecture_build_contract()["build_policy"]
     root = _closed(
         value,
         {
@@ -129,6 +133,9 @@ def validate_build_candidate(value: object) -> dict[str, Any]:
             "jax_commit",
             "jax_patch_sha256",
             "jax_tree",
+            "production_commit",
+            "production_tree",
+            "task_entrypoint",
             "xla_commit",
         },
         "build source",
@@ -139,30 +146,37 @@ def validate_build_candidate(value: object) -> dict[str, Any]:
         "jax_commit",
         "jax_tree",
         "xla_commit",
+        "production_commit",
+        "production_tree",
     ):
         _revision(source[field], f"source.{field}")
+    expected_source = policy["source"]
+    if any(
+        source[field] != expected_source[field]
+        for field in ("jax_commit", "jax_tree", "production_commit", "production_tree", "task_entrypoint", "xla_commit")
+    ):
+        raise ValueError("build candidate differs from the pinned local source policy")
     patches = source["jax_patch_sha256"]
-    if type(patches) is not list or len(patches) != 3:
-        raise ValueError("build source must bind the three ordered JAX patches")
-    for index, digest in enumerate(patches):
-        _sha(digest, f"source.jax_patch_sha256[{index}]")
+    expected_patches = [record["sha256"] for record in expected_source["jax_patches"]]
+    if patches != expected_patches:
+        raise ValueError("build source differs from the three ordered JAX patches")
     toolchain = _closed(
         root["toolchain"],
         {"bazel_sha256", "bazel_version", "ptxas_sha256", "ptxas_version", "target"},
         "toolchain",
     )
-    if toolchain["target"] != "sm_90" or any(
-        type(toolchain[field]) is not str or not toolchain[field] for field in ("bazel_version", "ptxas_version")
+    constraints = policy["tool_constraints"]
+    if (
+        toolchain["target"] != constraints["ptx_target"]
+        or toolchain["bazel_version"] != constraints["bazel_version"]
+        or toolchain["ptxas_version"] != constraints["ptxas_version"]
     ):
         raise ValueError("build toolchain version or target drift")
     _sha(toolchain["bazel_sha256"], "Bazel digest")
     _sha(toolchain["ptxas_sha256"], "ptxas digest")
     commands = root["commands"]
-    if type(commands) is not list or not commands:
-        raise ValueError("build candidate must record exact argv arrays")
-    for command in commands:
-        if type(command) is not list or not command or any(type(item) is not str or not item for item in command):
-            raise ValueError("build command must be a nonempty argv array")
+    if commands != policy["commands"]:
+        raise ValueError("build candidate command templates differ from the pinned local policy")
     wheels = _closed(root["wheels"], {"cuda_plugin", "cuda_pjrt", "jaxlib"}, "wheels")
     for name, wheel_value in wheels.items():
         wheel = _closed(wheel_value, {"sha256", "size"}, f"wheel {name}")

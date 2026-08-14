@@ -23,7 +23,6 @@ ALLOWLIST_RELATIVE_PATH = "lib/shuttle/mlir/jax_patch/abi15-h100-source-allowlis
 RAW_EXPORT_ARCHIVE_FILENAME = "abi15-h100-raw-artifacts.tar.gz"
 RAW_EXPORT_MANIFEST_FILENAME = "RAW_EXPORT_MANIFEST"
 READY_FILENAME = "RAW_EXPORT_READY"
-ACK_FILENAME = "RAW_EXPORT_ACK"
 CHUNK_BYTES = 256 * 1024
 MAX_CAPSULE_BYTES = 20 * 1024 * 1024
 MAX_CAPSULE_MEMBER_BYTES = 8 * 1024 * 1024
@@ -43,11 +42,14 @@ REQUIRED_EXACT_PATHS = tuple(
             "lib/shuttle/mlir/jax_patch/0001-link-shuttle-xla-registry-adapter.patch",
             "lib/shuttle/mlir/jax_patch/0002-add-acceptance-observer-bridge.patch",
             "lib/shuttle/mlir/jax_patch/0003-link-shuttle-cuda-ffi.patch",
+            "lib/shuttle/mlir/jax_patch/abi15-h100-architecture-build-contract-v1.json",
             "lib/shuttle/mlir/jax_patch/abi15-h100-composed-role-paths-v1.json",
             ALLOWLIST_RELATIVE_PATH,
+            "lib/shuttle/mlir/jax_patch/abi15_h100_architecture_contract.py",
             "lib/shuttle/mlir/jax_patch/abi15_h100_composed_contract.py",
             "lib/shuttle/mlir/jax_patch/abi15_h100_composed_fixture.py",
             "lib/shuttle/mlir/jax_patch/abi15_h100_evidence.py",
+            "lib/shuttle/mlir/jax_patch/abi15_h100_evidence_launcher.py",
             "lib/shuttle/mlir/jax_patch/abi15_h100_evidence_subject.py",
             "lib/shuttle/mlir/jax_patch/abi15_h100_evidence_verify.py",
             "lib/shuttle/mlir/jax_patch/abi15_h100_gpu_build.py",
@@ -271,17 +273,18 @@ def _artifact_records(root: Path) -> list[dict[str, Any]]:
     if root.is_symlink() or not root.is_dir() or (root / "accepted_bundle.json").exists():
         raise ValueError("task raw artifact must be regular and cannot contain accepted_bundle.json")
     records = []
+    directories = set()
     total_size = 0
     for path in sorted(root.rglob("*")):
-        if path.is_symlink():
-            raise ValueError("raw export rejects symlinks")
-        if path.is_dir():
-            continue
-        if not path.is_file():
-            raise ValueError("raw export rejects non-regular files")
+        mode_value = os.lstat(path).st_mode
         relative = path.relative_to(root).as_posix()
         _relative_path(relative, "artifact path")
-        mode = stat.S_IMODE(path.stat().st_mode)
+        if stat.S_ISDIR(mode_value):
+            directories.add(relative)
+            continue
+        if not stat.S_ISREG(mode_value):
+            raise ValueError("raw export rejects non-regular files")
+        mode = stat.S_IMODE(mode_value)
         if mode not in {0o644, 0o755}:
             raise ValueError("raw export rejects noncanonical modes")
         records.append(
@@ -297,6 +300,19 @@ def _artifact_records(root: Path) -> list[dict[str, Any]]:
             raise ValueError("raw export exceeds its member or size bound")
     if not records or not any(record["path"] == "raw-artifact-manifest.json" for record in records):
         raise ValueError("raw export requires the closed raw artifact manifest")
+    implied_directories = {
+        PurePosixPath(record["path"]).parent.as_posix()
+        for record in records
+        if PurePosixPath(record["path"]).parent != PurePosixPath(".")
+    }
+    implied_directories |= {
+        parent.as_posix()
+        for directory in tuple(implied_directories)
+        for parent in PurePosixPath(directory).parents
+        if parent != PurePosixPath(".")
+    }
+    if directories != implied_directories:
+        raise ValueError("raw export contains an empty or unmanifested directory")
     return records
 
 
@@ -346,8 +362,8 @@ def prepare_raw_export(
     authorization_sha256: str,
 ) -> dict[str, Any]:
     """Close raw task files into text-retrievable parts without acceptance."""
-    if type(runner_exit_code) is not int or not 0 <= runner_exit_code <= 255:
-        raise ValueError("runner exit code must be in [0, 255]")
+    if runner_exit_code != 0:
+        raise ValueError("raw export requires exact runner success")
     if output.exists() or output.is_symlink():
         raise ValueError("raw export output must be fresh")
     source = {
@@ -493,11 +509,37 @@ def validate_retrieved_export(
     manifest_path = retrieval / RAW_EXPORT_MANIFEST_FILENAME
     ready = _load_canonical(ready_path, "READY")
     manifest = _load_canonical(manifest_path, "raw export manifest")
+    expected_ready_fields = {
+        "archive_sha256",
+        "archive_size",
+        "authorization_sha256",
+        "manifest_sha256",
+        "part_count",
+        "runner_exit_code",
+        "schema_version",
+        "status",
+    }
+    expected_manifest_fields = {
+        "archive",
+        "authorization_sha256",
+        "members",
+        "parts",
+        "runner_exit_code",
+        "schema_version",
+        "source",
+        "status",
+    }
+    if set(ready) != expected_ready_fields or set(manifest) != expected_manifest_fields:
+        raise ValueError("READY or raw export manifest uses an open schema")
     if (
         ready.get("status") != "raw_ready_for_controller_verification"
         or manifest.get("status") != "raw_subject_artifact_only"
+        or ready.get("schema_version") != 1
+        or manifest.get("schema_version") != 1
+        or ready.get("runner_exit_code") != 0
+        or manifest.get("runner_exit_code") != 0
     ):
-        raise ValueError("raw retrieval attempted to claim acceptance")
+        raise ValueError("raw retrieval status, schema, or runner success drift")
     expected_authorization = _sha(expected_authorization_sha256, _SHA256, "authorization SHA-256")
     expected_source = {
         "commit": _sha(expected_source_commit, _SHA1, "source commit"),
@@ -511,57 +553,63 @@ def validate_retrieved_export(
         raise ValueError("raw retrieval authorization drift")
     if manifest.get("source") != expected_source or ready.get("manifest_sha256") != _sha256_file(manifest_path):
         raise ValueError("raw retrieval source or manifest drift")
+    if ready.get("archive_sha256") != manifest.get("archive", {}).get("sha256") or ready.get(
+        "archive_size"
+    ) != manifest.get("archive", {}).get("size"):
+        raise ValueError("READY and raw export manifest archive identities differ")
     parts = manifest.get("parts")
     if type(parts) is not list or not parts or ready.get("part_count") != len(parts):
         raise ValueError("raw retrieval part roster drift")
     expected_files = {READY_FILENAME, RAW_EXPORT_MANIFEST_FILENAME}
     archive_output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = archive_output.parent / f".{archive_output.name}.unverified"
+    if temporary.exists() or temporary.is_symlink():
+        raise ValueError("raw retrieval temporary output must be fresh")
     digest = hashlib.sha256()
     size = 0
-    with archive_output.open("wb") as output:
-        for index, record in enumerate(parts):
-            if type(record) is not dict or set(record) != {
-                "filename",
-                "index",
-                "sha256",
-                "size",
-            }:
-                raise ValueError("raw retrieval part schema drift")
-            filename = f"{RAW_EXPORT_ARCHIVE_FILENAME}.part.{index:06d}"
-            if record["index"] != index or record["filename"] != filename:
-                raise ValueError("raw retrieval parts are missing or reordered")
-            path = retrieval / filename
-            if path.is_symlink() or not path.is_file() or path.stat().st_size != record["size"]:
-                raise ValueError("raw retrieval part file metadata drift")
-            contents = path.read_bytes()
-            if not contents or len(contents) > CHUNK_BYTES or _sha256_bytes(contents) != record["sha256"]:
-                raise ValueError("raw retrieval part bytes drift")
-            output.write(contents)
-            digest.update(contents)
-            size += len(contents)
-            expected_files.add(filename)
-    actual_files = {path.name for path in retrieval.iterdir() if path.is_file() and not path.is_symlink()}
-    if actual_files != expected_files:
-        archive_output.unlink(missing_ok=True)
-        raise ValueError("raw retrieval contains extra or missing transport files")
-    archive = manifest.get("archive")
-    if archive != {
-        "filename": RAW_EXPORT_ARCHIVE_FILENAME,
-        "sha256": digest.hexdigest(),
-        "size": size,
-    }:
-        archive_output.unlink(missing_ok=True)
-        raise ValueError("raw retrieval archive identity drift")
-    if ready.get("archive_sha256") != digest.hexdigest() or ready.get("archive_size") != size:
-        archive_output.unlink(missing_ok=True)
-        raise ValueError("READY does not bind the reconstructed archive")
-    members = manifest.get("members")
-    if type(members) is not list or not members:
-        archive_output.unlink(missing_ok=True)
-        raise ValueError("raw export member roster is empty")
-    observed = []
     try:
-        with tarfile.open(archive_output, mode="r:gz") as archive_stream:
+        with temporary.open("xb") as output:
+            for index, record in enumerate(parts):
+                if type(record) is not dict or set(record) != {
+                    "filename",
+                    "index",
+                    "sha256",
+                    "size",
+                }:
+                    raise ValueError("raw retrieval part schema drift")
+                filename = f"{RAW_EXPORT_ARCHIVE_FILENAME}.part.{index:06d}"
+                if record["index"] != index or record["filename"] != filename:
+                    raise ValueError("raw retrieval parts are missing or reordered")
+                path = retrieval / filename
+                mode_value = os.lstat(path).st_mode
+                if not stat.S_ISREG(mode_value) or path.stat().st_size != record["size"]:
+                    raise ValueError("raw retrieval part file metadata drift")
+                contents = path.read_bytes()
+                if not contents or len(contents) > CHUNK_BYTES or _sha256_bytes(contents) != record["sha256"]:
+                    raise ValueError("raw retrieval part bytes drift")
+                output.write(contents)
+                digest.update(contents)
+                size += len(contents)
+                expected_files.add(filename)
+        actual_entries = {path.name for path in retrieval.iterdir()}
+        if actual_entries != expected_files or any(
+            not stat.S_ISREG(os.lstat(path).st_mode) for path in retrieval.iterdir()
+        ):
+            raise ValueError("raw retrieval contains extra, missing, or non-regular transport entries")
+        archive = manifest.get("archive")
+        if archive != {
+            "filename": RAW_EXPORT_ARCHIVE_FILENAME,
+            "sha256": digest.hexdigest(),
+            "size": size,
+        }:
+            raise ValueError("raw retrieval archive identity drift")
+        if ready.get("archive_sha256") != digest.hexdigest() or ready.get("archive_size") != size:
+            raise ValueError("READY does not bind the reconstructed archive")
+        members = manifest.get("members")
+        if type(members) is not list or not members:
+            raise ValueError("raw export member roster is empty")
+        observed = []
+        with tarfile.open(temporary, mode="r:gz") as archive_stream:
             tar_members = archive_stream.getmembers()
             if len(tar_members) != len(members):
                 raise ValueError("raw archive member count drift")
@@ -582,57 +630,10 @@ def validate_retrieved_export(
                 if stream is None or _sha256_bytes(stream.read()) != record["sha256"]:
                     raise ValueError("raw archive member digest drift")
                 observed.append(tar_member.name)
+        if observed != sorted(set(observed)) or "accepted_bundle.json" in observed or "RAW_EXPORT_ACK" in observed:
+            raise ValueError("raw archive paths are noncanonical or contain task acceptance")
+        temporary.replace(archive_output)
     except Exception:
-        archive_output.unlink(missing_ok=True)
+        temporary.unlink(missing_ok=True)
         raise
-    if observed != sorted(set(observed)) or "accepted_bundle.json" in observed:
-        archive_output.unlink(missing_ok=True)
-        raise ValueError("raw archive paths are noncanonical or contain task acceptance")
     return manifest
-
-
-def controller_ack(
-    ready: dict[str, Any],
-    *,
-    verification_report_sha256: str,
-    verifier_sha256: str,
-) -> dict[str, Any]:
-    """Build the ACK only after independent controller verification."""
-    if ready.get("schema_version") != 1 or ready.get("status") != "raw_ready_for_controller_verification":
-        raise ValueError("ACK requires one ABI15 raw READY record")
-    return {
-        "archive_sha256": _sha(ready.get("archive_sha256"), _SHA256, "archive SHA-256"),
-        "authorization_sha256": _sha(ready.get("authorization_sha256"), _SHA256, "authorization SHA-256"),
-        "manifest_sha256": _sha(ready.get("manifest_sha256"), _SHA256, "manifest SHA-256"),
-        "schema_version": 1,
-        "status": "controller_verified_raw_ack",
-        "verification_report_sha256": _sha(verification_report_sha256, _SHA256, "verification report SHA-256"),
-        "verifier_sha256": _sha(verifier_sha256, _SHA256, "verifier SHA-256"),
-    }
-
-
-def write_task_ack(export: Path, ack: dict[str, Any]) -> None:
-    """Write a controller-produced ACK only when it binds the task's exact READY."""
-    ready = _load_canonical(export / READY_FILENAME, "READY")
-    expected_fields = {
-        "archive_sha256",
-        "authorization_sha256",
-        "manifest_sha256",
-        "schema_version",
-        "status",
-        "verification_report_sha256",
-        "verifier_sha256",
-    }
-    if set(ack) != expected_fields or ack.get("status") != "controller_verified_raw_ack":
-        raise ValueError("ACK must use the closed controller schema")
-    for field in ("archive_sha256", "authorization_sha256", "manifest_sha256"):
-        if ack.get(field) != ready.get(field):
-            raise ValueError("ACK does not bind the task READY identities")
-    for field in ("verification_report_sha256", "verifier_sha256"):
-        _sha(ack.get(field), _SHA256, field)
-    path = export / ACK_FILENAME
-    if path.exists() or path.is_symlink():
-        raise ValueError("raw ACK path must be fresh")
-    temporary = export / f".{ACK_FILENAME}.tmp"
-    temporary.write_bytes(_canonical_json(ack))
-    temporary.replace(path)

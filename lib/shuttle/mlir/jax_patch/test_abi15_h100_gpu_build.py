@@ -4,14 +4,18 @@
 """Tests for the unsealed ABI15 pre-hardware build boundary."""
 
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
-from abi15_h100_gpu_build import parse_ptxas_resources, validate_build_candidate
+from abi15_h100_architecture_contract import load_architecture_build_contract
+from abi15_h100_gpu_build import assemble_transports, parse_ptxas_resources, validate_build_candidate
 
 SHA = "a" * 64
 
 
 def _candidate() -> dict[str, object]:
+    build_policy = load_architecture_build_contract()["build_policy"]
+    pinned_source = build_policy["source"]
     transports = []
     for policy_index, policy in enumerate(("source_ordered", "fast")):
         for call_index, (call, launches) in enumerate((("forward", 2), ("backward", 10))):
@@ -39,27 +43,27 @@ def _candidate() -> dict[str, object]:
                 }
             )
     return {
-        "commands": [
-            ["jax-build", "--cuda_compute_capabilities=9.0"],
-            ["ptxas", "-arch=sm_90"],
-        ],
+        "commands": build_policy["commands"],
         "registration_transcript_sha256": "f" * 64,
         "schema_version": 1,
         "source": {
             "harness_commit": "1" * 40,
             "harness_tree": "2" * 40,
-            "jax_commit": "3" * 40,
-            "jax_patch_sha256": ["4" * 64, "5" * 64, "6" * 64],
-            "jax_tree": "7" * 40,
-            "xla_commit": "8" * 40,
+            "jax_commit": pinned_source["jax_commit"],
+            "jax_patch_sha256": [record["sha256"] for record in pinned_source["jax_patches"]],
+            "jax_tree": pinned_source["jax_tree"],
+            "production_commit": pinned_source["production_commit"],
+            "production_tree": pinned_source["production_tree"],
+            "task_entrypoint": pinned_source["task_entrypoint"],
+            "xla_commit": pinned_source["xla_commit"],
         },
         "status": "pre_hardware_build_candidate_not_authority",
         "toolchain": {
             "bazel_sha256": "9" * 64,
-            "bazel_version": "candidate",
+            "bazel_version": build_policy["tool_constraints"]["bazel_version"],
             "ptxas_sha256": "a" * 64,
-            "ptxas_version": "candidate",
-            "target": "sm_90",
+            "ptxas_version": build_policy["tool_constraints"]["ptxas_version"],
+            "target": build_policy["tool_constraints"]["ptx_target"],
         },
         "transports": transports,
         "wheels": {
@@ -89,7 +93,16 @@ def test_build_candidate_closes_four_transports_and_twenty_four_assemblies() -> 
     assert validated["status"] == "pre_hardware_build_candidate_not_authority"
 
 
-@pytest.mark.parametrize("mutation", ["status", "policy", "slice", "spill", "toolchain"])
+def test_assembly_stops_before_directory_write_or_ptxas_while_unsealed(tmp_path: Path) -> None:
+    output = tmp_path / "assembly"
+
+    with pytest.raises(RuntimeError, match="explicitly unsealed"):
+        assemble_transports(output, {}, tmp_path / "must-not-run-ptxas")
+
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("mutation", ["status", "policy", "slice", "spill", "toolchain", "source", "command"])
 def test_build_candidate_rejects_self_consistent_semantic_drift(mutation: str) -> None:
     candidate = deepcopy(_candidate())
     if mutation == "status":
@@ -101,8 +114,12 @@ def test_build_candidate_rejects_self_consistent_semantic_drift(mutation: str) -
         candidate["transports"][1]["launches"] = 9
     elif mutation == "spill":
         candidate["transports"][3]["ptx_slices"][8]["spill_bytes"] = 4
-    else:
+    elif mutation == "toolchain":
         candidate["toolchain"]["target"] = "sm_89"
+    elif mutation == "source":
+        candidate["source"]["jax_commit"] = "f" * 40
+    else:
+        candidate["commands"][0].append("--drift")
 
     with pytest.raises(ValueError):
         validate_build_candidate(candidate)

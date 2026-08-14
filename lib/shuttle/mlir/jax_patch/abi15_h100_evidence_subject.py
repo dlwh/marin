@@ -5,6 +5,7 @@
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
 import os
 import shutil
@@ -139,6 +140,92 @@ def _cache_record(snapshot: dict[str, tuple[int, str]]) -> list[dict[str, object
     return [{"filename": name, "sha256": digest, "size": size} for name, (size, digest) in sorted(snapshot.items())]
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _mapped_files() -> dict[Path, tuple[tuple[int, int], ...]]:
+    maps = Path("/proc/self/maps")
+    if not maps.is_file():
+        raise RuntimeError("ABI15 H100 evidence requires Linux /proc/self/maps")
+    paths: dict[Path, list[tuple[int, int]]] = {}
+    for line in maps.read_text().splitlines():
+        fields = line.split(maxsplit=5)
+        if len(fields) == 6 and fields[5].startswith("/"):
+            path = Path(fields[5].removesuffix(" (deleted)")).resolve()
+            if path.is_file() and not path.is_symlink():
+                start_text, end_text = fields[0].split("-", maxsplit=1)
+                paths.setdefault(path, []).append((int(start_text, 16), int(end_text, 16)))
+    return {path: tuple(ranges) for path, ranges in paths.items()}
+
+
+def _one_mapped(mapped: dict[Path, tuple[tuple[int, int], ...]], name: str) -> Path:
+    matches = [path for path in mapped if path.name == name]
+    if len(matches) != 1:
+        raise RuntimeError(f"expected exactly one mapped {name}")
+    return matches[0]
+
+
+def _distribution_record(distribution: importlib.metadata.Distribution) -> Path:
+    files = distribution.files
+    if files is None:
+        raise RuntimeError("CUDA plugin distribution file roster is missing")
+    records = [file for file in files if file.name == "RECORD" and ".dist-info" in file.as_posix()]
+    if len(records) != 1:
+        raise RuntimeError("CUDA plugin distribution has no unique RECORD")
+    return Path(distribution.locate_file(records[0])).resolve()
+
+
+def _runtime_binary_identity() -> tuple[tuple[tuple[str, str], ...], tuple[tuple[str, str, int, int], ...]]:
+    mapped = _mapped_files()
+    extension = Path(_jax.__file__).resolve()
+    plugin_package = sys.modules.get("jax_plugins.cuda")
+    plugin_module = getattr(plugin_package, "cuda_plugin_extension", None)
+    plugin_file = getattr(plugin_module, "__file__", None)
+    if extension not in mapped or type(plugin_file) is not str:
+        raise RuntimeError("could not identify exact mapped JAX/CUDA extension bytes")
+    plugin = Path(plugin_file).resolve()
+    if plugin.is_symlink() or not plugin.is_file() or plugin not in mapped:
+        raise RuntimeError("loaded CUDA plugin extension is not one mapped regular file")
+    plugin_distribution = importlib.metadata.distribution("jax-cuda13-plugin")
+    pjrt_distribution = importlib.metadata.distribution("jax-cuda13-pjrt")
+    if plugin_distribution.version != JAXLIB_VERSION or pjrt_distribution.version != JAXLIB_VERSION:
+        raise RuntimeError("CUDA plugin distributions differ from exact JAX 0.10.1")
+    paths = {
+        "cuda_pjrt_plugin_sha256": _one_mapped(mapped, "xla_cuda_plugin.so"),
+        "cuda_pjrt_record_sha256": _distribution_record(pjrt_distribution),
+        "cuda_plugin_extension_sha256": plugin,
+        "cuda_plugin_record_sha256": _distribution_record(plugin_distribution),
+        "jax_common_sha256": _one_mapped(mapped, "libjax_common.so"),
+        "jax_extension_sha256": extension,
+    }
+    if any(path.is_symlink() or not path.is_file() for path in paths.values()):
+        raise RuntimeError("loaded runtime evidence contains a symlink or missing file")
+    digests = tuple((name, _sha256_file(path)) for name, path in sorted(paths.items()))
+    mapping_paths = {
+        "cuda_pjrt_plugin": paths["cuda_pjrt_plugin_sha256"],
+        "cuda_plugin_extension": paths["cuda_plugin_extension_sha256"],
+        "jax_common": paths["jax_common_sha256"],
+        "jax_extension": paths["jax_extension_sha256"],
+    }
+    mappings = []
+    for role, path in sorted(mapping_paths.items()):
+        ranges = mapped[path]
+        mappings.append(
+            (
+                role,
+                str(path),
+                min(start for start, _ in ranges),
+                max(end for _, end in ranges),
+            )
+        )
+    return digests, tuple(mappings)
+
+
 def _compile(policy: str) -> Any:
     return jax.jit(composed, compiler_options=_options(policy))
 
@@ -163,7 +250,8 @@ def run_baseline(output: Path) -> ProcessReport:
     for dataset, factory in DATASETS.items():
         values = _ready(compiled(*_arrays(factory())))
         _write_arrays(output, roles, f"baseline_{dataset}", values)
-    return ProcessReport("baseline", os.getpid(), 0, 0, (), ())
+    binaries, mappings = _runtime_binary_identity()
+    return ProcessReport("baseline", os.getpid(), 0, 0, (), (), binaries, mappings)
 
 
 def run_populate(output: Path, cache_directory: Path) -> ProcessReport:
@@ -199,6 +287,7 @@ def run_populate(output: Path, cache_directory: Path) -> ProcessReport:
         raise RuntimeError("ABI15 populate must miss twice and create two entries")
     _write_json(output / roles["cache_populate_before"], [])
     _write_json(output / roles["cache_populate_after"], _cache_record(after))
+    binaries, mappings = _runtime_binary_identity()
     return ProcessReport(
         "populate",
         os.getpid(),
@@ -206,6 +295,8 @@ def run_populate(output: Path, cache_directory: Path) -> ProcessReport:
         observer_events,
         (),
         tuple(sorted(policy_entries.items())),
+        binaries,
+        mappings,
     )
 
 
@@ -237,7 +328,17 @@ def run_reuse(output: Path, cache_directory: Path) -> ProcessReport:
     _write_json(output / roles["cache_reuse_before"], _cache_record(before))
     _write_json(output / roles["cache_reuse_after"], _cache_record(after))
     entries = tuple(sorted((policy, digest) for policy, digest in _policy_cache_digests(output, roles).items()))
-    return ProcessReport("reuse", os.getpid(), counter.count, observed, entries, entries)
+    binaries, mappings = _runtime_binary_identity()
+    return ProcessReport(
+        "reuse",
+        os.getpid(),
+        counter.count,
+        observed,
+        entries,
+        entries,
+        binaries,
+        mappings,
+    )
 
 
 def _policy_cache_digests(output: Path, roles: dict[str, str]) -> dict[str, str]:
@@ -255,6 +356,11 @@ def _report_value(report: ProcessReport) -> dict[str, object]:
         "observer_events": report.observer_events,
         "pid": report.pid,
         "process": report.process,
+        "runtime_binaries": dict(report.runtime_binaries),
+        "runtime_mappings": [
+            {"end": end, "path": path, "role": role, "start": start}
+            for role, path, start, end in report.runtime_mappings
+        ],
     }
 
 
@@ -302,7 +408,12 @@ def run_orchestrator(
         Path(__file__).parents[4] / ".agents/projects/tile_lifetime_compiler/shuttle_abi15_h100_composed_prerun_v1.json"
     )
     fixture_path = Path(__file__).parents[1] / "test/Inputs/jax-0.10.1-bf16-matmul-vjp-33x2x34-composed.mlir"
-    for role, source in (("prerun_contract", contract_path), ("fixture", fixture_path)):
+    architecture_path = Path(__file__).with_name("abi15-h100-architecture-build-contract-v1.json")
+    for role, source in (
+        ("architecture_build_contract", architecture_path),
+        ("prerun_contract", contract_path),
+        ("fixture", fixture_path),
+    ):
         destination = output / roles[role]
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, destination)
@@ -345,6 +456,8 @@ def run_orchestrator(
                 value["observer_events"],
                 tuple(tuple(item) for item in value["cache_before"]),
                 tuple(tuple(item) for item in value["cache_after"]),
+                tuple(sorted(value["runtime_binaries"].items())),
+                tuple((item["role"], item["path"], item["start"], item["end"]) for item in value["runtime_mappings"]),
             )
         )
     validate_process_reports(tuple(reports))
