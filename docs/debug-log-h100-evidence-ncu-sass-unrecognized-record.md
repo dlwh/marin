@@ -449,3 +449,28 @@ forms, mnemonic modifiers, multibyte private suffixes, both fixed widths, the
 serialized bound, nonleakage, and the production NCU subprocess boundary. No
 image build, GPU execution, v34 submission, retry, or relaunch was performed
 for this diagnostic-only change.
+
+## V34 parser candidate
+
+Checkpoint `f80f20d2c0` changes the post-header state machine without adding a
+new accepted separator. After one through nine bounded metric-label rows, the
+parser accepts either the existing selected-width separator or one direct
+fixed-column instruction row. The direct form requires the selected 107- or
+108-byte layout, left-aligned address and instruction fields, a 4- to 16-digit
+hexadecimal address, one decimal digit in each of the four metric columns, the
+existing anchored instruction grammar, and the existing opcode-base allowlist.
+Subsequent instruction rows use the unchanged instruction grammar.
+
+The regression fixture matches the retained v33 structure: five metric-label
+rows, 107 bytes, exact fixed-column gaps, a 14-digit hexadecimal address, and a
+20-byte `MOV R1, c[0x0][0x28]` instruction field. Tests cover both reviewed
+widths, one, five, and nine label rows, `MOV` and `FFMA`, the subprocess export
+boundary, and rejection of zero labels, a disallowed mnemonic, and a
+multi-digit metric cell. The existing malformed-row, mixed-width,
+misplaced-separator, label-bound, opcode, privacy, and file-bound tests remain
+green. The combined runner and source-capsule suite passes 891 tests.
+
+No v34 job, image build, source-capsule upload, GPU execution, retry, or
+relaunch was performed for this parser repair. A future v34 submission must use
+a fresh capsule from its final clean source commit and keep zero failure
+retries.

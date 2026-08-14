@@ -6,9 +6,12 @@ It measures kernel-only and full forward/backward boundaries separately. The
 direct campaign has executed 33 single-attempt H100 jobs with zero configured
 failure retries. No accepted 24-record bundle exists. The latest sealed run,
 v33, passed compilation, numerical, timing, cache, Nsight Systems, and Nsight
-Compute CSV gates before rejecting an unrecognized public SASS record. The
-direct FFI backends remain outside the native ordinary-JAX Shuttle transform
-seam and therefore remain architecture-nonconforming.
+Compute CSV gates before rejecting the first instruction-shaped SASS row after
+five metric-label rows. Parser checkpoint `f80f20d2c0` admits only the observed
+fixed-column direct-instruction transition and passes the 891-test runner and
+capsule suite. No v34 job has run. The direct FFI backends remain outside the
+native ordinary-JAX Shuttle transform seam and therefore remain
+architecture-nonconforming.
 
 ## Status and architecture boundary
 
