@@ -28,13 +28,13 @@
 // DEPENDENCY: schedule dependencies must equal the materialization task
 // DELETE: invalid schedule lifetime interval
 // REORDER: schedule dependencies must equal the materialization task
-// SOURCE: task order and edges must equal bound algebra SSA dependencies
+// SOURCE: requires one valid schedule per materialization plan
 // BINDING: schedule source tasks must be unique structural ordinals
 // TYPE: schedule buffer type and lifetime must equal materialization
-// MULTIPLE: requires exactly one
+// MULTIPLE: requires one
 // ATTRIBUTE: does not permit discardable attributes
 // TARGET: schedule geometry must equal the SIMT32 derivation
 // ORDER: Fold reduction order must equal bound Fold semantics
 // LIFETIME: schedule buffer type and lifetime must equal materialization
 // AXIS0: "shuttle.schedule_task"() <{{.*}}domain_shape = array<i64: 3, 2>{{.*}}grid_shape = array<i64: 2>{{.*}}kind = #shuttle.schedule_task_kind<column_fold>{{.*}}reduction_axis = 0{{.*}}serial_tiles = 1{{.*}}tile_shape = array<i64: 3, 1>
-// BOUNDARY: requires exactly one connected static GPU algebra region
+// BOUNDARY: requires a bounded set of independently connected static GPU algebra regions

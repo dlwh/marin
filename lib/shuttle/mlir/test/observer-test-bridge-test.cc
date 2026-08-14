@@ -109,7 +109,7 @@ TEST(ShuttleObserverTestBridgeTest,
   mlir::shuttle::ShuttlePipelineOptions options;
   options.executionMode = mlir::shuttle::ExecutionMode::GpuExecutableBundle;
   options.canonicalOptions =
-      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":14,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":15,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
   ASSERT_TRUE(
       mlir::succeeded(mlir::shuttle::runShuttleXlaTransform(*module, options)));
   auto events = capture->snapshot();
@@ -122,7 +122,7 @@ TEST(ShuttleObserverTestBridgeTest,
   EXPECT_FALSE(events[1].noShuttleSemantics);
   EXPECT_TRUE(events[2].noShuttleSemantics);
   EXPECT_EQ(events[1].normalizedModuleFingerprint,
-            "4dc859ba10a6b52fe8f20fcbaa75df13b4e4c8c40e5f730a34e6432e1f2da00f");
+            "99a7ad4e39a93e04a7c8f50fcbfb095a96aca114a66d9803cf119499055cac00");
   EXPECT_EQ(events[2].normalizedModuleFingerprint,
             "b97870ed629fde9df6ba1494314fa2062293d85de56e53f98a4417e3a24e958d");
 }
@@ -139,33 +139,33 @@ TEST(ShuttleObserverTestBridgeTest,
   };
   constexpr std::array<Fingerprints, 6> fixtures = {{
       {"jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-forward.mlir",
-       {"14dd27fbea0fb542923447a84c401862972d51b882d437db351f9017b2e9c9a1",
-        "7ea3cd47aa4ebee558d87b9c38806f1d4aa4d45f8d5d71a300cb11cec0cf94cf"},
+       {"6f082ddb0d43fcc4238b0bb572bf75fb307570c75a1ecb2bfc672bb5273aa0ed",
+        "026b877701a10ed8087dad33bb974bff482149542abf95226a12fe8241298791"},
        {"3dea82023efde83bd2f0cc42940eef3ee78c1dd7cbed26c69228ff8e1d08cf06",
         "e5a44e4947fd16d004d5d156f539fa4a2b5e751d6b957dd0b984062141626887"}},
       {"jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-backward.mlir",
-       {"70212b005312cecc45de474b2572306e895e7429b3783c1c569b00c2ac59c688",
-        "f81bebdc98bc8db0177bf961809602cb69378ca4689599c07be6a25d30368d6c"},
+       {"d5439e810514b0ce5165e687690c71b6fdf4d4dd9215eecc48fb1fd9a0c940fe",
+        "48a8082aa0664925fcb3204caf99775962650b58631932da65ceccf1dc174bcf"},
        {"2538cfec50123bcff3c9d13efaa1f262dc972e4fa9d3ef91bc3f86d66f61e71e",
         "092dfd91fd44248286a518598115f3104881b05755b65d873dfbe296b3c6ca7a"}},
       {"jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-composed.mlir",
-       {"264e568277f36cb22c4ef362b8f37c934f8e05844a53e321f9fce13b12f1716c",
-        "bac6f333ae444eab24b9fbfb286a4d1eac2be780f1c0469adcb8a7a0426a73b1"},
+       {"b77184334f524c01b521041af7eee42b05b3d55c8485695da64704dcf04c1331",
+        "52c357f82c47bad9f449d09ddb3165fb454f958d31d1333f6e132ce6f510938b"},
        {"57b365ea9f022632cdc127016f65fb884c86e09b3d33c2d2ce988865003060fb",
         "feb4450affed2cefe1a60a631fa368fc2e8417534f5e232e2b844639aee90511"}},
       {"jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-forward.mlir",
-       {"7c9528eb9f0b70c94398dc88d0ca9299a3fb4f73e4656b0c69f6d4eda29027f4",
-        "f637184d311568d777f4a06844661560cf35a2f9a7361fb8cf3b8174d5a9e2d9"},
+       {"d40f43268543ffa485590164d438e1a990a08ece10f005eebb1289d965bc50c5",
+        "ac5867f2cc8b054923e47163f9edf90c8f81a8caeb879d247dd1518716b4a8ef"},
        {"e04ef75d200893ec138459d7d197cba47941b4cf2e4718b45cd679772244d4de",
         "ed18f687d1d62283859071c493270c1911e916eb22dd6a836a6b52a4777ea8a4"}},
       {"jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-backward.mlir",
-       {"a3e917830b43cbe6a6b88ee2b1037c5a1e90329bb6f3e3f3ad1e07fb6f4881b4",
-        "59eec815eac7bc70e34d43c989d2de0ef3b0630fca6dd8c8807918ec6cd878fb"},
+       {"e96b5524f9116704c30f936599ee76a43dced8a3c5fede307920d2bb2277bda5",
+        "04c5b0efd75b3a50c7b2eb4d2c3a059be04a68068a1f879c83d83c6189c3899d"},
        {"4e65e61b30890170096cf8f38f55eb58bb77b15fe0fe1ddfebe1a454b2d5df3b",
         "df75fedb775547f2e32e915fbe88053b6305065adbf48491e7cb7eddf3c159a4"}},
       {"jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-composed.mlir",
-       {"73e7fd2631e83f8fcda2600ace109783175fb312c37a4abfc55dc8741eed127b",
-        "c6c63421ab8b1be82f0ad7f1c935dbae043b59af428d5c9261c119074feae04e"},
+       {"1b6d298b94847eed4417a9dbc8e57fad0e6073a395dbec92e4fd1c0cbc07ddce",
+        "f7f6fd925d558ebebcdc6cd06d023dc2ea57d854580071f7d88abc67e2d880e6"},
        {"63f722e6e20356c452e03513137d420cce87126902bfbc88d439236c0e3fadf1",
         "669d6168dea3b47713af143255c4940421a5d989ec30b423dcbbf4a562f25475"}},
   }};
@@ -200,7 +200,7 @@ TEST(ShuttleObserverTestBridgeTest,
           std::string("{\"execution_mode\":\"gpu_executable_bundle\","
                       "\"numerics\":\"") +
           policy +
-          "\",\"pipeline_abi_version\":14,\"schema_version\":1,"
+          "\",\"pipeline_abi_version\":15,\"schema_version\":1,"
           "\"tuning\":{\"cluster_shape\":[],\"materialization\":"
           "\"automatic\",\"maximum_candidates\":1,\"pipeline_stages\":1,"
           "\"tile_sizes\":[]}}";

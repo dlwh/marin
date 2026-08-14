@@ -18,6 +18,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Parser/Parser.h"
@@ -682,7 +683,7 @@ buildFixture(llvm::StringRef source,
   } else if (policy == mlir::shuttle::NumericalPolicy::Fast) {
     manager.addPass(mlir::shuttle::createFormStructuralRegionsPass(
         policy,
-        R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":14,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
+        R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":15,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
         R"json({"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json"));
   } else {
     manager.addPass(mlir::shuttle::createFormStructuralRegionsPass());
@@ -698,15 +699,55 @@ buildFixture(llvm::StringRef source,
 }
 
 std::unique_ptr<BuiltBundle>
-buildAbi14ContractFixture(llvm::StringRef source,
-                          mlir::shuttle::NumericalPolicy policy) {
+buildGpuContractFixture(llvm::StringRef source,
+                        mlir::shuttle::NumericalPolicy policy) {
   constexpr llvm::StringLiteral sourceOrdered =
-      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":14,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":15,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
   constexpr llvm::StringLiteral fast =
-      R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":14,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":15,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
   return buildFixture(
       source, policy,
       policy == mlir::shuttle::NumericalPolicy::Fast ? fast : sourceOrdered);
+}
+
+std::optional<llvm::SmallVector<llvm::SmallVector<uint8_t>>>
+serializeAllGpuBundles(mlir::ModuleOp module) {
+  llvm::SmallVector<llvm::SmallVector<uint8_t>> serialized;
+  for (mlir::shuttle::ExecutableBundleOp bundle :
+       module.getOps<mlir::shuttle::ExecutableBundleOp>()) {
+    mlir::shuttle::DeviceModuleOp device;
+    for (mlir::shuttle::DeviceModuleOp candidate :
+         module.getOps<mlir::shuttle::DeviceModuleOp>()) {
+      if (candidate.getFingerprint() != bundle.getDeviceModuleFingerprint())
+        continue;
+      if (device)
+        return std::nullopt;
+      device = candidate;
+    }
+    mlir::shuttle::InvocationAbiOp abi;
+    for (mlir::shuttle::InvocationAbiOp candidate :
+         module.getOps<mlir::shuttle::InvocationAbiOp>()) {
+      if (candidate.getFingerprint() != bundle.getInvocationAbiFingerprint())
+        continue;
+      if (abi)
+        return std::nullopt;
+      abi = candidate;
+    }
+    if (!device || !abi)
+      return std::nullopt;
+    mlir::OwningOpRef<mlir::ModuleOp> tuple =
+        mlir::ModuleOp::create(module.getLoc());
+    mlir::OpBuilder builder(module.getContext());
+    builder.setInsertionPointToEnd(tuple->getBody());
+    builder.insert(device->clone());
+    builder.insert(abi->clone());
+    builder.insert(bundle->clone());
+    auto bytes = mlir::shuttle::serializeGpuExecutableBundle(*tuple);
+    if (mlir::failed(bytes))
+      return std::nullopt;
+    serialized.push_back(std::move(*bytes));
+  }
+  return serialized;
 }
 
 std::unique_ptr<BuiltBundle> buildFixture() {
@@ -1199,9 +1240,9 @@ TEST(GpuTransportV2Test,
                  << "M=" << shape.rows << " K=" << shape.reduction
                  << " N=" << shape.columns);
     auto built =
-        buildAbi14ContractFixture(contractMapModule(shape.rows, shape.reduction,
-                                                    shape.columns, "anonymous"),
-                                  mlir::shuttle::NumericalPolicy::Fast);
+        buildGpuContractFixture(contractMapModule(shape.rows, shape.reduction,
+                                                  shape.columns, "anonymous"),
+                                mlir::shuttle::NumericalPolicy::Fast);
     ASSERT_TRUE(built);
     auto bytes = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
     ASSERT_TRUE(mlir::succeeded(bytes));
@@ -1236,9 +1277,8 @@ TEST(GpuTransportV2Test,
 
 TEST(GpuTransportV2Test,
      Abi14FastContractMapPtxUsesLaneStridedFmaAndFixedShuffleTree) {
-  auto built =
-      buildAbi14ContractFixture(contractMapModule(2, 33, 3, "anonymous"),
-                                mlir::shuttle::NumericalPolicy::Fast);
+  auto built = buildGpuContractFixture(contractMapModule(2, 33, 3, "anonymous"),
+                                       mlir::shuttle::NumericalPolicy::Fast);
   ASSERT_TRUE(built);
   auto bytes = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
   ASSERT_TRUE(mlir::succeeded(bytes));
@@ -1291,10 +1331,10 @@ TEST(GpuTransportV2Test,
 TEST(GpuTransportV2Test,
      Abi14ContractPoliciesSeparateCodeDeviceAndBundleRoots) {
   std::string source = contractMapModule(2, 33, 3, "anonymous");
-  auto sourceOrdered = buildAbi14ContractFixture(
+  auto sourceOrdered = buildGpuContractFixture(
       source, mlir::shuttle::NumericalPolicy::SourceOrdered);
   auto fast =
-      buildAbi14ContractFixture(source, mlir::shuttle::NumericalPolicy::Fast);
+      buildGpuContractFixture(source, mlir::shuttle::NumericalPolicy::Fast);
   ASSERT_TRUE(sourceOrdered);
   ASSERT_TRUE(fast);
   auto sourceBytes =
@@ -1396,10 +1436,10 @@ TEST(GpuTransportV2Test,
   auto source =
       fixtureSource("jax-0.10.1-bf16-matmul-vjp-17x33x19-backward.mlir");
   ASSERT_TRUE(source);
-  auto sourceOrdered = buildAbi14ContractFixture(
+  auto sourceOrdered = buildGpuContractFixture(
       *source, mlir::shuttle::NumericalPolicy::SourceOrdered);
   auto fast =
-      buildAbi14ContractFixture(*source, mlir::shuttle::NumericalPolicy::Fast);
+      buildGpuContractFixture(*source, mlir::shuttle::NumericalPolicy::Fast);
   ASSERT_TRUE(sourceOrdered);
   ASSERT_TRUE(fast);
 
@@ -1492,6 +1532,80 @@ TEST(GpuTransportV2Test,
   // The transpose Map consumes its input through (d1,d0), not identity order.
   EXPECT_TRUE(transposePtx.contains("mad.lo.u64 %rd10, %rd10, 19, %rd9;\n"
                                     "  mad.lo.u64 %rd10, %rd10, 33, %rd8;"));
+}
+
+TEST(GpuTransportV2Test,
+     Abi15ComposedMatmulUsesTwoIndependentClosedTransportsTransactionally) {
+  auto source =
+      fixtureSource("jax-0.10.1-bf16-matmul-vjp-17x33x19-composed.mlir");
+  ASSERT_TRUE(source);
+  auto built = buildGpuContractFixture(
+      *source, mlir::shuttle::NumericalPolicy::SourceOrdered);
+  ASSERT_TRUE(built);
+  auto serialized = serializeAllGpuBundles(*built->module);
+  ASSERT_TRUE(serialized);
+  ASSERT_EQ(serialized->size(), 2u);
+
+  constexpr std::array<int64_t, 2> expectedLaunches = {2, 10};
+  constexpr std::array<int64_t, 2> expectedSlots = {4, 13};
+  constexpr std::array<std::array<int64_t, 5>, 2> expectedBytes = {{
+      {1122, 1254, 646, 0, 0},
+      {646, 1122, 1254, 1254, 1122},
+  }};
+  constexpr std::array<int64_t, 2> expectedBindings = {3, 5};
+  for (size_t index = 0; index < serialized->size(); ++index) {
+    auto decoded = decodeInlineSchema2((*serialized)[index]);
+    ASSERT_TRUE(decoded);
+    auto loaded = mlir::shuttle::GpuExecutable::Load((*serialized)[index]);
+    ASSERT_TRUE(loaded.ok()) << loaded.status();
+    EXPECT_EQ(decoded->launches.size(), expectedLaunches[index]);
+    EXPECT_EQ(decoded->slots, expectedSlots[index]);
+    ASSERT_EQ((*loaded)->externalBindings().size(), expectedBindings[index]);
+    for (auto [binding, expectedBytes] :
+         llvm::zip_equal((*loaded)->externalBindings(),
+                         llvm::ArrayRef<int64_t>(expectedBytes[index])
+                             .take_front(expectedBindings[index]))) {
+      EXPECT_EQ(binding.requiredBytes, expectedBytes);
+    }
+    for (auto [ordinal, binding] :
+         llvm::enumerate((*loaded)->externalBindings())) {
+      const int64_t operands = index == 0 ? 2 : 3;
+      EXPECT_EQ(binding.kind,
+                ordinal < operands
+                    ? mlir::shuttle::ExecutableBindingKind::Operand
+                    : mlir::shuttle::ExecutableBindingKind::Result);
+      EXPECT_EQ(binding.index,
+                ordinal < operands ? ordinal : ordinal - operands);
+    }
+  }
+
+  auto broken = buildGpuContractFixture(
+      *source, mlir::shuttle::NumericalPolicy::SourceOrdered);
+  ASSERT_TRUE(broken);
+  llvm::SmallVector<mlir::shuttle::ExecutableBundleOp> bundles(
+      broken->module->getOps<mlir::shuttle::ExecutableBundleOp>());
+  ASSERT_EQ(bundles.size(), 2u);
+  bundles[1].setSourceScheduleFingerprint(
+      bundles[0].getSourceScheduleFingerprint());
+  bundles[1].setDeviceModuleFingerprint(
+      bundles[0].getDeviceModuleFingerprint());
+  bundles[1].setInvocationAbiFingerprint(
+      bundles[0].getInvocationAbiFingerprint());
+  bundles[1].setFingerprint(
+      mlir::shuttle::executableBundleFingerprint(bundles[1]));
+
+  mlir::PassManager replace(broken->context.get());
+  replace.addPass(mlir::shuttle::createReplaceWithGpuExecutableBundlePass());
+  EXPECT_TRUE(mlir::failed(replace.run(*broken->module)));
+  int64_t regions = 0;
+  int64_t customCalls = 0;
+  broken->module->walk([&](mlir::Operation *operation) {
+    regions += mlir::isa<mlir::shuttle::RegionOp>(operation);
+    customCalls +=
+        operation->getName().getStringRef() == "stablehlo.custom_call";
+  });
+  EXPECT_EQ(regions, 2);
+  EXPECT_EQ(customCalls, 0);
 }
 
 TEST(GpuTransportV2Test, FoldDynamicSharedMemoryIsDeclaredAtModuleScope) {

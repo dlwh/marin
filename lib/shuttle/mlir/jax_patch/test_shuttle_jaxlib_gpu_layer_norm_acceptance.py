@@ -68,7 +68,7 @@ def _events(shape_id: str, boundary: str, numerics: Numerics) -> list[dict[str, 
     ]
 
 
-def test_historical_layer_norm_gpu_driver_rejects_current_abi14_options() -> None:
+def test_historical_layer_norm_gpu_driver_rejects_current_abi15_options() -> None:
     assert PIPELINE_ABI_VERSION == 13
     assert BOUNDARIES == ("forward", "backward", "composed")
     assert POLICIES == (Numerics.SOURCE_ORDERED, Numerics.FAST)

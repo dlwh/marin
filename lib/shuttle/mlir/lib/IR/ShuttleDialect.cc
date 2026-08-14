@@ -1686,16 +1686,33 @@ LogicalResult ExecutableBundleOp::verify() {
   if (!module) {
     return emitOpError("must be nested in a builtin module");
   }
-  SmallVector<DeviceModuleOp> deviceModules(module.getOps<DeviceModuleOp>());
-  SmallVector<InvocationAbiOp> invocationAbis(module.getOps<InvocationAbiOp>());
-  SmallVector<ExecutableBundleOp> bundles(module.getOps<ExecutableBundleOp>());
-  if (deviceModules.size() != 1 || invocationAbis.size() != 1 ||
-      bundles.size() != 1) {
+  if (getSchemaVersion() == 1 &&
+      (llvm::range_size(module.getOps<DeviceModuleOp>()) != 1 ||
+       llvm::range_size(module.getOps<InvocationAbiOp>()) != 1 ||
+       llvm::range_size(module.getOps<ExecutableBundleOp>()) != 1)) {
     return emitOpError(
         "requires exactly one device module, invocation ABI, and bundle root");
   }
-  DeviceModuleOp deviceModule = deviceModules.front();
-  InvocationAbiOp abi = invocationAbis.front();
+  DeviceModuleOp deviceModule;
+  for (DeviceModuleOp candidate : module.getOps<DeviceModuleOp>()) {
+    if (candidate.getFingerprint() != getDeviceModuleFingerprint())
+      continue;
+    if (deviceModule)
+      return emitOpError("device-module fingerprint is not unique");
+    deviceModule = candidate;
+  }
+  InvocationAbiOp abi;
+  for (InvocationAbiOp candidate : module.getOps<InvocationAbiOp>()) {
+    if (candidate.getFingerprint() != getInvocationAbiFingerprint())
+      continue;
+    if (abi)
+      return emitOpError("invocation-ABI fingerprint is not unique");
+    abi = candidate;
+  }
+  if (!deviceModule || !abi)
+    return emitOpError(getSchemaVersion() == 1
+                           ? "invalid closed CPU executable bundle"
+                           : "invalid closed GPU executable bundle");
   if (getSourceScheduleFingerprint() !=
           deviceModule.getSourceScheduleFingerprint() ||
       getSourceScheduleFingerprint() != abi.getSourceScheduleFingerprint() ||

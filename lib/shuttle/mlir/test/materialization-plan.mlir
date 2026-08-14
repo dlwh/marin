@@ -11,7 +11,7 @@
 // RUN: not diff %t.original %t.fast
 // RUN: shuttle-test-opt --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-test-set-fast-region-policy --shuttle-plan-row-fold-materialization --shuttle-verify-materialization-plan --mlir-print-op-generic %S/Inputs/jax-0.10.1-bf16-row_fold_scale_81928ab3539c0f03-forward.mlir | FileCheck %s --check-prefix=FAST
 // RUN: shuttle-test-opt --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-plan-row-fold-materialization --shuttle-verify-materialization-plan --mlir-print-op-generic %S/Inputs/f32-reduce-add-axis0.mlir | FileCheck %s --check-prefix=AXIS0
-// RUN: not shuttle-test-opt --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-plan-row-fold-materialization %S/Inputs/two-row-folds.mlir 2>&1 | FileCheck %s --check-prefix=BOUNDARY
+// RUN: shuttle-test-opt --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-plan-row-fold-materialization --mlir-print-op-generic %S/Inputs/two-row-folds.mlir | FileCheck %s --check-prefix=MULTI
 
 // PLAN: "shuttle.materialization_plan"
 // PLAN-SAME: fingerprint = "e6d3838bc6ae01c514adf9fb71236406da01b93ee866f411ffb4af4d0161384d"
@@ -36,4 +36,4 @@
 // FAST-SAME: policy = #shuttle.policy<fast>
 
 // AXIS0: "shuttle.materialization_task"() <{{.*}}domain_shape = array<i64: 3, 2>{{.*}}kind = #shuttle.materialization_task_kind<fold>{{.*}}reduction_dimensions = array<i64: 0>
-// BOUNDARY: requires exactly one connected static GPU algebra region
+// MULTI-COUNT-2: "shuttle.materialization_plan"

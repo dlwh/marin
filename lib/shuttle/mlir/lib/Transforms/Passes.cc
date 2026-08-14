@@ -79,7 +79,7 @@ ShuttlePipelineOptions commandLinePipelineOptions(NumericalPolicy numerics) {
   options.numerics = numerics;
   if (numerics == NumericalPolicy::Fast) {
     options.canonicalOptions =
-        R"json({"execution_mode":"stablehlo_round_trip","numerics":"fast","pipeline_abi_version":14,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+        R"json({"execution_mode":"stablehlo_round_trip","numerics":"fast","pipeline_abi_version":15,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
   }
   return options;
 }
@@ -2791,14 +2791,41 @@ std::string generatedGpuBundleFingerprintImpl(ModuleOp module) {
   SmallVector<DeviceModuleOp> devices(module.getOps<DeviceModuleOp>());
   SmallVector<InvocationAbiOp> abis(module.getOps<InvocationAbiOp>());
   SmallVector<ExecutableBundleOp> bundles(module.getOps<ExecutableBundleOp>());
-  if (devices.size() != 1 || abis.size() != 1 || bundles.size() != 1)
+  if (bundles.empty() || devices.size() != bundles.size() ||
+      abis.size() != bundles.size())
     return {};
   std::string normalized;
   llvm::raw_string_ostream stream(normalized);
-  stream << "device_module:" << deviceModuleFingerprint(devices.front())
-         << "\ninvocation_abi:" << invocationAbiFingerprint(abis.front())
-         << "\nexecutable_bundle:"
-         << executableBundleFingerprint(bundles.front()) << '\n';
+  llvm::SmallDenseSet<Operation *> matchedDevices;
+  llvm::SmallDenseSet<Operation *> matchedAbis;
+  stream << "bundle_count:" << bundles.size() << '\n';
+  for (auto [ordinal, bundle] : llvm::enumerate(bundles)) {
+    DeviceModuleOp device;
+    for (DeviceModuleOp candidate : devices) {
+      if (candidate.getFingerprint() != bundle.getDeviceModuleFingerprint())
+        continue;
+      if (device)
+        return {};
+      device = candidate;
+    }
+    InvocationAbiOp abi;
+    for (InvocationAbiOp candidate : abis) {
+      if (candidate.getFingerprint() != bundle.getInvocationAbiFingerprint())
+        continue;
+      if (abi)
+        return {};
+      abi = candidate;
+    }
+    if (!device || !abi ||
+        !matchedDevices.insert(device.getOperation()).second ||
+        !matchedAbis.insert(abi.getOperation()).second)
+      return {};
+    stream << "tuple:" << ordinal
+           << "\ndevice_module:" << deviceModuleFingerprint(device)
+           << "\ninvocation_abi:" << invocationAbiFingerprint(abi)
+           << "\nexecutable_bundle:" << executableBundleFingerprint(bundle)
+           << '\n';
+  }
   stream.flush();
   return sha256(normalized);
 }
@@ -3280,135 +3307,149 @@ public:
       module.emitError("already contains a materialization plan");
       return signalPassFailure();
     }
-    RegionOp selected;
-    DerivedPlan derived;
+    SmallVector<std::pair<RegionOp, DerivedPlan>> selected;
+    bool invalidRegion = false;
     module.walk([&](RegionOp region) {
       FailureOr<DerivedPlan> candidate = deriveGpuPlan(region);
-      if (succeeded(candidate)) {
-        if (selected) {
-          selected = RegionOp{};
-          return WalkResult::interrupt();
-        }
-        selected = region;
-        derived = std::move(*candidate);
+      if (failed(candidate)) {
+        invalidRegion = true;
+        return WalkResult::interrupt();
       }
+      selected.emplace_back(region, std::move(*candidate));
       return WalkResult::advance();
     });
-    if (!selected) {
+    uint64_t aggregateTasks = 0;
+    uint64_t aggregateBuffers = 0;
+    for (const auto &[region, derived] : selected) {
+      (void)region;
+      aggregateTasks += derived.tasks.size();
+      aggregateBuffers += derived.buffers.size();
+    }
+    if (invalidRegion || selected.empty() ||
+        selected.size() > kMaximumGpuExecutableRecords ||
+        aggregateTasks > kMaximumGpuExecutableRecords ||
+        aggregateBuffers > kMaximumGpuExecutableRecords) {
       module.emitError(
-          "requires exactly one connected static GPU algebra region");
+          "requires a bounded set of independently connected static GPU "
+          "algebra regions");
       return signalPassFailure();
     }
-    if (derived.hasContract) {
-      auto manifest =
-          module->getAttrOfType<DictionaryAttr>(kCoverageManifestAttribute);
-      auto tuning = manifest ? manifest.getAs<StringAttr>("canonical_tuning")
-                             : StringAttr{};
-      if (!tuning || tuning.getValue() != kDefaultCanonicalTuning) {
-        module.emitError("ABI14 GPU Contract requires exact default tuning");
+    for (auto &[selectedRegion, derived] : selected) {
+      if (derived.hasContract) {
+        auto manifest =
+            module->getAttrOfType<DictionaryAttr>(kCoverageManifestAttribute);
+        auto tuning = manifest ? manifest.getAs<StringAttr>("canonical_tuning")
+                               : StringAttr{};
+        if (!tuning || tuning.getValue() != kDefaultCanonicalTuning) {
+          module.emitError("ABI15 GPU Contract requires exact default tuning");
+          return signalPassFailure();
+        }
+      }
+
+      OpBuilder builder(module.getContext());
+      builder.setInsertionPointToEnd(module.getBody());
+      OperationState planState(module.getLoc(),
+                               MaterializationPlanOp::getOperationName());
+      planState.addAttribute(
+          "schema_version",
+          builder.getI64IntegerAttr(derived.hasContract ? 2 : 1));
+      planState.addAttribute("policy", selectedRegion.getPolicyAttr());
+      planState.addAttribute("fingerprint",
+                             builder.getStringAttr(std::string(64, '0')));
+      planState.addRegion();
+      auto plan = cast<MaterializationPlanOp>(builder.create(planState));
+      Block *body = new Block();
+      plan.getBody().push_back(body);
+      builder.setInsertionPointToEnd(body);
+
+      auto &tasks = derived.tasks;
+      auto &buffers = derived.buffers;
+      for (auto [ordinal, buffer] : llvm::enumerate(buffers)) {
+        int64_t end =
+            buffer.liveOut
+                ? tasks.size()
+                : (buffer.consumers.empty() ? 0 : buffer.consumers.back());
+        SmallVector<NamedAttribute> attrs{
+            builder.getNamedAttr("ordinal", builder.getI64IntegerAttr(ordinal)),
+            builder.getNamedAttr("tensor_type",
+                                 TypeAttr::get(buffer.value.getType())),
+            builder.getNamedAttr("storage",
+                                 MaterializationStorageAttr::get(
+                                     module.getContext(),
+                                     (!buffer.producer || buffer.liveOut)
+                                         ? MaterializationStorage::External
+                                         : MaterializationStorage::Temporary)),
+            builder.getNamedAttr("live_in",
+                                 builder.getBoolAttr(!buffer.producer)),
+            builder.getNamedAttr("live_out",
+                                 builder.getBoolAttr(buffer.liveOut)),
+            builder.getNamedAttr(
+                "consumers",
+                DenseI64ArrayAttr::get(module.getContext(), buffer.consumers)),
+            builder.getNamedAttr(
+                "lifetime_start",
+                builder.getI64IntegerAttr(buffer.producer.value_or(0))),
+            builder.getNamedAttr("lifetime_end",
+                                 builder.getI64IntegerAttr(end))};
+        if (buffer.producer) {
+          attrs.push_back(builder.getNamedAttr(
+              "producer", builder.getI64IntegerAttr(*buffer.producer)));
+        }
+        createMaterializationRecord(builder, module.getLoc(),
+                                    MaterializationBufferOp::getOperationName(),
+                                    attrs);
+      }
+      for (auto [ordinal, task] : llvm::enumerate(tasks)) {
+        auto source = isa<MapOp>(task.operation)
+                          ? cast<MapOp>(task.operation).getSource()
+                      : isa<FoldOp>(task.operation)
+                          ? cast<FoldOp>(task.operation).getSource()
+                          : cast<ContractOp>(task.operation).getSource();
+        SmallVector<NamedAttribute> attrs{
+            builder.getNamedAttr("ordinal", builder.getI64IntegerAttr(ordinal)),
+            builder.getNamedAttr("kind", MaterializationTaskKindAttr::get(
+                                             module.getContext(), task.kind)),
+            builder.getNamedAttr(
+                "domain_shape",
+                DenseI64ArrayAttr::get(module.getContext(), task.domain)),
+            builder.getNamedAttr(
+                "reduction_dimensions",
+                DenseI64ArrayAttr::get(module.getContext(),
+                                       task.reductionDimensions)),
+            builder.getNamedAttr(
+                "input_buffers",
+                DenseI64ArrayAttr::get(module.getContext(), task.inputs)),
+            builder.getNamedAttr(
+                "output_buffers",
+                DenseI64ArrayAttr::get(module.getContext(), task.outputs)),
+            builder.getNamedAttr(
+                "dependencies",
+                DenseI64ArrayAttr::get(module.getContext(), task.dependencies)),
+            builder.getNamedAttr(
+                "semantic_fingerprint",
+                builder.getStringAttr(semanticTaskFingerprint(task.operation))),
+            builder.getNamedAttr("source", source)};
+        if (task.kind == MaterializationTaskKind::Fold) {
+          attrs.push_back(builder.getNamedAttr(
+              "order_free", builder.getBoolAttr(task.orderFree)));
+        }
+        createMaterializationRecord(builder, task.operation->getLoc(),
+                                    MaterializationTaskOp::getOperationName(),
+                                    attrs);
+      }
+      builder.create<MaterializationPlanYieldOp>(module.getLoc());
+      plan.setFingerprint(materializationPlanFingerprint(plan));
+      if (failed(plan.verifyRegions())) {
         return signalPassFailure();
       }
-    }
-
-    OpBuilder builder(module.getContext());
-    builder.setInsertionPointToEnd(module.getBody());
-    OperationState planState(module.getLoc(),
-                             MaterializationPlanOp::getOperationName());
-    planState.addAttribute("schema_version", builder.getI64IntegerAttr(
-                                                 derived.hasContract ? 2 : 1));
-    planState.addAttribute("policy", selected.getPolicyAttr());
-    planState.addAttribute("fingerprint",
-                           builder.getStringAttr(std::string(64, '0')));
-    planState.addRegion();
-    auto plan = cast<MaterializationPlanOp>(builder.create(planState));
-    Block *body = new Block();
-    plan.getBody().push_back(body);
-    builder.setInsertionPointToEnd(body);
-
-    auto &tasks = derived.tasks;
-    auto &buffers = derived.buffers;
-    for (auto [ordinal, buffer] : llvm::enumerate(buffers)) {
-      int64_t end =
-          buffer.liveOut
-              ? tasks.size()
-              : (buffer.consumers.empty() ? 0 : buffer.consumers.back());
-      SmallVector<NamedAttribute> attrs{
-          builder.getNamedAttr("ordinal", builder.getI64IntegerAttr(ordinal)),
-          builder.getNamedAttr("tensor_type",
-                               TypeAttr::get(buffer.value.getType())),
-          builder.getNamedAttr("storage",
-                               MaterializationStorageAttr::get(
-                                   module.getContext(),
-                                   (!buffer.producer || buffer.liveOut)
-                                       ? MaterializationStorage::External
-                                       : MaterializationStorage::Temporary)),
-          builder.getNamedAttr("live_in",
-                               builder.getBoolAttr(!buffer.producer)),
-          builder.getNamedAttr("live_out", builder.getBoolAttr(buffer.liveOut)),
-          builder.getNamedAttr(
-              "consumers",
-              DenseI64ArrayAttr::get(module.getContext(), buffer.consumers)),
-          builder.getNamedAttr(
-              "lifetime_start",
-              builder.getI64IntegerAttr(buffer.producer.value_or(0))),
-          builder.getNamedAttr("lifetime_end", builder.getI64IntegerAttr(end))};
-      if (buffer.producer) {
-        attrs.push_back(builder.getNamedAttr(
-            "producer", builder.getI64IntegerAttr(*buffer.producer)));
-      }
-      createMaterializationRecord(builder, module.getLoc(),
-                                  MaterializationBufferOp::getOperationName(),
-                                  attrs);
-    }
-    for (auto [ordinal, task] : llvm::enumerate(tasks)) {
-      auto source = isa<MapOp>(task.operation)
-                        ? cast<MapOp>(task.operation).getSource()
-                    : isa<FoldOp>(task.operation)
-                        ? cast<FoldOp>(task.operation).getSource()
-                        : cast<ContractOp>(task.operation).getSource();
-      SmallVector<NamedAttribute> attrs{
-          builder.getNamedAttr("ordinal", builder.getI64IntegerAttr(ordinal)),
-          builder.getNamedAttr("kind", MaterializationTaskKindAttr::get(
-                                           module.getContext(), task.kind)),
-          builder.getNamedAttr(
-              "domain_shape",
-              DenseI64ArrayAttr::get(module.getContext(), task.domain)),
-          builder.getNamedAttr(
-              "reduction_dimensions",
-              DenseI64ArrayAttr::get(module.getContext(),
-                                     task.reductionDimensions)),
-          builder.getNamedAttr(
-              "input_buffers",
-              DenseI64ArrayAttr::get(module.getContext(), task.inputs)),
-          builder.getNamedAttr(
-              "output_buffers",
-              DenseI64ArrayAttr::get(module.getContext(), task.outputs)),
-          builder.getNamedAttr(
-              "dependencies",
-              DenseI64ArrayAttr::get(module.getContext(), task.dependencies)),
-          builder.getNamedAttr(
-              "semantic_fingerprint",
-              builder.getStringAttr(semanticTaskFingerprint(task.operation))),
-          builder.getNamedAttr("source", source)};
-      if (task.kind == MaterializationTaskKind::Fold) {
-        attrs.push_back(builder.getNamedAttr(
-            "order_free", builder.getBoolAttr(task.orderFree)));
-      }
-      createMaterializationRecord(builder, task.operation->getLoc(),
-                                  MaterializationTaskOp::getOperationName(),
-                                  attrs);
-    }
-    builder.create<MaterializationPlanYieldOp>(module.getLoc());
-    plan.setFingerprint(materializationPlanFingerprint(plan));
-    if (failed(plan.verifyRegions())) {
-      signalPassFailure();
     }
   }
 };
 
 LogicalResult
 verifyMaterializationPlanAgainstSource(ModuleOp module,
-                                       MaterializationPlanOp plan) {
+                                       MaterializationPlanOp plan,
+                                       RegionOp *boundRegion = nullptr) {
   if (failed(plan.verifyRegions())) {
     return failure();
   }
@@ -3558,6 +3599,8 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
       return failure();
     }
   }
+  if (boundRegion)
+    *boundRegion = owner;
   return success();
 }
 
@@ -3569,9 +3612,24 @@ public:
     ModuleOp module = getOperation();
     SmallVector<MaterializationPlanOp> plans(
         module.getOps<MaterializationPlanOp>());
-    if (plans.size() != 1 ||
-        failed(verifyMaterializationPlanAgainstSource(module, plans[0]))) {
-      module.emitError("requires one source-bound materialization plan");
+    SmallVector<RegionOp> regions;
+    llvm::SmallDenseSet<Operation *> owners;
+    bool invalid = plans.empty();
+    for (MaterializationPlanOp plan : plans) {
+      RegionOp owner;
+      if (failed(
+              verifyMaterializationPlanAgainstSource(module, plan, &owner)) ||
+          !owners.insert(owner.getOperation()).second) {
+        invalid = true;
+        break;
+      }
+      regions.push_back(owner);
+    }
+    size_t regionCount = 0;
+    module.walk([&](RegionOp) { ++regionCount; });
+    if (invalid || regions.size() != regionCount) {
+      module.emitError(
+          "requires one source-bound materialization plan per GPU region");
       signalPassFailure();
     }
   }
@@ -3694,135 +3752,154 @@ public:
     ModuleOp module = getOperation();
     SmallVector<MaterializationPlanOp> materializationPlans(
         module.getOps<MaterializationPlanOp>());
-    if (materializationPlans.size() != 1 ||
-        failed(verifyMaterializationPlanAgainstSource(
-            module, materializationPlans.front()))) {
+    if (materializationPlans.empty()) {
+      module.emitError("requires source-bound materialization plans");
+      return signalPassFailure();
+    }
+    llvm::SmallDenseSet<Operation *> owners;
+    for (MaterializationPlanOp plan : materializationPlans) {
+      RegionOp owner;
+      if (failed(
+              verifyMaterializationPlanAgainstSource(module, plan, &owner)) ||
+          !owners.insert(owner.getOperation()).second) {
+        module.emitError(
+            "requires one source-bound materialization plan per GPU region");
+        return signalPassFailure();
+      }
+    }
+    size_t regionCount = 0;
+    module.walk([&](RegionOp) { ++regionCount; });
+    if (owners.size() != regionCount) {
       module.emitError(
-          "requires exactly one source-bound materialization plan");
+          "requires one source-bound materialization plan per GPU region");
       return signalPassFailure();
     }
     if (!module.getOps<SchedulePlanOp>().empty()) {
       module.emitError("already contains a schedule plan");
       return signalPassFailure();
     }
-    MaterializationPlanOp source = materializationPlans.front();
-    SmallVector<MaterializationBufferOp> sourceBuffers(
-        source.getBody().front().getOps<MaterializationBufferOp>());
-    SmallVector<MaterializationTaskOp> sourceTasks(
-        source.getBody().front().getOps<MaterializationTaskOp>());
+    for (MaterializationPlanOp source : materializationPlans) {
+      SmallVector<MaterializationBufferOp> sourceBuffers(
+          source.getBody().front().getOps<MaterializationBufferOp>());
+      SmallVector<MaterializationTaskOp> sourceTasks(
+          source.getBody().front().getOps<MaterializationTaskOp>());
 
-    OpBuilder builder(module.getContext());
-    builder.setInsertionPointToEnd(module.getBody());
-    OperationState planState(module.getLoc(),
-                             SchedulePlanOp::getOperationName());
-    planState.addAttribute(
-        "schema_version", builder.getI64IntegerAttr(source.getSchemaVersion()));
-    planState.addAttribute(
-        "target",
-        ScheduleTargetAttr::get(module.getContext(), ScheduleTarget::Simt32));
-    planState.addAttribute("policy", source.getPolicyAttr());
-    planState.addAttribute("source_plan_fingerprint",
-                           builder.getStringAttr(source.getFingerprint()));
-    planState.addAttribute("fingerprint",
-                           builder.getStringAttr(std::string(64, '0')));
-    planState.addRegion();
-    auto schedule = cast<SchedulePlanOp>(builder.create(planState));
-    Block *body = new Block();
-    schedule.getBody().push_back(body);
-    builder.setInsertionPointToEnd(body);
+      OpBuilder builder(module.getContext());
+      builder.setInsertionPointToEnd(module.getBody());
+      OperationState planState(module.getLoc(),
+                               SchedulePlanOp::getOperationName());
+      planState.addAttribute("schema_version", builder.getI64IntegerAttr(
+                                                   source.getSchemaVersion()));
+      planState.addAttribute(
+          "target",
+          ScheduleTargetAttr::get(module.getContext(), ScheduleTarget::Simt32));
+      planState.addAttribute("policy", source.getPolicyAttr());
+      planState.addAttribute("source_plan_fingerprint",
+                             builder.getStringAttr(source.getFingerprint()));
+      planState.addAttribute("fingerprint",
+                             builder.getStringAttr(std::string(64, '0')));
+      planState.addRegion();
+      auto schedule = cast<SchedulePlanOp>(builder.create(planState));
+      Block *body = new Block();
+      schedule.getBody().push_back(body);
+      builder.setInsertionPointToEnd(body);
 
-    for (auto [ordinal, buffer] : llvm::enumerate(sourceBuffers)) {
-      auto type = cast<RankedTensorType>(buffer.getTensorType());
-      SmallVector<int64_t> order;
-      for (int64_t axis = 0; axis < type.getRank(); ++axis) {
-        order.push_back(axis);
+      for (auto [ordinal, buffer] : llvm::enumerate(sourceBuffers)) {
+        auto type = cast<RankedTensorType>(buffer.getTensorType());
+        SmallVector<int64_t> order;
+        for (int64_t axis = 0; axis < type.getRank(); ++axis) {
+          order.push_back(axis);
+        }
+        createScheduleRecord(
+            builder, buffer.getLoc(), ScheduleBufferOp::getOperationName(),
+            {builder.getNamedAttr("ordinal",
+                                  builder.getI64IntegerAttr(ordinal)),
+             builder.getNamedAttr("source_buffer",
+                                  builder.getI64IntegerAttr(ordinal)),
+             builder.getNamedAttr("tensor_type", TypeAttr::get(type)),
+             builder.getNamedAttr(
+                 "indexing", ScheduleBufferIndexingAttr::get(
+                                 module.getContext(),
+                                 type.getRank() == 0
+                                     ? ScheduleBufferIndexing::Scalar
+                                     : ScheduleBufferIndexing::Lexicographic)),
+             builder.getNamedAttr(
+                 "iteration_order",
+                 DenseI64ArrayAttr::get(module.getContext(), order)),
+             builder.getNamedAttr(
+                 "lifetime_start",
+                 builder.getI64IntegerAttr(buffer.getLifetimeStart())),
+             builder.getNamedAttr(
+                 "lifetime_end",
+                 builder.getI64IntegerAttr(buffer.getLifetimeEnd()))});
       }
-      createScheduleRecord(
-          builder, buffer.getLoc(), ScheduleBufferOp::getOperationName(),
-          {builder.getNamedAttr("ordinal", builder.getI64IntegerAttr(ordinal)),
-           builder.getNamedAttr("source_buffer",
-                                builder.getI64IntegerAttr(ordinal)),
-           builder.getNamedAttr("tensor_type", TypeAttr::get(type)),
-           builder.getNamedAttr(
-               "indexing", ScheduleBufferIndexingAttr::get(
-                               module.getContext(),
-                               type.getRank() == 0
-                                   ? ScheduleBufferIndexing::Scalar
-                                   : ScheduleBufferIndexing::Lexicographic)),
-           builder.getNamedAttr(
-               "iteration_order",
-               DenseI64ArrayAttr::get(module.getContext(), order)),
-           builder.getNamedAttr(
-               "lifetime_start",
-               builder.getI64IntegerAttr(buffer.getLifetimeStart())),
-           builder.getNamedAttr("lifetime_end", builder.getI64IntegerAttr(
-                                                    buffer.getLifetimeEnd()))});
-    }
-    for (auto [ordinal, task] : llvm::enumerate(sourceTasks)) {
-      ScheduleTaskKind kind =
-          task.getKind() == MaterializationTaskKind::Fold
-              ? (task.getReductionDimensions().front() == 1
-                     ? ScheduleTaskKind::RowFold
-                     : ScheduleTaskKind::ColumnFold)
-          : task.getKind() == MaterializationTaskKind::Contract
-              ? ScheduleTaskKind::Contract
-              : (task.getDomainShape().empty() ? ScheduleTaskKind::Scalar
-                                               : ScheduleTaskKind::Elementwise);
-      FailureOr<ScheduledGeometry> geometry =
-          deriveSimt32Geometry(kind, task.getDomainShape(), source.getPolicy());
-      if (failed(geometry)) {
-        task.emitOpError("cannot derive a bounded SIMT32 schedule candidate");
+      for (auto [ordinal, task] : llvm::enumerate(sourceTasks)) {
+        ScheduleTaskKind kind =
+            task.getKind() == MaterializationTaskKind::Fold
+                ? (task.getReductionDimensions().front() == 1
+                       ? ScheduleTaskKind::RowFold
+                       : ScheduleTaskKind::ColumnFold)
+            : task.getKind() == MaterializationTaskKind::Contract
+                ? ScheduleTaskKind::Contract
+                : (task.getDomainShape().empty()
+                       ? ScheduleTaskKind::Scalar
+                       : ScheduleTaskKind::Elementwise);
+        FailureOr<ScheduledGeometry> geometry = deriveSimt32Geometry(
+            kind, task.getDomainShape(), source.getPolicy());
+        if (failed(geometry)) {
+          task.emitOpError("cannot derive a bounded SIMT32 schedule candidate");
+          return signalPassFailure();
+        }
+        SmallVector<NamedAttribute> attrs{
+            builder.getNamedAttr("ordinal", builder.getI64IntegerAttr(ordinal)),
+            builder.getNamedAttr("source_task",
+                                 builder.getI64IntegerAttr(ordinal)),
+            builder.getNamedAttr(
+                "kind", ScheduleTaskKindAttr::get(module.getContext(), kind)),
+            builder.getNamedAttr("domain_shape", task.getDomainShapeAttr()),
+            builder.getNamedAttr(
+                "grid_shape",
+                DenseI64ArrayAttr::get(module.getContext(), geometry->grid)),
+            builder.getNamedAttr(
+                "tile_shape",
+                DenseI64ArrayAttr::get(module.getContext(), geometry->tile)),
+            builder.getNamedAttr("serial_tiles", builder.getI64IntegerAttr(
+                                                     geometry->serialTiles)),
+            builder.getNamedAttr(
+                "workgroup_threads",
+                builder.getI64IntegerAttr(geometry->workgroupThreads)),
+            builder.getNamedAttr("subgroup_size", builder.getI64IntegerAttr(
+                                                      geometry->subgroupSize)),
+            builder.getNamedAttr("scratch_bytes", builder.getI64IntegerAttr(
+                                                      geometry->scratchBytes)),
+            builder.getNamedAttr("input_buffers", task.getInputBuffersAttr()),
+            builder.getNamedAttr("output_buffers", task.getOutputBuffersAttr()),
+            builder.getNamedAttr("dependencies", task.getDependenciesAttr()),
+            builder.getNamedAttr("semantic_fingerprint",
+                                 task.getSemanticFingerprintAttr())};
+        if (geometry->reductionAxis) {
+          attrs.push_back(builder.getNamedAttr(
+              "reduction_axis",
+              builder.getI64IntegerAttr(*geometry->reductionAxis)));
+          attrs.push_back(builder.getNamedAttr(
+              "reduction_order",
+              ScheduleReductionOrderAttr::get(
+                  module.getContext(),
+                  kind == ScheduleTaskKind::Contract
+                      ? (source.getPolicy() == NumericalPolicy::Fast
+                             ? ScheduleReductionOrder::LeafOrderFree
+                             : ScheduleReductionOrder::SerialAscendingFmaRnF32)
+                      : ScheduleReductionOrder::
+                            TreeAssociationFreeLeafOrderFixed)));
+        }
+        createScheduleRecord(builder, task.getLoc(),
+                             ScheduleTaskOp::getOperationName(), attrs);
+      }
+      builder.create<SchedulePlanYieldOp>(module.getLoc());
+      schedule.setFingerprint(schedulePlanFingerprint(schedule));
+      if (failed(schedule.verifyRegions())) {
         return signalPassFailure();
       }
-      SmallVector<NamedAttribute> attrs{
-          builder.getNamedAttr("ordinal", builder.getI64IntegerAttr(ordinal)),
-          builder.getNamedAttr("source_task",
-                               builder.getI64IntegerAttr(ordinal)),
-          builder.getNamedAttr(
-              "kind", ScheduleTaskKindAttr::get(module.getContext(), kind)),
-          builder.getNamedAttr("domain_shape", task.getDomainShapeAttr()),
-          builder.getNamedAttr(
-              "grid_shape",
-              DenseI64ArrayAttr::get(module.getContext(), geometry->grid)),
-          builder.getNamedAttr(
-              "tile_shape",
-              DenseI64ArrayAttr::get(module.getContext(), geometry->tile)),
-          builder.getNamedAttr(
-              "serial_tiles", builder.getI64IntegerAttr(geometry->serialTiles)),
-          builder.getNamedAttr(
-              "workgroup_threads",
-              builder.getI64IntegerAttr(geometry->workgroupThreads)),
-          builder.getNamedAttr("subgroup_size", builder.getI64IntegerAttr(
-                                                    geometry->subgroupSize)),
-          builder.getNamedAttr("scratch_bytes", builder.getI64IntegerAttr(
-                                                    geometry->scratchBytes)),
-          builder.getNamedAttr("input_buffers", task.getInputBuffersAttr()),
-          builder.getNamedAttr("output_buffers", task.getOutputBuffersAttr()),
-          builder.getNamedAttr("dependencies", task.getDependenciesAttr()),
-          builder.getNamedAttr("semantic_fingerprint",
-                               task.getSemanticFingerprintAttr())};
-      if (geometry->reductionAxis) {
-        attrs.push_back(builder.getNamedAttr(
-            "reduction_axis",
-            builder.getI64IntegerAttr(*geometry->reductionAxis)));
-        attrs.push_back(builder.getNamedAttr(
-            "reduction_order",
-            ScheduleReductionOrderAttr::get(
-                module.getContext(),
-                kind == ScheduleTaskKind::Contract
-                    ? (source.getPolicy() == NumericalPolicy::Fast
-                           ? ScheduleReductionOrder::LeafOrderFree
-                           : ScheduleReductionOrder::SerialAscendingFmaRnF32)
-                    : ScheduleReductionOrder::
-                          TreeAssociationFreeLeafOrderFixed)));
-      }
-      createScheduleRecord(builder, task.getLoc(),
-                           ScheduleTaskOp::getOperationName(), attrs);
-    }
-    builder.create<SchedulePlanYieldOp>(module.getLoc());
-    schedule.setFingerprint(schedulePlanFingerprint(schedule));
-    if (failed(schedule.verifyRegions())) {
-      signalPassFailure();
     }
   }
 };
@@ -3895,15 +3972,34 @@ public:
     SmallVector<MaterializationPlanOp> materializationPlans(
         module.getOps<MaterializationPlanOp>());
     SmallVector<SchedulePlanOp> schedules(module.getOps<SchedulePlanOp>());
-    if (materializationPlans.size() != 1 || schedules.size() != 1 ||
-        failed(verifyMaterializationPlanAgainstSource(
-            module, materializationPlans.front())) ||
-        failed(schedules.front().verifyRegions()) ||
-        failed(verifySchedulePlanAgainstMaterialization(
-            materializationPlans.front(), schedules.front()))) {
-      module.emitError(
-          "requires exactly one valid materialization and schedule plan");
+    if (materializationPlans.empty() ||
+        materializationPlans.size() != schedules.size()) {
+      module.emitError("requires one valid schedule per materialization plan");
       return signalPassFailure();
+    }
+    llvm::SmallDenseSet<Operation *> matchedSchedules;
+    for (MaterializationPlanOp materialization : materializationPlans) {
+      SchedulePlanOp match;
+      for (SchedulePlanOp schedule : schedules) {
+        if (schedule.getSourcePlanFingerprint() ==
+            materialization.getFingerprint()) {
+          if (match) {
+            module.emitError("materialization plan has duplicate schedules");
+            return signalPassFailure();
+          }
+          match = schedule;
+        }
+      }
+      if (!match || !matchedSchedules.insert(match.getOperation()).second ||
+          failed(verifyMaterializationPlanAgainstSource(module,
+                                                        materialization)) ||
+          failed(match.verifyRegions()) ||
+          failed(verifySchedulePlanAgainstMaterialization(materialization,
+                                                          match))) {
+        module.emitError(
+            "requires one valid schedule per materialization plan");
+        return signalPassFailure();
+      }
     }
   }
 };
@@ -4947,15 +5043,10 @@ deriveCpuExecutable(ModuleOp module, MaterializationPlanOp materialization,
 }
 
 FailureOr<GpuExecutableSpec>
-deriveGpuExecutable(ModuleOp module, MaterializationPlanOp materialization,
+deriveGpuExecutable(RegionOp region, MaterializationPlanOp materialization,
                     SchedulePlanOp schedule) {
-  SmallVector<RegionOp> regions;
-  module.walk([&](RegionOp region) { regions.push_back(region); });
-  if (regions.size() != 1)
-    return failure();
   SmallVector<Operation *> algebra;
-  for (Operation &operation :
-       regions.front().getBody().front().without_terminator())
+  for (Operation &operation : region.getBody().front().without_terminator())
     algebra.push_back(&operation);
   SmallVector<ScheduleTaskOp> tasks(
       schedule.getBody().front().getOps<ScheduleTaskOp>());
@@ -5030,6 +5121,79 @@ ArrayAttr accessArray(MLIRContext *context, ExecutableAccess access,
   return ArrayAttr::get(context, values);
 }
 
+SchedulePlanOp
+uniqueScheduleForMaterialization(ArrayRef<SchedulePlanOp> schedules,
+                                 MaterializationPlanOp materialization) {
+  SchedulePlanOp match;
+  for (SchedulePlanOp schedule : schedules) {
+    if (schedule.getSourcePlanFingerprint() != materialization.getFingerprint())
+      continue;
+    if (match)
+      return {};
+    match = schedule;
+  }
+  return match;
+}
+
+struct GpuBuildUnit {
+  RegionOp region;
+  MaterializationPlanOp materialization;
+  SchedulePlanOp schedule;
+  GpuExecutableSpec spec;
+};
+
+bool hasBoundedGpuModuleResources(ArrayRef<GpuBuildUnit> units) {
+  if (units.empty() || units.size() > kMaximumGpuExecutableRecords)
+    return false;
+  uint64_t entries = 0;
+  uint64_t slots = 0;
+  uint64_t codeBytes = 0;
+  uint64_t temporaryBytes = 0;
+  uint64_t taskPositions = 0;
+  for (const GpuBuildUnit &unit : units) {
+    entries += unit.spec.entries.size();
+    slots += unit.spec.slots.size();
+    codeBytes += unit.spec.code.size();
+    if (entries > kMaximumGpuExecutableRecords ||
+        slots > kMaximumGpuExecutableRecords ||
+        codeBytes > kMaximumGpuCodeBytes)
+      return false;
+    llvm::DenseMap<int64_t, uint64_t> groupBytes;
+    for (auto [slot, reuseGroup] :
+         llvm::zip_equal(unit.spec.slots, unit.spec.reuseGroups)) {
+      if (slot.storage != MaterializationStorage::Temporary)
+        continue;
+      uint64_t previous = groupBytes.lookup(reuseGroup);
+      uint64_t required = slot.requiredBytes;
+      if (required > previous) {
+        uint64_t increase = required - previous;
+        if (increase > kMaximumGpuTemporaryBytes - temporaryBytes)
+          return false;
+        temporaryBytes += increase;
+        groupBytes[reuseGroup] = required;
+      }
+    }
+    for (const GpuEntrySpec &entry : unit.spec.entries) {
+      uint64_t positions = 1;
+      auto multiplyExtents = [&](ArrayRef<int64_t> extents) {
+        for (int64_t extent : extents) {
+          if (extent <= 0 || static_cast<uint64_t>(extent) >
+                                 kMaximumGpuAggregateTaskPositions / positions)
+            return false;
+          positions *= extent;
+        }
+        return true;
+      };
+      if (!multiplyExtents(entry.grid) || !multiplyExtents(entry.block))
+        return false;
+      if (positions > kMaximumGpuAggregateTaskPositions - taskPositions)
+        return false;
+      taskPositions += positions;
+    }
+  }
+  return true;
+}
+
 class BuildGpuExecutableBundlePass
     : public impl::ShuttleBuildGpuExecutableBundlePassBase<
           BuildGpuExecutableBundlePass> {
@@ -5039,182 +5203,212 @@ public:
     SmallVector<MaterializationPlanOp> materializations(
         module.getOps<MaterializationPlanOp>());
     SmallVector<SchedulePlanOp> schedules(module.getOps<SchedulePlanOp>());
-    if (materializations.size() != 1 || schedules.size() != 1 ||
+    if (materializations.empty() ||
+        materializations.size() != schedules.size() ||
         !module.getOps<DeviceModuleOp>().empty() ||
         !module.getOps<InvocationAbiOp>().empty() ||
-        !module.getOps<ExecutableBundleOp>().empty() ||
-        failed(verifyMaterializationPlanAgainstSource(
-            module, materializations.front())) ||
-        failed(schedules.front().verifyRegions()) ||
-        failed(verifySchedulePlanAgainstMaterialization(
-            materializations.front(), schedules.front()))) {
+        !module.getOps<ExecutableBundleOp>().empty()) {
       module.emitError(
-          "requires one source-bound plan and no GPU executable bundle");
+          "requires source-bound plans and no GPU executable bundles");
       return signalPassFailure();
     }
-    FailureOr<GpuExecutableSpec> spec = deriveGpuExecutable(
-        module, materializations.front(), schedules.front());
-    if (failed(spec)) {
-      module.emitError("failed to build exact GPU executable bundle");
-      return signalPassFailure();
-    }
-    OpBuilder builder(module.getContext());
-    builder.setInsertionPointToEnd(module.getBody());
-    const std::string codeDigest = executableCodeDigest(spec->code);
-    OperationState deviceState(module.getLoc(),
-                               DeviceModuleOp::getOperationName());
-    deviceState.addAttribute("schema_version", builder.getI64IntegerAttr(3));
-    deviceState.addAttribute(
-        "code_format",
-        ExecutableCodeFormatAttr::get(module.getContext(),
-                                      ExecutableCodeFormat::CudaPtxSm90V1));
-    deviceState.addAttribute("policy", schedules.front().getPolicyAttr());
-    deviceState.addAttribute("source_schedule_fingerprint",
-                             schedules.front().getFingerprintAttr());
-    deviceState.addAttribute(
-        "code", DenseI8ArrayAttr::get(module.getContext(), spec->code));
-    deviceState.addAttribute("code_digest", builder.getStringAttr(codeDigest));
-    deviceState.addAttribute("fingerprint",
-                             builder.getStringAttr(std::string(64, '0')));
-    deviceState.addRegion();
-    auto device = cast<DeviceModuleOp>(builder.create(deviceState));
-    device.getBody().push_back(new Block());
-    builder.setInsertionPointToEnd(&device.getBody().front());
-    for (const GpuEntrySpec &entry : spec->entries) {
-      SmallVector<NamedAttribute> attributes{
-          builder.getNamedAttr("ordinal",
-                               builder.getI64IntegerAttr(entry.ordinal)),
-          builder.getNamedAttr("source_task",
-                               builder.getI64IntegerAttr(entry.ordinal)),
-          builder.getNamedAttr("code_offset",
-                               builder.getI64IntegerAttr(entry.codeOffset)),
-          builder.getNamedAttr("code_length",
-                               builder.getI64IntegerAttr(entry.codeLength)),
-          builder.getNamedAttr(
-              "input_buffers",
-              DenseI64ArrayAttr::get(module.getContext(), entry.inputs)),
-          builder.getNamedAttr(
-              "output_buffers",
-              DenseI64ArrayAttr::get(module.getContext(), entry.outputs)),
-          builder.getNamedAttr("input_accesses",
-                               accessArray(module.getContext(),
-                                           ExecutableAccess::Read,
-                                           entry.inputs.size())),
-          builder.getNamedAttr("output_accesses",
-                               accessArray(module.getContext(),
-                                           ExecutableAccess::Write,
-                                           entry.outputs.size())),
-          builder.getNamedAttr(
-              "dependencies",
-              DenseI64ArrayAttr::get(module.getContext(), entry.dependencies)),
-          builder.getNamedAttr(
-              "predication", ExecutablePredicationAttr::get(module.getContext(),
-                                                            entry.predication)),
-          builder.getNamedAttr("code_digest",
-                               builder.getStringAttr(entry.codeDigest)),
-          builder.getNamedAttr(
-              "grid", DenseI64ArrayAttr::get(module.getContext(), entry.grid)),
-          builder.getNamedAttr("block", DenseI64ArrayAttr::get(
-                                            module.getContext(), entry.block)),
-          builder.getNamedAttr(
-              "dynamic_shared_bytes",
-              builder.getI64IntegerAttr(entry.dynamicSharedBytes)),
-          builder.getNamedAttr("kernel_arity",
-                               builder.getI64IntegerAttr(entry.kernelArity))};
-      if (entry.reductionOrder)
-        attributes.push_back(builder.getNamedAttr(
-            "reduction_order",
-            ScheduleReductionOrderAttr::get(module.getContext(),
-                                            *entry.reductionOrder)));
-      createScheduleRecord(builder, module.getLoc(),
-                           DeviceEntryOp::getOperationName(), attributes);
-    }
-    builder.create<DeviceModuleYieldOp>(module.getLoc());
-    device.setFingerprint(deviceModuleFingerprint(device));
-
-    builder.setInsertionPointToEnd(module.getBody());
-    OperationState abiState(module.getLoc(),
-                            InvocationAbiOp::getOperationName());
-    abiState.addAttribute("schema_version", builder.getI64IntegerAttr(3));
-    abiState.addAttribute("source_plan_fingerprint",
-                          materializations.front().getFingerprintAttr());
-    abiState.addAttribute("source_schedule_fingerprint",
-                          schedules.front().getFingerprintAttr());
-    abiState.addAttribute("fingerprint",
-                          builder.getStringAttr(std::string(64, '0')));
-    abiState.addRegion();
-    auto abi = cast<InvocationAbiOp>(builder.create(abiState));
-    abi.getBody().push_back(new Block());
-    builder.setInsertionPointToEnd(&abi.getBody().front());
-    int64_t operandBinding = 0;
-    int64_t resultBinding = 0;
-    for (auto [ordinal, slot] : llvm::enumerate(spec->slots)) {
-      ExecutableBindingKind binding = ExecutableBindingKind::None;
-      std::optional<int64_t> bindingIndex;
-      if (slot.storage == MaterializationStorage::External &&
-          slot.access == ExecutableAccess::Read) {
-        binding = ExecutableBindingKind::Operand;
-        bindingIndex = operandBinding++;
-      } else if (slot.storage == MaterializationStorage::External &&
-                 slot.access == ExecutableAccess::Write) {
-        binding = ExecutableBindingKind::Result;
-        bindingIndex = resultBinding++;
+    SmallVector<GpuBuildUnit, 0> units;
+    llvm::SmallDenseSet<Operation *> regions;
+    llvm::SmallDenseSet<Operation *> matchedSchedules;
+    for (MaterializationPlanOp materialization : materializations) {
+      RegionOp region;
+      SchedulePlanOp schedule =
+          uniqueScheduleForMaterialization(schedules, materialization);
+      if (!schedule ||
+          failed(verifyMaterializationPlanAgainstSource(module, materialization,
+                                                        &region)) ||
+          !regions.insert(region.getOperation()).second ||
+          !matchedSchedules.insert(schedule.getOperation()).second ||
+          failed(schedule.verifyRegions()) ||
+          failed(verifySchedulePlanAgainstMaterialization(materialization,
+                                                          schedule))) {
+        module.emitError("GPU plans do not form one-to-one source bindings");
+        return signalPassFailure();
       }
-      SmallVector<NamedAttribute> attributes{
-          builder.getNamedAttr("ordinal", builder.getI64IntegerAttr(ordinal)),
-          builder.getNamedAttr("source_buffer",
-                               builder.getI64IntegerAttr(ordinal)),
-          builder.getNamedAttr("tensor_type", TypeAttr::get(slot.tensorType)),
-          builder.getNamedAttr("required_bytes",
-                               builder.getI64IntegerAttr(slot.requiredBytes)),
-          builder.getNamedAttr(
-              "strides",
-              DenseI64ArrayAttr::get(module.getContext(), slot.strides)),
-          builder.getNamedAttr("offset", builder.getI64IntegerAttr(0)),
-          builder.getNamedAttr("alignment",
-                               builder.getI64IntegerAttr(slot.alignment)),
-          builder.getNamedAttr(
-              "address_space",
-              ExecutableAddressSpaceAttr::get(module.getContext(),
-                                              ExecutableAddressSpace::Device)),
-          builder.getNamedAttr("access", ExecutableAccessAttr::get(
-                                             module.getContext(), slot.access)),
-          builder.getNamedAttr(
-              "storage", MaterializationStorageAttr::get(module.getContext(),
-                                                         slot.storage)),
-          builder.getNamedAttr("alias_group",
-                               builder.getI64IntegerAttr(ordinal)),
-          builder.getNamedAttr("reuse_group", builder.getI64IntegerAttr(
-                                                  spec->reuseGroups[ordinal])),
-          builder.getNamedAttr("binding", ExecutableBindingKindAttr::get(
-                                              module.getContext(), binding))};
-      if (bindingIndex)
-        attributes.push_back(builder.getNamedAttr(
-            "binding_index", builder.getI64IntegerAttr(*bindingIndex)));
-      createScheduleRecord(builder, module.getLoc(),
-                           InvocationSlotOp::getOperationName(), attributes);
+      FailureOr<GpuExecutableSpec> spec =
+          deriveGpuExecutable(region, materialization, schedule);
+      if (failed(spec)) {
+        module.emitError("failed to build exact GPU executable bundle");
+        return signalPassFailure();
+      }
+      units.push_back({region, materialization, schedule, std::move(*spec)});
     }
-    builder.create<InvocationAbiYieldOp>(module.getLoc());
-    abi.setFingerprint(invocationAbiFingerprint(abi));
+    size_t regionCount = 0;
+    module.walk([&](RegionOp) { ++regionCount; });
+    if (regions.size() != regionCount || !hasBoundedGpuModuleResources(units)) {
+      module.emitError("GPU executable bundle aggregate exceeds closed bounds");
+      return signalPassFailure();
+    }
+    for (GpuBuildUnit &unit : units) {
+      MaterializationPlanOp materialization = unit.materialization;
+      SchedulePlanOp schedule = unit.schedule;
+      GpuExecutableSpec &spec = unit.spec;
+      OpBuilder builder(module.getContext());
+      builder.setInsertionPointToEnd(module.getBody());
+      const std::string codeDigest = executableCodeDigest(spec.code);
+      OperationState deviceState(module.getLoc(),
+                                 DeviceModuleOp::getOperationName());
+      deviceState.addAttribute("schema_version", builder.getI64IntegerAttr(3));
+      deviceState.addAttribute(
+          "code_format",
+          ExecutableCodeFormatAttr::get(module.getContext(),
+                                        ExecutableCodeFormat::CudaPtxSm90V1));
+      deviceState.addAttribute("policy", schedule.getPolicyAttr());
+      deviceState.addAttribute("source_schedule_fingerprint",
+                               schedule.getFingerprintAttr());
+      deviceState.addAttribute(
+          "code", DenseI8ArrayAttr::get(module.getContext(), spec.code));
+      deviceState.addAttribute("code_digest",
+                               builder.getStringAttr(codeDigest));
+      deviceState.addAttribute("fingerprint",
+                               builder.getStringAttr(std::string(64, '0')));
+      deviceState.addRegion();
+      auto device = cast<DeviceModuleOp>(builder.create(deviceState));
+      device.getBody().push_back(new Block());
+      builder.setInsertionPointToEnd(&device.getBody().front());
+      for (const GpuEntrySpec &entry : spec.entries) {
+        SmallVector<NamedAttribute> attributes{
+            builder.getNamedAttr("ordinal",
+                                 builder.getI64IntegerAttr(entry.ordinal)),
+            builder.getNamedAttr("source_task",
+                                 builder.getI64IntegerAttr(entry.ordinal)),
+            builder.getNamedAttr("code_offset",
+                                 builder.getI64IntegerAttr(entry.codeOffset)),
+            builder.getNamedAttr("code_length",
+                                 builder.getI64IntegerAttr(entry.codeLength)),
+            builder.getNamedAttr(
+                "input_buffers",
+                DenseI64ArrayAttr::get(module.getContext(), entry.inputs)),
+            builder.getNamedAttr(
+                "output_buffers",
+                DenseI64ArrayAttr::get(module.getContext(), entry.outputs)),
+            builder.getNamedAttr("input_accesses",
+                                 accessArray(module.getContext(),
+                                             ExecutableAccess::Read,
+                                             entry.inputs.size())),
+            builder.getNamedAttr("output_accesses",
+                                 accessArray(module.getContext(),
+                                             ExecutableAccess::Write,
+                                             entry.outputs.size())),
+            builder.getNamedAttr("dependencies",
+                                 DenseI64ArrayAttr::get(module.getContext(),
+                                                        entry.dependencies)),
+            builder.getNamedAttr("predication",
+                                 ExecutablePredicationAttr::get(
+                                     module.getContext(), entry.predication)),
+            builder.getNamedAttr("code_digest",
+                                 builder.getStringAttr(entry.codeDigest)),
+            builder.getNamedAttr("grid", DenseI64ArrayAttr::get(
+                                             module.getContext(), entry.grid)),
+            builder.getNamedAttr(
+                "block",
+                DenseI64ArrayAttr::get(module.getContext(), entry.block)),
+            builder.getNamedAttr(
+                "dynamic_shared_bytes",
+                builder.getI64IntegerAttr(entry.dynamicSharedBytes)),
+            builder.getNamedAttr("kernel_arity",
+                                 builder.getI64IntegerAttr(entry.kernelArity))};
+        if (entry.reductionOrder)
+          attributes.push_back(builder.getNamedAttr(
+              "reduction_order",
+              ScheduleReductionOrderAttr::get(module.getContext(),
+                                              *entry.reductionOrder)));
+        createScheduleRecord(builder, module.getLoc(),
+                             DeviceEntryOp::getOperationName(), attributes);
+      }
+      builder.create<DeviceModuleYieldOp>(module.getLoc());
+      device.setFingerprint(deviceModuleFingerprint(device));
 
-    builder.setInsertionPointToEnd(module.getBody());
-    OperationState bundleState(module.getLoc(),
-                               ExecutableBundleOp::getOperationName());
-    bundleState.addAttribute("schema_version", builder.getI64IntegerAttr(2));
-    bundleState.addAttribute("source_schedule_fingerprint",
-                             schedules.front().getFingerprintAttr());
-    bundleState.addAttribute("device_module_fingerprint",
-                             device.getFingerprintAttr());
-    bundleState.addAttribute("invocation_abi_fingerprint",
-                             abi.getFingerprintAttr());
-    bundleState.addAttribute(
-        "completion",
-        ExecutableCompletionAttr::get(module.getContext(),
-                                      ExecutableCompletion::StreamOrdered));
-    bundleState.addAttribute("fingerprint",
-                             builder.getStringAttr(std::string(64, '0')));
-    auto bundle = cast<ExecutableBundleOp>(builder.create(bundleState));
-    bundle.setFingerprint(executableBundleFingerprint(bundle));
+      builder.setInsertionPointToEnd(module.getBody());
+      OperationState abiState(module.getLoc(),
+                              InvocationAbiOp::getOperationName());
+      abiState.addAttribute("schema_version", builder.getI64IntegerAttr(3));
+      abiState.addAttribute("source_plan_fingerprint",
+                            materialization.getFingerprintAttr());
+      abiState.addAttribute("source_schedule_fingerprint",
+                            schedule.getFingerprintAttr());
+      abiState.addAttribute("fingerprint",
+                            builder.getStringAttr(std::string(64, '0')));
+      abiState.addRegion();
+      auto abi = cast<InvocationAbiOp>(builder.create(abiState));
+      abi.getBody().push_back(new Block());
+      builder.setInsertionPointToEnd(&abi.getBody().front());
+      int64_t operandBinding = 0;
+      int64_t resultBinding = 0;
+      for (auto [ordinal, slot] : llvm::enumerate(spec.slots)) {
+        ExecutableBindingKind binding = ExecutableBindingKind::None;
+        std::optional<int64_t> bindingIndex;
+        if (slot.storage == MaterializationStorage::External &&
+            slot.access == ExecutableAccess::Read) {
+          binding = ExecutableBindingKind::Operand;
+          bindingIndex = operandBinding++;
+        } else if (slot.storage == MaterializationStorage::External &&
+                   slot.access == ExecutableAccess::Write) {
+          binding = ExecutableBindingKind::Result;
+          bindingIndex = resultBinding++;
+        }
+        SmallVector<NamedAttribute> attributes{
+            builder.getNamedAttr("ordinal", builder.getI64IntegerAttr(ordinal)),
+            builder.getNamedAttr("source_buffer",
+                                 builder.getI64IntegerAttr(ordinal)),
+            builder.getNamedAttr("tensor_type", TypeAttr::get(slot.tensorType)),
+            builder.getNamedAttr("required_bytes",
+                                 builder.getI64IntegerAttr(slot.requiredBytes)),
+            builder.getNamedAttr(
+                "strides",
+                DenseI64ArrayAttr::get(module.getContext(), slot.strides)),
+            builder.getNamedAttr("offset", builder.getI64IntegerAttr(0)),
+            builder.getNamedAttr("alignment",
+                                 builder.getI64IntegerAttr(slot.alignment)),
+            builder.getNamedAttr(
+                "address_space",
+                ExecutableAddressSpaceAttr::get(
+                    module.getContext(), ExecutableAddressSpace::Device)),
+            builder.getNamedAttr(
+                "access",
+                ExecutableAccessAttr::get(module.getContext(), slot.access)),
+            builder.getNamedAttr(
+                "storage", MaterializationStorageAttr::get(module.getContext(),
+                                                           slot.storage)),
+            builder.getNamedAttr("alias_group",
+                                 builder.getI64IntegerAttr(ordinal)),
+            builder.getNamedAttr("reuse_group", builder.getI64IntegerAttr(
+                                                    spec.reuseGroups[ordinal])),
+            builder.getNamedAttr("binding", ExecutableBindingKindAttr::get(
+                                                module.getContext(), binding))};
+        if (bindingIndex)
+          attributes.push_back(builder.getNamedAttr(
+              "binding_index", builder.getI64IntegerAttr(*bindingIndex)));
+        createScheduleRecord(builder, module.getLoc(),
+                             InvocationSlotOp::getOperationName(), attributes);
+      }
+      builder.create<InvocationAbiYieldOp>(module.getLoc());
+      abi.setFingerprint(invocationAbiFingerprint(abi));
+
+      builder.setInsertionPointToEnd(module.getBody());
+      OperationState bundleState(module.getLoc(),
+                                 ExecutableBundleOp::getOperationName());
+      bundleState.addAttribute("schema_version", builder.getI64IntegerAttr(2));
+      bundleState.addAttribute("source_schedule_fingerprint",
+                               schedule.getFingerprintAttr());
+      bundleState.addAttribute("device_module_fingerprint",
+                               device.getFingerprintAttr());
+      bundleState.addAttribute("invocation_abi_fingerprint",
+                               abi.getFingerprintAttr());
+      bundleState.addAttribute(
+          "completion",
+          ExecutableCompletionAttr::get(module.getContext(),
+                                        ExecutableCompletion::StreamOrdered));
+      bundleState.addAttribute("fingerprint",
+                               builder.getStringAttr(std::string(64, '0')));
+      auto bundle = cast<ExecutableBundleOp>(builder.create(bundleState));
+      bundle.setFingerprint(executableBundleFingerprint(bundle));
+    }
   }
 };
 
@@ -5707,41 +5901,39 @@ public:
   }
 };
 
-LogicalResult verifyGpuExecutableAgainstSource(ModuleOp module) {
-  SmallVector<MaterializationPlanOp> materializations(
-      module.getOps<MaterializationPlanOp>());
-  SmallVector<SchedulePlanOp> schedules(module.getOps<SchedulePlanOp>());
-  SmallVector<DeviceModuleOp> devices(module.getOps<DeviceModuleOp>());
-  SmallVector<InvocationAbiOp> abis(module.getOps<InvocationAbiOp>());
-  SmallVector<ExecutableBundleOp> bundles(module.getOps<ExecutableBundleOp>());
-  if (materializations.size() != 1 || schedules.size() != 1 ||
-      devices.size() != 1 || abis.size() != 1 || bundles.size() != 1 ||
-      failed(verifyMaterializationPlanAgainstSource(
-          module, materializations.front())) ||
-      failed(schedules.front().verifyRegions()) ||
-      failed(verifySchedulePlanAgainstMaterialization(materializations.front(),
-                                                      schedules.front())) ||
-      failed(devices.front().verifyRegions()) ||
-      failed(abis.front().verifyRegions()) || failed(bundles.front().verify()))
+LogicalResult verifyGpuExecutableUnit(ModuleOp module, RegionOp region,
+                                      MaterializationPlanOp materialization,
+                                      SchedulePlanOp schedule,
+                                      DeviceModuleOp device,
+                                      InvocationAbiOp abi,
+                                      ExecutableBundleOp bundle) {
+  if (failed(verifyMaterializationPlanAgainstSource(module, materialization)) ||
+      failed(schedule.verifyRegions()) ||
+      failed(verifySchedulePlanAgainstMaterialization(materialization,
+                                                      schedule)) ||
+      failed(device.verifyRegions()) || failed(abi.verifyRegions()) ||
+      failed(bundle.verify()))
     return failure();
   FailureOr<GpuExecutableSpec> expected =
-      deriveGpuExecutable(module, materializations.front(), schedules.front());
-  if (failed(expected) || devices.front().getSchemaVersion() != 3 ||
-      devices.front().getCodeFormat() != ExecutableCodeFormat::CudaPtxSm90V1 ||
-      devices.front().getPolicy() != schedules.front().getPolicy() ||
-      devices.front().getSourceScheduleFingerprint() !=
-          schedules.front().getFingerprint() ||
-      abis.front().getSchemaVersion() != 3 ||
-      abis.front().getSourcePlanFingerprint() !=
-          materializations.front().getFingerprint() ||
-      bundles.front().getSchemaVersion() != 2 ||
-      bundles.front().getCompletion() != ExecutableCompletion::StreamOrdered ||
-      devices.front().getCode() != ArrayRef<int8_t>(expected->code))
+      deriveGpuExecutable(region, materialization, schedule);
+  if (failed(expected) || device.getSchemaVersion() != 3 ||
+      device.getCodeFormat() != ExecutableCodeFormat::CudaPtxSm90V1 ||
+      device.getPolicy() != schedule.getPolicy() ||
+      device.getSourceScheduleFingerprint() != schedule.getFingerprint() ||
+      abi.getSchemaVersion() != 3 ||
+      abi.getSourcePlanFingerprint() != materialization.getFingerprint() ||
+      abi.getSourceScheduleFingerprint() != schedule.getFingerprint() ||
+      bundle.getSchemaVersion() != 2 ||
+      bundle.getSourceScheduleFingerprint() != schedule.getFingerprint() ||
+      bundle.getDeviceModuleFingerprint() != device.getFingerprint() ||
+      bundle.getInvocationAbiFingerprint() != abi.getFingerprint() ||
+      bundle.getCompletion() != ExecutableCompletion::StreamOrdered ||
+      device.getCode() != ArrayRef<int8_t>(expected->code))
     return failure();
   SmallVector<DeviceEntryOp> entries(
-      devices.front().getBody().front().getOps<DeviceEntryOp>());
+      device.getBody().front().getOps<DeviceEntryOp>());
   SmallVector<InvocationSlotOp> slots(
-      abis.front().getBody().front().getOps<InvocationSlotOp>());
+      abi.getBody().front().getOps<InvocationSlotOp>());
   if (entries.size() != expected->entries.size() ||
       slots.size() != expected->slots.size())
     return failure();
@@ -5792,6 +5984,87 @@ LogicalResult verifyGpuExecutableAgainstSource(ModuleOp module) {
   return success();
 }
 
+LogicalResult verifyGpuExecutableAgainstSource(ModuleOp module) {
+  SmallVector<MaterializationPlanOp> materializations(
+      module.getOps<MaterializationPlanOp>());
+  SmallVector<SchedulePlanOp> schedules(module.getOps<SchedulePlanOp>());
+  SmallVector<DeviceModuleOp> devices(module.getOps<DeviceModuleOp>());
+  SmallVector<InvocationAbiOp> abis(module.getOps<InvocationAbiOp>());
+  SmallVector<ExecutableBundleOp> bundles(module.getOps<ExecutableBundleOp>());
+  if (materializations.empty() || materializations.size() != schedules.size() ||
+      materializations.size() != devices.size() ||
+      materializations.size() != abis.size() ||
+      materializations.size() != bundles.size())
+    return failure();
+
+  llvm::SmallDenseSet<Operation *> regions;
+  llvm::SmallDenseSet<Operation *> matchedSchedules;
+  llvm::SmallDenseSet<Operation *> matchedDevices;
+  llvm::SmallDenseSet<Operation *> matchedAbis;
+  llvm::SmallDenseSet<Operation *> matchedBundles;
+  SmallVector<GpuBuildUnit, 0> units;
+  for (MaterializationPlanOp materialization : materializations) {
+    RegionOp region;
+    if (failed(verifyMaterializationPlanAgainstSource(module, materialization,
+                                                      &region)) ||
+        !regions.insert(region.getOperation()).second)
+      return failure();
+    SchedulePlanOp schedule =
+        uniqueScheduleForMaterialization(schedules, materialization);
+    if (!schedule || !matchedSchedules.insert(schedule.getOperation()).second)
+      return failure();
+
+    DeviceModuleOp device;
+    for (DeviceModuleOp candidate : devices) {
+      if (candidate.getSourceScheduleFingerprint() != schedule.getFingerprint())
+        continue;
+      if (device)
+        return failure();
+      device = candidate;
+    }
+    InvocationAbiOp abi;
+    for (InvocationAbiOp candidate : abis) {
+      if (candidate.getSourcePlanFingerprint() !=
+              materialization.getFingerprint() ||
+          candidate.getSourceScheduleFingerprint() != schedule.getFingerprint())
+        continue;
+      if (abi)
+        return failure();
+      abi = candidate;
+    }
+    if (!device || !abi ||
+        !matchedDevices.insert(device.getOperation()).second ||
+        !matchedAbis.insert(abi.getOperation()).second)
+      return failure();
+
+    ExecutableBundleOp bundle;
+    for (ExecutableBundleOp candidate : bundles) {
+      if (candidate.getSourceScheduleFingerprint() !=
+              schedule.getFingerprint() ||
+          candidate.getDeviceModuleFingerprint() != device.getFingerprint() ||
+          candidate.getInvocationAbiFingerprint() != abi.getFingerprint())
+        continue;
+      if (bundle)
+        return failure();
+      bundle = candidate;
+    }
+    if (!bundle || !matchedBundles.insert(bundle.getOperation()).second ||
+        failed(verifyGpuExecutableUnit(module, region, materialization,
+                                       schedule, device, abi, bundle)))
+      return failure();
+    FailureOr<GpuExecutableSpec> spec =
+        deriveGpuExecutable(region, materialization, schedule);
+    if (failed(spec))
+      return failure();
+    units.push_back({region, materialization, schedule, std::move(*spec)});
+  }
+  size_t regionCount = 0;
+  module.walk([&](RegionOp) { ++regionCount; });
+  if (regions.size() != regionCount || !hasBoundedGpuModuleResources(units))
+    return failure();
+  return success();
+}
+
 class VerifyGpuExecutableBundlePass
     : public impl::ShuttleVerifyGpuExecutableBundlePassBase<
           VerifyGpuExecutableBundlePass> {
@@ -5805,145 +6078,185 @@ public:
   }
 };
 
+struct PreparedGpuCall {
+  RegionOp region;
+  SmallVector<uint8_t> bundleBytes;
+  std::string digest;
+  SmallVector<Attribute> operandLayouts;
+  SmallVector<Attribute> resultLayouts;
+};
+
+FailureOr<PreparedGpuCall> prepareGpuCall(ModuleOp module, RegionOp region,
+                                          DeviceModuleOp device,
+                                          InvocationAbiOp abi,
+                                          ExecutableBundleOp bundle) {
+  if (device.getPolicy() != region.getPolicy())
+    return failure();
+  auto closedExternalType = [](Value value) {
+    auto tensor = dyn_cast<RankedTensorType>(value.getType());
+    return tensor && tensor.hasStaticShape() && tensor.getRank() >= 1 &&
+           tensor.getRank() <= 2 && tensor.getElementType().isBF16();
+  };
+  if (!llvm::all_of(region.getInputs(), closedExternalType) ||
+      !llvm::all_of(region.getResults(), closedExternalType))
+    return failure();
+  SmallVector<InvocationSlotOp> operandSlots(region.getInputs().size());
+  SmallVector<InvocationSlotOp> resultSlots(region.getResults().size());
+  for (InvocationSlotOp slot :
+       abi.getBody().front().getOps<InvocationSlotOp>()) {
+    if (!slot.getBindingIndex())
+      continue;
+    SmallVector<InvocationSlotOp> *projection = nullptr;
+    if (slot.getBinding() == ExecutableBindingKind::Operand)
+      projection = &operandSlots;
+    else if (slot.getBinding() == ExecutableBindingKind::Result)
+      projection = &resultSlots;
+    else
+      return failure();
+    int64_t index = *slot.getBindingIndex();
+    if (index < 0 || index >= static_cast<int64_t>(projection->size()) ||
+        (*projection)[index])
+      return failure();
+    (*projection)[index] = slot;
+  }
+  for (auto [index, slot] : llvm::enumerate(operandSlots)) {
+    if (!slot || slot.getTensorType() != region.getInputs()[index].getType())
+      return failure();
+  }
+  for (auto [index, slot] : llvm::enumerate(resultSlots)) {
+    if (!slot || slot.getTensorType() != region.getResults()[index].getType())
+      return failure();
+  }
+  OpBuilder builder(module.getContext());
+  OwningOpRef<ModuleOp> stripped = ModuleOp::create(module.getLoc());
+  builder.setInsertionPointToEnd(stripped->getBody());
+  builder.insert(device->clone());
+  builder.insert(abi->clone());
+  builder.insert(bundle->clone());
+  FailureOr<SmallVector<uint8_t>> bundleBytes =
+      serializeGpuExecutableBundle(*stripped);
+  if (failed(bundleBytes))
+    return failure();
+  PreparedGpuCall prepared{region, std::move(*bundleBytes), {}, {}, {}};
+  prepared.digest = gpuExecutableBundleDigest(prepared.bundleBytes);
+  for (Value input : region.getInputs())
+    prepared.operandLayouts.push_back(
+        rowMajorLayout(cast<RankedTensorType>(input.getType())));
+  for (Value result : region.getResults())
+    prepared.resultLayouts.push_back(
+        rowMajorLayout(cast<RankedTensorType>(result.getType())));
+  return prepared;
+}
+
 class ReplaceWithGpuExecutableBundlePass
     : public impl::ShuttleReplaceWithGpuExecutableBundlePassBase<
           ReplaceWithGpuExecutableBundlePass> {
 public:
   void runOnOperation() override {
     ModuleOp module = getOperation();
-    SmallVector<RegionOp> regions;
-    module.walk([&](RegionOp region) { regions.push_back(region); });
-    if (regions.size() != 1 ||
-        failed(verifyGpuExecutableAgainstSource(module))) {
-      module.emitError("requires one source-bound closed GPU executable");
+    if (failed(verifyGpuExecutableAgainstSource(module))) {
+      module.emitError("requires source-bound closed GPU executables");
       return signalPassFailure();
     }
-    RegionOp region = regions.front();
+    SmallVector<MaterializationPlanOp> materializations(
+        module.getOps<MaterializationPlanOp>());
+    SmallVector<SchedulePlanOp> schedules(module.getOps<SchedulePlanOp>());
     SmallVector<DeviceModuleOp> devices(module.getOps<DeviceModuleOp>());
     SmallVector<InvocationAbiOp> abis(module.getOps<InvocationAbiOp>());
     SmallVector<ExecutableBundleOp> bundles(
         module.getOps<ExecutableBundleOp>());
-    if (devices.size() != 1 || abis.size() != 1 || bundles.size() != 1 ||
-        devices.front().getPolicy() != region.getPolicy()) {
-      region.emitOpError(
-          "GPU typed-FFI bridge requires one policy-bound closed "
-          "bundle");
-      return signalPassFailure();
-    }
-    auto closedExternalType = [](Value value) {
-      auto tensor = dyn_cast<RankedTensorType>(value.getType());
-      return tensor && tensor.hasStaticShape() && tensor.getRank() >= 1 &&
-             tensor.getRank() <= 2 && tensor.getElementType().isBF16();
-    };
-    if (!llvm::all_of(region.getInputs(), closedExternalType) ||
-        !llvm::all_of(region.getResults(), closedExternalType)) {
-      region.emitOpError("GPU typed-FFI bridge requires static rank-one or "
-                         "rank-two BF16 views");
-      return signalPassFailure();
-    }
-    SmallVector<InvocationSlotOp> operandSlots(region.getInputs().size());
-    SmallVector<InvocationSlotOp> resultSlots(region.getResults().size());
-    for (InvocationSlotOp slot :
-         abis.front().getBody().front().getOps<InvocationSlotOp>()) {
-      if (!slot.getBindingIndex())
-        continue;
-      SmallVector<InvocationSlotOp> *projection = nullptr;
-      if (slot.getBinding() == ExecutableBindingKind::Operand)
-        projection = &operandSlots;
-      else if (slot.getBinding() == ExecutableBindingKind::Result)
-        projection = &resultSlots;
-      else {
-        region.emitOpError(
-            "GPU typed-FFI bridge has an invalid external binding");
+    SmallVector<PreparedGpuCall> preparedCalls;
+    uint64_t aggregateTransportBytes = 0;
+    for (MaterializationPlanOp materialization : materializations) {
+      RegionOp region;
+      if (failed(verifyMaterializationPlanAgainstSource(module, materialization,
+                                                        &region)))
+        return signalPassFailure();
+      SchedulePlanOp schedule =
+          uniqueScheduleForMaterialization(schedules, materialization);
+      DeviceModuleOp device;
+      for (DeviceModuleOp candidate : devices) {
+        if (candidate.getSourceScheduleFingerprint() ==
+            schedule.getFingerprint())
+          device = candidate;
+      }
+      InvocationAbiOp abi;
+      for (InvocationAbiOp candidate : abis) {
+        if (candidate.getSourcePlanFingerprint() ==
+                materialization.getFingerprint() &&
+            candidate.getSourceScheduleFingerprint() ==
+                schedule.getFingerprint())
+          abi = candidate;
+      }
+      ExecutableBundleOp bundle;
+      for (ExecutableBundleOp candidate : bundles) {
+        if (candidate.getSourceScheduleFingerprint() ==
+                schedule.getFingerprint() &&
+            candidate.getDeviceModuleFingerprint() == device.getFingerprint() &&
+            candidate.getInvocationAbiFingerprint() == abi.getFingerprint())
+          bundle = candidate;
+      }
+      FailureOr<PreparedGpuCall> prepared =
+          prepareGpuCall(module, region, device, abi, bundle);
+      if (failed(prepared) ||
+          prepared->bundleBytes.size() >
+              kMaximumGpuTransportBytes - aggregateTransportBytes) {
+        module.emitError("failed to prepare bounded GPU custom calls");
         return signalPassFailure();
       }
-      int64_t index = *slot.getBindingIndex();
-      if (index < 0 || index >= static_cast<int64_t>(projection->size()) ||
-          (*projection)[index]) {
-        region.emitOpError("GPU typed-FFI bridge projection is not contiguous");
-        return signalPassFailure();
-      }
-      (*projection)[index] = slot;
-    }
-    for (auto [index, slot] : llvm::enumerate(operandSlots)) {
-      if (!slot ||
-          slot.getTensorType() != region.getInputs()[index].getType()) {
-        region.emitOpError(
-            "GPU operand projection does not match the region ABI");
-        return signalPassFailure();
-      }
-    }
-    for (auto [index, slot] : llvm::enumerate(resultSlots)) {
-      if (!slot ||
-          slot.getTensorType() != region.getResults()[index].getType()) {
-        region.emitOpError(
-            "GPU result projection does not match the region ABI");
-        return signalPassFailure();
-      }
+      aggregateTransportBytes += prepared->bundleBytes.size();
+      preparedCalls.push_back(std::move(*prepared));
     }
     OpBuilder builder(module.getContext());
-    OwningOpRef<ModuleOp> stripped = ModuleOp::create(module.getLoc());
-    builder.setInsertionPointToEnd(stripped->getBody());
-    builder.insert(devices.front()->clone());
-    builder.insert(abis.front()->clone());
-    builder.insert(bundles.front()->clone());
-    FailureOr<SmallVector<uint8_t>> bundleBytes =
-        serializeGpuExecutableBundle(*stripped);
-    if (failed(bundleBytes)) {
-      module.emitError("failed to serialize the closed GPU executable");
-      return signalPassFailure();
+    for (PreparedGpuCall &prepared : preparedCalls) {
+      RegionOp region = prepared.region;
+      StringRef opaque(
+          reinterpret_cast<const char *>(prepared.bundleBytes.data()),
+          prepared.bundleBytes.size());
+      DictionaryAttr backendConfig = builder.getDictionaryAttr({
+          builder.getNamedAttr("bundle_bytes", builder.getStringAttr(opaque)),
+          builder.getNamedAttr("bundle_sha256",
+                               builder.getStringAttr(prepared.digest)),
+          builder.getNamedAttr("bundle_size", builder.getI64IntegerAttr(
+                                                  prepared.bundleBytes.size())),
+          builder.getNamedAttr("transport_schema_version",
+                               builder.getI64IntegerAttr(2)),
+          builder.getNamedAttr("device_schema_version",
+                               builder.getI64IntegerAttr(3)),
+          builder.getNamedAttr("invocation_abi_schema_version",
+                               builder.getI64IntegerAttr(3)),
+          builder.getNamedAttr("bundle_schema_version",
+                               builder.getI64IntegerAttr(2)),
+          builder.getNamedAttr("completion",
+                               builder.getStringAttr("stream_ordered")),
+      });
+      builder.setInsertionPoint(region);
+      OperationState callState(region.getLoc(), "stablehlo.custom_call");
+      callState.addOperands(region.getInputs());
+      callState.addTypes(region.getResultTypes());
+      callState.addAttribute(
+          "call_target_name",
+          builder.getStringAttr(kGpuExecutableBundleFfiTarget));
+      callState.addAttribute("api_version", builder.getI32IntegerAttr(4));
+      callState.addAttribute("backend_config", backendConfig);
+      callState.addAttribute("called_computations", builder.getArrayAttr({}));
+      callState.addAttribute("has_side_effect", builder.getBoolAttr(false));
+      callState.addAttribute("operand_layouts",
+                             builder.getArrayAttr(prepared.operandLayouts));
+      callState.addAttribute("output_operand_aliases",
+                             builder.getArrayAttr({}));
+      callState.addAttribute("result_layouts",
+                             builder.getArrayAttr(prepared.resultLayouts));
+      Operation *call = builder.create(callState);
+      region.getResults().replaceAllUsesWith(call->getResults());
+      region.erase();
     }
-    std::string digest = gpuExecutableBundleDigest(*bundleBytes);
-    StringRef opaque(reinterpret_cast<const char *>(bundleBytes->data()),
-                     bundleBytes->size());
-    DictionaryAttr backendConfig = builder.getDictionaryAttr({
-        builder.getNamedAttr("bundle_bytes", builder.getStringAttr(opaque)),
-        builder.getNamedAttr("bundle_sha256", builder.getStringAttr(digest)),
-        builder.getNamedAttr("bundle_size",
-                             builder.getI64IntegerAttr(bundleBytes->size())),
-        builder.getNamedAttr("transport_schema_version",
-                             builder.getI64IntegerAttr(2)),
-        builder.getNamedAttr("device_schema_version",
-                             builder.getI64IntegerAttr(3)),
-        builder.getNamedAttr("invocation_abi_schema_version",
-                             builder.getI64IntegerAttr(3)),
-        builder.getNamedAttr("bundle_schema_version",
-                             builder.getI64IntegerAttr(2)),
-        builder.getNamedAttr("completion",
-                             builder.getStringAttr("stream_ordered")),
-    });
-    SmallVector<Attribute> operandLayouts;
-    for (Value input : region.getInputs())
-      operandLayouts.push_back(
-          rowMajorLayout(cast<RankedTensorType>(input.getType())));
-    SmallVector<Attribute> resultLayouts;
-    for (Value result : region.getResults())
-      resultLayouts.push_back(
-          rowMajorLayout(cast<RankedTensorType>(result.getType())));
-    builder.setInsertionPoint(region);
-    OperationState callState(region.getLoc(), "stablehlo.custom_call");
-    callState.addOperands(region.getInputs());
-    callState.addTypes(region.getResultTypes());
-    callState.addAttribute(
-        "call_target_name",
-        builder.getStringAttr(kGpuExecutableBundleFfiTarget));
-    callState.addAttribute("api_version", builder.getI32IntegerAttr(4));
-    callState.addAttribute("backend_config", backendConfig);
-    callState.addAttribute("called_computations", builder.getArrayAttr({}));
-    callState.addAttribute("has_side_effect", builder.getBoolAttr(false));
-    callState.addAttribute("operand_layouts",
-                           builder.getArrayAttr(operandLayouts));
-    callState.addAttribute("output_operand_aliases", builder.getArrayAttr({}));
-    callState.addAttribute("result_layouts",
-                           builder.getArrayAttr(resultLayouts));
-    Operation *call = builder.create(callState);
-    region.getResults().replaceAllUsesWith(call->getResults());
-    region.erase();
     for (Operation &operation :
-         llvm::make_early_inc_range(module.getBody()->without_terminator()))
+         llvm::make_early_inc_range(module.getBody()->without_terminator())) {
       if (isa<MaterializationPlanOp, SchedulePlanOp, DeviceModuleOp,
               InvocationAbiOp, ExecutableBundleOp>(operation))
         operation.erase();
+    }
   }
 };
 
@@ -6272,7 +6585,7 @@ void registerShuttleStablehloPipelines() {
             commandLinePipelineOptions(NumericalPolicy::SourceOrdered);
         options.executionMode = ExecutionMode::CpuExecutableBundle;
         options.canonicalOptions =
-            R"json({"execution_mode":"cpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":14,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+            R"json({"execution_mode":"cpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":15,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
         buildShuttleStablehloPipeline(manager, options);
       });
   PassPipelineRegistration<>(
@@ -6283,7 +6596,7 @@ void registerShuttleStablehloPipelines() {
             commandLinePipelineOptions(NumericalPolicy::Fast);
         options.executionMode = ExecutionMode::CpuExecutableBundle;
         options.canonicalOptions =
-            R"json({"execution_mode":"cpu_executable_bundle","numerics":"fast","pipeline_abi_version":14,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+            R"json({"execution_mode":"cpu_executable_bundle","numerics":"fast","pipeline_abi_version":15,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
         buildShuttleStablehloPipeline(manager, options);
       });
   PassPipelineRegistration<>(
@@ -6295,7 +6608,7 @@ void registerShuttleStablehloPipelines() {
             commandLinePipelineOptions(NumericalPolicy::SourceOrdered);
         options.executionMode = ExecutionMode::GpuExecutableBundle;
         options.canonicalOptions =
-            R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":14,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+            R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":15,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
         buildShuttleStablehloPipeline(manager, options);
       });
   PassPipelineRegistration<>(
@@ -6306,7 +6619,7 @@ void registerShuttleStablehloPipelines() {
             commandLinePipelineOptions(NumericalPolicy::Fast);
         options.executionMode = ExecutionMode::GpuExecutableBundle;
         options.canonicalOptions =
-            R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":14,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+            R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":15,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
         buildShuttleStablehloPipeline(manager, options);
       });
 }
