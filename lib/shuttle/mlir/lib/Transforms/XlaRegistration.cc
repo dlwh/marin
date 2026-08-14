@@ -27,7 +27,7 @@ namespace mlir::shuttle {
 namespace {
 
 constexpr int64_t kSchemaVersion = 1;
-constexpr int64_t kPipelineAbiVersion = 16;
+constexpr int64_t kPipelineAbiVersion = 17;
 constexpr int64_t kMaximumNativeInteger = 2147483647;
 constexpr size_t kMaximumTensorRank = 8;
 constexpr size_t kMaximumClusterRank = 3;
@@ -157,7 +157,7 @@ parseShuttleXlaOptions(absl::string_view serializedOptions) {
     return invalidOptions("field 'schema_version' must be integer 1");
   }
   if (object->getInteger("pipeline_abi_version") != kPipelineAbiVersion) {
-    return invalidOptions("field 'pipeline_abi_version' must be integer 16");
+    return invalidOptions("field 'pipeline_abi_version' must be integer 17");
   }
 
   std::optional<llvm::StringRef> numerics = object->getString("numerics");
@@ -235,9 +235,15 @@ parseShuttleXlaOptions(absl::string_view serializedOptions) {
 LogicalResult runShuttleXlaTransform(ModuleOp module,
                                      const ShuttlePipelineOptions &options) {
   module.getContext()->getOrLoadDialect<ShuttleDialect>();
+  OwningOpRef<ModuleOp> transformed = module.clone();
   PassManager manager(module.getContext(), ModuleOp::getOperationName());
   buildShuttleStablehloPipeline(manager, options);
-  return manager.run(module);
+  if (failed(manager.run(*transformed))) {
+    return failure();
+  }
+  module->setAttrs(transformed->getOperation()->getAttrs());
+  module.getBodyRegion().takeBody(transformed->getBodyRegion());
+  return success();
 }
 
 absl::Status runShuttleXlaTransform(ModuleOp module,

@@ -914,16 +914,22 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
     }
     if (task.getKind() == MaterializationTaskKind::Fold) {
       ++foldCount;
+      const int64_t domainRank = task.getDomainShape().size();
+      const int64_t reductionAxis = task.getReductionDimensions().size() == 1
+                                        ? task.getReductionDimensions().front()
+                                        : -1;
+      const bool rankTwoFold =
+          domainRank == 2 && reductionAxis >= 0 && reductionAxis < domainRank;
+      const bool terminalRankNFold =
+          domainRank >= 3 && domainRank <= 8 && reductionAxis == domainRank - 1;
       if (task.getReductionDimensions().size() != 1 ||
-          task.getReductionDimensions().front() < 0 ||
-          task.getReductionDimensions().front() >= 2 ||
+          (!rankTwoFold && !terminalRankNFold) ||
           !task.getOrderFree().value_or(false) ||
-          task.getDomainShape().size() != 2 ||
           task.getInputBuffers().size() != 2 ||
           task.getOutputBuffers().size() != 1) {
         return task.emitOpError(
-            "Fold tasks require rank-two domain, one in-range dimension, and "
-            "order_free=true");
+            "Fold tasks require a rank-two in-range reduction or a rank-three "
+            "through rank-eight terminal-axis reduction, and order_free=true");
       }
       auto inputType = cast<RankedTensorType>(
           buffers[task.getInputBuffers()[0]].getTensorType());
@@ -932,10 +938,9 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
       auto resultType = cast<RankedTensorType>(
           buffers[task.getOutputBuffers()[0]].getTensorType());
       SmallVector<int64_t> expectedResultShape(task.getDomainShape());
-      expectedResultShape.erase(expectedResultShape.begin() +
-                                task.getReductionDimensions().front());
+      expectedResultShape.erase(expectedResultShape.begin() + reductionAxis);
       if (inputType.getShape() != task.getDomainShape() ||
-          inputType.getRank() != 2 || !inputType.getElementType().isF32() ||
+          !inputType.getElementType().isF32() ||
           initializerType.getRank() != 0 ||
           !initializerType.getElementType().isF32() ||
           resultType.getShape() != ArrayRef<int64_t>(expectedResultShape) ||
@@ -1136,22 +1141,31 @@ FailureOr<Simt32Geometry> simt32Geometry(ScheduleTaskKind kind,
                           0,
                           reductionAxis};
   }
-  if (domain.size() != 2 || domain[0] <= 0 || domain[1] <= 0) {
+  if (domain.size() < 2 || domain.size() > 8 ||
+      llvm::any_of(domain, [](int64_t extent) { return extent <= 0; })) {
     return failure();
   }
   const int64_t reductionAxis =
       kind == ScheduleTaskKind::RowFold
-          ? 1
-          : (kind == ScheduleTaskKind::ColumnFold ? 0 : -1);
-  if (reductionAxis < 0) {
+          ? domain.size() - 1
+          : (kind == ScheduleTaskKind::ColumnFold && domain.size() == 2 ? 0
+                                                                        : -1);
+  if (reductionAxis < 0 ||
+      (domain.size() > 2 && kind != ScheduleTaskKind::RowFold)) {
     return failure();
   }
-  const int64_t outputAxis = 1 - reductionAxis;
+  FailureOr<int64_t> outputs =
+      reductionAxis == static_cast<int64_t>(domain.size()) - 1
+          ? staticElementCount(domain.drop_back())
+          : FailureOr<int64_t>(domain[1]);
+  if (failed(outputs) || *outputs > UINT32_MAX) {
+    return failure();
+  }
   int64_t tile = std::min(domain[reductionAxis], kMaxThreads);
   int64_t threads = roundUpToSubgroup(tile);
-  SmallVector<int64_t> tileShape{1, 1};
+  SmallVector<int64_t> tileShape(domain.size(), 1);
   tileShape[reductionAxis] = tile;
-  return Simt32Geometry{{domain[outputAxis]},
+  return Simt32Geometry{{*outputs},
                         std::move(tileShape),
                         ceilDivPositive(domain[reductionAxis], tile),
                         threads,
@@ -1276,8 +1290,11 @@ LogicalResult SchedulePlanOp::verifyRegions() {
     const bool isFold = task.getKind() == ScheduleTaskKind::RowFold ||
                         task.getKind() == ScheduleTaskKind::ColumnFold;
     const bool isContract = task.getKind() == ScheduleTaskKind::Contract;
-    if (isFold && task.getReductionAxis() !=
-                      (task.getKind() == ScheduleTaskKind::RowFold ? 1 : 0)) {
+    const int64_t expectedFoldAxis =
+        task.getKind() == ScheduleTaskKind::RowFold
+            ? static_cast<int64_t>(task.getDomainShape().size()) - 1
+            : 0;
+    if (isFold && task.getReductionAxis() != expectedFoldAxis) {
       return task.emitOpError(
           "Fold schedule kind must match its reduction axis");
     }
