@@ -232,51 +232,68 @@ std::optional<std::string> firstOperand(llvm::StringRef instruction) {
   return instruction.slice(start, comma).trim().str();
 }
 
-testing::AssertionResult hasExpResultStoreDataflow(llvm::StringRef ptx) {
+std::optional<llvm::StringRef> entryBody(llvm::StringRef ptx) {
   const size_t entry = ptx.find(".visible .entry shuttle_entry(");
   if (entry == llvm::StringRef::npos)
-    return testing::AssertionFailure() << "missing Shuttle entry";
-  size_t call = entry;
+    return std::nullopt;
+  const size_t open = ptx.find('{', entry);
+  if (open == llvm::StringRef::npos)
+    return std::nullopt;
+  int64_t depth = 1;
+  for (size_t position = open + 1; position < ptx.size(); ++position) {
+    if (ptx[position] == '{')
+      ++depth;
+    else if (ptx[position] == '}' && --depth == 0)
+      return ptx.slice(open + 1, position);
+  }
+  return std::nullopt;
+}
+
+testing::AssertionResult hasExpResultStoreDataflow(llvm::StringRef ptx) {
+  auto body = entryBody(ptx);
+  if (!body)
+    return testing::AssertionFailure() << "missing closed Shuttle entry body";
+  size_t call = 0;
   size_t suffix = llvm::StringRef::npos;
-  while ((call = ptx.find("call", call)) != llvm::StringRef::npos) {
+  while ((call = body->find("call", call)) != llvm::StringRef::npos) {
     suffix = call + 4;
-    if (ptx.substr(suffix).starts_with(".uni"))
+    if (body->substr(suffix).starts_with(".uni"))
       suffix += 4;
-    auto target = functionName(ptx, suffix);
+    auto target = functionName(*body, suffix);
     if (target && *target == "__nv_expf")
       break;
     call = suffix;
   }
   if (call == llvm::StringRef::npos || suffix == llvm::StringRef::npos)
     return testing::AssertionFailure() << "missing __nv_expf return call";
-  const size_t returnOpen = ptx.find('(', suffix);
+  const size_t returnOpen = body->find('(', suffix);
   if (returnOpen == llvm::StringRef::npos)
     return testing::AssertionFailure() << "missing __nv_expf return call";
   const size_t returnStart = returnOpen + 1;
-  const size_t returnEnd = ptx.find(')', returnStart);
+  const size_t returnEnd = body->find(')', returnStart);
   if (returnEnd == llvm::StringRef::npos)
     return testing::AssertionFailure() << "missing __nv_expf return call";
-  const std::string returned = ptx.slice(returnStart, returnEnd).trim().str();
+  const std::string returned = body->slice(returnStart, returnEnd).trim().str();
 
-  const size_t load = ptx.find("ld.param", returnEnd);
-  const size_t loadEnd = ptx.find(';', load);
+  const size_t load = body->find("ld.param", returnEnd);
+  const size_t loadEnd = body->find(';', load);
   if (load == llvm::StringRef::npos || loadEnd == llvm::StringRef::npos)
     return testing::AssertionFailure() << "missing __nv_expf return load";
-  const llvm::StringRef loadInstruction = ptx.slice(load, loadEnd);
+  const llvm::StringRef loadInstruction = body->slice(load, loadEnd);
   if (!loadInstruction.contains("[" + returned + "]"))
     return testing::AssertionFailure() << "missing __nv_expf return load";
   auto f32Result = firstOperand(loadInstruction);
   if (!f32Result)
     return testing::AssertionFailure() << "malformed __nv_expf return load";
 
-  const size_t conversion = ptx.find("cvt.rn.bf16.f32", loadEnd);
-  const size_t conversionEnd = ptx.find(';', conversion);
+  const size_t conversion = body->find("cvt.rn.bf16.f32", loadEnd);
+  const size_t conversionEnd = body->find(';', conversion);
   if (conversion == llvm::StringRef::npos ||
       conversionEnd == llvm::StringRef::npos)
     return testing::AssertionFailure()
            << "__nv_expf result does not feed BF16 conversion";
   const llvm::StringRef conversionInstruction =
-      ptx.slice(conversion, conversionEnd);
+      body->slice(conversion, conversionEnd);
   if (!conversionInstruction.ends_with(", " + *f32Result))
     return testing::AssertionFailure()
            << "__nv_expf result does not feed BF16 conversion";
@@ -284,10 +301,10 @@ testing::AssertionResult hasExpResultStoreDataflow(llvm::StringRef ptx) {
   if (!bf16Result)
     return testing::AssertionFailure() << "malformed BF16 conversion";
 
-  const size_t store = ptx.find("st.global", conversionEnd);
-  const size_t storeEnd = ptx.find(';', store);
+  const size_t store = body->find("st.global", conversionEnd);
+  const size_t storeEnd = body->find(';', store);
   if (store == llvm::StringRef::npos || storeEnd == llvm::StringRef::npos ||
-      !ptx.slice(store, storeEnd).ends_with(", " + *bf16Result))
+      !body->slice(store, storeEnd).ends_with(", " + *bf16Result))
     return testing::AssertionFailure()
            << "converted __nv_expf result does not feed output store";
   return testing::AssertionSuccess();
@@ -390,6 +407,12 @@ TEST(Abi19LibdeviceContractTest, ClosedPtxOracleRejectsSemanticMutations) {
   ret;
 }
 )ptx";
+  constexpr llvm::StringLiteral chain = R"ptx(  st.param.b32 [__exp_input], %f1;
+  call.uni (__exp_return), __nv_expf, (__exp_input);
+  ld.param.b32 %f2, [__exp_return];
+  cvt.rn.bf16.f32 %rs1, %f2;
+  st.global.u16 [%rd1], %rs1;
+)ptx";
   ASSERT_TRUE(isClosedDefaultExpPtx(ptx));
   EXPECT_FALSE(isClosedDefaultExpPtx(
       replaceOnce(ptx, "call.uni (__exp_return), __nv_expf, (__exp_input);",
@@ -403,6 +426,11 @@ TEST(Abi19LibdeviceContractTest, ClosedPtxOracleRejectsSemanticMutations) {
   EXPECT_FALSE(isClosedDefaultExpPtx(replaceOnce(
       ptx, ".visible .entry shuttle_entry()",
       ".func __nv_fast_expf() { ret; }\n.visible .entry shuttle_entry()")));
+  std::string moved = replaceOnce(ptx, chain, "");
+  moved.append(".func __late_exp_dataflow() {\n");
+  moved.append(chain.str());
+  moved.append("  ret;\n}\n");
+  EXPECT_FALSE(isClosedDefaultExpPtx(moved));
 }
 
 TEST(Abi19LibdeviceContractTest,
