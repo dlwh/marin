@@ -2288,12 +2288,32 @@ public:
       refreshExecutableBundle(module, false);
       return;
     } else if (mutation == "singleton-broadcast-body") {
+      SchedulePlanOp schedule = schedulePlan(module);
+      MaterializationPlanOp materialization = materializationPlan(module);
+      if (!schedule || !materialization) {
+        module.emitError("test fixture has no schedule/materialization plan");
+        return signalPassFailure();
+      }
+      SmallVector<ScheduleTaskOp> scheduleTasks(
+          schedule.getBody().front().getOps<ScheduleTaskOp>());
+      SmallVector<MaterializationTaskOp> materializationTasks(
+          materialization.getBody().front().getOps<MaterializationTaskOp>());
+      SmallVector<MaterializationBufferOp> buffers(
+          materialization.getBody().front().getOps<MaterializationBufferOp>());
       SmallVector<int8_t> code(device.getCode());
       for (DeviceEntryOp entry : entries) {
-        StringRef ptx(reinterpret_cast<const char *>(code.data() +
-                                                     entry.getCodeOffset()),
-                      entry.getCodeLength());
-        if (!ptx.contains("div.u64")) {
+        int64_t sourceTask = entry.getSourceTask();
+        if (sourceTask < 0 ||
+            sourceTask >= static_cast<int64_t>(scheduleTasks.size())) {
+          continue;
+        }
+        int64_t materializationTask =
+            scheduleTasks[sourceTask].getSourceTask();
+        if (materializationTask < 0 ||
+            materializationTask >=
+                static_cast<int64_t>(materializationTasks.size()) ||
+            !isExpandingSingletonMapTask(
+                materializationTasks[materializationTask], buffers)) {
           continue;
         }
         code[entry.getCodeOffset() + entry.getCodeLength() - 1] ^= 1;

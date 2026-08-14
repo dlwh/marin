@@ -2413,10 +2413,19 @@ TEST(GpuTransportV2Test,
               reinterpret_cast<const char *>(decoded->code.data() +
                                              launch.codeOffset),
               launch.codeLength);
-          if (ptx.contains("div.u64")) {
+          bool isExpansion = launch.inputSlots.size() == 1 &&
+                             launch.outputSlots.size() == 1;
+          if (isExpansion) {
+            int64_t input = launch.inputSlots.front();
+            int64_t output = launch.outputSlots.front();
+            isExpansion =
+                decoded->slotDimensions[input] ==
+                    llvm::ArrayRef<int64_t>(shape.singletonShape) &&
+                decoded->slotDimensions[output] ==
+                    llvm::ArrayRef<int64_t>(shape.fullShape);
+          }
+          if (isExpansion) {
             ++expansionLaunches;
-            ASSERT_EQ(launch.inputSlots.size(), 1);
-            ASSERT_EQ(launch.outputSlots.size(), 1);
             const int64_t input = launch.inputSlots.front();
             const int64_t output = launch.outputSlots.front();
             EXPECT_EQ(decoded->slotDimensions[input],
@@ -2434,8 +2443,23 @@ TEST(GpuTransportV2Test,
             EXPECT_EQ(launch.block,
                       (std::array<uint64_t, 3>{256, 1, 1}));
             EXPECT_EQ(launch.dynamicSharedMemoryBytes, 0);
-            EXPECT_TRUE(ptx.contains(
-                (", " + llvm::Twine(shape.reductionExtent) + ";").str()));
+            llvm::SmallVector<llvm::StringRef> lines;
+            ptx.split(lines, '\n');
+            int64_t divisionsByReductionExtent = 0;
+            int64_t coordinateDivisionsByReductionExtent = 0;
+            std::string suffix =
+                (", " + llvm::Twine(shape.reductionExtent) + ";").str();
+            for (llvm::StringRef line : lines) {
+              if (!line.starts_with("  div.u64 ") || !line.ends_with(suffix)) {
+                continue;
+              }
+              ++divisionsByReductionExtent;
+              if (line.contains(", %rd0, ")) {
+                ++coordinateDivisionsByReductionExtent;
+              }
+            }
+            EXPECT_EQ(divisionsByReductionExtent, 2);
+            EXPECT_EQ(coordinateDivisionsByReductionExtent, 1);
 
             int64_t inputByte = 0;
             int64_t outputByte = 0;
@@ -2530,9 +2554,8 @@ TEST(GpuTransportV2Test,
   rehashInvocationAndBundle(requiredBytes, *decoded);
   expectRejected(requiredBytes);
 
-  llvm::SmallVector<uint8_t> reuse(*bytes);
-  writeU64(reuse, decoded->slotReuseOffsets[temporary], 0);
-  rehashInvocationAndBundle(reuse, *decoded);
+  auto reuse = overlappingTemporaryReuse(*bytes, *decoded);
+  ASSERT_FALSE(reuse.empty());
   expectRejected(reuse);
 
   auto futureResult = futureProducedResultInput(*bytes, *decoded);
