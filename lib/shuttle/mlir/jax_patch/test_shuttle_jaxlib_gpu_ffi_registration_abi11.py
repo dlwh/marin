@@ -14,7 +14,6 @@ from shuttle_jaxlib_gpu_ffi_registration import (
     capsule_pointer,
 )
 from shuttle_jaxlib_gpu_ffi_registration_abi11 import (
-    STALE_TARGET,
     TARGET,
     register_through_pjrt,
     validated_shuttle_bundle,
@@ -81,7 +80,8 @@ def test_abi11_bundle_registers_exact_v2_target_and_four_stages() -> None:
         ({TARGET: {**_bundle(), "unknown": 1}}, "unknown Shuttle handler field"),
         ({TARGET: {**_bundle(), "api_version": 0}}, "wrong Shuttle typed-FFI metadata"),
         ({TARGET: {**_bundle(), "execute": None}}, "complete Shuttle handler bundle"),
-        ({TARGET: _bundle(), STALE_TARGET: _bundle()}, "stale ABI 10"),
+        ({TARGET: _bundle(), "shuttle.gpu.executable_bundle.v1": _bundle()}, "another Shuttle"),
+        ({TARGET: _bundle(), "shuttle.gpu.executable_bundle.v3": _bundle()}, "another Shuttle"),
     ],
 )
 def test_abi11_bundle_rejects_missing_or_corrupt_exports(handlers: object, message: str) -> None:

@@ -91,6 +91,7 @@ def test_layer_norm_public_jax_result_order_matches_independent_oracle() -> None
     values = {}
     assert [len(boundary_inputs(shape, boundary)) for boundary in BOUNDARIES] == [3, 3, 4]
     for boundary in BOUNDARIES:
+        assert boundary_function(boundary).__name__ == boundary
         values[boundary] = arrays(boundary_function(boundary)(*boundary_inputs(shape, boundary)))
         assert tuple(value.shape for value in values[boundary]) == tuple(
             {

@@ -136,8 +136,10 @@ struct Decoded {
   llvm::SmallVector<int64_t> slotReuseGroups;
   llvm::SmallVector<uint64_t> slotReuseOffsets;
   llvm::SmallVector<uint8_t> slotStorage;
+  llvm::SmallVector<uint8_t> slotBinding;
   llvm::SmallVector<int64_t> slotProducers;
   llvm::SmallVector<int64_t> slotFinalUses;
+  llvm::SmallVector<uint64_t> launchFirstInputOffsets;
   llvm::SmallVector<int64_t> temporaryGroupOrder;
   llvm::SmallVector<uint64_t> temporaryGroupBytes;
   int64_t slots = 0;
@@ -189,6 +191,7 @@ std::optional<Decoded> decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes) {
 
   llvm::SmallVector<mlir::shuttle::GpuLaunch> launches;
   llvm::SmallVector<uint64_t> launchGridOffsets;
+  llvm::SmallVector<uint64_t> launchFirstInputOffsets;
   int64_t nextOffset = 0;
   uint64_t taskPositions = 0;
   for (int64_t ordinal = 0; ordinal < static_cast<int64_t>(entryCount);
@@ -201,6 +204,8 @@ std::optional<Decoded> decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes) {
         nextOffset > static_cast<int64_t>(code.size()) - length)
       return std::nullopt;
     auto inputs = reader.integers();
+    uint64_t firstInputOffset =
+        reader.position() - inputs.size() * sizeof(uint64_t);
     auto outputs = reader.integers();
     if (llvm::any_of(inputs, [](int64_t slot) { return slot < 0; }) ||
         llvm::any_of(outputs, [](int64_t slot) { return slot < 0; }))
@@ -260,6 +265,7 @@ std::optional<Decoded> decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes) {
     launch.outputSlots.assign(outputs.begin(), outputs.end());
     launch.dependencies.assign(dependencies.begin(), dependencies.end());
     launches.push_back(std::move(launch));
+    launchFirstInputOffsets.push_back(firstInputOffset);
     launchGridOffsets.push_back(launchGridOffset);
   }
   uint64_t invocationStart = reader.position();
@@ -384,11 +390,14 @@ std::optional<Decoded> decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes) {
   if (!reader.done() || bundleRoot != sha256(bytes.take_front(rootOffset)))
     return std::nullopt;
   llvm::SmallVector<int64_t> producers(slotCount, -1);
+  llvm::SmallVector<int64_t> firstUses(slotCount, -1);
   llvm::SmallVector<int64_t> finalUses(slotCount, -1);
   for (const auto &launch : launches) {
     for (int64_t slot : launch.inputSlots) {
       if (slot >= static_cast<int64_t>(slotCount))
         return std::nullopt;
+      if (firstUses[slot] == -1)
+        firstUses[slot] = launch.taskOrdinal;
       finalUses[slot] = std::max(finalUses[slot], launch.taskOrdinal);
     }
     for (int64_t slot : launch.outputSlots) {
@@ -403,7 +412,8 @@ std::optional<Decoded> decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes) {
   for (int64_t ordinal = 0; ordinal < static_cast<int64_t>(slotCount);
        ++ordinal) {
     if (slotStorage[ordinal] == 1) {
-      if (producers[ordinal] < 0 || finalUses[ordinal] <= producers[ordinal])
+      if (producers[ordinal] < 0 || firstUses[ordinal] <= producers[ordinal] ||
+          finalUses[ordinal] <= producers[ordinal])
         return std::nullopt;
       continue;
     }
@@ -412,7 +422,10 @@ std::optional<Decoded> decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes) {
           producers[ordinal] != -1 || finalUses[ordinal] < 0)
         return std::nullopt;
     } else if (slotBinding[ordinal] == 2) {
-      if (slotBindingIndex[ordinal] != resultIndex++ || producers[ordinal] < 0)
+      if (slotBindingIndex[ordinal] != resultIndex++ ||
+          producers[ordinal] < 0 ||
+          (firstUses[ordinal] != -1 &&
+           firstUses[ordinal] <= producers[ordinal]))
         return std::nullopt;
     } else {
       return std::nullopt;
@@ -440,8 +453,10 @@ std::optional<Decoded> decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes) {
                  std::move(slotReuseGroups),
                  std::move(slotReuseOffsets),
                  std::move(slotStorage),
+                 std::move(slotBinding),
                  std::move(producers),
                  std::move(finalUses),
+                 std::move(launchFirstInputOffsets),
                  std::move(temporaryGroupOrder),
                  std::move(temporaryGroupBytes),
                  static_cast<int64_t>(slotCount),
@@ -540,6 +555,48 @@ overlappingTemporaryReuse(llvm::ArrayRef<uint8_t> bytes,
   return {};
 }
 
+llvm::SmallVector<uint8_t> futureProducedInput(llvm::ArrayRef<uint8_t> bytes,
+                                               const Decoded &decoded) {
+  for (const auto &launch : decoded.launches) {
+    if (launch.inputSlots.empty())
+      continue;
+    for (int64_t slot = 0;
+         slot < static_cast<int64_t>(decoded.slotStorage.size()); ++slot) {
+      if (decoded.slotStorage[slot] != 1 ||
+          decoded.slotProducers[slot] <= launch.taskOrdinal ||
+          decoded.slotFinalUses[slot] <= decoded.slotProducers[slot])
+        continue;
+      llvm::SmallVector<uint8_t> result(bytes);
+      writeU64(result, decoded.launchFirstInputOffsets[launch.taskOrdinal],
+               slot);
+      rehashDeviceAndBundle(result, decoded);
+      return result;
+    }
+  }
+  return {};
+}
+
+llvm::SmallVector<uint8_t>
+futureProducedResultInput(llvm::ArrayRef<uint8_t> bytes,
+                          const Decoded &decoded) {
+  for (const auto &launch : decoded.launches) {
+    if (launch.inputSlots.empty())
+      continue;
+    for (int64_t slot = 0;
+         slot < static_cast<int64_t>(decoded.slotStorage.size()); ++slot) {
+      if (decoded.slotBinding[slot] != 2 ||
+          decoded.slotProducers[slot] <= launch.taskOrdinal)
+        continue;
+      llvm::SmallVector<uint8_t> result(bytes);
+      writeU64(result, decoded.launchFirstInputOffsets[launch.taskOrdinal],
+               slot);
+      rehashDeviceAndBundle(result, decoded);
+      return result;
+    }
+  }
+  return {};
+}
+
 struct BuiltBundle {
   std::unique_ptr<mlir::MLIRContext> context;
   mlir::OwningOpRef<mlir::ModuleOp> module;
@@ -619,35 +676,34 @@ std::unique_ptr<BuiltBundle> buildAlternateFixture() {
 std::string mapOnlyModule(int64_t inputs, bool permutedResult) {
   std::string source;
   llvm::raw_string_ostream stream(source);
-  stream << (permutedResult
-                 ? "#indexing = affine_map<(d0, d1) -> (d1, d0)>\n"
-                 : "#indexing = affine_map<(d0, d1) -> (d0, d1)>\n")
+  stream << (permutedResult ? "#indexing = affine_map<(d0, d1) -> (d1, d0)>\n"
+                            : "#indexing = affine_map<(d0, d1) -> (d0, d1)>\n")
          << "module {\n  func.func @map_only(";
   for (int64_t index = 0; index < inputs; ++index) {
     if (index)
       stream << ", ";
     stream << "%arg" << index << ": tensor<2x3xf32>";
   }
-  if (inputs)
-    stream << ", ";
-  stream << "%init: tensor<f32>) -> tensor<2xf32> {\n"
+  stream << ") -> tensor<2xf32> {\n"
             "    %result = \"shuttle.region\"(";
   for (int64_t index = 0; index < inputs; ++index) {
     if (index)
       stream << ", ";
     stream << "%arg" << index;
   }
-  if (inputs)
-    stream << ", ";
-  stream << "%init) ({\n    ^bb0(";
+  stream << ") ({\n    ^bb0(";
   for (int64_t index = 0; index < inputs; ++index) {
     if (index)
       stream << ", ";
     stream << "%region" << index << ": tensor<2x3xf32>";
   }
-  if (inputs)
-    stream << ", ";
-  stream << "%region_init: tensor<f32>):\n"
+  stream << "):\n"
+            "      %zero = \"shuttle.map\"() ({\n"
+            "      ^bb0:\n"
+            "        %constant = arith.constant 0.0 : f32\n"
+            "        \"shuttle.yield\"(%constant) : (f32) -> ()\n"
+            "      }) {indexing_maps = [affine_map<() -> ()>], source = "
+            "#shuttle.source_ref<0, 0, 0, 0>} : () -> tensor<f32>\n"
             "      %mapped = \"shuttle.map\"(";
   for (int64_t index = 0; index < inputs; ++index) {
     if (index)
@@ -667,35 +723,71 @@ std::string mapOnlyModule(int64_t inputs, bool permutedResult) {
       stream << ", ";
     stream << "#indexing";
   }
-  stream << "], source = #shuttle.source_ref<0, 0, 0, 0>} : (";
+  stream << "], source = #shuttle.source_ref<0, 0, 1, 0>} : (";
   for (int64_t index = 0; index < inputs; ++index) {
     if (index)
       stream << ", ";
     stream << "tensor<2x3xf32>";
   }
   stream << ") -> tensor<2x3xf32>\n"
-            "      %folded = \"shuttle.fold\"(%mapped, %region_init) ({\n"
+            "      %folded = \"shuttle.fold\"(%mapped, %zero) ({\n"
             "      ^bb0(%left: f32, %right: f32):\n"
             "        %sum = arith.addf %left, %right : f32\n"
             "        \"shuttle.yield\"(%sum) : (f32) -> ()\n"
             "      }) {accumulator_types = [f32], operandSegmentSizes = "
             "array<i32: 1, 1>, order_free = true, reduction_dimensions = "
-            "array<i64: 1>, source = #shuttle.source_ref<0, 0, 1, 0>} : "
+            "array<i64: 1>, source = #shuttle.source_ref<0, 0, 2, 0>} : "
             "(tensor<2x3xf32>, tensor<f32>) -> tensor<2xf32>\n"
             "      \"shuttle.yield\"(%folded) : (tensor<2xf32>) -> ()\n"
             "    }) {policy = #shuttle.policy<source_ordered>, "
             "source_refs = [#shuttle.source_ref<0, 0, 0, 0>, "
-            "#shuttle.source_ref<0, 0, 1, 0>]} : (";
+            "#shuttle.source_ref<0, 0, 1, 0>, "
+            "#shuttle.source_ref<0, 0, 2, 0>]} : (";
   for (int64_t index = 0; index < inputs; ++index) {
     if (index)
       stream << ", ";
     stream << "tensor<2x3xf32>";
   }
-  if (inputs)
-    stream << ", ";
-  stream << "tensor<f32>) -> tensor<2xf32>\n"
+  stream << ") -> tensor<2xf32>\n"
             "    return %result : tensor<2xf32>\n  }\n}\n";
   stream.flush();
+  return source;
+}
+
+std::string roundedScalarMapModule() {
+  std::string source = mapOnlyModule(1, false);
+  constexpr llvm::StringLiteral yield =
+      "        \"shuttle.yield\"(%value0) : (f32) -> ()\n";
+  constexpr llvm::StringLiteral rounded =
+      "        %rounded = \"shuttle.scalar_convert\"(%value0) "
+      "{semantics = #shuttle.scalar_convert_semantics<round_nearest_even>} "
+      ": (f32) -> bf16\n"
+      "        %expanded = \"shuttle.scalar_convert\"(%rounded) "
+      "{semantics = #shuttle.scalar_convert_semantics<exact>} "
+      ": (bf16) -> f32\n"
+      "        \"shuttle.yield\"(%expanded) : (f32) -> ()\n";
+  size_t position = source.find(yield.str());
+  if (position == std::string::npos)
+    return {};
+  source.replace(position, yield.size(), rounded.str());
+  return source;
+}
+
+std::string bf16ArithmeticMapModule() {
+  std::string source = roundedScalarMapModule();
+  constexpr llvm::StringLiteral expanded =
+      "        %expanded = \"shuttle.scalar_convert\"(%rounded) "
+      "{semantics = #shuttle.scalar_convert_semantics<exact>} "
+      ": (bf16) -> f32\n";
+  constexpr llvm::StringLiteral arithmetic =
+      "        %summed = arith.addf %rounded, %rounded : bf16\n"
+      "        %expanded = \"shuttle.scalar_convert\"(%summed) "
+      "{semantics = #shuttle.scalar_convert_semantics<exact>} "
+      ": (bf16) -> f32\n";
+  size_t position = source.find(expanded.str());
+  if (position == std::string::npos)
+    return {};
+  source.replace(position, expanded.size(), arithmetic.str());
   return source;
 }
 
@@ -764,6 +856,15 @@ TEST(GpuTransportV2Test, IndependentInlineDecoderMatchesPublicDescriptor) {
   ASSERT_FALSE(overlappingReuse.empty());
   EXPECT_FALSE(decodeInlineSchema2(overlappingReuse));
   EXPECT_FALSE(mlir::shuttle::GpuExecutable::Load(overlappingReuse).ok());
+
+  auto futureInput = futureProducedInput(*bytes, *independent);
+  ASSERT_FALSE(futureInput.empty());
+  EXPECT_FALSE(decodeInlineSchema2(futureInput));
+  EXPECT_FALSE(mlir::shuttle::GpuExecutable::Load(futureInput).ok());
+  auto futureResultInput = futureProducedResultInput(*bytes, *independent);
+  ASSERT_FALSE(futureResultInput.empty());
+  EXPECT_FALSE(decodeInlineSchema2(futureResultInput));
+  EXPECT_FALSE(mlir::shuttle::GpuExecutable::Load(futureResultInput).ok());
 }
 
 TEST(GpuTransportV2Test, GenericLayerNormGraphsHaveClosedDynamicDescriptors) {
@@ -809,6 +910,12 @@ TEST(GpuTransportV2Test, GenericLayerNormGraphsHaveClosedDynamicDescriptors) {
     ASSERT_EQ((*publicDescriptor)->slots().size(), independent->slots);
     EXPECT_EQ((*publicDescriptor)->externalBindings().size(),
               independent->externalSlots);
+    llvm::StringRef ptx(
+        reinterpret_cast<const char *>((*publicDescriptor)->codeBytes().data()),
+        (*publicDescriptor)->codeBytes().size());
+    EXPECT_TRUE(ptx.contains("sqrt.rn.f32"));
+    EXPECT_TRUE(ptx.contains(", 0f3F800000, %f"));
+    EXPECT_FALSE(ptx.contains("rcp.rn.f32"));
     for (auto [slot, reuse] : llvm::zip_equal((*publicDescriptor)->slots(),
                                               independent->slotReuseGroups))
       EXPECT_EQ(slot.reuseGroup, reuse);
@@ -853,16 +960,31 @@ TEST(GpuTransportV2Test, RejectsPermutedResultMapBeforeGpuCodeEmission) {
 TEST(GpuTransportV2Test, WideMapDeclaresEveryReferencedRegister) {
   auto built = buildAlgebraFixture(mapOnlyModule(58, false));
   ASSERT_TRUE(built);
-  auto devices = llvm::to_vector(
-      built->module->getOps<mlir::shuttle::DeviceModuleOp>());
+  auto devices =
+      llvm::to_vector(built->module->getOps<mlir::shuttle::DeviceModuleOp>());
   ASSERT_EQ(devices.size(), 1);
-  llvm::StringRef ptx(reinterpret_cast<const char *>(devices[0].getCode().data()),
-                      devices[0].getCode().size());
+  llvm::StringRef ptx(
+      reinterpret_cast<const char *>(devices[0].getCode().data()),
+      devices[0].getCode().size());
   EXPECT_TRUE(ptx.contains(".reg .b64 %rd<128>;"));
   EXPECT_TRUE(ptx.contains(".reg .f32 %f<128>;"));
   EXPECT_TRUE(ptx.contains("%rd126"));
   EXPECT_TRUE(ptx.contains("%f57"));
   EXPECT_FALSE(buildAlgebraFixture(mapOnlyModule(59, false)));
+}
+
+TEST(GpuTransportV2Test, ScalarConvertPreservesBf16RoundingBoundary) {
+  auto built = buildAlgebraFixture(roundedScalarMapModule());
+  ASSERT_TRUE(built);
+  auto devices =
+      llvm::to_vector(built->module->getOps<mlir::shuttle::DeviceModuleOp>());
+  ASSERT_EQ(devices.size(), 1);
+  llvm::StringRef ptx(
+      reinterpret_cast<const char *>(devices[0].getCode().data()),
+      devices[0].getCode().size());
+  EXPECT_TRUE(ptx.contains("cvt.rn.bf16.f32 %h2, %f0;"));
+  EXPECT_TRUE(ptx.contains("cvt.f32.bf16 %f1, %h2;"));
+  EXPECT_FALSE(buildAlgebraFixture(bf16ArithmeticMapModule()));
 }
 
 TEST(GpuTransportV2Test, FoldDynamicSharedMemoryIsDeclaredAtModuleScope) {
@@ -899,6 +1021,22 @@ TEST(GpuTransportV2Test, FoldDynamicSharedMemoryIsDeclaredAtModuleScope) {
     EXPECT_EQ(ptx.find(".extern .shared", entry), llvm::StringRef::npos);
   }
   EXPECT_EQ(foldCount, 1);
+}
+
+TEST(GpuTransportV2Test, FoldRejectsNonPositiveZeroInitializer) {
+  auto source =
+      fixtureSource("jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-forward.mlir");
+  ASSERT_TRUE(source);
+  ASSERT_TRUE(buildFixture(*source));
+  constexpr llvm::StringLiteral positiveZero = "dense<0.000000e+00>";
+  size_t position = source->find(positiveZero.str());
+  ASSERT_NE(position, std::string::npos);
+  for (llvm::StringRef replacement :
+       {"dense<-0.000000e+00>", "dense<1.000000e+00>"}) {
+    std::string mutated = *source;
+    mutated.replace(position, positiveZero.size(), replacement.str());
+    EXPECT_FALSE(buildFixture(mutated));
+  }
 }
 
 TEST(GpuTransportV2Test, GeneratedBundleFingerprintBindsEveryClosedRoot) {
@@ -1092,12 +1230,14 @@ dynamicCallFrame(const mlir::shuttle::GpuExecutable &executable,
   llvm::SmallVector<const mlir::shuttle::GpuExternalBinding *> operands;
   llvm::SmallVector<const mlir::shuttle::GpuExternalBinding *> results;
   for (const auto &binding : executable.externalBindings()) {
-    auto *projection = binding.kind == mlir::shuttle::ExecutableBindingKind::Operand
-                           ? &operands
-                       : binding.kind == mlir::shuttle::ExecutableBindingKind::Result
-                           ? &results
-                           : nullptr;
-    if (!projection || binding.index != static_cast<int64_t>(projection->size()))
+    auto *projection =
+        binding.kind == mlir::shuttle::ExecutableBindingKind::Operand
+            ? &operands
+        : binding.kind == mlir::shuttle::ExecutableBindingKind::Result
+            ? &results
+            : nullptr;
+    if (!projection ||
+        binding.index != static_cast<int64_t>(projection->size()))
       return std::nullopt;
     projection->push_back(&binding);
   }
@@ -1110,9 +1250,9 @@ dynamicCallFrame(const mlir::shuttle::GpuExecutable &executable,
     auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(binding.tensorType);
     if (!tensor || !tensor.getElementType().isBF16())
       return false;
-    uintptr_t address = UINT64_C(0x100000000) +
-                        static_cast<uintptr_t>(binding.slotOrdinal) *
-                            UINT64_C(0x10000000);
+    uintptr_t address =
+        UINT64_C(0x100000000) +
+        static_cast<uintptr_t>(binding.slotOrdinal) * UINT64_C(0x10000000);
     stream_executor::DeviceAddressBase deviceAddress(
         reinterpret_cast<void *>(address), binding.requiredBytes);
     if (result)
@@ -1132,8 +1272,8 @@ dynamicCallFrame(const mlir::shuttle::GpuExecutable &executable,
       return std::nullopt;
   xla::ffi::CallFrameBuilder::AttributesBuilder attributes;
   attributes.Insert("bundle_bytes", std::string(reinterpret_cast<const char *>(
-                                                      transport.data()),
-                                                  transport.size()));
+                                                    transport.data()),
+                                                transport.size()));
   attributes.Insert("bundle_sha256", transportDigest.str());
   attributes.Insert("bundle_size", static_cast<int64_t>(transport.size()));
   attributes.Insert("transport_schema_version", int64_t{2});
@@ -1449,9 +1589,9 @@ TEST(GpuTransportV2Test,
   auto executable = mlir::shuttle::GpuExecutable::Load(*transport);
   ASSERT_TRUE(executable.ok()) << executable.status();
   ASSERT_EQ((*executable)->externalBindings().size(), 8);
-  auto dynamicFrame = dynamicCallFrame(
-      **executable, *transport,
-      mlir::shuttle::gpuExecutableBundleDigest(*transport));
+  auto dynamicFrame =
+      dynamicCallFrame(**executable, *transport,
+                       mlir::shuttle::gpuExecutableBundleDigest(*transport));
   ASSERT_TRUE(dynamicFrame);
 
   XLA_FFI_Handler_Bundle handlers =
