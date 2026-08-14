@@ -5061,11 +5061,13 @@ author: dlwh
   implicit DEFAULT accuracy request, deterministic and renamed-symbol PTX,
   target preamble, fast-symbol exclusion, FTZ exclusion, and unresolved-call
   exclusion for both policies.
-- Exact initial test-only commit
+- The exact chain comprises initial test-only commit
   `7d152711f7a4502f7abc9bc9f87fc9d611a2e27d`, tree
-  `25208f740a60edfd9593c2ca11d746dde4cd80cb`, and independent-review repair
+  `25208f740a60edfd9593c2ca11d746dde4cd80cb`; independent-review repair
   `77edf150bd5e7d43e48cfb37352307b134674e15`, tree
-  `90af5dd9afc7e6b153ae854ed6a56db59c9d5c2c`, are based on
+  `90af5dd9afc7e6b153ae854ed6a56db59c9d5c2c`; and per-entry binding repair
+  `2a2f17026774007e938d70129a251de1d44c6fcc`, tree
+  `32b4a501160f498cf55b690dbb5393cef046bc08`. It is based on
   `f7afc3ee7a7d22273230695fb935fdac7abc3212`. The focused Python census is
   38 pass and six intended ABI19 rotation failures. Full Shuttle Python is
   86/92: five intended ABI19 rotation failures and the unchanged accepted-base
