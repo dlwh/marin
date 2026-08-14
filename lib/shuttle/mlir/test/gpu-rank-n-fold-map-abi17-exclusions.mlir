@@ -13,4 +13,4 @@
 // EXCLUDED-COUNT-7: requires a bounded set of independently connected static GPU algebra regions
 // EXCLUDED: must be statically shaped
 // EXCLUDED-COUNT-3: requires a bounded set of independently connected static GPU algebra regions
-// CPU: requires a bounded set of independently connected static {{GPU|CPU}} algebra regions
+// CPU: requires a bounded generated Map/Fold CPU bytecode subset
