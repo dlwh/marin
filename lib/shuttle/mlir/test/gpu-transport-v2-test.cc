@@ -325,8 +325,11 @@ struct Decoded {
   uint64_t bundleRootPayloadOffset = 0;
   llvm::SmallVector<uint64_t> launchGridOffsets;
   uint64_t codeLengthOffset = 0;
+  uint64_t codePayloadOffset = 0;
+  uint64_t codeDigestPayloadOffset = 0;
   uint64_t deviceEntryCountOffset = 0;
   llvm::SmallVector<uint64_t> entryLengthOffsets;
+  llvm::SmallVector<uint64_t> entryDigestPayloadOffsets;
   llvm::SmallVector<uint64_t> launchSharedOffsets;
   uint64_t invocationSlotCountOffset = 0;
   llvm::SmallVector<uint64_t> slotRankOffsets;
@@ -366,8 +369,11 @@ decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes,
   if (!isDigest(schedule))
     return std::nullopt;
   uint64_t codeLengthOffset = reader.position();
-  auto code = reader.blob();
-  if (code.size() > limits.codeBytes || reader.text() != sha256(code))
+  uint64_t codePayloadOffset = 0;
+  auto code = reader.blob(&codePayloadOffset);
+  uint64_t codeDigestPayloadOffset = 0;
+  if (code.size() > limits.codeBytes ||
+      reader.text(&codeDigestPayloadOffset) != sha256(code))
     return std::nullopt;
   uint64_t deviceRootOffset = reader.position();
   uint64_t deviceRootPayloadOffset = 0;
@@ -382,6 +388,7 @@ decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes,
   llvm::SmallVector<uint64_t> launchGridOffsets;
   llvm::SmallVector<uint64_t> launchFirstInputOffsets;
   llvm::SmallVector<uint64_t> entryLengthOffsets;
+  llvm::SmallVector<uint64_t> entryDigestPayloadOffsets;
   llvm::SmallVector<uint64_t> launchSharedOffsets;
   int64_t nextOffset = 0;
   uint64_t taskPositions = 0;
@@ -422,7 +429,8 @@ decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes,
     uint8_t hasReduction = reader.u8();
     if (hasReduction > 1 || (hasReduction && reader.u8() > 0))
       return std::nullopt;
-    llvm::StringRef codeDigest = reader.text();
+    uint64_t entryDigestPayloadOffset = 0;
+    llvm::StringRef codeDigest = reader.text(&entryDigestPayloadOffset);
     auto slice = code.slice(nextOffset, length);
     if (codeDigest != sha256(slice))
       return std::nullopt;
@@ -458,6 +466,7 @@ decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes,
     launch.outputSlots.assign(outputs.begin(), outputs.end());
     launch.dependencies.assign(dependencies.begin(), dependencies.end());
     launches.push_back(std::move(launch));
+    entryDigestPayloadOffsets.push_back(entryDigestPayloadOffset);
     launchFirstInputOffsets.push_back(firstInputOffset);
     launchGridOffsets.push_back(launchGridOffset);
   }
@@ -690,8 +699,11 @@ decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes,
                  bundleRootPayloadOffset,
                  std::move(launchGridOffsets),
                  codeLengthOffset,
+                 codePayloadOffset,
+                 codeDigestPayloadOffset,
                  deviceEntryCountOffset,
                  std::move(entryLengthOffsets),
+                 std::move(entryDigestPayloadOffsets),
                  std::move(launchSharedOffsets),
                  invocationSlotCountOffset,
                  std::move(slotRankOffsets),
@@ -727,6 +739,56 @@ void rehashDeviceAndBundle(llvm::MutableArrayRef<uint8_t> bytes,
   writeDigest(bytes, decoded.bundleDeviceRootPayloadOffset, deviceRoot);
   writeDigest(bytes, decoded.bundleRootPayloadOffset,
               sha256(bytes.take_front(decoded.bundleRootOffset)));
+}
+
+llvm::SmallVector<uint8_t>
+replaceEntryCodeAndRehash(llvm::ArrayRef<uint8_t> bytes,
+                          const Decoded &decoded, int64_t entry,
+                          llvm::StringRef from, llvm::StringRef to) {
+  if (entry < 0 || entry >= static_cast<int64_t>(decoded.launches.size()) ||
+      from.size() != to.size())
+    return {};
+  const auto &launch = decoded.launches[entry];
+  llvm::StringRef ptx(
+      reinterpret_cast<const char *>(decoded.code.data() + launch.codeOffset),
+      launch.codeLength);
+  size_t relative = ptx.find(from);
+  if (relative == llvm::StringRef::npos ||
+      ptx.find(from, relative + 1) != llvm::StringRef::npos)
+    return {};
+  llvm::SmallVector<uint8_t> result(bytes);
+  llvm::copy(to, result.begin() + decoded.codePayloadOffset +
+                     launch.codeOffset + relative);
+  auto code = llvm::ArrayRef<uint8_t>(result).slice(decoded.codePayloadOffset,
+                                                    decoded.code.size());
+  writeDigest(result, decoded.codeDigestPayloadOffset, sha256(code));
+  writeDigest(result, decoded.entryDigestPayloadOffsets[entry],
+              sha256(code.slice(launch.codeOffset, launch.codeLength)));
+  rehashDeviceAndBundle(result, decoded);
+  return result;
+}
+
+std::optional<std::string>
+projectedF32LoadedRegister(llvm::StringRef ptx, int64_t inputPointer) {
+  std::string suffix =
+      (", [%rd" + llvm::Twine(inputPointer) + "];").str();
+  std::optional<std::string> loaded;
+  llvm::SmallVector<llvm::StringRef> lines;
+  ptx.split(lines, '\n');
+  for (llvm::StringRef line : lines) {
+    line = line.trim();
+    if (!line.starts_with("ld.global.f32 ") || !line.ends_with(suffix))
+      continue;
+    if (loaded)
+      return std::nullopt;
+    llvm::StringRef destination =
+        line.drop_front(llvm::StringRef("ld.global.f32 ").size())
+            .drop_back(suffix.size());
+    if (!destination.starts_with("%f") || destination.contains(','))
+      return std::nullopt;
+    loaded = destination.str();
+  }
+  return loaded;
 }
 
 void rehashInvocationAndBundle(llvm::MutableArrayRef<uint8_t> bytes,
@@ -2672,18 +2734,14 @@ TEST(GpuTransportV2Test,
              llvm::Twine(linearRegister) + ", 4, %rd" +
              llvm::Twine(inputPointer) + ";")
                 .str()));
-        size_t load = ptx.find("ld.global.f32 %f");
-        ASSERT_NE(load, llvm::StringRef::npos);
-        size_t loadedRegister = load + llvm::StringRef("ld.global.f32 ").size();
-        size_t loadedRegisterEnd = ptx.find(',', loadedRegister);
-        ASSERT_NE(loadedRegisterEnd, llvm::StringRef::npos);
-        llvm::StringRef loaded =
-            ptx.slice(loadedRegister, loadedRegisterEnd);
+        auto loaded = projectedF32LoadedRegister(ptx, inputPointer);
+        ASSERT_TRUE(loaded);
         llvm::SmallVector<llvm::StringRef> ptxLines;
         ptx.split(ptxLines, '\n');
         int64_t matchingStores = llvm::count_if(
             ptxLines, [&](llvm::StringRef line) {
-              return line.contains("st.global.f32") && line.contains(loaded);
+              return line.contains("st.global.f32") &&
+                     line.contains(*loaded);
             });
         EXPECT_EQ(matchingStores, 1);
         const int64_t outputPointer = inputPointer + 1;
@@ -2693,7 +2751,7 @@ TEST(GpuTransportV2Test,
                 .str()));
         EXPECT_TRUE(ptx.contains(
             ("st.global.f32 [%rd" + llvm::Twine(outputPointer) + "], " +
-             loaded + ";")
+             *loaded + ";")
                 .str()));
         EXPECT_FALSE(ptx.contains("st.global.u16"));
         int64_t inputByte = 0;
@@ -2741,7 +2799,7 @@ TEST(GpuTransportV2Test,
 }
 
 TEST(GpuTransportV2Test,
-     Abi20ProjectedParameterTransportMutationsFailBothDecoders) {
+     Abi20ProjectedParameterTransportMutationsAreBehaviorSensitive) {
   auto source = fixtureSource(
       "jax-0.10.1-bf16-projected_parameter_broadcast-"
       "3x2x5x11x263-forward.mlir");
@@ -2753,6 +2811,52 @@ TEST(GpuTransportV2Test,
   ASSERT_TRUE(mlir::succeeded(bytes));
   auto decoded = decodeInlineSchema2(*bytes);
   ASSERT_TRUE(decoded);
+
+  const std::vector<int64_t> inserted{1, 1, 1, 1, 263};
+  const std::vector<int64_t> full{3, 2, 5, 11, 263};
+  int64_t projectedEntry = -1;
+  int64_t projectedEntries = 0;
+  std::string projectedLoad;
+  for (const auto &launch : decoded->launches) {
+    if (launch.inputSlots.size() != 1 || launch.outputSlots.size() != 1 ||
+        decoded->slotDimensions[launch.inputSlots.front()] !=
+            llvm::ArrayRef<int64_t>(inserted) ||
+        decoded->slotDimensions[launch.outputSlots.front()] !=
+            llvm::ArrayRef<int64_t>(full))
+      continue;
+    ++projectedEntries;
+    llvm::StringRef ptx(
+        reinterpret_cast<const char *>(decoded->code.data() +
+                                       launch.codeOffset),
+        launch.codeLength);
+    auto loaded = projectedF32LoadedRegister(ptx, /*inputPointer=*/18);
+    ASSERT_TRUE(loaded);
+    projectedEntry = launch.taskOrdinal;
+    projectedLoad = "ld.global.f32 " + *loaded + ", [%rd18];";
+  }
+  ASSERT_EQ(projectedEntries, 1);
+  ASSERT_GE(projectedEntry, 0);
+  std::string wrongProjectedLoad = projectedLoad;
+  size_t pointer = wrongProjectedLoad.find("%rd18");
+  ASSERT_NE(pointer, std::string::npos);
+  wrongProjectedLoad.replace(pointer, llvm::StringRef("%rd18").size(),
+                             "%rd17");
+  auto wrongPointer = replaceEntryCodeAndRehash(
+      *bytes, *decoded, projectedEntry, projectedLoad,
+      wrongProjectedLoad);
+  ASSERT_FALSE(wrongPointer.empty());
+  auto wrongPointerDecoded = decodeInlineSchema2(wrongPointer);
+  ASSERT_TRUE(wrongPointerDecoded);
+  auto wrongPointerLoaded = mlir::shuttle::GpuExecutable::Load(wrongPointer);
+  ASSERT_TRUE(wrongPointerLoaded.ok()) << wrongPointerLoaded.status();
+  const auto &wrongLaunch = wrongPointerDecoded->launches[projectedEntry];
+  llvm::StringRef wrongPtx(
+      reinterpret_cast<const char *>(wrongPointerDecoded->code.data() +
+                                     wrongLaunch.codeOffset),
+      wrongLaunch.codeLength);
+  EXPECT_FALSE(projectedF32LoadedRegister(wrongPtx, /*inputPointer=*/18));
+  EXPECT_TRUE(projectedF32LoadedRegister(wrongPtx, /*inputPointer=*/17));
+
   auto expectRejected = [](llvm::ArrayRef<uint8_t> mutation) {
     EXPECT_FALSE(decodeInlineSchema2(mutation));
     EXPECT_FALSE(mlir::shuttle::GpuExecutable::Load(mutation).ok());
