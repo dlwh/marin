@@ -523,6 +523,7 @@ def test_controller_derives_ack_from_database_and_actual_verifier_bytes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     controller = _controller_module()
+    receipts = _receipt_module()
     contract = _contract()
     database = _controller_db(tmp_path / "db")
     attempt_uid = _seed_running_attempt(database, contract)
@@ -539,6 +540,7 @@ def test_controller_derives_ack_from_database_and_actual_verifier_bytes(
     try:
         ack = _issue_ack(store, paths)
         payload = json.loads(ack)["payload"]
+        assert receipts.verify_ack_receipt(ack, contract) == payload
         assert payload["attempt_uid"] == attempt_uid
         assert payload["job_state"] == "RUNNING"
         assert payload["task_state"] == "RUNNING"
@@ -642,6 +644,7 @@ def test_controller_receipts_are_persistently_idempotent_per_authorization_and_s
         paths["archive"].write_bytes(b"substituted archive\n")
         with pytest.raises(ValueError):
             _issue_ack(reopened, paths)
+        assert reopened.stored_receipt("ACK") == first
     finally:
         reopened_database.close()
 
@@ -698,6 +701,45 @@ def test_controller_rejects_changed_verifier_report_and_preserves_stored_receipt
         with pytest.raises(ValueError):
             _issue_ack(store, paths)
         assert store.stored_receipt("ACK") == first
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("job_id", "/attacker/job"),
+        ("task_id", "/attacker/job/0"),
+        ("attempt_id", 1),
+        ("attempt_uid", "fedcba9876543210"),
+        ("record", "TERMINAL"),
+        ("log_seq", 101),
+    ],
+)
+def test_controller_rejects_canonical_ready_identity_substitution_without_partial_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    controller = _controller_module()
+    contract = _contract()
+    database = _controller_db(tmp_path / "db")
+    attempt_uid = _seed_running_attempt(database, contract)
+    paths = _evidence_paths(tmp_path, contract, attempt_uid)
+    record = json.loads(paths["ready_log_record"].read_bytes())
+    record[field] = value
+    paths["ready_log_record"].write_bytes(_canonical(record))
+    _install_verifier(monkeypatch, controller, [])
+    store = controller.ControllerReceiptStore(
+        database,
+        signing_key_from_private_pem(RFC8032_TEST_PRIVATE_KEY_PEM),
+        contract,
+    )
+    try:
+        with pytest.raises(ValueError):
+            _issue_ack(store, paths)
+        assert store.stored_receipt("ACK") is None
     finally:
         database.close()
 
@@ -778,6 +820,7 @@ def test_controller_derives_terminal_from_same_successful_attempt_and_database_s
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     controller = _controller_module()
+    receipts = _receipt_module()
     contract = _contract()
     database = _controller_db(tmp_path / "db")
     attempt_uid = _seed_running_attempt(database, contract)
@@ -796,11 +839,54 @@ def test_controller_derives_terminal_from_same_successful_attempt_and_database_s
         _finish_attempt(database, contract)
         terminal = store.issue_terminal(terminal_log_record_path=paths["terminal_log_record"])
         payload = json.loads(terminal)["payload"]
+        assert receipts.verify_terminal_receipt(terminal, ack, contract) == payload
         assert payload["ack_receipt_sha256"] == hashlib.sha256(ack).hexdigest()
         assert payload["attempt_uid"] == attempt_uid
         assert payload["job_state"] == "SUCCEEDED"
         assert payload["task_state"] == "SUCCEEDED"
         assert payload["runner_exit_code"] == 0
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("job_id", "/attacker/job"),
+        ("task_id", "/attacker/job/0"),
+        ("attempt_id", 1),
+        ("attempt_uid", "fedcba9876543210"),
+        ("record", "READY"),
+        ("log_seq", 103),
+        ("runner_exit_code", 1),
+    ],
+)
+def test_controller_rejects_canonical_terminal_identity_substitution_without_partial_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    controller = _controller_module()
+    contract = _contract()
+    database = _controller_db(tmp_path / "db")
+    attempt_uid = _seed_running_attempt(database, contract)
+    paths = _evidence_paths(tmp_path, contract, attempt_uid)
+    _install_verifier(monkeypatch, controller, [])
+    store = controller.ControllerReceiptStore(
+        database,
+        signing_key_from_private_pem(RFC8032_TEST_PRIVATE_KEY_PEM),
+        contract,
+    )
+    try:
+        _issue_ack(store, paths)
+        _finish_attempt(database, contract)
+        record = json.loads(paths["terminal_log_record"].read_bytes())
+        record[field] = value
+        paths["terminal_log_record"].write_bytes(_canonical(record))
+        with pytest.raises(ValueError):
+            store.issue_terminal(terminal_log_record_path=paths["terminal_log_record"])
+        assert store.stored_receipt("TERMINAL") is None
     finally:
         database.close()
 
