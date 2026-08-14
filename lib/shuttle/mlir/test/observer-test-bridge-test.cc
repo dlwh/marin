@@ -117,6 +117,8 @@ TEST(ShuttleObserverTestBridgeTest,
   EXPECT_EQ(events[0].phase, "algebra_coverage");
   EXPECT_EQ(events[1].phase, "generated_bundle");
   EXPECT_EQ(events[2].phase, "final_erasure");
+  EXPECT_EQ(events[1].policyDigest,
+            "e88a2d0d73e15ed5fbfb98e0d30a5a2c0ca581b8369543225d53a1fa29bfdde2");
   EXPECT_EQ(events[0].coverageManifest, events[1].coverageManifest);
   EXPECT_FALSE(events[1].normalizedModuleFingerprint.empty());
   EXPECT_FALSE(events[1].noShuttleSemantics);

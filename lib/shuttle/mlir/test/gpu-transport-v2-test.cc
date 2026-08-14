@@ -2638,27 +2638,77 @@ TEST(GpuTransportV2Test,
             reinterpret_cast<const char *>(decoded->code.data() +
                                            launch.codeOffset),
             launch.codeLength);
-        for (int64_t divisor : shape.divisors) {
-          std::string suffix = (", " + llvm::Twine(divisor) + ";").str();
-          int64_t affineDivisions = 0;
-          llvm::SmallVector<llvm::StringRef> lines;
-          ptx.split(lines, '\n');
-          for (llvm::StringRef line : lines)
-            if (line.starts_with("  div.u64 ") && line.ends_with(suffix) &&
-                !line.contains(", %rd0, "))
-              ++affineDivisions;
-          EXPECT_EQ(affineDivisions, 1) << divisor;
+        int64_t elementStride = 1;
+        llvm::SmallVector<int64_t> elementStrides(shape.full.size());
+        for (size_t axis = shape.full.size(); axis > 0; --axis) {
+          elementStrides[axis - 1] = elementStride;
+          elementStride *= shape.full[axis - 1];
         }
-        EXPECT_TRUE(ptx.contains("mad.lo.u64"));
-        EXPECT_TRUE(ptx.contains("ld.global.f32"));
-        EXPECT_TRUE(ptx.contains("st.global.u16"));
-        int64_t inputByte = shape.coordinates.back() * 4;
-        int64_t outputLinear = 0;
-        for (size_t axis = 0; axis < shape.full.size(); ++axis)
-          outputLinear = outputLinear * shape.full[axis] +
-                         shape.coordinates[axis];
+        const int64_t linearRegister = 8 + shape.full.size();
+        for (size_t axis = 0; axis < shape.full.size(); ++axis) {
+          EXPECT_TRUE(ptx.contains(
+              ("div.u64 %rd" + llvm::Twine(8 + axis) + ", %rd0, " +
+               llvm::Twine(elementStrides[axis]) + ";")
+                  .str()));
+          int64_t mappedRegister = 8 + axis;
+          if (axis < shape.divisors.size()) {
+            mappedRegister = linearRegister + 1 + axis;
+            EXPECT_TRUE(ptx.contains(
+                ("div.u64 %rd" + llvm::Twine(mappedRegister) + ", %rd" +
+                 llvm::Twine(8 + axis) + ", " +
+                 llvm::Twine(shape.divisors[axis]) + ";")
+                    .str()));
+          }
+          EXPECT_TRUE(ptx.contains(
+              ("mad.lo.u64 %rd" + llvm::Twine(linearRegister) + ", %rd" +
+               llvm::Twine(linearRegister) + ", " +
+               llvm::Twine(shape.inserted[axis]) + ", %rd" +
+               llvm::Twine(mappedRegister) + ";")
+                  .str()));
+        }
+        const int64_t inputPointer = 8 + 2 * shape.full.size();
+        EXPECT_TRUE(ptx.contains(
+            ("mad.lo.u64 %rd" + llvm::Twine(inputPointer) + ", %rd" +
+             llvm::Twine(linearRegister) + ", 4, %rd" +
+             llvm::Twine(inputPointer) + ";")
+                .str()));
+        size_t load = ptx.find("ld.global.f32 %f");
+        ASSERT_NE(load, llvm::StringRef::npos);
+        size_t loadedRegister = load + llvm::StringRef("ld.global.f32 ").size();
+        size_t loadedRegisterEnd = ptx.find(',', loadedRegister);
+        ASSERT_NE(loadedRegisterEnd, llvm::StringRef::npos);
+        llvm::StringRef loaded =
+            ptx.slice(loadedRegister, loadedRegisterEnd);
+        llvm::SmallVector<llvm::StringRef> ptxLines;
+        ptx.split(ptxLines, '\n');
+        int64_t matchingStores = llvm::count_if(
+            ptxLines, [&](llvm::StringRef line) {
+              return line.contains("st.global.f32") && line.contains(loaded);
+            });
+        EXPECT_EQ(matchingStores, 1);
+        const int64_t outputPointer = inputPointer + 1;
+        EXPECT_TRUE(ptx.contains(
+            ("mad.lo.u64 %rd" + llvm::Twine(outputPointer) +
+             ", %rd0, 4, %rd" + llvm::Twine(outputPointer) + ";")
+                .str()));
+        EXPECT_TRUE(ptx.contains(
+            ("st.global.f32 [%rd" + llvm::Twine(outputPointer) + "], " +
+             loaded + ";")
+                .str()));
+        EXPECT_FALSE(ptx.contains("st.global.u16"));
+        int64_t inputByte = 0;
+        int64_t outputByte = 0;
+        for (size_t axis = 0; axis < shape.full.size(); ++axis) {
+          int64_t inputCoordinate =
+              axis < shape.divisors.size()
+                  ? shape.coordinates[axis] / shape.divisors[axis]
+                  : shape.coordinates[axis];
+          inputByte += inputCoordinate * decoded->slotStrides[input][axis];
+          outputByte +=
+              shape.coordinates[axis] * decoded->slotStrides[output][axis];
+        }
         EXPECT_EQ(inputByte, shape.sampleInputByte);
-        EXPECT_EQ(outputLinear * 4, shape.sampleOutputByte);
+        EXPECT_EQ(outputByte, shape.sampleOutputByte);
       }
       EXPECT_EQ(projectedLaunches, 1);
       int64_t publicWeightBindings = 0;
