@@ -79,7 +79,7 @@ ShuttlePipelineOptions commandLinePipelineOptions(NumericalPolicy numerics) {
   options.numerics = numerics;
   if (numerics == NumericalPolicy::Fast) {
     options.canonicalOptions =
-        R"json({"execution_mode":"stablehlo_round_trip","numerics":"fast","pipeline_abi_version":12,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+        R"json({"execution_mode":"stablehlo_round_trip","numerics":"fast","pipeline_abi_version":13,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
   }
   return options;
 }
@@ -3048,7 +3048,8 @@ bool isClosedContractMapRegion(ArrayRef<Operation *> algebra) {
   }
   auto convert = dyn_cast<ScalarConvertOp>(body.front());
   auto yield = dyn_cast<YieldOp>(body.back());
-  auto regionYield = dyn_cast<YieldOp>(region.getBody().front().getTerminator());
+  auto regionYield =
+      dyn_cast<YieldOp>(region.getBody().front().getTerminator());
   return convert && yield && regionYield && map.getResult(0).hasOneUse() &&
          convert.getInput() == body.getArgument(0) &&
          convert.getInput().getType().isF32() &&
@@ -3322,20 +3323,17 @@ public:
       return WalkResult::advance();
     });
     if (!selected) {
-      module.emitError("requires exactly one connected static GPU algebra region");
+      module.emitError(
+          "requires exactly one connected static GPU algebra region");
       return signalPassFailure();
     }
     if (derived.hasContract) {
-      if (selected.getPolicy() != NumericalPolicy::SourceOrdered) {
-        module.emitError("ABI12 GPU Contract requires source_ordered numerics");
-        return signalPassFailure();
-      }
       auto manifest =
           module->getAttrOfType<DictionaryAttr>(kCoverageManifestAttribute);
       auto tuning = manifest ? manifest.getAs<StringAttr>("canonical_tuning")
                              : StringAttr{};
       if (!tuning || tuning.getValue() != kDefaultCanonicalTuning) {
-        module.emitError("ABI12 GPU Contract requires exact default tuning");
+        module.emitError("ABI13 GPU Contract requires exact default tuning");
         return signalPassFailure();
       }
     }
@@ -3634,7 +3632,8 @@ int64_t scheduleThreads(int64_t tile) {
 }
 
 FailureOr<ScheduledGeometry> deriveSimt32Geometry(ScheduleTaskKind kind,
-                                                  ArrayRef<int64_t> domain) {
+                                                  ArrayRef<int64_t> domain,
+                                                  NumericalPolicy policy) {
   constexpr int64_t kSubgroup = 32;
   constexpr int64_t kMaxThreads = 256;
   if (kind == ScheduleTaskKind::Scalar) {
@@ -3664,6 +3663,16 @@ FailureOr<ScheduledGeometry> deriveSimt32Geometry(ScheduleTaskKind kind,
       return failure();
     }
     const int64_t outputs = domain[0] * domain[1];
+    if (policy == NumericalPolicy::Fast) {
+      const int64_t outputsPerBlock = std::min<int64_t>(outputs, 8);
+      return ScheduledGeometry{{ceilDivPositive(outputs, outputsPerBlock)},
+                               {outputsPerBlock},
+                               ceilDivPositive(domain[2], kSubgroup),
+                               outputsPerBlock * kSubgroup,
+                               kSubgroup,
+                               0,
+                               2};
+    }
     const int64_t tile = std::min(outputs, kMaxThreads);
     return ScheduledGeometry{{ceilDivPositive(outputs, tile)},
                              {tile},
@@ -3788,7 +3797,7 @@ public:
               : (task.getDomainShape().empty() ? ScheduleTaskKind::Scalar
                                                : ScheduleTaskKind::Elementwise);
       FailureOr<ScheduledGeometry> geometry =
-          deriveSimt32Geometry(kind, task.getDomainShape());
+          deriveSimt32Geometry(kind, task.getDomainShape(), source.getPolicy());
       if (failed(geometry)) {
         task.emitOpError("cannot derive a bounded SIMT32 schedule candidate");
         return signalPassFailure();
@@ -3829,7 +3838,9 @@ public:
             ScheduleReductionOrderAttr::get(
                 module.getContext(),
                 kind == ScheduleTaskKind::Contract
-                    ? ScheduleReductionOrder::SerialAscendingFmaRnF32
+                    ? (source.getPolicy() == NumericalPolicy::Fast
+                           ? ScheduleReductionOrder::LeafOrderFree
+                           : ScheduleReductionOrder::SerialAscendingFmaRnF32)
                     : ScheduleReductionOrder::
                           TreeAssociationFreeLeafOrderFixed)));
       }
@@ -4498,11 +4509,13 @@ FailureOr<std::string> emitMapPtx(MapOp map, ScheduleTaskOp task) {
 
 FailureOr<std::string> emitContractPtx(ContractOp contract,
                                        ScheduleTaskOp task) {
+  const bool fast =
+      task.getReductionOrder() == ScheduleReductionOrder::LeafOrderFree;
   if (!isClosedRankTwoContract(contract) ||
       task.getKind() != ScheduleTaskKind::Contract ||
       task.getDomainShape().size() != 3 || task.getReductionAxis() != 2 ||
-      task.getReductionOrder() !=
-          ScheduleReductionOrder::SerialAscendingFmaRnF32 ||
+      (!fast && task.getReductionOrder() !=
+                    ScheduleReductionOrder::SerialAscendingFmaRnF32) ||
       task.getInputBuffers().size() != 2 ||
       task.getOutputBuffers().size() != 1 || task.getScratchBytes() != 0) {
     return failure();
@@ -4514,12 +4527,92 @@ FailureOr<std::string> emitContractPtx(ContractOp contract,
     return failure();
   }
   const int64_t outputs = rows * columns;
+  if (outputs > UINT32_MAX) {
+    return failure();
+  }
+  if (fast) {
+    const int64_t outputsPerBlock = std::min<int64_t>(outputs, 8);
+    if (task.getGridShape() !=
+            ArrayRef<int64_t>({ceilDivPositive(outputs, outputsPerBlock)}) ||
+        task.getTileShape() != ArrayRef<int64_t>({outputsPerBlock}) ||
+        task.getWorkgroupThreads() != outputsPerBlock * 32 ||
+        task.getSubgroupSize() != 32 ||
+        task.getSerialTiles() != ceilDivPositive(reduction, 32)) {
+      return failure();
+    }
+
+    PtxEmitter ptx(/*arity=*/3);
+    ptx.header(task.getSemanticFingerprint());
+    ptx.stream << "  mov.u32 %r0, %tid.x;\n"
+                  "  shr.u32 %r1, %r0, 5;\n"
+                  "  and.b32 %r2, %r0, 31;\n"
+                  "  mov.u32 %r3, %ctaid.x;\n"
+                  "  mad.lo.u32 %r4, %r3, "
+               << outputsPerBlock
+               << ", %r1;\n"
+                  "  setp.ge.u32 %p0, %r4, "
+               << outputs
+               << ";\n"
+                  "  @%p0 bra $done;\n"
+                  "  cvt.u64.u32 %rd0, %r4;\n";
+    auto result = cast<RankedTensorType>(contract.getResult(0).getType());
+    FailureOr<SmallVector<int64_t>> coordinates =
+        emitOutputCoordinates(ptx, result);
+    if (failed(coordinates) || *coordinates != ArrayRef<int64_t>({8, 9})) {
+      return failure();
+    }
+    ptx.stream << "  ld.param.u64 %rd10, [p0];\n"
+                  "  ld.param.u64 %rd11, [p1];\n"
+                  "  mov.f32 %f0, 0f00000000;\n"
+                  "  cvt.u64.u32 %rd13, %r2;\n"
+                  "$contract_fast_loop:\n"
+                  "  setp.ge.u64 %p1, %rd13, "
+               << reduction
+               << ";\n"
+                  "  @%p1 bra $contract_fast_reduce;\n"
+                  "  mad.lo.u64 %rd14, %rd8, "
+               << reduction
+               << ", %rd13;\n"
+                  "  mad.lo.u64 %rd15, %rd13, "
+               << columns
+               << ", %rd9;\n"
+                  "  mad.lo.u64 %rd16, %rd14, 2, %rd10;\n"
+                  "  mad.lo.u64 %rd17, %rd15, 2, %rd11;\n"
+                  "  ld.global.u16 %h0, [%rd16];\n"
+                  "  ld.global.u16 %h1, [%rd17];\n"
+                  "  cvt.f32.bf16 %f1, %h0;\n"
+                  "  cvt.f32.bf16 %f2, %h1;\n"
+                  "  fma.rn.f32 %f0, %f1, %f2, %f0;\n"
+                  "  add.u64 %rd13, %rd13, 32;\n"
+                  "  bra $contract_fast_loop;\n"
+                  "$contract_fast_reduce:\n"
+                  "  mov.b32 %r5, %f0;\n";
+    for (int64_t offset : {16, 8, 4, 2, 1}) {
+      ptx.stream << "  shfl.sync.down.b32 %r6, %r5, " << offset
+                 << ", 31, 0xffffffff;\n"
+                    "  mov.b32 %f3, %r6;\n"
+                    "  add.rn.f32 %f0, %f0, %f3;\n"
+                    "  mov.b32 %r5, %f0;\n";
+    }
+    ptx.stream << "  setp.ne.u32 %p2, %r2, 0;\n"
+                  "  @%p2 bra $done;\n"
+                  "  ld.param.u64 %rd12, [p2];\n"
+                  "  mad.lo.u64 %rd12, %rd0, 4, %rd12;\n"
+                  "  st.global.f32 [%rd12], %f0;\n";
+    ptx.u64 = std::max<int64_t>(ptx.u64, 18);
+    ptx.f32 = std::max<int64_t>(ptx.f32, 4);
+    ptx.finish();
+    return ptx.text;
+  }
+
   const int64_t expectedThreads =
       scheduleThreads(std::min<int64_t>(outputs, 256));
   if (task.getGridShape() != ArrayRef<int64_t>({ceilDivPositive(
                                  outputs, std::min<int64_t>(outputs, 256))}) ||
+      task.getTileShape() !=
+          ArrayRef<int64_t>({std::min<int64_t>(outputs, 256)}) ||
       task.getWorkgroupThreads() != expectedThreads ||
-      task.getSerialTiles() != reduction) {
+      task.getSubgroupSize() != 32 || task.getSerialTiles() != reduction) {
     return failure();
   }
 
@@ -6188,7 +6281,7 @@ void registerShuttleStablehloPipelines() {
             commandLinePipelineOptions(NumericalPolicy::SourceOrdered);
         options.executionMode = ExecutionMode::CpuExecutableBundle;
         options.canonicalOptions =
-            R"json({"execution_mode":"cpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":12,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+            R"json({"execution_mode":"cpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":13,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
         buildShuttleStablehloPipeline(manager, options);
       });
   PassPipelineRegistration<>(
@@ -6199,7 +6292,7 @@ void registerShuttleStablehloPipelines() {
             commandLinePipelineOptions(NumericalPolicy::Fast);
         options.executionMode = ExecutionMode::CpuExecutableBundle;
         options.canonicalOptions =
-            R"json({"execution_mode":"cpu_executable_bundle","numerics":"fast","pipeline_abi_version":12,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+            R"json({"execution_mode":"cpu_executable_bundle","numerics":"fast","pipeline_abi_version":13,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
         buildShuttleStablehloPipeline(manager, options);
       });
   PassPipelineRegistration<>(
@@ -6211,7 +6304,7 @@ void registerShuttleStablehloPipelines() {
             commandLinePipelineOptions(NumericalPolicy::SourceOrdered);
         options.executionMode = ExecutionMode::GpuExecutableBundle;
         options.canonicalOptions =
-            R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":12,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+            R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":13,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
         buildShuttleStablehloPipeline(manager, options);
       });
   PassPipelineRegistration<>(
@@ -6222,7 +6315,7 @@ void registerShuttleStablehloPipelines() {
             commandLinePipelineOptions(NumericalPolicy::Fast);
         options.executionMode = ExecutionMode::GpuExecutableBundle;
         options.canonicalOptions =
-            R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":12,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+            R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":13,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
         buildShuttleStablehloPipeline(manager, options);
       });
 }

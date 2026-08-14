@@ -1031,7 +1031,8 @@ struct Simt32Geometry {
 };
 
 FailureOr<Simt32Geometry> simt32Geometry(ScheduleTaskKind kind,
-                                         ArrayRef<int64_t> domain) {
+                                         ArrayRef<int64_t> domain,
+                                         NumericalPolicy policy) {
   constexpr int64_t kSubgroup = 32;
   constexpr int64_t kMaxThreads = 256;
   if (kind == ScheduleTaskKind::Scalar) {
@@ -1061,6 +1062,16 @@ FailureOr<Simt32Geometry> simt32Geometry(ScheduleTaskKind kind,
       return failure();
     }
     const int64_t outputs = domain[0] * domain[1];
+    if (policy == NumericalPolicy::Fast) {
+      const int64_t outputsPerBlock = std::min<int64_t>(outputs, 8);
+      return Simt32Geometry{{ceilDivPositive(outputs, outputsPerBlock)},
+                            {outputsPerBlock},
+                            ceilDivPositive(domain[2], kSubgroup),
+                            outputsPerBlock * kSubgroup,
+                            kSubgroup,
+                            0,
+                            2};
+    }
     const int64_t tile = std::min(outputs, kMaxThreads);
     return Simt32Geometry{{ceilDivPositive(outputs, tile)},
                           {tile},
@@ -1219,17 +1230,18 @@ LogicalResult SchedulePlanOp::verifyRegions() {
     if (isFold) {
       expectedOrder = ScheduleReductionOrder::TreeAssociationFreeLeafOrderFixed;
     } else if (isContract) {
-      expectedOrder = ScheduleReductionOrder::SerialAscendingFmaRnF32;
+      expectedOrder = getPolicy() == NumericalPolicy::Fast
+                          ? ScheduleReductionOrder::LeafOrderFree
+                          : ScheduleReductionOrder::SerialAscendingFmaRnF32;
     }
     if (task.getReductionOrder() != expectedOrder) {
-      return task.emitOpError(isContract
-                                  ? "Contract reduction order must equal "
-                                    "serial ascending fma.rn.f32 semantics"
-                                  : "Fold reduction order must equal bound "
-                                    "Fold semantics");
+      return task.emitOpError(
+          isContract ? "Contract reduction order must equal the policy-bound "
+                       "Contract semantics"
+                     : "Fold reduction order must equal bound Fold semantics");
     }
     FailureOr<Simt32Geometry> expected =
-        simt32Geometry(task.getKind(), task.getDomainShape());
+        simt32Geometry(task.getKind(), task.getDomainShape(), getPolicy());
     if (failed(expected) ||
         task.getGridShape() != ArrayRef<int64_t>(expected->grid) ||
         task.getTileShape() != ArrayRef<int64_t>(expected->tile) ||

@@ -1,7 +1,7 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Untimed ordinary-JAX ABI 12 GPU LayerNorm acceptance driver."""
+"""Untimed ordinary-JAX ABI 13 GPU LayerNorm acceptance driver."""
 
 import argparse
 import hashlib
@@ -31,7 +31,7 @@ from shuttle import ExecutionMode, Numerics, compiler_options
 
 JAX_VERSION = "0.10.1"
 JAXLIB_VERSION = "0.10.1"
-PIPELINE_ABI_VERSION = 12
+PIPELINE_ABI_VERSION = 13
 BOUNDARIES = ("forward", "backward", "composed")
 POLICIES = (Numerics.SOURCE_ORDERED, Numerics.FAST)
 WORKERS = ("baseline", "populate", "reuse")
@@ -223,7 +223,7 @@ def subject_options(numerics: Numerics) -> dict[str, object]:
         raise TypeError("xla_shuttle_options must be canonical JSON text")
     payload = json.loads(encoded)
     if payload.get("pipeline_abi_version") != PIPELINE_ABI_VERSION:
-        raise AssertionError("LayerNorm GPU proof requires pipeline ABI 12")
+        raise AssertionError("LayerNorm GPU proof requires pipeline ABI 13")
     if payload.get("numerics") != numerics.value:
         raise AssertionError("LayerNorm GPU proof lost its numerical policy")
     return options
@@ -368,11 +368,11 @@ def run_subject(worker: str, baseline_path: Path, cache_directory: Path, key_map
     configure_cache(cache_directory)
     initial = cache_snapshot(cache_directory)
     if worker == "populate" and initial:
-        raise AssertionError("ABI 12 populate cache must start empty")
+        raise AssertionError("ABI 13 populate cache must start empty")
     expected_keys = json.loads(key_map_path.read_text()) if worker == "reuse" else {}
     expected_labels = {f"{shape_id}_{boundary}_{policy}" for shape_id, boundary, policy in cell_identities()}
     if worker == "reuse" and set(expected_keys) != expected_labels:
-        raise AssertionError("ABI 12 reuse key map does not cover the twelve exact cells")
+        raise AssertionError("ABI 13 reuse key map does not cover the twelve exact cells")
     counter = CacheHitCounter()
     jax.monitoring.register_event_listener(counter.observe)
     reports = []
@@ -393,11 +393,11 @@ def run_subject(worker: str, baseline_path: Path, cache_directory: Path, key_map
                 added = set(after) - set(before)
                 if worker == "populate":
                     if len(added) != 1 or counter.count != hits:
-                        raise AssertionError(f"{label}: expected one ABI 12 cache miss")
+                        raise AssertionError(f"{label}: expected one ABI 13 cache miss")
                     keys[label] = added.pop()
                     observer = validate_observer_events(events, shape, boundary, expected_identity(numerics))
                 elif after != before or counter.count != hits + 1:
-                    raise AssertionError(f"{label}: expected one immutable ABI 12 cache hit")
+                    raise AssertionError(f"{label}: expected one immutable ABI 13 cache hit")
                 else:
                     if events:
                         raise AssertionError(f"{label}: persistent-cache hit invoked Shuttle")
@@ -417,11 +417,11 @@ def run_subject(worker: str, baseline_path: Path, cache_directory: Path, key_map
                 )
     final = cache_snapshot(cache_directory)
     if len(final) != len(cell_identities()) or len(set(keys.values())) != len(cell_identities()):
-        raise AssertionError("ABI 12 proof requires twelve distinct persistent-cache entries")
+        raise AssertionError("ABI 13 proof requires twelve distinct persistent-cache entries")
     if worker == "populate":
         key_map_path.write_text(json.dumps(keys, indent=2, sort_keys=True) + "\n")
     elif final != initial:
-        raise AssertionError("ABI 12 reuse changed persistent-cache bytes")
+        raise AssertionError("ABI 13 reuse changed persistent-cache bytes")
     return {
         "worker": worker,
         "pid": os.getpid(),
@@ -477,9 +477,9 @@ def run_orchestrator(work_directory: Path) -> dict[str, object]:
     if len({reports[worker]["pid"] for worker in WORKERS}) != len(WORKERS):
         raise AssertionError("baseline, populate, and reuse must run in distinct processes")
     if reports["populate"]["cell_to_cache_file"] != reports["reuse"]["cell_to_cache_file"]:
-        raise AssertionError("reuse process changed ABI 12 cache-key attribution")
+        raise AssertionError("reuse process changed ABI 13 cache-key attribution")
     if reports["reuse"]["cache_hits"] != len(cell_identities()):
-        raise AssertionError("reuse process omitted an ABI 12 cache hit")
+        raise AssertionError("reuse process omitted an ABI 13 cache hit")
     return {
         "classification": "untimed_cuda_sm90_layer_norm_correctness_and_cache_only",
         "timing_collected": False,

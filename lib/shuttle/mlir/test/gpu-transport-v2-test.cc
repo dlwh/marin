@@ -682,7 +682,7 @@ buildFixture(llvm::StringRef source,
   } else if (policy == mlir::shuttle::NumericalPolicy::Fast) {
     manager.addPass(mlir::shuttle::createFormStructuralRegionsPass(
         policy,
-        R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":12,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
+        R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":13,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
         R"json({"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json"));
   } else {
     manager.addPass(mlir::shuttle::createFormStructuralRegionsPass());
@@ -1047,7 +1047,7 @@ TEST(GpuTransportV2Test, ScalarConvertPreservesBf16RoundingBoundary) {
 }
 
 TEST(GpuTransportV2Test,
-     Abi12ContractMapShapeSweepHasClosedGenericDescriptors) {
+     Abi13ContractMapShapeSweepHasClosedGenericDescriptors) {
   struct Shape {
     int64_t rows;
     int64_t reduction;
@@ -1111,7 +1111,7 @@ TEST(GpuTransportV2Test,
 }
 
 TEST(GpuTransportV2Test,
-     Abi12ContractMapPtxUsesAscendingFmaAndExplicitBf16Map) {
+     Abi13SourceOrderedContractMapUsesAscendingFmaAndExplicitBf16Map) {
   auto built = buildFixture(contractMapModule(7, 13, 3, "first_name"));
   auto renamed = buildFixture(contractMapModule(7, 13, 3, "second_name"));
   ASSERT_TRUE(built);
@@ -1323,7 +1323,7 @@ TEST(GpuTransportV2Test,
   EXPECT_FALSE(fastPtx.contains("add.u64 %rd13, %rd13, 1;"));
 }
 
-TEST(GpuTransportV2Test, Abi12ContractMapTransportMutationsFailClosed) {
+TEST(GpuTransportV2Test, Abi13ContractMapTransportMutationsFailClosed) {
   auto built = buildFixture(contractMapModule(3, 5, 2, "anonymous"));
   ASSERT_TRUE(built);
   auto bytes = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
@@ -1346,7 +1346,7 @@ TEST(GpuTransportV2Test, Abi12ContractMapTransportMutationsFailClosed) {
   EXPECT_FALSE(mlir::shuttle::GpuExecutable::Load(futureResultInput).ok());
 }
 
-TEST(GpuTransportV2Test, Abi12ContractMapRejectsUnsupportedNumericsAndShapes) {
+TEST(GpuTransportV2Test, Abi13ContractMapRejectsUnsupportedShapes) {
   constexpr llvm::StringLiteral batched = R"mlir(
 module @batched {
   func.func @main(%lhs: tensor<2x3x5xbf16>, %rhs: tensor<2x5x7xbf16>) -> tensor<2x3x7xbf16> {
@@ -1374,8 +1374,6 @@ module @f32_inputs {
   }
 }
 )mlir";
-  EXPECT_FALSE(buildFixture(contractMapModule(3, 5, 2, "fast", "DEFAULT", true),
-                            mlir::shuttle::NumericalPolicy::Fast));
   EXPECT_FALSE(
       buildFixture(contractMapModule(3, 5, 2, "high_precision", "HIGH", true)));
   EXPECT_FALSE(buildFixture(
@@ -2044,7 +2042,7 @@ TEST(GpuTransportV2Test,
 }
 
 TEST(GpuTransportV2Test,
-     Abi12ContractMapUsesUnchangedFfiSchemasAndTwoLaunchLifecycle) {
+     Abi13ContractMapUsesUnchangedFfiSchemasAndTwoLaunchLifecycle) {
   auto built = buildFixture(contractMapModule(3, 5, 2, "ffi_anonymous"));
   ASSERT_TRUE(built);
   auto transport = mlir::shuttle::serializeGpuExecutableBundle(*built->module);

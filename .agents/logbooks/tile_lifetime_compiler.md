@@ -4719,3 +4719,29 @@ author: dlwh
   evidence must be an untimed, sealed `2048x4096` forward SOURCE_ORDERED H100
   observation using `target1_numerical_oracle.fixed_inputs`. Performance stays
   `not_started` until a separately reviewed cross-run protocol exists.
+
+### 2026-08-13 - TLTC-MLIR-018 ABI 13 FAST Contract local boundary
+
+- Pipeline ABI 13 adds a narrow FAST realization for the existing anonymous
+  rank-two BF16 Contract followed by an explicit FP32-to-BF16 RNE Map.
+  SOURCE_ORDERED Contract code remains the serial ascending-FMA realization.
+- FAST assigns one warp to each output. Lanes traverse `K` with stride 32 using
+  `fma.rn.f32`, then reduce through fixed shuffle/add offsets
+  `16, 8, 4, 2, 1`; lane zero writes the internal FP32 result for the existing
+  conversion Map. Blocks contain at most eight output warps, use no scratch,
+  and record the policy-bound `leaf_order_free` schedule.
+- The pipeline ABI and cache identity advance from 12 to 13. Materialization,
+  schedule, transport, device, invocation, and bundle schemas remain
+  `2/2/2/3/3/2`; the CUDA FFI target remains
+  `shuttle.gpu.executable_bundle.v2`.
+- Local native coverage passes 51/51, including anonymous `K=16,32,33,65`
+  geometry, exact shuffle PTX structure, policy/root separation, serialized
+  XLA options, observer behavior, ABI 9 CPU preservation, and fake typed-FFI
+  lifecycle. JAX-patch Python coverage passes 450/450. Shuttle Python passes
+  61/62; the sole failure is a pre-existing evaluation-manifest SHA mismatch
+  already present at the exact base and unrelated to ABI 13.
+- No local `ptxas` exists, so this checkpoint does not claim PTX assembly,
+  CUDA execution, numerical parity, cache reuse, timing, or performance. No
+  hardware reservation, upload, push, or integration occurred. The next
+  architecture-conforming step is a separately reviewed and authorized SM90
+  assembly and untimed numerical/cache run.

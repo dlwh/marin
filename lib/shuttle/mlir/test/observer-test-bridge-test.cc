@@ -109,7 +109,7 @@ TEST(ShuttleObserverTestBridgeTest,
   mlir::shuttle::ShuttlePipelineOptions options;
   options.executionMode = mlir::shuttle::ExecutionMode::GpuExecutableBundle;
   options.canonicalOptions =
-      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":12,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":13,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
   ASSERT_TRUE(
       mlir::succeeded(mlir::shuttle::runShuttleXlaTransform(*module, options)));
   auto events = capture->snapshot();
