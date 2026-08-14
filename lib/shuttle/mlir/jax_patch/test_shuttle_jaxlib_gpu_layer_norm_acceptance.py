@@ -68,8 +68,8 @@ def _events(shape_id: str, boundary: str, numerics: Numerics) -> list[dict[str, 
     ]
 
 
-def test_layer_norm_gpu_driver_binds_twelve_distinct_abi11_cells() -> None:
-    assert PIPELINE_ABI_VERSION == 11
+def test_layer_norm_gpu_driver_binds_twelve_distinct_abi12_cells() -> None:
+    assert PIPELINE_ABI_VERSION == 12
     assert BOUNDARIES == ("forward", "backward", "composed")
     assert POLICIES == (Numerics.SOURCE_ORDERED, Numerics.FAST)
     assert len(cell_identities()) == 12
@@ -79,8 +79,8 @@ def test_layer_norm_gpu_driver_binds_twelve_distinct_abi11_cells() -> None:
 
     source = json.loads(subject_options(Numerics.SOURCE_ORDERED)["xla_shuttle_options"])
     fast = json.loads(subject_options(Numerics.FAST)["xla_shuttle_options"])
-    assert source["pipeline_abi_version"] == 11
-    assert fast["pipeline_abi_version"] == 11
+    assert source["pipeline_abi_version"] == 12
+    assert fast["pipeline_abi_version"] == 12
     assert source["numerics"] == "source_ordered"
     assert fast["numerics"] == "fast"
     assert source != fast

@@ -666,7 +666,7 @@ buildFixture(llvm::StringRef source,
   if (policy == mlir::shuttle::NumericalPolicy::Fast) {
     manager.addPass(mlir::shuttle::createFormStructuralRegionsPass(
         policy,
-        R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":11,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
+        R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":12,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
         R"json({"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json"));
   } else {
     manager.addPass(mlir::shuttle::createFormStructuralRegionsPass());
