@@ -164,8 +164,14 @@ def _other_public_key_pem() -> str:
     )
 
 
-def _seed_running_attempt(database: Any, contract: dict[str, Any]) -> str:
-    request = _launch_request(contract)
+def _seed_running_attempt(
+    database: Any,
+    contract: dict[str, Any],
+    *,
+    request: controller_pb2.Controller.LaunchJobRequest | None = None,
+) -> str:
+    if request is None:
+        request = _launch_request(contract)
     job_id = JobName.from_string(contract["launch"]["job_id"])
     task_id = job_id.task(0)
     with database.transaction() as tx:
@@ -268,16 +274,26 @@ def _evidence_paths(tmp_path: Path, contract: dict[str, Any], attempt_uid: str) 
     }
 
 
-def _install_verifier(monkeypatch: pytest.MonkeyPatch, controller: Any, calls: list[tuple[Path, Path]]) -> None:
+def _install_verifier(
+    monkeypatch: pytest.MonkeyPatch,
+    controller: Any,
+    calls: list[tuple[Path, Path]],
+    reports: list[bytes] | None = None,
+    report_mutation: dict[str, object] | None = None,
+) -> None:
     def run_verifier(*, archive_path: Path, export_manifest_path: Path) -> bytes:
         calls.append((archive_path, export_manifest_path))
-        return _canonical(
-            {
-                "archive_sha256": hashlib.sha256(archive_path.read_bytes()).hexdigest(),
-                "export_manifest_sha256": hashlib.sha256(export_manifest_path.read_bytes()).hexdigest(),
-                "verdict": "accepted",
-            }
-        )
+        report: dict[str, object] = {
+            "archive_sha256": hashlib.sha256(archive_path.read_bytes()).hexdigest(),
+            "export_manifest_sha256": hashlib.sha256(export_manifest_path.read_bytes()).hexdigest(),
+            "verdict": "accepted",
+        }
+        if report_mutation is not None:
+            report.update(report_mutation)
+        raw = _canonical(report)
+        if reports is not None:
+            reports.append(raw)
+        return raw
 
     monkeypatch.setattr(controller, "run_abi15_evidence_verifier", run_verifier)
 
@@ -512,7 +528,8 @@ def test_controller_derives_ack_from_database_and_actual_verifier_bytes(
     attempt_uid = _seed_running_attempt(database, contract)
     paths = _evidence_paths(tmp_path, contract, attempt_uid)
     calls: list[tuple[Path, Path]] = []
-    _install_verifier(monkeypatch, controller, calls)
+    reports: list[bytes] = []
+    _install_verifier(monkeypatch, controller, calls, reports)
     store = controller.ControllerReceiptStore(
         database,
         signing_key_from_private_pem(RFC8032_TEST_PRIVATE_KEY_PEM),
@@ -525,9 +542,71 @@ def test_controller_derives_ack_from_database_and_actual_verifier_bytes(
         assert payload["attempt_uid"] == attempt_uid
         assert payload["job_state"] == "RUNNING"
         assert payload["task_state"] == "RUNNING"
+        with database.read_snapshot() as tx:
+            job_id = JobName.from_string(contract["launch"]["job_id"])
+            reconstructed = reconstruct_launch_job_request(
+                reads.get_job_detail(tx, job_id),
+                workdir_files=reads.get_workdir_files(tx, job_id),
+            ).SerializeToString(deterministic=True)
+        assert payload["launch_request_sha256"] == hashlib.sha256(reconstructed).hexdigest()
         assert payload["archive_sha256"] == hashlib.sha256(paths["archive"].read_bytes()).hexdigest()
+        assert payload["export_manifest_sha256"] == hashlib.sha256(paths["export_manifest"].read_bytes()).hexdigest()
+        assert payload["ready_sha256"] == hashlib.sha256(paths["ready_log_record"].read_bytes()).hexdigest()
+        assert payload["ready_log_seq"] == 100
+        assert payload["verification_report_sha256"] == hashlib.sha256(reports[0]).hexdigest()
         assert payload["verifier_sha256"] == hashlib.sha256(paths["verifier"].read_bytes()).hexdigest()
         assert calls == [(paths["archive"], paths["export_manifest"])]
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "image",
+        "bundle",
+        "argv",
+        "max_retries_failure",
+        "max_retries_preemption",
+        "max_task_failures",
+        "fail_if_exists",
+        "existing_job_policy",
+    ],
+)
+def test_controller_rejects_persisted_launch_request_substitution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    controller = _controller_module()
+    contract = _contract()
+    request = controller_pb2.Controller.LaunchJobRequest()
+    request.CopyFrom(_launch_request(contract))
+    if mutation == "image":
+        request.task_image = "ghcr.io/attacker/image@sha256:" + "9" * 64
+    elif mutation == "bundle":
+        request.bundle_id = "9" * 64
+    elif mutation == "argv":
+        request.entrypoint.run_command.argv[-1] = "9" * 64
+    elif mutation == "fail_if_exists":
+        request.fail_if_exists = False
+    elif mutation == "existing_job_policy":
+        request.existing_job_policy = job_pb2.EXISTING_JOB_POLICY_RECREATE
+    else:
+        setattr(request, mutation, 1)
+    database = _controller_db(tmp_path / "db")
+    attempt_uid = _seed_running_attempt(database, contract, request=request)
+    paths = _evidence_paths(tmp_path, contract, attempt_uid)
+    _install_verifier(monkeypatch, controller, [])
+    store = controller.ControllerReceiptStore(
+        database,
+        signing_key_from_private_pem(RFC8032_TEST_PRIVATE_KEY_PEM),
+        contract,
+    )
+    try:
+        with pytest.raises(ValueError):
+            _issue_ack(store, paths)
+        assert store.stored_receipt("ACK") is None
     finally:
         database.close()
 
@@ -565,6 +644,62 @@ def test_controller_receipts_are_persistently_idempotent_per_authorization_and_s
             _issue_ack(reopened, paths)
     finally:
         reopened_database.close()
+
+
+@pytest.mark.parametrize("input_name", ["export_manifest", "ready_log_record"])
+def test_controller_rejects_changed_ack_input_bytes_and_preserves_stored_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    input_name: str,
+) -> None:
+    controller = _controller_module()
+    contract = _contract()
+    database = _controller_db(tmp_path / "db")
+    attempt_uid = _seed_running_attempt(database, contract)
+    paths = _evidence_paths(tmp_path, contract, attempt_uid)
+    _install_verifier(monkeypatch, controller, [])
+    store = controller.ControllerReceiptStore(
+        database,
+        signing_key_from_private_pem(RFC8032_TEST_PRIVATE_KEY_PEM),
+        contract,
+    )
+    try:
+        first = _issue_ack(store, paths)
+        paths[input_name].write_bytes(paths[input_name].read_bytes() + b"changed\n")
+        with pytest.raises(ValueError):
+            _issue_ack(store, paths)
+        assert store.stored_receipt("ACK") == first
+    finally:
+        database.close()
+
+
+def test_controller_rejects_changed_verifier_report_and_preserves_stored_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = _controller_module()
+    contract = _contract()
+    database = _controller_db(tmp_path / "db")
+    attempt_uid = _seed_running_attempt(database, contract)
+    paths = _evidence_paths(tmp_path, contract, attempt_uid)
+    _install_verifier(monkeypatch, controller, [])
+    store = controller.ControllerReceiptStore(
+        database,
+        signing_key_from_private_pem(RFC8032_TEST_PRIVATE_KEY_PEM),
+        contract,
+    )
+    try:
+        first = _issue_ack(store, paths)
+        _install_verifier(
+            monkeypatch,
+            controller,
+            [],
+            report_mutation={"controller_test_nonce": "changed"},
+        )
+        with pytest.raises(ValueError):
+            _issue_ack(store, paths)
+        assert store.stored_receipt("ACK") == first
+    finally:
+        database.close()
 
 
 def test_controller_rejects_nonrunning_database_state_or_changed_verifier_report_without_partial_receipt(
@@ -668,6 +803,46 @@ def test_controller_derives_terminal_from_same_successful_attempt_and_database_s
         assert payload["runner_exit_code"] == 0
     finally:
         database.close()
+
+
+def test_controller_terminal_receipt_is_persistently_idempotent_and_immutable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = _controller_module()
+    contract = _contract()
+    database_path = tmp_path / "db"
+    database = _controller_db(database_path)
+    attempt_uid = _seed_running_attempt(database, contract)
+    paths = _evidence_paths(tmp_path, contract, attempt_uid)
+    _install_verifier(monkeypatch, controller, [])
+    store = controller.ControllerReceiptStore(
+        database,
+        signing_key_from_private_pem(RFC8032_TEST_PRIVATE_KEY_PEM),
+        contract,
+    )
+    try:
+        _issue_ack(store, paths)
+        _finish_attempt(database, contract)
+        first = store.issue_terminal(terminal_log_record_path=paths["terminal_log_record"])
+    finally:
+        database.close()
+
+    reopened_database = _controller_db(database_path)
+    reopened = controller.ControllerReceiptStore(
+        reopened_database,
+        signing_key_from_private_pem(RFC8032_TEST_PRIVATE_KEY_PEM),
+        contract,
+    )
+    try:
+        assert reopened.issue_terminal(terminal_log_record_path=paths["terminal_log_record"]) == first
+        record = json.loads(paths["terminal_log_record"].read_bytes())
+        record["log_seq"] = 103
+        paths["terminal_log_record"].write_bytes(_canonical(record))
+        with pytest.raises(ValueError):
+            reopened.issue_terminal(terminal_log_record_path=paths["terminal_log_record"])
+        assert reopened.stored_receipt("TERMINAL") == first
+    finally:
+        reopened_database.close()
 
 
 @pytest.mark.parametrize("retry_field", ["max_retries_failure", "max_retries_preemption", "max_task_failures"])
