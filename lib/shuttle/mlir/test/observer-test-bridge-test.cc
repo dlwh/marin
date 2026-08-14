@@ -217,6 +217,73 @@ TEST(ShuttleObserverTestBridgeTest,
 }
 
 TEST(ShuttleObserverTestBridgeTest,
+     MultiRegionGeneratedFingerprintConsumesEveryBundleTuple) {
+  std::string error;
+  auto runfiles = bazel::tools::cpp::runfiles::Runfiles::CreateForTest(&error);
+  ASSERT_TRUE(runfiles) << error;
+  std::ifstream input(
+      runfiles->Rlocation("shuttle_mlir/test/Inputs/"
+                          "jax-0.10.1-bf16-matmul-vjp-17x33x19-composed.mlir"));
+  std::ostringstream source;
+  source << input.rdbuf();
+  ASSERT_TRUE(input);
+
+  struct Fingerprints {
+    const char *policy;
+    const char *generated;
+    const char *final;
+  };
+  constexpr std::array<Fingerprints, 2> fingerprints = {{
+      {"source_ordered",
+       "458d941bc3a5cd636b4a836bc2c4b515246add12d17180205c0524343dfd7ae0",
+       "22d4520b8a9337ccb192272126323e7d1b8a3629007ba02de5342a7026b198ca"},
+      {"fast",
+       "6b5d9bc0141c4555a8397aae21c6bb097d3637d2fab957713a82ebf6dc863eec",
+       "b5746a610b98f683f28378090ff48d163b27e0d92bee20af8f5f144e95b1acf4"},
+  }};
+  for (const Fingerprints &expected : fingerprints) {
+    auto capture = mlir::shuttle::testing::subscribeShuttleObserverForTesting();
+    mlir::DialectRegistry registry;
+    mlir::stablehlo::registerAllDialects(registry);
+    registry.insert<mlir::func::FuncDialect>();
+    mlir::MLIRContext context(registry);
+    auto module =
+        mlir::parseSourceString<mlir::ModuleOp>(source.str(), &context);
+    ASSERT_TRUE(module);
+    mlir::shuttle::ShuttlePipelineOptions options;
+    options.executionMode = mlir::shuttle::ExecutionMode::GpuExecutableBundle;
+    options.numerics = expected.policy == std::string("fast")
+                           ? mlir::shuttle::NumericalPolicy::Fast
+                           : mlir::shuttle::NumericalPolicy::SourceOrdered;
+    options.canonicalOptions =
+        std::string("{\"execution_mode\":\"gpu_executable_bundle\","
+                    "\"numerics\":\"") +
+        expected.policy +
+        "\",\"pipeline_abi_version\":15,\"schema_version\":1,"
+        "\"tuning\":{\"cluster_shape\":[],\"materialization\":"
+        "\"automatic\",\"maximum_candidates\":1,\"pipeline_stages\":1,"
+        "\"tile_sizes\":[]}}";
+    ASSERT_TRUE(mlir::succeeded(
+        mlir::shuttle::runShuttleXlaTransform(*module, options)));
+    auto events = capture->snapshot();
+    ASSERT_EQ(events.size(), 3);
+    EXPECT_EQ(events[0].phase, "algebra_coverage");
+    EXPECT_EQ(events[1].phase, "generated_bundle");
+    EXPECT_EQ(events[2].phase, "final_erasure");
+    EXPECT_EQ(events[0].invocationId, events[1].invocationId);
+    EXPECT_EQ(events[1].invocationId, events[2].invocationId);
+    EXPECT_EQ(events[0].policy, expected.policy);
+    EXPECT_EQ(events[1].policy, expected.policy);
+    EXPECT_EQ(events[2].policy, expected.policy);
+    EXPECT_EQ(events[0].coverageManifest, events[1].coverageManifest);
+    EXPECT_FALSE(events[1].noShuttleSemantics);
+    EXPECT_TRUE(events[2].noShuttleSemantics);
+    EXPECT_EQ(events[1].normalizedModuleFingerprint, expected.generated);
+    EXPECT_EQ(events[2].normalizedModuleFingerprint, expected.final);
+  }
+}
+
+TEST(ShuttleObserverTestBridgeTest,
      ConcurrentCloseWaitsForCapturedInvocationAndEachOther) {
   auto capture = mlir::shuttle::testing::subscribeShuttleObserverForTesting();
   capture->blockNextCallbackForTesting();
