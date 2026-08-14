@@ -629,12 +629,44 @@ bool isTerminalRankNAdditiveReduce(Operation *operation) {
          dimensions.asArrayRef() == ArrayRef<int64_t>({input.getRank() - 1});
 }
 
+bool isFoldProjectionStep(Operation *operation) {
+  StringRef name = operation->getName().getStringRef();
+  if (name == stablehlo::BroadcastInDimOp::getOperationName()) {
+    return isSupportedAffineBroadcast(operation) &&
+           !isRankNExpandingSingletonBroadcast(operation);
+  }
+  return name == stablehlo::ReshapeOp::getOperationName() &&
+         isCopyFreeSingletonReshape(operation);
+}
+
+bool isExpansionDrivenByTerminalFold(
+    Operation *expansion,
+    const llvm::SmallPtrSetImpl<Operation *> &componentOperations) {
+  Value producerValue = expansion->getOperand(0);
+  llvm::SmallPtrSet<Operation *, 8> visited;
+  while (Operation *producer = producerValue.getDefiningOp()) {
+    if (!componentOperations.contains(producer) ||
+        !visited.insert(producer).second) {
+      return false;
+    }
+    if (isTerminalRankNAdditiveReduce(producer)) {
+      return true;
+    }
+    if (!isFoldProjectionStep(producer) || producer->getNumOperands() != 1) {
+      return false;
+    }
+    producerValue = producer->getOperand(0);
+  }
+  return false;
+}
+
 bool hasRankNExpansionWithoutTerminalFold(const CandidateComponent &component) {
-  const bool hasExpansion =
-      llvm::any_of(component.operations, isRankNExpandingSingletonBroadcast);
-  const bool hasTerminalFold =
-      llvm::any_of(component.operations, isTerminalRankNAdditiveReduce);
-  return hasExpansion && !hasTerminalFold;
+  llvm::SmallPtrSet<Operation *, 16> componentOperations(
+      component.operations.begin(), component.operations.end());
+  return llvm::any_of(component.operations, [&](Operation *operation) {
+    return isRankNExpandingSingletonBroadcast(operation) &&
+           !isExpansionDrivenByTerminalFold(operation, componentOperations);
+  });
 }
 
 SmallVector<CandidateComponent> candidateComponents(ModuleOp module) {
@@ -3328,6 +3360,43 @@ bool isClosedRankNExpandingSingletonMap(MapOp map) {
          yield.getValues()[0] == body.getArgument(0);
 }
 
+bool hasIdentityScalarBody(MapOp map) {
+  if (map.getBody().empty()) {
+    return false;
+  }
+  Block &body = map.getBody().front();
+  auto yield = dyn_cast<YieldOp>(body.getTerminator());
+  return body.getNumArguments() == 1 && body.getOperations().size() == 1 &&
+         yield && yield.getValues().size() == 1 &&
+         yield.getValues()[0] == body.getArgument(0);
+}
+
+bool isClosedFoldProjectionMap(MapOp map) {
+  return map.getInputs().size() == 1 &&
+         (map.getSemantics() == MapSemantics::BroadcastInDim ||
+          map.getSemantics() == MapSemantics::Reshape) &&
+         isClosedDirectProjectedMap(map) && hasIdentityScalarBody(map);
+}
+
+bool isExpansionDrivenByTerminalFold(MapOp expansion) {
+  Value producerValue = expansion.getInputs()[0];
+  llvm::SmallPtrSet<Operation *, 8> visited;
+  while (Operation *producer = producerValue.getDefiningOp()) {
+    if (!visited.insert(producer).second) {
+      return false;
+    }
+    if (auto fold = dyn_cast<FoldOp>(producer)) {
+      return isClosedTerminalRankNFold(fold);
+    }
+    auto map = dyn_cast<MapOp>(producer);
+    if (!map || !isClosedFoldProjectionMap(map)) {
+      return false;
+    }
+    producerValue = map.getInputs()[0];
+  }
+  return false;
+}
+
 bool isClosedRankNFoldMapRegion(RegionOp region,
                                 ArrayRef<Operation *> algebra) {
   auto isExternalType = [](Type type) {
@@ -3357,8 +3426,10 @@ bool isClosedRankNFoldMapRegion(RegionOp region,
              isClosedTerminalRankNFold(fold);
     }
     auto map = dyn_cast<MapOp>(operation);
-    return map && (isClosedDirectProjectedMap(map) ||
-                   isClosedRankNExpandingSingletonMap(map));
+    return map &&
+           (isClosedDirectProjectedMap(map) ||
+            (isClosedRankNExpandingSingletonMap(map) &&
+             isExpansionDrivenByTerminalFold(map)));
   });
 }
 
