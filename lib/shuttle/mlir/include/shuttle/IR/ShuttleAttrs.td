@@ -58,7 +58,8 @@ def Shuttle_MapSemanticsAttr
 def Shuttle_MaterializationTaskKind
     : I32EnumAttr<"MaterializationTaskKind", "Materialization task family kind",
                   [I32EnumAttrCase<"Map", 0, "map">,
-                   I32EnumAttrCase<"Fold", 1, "fold">]> {
+                   I32EnumAttrCase<"Fold", 1, "fold">,
+                   I32EnumAttrCase<"Contract", 2, "contract">]> {
   let genSpecializedAttr = 0;
   let cppNamespace = "::mlir::shuttle";
 }
@@ -110,10 +111,12 @@ def Shuttle_ScheduleBufferIndexingAttr
 }
 
 def Shuttle_ScheduleReductionOrder
-    : I32EnumAttr<"ScheduleReductionOrder", "Required Fold realization order",
+    : I32EnumAttr<"ScheduleReductionOrder", "Required reduction realization order",
                   [I32EnumAttrCase<"TreeAssociationFreeLeafOrderFixed", 0,
                       "tree_association_free_leaf_order_fixed">,
-                   I32EnumAttrCase<"LeafOrderFree", 1, "leaf_order_free">]> {
+                   I32EnumAttrCase<"LeafOrderFree", 1, "leaf_order_free">,
+                   I32EnumAttrCase<"SerialAscendingFmaRnF32", 2,
+                                   "serial_ascending_fma_rn_f32">]> {
   let genSpecializedAttr = 0;
   let cppNamespace = "::mlir::shuttle";
 }
@@ -129,7 +132,8 @@ def Shuttle_ScheduleTaskKind
                   [I32EnumAttrCase<"Scalar", 0, "scalar">,
                    I32EnumAttrCase<"Elementwise", 1, "elementwise">,
                    I32EnumAttrCase<"RowFold", 2, "row_fold">,
-                   I32EnumAttrCase<"ColumnFold", 3, "column_fold">]> {
+                   I32EnumAttrCase<"ColumnFold", 3, "column_fold">,
+                   I32EnumAttrCase<"Contract", 4, "contract">]> {
   let genSpecializedAttr = 0;
   let cppNamespace = "::mlir::shuttle";
 }

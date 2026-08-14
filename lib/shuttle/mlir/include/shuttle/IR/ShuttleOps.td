@@ -109,7 +109,7 @@ def Shuttle_MaterializationBufferOp
 def Shuttle_MaterializationTaskOp
     : Shuttle_Op<"materialization_task",
                  [ParentOneOf<["::mlir::shuttle::MaterializationPlanOp"]>]> {
-  let summary = "One generic Map or Fold task family";
+  let summary = "One generic Map, Fold, or Contract task family";
   let arguments = (ins I64Attr:$ordinal, Shuttle_MaterializationTaskKindAttr:$kind,
       DenseI64ArrayAttr:$domain_shape,
       DenseI64ArrayAttr:$reduction_dimensions,

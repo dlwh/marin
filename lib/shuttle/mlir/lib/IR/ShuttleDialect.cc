@@ -731,8 +731,8 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
     return emitOpError(
         "body must terminate with shuttle.materialization_plan_yield");
   }
-  if (getSchemaVersion() != 1) {
-    return emitOpError("requires materialization plan schema version 1");
+  if (getSchemaVersion() != 1 && getSchemaVersion() != 2) {
+    return emitOpError("requires materialization plan schema version 1 or 2");
   }
   if (!isLowerHexDigest(getFingerprint())) {
     return emitOpError("fingerprint must be a lowercase SHA-256 digest");
@@ -773,6 +773,7 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
   }
 
   unsigned foldCount = 0;
+  unsigned contractCount = 0;
   SmallVector<SmallVector<int64_t>> actualConsumers(buffers.size());
   for (auto [position, buffer] : llvm::enumerate(buffers)) {
     if (buffer.getOrdinal() != static_cast<int64_t>(position)) {
@@ -895,6 +896,28 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
         return task.emitOpError(
             "Fold buffer types must match its f32 domain and accumulator");
       }
+    } else if (task.getKind() == MaterializationTaskKind::Contract) {
+      ++contractCount;
+      if (task.getReductionDimensions() != ArrayRef<int64_t>({2}) ||
+          task.getOrderFree() || task.getDomainShape().size() != 3 ||
+          task.getInputBuffers().size() != 2 ||
+          task.getOutputBuffers().size() != 1) {
+        return task.emitOpError(
+            "Contract tasks require rank-three domain, reduction dimension "
+            "two, two inputs, and one output");
+      }
+      auto lhs = cast<RankedTensorType>(
+          buffers[task.getInputBuffers()[0]].getTensorType());
+      auto rhs = cast<RankedTensorType>(
+          buffers[task.getInputBuffers()[1]].getTensorType());
+      auto result = cast<RankedTensorType>(
+          buffers[task.getOutputBuffers()[0]].getTensorType());
+      if (lhs.getRank() != 2 || rhs.getRank() != 2 || result.getRank() != 2 ||
+          !lhs.getElementType().isBF16() || !rhs.getElementType().isBF16() ||
+          !result.getElementType().isF32()) {
+        return task.emitOpError(
+            "Contract buffers require rank-two bf16 inputs and f32 output");
+      }
     } else {
       if (!task.getReductionDimensions().empty() || task.getOrderFree()) {
         return task.emitOpError(
@@ -912,8 +935,12 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
       }
     }
   }
-  if (foldCount == 0) {
-    return emitOpError("requires at least one Fold task");
+  if (foldCount == 0 && contractCount == 0) {
+    return emitOpError("requires at least one Fold or Contract task");
+  }
+  if (getSchemaVersion() != (contractCount == 0 ? 1 : 2)) {
+    return emitOpError(
+        "materialization schema must equal the admitted task family");
   }
 
   for (auto [position, buffer] : llvm::enumerate(buffers)) {
@@ -1023,6 +1050,22 @@ FailureOr<Simt32Geometry> simt32Geometry(ScheduleTaskKind kind,
                           0,
                           std::nullopt};
   }
+  if (kind == ScheduleTaskKind::Contract) {
+    if (domain.size() != 3 || domain[0] <= 0 || domain[1] <= 0 ||
+        domain[2] <= 0 ||
+        domain[0] > std::numeric_limits<int64_t>::max() / domain[1]) {
+      return failure();
+    }
+    const int64_t outputs = domain[0] * domain[1];
+    const int64_t tile = std::min(outputs, kMaxThreads);
+    return Simt32Geometry{{ceilDivPositive(outputs, tile)},
+                          {tile},
+                          domain[2],
+                          roundUpToSubgroup(tile),
+                          kSubgroup,
+                          0,
+                          2};
+  }
   if (domain.size() != 2 || domain[0] <= 0 || domain[1] <= 0) {
     return failure();
   }
@@ -1053,8 +1096,9 @@ LogicalResult SchedulePlanOp::verifyRegions() {
   if (!getOperation()->getDiscardableAttrs().empty()) {
     return emitOpError("does not permit discardable attributes");
   }
-  if (getSchemaVersion() != 1 || getTarget() != ScheduleTarget::Simt32) {
-    return emitOpError("requires schedule schema 1 and target simt32");
+  if ((getSchemaVersion() != 1 && getSchemaVersion() != 2) ||
+      getTarget() != ScheduleTarget::Simt32) {
+    return emitOpError("requires schedule schema 1 or 2 and target simt32");
   }
   if (!isLowerHexDigest(getSourcePlanFingerprint()) ||
       !isLowerHexDigest(getFingerprint())) {
@@ -1132,6 +1176,7 @@ LogicalResult SchedulePlanOp::verifyRegions() {
   }
 
   unsigned foldCount = 0;
+  unsigned contractCount = 0;
   for (auto [ordinal, task] : llvm::enumerate(tasks)) {
     if (task.getOrdinal() != static_cast<int64_t>(ordinal) ||
         task.getSourceTask() != static_cast<int64_t>(ordinal)) {
@@ -1160,6 +1205,7 @@ LogicalResult SchedulePlanOp::verifyRegions() {
     }
     const bool isFold = task.getKind() == ScheduleTaskKind::RowFold ||
                         task.getKind() == ScheduleTaskKind::ColumnFold;
+    const bool isContract = task.getKind() == ScheduleTaskKind::Contract;
     if (isFold && task.getReductionAxis() !=
                       (task.getKind() == ScheduleTaskKind::RowFold ? 1 : 0)) {
       return task.emitOpError(
@@ -1168,10 +1214,15 @@ LogicalResult SchedulePlanOp::verifyRegions() {
     std::optional<ScheduleReductionOrder> expectedOrder;
     if (isFold) {
       expectedOrder = ScheduleReductionOrder::TreeAssociationFreeLeafOrderFixed;
+    } else if (isContract) {
+      expectedOrder = ScheduleReductionOrder::SerialAscendingFmaRnF32;
     }
     if (task.getReductionOrder() != expectedOrder) {
-      return task.emitOpError(
-          "Fold reduction order must equal bound Fold semantics");
+      return task.emitOpError(isContract
+                                  ? "Contract reduction order must equal "
+                                    "serial ascending fma.rn.f32 semantics"
+                                  : "Fold reduction order must equal bound "
+                                    "Fold semantics");
     }
     FailureOr<Simt32Geometry> expected =
         simt32Geometry(task.getKind(), task.getDomainShape());
@@ -1188,10 +1239,15 @@ LogicalResult SchedulePlanOp::verifyRegions() {
     }
     if (isFold) {
       ++foldCount;
+    } else if (isContract) {
+      ++contractCount;
     }
   }
-  if (foldCount == 0) {
-    return emitOpError("requires at least one Fold schedule task");
+  if (foldCount == 0 && contractCount == 0) {
+    return emitOpError("requires at least one Fold or Contract schedule task");
+  }
+  if (getSchemaVersion() != (contractCount == 0 ? 1 : 2)) {
+    return emitOpError("schedule schema must equal the admitted task family");
   }
   if (getFingerprint() != schedulePlanFingerprint(*this)) {
     return emitOpError("fingerprint does not match the closed schedule plan");
