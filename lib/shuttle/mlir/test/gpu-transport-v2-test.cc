@@ -123,6 +123,166 @@ std::string sha256(llvm::ArrayRef<uint8_t> prefix,
   return llvm::toHex(sha.final(), true);
 }
 
+class PacketWriter {
+public:
+  void u8(uint8_t value) { bytes.push_back(value); }
+  void u16(uint16_t value) { integer(value); }
+  void u32(uint32_t value) { integer(value); }
+  void u64(uint64_t value) { integer(value); }
+  void i64(int64_t value) { u64(static_cast<uint64_t>(value)); }
+  void append(llvm::ArrayRef<uint8_t> value) {
+    bytes.append(value.begin(), value.end());
+  }
+  void append(llvm::StringRef value) {
+    append(llvm::ArrayRef<uint8_t>(
+        reinterpret_cast<const uint8_t *>(value.data()), value.size()));
+  }
+  void text(llvm::StringRef value) {
+    u64(value.size());
+    append(value);
+  }
+  void blob(llvm::ArrayRef<uint8_t> value) {
+    u64(value.size());
+    append(value);
+  }
+  void integers(llvm::ArrayRef<int64_t> values) {
+    u64(values.size());
+    for (int64_t value : values)
+      i64(value);
+  }
+  llvm::ArrayRef<uint8_t> view() const { return bytes; }
+  llvm::SmallVector<uint8_t> take() { return std::move(bytes); }
+
+private:
+  template <typename T> void integer(T value) {
+    for (size_t index = 0; index < sizeof(T); ++index)
+      bytes.push_back(static_cast<uint8_t>(value >> (index * 8)));
+  }
+  llvm::SmallVector<uint8_t> bytes;
+};
+
+llvm::SmallVector<uint8_t>
+completeSchema2Packet(llvm::ArrayRef<uint64_t> codeLengths,
+                      uint32_t gridX = 1, uint32_t sharedBytes = 0,
+                      uint64_t temporaryRank = 1) {
+  if (codeLengths.size() < 2)
+    return {};
+  const std::string schedule(64, 'a');
+  const std::string plan(64, 'b');
+  constexpr llvm::StringLiteral ptxMarker =
+      ".visible .entry shuttle_entry(\n)\n";
+
+  llvm::SmallVector<uint8_t> code;
+  llvm::SmallVector<std::string> entryDigests;
+  for (uint64_t length : codeLengths) {
+    if (length < ptxMarker.size())
+      return {};
+    llvm::SmallVector<uint8_t> slice(length, ' ');
+    llvm::copy(ptxMarker, slice.begin());
+    slice.back() = '\n';
+    entryDigests.push_back(sha256(slice));
+    code.append(slice.begin(), slice.end());
+  }
+
+  PacketWriter devicePrefix;
+  devicePrefix.i64(3);
+  devicePrefix.u8(2);
+  devicePrefix.u8(0);
+  devicePrefix.text(schedule);
+  devicePrefix.blob(code);
+  devicePrefix.text(sha256(code));
+  PacketWriter deviceSuffix;
+  deviceSuffix.u64(codeLengths.size());
+  int64_t codeOffset = 0;
+  for (auto [ordinal, length] : llvm::enumerate(codeLengths)) {
+    const int64_t input = ordinal;
+    const int64_t output = ordinal + 1;
+    deviceSuffix.i64(ordinal);
+    deviceSuffix.i64(ordinal);
+    deviceSuffix.i64(codeOffset);
+    deviceSuffix.i64(length);
+    deviceSuffix.integers(llvm::ArrayRef<int64_t>(input));
+    deviceSuffix.integers(llvm::ArrayRef<int64_t>(output));
+    deviceSuffix.u64(1);
+    deviceSuffix.u8(0);
+    deviceSuffix.u64(1);
+    deviceSuffix.u8(1);
+    if (ordinal == 0) {
+      deviceSuffix.integers({});
+    } else {
+      const int64_t dependency = ordinal - 1;
+      deviceSuffix.integers(llvm::ArrayRef<int64_t>(dependency));
+    }
+    deviceSuffix.u8(1);
+    deviceSuffix.u8(0);
+    deviceSuffix.text(entryDigests[ordinal]);
+    deviceSuffix.u32(gridX);
+    deviceSuffix.u32(1);
+    deviceSuffix.u32(1);
+    deviceSuffix.u16(1);
+    deviceSuffix.u16(1);
+    deviceSuffix.u16(1);
+    deviceSuffix.u32(sharedBytes);
+    deviceSuffix.u16(2);
+    codeOffset += length;
+  }
+  const std::string deviceRoot =
+      sha256(devicePrefix.view(), deviceSuffix.view());
+
+  PacketWriter invocationPrefix;
+  invocationPrefix.i64(3);
+  invocationPrefix.text(plan);
+  invocationPrefix.text(schedule);
+  PacketWriter invocationSuffix;
+  const uint64_t slotCount = codeLengths.size() + 1;
+  invocationSuffix.u64(slotCount);
+  for (uint64_t ordinal = 0; ordinal < slotCount; ++ordinal) {
+    const bool external = ordinal == 0 || ordinal + 1 == slotCount;
+    const uint8_t element = external ? 0 : 1;
+    const uint64_t rank = !external && ordinal == 1 ? temporaryRank : 1;
+    const int64_t width = element == 0 ? 2 : 4;
+    invocationSuffix.i64(ordinal);
+    invocationSuffix.i64(ordinal);
+    invocationSuffix.u8(element);
+    invocationSuffix.u64(rank);
+    for (uint64_t axis = 0; axis < rank; ++axis)
+      invocationSuffix.i64(1);
+    invocationSuffix.i64(width);
+    llvm::SmallVector<int64_t> strides(rank, width);
+    invocationSuffix.integers(strides);
+    invocationSuffix.i64(0);
+    invocationSuffix.i64(width);
+    invocationSuffix.u8(1);
+    invocationSuffix.u8(ordinal == 0 ? 0 : (external ? 1 : 2));
+    invocationSuffix.u8(external ? 0 : 1);
+    invocationSuffix.i64(ordinal);
+    invocationSuffix.i64(ordinal);
+    invocationSuffix.u8(ordinal == 0 ? 1 : (external ? 2 : 0));
+    invocationSuffix.u8(external ? 1 : 0);
+    if (external)
+      invocationSuffix.i64(0);
+  }
+  const std::string invocationRoot =
+      sha256(invocationPrefix.view(), invocationSuffix.view());
+
+  PacketWriter packet;
+  packet.append(llvm::StringRef("SHUTGPU\0", 8));
+  packet.u32(2);
+  packet.append(devicePrefix.view());
+  packet.text(deviceRoot);
+  packet.append(deviceSuffix.view());
+  packet.append(invocationPrefix.view());
+  packet.text(invocationRoot);
+  packet.append(invocationSuffix.view());
+  packet.i64(2);
+  packet.text(schedule);
+  packet.text(deviceRoot);
+  packet.text(invocationRoot);
+  packet.u8(1);
+  packet.text(sha256(packet.view()));
+  return packet.take();
+}
+
 bool isDigest(llvm::StringRef value) {
   return value.size() == 64 && llvm::all_of(value, [](char character) {
            return llvm::isDigit(character) ||
@@ -174,8 +334,22 @@ struct Decoded {
   llvm::SmallVector<uint64_t> slotRequiredOffsets;
 };
 
-std::optional<Decoded> decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes) {
-  if (bytes.size() > 16 * 1024 * 1024)
+struct DecodeLimits {
+  uint64_t transportBytes = 16 * 1024 * 1024;
+  uint64_t codeBytes = 8 * 1024 * 1024;
+  uint64_t records = 256;
+  uint64_t entryCodeBytes = 512 * 1024;
+  uint64_t taskPositions = 256 * 1024 * 1024;
+  uint64_t sharedBytes = 16 * 1024;
+  uint64_t rank = 8;
+  uint64_t slotBytes = 32 * 1024 * 1024;
+  uint64_t temporaryBytes = 256 * 1024 * 1024;
+};
+
+std::optional<Decoded>
+decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes,
+                    DecodeLimits limits = {}) {
+  if (bytes.size() > limits.transportBytes)
     return std::nullopt;
   Reader reader(bytes);
   for (char expected : llvm::StringRef("SHUTGPU\0", 8))
@@ -193,7 +367,7 @@ std::optional<Decoded> decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes) {
     return std::nullopt;
   uint64_t codeLengthOffset = reader.position();
   auto code = reader.blob();
-  if (code.size() > 8 * 1024 * 1024 || reader.text() != sha256(code))
+  if (code.size() > limits.codeBytes || reader.text() != sha256(code))
     return std::nullopt;
   uint64_t deviceRootOffset = reader.position();
   uint64_t deviceRootPayloadOffset = 0;
@@ -201,7 +375,7 @@ std::optional<Decoded> decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes) {
   uint64_t deviceSuffixStart = reader.position();
   uint64_t deviceEntryCountOffset = reader.position();
   uint64_t entryCount = reader.u64();
-  if (!isDigest(deviceRoot) || entryCount == 0 || entryCount > 256)
+  if (!isDigest(deviceRoot) || entryCount == 0 || entryCount > limits.records)
     return std::nullopt;
 
   llvm::SmallVector<mlir::shuttle::GpuLaunch> launches;
@@ -218,7 +392,7 @@ std::optional<Decoded> decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes) {
       return std::nullopt;
     entryLengthOffsets.push_back(reader.position());
     int64_t length = reader.i64();
-    if (length <= 0 || length > 512 * 1024 ||
+    if (length <= 0 || length > static_cast<int64_t>(limits.entryCodeBytes) ||
         nextOffset > static_cast<int64_t>(code.size()) - length)
       return std::nullopt;
     auto inputs = reader.integers();
@@ -259,17 +433,17 @@ std::optional<Decoded> decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes) {
     launchSharedOffsets.push_back(reader.position());
     uint32_t shared = reader.u32();
     if (llvm::is_contained(grid, 0) || llvm::is_contained(block, 0) ||
-        block[0] * block[1] * block[2] > 1024 || shared > 16 * 1024 ||
+        block[0] * block[1] * block[2] > 1024 ||
+        shared > limits.sharedBytes ||
         reader.u16() != inputs.size() + outputs.size())
       return std::nullopt;
-    constexpr uint64_t maximumTaskPositions = 256 * 1024 * 1024;
     uint64_t positions = 1;
     for (uint64_t extent : llvm::concat<uint64_t>(grid, block)) {
-      if (extent > maximumTaskPositions / positions)
+      if (extent > limits.taskPositions / positions)
         return std::nullopt;
       positions *= extent;
     }
-    if (positions > maximumTaskPositions - taskPositions)
+    if (positions > limits.taskPositions - taskPositions)
       return std::nullopt;
     taskPositions += positions;
     mlir::shuttle::GpuLaunch launch;
@@ -302,7 +476,8 @@ std::optional<Decoded> decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes) {
   uint64_t invocationSuffixStart = reader.position();
   uint64_t invocationSlotCountOffset = reader.position();
   uint64_t slotCount = reader.u64();
-  if (!isDigest(invocationRoot) || slotCount == 0 || slotCount > 256)
+  if (!isDigest(invocationRoot) || slotCount == 0 ||
+      slotCount > limits.records)
     return std::nullopt;
   uint64_t temporaryBytes = 0;
   int64_t scalarSlots = 0;
@@ -330,7 +505,7 @@ std::optional<Decoded> decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes) {
       return std::nullopt;
     slotRankOffsets.push_back(reader.position());
     uint64_t rank = reader.u64();
-    if (rank > 8)
+    if (rank > limits.rank)
       return std::nullopt;
     llvm::SmallVector<int64_t> dimensions;
     llvm::SmallVector<uint64_t> dimensionOffsets;
@@ -352,7 +527,8 @@ std::optional<Decoded> decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes) {
     int64_t alignment = reader.i64();
     uint8_t addressSpace = reader.u8();
     uint8_t access = reader.u8();
-    if (required != expectedBytes || required > 32 * 1024 * 1024 ||
+    if (required != expectedBytes ||
+        required > static_cast<int64_t>(limits.slotBytes) ||
         strides.size() != rank || offset != 0 ||
         alignment != (elementType == 0 ? 2 : 4) || addressSpace != 1 ||
         access > 2)
@@ -408,7 +584,7 @@ std::optional<Decoded> decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes) {
           bytes.slice(invocationSuffixStart,
                       bundleStart - invocationSuffixStart)))
     return std::nullopt;
-  if (temporaryBytes == 0 || temporaryBytes > 256 * 1024 * 1024 ||
+  if (temporaryBytes == 0 || temporaryBytes > limits.temporaryBytes ||
       externalSlots == 0 || reader.i64() != 2 || reader.text() != schedule)
     return std::nullopt;
   uint64_t bundleDeviceRootPayloadOffset = 0;
@@ -1471,44 +1647,84 @@ TEST(GpuTransportV2Test, Abi17PreservesEveryTransportAndRuntimeCap) {
   ASSERT_TRUE(mlir::succeeded(bytes));
   auto decoded = decodeInlineSchema2(*bytes);
   ASSERT_TRUE(decoded);
-  auto expectRejected = [](llvm::ArrayRef<uint8_t> mutation) {
+  auto expectOnlyCapsRejected = [](llvm::StringRef label,
+                                   llvm::ArrayRef<uint8_t> mutation,
+                                   DecodeLimits raised) {
+    SCOPED_TRACE(label.str());
+    EXPECT_TRUE(decodeInlineSchema2(mutation, raised));
     EXPECT_FALSE(decodeInlineSchema2(mutation));
     EXPECT_FALSE(mlir::shuttle::GpuExecutable::Load(mutation).ok());
   };
 
-  llvm::SmallVector<uint8_t> transportCap(16 * 1024 * 1024 + 1, 0);
-  expectRejected(transportCap);
+  const auto baselinePacket = completeSchema2Packet({64, 64});
+  ASSERT_TRUE(decodeInlineSchema2(baselinePacket));
+  ASSERT_TRUE(mlir::shuttle::GpuExecutable::Load(baselinePacket).ok());
 
-  llvm::SmallVector<uint8_t> codeCap(*bytes);
-  writeU64(codeCap, decoded->codeLengthOffset, 8 * 1024 * 1024 + 1);
-  expectRejected(codeCap);
+  EXPECT_EQ(mlir::shuttle::kMaximumGpuTransportBytes, 16 * 1024 * 1024);
+  EXPECT_EQ(mlir::shuttle::kMaximumGpuCodeBytes, 8 * 1024 * 1024);
+  EXPECT_EQ(mlir::shuttle::kMaximumGpuEntryCodeBytes, 512 * 1024);
+  EXPECT_EQ(mlir::shuttle::kMaximumGpuExecutableRecords, 256);
+  EXPECT_EQ(mlir::shuttle::kMaximumGpuAggregateTaskPositions,
+            256 * 1024 * 1024);
 
-  llvm::SmallVector<uint8_t> recordCountCap(*bytes);
-  writeU64(recordCountCap, decoded->deviceEntryCountOffset, 257);
-  rehashDeviceAndBundle(recordCountCap, *decoded);
-  expectRejected(recordCountCap);
+  llvm::SmallVector<uint64_t> transportLengths(32, 512 * 1024);
+  const auto transportPacket = completeSchema2Packet(transportLengths);
+  ASSERT_GT(transportPacket.size(),
+            mlir::shuttle::kMaximumGpuTransportBytes);
+  DecodeLimits raisedTransport;
+  raisedTransport.transportBytes = transportPacket.size();
+  raisedTransport.codeBytes = 16 * 1024 * 1024;
+  expectOnlyCapsRejected("transport", transportPacket, raisedTransport);
 
-  llvm::SmallVector<uint8_t> entryCap(*bytes);
-  writeU64(entryCap, decoded->entryLengthOffsets.front(), 512 * 1024 + 1);
-  rehashDeviceAndBundle(entryCap, *decoded);
-  expectRejected(entryCap);
+  llvm::SmallVector<uint64_t> codeLengths(
+      17, mlir::shuttle::kMaximumGpuCodeBytes / 17 + 1);
+  const auto codePacket = completeSchema2Packet(codeLengths);
+  ASSERT_LT(codePacket.size(), mlir::shuttle::kMaximumGpuTransportBytes);
+  DecodeLimits raisedCode;
+  raisedCode.codeBytes = mlir::shuttle::kMaximumGpuCodeBytes + 17;
+  expectOnlyCapsRejected("code", codePacket, raisedCode);
+
+  // Device closure requires one distinct produced slot per entry, so the
+  // shared 256-record ceiling necessarily couples entry and slot counts.
+  llvm::SmallVector<uint64_t> recordLengths(257, 64);
+  DecodeLimits raisedRecords;
+  raisedRecords.records = 258;
+  expectOnlyCapsRejected("records", completeSchema2Packet(recordLengths),
+                         raisedRecords);
+
+  DecodeLimits raisedEntry;
+  raisedEntry.entryCodeBytes =
+      mlir::shuttle::kMaximumGpuEntryCodeBytes + 1;
+  expectOnlyCapsRejected(
+      "entry",
+      completeSchema2Packet(
+          {mlir::shuttle::kMaximumGpuEntryCodeBytes + 1, 64}),
+      raisedEntry);
 
   llvm::SmallVector<uint8_t> sharedCap(*bytes);
   writeU32(sharedCap, decoded->launchSharedOffsets.front(), 16 * 1024 + 4);
   rehashDeviceAndBundle(sharedCap, *decoded);
-  expectRejected(sharedCap);
+  DecodeLimits raisedShared;
+  raisedShared.sharedBytes = 16 * 1024 + 4;
+  expectOnlyCapsRejected("shared", sharedCap, raisedShared);
 
-  expectRejected(oversizedLaunchGrid(*bytes, *decoded));
+  const auto positionsPacket = completeSchema2Packet(
+      {64, 64}, mlir::shuttle::kMaximumGpuAggregateTaskPositions + 1);
+  DecodeLimits raisedPositions;
+  raisedPositions.taskPositions =
+      2 * (mlir::shuttle::kMaximumGpuAggregateTaskPositions + 1);
+  expectOnlyCapsRejected("positions", positionsPacket, raisedPositions);
 
-  llvm::SmallVector<uint8_t> slotCountCap(*bytes);
-  writeU64(slotCountCap, decoded->invocationSlotCountOffset, 257);
-  rehashInvocationAndBundle(slotCountCap, *decoded);
-  expectRejected(slotCountCap);
+  llvm::SmallVector<uint64_t> slotCountLengths(256, 64);
+  DecodeLimits raisedSlots;
+  raisedSlots.records = 257;
+  expectOnlyCapsRejected("slots", completeSchema2Packet(slotCountLengths),
+                         raisedSlots);
 
-  llvm::SmallVector<uint8_t> rankCap(*bytes);
-  writeU64(rankCap, decoded->slotRankOffsets.front(), 9);
-  rehashInvocationAndBundle(rankCap, *decoded);
-  expectRejected(rankCap);
+  DecodeLimits raisedRank;
+  raisedRank.rank = 9;
+  expectOnlyCapsRejected("rank", completeSchema2Packet({64, 64}, 1, 0, 9),
+                         raisedRank);
 
   llvm::SmallVector<uint8_t> slotByteCap(*bytes);
   const uint64_t publicSlot = llvm::find(decoded->slotStorage, 0) -
@@ -1526,7 +1742,9 @@ TEST(GpuTransportV2Test, Abi17PreservesEveryTransportAndRuntimeCap) {
   writeU64(slotByteCap, decoded->slotRequiredOffsets[publicSlot],
            oversizedBytes);
   rehashInvocationAndBundle(slotByteCap, *decoded);
-  expectRejected(slotByteCap);
+  DecodeLimits raisedSlotBytes;
+  raisedSlotBytes.slotBytes = oversizedBytes;
+  expectOnlyCapsRejected("slot bytes", slotByteCap, raisedSlotBytes);
 
   llvm::SmallVector<uint8_t> temporaryCap(*bytes);
   int64_t widenedTemporaries = 0;
@@ -1554,7 +1772,11 @@ TEST(GpuTransportV2Test, Abi17PreservesEveryTransportAndRuntimeCap) {
   ASSERT_EQ(widenedTemporaries, 9);
   ASSERT_GT(widenedTemporaryBytes, 256 * 1024 * 1024);
   rehashInvocationAndBundle(temporaryCap, *decoded);
-  expectRejected(temporaryCap);
+  DecodeLimits raisedTemporaryBytes;
+  raisedTemporaryBytes.temporaryBytes =
+      widenedTemporaryBytes + decoded->temporaryBytes;
+  expectOnlyCapsRejected("temporary bytes", temporaryCap,
+                         raisedTemporaryBytes);
 }
 
 TEST(GpuTransportV2Test,
@@ -1914,7 +2136,6 @@ TEST(GpuTransportV2Test,
     int64_t publicBytes;
     int64_t sampleOutput;
     int64_t sampleLeaf;
-    int64_t sampleInputElement;
     int64_t sampleInputByte;
     int64_t sampleOutputByte;
   };
@@ -1940,7 +2161,6 @@ TEST(GpuTransportV2Test,
        340,
        7,
        11,
-       130,
        520,
        28},
       {"3x2x4x7x269",
@@ -1958,7 +2178,6 @@ TEST(GpuTransportV2Test,
        90384,
        137,
        268,
-       37121,
        148484,
        548},
   };
@@ -1995,12 +2214,6 @@ TEST(GpuTransportV2Test,
                   boundary.externalSlots);
         for (const auto &binding : (*loaded)->externalBindings())
           EXPECT_EQ(binding.requiredBytes, shape.publicBytes);
-        EXPECT_EQ(shape.sampleOutput * shape.reductionExtent +
-                      shape.sampleLeaf,
-                  shape.sampleInputElement);
-        EXPECT_EQ(shape.sampleInputElement * 4, shape.sampleInputByte);
-        EXPECT_EQ(shape.sampleOutput * 4, shape.sampleOutputByte);
-
         int64_t inputSlots = 0;
         int64_t resultSlots = 0;
         for (size_t slot = 0; slot < decoded->slotDimensions.size(); ++slot) {
@@ -2010,6 +2223,17 @@ TEST(GpuTransportV2Test,
             ++inputSlots;
             EXPECT_EQ(decoded->slotStrides[slot],
                       llvm::ArrayRef<int64_t>(shape.inputStrides));
+            int64_t remainingOutput = shape.sampleOutput;
+            int64_t decodedByte =
+                shape.sampleLeaf * decoded->slotStrides[slot].back();
+            for (int64_t axis = shape.resultShape.size(); axis > 0; --axis) {
+              const int64_t coordinate =
+                  remainingOutput % shape.resultShape[axis - 1];
+              remainingOutput /= shape.resultShape[axis - 1];
+              decodedByte += coordinate * decoded->slotStrides[slot][axis - 1];
+            }
+            EXPECT_EQ(remainingOutput, 0);
+            EXPECT_EQ(decodedByte, shape.sampleInputByte);
           }
           if (decoded->slotDimensions[slot] ==
                   llvm::ArrayRef<int64_t>(shape.resultShape) &&
@@ -2017,6 +2241,16 @@ TEST(GpuTransportV2Test,
             ++resultSlots;
             EXPECT_EQ(decoded->slotStrides[slot],
                       llvm::ArrayRef<int64_t>(shape.resultStrides));
+            int64_t remainingOutput = shape.sampleOutput;
+            int64_t decodedByte = 0;
+            for (int64_t axis = shape.resultShape.size(); axis > 0; --axis) {
+              const int64_t coordinate =
+                  remainingOutput % shape.resultShape[axis - 1];
+              remainingOutput /= shape.resultShape[axis - 1];
+              decodedByte += coordinate * decoded->slotStrides[slot][axis - 1];
+            }
+            EXPECT_EQ(remainingOutput, 0);
+            EXPECT_EQ(decodedByte, shape.sampleOutputByte);
           }
           if (decoded->slotStorage[slot] == 0) {
             EXPECT_EQ(decoded->slotDimensions[slot],

@@ -82,10 +82,12 @@ module @nonzero {
 
 // Public f32 is outside the BF16/f32 boundary.
 module @public_f32 {
-  func.func public @main(%x: tensor<2x5x17xf32>) -> tensor<2x5xf32> {
+  func.func public @main(%x: tensor<2x5x17xf32>) -> tensor<2x5x17xf32> {
     %z = stablehlo.constant dense<0.0> : tensor<f32>
     %r = stablehlo.reduce(%x init: %z) applies stablehlo.add across dimensions = [2] : (tensor<2x5x17xf32>, tensor<f32>) -> tensor<2x5xf32>
-    return %r : tensor<2x5xf32>
+    %b = stablehlo.broadcast_in_dim %r, dims = [0, 1] : (tensor<2x5xf32>) -> tensor<2x5x17xf32>
+    %o = stablehlo.multiply %x, %b : tensor<2x5x17xf32>
+    return %o : tensor<2x5x17xf32>
   }
 }
 
