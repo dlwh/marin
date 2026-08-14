@@ -4911,3 +4911,53 @@ author: dlwh
   causal masking, GQA, mixed Fold/Contract planning, score-tensor elision,
   streaming state, dynamic shapes, and collectives require separate generic
   semantics and evidence.
+
+### 2026-08-14 - TLTC-MLIR-023 ABI 17 terminal-axis rank-N additive Fold
+
+- Pipeline ABI 17 adds a closed GPU realization for static rank-three through
+  rank-eight additive f32 Folds over exactly the final input dimension.
+  Results have the rank-one prefix shape, the scalar initializer is exact
+  positive `+0.0`, the combiner is exact `arith.addf` without fast-math, and
+  public tensors remain static positive BF16. Regions may contain the existing
+  direct projected Maps but no Contract.
+- Planning derives the flattened output count from the domain prefix, retains
+  the final reduction extent, and uses checked products before scheduling,
+  allocation, serialization, and runtime validation. PTX decodes row-major
+  output coordinates and addresses contiguous leaves as
+  `output_linear * reduction_extent + leaf`. Existing rank-two row/column Fold
+  behavior is unchanged; CPU rank-N execution rejects transactionally before
+  serialization.
+- SOURCE_ORDERED and FAST use the same
+  `tree_association_free_leaf_order_fixed` Fold schedule because the source
+  reduction does not specify serial association. Both retain f32 accumulation
+  and explicit BF16 cast boundaries, while policy, option, observer, and cache
+  identities remain distinct.
+- Six ordinary-JAX 0.10.1 fixtures freeze anonymous `[2,5,17]` and
+  `[3,2,4,7,269]` programs across forward, JAX-owned backward, and composed
+  boundaries. Tests cover both Fold occurrences in derivative graphs, exact
+  zero/add bodies, projected Maps, flattened geometry, shared memory, PTX byte
+  addressing, transport strides and bytes, fake FFI, symbol erasure,
+  transactional sibling failure, cap packets, and ABI/cache rotation.
+- Only the pipeline ABI advances from 16 to 17. Materialization, schedule,
+  transport, device, invocation, and bundle schemas remain `1/1/2/3/3/2` for
+  this Fold family; the CUDA FFI target remains
+  `shuttle.gpu.executable_bundle.v2`. Slot, temporary, task-position, scratch,
+  record, code, and transport caps are unchanged.
+- Exact local chain: initial test-only boundary
+  `e5f11a45e6b88866ead6ecb5819f64a127d174f7`; reviewer repair
+  `9884c6fb9170d5bcf4ec9331ca38f5ca3d285f1a`; behavior-sensitivity closure
+  `1a416f33dc7c8b4ef96442e109ad979641f6c5fc`; production
+  `defb478ebc4e303e614837085f7ce1328ff95535`; transactional CPU rejection
+  follow-up
+  `20d491b296868641ee48d0bd148f1c3924303b4a`, tree
+  `be79f812d6e9a35b8be7830cd1805839a8eba2ce`. Independent exact-tip review
+  returned APPROVE with no actionable findings. Full native coverage passes
+  52/52, focused Python coverage passes 18/18, and changed-files precommit
+  passes.
+- Maximum Fold, i1 compare/select/conversion, Map-only regions, expanding-
+  singleton broadcasts, multiple or nonfinal rank-N reductions, mixed
+  Contract/Fold regions, normalized exponential, masking, GQA, score-tensor
+  elision, streaming state, dynamic shapes, collectives, and full attention
+  remain explicit design stops. No PTX assembly, GPU execution, hardware,
+  image, upload, timing, performance, push, integration, or scorecard change
+  occurred.
