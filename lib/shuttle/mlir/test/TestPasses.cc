@@ -1622,7 +1622,8 @@ public:
     if (plan) {
       for (ScheduleTaskOp task :
            plan.getBody().front().getOps<ScheduleTaskOp>()) {
-        if (task.getKind() == ScheduleTaskKind::RowFold) {
+        if (task.getKind() == ScheduleTaskKind::RowFold ||
+            task.getKind() == ScheduleTaskKind::Contract) {
           task->setAttr(
               "reduction_order",
               ScheduleReductionOrderAttr::get(
@@ -1632,7 +1633,7 @@ public:
         }
       }
     }
-    getOperation().emitError("test fixture has no row Fold schedule");
+    getOperation().emitError("test fixture has no reducible schedule task");
     signalPassFailure();
   }
 };
