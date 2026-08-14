@@ -20,6 +20,8 @@
 
 namespace {
 
+constexpr char kDefaultOptions[] =
+    R"json({"execution_mode":"stablehlo_round_trip","numerics":"source_ordered","pipeline_abi_version":14,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
 constexpr char kSourceOrderedOptions[] =
     R"json({"execution_mode":"stablehlo_round_trip","numerics":"source_ordered","pipeline_abi_version":14,"schema_version":1,"tuning":{"cluster_shape":[2,1,1],"materialization":"prefer_fusion","maximum_candidates":16,"pipeline_stages":3,"tile_sizes":[64,128]}})json";
 constexpr char kFastOptions[] =
@@ -61,6 +63,15 @@ parseModule(mlir::MLIRContext &context, llvm::StringRef source = kProgram) {
   mlir::stablehlo::registerAllDialects(dialects);
   context.appendDialectRegistry(dialects);
   return mlir::parseSourceString<mlir::ModuleOp>(source, &context);
+}
+
+TEST(ShuttleXlaOptionsTest, DefaultOptionsBindCurrentPipelineAbi) {
+  mlir::shuttle::ShuttlePipelineOptions options;
+  EXPECT_EQ(options.canonicalOptions, kDefaultOptions);
+  auto parsed = mlir::shuttle::parseShuttleXlaOptions(options.canonicalOptions);
+  ASSERT_TRUE(parsed.ok()) << parsed.status();
+  EXPECT_EQ(mlir::shuttle::shuttlePipelineIdentity(options),
+            mlir::shuttle::shuttlePipelineIdentity(*parsed));
 }
 
 TEST(ShuttleXlaOptionsTest, ParsesCanonicalPythonWireFormat) {
