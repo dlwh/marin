@@ -4961,3 +4961,81 @@ author: dlwh
   remain explicit design stops. No PTX assembly, GPU execution, hardware,
   image, upload, timing, performance, push, integration, or scorecard change
   occurred.
+
+### 2026-08-14 - TLTC-MLIR-024 ABI 15 unsealed pre-image H100 harness
+
+- A separate ABI15 local harness now closes the pre-image evidence boundary for
+  the ordinary-JAX `(33,2,34)` composed matmul-plus-VJP fixture under
+  SOURCE_ORDERED and FAST. It independently derives and validates the two-call
+  forward/backward launch graph, four policy/call transports, twenty-four PTX
+  slices, slots, accesses, initialization, dependencies, affine semantics,
+  observer identities, cache transitions, runtime mappings, registration, and
+  raw artifact closure.
+- The harness includes a deterministic source capsule and atomic raw export,
+  but it intentionally has no launch authority. Build/image/wheel/PTX/cubin
+  outputs, Bazel and ptxas identities, ACK trust root, controller receipts and
+  envelope, task-success exit, and terminal receipt remain null or absent.
+  Every task-side launcher, worker, build, assembly, subprocess, and JAX import
+  path fails before action while authority is unsealed.
+- PTX validation uses a declaration-filtered closed executable grammar plus
+  exact normalized Contract/Map instruction and control sequences for all
+  twenty-four slices. Rehashed mutations covering missing loads/stores,
+  register clobbers, bad affine/output addresses, reordered initialization,
+  load-after-use, decoy operations, and FAST shuffle placement reject.
+- Exact local chain: initial harness
+  `0573d0ca2d7219e1d1e7bb107565a6a22fb26c7f`; architecture and evidence
+  repair `52cc7d63c658c3a050c84c084b226493306724fa`; semantic hardening
+  `e8cdd3d0726187ca9a0589369a1d459054c53c67`; final PTX closure
+  `f12f93c0ff0793a359d905331a4074d1df583692`, tree
+  `7c39e5502993295dd9ae2292564e2a3a13c2db0d`. Independent review returned
+  GO for the local unsealed checkpoint with no P1 or P2. Full focused ABI15
+  coverage passes 135/135 and PTX coverage passes 31/31; changed-files
+  precommit passes.
+- This checkpoint does not authorize an image build, upload, cluster task,
+  H100 allocation, controller ACK, accepted envelope, timing, performance,
+  push, integration, or scorecard change. A separately reviewed trust-root and
+  launch-authorization design is required before any external action.
+
+### 2026-08-14 - TLTC-MLIR-025 ABI 18 expanding-singleton BroadcastInDim
+
+- Pipeline ABI 18 admits exactly one expanding singleton in a static rank-three
+  through rank-eight BroadcastInDim/Map inside the existing terminal additive
+  Fold/Map region. Internal tensors are f32, public tensors remain BF16, the
+  result map is identity, and the input map contains unique direct dimensions
+  plus one `d_i floordiv E` expression whose input extent is one and result
+  extent is the same positive `E`.
+- Expansion is admitted only when it traces through structural broadcast and
+  reshape projections to the terminal additive Fold. An unrelated valid Fold
+  elsewhere in the connected region is insufficient. This ancestry condition
+  is checked both while selecting StableHLO and while closing the Shuttle
+  region, without workload, name, shape, count, or digest dispatch.
+- The operation performs no arithmetic and preserves BF16/f32 values bitwise.
+  SOURCE_ORDERED and FAST use identical Map/Fold geometry and affine
+  addressing while retaining distinct public option, observer, and cache
+  identities. Existing generic affine PTX lowering supplies the singleton
+  address expression; physical schemas, caps, and the v2 FFI target are
+  unchanged.
+- Six ordinary-JAX 0.10.1 fixtures freeze anonymous `[2,7,19]` and
+  `[3,2,5,11,263]` programs across forward, JAX-owned backward, and composed
+  boundaries. Tests cover every expansion map, geometry, sampled byte address,
+  transport, fake FFI, temporary reuse, symbol erasure, CPU/GPU
+  transactionality, caps, policy/cache rotation, and otherwise-valid BF16
+  semantic exclusions.
+- Exact local chain: reviewed test-only boundary
+  `a57b48a2a9b6376a639457ac739f0e50603e99d5`; production
+  `7fe248f9a4a6230fab12d32a42649b053b2ac7d9`; test-only launch inventory
+  `19f3c932cc948a72f6daa9a417aae952ac65de15`; CPU diagnostic binding
+  `3020ed336a5256179a707455e80f09de28066e57`; ancestry regression
+  `42ef54ce0694352721d6d1d32955ba190ad3b0ae`; ancestry fix
+  `48af0df735bf6de08fcc8a9f8bb6ed454e74a609`, tree
+  `ae1aabe1733025e4bbb4e3b02858395337bf2b62`. Independent exact-tip review
+  returned APPROVE with no P1 or P2. Uncached native coverage passes 56/56,
+  focused ABI18 passes 3/3, options coverage passes 14/14, and changed-files
+  precommit passes. Full Python passes 68/69; the sole failure is the unchanged
+  accepted-base evidence-manifest SHA mismatch.
+- Maximum/minimum Fold, i1 compare/select/conversion, Map-only regions, more
+  than one expanded singleton, arbitrary affine expressions, mixed
+  Contract/Fold, normalized exponential, masking, GQA, dynamic shapes,
+  collectives, full attention, cap raises, PTX assembly, GPU execution,
+  hardware, image, upload, timing, performance, push, integration, and
+  scorecard change remain excluded.
