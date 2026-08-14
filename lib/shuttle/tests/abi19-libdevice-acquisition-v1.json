@@ -1,0 +1,50 @@
+{
+  "artifact": {
+    "libdevice_path": null,
+    "libdevice_sha256": null,
+    "libdevice_size": null,
+    "license_path": null,
+    "license_sha256": null,
+    "selected_platform": null
+  },
+  "compile_contract": {
+    "accuracy": "DEFAULT",
+    "address_size": 64,
+    "fast_function_forbidden": "__nv_fast_expf",
+    "ftz": false,
+    "function": "__nv_expf",
+    "linkage": "compile_time",
+    "ptx_version": "8.0",
+    "target": "sm_90",
+    "target_triple": "nvptx64-nvidia-cuda",
+    "unresolved_calls": 0
+  },
+  "license": {
+    "classification": "restricted",
+    "evidence": null,
+    "source_path": "third_party/gpus/cuda/hermetic/cuda_nvcc.BUILD.tpl",
+    "source_revision": "9b635916ecc6df6efee62d8e4b0c7ef87ef84d69",
+    "source_sha256": "8d967dc789bb28df23df42b51003300c3b3d67b4bbacad59aaedfb8a6747c86d"
+  },
+  "schema_version": 1,
+  "source": {
+    "lockfile_sha256": "e03633c1f7f8cd01fff82db197206d1ddeb0fad7ba0f4968b3b21e4831f20bc9",
+    "package": "nvidia-nvvm",
+    "registry": "https://pypi.org/simple",
+    "version": "13.2.78",
+    "wheels": [
+      {
+        "platform": "manylinux2010_x86_64.manylinux_2_12_x86_64",
+        "sha256": "f5aa433631109bbdec81802c5b5f319bf10bc891fe2f212e4e445845211d6f77",
+        "size": 64279462,
+        "url": "https://files.pythonhosted.org/packages/e8/1f/930d63ccc8adcdf27bfc051a24e3e4da2cf6ef987848d6d1d642e29d704b/nvidia_nvvm-13.2.78-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+      },
+      {
+        "platform": "manylinux2014_aarch64.manylinux_2_17_aarch64",
+        "sha256": "88075f87a361a1dce95c799cabc028f7093af616a5702dcfb74eba4045dbbd5f",
+        "size": 61886055,
+        "url": "https://files.pythonhosted.org/packages/8b/fd/db44b7a662a6af75a9a0683ca4580c855a3f5fcfdf1261b0ddb9fce0ee26/nvidia_nvvm-13.2.78-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl"
+      }
+    ]
+  }
+}
