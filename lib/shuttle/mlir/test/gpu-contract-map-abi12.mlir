@@ -12,30 +12,30 @@
 // RUN: not shuttle-test-opt %S/Inputs/abi12-bf16-contract-map-sweep.mlir --split-input-file --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-plan-row-fold-materialization --shuttle-plan-simt32-row-fold-schedule --shuttle-test-mutate-schedule-dependency --shuttle-verify-simt32-row-fold-schedule 2>&1 | FileCheck %s --check-prefix=SCHEDULE-DEPENDENCY
 // RUN: not shuttle-test-opt %S/Inputs/abi12-bf16-contract-map-sweep.mlir --split-input-file --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-plan-row-fold-materialization --shuttle-plan-simt32-row-fold-schedule --shuttle-test-mutate-schedule-order --shuttle-verify-simt32-row-fold-schedule 2>&1 | FileCheck %s --check-prefix=SCHEDULE-ORDER
 
-// MATERIALIZATION-LABEL: module @anonymous_a
+// MATERIALIZATION-LABEL: sym_name = "anonymous_a"
 // MATERIALIZATION: "shuttle.materialization_plan"() <{{.*}}policy = #shuttle.policy<source_ordered>{{.*}}schema_version = 2
 // MATERIALIZATION: "shuttle.materialization_task"() <{{.*}}domain_shape = array<i64: 2, 5, 3>{{.*}}kind = #shuttle.materialization_task_kind<contract>{{.*}}reduction_dimensions = array<i64: 2>
 // MATERIALIZATION: "shuttle.materialization_task"() <{{.*}}dependencies = array<i64: 0>{{.*}}kind = #shuttle.materialization_task_kind<map>
-// MATERIALIZATION-LABEL: module @anonymous_b
+// MATERIALIZATION-LABEL: sym_name = "anonymous_b"
 // MATERIALIZATION: domain_shape = array<i64: 3, 2, 5>
-// MATERIALIZATION-LABEL: module @anonymous_c
+// MATERIALIZATION-LABEL: sym_name = "anonymous_c"
 // MATERIALIZATION: domain_shape = array<i64: 7, 3, 13>
-// MATERIALIZATION-LABEL: module @anonymous_d
+// MATERIALIZATION-LABEL: sym_name = "anonymous_d"
 // MATERIALIZATION: domain_shape = array<i64: 11, 17, 3>
-// MATERIALIZATION-LABEL: module @anonymous_e
+// MATERIALIZATION-LABEL: sym_name = "anonymous_e"
 // MATERIALIZATION: domain_shape = array<i64: 17, 19, 3>
 
-// SCHEDULE-LABEL: module @anonymous_a
+// SCHEDULE-LABEL: sym_name = "anonymous_a"
 // SCHEDULE: "shuttle.schedule_plan"() <{{.*}}policy = #shuttle.policy<source_ordered>{{.*}}schema_version = 2
 // SCHEDULE: "shuttle.schedule_task"() <{{.*}}kind = #shuttle.schedule_task_kind<contract>{{.*}}reduction_axis = 2{{.*}}reduction_order = #shuttle.schedule_reduction_order<serial_ascending_fma_rn_f32>
 // SCHEDULE: "shuttle.schedule_task"() <{{.*}}dependencies = array<i64: 0>{{.*}}kind = #shuttle.schedule_task_kind<elementwise>
-// SCHEDULE-LABEL: module @anonymous_b
+// SCHEDULE-LABEL: sym_name = "anonymous_b"
 // SCHEDULE: #shuttle.schedule_task_kind<contract>
-// SCHEDULE-LABEL: module @anonymous_c
+// SCHEDULE-LABEL: sym_name = "anonymous_c"
 // SCHEDULE: #shuttle.schedule_task_kind<contract>
-// SCHEDULE-LABEL: module @anonymous_d
+// SCHEDULE-LABEL: sym_name = "anonymous_d"
 // SCHEDULE: #shuttle.schedule_task_kind<contract>
-// SCHEDULE-LABEL: module @anonymous_e
+// SCHEDULE-LABEL: sym_name = "anonymous_e"
 // SCHEDULE: #shuttle.schedule_task_kind<contract>
 
 // DESCRIPTOR-LABEL: module @anonymous_a
