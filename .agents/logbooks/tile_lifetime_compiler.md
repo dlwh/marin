@@ -4745,3 +4745,85 @@ author: dlwh
   hardware reservation, upload, push, or integration occurred. The next
   architecture-conforming step is a separately reviewed and authorized SM90
   assembly and untimed numerical/cache run.
+
+### 2026-08-13 - TLTC-MLIR-019 ABI 14 ordinary-JAX Contract VJP
+
+- Pipeline ABI 14 executes the ordinary-JAX VJP of one static rank-two BF16
+  matmul as one connected generic GPU region. The frozen JAX 0.10.1 graph has
+  three BF16 inputs, two BF16 results, two FP32 `Contract` tasks, eight generic
+  `Map` tasks, thirteen buffers, and no scalar slots. Admission is based on
+  rank, element type, affine indexing maps, iterator kinds, connectivity, and
+  policy; it does not dispatch on workload names, operation counts, shapes, or
+  fixture digests.
+- Both equal-type BF16 and FP32 Contract inputs are legal internally. Generated
+  PTX derives row-major addresses from each operand's affine map, so the two
+  VJP contractions retain `(d2,d0)/(d2,d1)` and
+  `(d0,d2)/(d1,d2)` indexing and the intervening transpose remains a
+  `(d1,d0)` Map. SOURCE_ORDERED uses ascending serial `fma.rn.f32`; FAST uses
+  lane-strided leaves and the fixed `16,8,4,2,1` shuffle/add tree. Explicit
+  BF16/FP32 cast boundaries remain separate tasks.
+- Public options and every C++ default now bind pipeline ABI 14. Materialization,
+  schedule, transport, device, invocation, and bundle schemas remain
+  `2/2/2/3/3/2`; the CUDA FFI target remains
+  `shuttle.gpu.executable_bundle.v2`. Historical ABI 13 LayerNorm observer
+  identities remain frozen and reject current options rather than silently
+  migrating old evidence.
+- Exact local series: ABI13 base
+  `7fb7eb2aaa499d24fec40a947a57f8a41c840052`; red checkpoint
+  `a71bb30e7fffd1c0a08d204995c1cf31a2e4c393`; production
+  `60e076f2a6dae7a5de2ec2056c39a3eb3cd85cc6`; default-identity repair
+  `edae8b2d1f76e3a5ffb421fa55e34fb6e4215ec9`; final address-test closure
+  `5205b622bb0dfa9b795dc0af28fccf8d86c77920`. Final tree is
+  `702744f8fe00fc79abdac4ccb9f591f9f9e3a24a` and independent review returned
+  strict GO with no unresolved findings.
+- Final native/XLA/MLIR coverage passes 52/52. Shuttle and JAX-patch Python
+  coverage passes 512/513; the sole failure is the pre-existing linked
+  evaluation-manifest SHA mismatch present at the ABI13 base. Changed-files
+  precommit passes. No push, integration, PTX assembly, CUDA execution,
+  numerical acceptance, persistent-cache proof, timing, hardware reservation,
+  or scorecard change occurred.
+- Composed forward-plus-backward remains a design stop because ordinary JAX
+  forms separate forward and backward Shuttle regions. The next compiler step
+  must choose an explicit generic multi-region replacement contract rather
+  than hiding region coalescing or multi-call behavior behind a workload
+  recognizer. In parallel, the next evidence step is a locally sealed ABI14
+  SM90 assembly/numerical/cache contract; any H100 allocation remains subject
+  to separate authorization.
+
+### 2026-08-14 - TLTC-MLIR-020 ABI 15 transactional multi-region GPU execution
+
+- Pipeline ABI 15 replaces every independently valid connected GPU region with
+  one ordinary StableHLO custom call. It does not coalesce regions or create a
+  module-wide super-bundle. The ordinary-JAX composed `17x33x19` matmul graph
+  therefore emits a two-launch forward call and a ten-launch backward call;
+  the enclosing return preserves public `(y, dLHS, dRHS)` ordering while the
+  backward call retains its source-bound `(dRHS, dLHS)` result projection.
+- Materialization, schedule, device, invocation, and bundle ownership are
+  matched one-to-one through source-bound fingerprints and root sets. All
+  regions are planned, verified, projected, serialized, and checked against
+  aggregate call, entry, slot, code, temporary-allocation, launch-position,
+  and transport caps before the first IR mutation. A malformed later sibling
+  therefore produces no partial custom calls. CPU schema 1 keeps its exact
+  single-root contract.
+- Per-call materialization, schedule, transport, device, invocation, and bundle
+  schemas remain `2/2/2/3/3/2`; the CUDA FFI target remains
+  `shuttle.gpu.executable_bundle.v2`. Pipeline ABI 15 rotates the public option
+  and persistent-cache identity. Generated observer fingerprints consume every
+  device/invocation/bundle tuple in source order and reject missing, duplicate,
+  or reused roots.
+- Exact local series: ABI14 base
+  `5205b622bb0dfa9b795dc0af28fccf8d86c77920`; red checkpoint
+  `76318e9c69e71dcc2c880645e0b16c066a56d36e`; reviewed production
+  `d31a88cb9a93e591469fa8edfcf9dacada90c7b4`, tree
+  `66175cbd89dcac0857ee2fbc456f7715170d239c`; test-only identical-region and
+  multi-tuple observer hardening `c11c81ff1b24e6ba4c0e3dfc7d843333fcb43919`,
+  tree `6b30c04473b562482a8ac2f42749fe4991cdb1e2`. Independent production review
+  returned strict GO with no P1 or P2 findings.
+- Native/XLA/MLIR coverage passes 53/53. Shuttle and JAX-patch Python coverage
+  passes 512/513; the sole failure remains the pre-existing linked
+  evaluation-manifest SHA mismatch present at the ABI14 base. The focused
+  identical-region and observer tests pass 2/2; independent follow-up review
+  passes the complete MLIR-plus-observer gate 45/45 and returns strict GO.
+  Changed-files precommit passes. No push, integration, PTX assembly, CUDA
+  execution, numerical or persistent-cache acceptance, timing, profiling,
+  hardware reservation, upload, or scorecard change occurred.
