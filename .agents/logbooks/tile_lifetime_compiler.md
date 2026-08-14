@@ -5067,7 +5067,9 @@ author: dlwh
   `77edf150bd5e7d43e48cfb37352307b134674e15`, tree
   `90af5dd9afc7e6b153ae854ed6a56db59c9d5c2c`; and per-entry binding repair
   `2a2f17026774007e938d70129a251de1d44c6fcc`, tree
-  `32b4a501160f498cf55b690dbb5393cef046bc08`. It is based on
+  `32b4a501160f498cf55b690dbb5393cef046bc08`; and balanced-entry repair
+  `df82f6144376131c52e44e8b9424c2cc2b8910cc`, tree
+  `2a7954e752236654ab86fc52ce73dbdb8652e6bf`. It is based on
   `f7afc3ee7a7d22273230695fb935fdac7abc3212`. The focused Python census is
   38 pass and six intended ABI19 rotation failures. Full Shuttle Python is
   86/92: five intended ABI19 rotation failures and the unchanged accepted-base
