@@ -56,6 +56,6 @@
 // DESCRIPTOR-NOT: shuttle.contract
 
 // MATERIALIZATION-MUTATION: producer is outside the task range
-// MATERIALIZATION-SHAPE: Contract buffers must equal the bound MxK, KxN, and MxN shapes
+// MATERIALIZATION-SHAPE: Contract buffers must bind two distinct parallel axes and one reduction axis with equal bf16 or f32 input types
 // SCHEDULE-DEPENDENCY: schedule dependencies must equal the materialization task
 // SCHEDULE-ORDER: Contract reduction order must equal the policy-bound Contract semantics

@@ -913,14 +913,24 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
       auto result = cast<RankedTensorType>(
           buffers[task.getOutputBuffers()[0]].getTensorType());
       ArrayRef<int64_t> domain = task.getDomainShape();
+      auto matchesInputShape = [&](RankedTensorType type,
+                                   int64_t parallelAxis) {
+        return type.getShape() ==
+                   ArrayRef<int64_t>({domain[parallelAxis], domain[2]}) ||
+               type.getShape() ==
+                   ArrayRef<int64_t>({domain[2], domain[parallelAxis]});
+      };
+      const bool inputsBindDistinctParallelAxes =
+          (matchesInputShape(lhs, 0) && matchesInputShape(rhs, 1)) ||
+          (matchesInputShape(lhs, 1) && matchesInputShape(rhs, 0));
       if (lhs.getRank() != 2 || rhs.getRank() != 2 || result.getRank() != 2 ||
-          !lhs.getElementType().isBF16() || !rhs.getElementType().isBF16() ||
-          !result.getElementType().isF32() ||
-          lhs.getShape() != ArrayRef<int64_t>({domain[0], domain[2]}) ||
-          rhs.getShape() != ArrayRef<int64_t>({domain[2], domain[1]}) ||
+          lhs.getElementType() != rhs.getElementType() ||
+          (!lhs.getElementType().isBF16() && !lhs.getElementType().isF32()) ||
+          !result.getElementType().isF32() || !inputsBindDistinctParallelAxes ||
           result.getShape() != ArrayRef<int64_t>({domain[0], domain[1]})) {
         return task.emitOpError(
-            "Contract buffers must equal the bound MxK, KxN, and MxN shapes");
+            "Contract buffers must bind two distinct parallel axes and one "
+            "reduction axis with equal bf16 or f32 input types");
       }
     } else {
       if (!task.getReductionDimensions().empty() || task.getOrderFree()) {

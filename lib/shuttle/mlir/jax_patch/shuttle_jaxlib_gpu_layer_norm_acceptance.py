@@ -229,10 +229,25 @@ def subject_options(numerics: Numerics) -> dict[str, object]:
     return options
 
 
+def historical_options_json(numerics: Numerics) -> str:
+    payload = {
+        "execution_mode": ExecutionMode.GPU_EXECUTABLE_BUNDLE.value,
+        "numerics": numerics.value,
+        "pipeline_abi_version": PIPELINE_ABI_VERSION,
+        "schema_version": 1,
+        "tuning": {
+            "cluster_shape": [],
+            "materialization": "automatic",
+            "maximum_candidates": 1,
+            "pipeline_stages": 1,
+            "tile_sizes": [],
+        },
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
 def expected_identity(numerics: Numerics) -> ObserverIdentity:
-    canonical = subject_options(numerics)["xla_shuttle_options"]
-    if not isinstance(canonical, str):
-        raise TypeError("xla_shuttle_options must be canonical JSON text")
+    canonical = historical_options_json(numerics)
     payload = json.loads(canonical)
     tuning = json.dumps(payload["tuning"], sort_keys=True, separators=(",", ":"))
     return ObserverIdentity(

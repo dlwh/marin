@@ -79,7 +79,7 @@ ShuttlePipelineOptions commandLinePipelineOptions(NumericalPolicy numerics) {
   options.numerics = numerics;
   if (numerics == NumericalPolicy::Fast) {
     options.canonicalOptions =
-        R"json({"execution_mode":"stablehlo_round_trip","numerics":"fast","pipeline_abi_version":13,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+        R"json({"execution_mode":"stablehlo_round_trip","numerics":"fast","pipeline_abi_version":14,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
   }
   return options;
 }
@@ -2946,7 +2946,8 @@ bool isClosedRankTwoContract(ContractOp contract) {
   FailureOr<SmallVector<int64_t>> domain = contractDomainShape(contract);
   if (!lhs || !rhs || !result || failed(domain) || lhs.getRank() != 2 ||
       rhs.getRank() != 2 || result.getRank() != 2 ||
-      !lhs.getElementType().isBF16() || !rhs.getElementType().isBF16() ||
+      lhs.getElementType() != rhs.getElementType() ||
+      (!lhs.getElementType().isBF16() && !lhs.getElementType().isF32()) ||
       !result.getElementType().isF32() || domain->size() != 3 ||
       contract.getAlgorithm() != "dot_general" ||
       contract.getAccumulatorTypes().size() != 1 ||
@@ -2985,15 +2986,7 @@ bool isClosedRankTwoContract(ContractOp contract) {
   AffineMap resultMap =
       cast<AffineMapAttr>(contract.getIndexingMaps()[2]).getValue();
   MLIRContext *context = contract.getContext();
-  if (lhsMap != AffineMap::get(3, 0,
-                               {getAffineDimExpr(0, context),
-                                getAffineDimExpr(2, context)},
-                               context) ||
-      rhsMap != AffineMap::get(3, 0,
-                               {getAffineDimExpr(2, context),
-                                getAffineDimExpr(1, context)},
-                               context) ||
-      resultMap != AffineMap::get(3, 0,
+  if (resultMap != AffineMap::get(3, 0,
                                   {getAffineDimExpr(0, context),
                                    getAffineDimExpr(1, context)},
                                   context)) {
@@ -3014,49 +3007,28 @@ bool isClosedRankTwoContract(ContractOp contract) {
   return true;
 }
 
-bool isClosedContractMapRegion(ArrayRef<Operation *> algebra) {
-  if (algebra.size() != 2) {
+bool isClosedContractMapRegion(RegionOp region, ArrayRef<Operation *> algebra) {
+  auto isExternalType = [](Type type) {
+    auto tensor = dyn_cast<RankedTensorType>(type);
+    return tensor && tensor.hasStaticShape() && tensor.getRank() == 2 &&
+           tensor.getElementType().isBF16() &&
+           llvm::all_of(tensor.getShape(),
+                        [](int64_t extent) { return extent > 0; });
+  };
+  if (!llvm::all_of(
+          region.getInputs(),
+          [&](Value input) { return isExternalType(input.getType()); }) ||
+      !llvm::all_of(region.getResults(), [&](Value result) {
+        return isExternalType(result.getType());
+      })) {
     return false;
   }
-  auto contract = dyn_cast<ContractOp>(algebra[0]);
-  auto map = dyn_cast<MapOp>(algebra[1]);
-  if (!contract || !map || !isClosedRankTwoContract(contract) ||
-      map.getInputs().size() != 1 || map.getNumResults() != 1 ||
-      map.getInputs()[0] != contract.getResult(0) ||
-      !contract.getResult(0).hasOneUse()) {
-    return false;
-  }
-  auto region = contract->getParentOfType<RegionOp>();
-  if (!region || region.getInputs().size() != 2 ||
-      region.getResults().size() != 1) {
-    return false;
-  }
-  auto input = dyn_cast<RankedTensorType>(map.getInputs()[0].getType());
-  auto output = dyn_cast<RankedTensorType>(map.getResult(0).getType());
-  if (!input || !output || input.getShape() != output.getShape() ||
-      !input.getElementType().isF32() || !output.getElementType().isBF16() ||
-      map.getIndexingMaps().size() != 2 ||
-      !isIdentityMap(
-          cast<AffineMapAttr>(map.getIndexingMaps()[0]).getValue()) ||
-      !isIdentityMap(
-          cast<AffineMapAttr>(map.getIndexingMaps()[1]).getValue())) {
-    return false;
-  }
-  Block &body = map.getBody().front();
-  if (body.getNumArguments() != 1 || body.getOperations().size() != 2) {
-    return false;
-  }
-  auto convert = dyn_cast<ScalarConvertOp>(body.front());
-  auto yield = dyn_cast<YieldOp>(body.back());
-  auto regionYield =
-      dyn_cast<YieldOp>(region.getBody().front().getTerminator());
-  return convert && yield && regionYield && map.getResult(0).hasOneUse() &&
-         convert.getInput() == body.getArgument(0) &&
-         convert.getInput().getType().isF32() &&
-         convert.getResult().getType().isBF16() &&
-         convert.getSemantics() == ScalarConvertSemantics::RoundNearestEven &&
-         yield.getValues() == ValueRange{convert.getResult()} &&
-         regionYield.getValues() == ValueRange{map.getResult(0)};
+  return llvm::all_of(algebra, [](Operation *operation) {
+    if (auto contract = dyn_cast<ContractOp>(operation)) {
+      return isClosedRankTwoContract(contract);
+    }
+    return isa<MapOp>(operation);
+  });
 }
 
 bool isClosedRankTwoFold(FoldOp fold) {
@@ -3145,7 +3117,7 @@ FailureOr<DerivedPlan> deriveGpuPlan(RegionOp region) {
   }
   const bool containsContract = llvm::any_of(
       algebra, [](Operation *operation) { return isa<ContractOp>(operation); });
-  if (containsContract && !isClosedContractMapRegion(algebra)) {
+  if (containsContract && !isClosedContractMapRegion(region, algebra)) {
     return failure();
   }
   SmallVector<PlannedBuffer, 0> buffers;
@@ -3333,7 +3305,7 @@ public:
       auto tuning = manifest ? manifest.getAs<StringAttr>("canonical_tuning")
                              : StringAttr{};
       if (!tuning || tuning.getValue() != kDefaultCanonicalTuning) {
-        module.emitError("ABI13 GPU Contract requires exact default tuning");
+        module.emitError("ABI14 GPU Contract requires exact default tuning");
         return signalPassFailure();
       }
     }
@@ -4530,6 +4502,12 @@ FailureOr<std::string> emitContractPtx(ContractOp contract,
   if (outputs > UINT32_MAX) {
     return failure();
   }
+  AffineMap lhsMap =
+      cast<AffineMapAttr>(contract.getIndexingMaps()[0]).getValue();
+  AffineMap rhsMap =
+      cast<AffineMapAttr>(contract.getIndexingMaps()[1]).getValue();
+  auto lhsType = cast<RankedTensorType>(contract.getInputs()[0].getType());
+  auto rhsType = cast<RankedTensorType>(contract.getInputs()[1].getType());
   if (fast) {
     const int64_t outputsPerBlock = std::min<int64_t>(outputs, 8);
     if (task.getGridShape() !=
@@ -4558,49 +4536,58 @@ FailureOr<std::string> emitContractPtx(ContractOp contract,
     auto result = cast<RankedTensorType>(contract.getResult(0).getType());
     FailureOr<SmallVector<int64_t>> coordinates =
         emitOutputCoordinates(ptx, result);
-    if (failed(coordinates) || *coordinates != ArrayRef<int64_t>({8, 9})) {
+    if (failed(coordinates) || coordinates->size() != 2) {
       return failure();
     }
-    ptx.stream << "  ld.param.u64 %rd10, [p0];\n"
-                  "  ld.param.u64 %rd11, [p1];\n"
-                  "  mov.f32 %f0, 0f00000000;\n"
-                  "  cvt.u64.u32 %rd13, %r2;\n"
+    int64_t accumulator = ptx.nextF32();
+    int64_t reductionCoordinate = ptx.nextU64();
+    ptx.stream << "  mov.f32 %f" << accumulator
+               << ", 0f00000000;\n"
+                  "  cvt.u64.u32 %rd"
+               << reductionCoordinate
+               << ", %r2;\n"
                   "$contract_fast_loop:\n"
-                  "  setp.ge.u64 %p1, %rd13, "
-               << reduction
+                  "  setp.ge.u64 %p1, %rd"
+               << reductionCoordinate << ", " << reduction
                << ";\n"
                   "  @%p1 bra $contract_fast_reduce;\n"
-                  "  mad.lo.u64 %rd14, %rd8, "
-               << reduction
-               << ", %rd13;\n"
-                  "  mad.lo.u64 %rd15, %rd13, "
-               << columns
-               << ", %rd9;\n"
-                  "  mad.lo.u64 %rd16, %rd14, 2, %rd10;\n"
-                  "  mad.lo.u64 %rd17, %rd15, 2, %rd11;\n"
-                  "  ld.global.u16 %h0, [%rd16];\n"
-                  "  ld.global.u16 %h1, [%rd17];\n"
-                  "  cvt.f32.bf16 %f1, %h0;\n"
-                  "  cvt.f32.bf16 %f2, %h1;\n"
-                  "  fma.rn.f32 %f0, %f1, %f2, %f0;\n"
-                  "  add.u64 %rd13, %rd13, 32;\n"
+                  "";
+    SmallVector<int64_t> domainCoordinates{(*coordinates)[0], (*coordinates)[1],
+                                           reductionCoordinate};
+    FailureOr<int64_t> lhs =
+        emitMapInput(ptx, 0, lhsType, lhsMap, domainCoordinates);
+    FailureOr<int64_t> rhs =
+        emitMapInput(ptx, 1, rhsType, rhsMap, domainCoordinates);
+    if (failed(lhs) || failed(rhs)) {
+      return failure();
+    }
+    ptx.stream << "  fma.rn.f32 %f" << accumulator << ", %f" << *lhs << ", %f"
+               << *rhs << ", %f" << accumulator << ";\n  add.u64 %rd"
+               << reductionCoordinate << ", %rd" << reductionCoordinate
+               << ", 32;\n"
                   "  bra $contract_fast_loop;\n"
                   "$contract_fast_reduce:\n"
-                  "  mov.b32 %r5, %f0;\n";
+                  "  mov.b32 %r5, %f"
+               << accumulator << ";\n";
+    int64_t shuffled = ptx.nextF32();
     for (int64_t offset : {16, 8, 4, 2, 1}) {
       ptx.stream << "  shfl.sync.down.b32 %r6, %r5, " << offset
                  << ", 31, 0xffffffff;\n"
-                    "  mov.b32 %f3, %r6;\n"
-                    "  add.rn.f32 %f0, %f0, %f3;\n"
-                    "  mov.b32 %r5, %f0;\n";
+                    "  mov.b32 %f"
+                 << shuffled << ", %r6;\n  add.rn.f32 %f" << accumulator
+                 << ", %f" << accumulator << ", %f" << shuffled
+                 << ";\n  mov.b32 %r5, %f" << accumulator << ";\n";
     }
+    int64_t outputPointer = ptx.nextU64();
     ptx.stream << "  setp.ne.u32 %p2, %r2, 0;\n"
                   "  @%p2 bra $done;\n"
-                  "  ld.param.u64 %rd12, [p2];\n"
-                  "  mad.lo.u64 %rd12, %rd0, 4, %rd12;\n"
-                  "  st.global.f32 [%rd12], %f0;\n";
-    ptx.u64 = std::max<int64_t>(ptx.u64, 18);
-    ptx.f32 = std::max<int64_t>(ptx.f32, 4);
+                  "  ld.param.u64 %rd"
+               << outputPointer << ", [p2];\n  mad.lo.u64 %rd" << outputPointer
+               << ", %rd0, 4, %rd" << outputPointer << ";\n  st.global.f32 [%rd"
+               << outputPointer << "], %f" << accumulator << ";\n";
+    if (ptx.f32 > 128 || ptx.u64 > 128 || ptx.bf16 > 16) {
+      return failure();
+    }
     ptx.finish();
     return ptx.text;
   }
@@ -4624,38 +4611,42 @@ FailureOr<std::string> emitContractPtx(ContractOp contract,
   auto result = cast<RankedTensorType>(contract.getResult(0).getType());
   FailureOr<SmallVector<int64_t>> coordinates =
       emitOutputCoordinates(ptx, result);
-  if (failed(coordinates) || *coordinates != ArrayRef<int64_t>({8, 9})) {
+  if (failed(coordinates) || coordinates->size() != 2) {
     return failure();
   }
-  ptx.stream << "  ld.param.u64 %rd10, [p0];\n"
-                "  ld.param.u64 %rd11, [p1];\n"
-                "  mov.f32 %f0, 0f00000000;\n"
-                "  mov.u64 %rd13, 0;\n"
+  int64_t accumulator = ptx.nextF32();
+  int64_t reductionCoordinate = ptx.nextU64();
+  ptx.stream << "  mov.f32 %f" << accumulator << ", 0f00000000;\n  mov.u64 %rd"
+             << reductionCoordinate
+             << ", 0;\n"
                 "$contract_loop:\n"
-                "  setp.ge.u64 %p1, %rd13, "
-             << reduction
+                "  setp.ge.u64 %p1, %rd"
+             << reductionCoordinate << ", " << reduction
              << ";\n  @%p1 bra $contract_done;\n"
-                "  mad.lo.u64 %rd14, %rd8, "
-             << reduction
-             << ", %rd13;\n"
-                "  mad.lo.u64 %rd15, %rd13, "
-             << columns
-             << ", %rd9;\n"
-                "  mad.lo.u64 %rd16, %rd14, 2, %rd10;\n"
-                "  mad.lo.u64 %rd17, %rd15, 2, %rd11;\n"
-                "  ld.global.u16 %h0, [%rd16];\n"
-                "  ld.global.u16 %h1, [%rd17];\n"
-                "  cvt.f32.bf16 %f1, %h0;\n"
-                "  cvt.f32.bf16 %f2, %h1;\n"
-                "  fma.rn.f32 %f0, %f1, %f2, %f0;\n"
-                "  add.u64 %rd13, %rd13, 1;\n"
+                "";
+  SmallVector<int64_t> domainCoordinates{(*coordinates)[0], (*coordinates)[1],
+                                         reductionCoordinate};
+  FailureOr<int64_t> lhs =
+      emitMapInput(ptx, 0, lhsType, lhsMap, domainCoordinates);
+  FailureOr<int64_t> rhs =
+      emitMapInput(ptx, 1, rhsType, rhsMap, domainCoordinates);
+  if (failed(lhs) || failed(rhs)) {
+    return failure();
+  }
+  int64_t outputPointer = ptx.nextU64();
+  ptx.stream << "  fma.rn.f32 %f" << accumulator << ", %f" << *lhs << ", %f"
+             << *rhs << ", %f" << accumulator << ";\n  add.u64 %rd"
+             << reductionCoordinate << ", %rd" << reductionCoordinate
+             << ", 1;\n"
                 "  bra $contract_loop;\n"
                 "$contract_done:\n"
-                "  ld.param.u64 %rd12, [p2];\n"
-                "  mad.lo.u64 %rd12, %rd0, 4, %rd12;\n"
-                "  st.global.f32 [%rd12], %f0;\n";
-  ptx.u64 = std::max<int64_t>(ptx.u64, 18);
-  ptx.f32 = std::max<int64_t>(ptx.f32, 3);
+                "  ld.param.u64 %rd"
+             << outputPointer << ", [p2];\n  mad.lo.u64 %rd" << outputPointer
+             << ", %rd0, 4, %rd" << outputPointer << ";\n  st.global.f32 [%rd"
+             << outputPointer << "], %f" << accumulator << ";\n";
+  if (ptx.f32 > 128 || ptx.u64 > 128 || ptx.bf16 > 16) {
+    return failure();
+  }
   ptx.finish();
   return ptx.text;
 }
@@ -6281,7 +6272,7 @@ void registerShuttleStablehloPipelines() {
             commandLinePipelineOptions(NumericalPolicy::SourceOrdered);
         options.executionMode = ExecutionMode::CpuExecutableBundle;
         options.canonicalOptions =
-            R"json({"execution_mode":"cpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":13,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+            R"json({"execution_mode":"cpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":14,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
         buildShuttleStablehloPipeline(manager, options);
       });
   PassPipelineRegistration<>(
@@ -6292,7 +6283,7 @@ void registerShuttleStablehloPipelines() {
             commandLinePipelineOptions(NumericalPolicy::Fast);
         options.executionMode = ExecutionMode::CpuExecutableBundle;
         options.canonicalOptions =
-            R"json({"execution_mode":"cpu_executable_bundle","numerics":"fast","pipeline_abi_version":13,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+            R"json({"execution_mode":"cpu_executable_bundle","numerics":"fast","pipeline_abi_version":14,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
         buildShuttleStablehloPipeline(manager, options);
       });
   PassPipelineRegistration<>(
@@ -6304,7 +6295,7 @@ void registerShuttleStablehloPipelines() {
             commandLinePipelineOptions(NumericalPolicy::SourceOrdered);
         options.executionMode = ExecutionMode::GpuExecutableBundle;
         options.canonicalOptions =
-            R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":13,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+            R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":14,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
         buildShuttleStablehloPipeline(manager, options);
       });
   PassPipelineRegistration<>(
@@ -6315,7 +6306,7 @@ void registerShuttleStablehloPipelines() {
             commandLinePipelineOptions(NumericalPolicy::Fast);
         options.executionMode = ExecutionMode::GpuExecutableBundle;
         options.canonicalOptions =
-            R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":13,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+            R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":14,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
         buildShuttleStablehloPipeline(manager, options);
       });
 }

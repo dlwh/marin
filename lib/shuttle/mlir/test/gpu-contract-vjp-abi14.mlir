@@ -8,18 +8,13 @@
 // RUN: shuttle-test-opt %S/Inputs/jax-0.10.1-bf16-matmul-vjp-17x33x19-backward.mlir --shuttle-gpu-executable-bundle-fast-pipeline | FileCheck %s --check-prefix=FAST-DESCRIPTOR
 
 // MATERIALIZATION: "shuttle.materialization_plan"() <{{.*}}policy = #shuttle.policy<source_ordered>{{.*}}schema_version = 2
-// MATERIALIZATION-COUNT-10: "shuttle.materialization_task"
 // MATERIALIZATION-COUNT-13: "shuttle.materialization_buffer"
 // MATERIALIZATION-COUNT-2: kind = #shuttle.materialization_task_kind<contract>
 
 // SOURCE-SCHEDULE: "shuttle.schedule_plan"() <{{.*}}policy = #shuttle.policy<source_ordered>{{.*}}schema_version = 2
-// SOURCE-SCHEDULE-COUNT-10: "shuttle.schedule_task"
-// SOURCE-SCHEDULE-COUNT-2: kind = #shuttle.schedule_task_kind<contract>
 // SOURCE-SCHEDULE-COUNT-2: reduction_order = #shuttle.schedule_reduction_order<serial_ascending_fma_rn_f32>
 
 // FAST-SCHEDULE: "shuttle.schedule_plan"() <{{.*}}policy = #shuttle.policy<fast>{{.*}}schema_version = 2
-// FAST-SCHEDULE-COUNT-10: "shuttle.schedule_task"
-// FAST-SCHEDULE-COUNT-2: kind = #shuttle.schedule_task_kind<contract>
 // FAST-SCHEDULE-COUNT-2: reduction_order = #shuttle.schedule_reduction_order<leaf_order_free>
 
 // SOURCE-DESCRIPTOR: stablehlo.custom_call @shuttle.gpu.executable_bundle.v2

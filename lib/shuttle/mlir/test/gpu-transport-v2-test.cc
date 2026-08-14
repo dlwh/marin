@@ -682,7 +682,7 @@ buildFixture(llvm::StringRef source,
   } else if (policy == mlir::shuttle::NumericalPolicy::Fast) {
     manager.addPass(mlir::shuttle::createFormStructuralRegionsPass(
         policy,
-        R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":13,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
+        R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":14,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
         R"json({"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json"));
   } else {
     manager.addPass(mlir::shuttle::createFormStructuralRegionsPass());
@@ -698,20 +698,8 @@ buildFixture(llvm::StringRef source,
 }
 
 std::unique_ptr<BuiltBundle>
-buildAbi13ContractFixture(llvm::StringRef source,
+buildAbi14ContractFixture(llvm::StringRef source,
                           mlir::shuttle::NumericalPolicy policy) {
-  constexpr llvm::StringLiteral sourceOrdered =
-      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":13,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
-  constexpr llvm::StringLiteral fast =
-      R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":13,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
-  return buildFixture(
-      source, policy,
-      policy == mlir::shuttle::NumericalPolicy::Fast ? fast : sourceOrdered);
-}
-
-std::unique_ptr<BuiltBundle>
-buildAbi14ContractVjpFixture(llvm::StringRef source,
-                             mlir::shuttle::NumericalPolicy policy) {
   constexpr llvm::StringLiteral sourceOrdered =
       R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":14,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
   constexpr llvm::StringLiteral fast =
@@ -1059,7 +1047,7 @@ TEST(GpuTransportV2Test, ScalarConvertPreservesBf16RoundingBoundary) {
 }
 
 TEST(GpuTransportV2Test,
-     Abi13ContractMapShapeSweepHasClosedGenericDescriptors) {
+     Abi14ContractMapShapeSweepHasClosedGenericDescriptors) {
   struct Shape {
     int64_t rows;
     int64_t reduction;
@@ -1123,7 +1111,7 @@ TEST(GpuTransportV2Test,
 }
 
 TEST(GpuTransportV2Test,
-     Abi13SourceOrderedContractMapUsesAscendingFmaAndExplicitBf16Map) {
+     Abi14SourceOrderedContractMapUsesAscendingFmaAndExplicitBf16Map) {
   auto built = buildFixture(contractMapModule(7, 13, 3, "first_name"));
   auto renamed = buildFixture(contractMapModule(7, 13, 3, "second_name"));
   ASSERT_TRUE(built);
@@ -1151,28 +1139,35 @@ TEST(GpuTransportV2Test,
                                                         mapLaunch.codeOffset),
                          mapLaunch.codeLength);
   size_t zero = contractPtx.find("mov.f32 %f0, 0f00000000;");
-  size_t induction = contractPtx.find("mov.u64 %rd13, 0;");
+  size_t induction = contractPtx.find("mov.u64 %rd10, 0;");
   size_t loop = contractPtx.find("$contract_loop:");
-  size_t bound = contractPtx.find("setp.ge.u64 %p1, %rd13, 13;", loop);
+  size_t bound = contractPtx.find("setp.ge.u64 %p1, %rd10, 13;", loop);
+  size_t lhsRow = contractPtx.find("mad.lo.u64 %rd11, %rd11, 7, %rd8;", bound);
   size_t lhsIndex =
-      contractPtx.find("mad.lo.u64 %rd14, %rd8, 13, %rd13;", bound);
+      contractPtx.find("mad.lo.u64 %rd11, %rd11, 13, %rd10;", lhsRow);
+  size_t rhsReduction =
+      contractPtx.find("mad.lo.u64 %rd13, %rd13, 13, %rd10;", lhsIndex);
   size_t rhsIndex =
-      contractPtx.find("mad.lo.u64 %rd15, %rd13, 3, %rd9;", lhsIndex);
+      contractPtx.find("mad.lo.u64 %rd13, %rd13, 3, %rd9;", rhsReduction);
   size_t fma = contractPtx.find("fma.rn.f32 %f0, %f1, %f2, %f0;", rhsIndex);
-  size_t increment = contractPtx.find("add.u64 %rd13, %rd13, 1;", fma);
+  size_t increment = contractPtx.find("add.u64 %rd10, %rd10, 1;", fma);
   size_t branch = contractPtx.find("bra $contract_loop;", increment);
   ASSERT_NE(zero, llvm::StringRef::npos);
   ASSERT_NE(induction, llvm::StringRef::npos);
   ASSERT_NE(loop, llvm::StringRef::npos);
   ASSERT_NE(bound, llvm::StringRef::npos);
+  ASSERT_NE(lhsRow, llvm::StringRef::npos);
   ASSERT_NE(lhsIndex, llvm::StringRef::npos);
+  ASSERT_NE(rhsReduction, llvm::StringRef::npos);
   ASSERT_NE(rhsIndex, llvm::StringRef::npos);
   ASSERT_NE(fma, llvm::StringRef::npos);
   EXPECT_LT(zero, induction);
   EXPECT_LT(induction, loop);
   EXPECT_LT(loop, bound);
-  EXPECT_LT(bound, lhsIndex);
-  EXPECT_LT(lhsIndex, rhsIndex);
+  EXPECT_LT(bound, lhsRow);
+  EXPECT_LT(lhsRow, lhsIndex);
+  EXPECT_LT(lhsIndex, rhsReduction);
+  EXPECT_LT(rhsReduction, rhsIndex);
   EXPECT_LT(rhsIndex, fma);
   ASSERT_NE(increment, llvm::StringRef::npos);
   EXPECT_LT(fma, increment);
@@ -1185,7 +1180,7 @@ TEST(GpuTransportV2Test,
 }
 
 TEST(GpuTransportV2Test,
-     Abi13FastContractMapWarpGeometryCoversReductionBoundaries) {
+     Abi14FastContractMapWarpGeometryCoversReductionBoundaries) {
   struct Shape {
     int64_t rows;
     int64_t reduction;
@@ -1204,7 +1199,7 @@ TEST(GpuTransportV2Test,
                  << "M=" << shape.rows << " K=" << shape.reduction
                  << " N=" << shape.columns);
     auto built =
-        buildAbi13ContractFixture(contractMapModule(shape.rows, shape.reduction,
+        buildAbi14ContractFixture(contractMapModule(shape.rows, shape.reduction,
                                                     shape.columns, "anonymous"),
                                   mlir::shuttle::NumericalPolicy::Fast);
     ASSERT_TRUE(built);
@@ -1240,9 +1235,9 @@ TEST(GpuTransportV2Test,
 }
 
 TEST(GpuTransportV2Test,
-     Abi13FastContractMapPtxUsesLaneStridedFmaAndFixedShuffleTree) {
+     Abi14FastContractMapPtxUsesLaneStridedFmaAndFixedShuffleTree) {
   auto built =
-      buildAbi13ContractFixture(contractMapModule(2, 33, 3, "anonymous"),
+      buildAbi14ContractFixture(contractMapModule(2, 33, 3, "anonymous"),
                                 mlir::shuttle::NumericalPolicy::Fast);
   ASSERT_TRUE(built);
   auto bytes = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
@@ -1294,12 +1289,12 @@ TEST(GpuTransportV2Test,
 }
 
 TEST(GpuTransportV2Test,
-     Abi13ContractPoliciesSeparateCodeDeviceAndBundleRoots) {
+     Abi14ContractPoliciesSeparateCodeDeviceAndBundleRoots) {
   std::string source = contractMapModule(2, 33, 3, "anonymous");
-  auto sourceOrdered = buildAbi13ContractFixture(
+  auto sourceOrdered = buildAbi14ContractFixture(
       source, mlir::shuttle::NumericalPolicy::SourceOrdered);
   auto fast =
-      buildAbi13ContractFixture(source, mlir::shuttle::NumericalPolicy::Fast);
+      buildAbi14ContractFixture(source, mlir::shuttle::NumericalPolicy::Fast);
   ASSERT_TRUE(sourceOrdered);
   ASSERT_TRUE(fast);
   auto sourceBytes =
@@ -1329,13 +1324,13 @@ TEST(GpuTransportV2Test,
   llvm::StringRef fastPtx(
       reinterpret_cast<const char *>(fastDecoded->code.data()),
       fastDecoded->launches.front().codeLength);
-  EXPECT_TRUE(sourcePtx.contains("add.u64 %rd13, %rd13, 1;"));
+  EXPECT_TRUE(sourcePtx.contains("add.u64 %rd10, %rd10, 1;"));
   EXPECT_FALSE(sourcePtx.contains("shfl.sync.down.b32"));
   EXPECT_TRUE(fastPtx.contains("shfl.sync.down.b32"));
-  EXPECT_FALSE(fastPtx.contains("add.u64 %rd13, %rd13, 1;"));
+  EXPECT_FALSE(fastPtx.contains("add.u64 %rd10, %rd10, 1;"));
 }
 
-TEST(GpuTransportV2Test, Abi13ContractMapTransportMutationsFailClosed) {
+TEST(GpuTransportV2Test, Abi14ContractMapTransportMutationsFailClosed) {
   auto built = buildFixture(contractMapModule(3, 5, 2, "anonymous"));
   ASSERT_TRUE(built);
   auto bytes = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
@@ -1358,7 +1353,7 @@ TEST(GpuTransportV2Test, Abi13ContractMapTransportMutationsFailClosed) {
   EXPECT_FALSE(mlir::shuttle::GpuExecutable::Load(futureResultInput).ok());
 }
 
-TEST(GpuTransportV2Test, Abi13ContractMapRejectsUnsupportedShapes) {
+TEST(GpuTransportV2Test, Abi14ContractMapRejectsUnsupportedShapes) {
   constexpr llvm::StringLiteral batched = R"mlir(
 module @batched {
   func.func @main(%lhs: tensor<2x3x5xbf16>, %rhs: tensor<2x5x7xbf16>) -> tensor<2x3x7xbf16> {
@@ -1401,10 +1396,10 @@ TEST(GpuTransportV2Test,
   auto source =
       fixtureSource("jax-0.10.1-bf16-matmul-vjp-17x33x19-backward.mlir");
   ASSERT_TRUE(source);
-  auto sourceOrdered = buildAbi14ContractVjpFixture(
+  auto sourceOrdered = buildAbi14ContractFixture(
       *source, mlir::shuttle::NumericalPolicy::SourceOrdered);
-  auto fast = buildAbi14ContractVjpFixture(
-      *source, mlir::shuttle::NumericalPolicy::Fast);
+  auto fast =
+      buildAbi14ContractFixture(*source, mlir::shuttle::NumericalPolicy::Fast);
   ASSERT_TRUE(sourceOrdered);
   ASSERT_TRUE(fast);
 
@@ -1429,7 +1424,7 @@ TEST(GpuTransportV2Test,
   constexpr int64_t kExternalSlots = 5;
   constexpr int64_t kContractOrdinals[] = {3, 8};
   const std::vector<std::vector<int64_t>> expectedInputs = {
-      {2}, {3}, {0}, {4, 5}, {6}, {7}, {3}, {1}, {9, 10}, {11},
+      {0}, {3}, {1}, {4, 5}, {6}, {7}, {3}, {2}, {9, 10}, {11},
   };
   ASSERT_EQ(expectedInputs.size(), kTaskCount);
 
@@ -2132,7 +2127,7 @@ TEST(GpuTransportV2Test,
 }
 
 TEST(GpuTransportV2Test,
-     Abi13ContractMapUsesUnchangedFfiSchemasAndTwoLaunchLifecycle) {
+     Abi14ContractMapUsesUnchangedFfiSchemasAndTwoLaunchLifecycle) {
   auto built = buildFixture(contractMapModule(3, 5, 2, "ffi_anonymous"));
   ASSERT_TRUE(built);
   auto transport = mlir::shuttle::serializeGpuExecutableBundle(*built->module);

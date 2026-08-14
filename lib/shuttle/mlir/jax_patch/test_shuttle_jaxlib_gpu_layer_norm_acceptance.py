@@ -68,7 +68,7 @@ def _events(shape_id: str, boundary: str, numerics: Numerics) -> list[dict[str, 
     ]
 
 
-def test_layer_norm_gpu_driver_binds_twelve_distinct_abi13_cells() -> None:
+def test_historical_layer_norm_gpu_driver_rejects_current_abi14_options() -> None:
     assert PIPELINE_ABI_VERSION == 13
     assert BOUNDARIES == ("forward", "backward", "composed")
     assert POLICIES == (Numerics.SOURCE_ORDERED, Numerics.FAST)
@@ -77,13 +77,12 @@ def test_layer_norm_gpu_driver_binds_twelve_distinct_abi13_cells() -> None:
     assert set(OBSERVER_FINGERPRINTS) == set(cell_identities())
     assert len({fingerprint for pair in OBSERVER_FINGERPRINTS.values() for fingerprint in pair}) == 24
 
-    source = json.loads(subject_options(Numerics.SOURCE_ORDERED)["xla_shuttle_options"])
-    fast = json.loads(subject_options(Numerics.FAST)["xla_shuttle_options"])
-    assert source["pipeline_abi_version"] == 13
-    assert fast["pipeline_abi_version"] == 13
-    assert source["numerics"] == "source_ordered"
-    assert fast["numerics"] == "fast"
-    assert source != fast
+    for numerics in POLICIES:
+        with pytest.raises(AssertionError, match="requires pipeline ABI 13"):
+            subject_options(numerics)
+        identity = expected_identity(numerics)
+        assert json.loads(identity.canonical_options)["pipeline_abi_version"] == 13
+        assert identity.policy == numerics.value
 
 
 def test_layer_norm_public_jax_result_order_matches_independent_oracle() -> None:
