@@ -410,8 +410,12 @@ cc_test(
     name = "gpu_transport_v2_test",
     srcs = ["test/gpu-transport-v2-test.cc"],
     data = [
+        "test/Inputs/jax-0.10.1-bf16-batched_contract-2x5x3x7x11-backward.mlir",
         "test/Inputs/jax-0.10.1-bf16-batched_contract-2x5x3x7x11-composed.mlir",
         "test/Inputs/jax-0.10.1-bf16-batched_contract-2x5x3x7x11-forward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-batched_contract-3x4x2x13x6-backward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-batched_contract-3x4x2x13x6-composed.mlir",
+        "test/Inputs/jax-0.10.1-bf16-batched_contract-3x4x2x13x6-forward.mlir",
         "test/Inputs/jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-backward.mlir",
         "test/Inputs/jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-composed.mlir",
         "test/Inputs/jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-forward.mlir",

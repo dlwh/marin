@@ -1423,145 +1423,340 @@ module @f32_inputs {
 
 TEST(GpuTransportV2Test,
      Abi16ProjectedBatchedContractClosesTransportGeometryAndAddressing) {
-  auto source = fixtureSource(
-      "jax-0.10.1-bf16-batched_contract-2x5x3x7x11-forward.mlir");
-  ASSERT_TRUE(source);
-  auto sourceOrdered = buildGpuContractFixture(
-      *source, mlir::shuttle::NumericalPolicy::SourceOrdered);
-  auto fast =
-      buildGpuContractFixture(*source, mlir::shuttle::NumericalPolicy::Fast);
-  ASSERT_TRUE(sourceOrdered);
-  ASSERT_TRUE(fast);
-
-  auto sourceBytes =
-      mlir::shuttle::serializeGpuExecutableBundle(*sourceOrdered->module);
-  auto fastBytes = mlir::shuttle::serializeGpuExecutableBundle(*fast->module);
-  ASSERT_TRUE(mlir::succeeded(sourceBytes));
-  ASSERT_TRUE(mlir::succeeded(fastBytes));
-  auto sourceDecoded = decodeInlineSchema2(*sourceBytes);
-  auto fastDecoded = decodeInlineSchema2(*fastBytes);
-  ASSERT_TRUE(sourceDecoded);
-  ASSERT_TRUE(fastDecoded);
-  auto sourcePublic = mlir::shuttle::GpuExecutable::Load(*sourceBytes);
-  auto fastPublic = mlir::shuttle::GpuExecutable::Load(*fastBytes);
-  ASSERT_TRUE(sourcePublic.ok()) << sourcePublic.status();
-  ASSERT_TRUE(fastPublic.ok()) << fastPublic.status();
-
-  constexpr int64_t kContractOrdinal = 4;
-  const std::vector<std::vector<int64_t>> expectedInputs = {
-      {0}, {2}, {1}, {4}, {3, 5}, {6},
+  struct Linearization {
+    int64_t linearRegister;
+    std::array<int64_t, 4> extents;
+    std::array<int64_t, 4> coordinateRegisters;
   };
-  for (const Decoded *decoded : {&*sourceDecoded, &*fastDecoded}) {
-    ASSERT_EQ(decoded->launches.size(), 6);
-    EXPECT_EQ(decoded->slots, 8);
-    EXPECT_EQ(decoded->externalSlots, 3);
-    EXPECT_EQ(decoded->scalarSlots, 0);
-    for (int64_t ordinal = 0; ordinal < 6; ++ordinal) {
-      EXPECT_EQ(decoded->launches[ordinal].taskOrdinal, ordinal);
-      EXPECT_EQ(decoded->launches[ordinal].inputSlots,
-                expectedInputs[ordinal]);
-      EXPECT_EQ(decoded->launches[ordinal].outputSlots,
-                (std::vector<int64_t>{2 + ordinal}));
-    }
-  }
-  EXPECT_EQ(sourceDecoded->policy, 0);
-  EXPECT_EQ(fastDecoded->policy, 1);
-  EXPECT_EQ(sourceDecoded->launches[kContractOrdinal].grid,
-            (std::array<uint64_t, 3>{2, 1, 1}));
-  EXPECT_EQ(sourceDecoded->launches[kContractOrdinal].block,
-            (std::array<uint64_t, 3>{256, 1, 1}));
-  EXPECT_EQ(fastDecoded->launches[kContractOrdinal].grid,
-            (std::array<uint64_t, 3>{42, 1, 1}));
-  EXPECT_EQ(fastDecoded->launches[kContractOrdinal].block,
-            (std::array<uint64_t, 3>{256, 1, 1}));
+  struct Contract {
+    llvm::StringRef orientation;
+    int64_t ordinal;
+    std::vector<int64_t> inputSlots;
+    uint64_t sourceGrid;
+    uint64_t sourceBlock;
+    uint64_t fastGrid;
+    uint64_t fastBlock;
+    std::array<Linearization, 2> inputs;
+  };
+  struct Boundary {
+    llvm::StringRef filename;
+    int64_t launches;
+    int64_t slots;
+    int64_t operandCount;
+    std::vector<int64_t> externalBytes;
+    std::vector<Contract> contracts;
+  };
 
-  constexpr std::array<int64_t, 3> expectedBytes = {420, 924, 660};
-  for (const auto *loaded : {&*sourcePublic, &*fastPublic}) {
-    ASSERT_EQ((*loaded)->launches().size(), 6);
-    ASSERT_EQ((*loaded)->slots().size(), 8);
-    ASSERT_EQ((*loaded)->externalBindings().size(), 3);
-    for (auto [ordinal, binding] :
-         llvm::enumerate((*loaded)->externalBindings())) {
-      EXPECT_EQ(binding.kind,
-                ordinal < 2
-                    ? mlir::shuttle::ExecutableBindingKind::Operand
-                    : mlir::shuttle::ExecutableBindingKind::Result);
-      EXPECT_EQ(binding.index, ordinal < 2 ? ordinal : 0);
-      EXPECT_EQ(binding.requiredBytes, expectedBytes[ordinal]);
-    }
-  }
+  const std::vector<Boundary> boundaries = {
+      {"jax-0.10.1-bf16-batched_contract-2x5x3x7x11-forward.mlir",
+       6,
+       8,
+       2,
+       {420, 924, 660},
+       {{"forward",
+         4,
+         {3, 5},
+         2,
+         256,
+         42,
+         256,
+         {{{13, {2, 3, 5, 7}, {8, 9, 10, 12}},
+           {15, {2, 3, 11, 7}, {8, 9, 11, 12}}}}}}},
+      {"jax-0.10.1-bf16-batched_contract-2x5x3x7x11-backward.mlir",
+       11,
+       14,
+       3,
+       {420, 924, 660, 924, 420},
+       {{"dRHS",
+         5,
+         {7, 4},
+         2,
+         256,
+         58,
+         256,
+         {{{13, {2, 3, 5, 11}, {8, 9, 12, 10}},
+           {15, {2, 3, 5, 7}, {8, 9, 12, 11}}}}},
+        {"dLHS",
+         6,
+         {7, 6},
+         1,
+         224,
+         27,
+         256,
+         {{{13, {2, 3, 5, 11}, {8, 9, 10, 12}},
+           {15, {2, 3, 11, 7}, {8, 9, 12, 11}}}}}}},
+      {"jax-0.10.1-bf16-batched_contract-2x5x3x7x11-composed.mlir",
+       13,
+       16,
+       3,
+       {420, 924, 660, 660, 924, 420},
+       {{"forward",
+         4,
+         {4, 6},
+         2,
+         256,
+         42,
+         256,
+         {{{13, {2, 3, 5, 7}, {8, 9, 10, 12}},
+           {15, {2, 3, 11, 7}, {8, 9, 11, 12}}}}},
+        {"dRHS",
+         7,
+         {9, 4},
+         2,
+         256,
+         58,
+         256,
+         {{{13, {2, 3, 5, 11}, {8, 9, 12, 10}},
+           {15, {2, 3, 5, 7}, {8, 9, 12, 11}}}}},
+        {"dLHS",
+         8,
+         {9, 6},
+         1,
+         224,
+         27,
+         256,
+         {{{13, {2, 3, 5, 11}, {8, 9, 10, 12}},
+           {15, {2, 3, 11, 7}, {8, 9, 12, 11}}}}}}},
+      {"jax-0.10.1-bf16-batched_contract-3x4x2x13x6-forward.mlir",
+       6,
+       8,
+       2,
+       {624, 936, 288},
+       {{"forward",
+         4,
+         {3, 5},
+         1,
+         160,
+         18,
+         256,
+         {{{13, {3, 2, 4, 13}, {8, 9, 10, 12}},
+           {15, {3, 2, 6, 13}, {8, 9, 11, 12}}}}}}},
+      {"jax-0.10.1-bf16-batched_contract-3x4x2x13x6-backward.mlir",
+       11,
+       14,
+       3,
+       {624, 936, 288, 936, 624},
+       {{"dRHS",
+         5,
+         {7, 4},
+         2,
+         256,
+         59,
+         256,
+         {{{13, {3, 2, 4, 6}, {8, 9, 12, 10}},
+           {15, {3, 2, 4, 13}, {8, 9, 12, 11}}}}},
+        {"dLHS",
+         6,
+         {7, 6},
+         2,
+         256,
+         39,
+         256,
+         {{{13, {3, 2, 4, 6}, {8, 9, 10, 12}},
+           {15, {3, 2, 6, 13}, {8, 9, 12, 11}}}}}}},
+      {"jax-0.10.1-bf16-batched_contract-3x4x2x13x6-composed.mlir",
+       13,
+       16,
+       3,
+       {624, 936, 288, 288, 936, 624},
+       {{"forward",
+         4,
+         {4, 6},
+         1,
+         160,
+         18,
+         256,
+         {{{13, {3, 2, 4, 13}, {8, 9, 10, 12}},
+           {15, {3, 2, 6, 13}, {8, 9, 11, 12}}}}},
+        {"dRHS",
+         7,
+         {9, 4},
+         2,
+         256,
+         59,
+         256,
+         {{{13, {3, 2, 4, 6}, {8, 9, 12, 10}},
+           {15, {3, 2, 4, 13}, {8, 9, 12, 11}}}}},
+        {"dLHS",
+         8,
+         {9, 6},
+         2,
+         256,
+         39,
+         256,
+         {{{13, {3, 2, 4, 6}, {8, 9, 10, 12}},
+           {15, {3, 2, 6, 13}, {8, 9, 12, 11}}}}}}},
+  };
 
-  auto contractPtx = [=](const Decoded &decoded) {
-    const auto &launch = decoded.launches[kContractOrdinal];
+  auto contractPtx = [](const Decoded &decoded, int64_t ordinal) {
+    const auto &launch = decoded.launches[ordinal];
     return llvm::StringRef(
-        reinterpret_cast<const char *>(decoded.code.data() +
-                                       launch.codeOffset),
+        reinterpret_cast<const char *>(decoded.code.data() + launch.codeOffset),
         launch.codeLength);
   };
-  llvm::StringRef sourcePtx = contractPtx(*sourceDecoded);
-  llvm::StringRef fastPtx = contractPtx(*fastDecoded);
-  for (llvm::StringRef ptx : {sourcePtx, fastPtx}) {
-    EXPECT_TRUE(ptx.contains("mad.lo.u64 %rd13, %rd13, 2, %rd8;\n"
-                             "  mad.lo.u64 %rd13, %rd13, 3, %rd9;\n"
-                             "  mad.lo.u64 %rd13, %rd13, 5, %rd10;\n"
-                             "  mad.lo.u64 %rd13, %rd13, 7, %rd12;"));
-    EXPECT_TRUE(ptx.contains("mad.lo.u64 %rd15, %rd15, 2, %rd8;\n"
-                             "  mad.lo.u64 %rd15, %rd15, 3, %rd9;\n"
-                             "  mad.lo.u64 %rd15, %rd15, 11, %rd11;\n"
-                             "  mad.lo.u64 %rd15, %rd15, 7, %rd12;"));
-    EXPECT_EQ(ptx.count("fma.rn.f32"), 1u);
-  }
-  EXPECT_TRUE(sourcePtx.contains("add.u64 %rd12, %rd12, 1;"));
-  EXPECT_FALSE(sourcePtx.contains("shfl.sync.down.b32"));
-  EXPECT_FALSE(fastPtx.contains("add.u64 %rd12, %rd12, 1;"));
-  EXPECT_EQ(fastPtx.count("shfl.sync.down.b32"), 5u);
-  EXPECT_NE(sourceDecoded->code, fastDecoded->code);
-  EXPECT_NE(*sourceBytes, *fastBytes);
+  auto expectLinearization = [](llvm::StringRef ptx,
+                                const Linearization &input) {
+    size_t cursor = 0;
+    for (auto [extent, coordinate] :
+         llvm::zip_equal(input.extents, input.coordinateRegisters)) {
+      std::string expected =
+          ("mad.lo.u64 %rd" + llvm::Twine(input.linearRegister) + ", %rd" +
+           llvm::Twine(input.linearRegister) + ", " + llvm::Twine(extent) +
+           ", %rd" + llvm::Twine(coordinate) + ";")
+              .str();
+      cursor = ptx.find(expected, cursor);
+      ASSERT_NE(cursor, llvm::StringRef::npos) << expected;
+      ++cursor;
+    }
+    const int64_t pointerRegister = input.linearRegister + 1;
+    const int64_t parameter = input.linearRegister == 13 ? 0 : 1;
+    std::string address =
+        ("ld.param.u64 %rd" + llvm::Twine(pointerRegister) + ", [p" +
+         llvm::Twine(parameter) + "];\n  mad.lo.u64 %rd" +
+         llvm::Twine(pointerRegister) + ", %rd" +
+         llvm::Twine(input.linearRegister) + ", 4, %rd" +
+         llvm::Twine(pointerRegister) + ";")
+            .str();
+    EXPECT_TRUE(ptx.contains(address)) << address;
+  };
 
-  auto futureResultInput = futureProducedResultInput(*sourceBytes,
-                                                     *sourceDecoded);
-  ASSERT_FALSE(futureResultInput.empty());
-  EXPECT_FALSE(decodeInlineSchema2(futureResultInput));
-  EXPECT_FALSE(mlir::shuttle::GpuExecutable::Load(futureResultInput).ok());
+  for (const Boundary &boundary : boundaries) {
+    SCOPED_TRACE(boundary.filename.str());
+    auto source = fixtureSource(boundary.filename);
+    ASSERT_TRUE(source);
+    auto sourceOrdered = buildGpuContractFixture(
+        *source, mlir::shuttle::NumericalPolicy::SourceOrdered);
+    auto fast =
+        buildGpuContractFixture(*source, mlir::shuttle::NumericalPolicy::Fast);
+    ASSERT_TRUE(sourceOrdered);
+    ASSERT_TRUE(fast);
+
+    auto sourceBytes =
+        mlir::shuttle::serializeGpuExecutableBundle(*sourceOrdered->module);
+    auto fastBytes = mlir::shuttle::serializeGpuExecutableBundle(*fast->module);
+    ASSERT_TRUE(mlir::succeeded(sourceBytes));
+    ASSERT_TRUE(mlir::succeeded(fastBytes));
+    auto sourceDecoded = decodeInlineSchema2(*sourceBytes);
+    auto fastDecoded = decodeInlineSchema2(*fastBytes);
+    ASSERT_TRUE(sourceDecoded);
+    ASSERT_TRUE(fastDecoded);
+    auto sourcePublic = mlir::shuttle::GpuExecutable::Load(*sourceBytes);
+    auto fastPublic = mlir::shuttle::GpuExecutable::Load(*fastBytes);
+    ASSERT_TRUE(sourcePublic.ok()) << sourcePublic.status();
+    ASSERT_TRUE(fastPublic.ok()) << fastPublic.status();
+
+    for (const Decoded *decoded : {&*sourceDecoded, &*fastDecoded}) {
+      ASSERT_EQ(decoded->launches.size(), boundary.launches);
+      EXPECT_EQ(decoded->slots, boundary.slots);
+      EXPECT_EQ(decoded->externalSlots, boundary.externalBytes.size());
+      EXPECT_EQ(decoded->scalarSlots, 0);
+      for (int64_t ordinal = 0; ordinal < boundary.launches; ++ordinal) {
+        EXPECT_EQ(decoded->launches[ordinal].taskOrdinal, ordinal);
+        EXPECT_EQ(decoded->launches[ordinal].outputSlots,
+                  (std::vector<int64_t>{boundary.operandCount + ordinal}));
+      }
+    }
+    EXPECT_EQ(sourceDecoded->policy, 0);
+    EXPECT_EQ(fastDecoded->policy, 1);
+
+    for (const auto *loaded : {&*sourcePublic, &*fastPublic}) {
+      ASSERT_EQ((*loaded)->launches().size(), boundary.launches);
+      ASSERT_EQ((*loaded)->slots().size(), boundary.slots);
+      ASSERT_EQ((*loaded)->externalBindings().size(),
+                boundary.externalBytes.size());
+      for (auto [ordinal, binding] :
+           llvm::enumerate((*loaded)->externalBindings())) {
+        const bool isOperand = ordinal < boundary.operandCount;
+        EXPECT_EQ(binding.kind,
+                  isOperand ? mlir::shuttle::ExecutableBindingKind::Operand
+                            : mlir::shuttle::ExecutableBindingKind::Result);
+        EXPECT_EQ(binding.index,
+                  isOperand ? ordinal : ordinal - boundary.operandCount);
+        EXPECT_EQ(binding.requiredBytes, boundary.externalBytes[ordinal]);
+      }
+    }
+
+    for (const Contract &contract : boundary.contracts) {
+      SCOPED_TRACE(contract.orientation.str());
+      const auto &sourceLaunch = sourceDecoded->launches[contract.ordinal];
+      const auto &fastLaunch = fastDecoded->launches[contract.ordinal];
+      EXPECT_EQ(sourceLaunch.inputSlots, contract.inputSlots);
+      EXPECT_EQ(fastLaunch.inputSlots, contract.inputSlots);
+      EXPECT_EQ(sourceLaunch.grid,
+                (std::array<uint64_t, 3>{contract.sourceGrid, 1, 1}));
+      EXPECT_EQ(sourceLaunch.block,
+                (std::array<uint64_t, 3>{contract.sourceBlock, 1, 1}));
+      EXPECT_EQ(fastLaunch.grid,
+                (std::array<uint64_t, 3>{contract.fastGrid, 1, 1}));
+      EXPECT_EQ(fastLaunch.block,
+                (std::array<uint64_t, 3>{contract.fastBlock, 1, 1}));
+      EXPECT_EQ(sourceLaunch.dynamicSharedMemoryBytes, 0);
+      EXPECT_EQ(fastLaunch.dynamicSharedMemoryBytes, 0);
+
+      llvm::StringRef sourcePtx = contractPtx(*sourceDecoded, contract.ordinal);
+      llvm::StringRef fastPtx = contractPtx(*fastDecoded, contract.ordinal);
+      for (llvm::StringRef ptx : {sourcePtx, fastPtx}) {
+        for (const Linearization &input : contract.inputs)
+          expectLinearization(ptx, input);
+        EXPECT_EQ(ptx.count("fma.rn.f32"), 1u);
+        EXPECT_EQ(ptx.count("ld.global.f32"), 2u);
+        EXPECT_FALSE(ptx.contains("ld.global.u16"));
+      }
+      EXPECT_TRUE(sourcePtx.contains("add.u64 %rd12, %rd12, 1;"));
+      EXPECT_FALSE(sourcePtx.contains("shfl.sync.down.b32"));
+      EXPECT_FALSE(fastPtx.contains("add.u64 %rd12, %rd12, 1;"));
+      EXPECT_EQ(fastPtx.count("shfl.sync.down.b32"), 5u);
+    }
+    EXPECT_NE(sourceDecoded->code, fastDecoded->code);
+    EXPECT_NE(*sourceBytes, *fastBytes);
+
+    auto futureResultInput =
+        futureProducedResultInput(*sourceBytes, *sourceDecoded);
+    ASSERT_FALSE(futureResultInput.empty());
+    EXPECT_FALSE(decodeInlineSchema2(futureResultInput));
+    EXPECT_FALSE(mlir::shuttle::GpuExecutable::Load(futureResultInput).ok());
+  }
 }
 
-TEST(GpuTransportV2Test,
-     Abi16ComposedBatchedContractPreservesPublicProjectionTransport) {
-  auto source = fixtureSource(
-      "jax-0.10.1-bf16-batched_contract-2x5x3x7x11-composed.mlir");
-  ASSERT_TRUE(source);
-  auto built = buildGpuContractFixture(
-      *source, mlir::shuttle::NumericalPolicy::SourceOrdered);
-  ASSERT_TRUE(built);
-  auto bytes = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
-  ASSERT_TRUE(mlir::succeeded(bytes));
-  auto decoded = decodeInlineSchema2(*bytes);
-  ASSERT_TRUE(decoded);
-  auto loaded = mlir::shuttle::GpuExecutable::Load(*bytes);
-  ASSERT_TRUE(loaded.ok()) << loaded.status();
-
-  EXPECT_EQ(decoded->launches.size(), 13);
-  EXPECT_EQ(decoded->slots, 16);
-  EXPECT_EQ(decoded->externalSlots, 6);
-  constexpr int64_t kContractOrdinals[] = {4, 7, 8};
-  for (int64_t ordinal : kContractOrdinals) {
-    llvm::StringRef ptx(
-        reinterpret_cast<const char *>(decoded->code.data() +
-                                       decoded->launches[ordinal].codeOffset),
-        decoded->launches[ordinal].codeLength);
-    EXPECT_EQ(ptx.count("fma.rn.f32"), 1u);
-  }
-  constexpr std::array<int64_t, 6> expectedBytes = {
-      420, 924, 660, 660, 924, 420,
+TEST(GpuTransportV2Test, Abi16BatchedContractFingerprintsIgnoreModuleSymbols) {
+  struct Rename {
+    llvm::StringRef filename;
+    llvm::StringRef original;
+    llvm::StringRef replacement;
   };
-  ASSERT_EQ((*loaded)->externalBindings().size(), expectedBytes.size());
-  for (auto [ordinal, binding] :
-       llvm::enumerate((*loaded)->externalBindings())) {
-    EXPECT_EQ(binding.kind,
-              ordinal < 3 ? mlir::shuttle::ExecutableBindingKind::Operand
-                          : mlir::shuttle::ExecutableBindingKind::Result);
-    EXPECT_EQ(binding.index, ordinal < 3 ? ordinal : ordinal - 3);
-    EXPECT_EQ(binding.requiredBytes, expectedBytes[ordinal]);
+  constexpr Rename renames[] = {
+      {"jax-0.10.1-bf16-batched_contract-2x5x3x7x11-forward.mlir",
+       "module @jit_forward", "module @renamed_forward"},
+      {"jax-0.10.1-bf16-batched_contract-2x5x3x7x11-composed.mlir",
+       "module @jit_composed", "module @renamed_composed"},
+  };
+  for (const Rename &rename : renames) {
+    SCOPED_TRACE(rename.filename.str());
+    auto source = fixtureSource(rename.filename);
+    ASSERT_TRUE(source);
+    llvm::StringRef sourceRef(*source);
+    const size_t first = sourceRef.find(rename.original);
+    ASSERT_NE(first, llvm::StringRef::npos);
+    ASSERT_EQ(sourceRef.find(rename.original, first + rename.original.size()),
+              llvm::StringRef::npos);
+    std::string renamed = *source;
+    renamed.replace(first, rename.original.size(), rename.replacement.str());
+
+    for (mlir::shuttle::NumericalPolicy policy :
+         {mlir::shuttle::NumericalPolicy::SourceOrdered,
+          mlir::shuttle::NumericalPolicy::Fast}) {
+      auto originalBuilt = buildGpuContractFixture(*source, policy);
+      auto renamedBuilt = buildGpuContractFixture(renamed, policy);
+      ASSERT_TRUE(originalBuilt);
+      ASSERT_TRUE(renamedBuilt);
+      auto originalBytes =
+          mlir::shuttle::serializeGpuExecutableBundle(*originalBuilt->module);
+      auto renamedBytes =
+          mlir::shuttle::serializeGpuExecutableBundle(*renamedBuilt->module);
+      ASSERT_TRUE(mlir::succeeded(originalBytes));
+      ASSERT_TRUE(mlir::succeeded(renamedBytes));
+      EXPECT_EQ(*originalBytes, *renamedBytes);
+    }
   }
 }
 
@@ -2467,8 +2662,8 @@ TEST(GpuTransportV2Test,
 
 TEST(GpuTransportV2Test,
      Abi16ProjectedBatchedContractUsesUnchangedFfiSchemasAndSixLaunches) {
-  auto source = fixtureSource(
-      "jax-0.10.1-bf16-batched_contract-2x5x3x7x11-forward.mlir");
+  auto source =
+      fixtureSource("jax-0.10.1-bf16-batched_contract-2x5x3x7x11-forward.mlir");
   ASSERT_TRUE(source);
   auto built = buildGpuContractFixture(
       *source, mlir::shuttle::NumericalPolicy::SourceOrdered);

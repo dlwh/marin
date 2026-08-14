@@ -1272,17 +1272,22 @@ public:
     if (plan) {
       for (MaterializationTaskOp task :
            plan.getBody().front().getOps<MaterializationTaskOp>()) {
-        if (task.getKind() != MaterializationTaskKind::Contract ||
-            task.getDomainShape().size() != 3) {
+        if (task.getKind() != MaterializationTaskKind::Contract) {
           continue;
         }
         SmallVector<int64_t> domain(task.getDomainShape().begin(),
                                     task.getDomainShape().end());
-        ++domain[0];
-        task->setAttr("domain_shape",
-                      DenseI64ArrayAttr::get(task.getContext(), domain));
-        refreshMaterializationFingerprint(plan);
-        return;
+        for (auto [axis, extent] : llvm::enumerate(domain)) {
+          if (llvm::is_contained(task.getReductionDimensions(),
+                                 static_cast<int64_t>(axis))) {
+            continue;
+          }
+          domain[axis] = extent + 1;
+          task->setAttr("domain_shape",
+                        DenseI64ArrayAttr::get(task.getContext(), domain));
+          refreshMaterializationFingerprint(plan);
+          return;
+        }
       }
     }
     getOperation().emitError(
@@ -1715,6 +1720,21 @@ public:
         task->setAttr(
             "reduction_axis",
             IntegerAttr::get(task.getReductionAxisAttr().getType(), 1));
+      } else if (mutation == "output") {
+        SmallVector<int64_t> domain(task.getDomainShape());
+        for (auto [axis, extent] : llvm::enumerate(domain)) {
+          if (static_cast<int64_t>(axis) == task.getReductionAxis()) {
+            continue;
+          }
+          domain[axis] = extent + 1;
+          task->setAttr("domain_shape",
+                        DenseI64ArrayAttr::get(task.getContext(), domain));
+          refreshScheduleFingerprint(plan);
+          return;
+        }
+        getOperation().emitError(
+            "Contract schedule has no parallel output axis");
+        return signalPassFailure();
       } else {
         getOperation().emitError("unknown Contract schedule mutation kind");
         return signalPassFailure();
