@@ -4936,3 +4936,32 @@ author: dlwh
   secret projection, trust-root approval, image transfer, hardware launch, and
   the two implementation modules remain absent or null. No network, image,
   Iris, hardware, upload, push, or integration action occurred.
+
+### 2026-08-14 07:16 PDT - TLTC-MLIR-028 ABI 15 task receipt verification
+
+- Implemented task-side verification for canonical controller-signed `ACK`
+  and chained `TERMINAL` receipts. The verifier closes JSON schemas and types,
+  requires the current pinned Ed25519 key with no previous-key fallback, joins
+  launch and authority identities to the governing contract, enforces running
+  and succeeded states, and requires `READY < ACK < TERMINAL` sequence order.
+- Iris mints `attempt_uid` when it inserts an attempt, so the pre-run contract
+  cannot pin that value. The task accepts the well-formed UID in the exact
+  signed `ACK`; `TERMINAL` must repeat the same UID. A prior test that treated
+  the fixture UID as preauthorized was replaced with this controller-minting
+  behavior.
+- Exact local series: implementation
+  `b9c4c371c3857b756ebd25038bd8705d0a3dea1e`; contract-metadata repair
+  `260d90329415322a2edecceb472bc78745a47552`, tree
+  `46757967bbbc77396cc18c7e2f65ecd17d4264b8`. Independent strict review
+  approved the final tip with no P1 or P2 findings.
+- Task and contract coverage passes 58/58. The complete receipt census is
+  59 passed and 33 intentional failures, all at the absent controller receipt
+  module. The unchanged ABI15 pre-image harness passes 157/157. Required
+  changed-files precommit and both commit hooks pass.
+- Controller issuance remains a design stop. A future implementation must
+  derive `READY` and `TERMINAL` records from a controller-owned log observation
+  interface and must not treat caller-supplied record files or fixture sequence
+  numbers as authority. Receipt-authority approval, signer integration, secret
+  projection, task success, image transfer, and hardware launch remain absent.
+  No network, Iris mutation, image, hardware, upload, push, or integration
+  action occurred.
