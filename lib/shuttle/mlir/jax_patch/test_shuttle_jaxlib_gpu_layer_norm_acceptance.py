@@ -89,6 +89,7 @@ def test_layer_norm_gpu_driver_binds_twelve_distinct_abi11_cells() -> None:
 def test_layer_norm_public_jax_result_order_matches_independent_oracle() -> None:
     shape = SHAPES[0]
     values = {}
+    assert [len(boundary_inputs(shape, boundary)) for boundary in BOUNDARIES] == [3, 3, 4]
     for boundary in BOUNDARIES:
         values[boundary] = arrays(boundary_function(boundary)(*boundary_inputs(shape, boundary)))
         assert tuple(value.shape for value in values[boundary]) == tuple(

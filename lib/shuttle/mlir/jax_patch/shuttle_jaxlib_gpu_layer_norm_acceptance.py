@@ -133,7 +133,8 @@ def boundary_function(boundary: str):
         return layer_norm
     if boundary == "backward":
 
-        def backward(x, gamma, beta, dy):
+        def backward(x, gamma, dy):
+            beta = jnp.zeros_like(gamma)
             _, pullback = jax.vjp(layer_norm, x, gamma, beta)
             return pullback(dy)
 
@@ -178,7 +179,11 @@ def independent_reference(shape: Shape) -> tuple[np.ndarray, ...]:
 
 def boundary_inputs(shape: Shape, boundary: str) -> tuple[np.ndarray, ...]:
     values = fixed_inputs(shape)
-    return values[:3] if boundary == "forward" else values
+    if boundary == "forward":
+        return values[:3]
+    if boundary == "backward":
+        return values[0], values[1], values[3]
+    return values
 
 
 def arrays(value: Any) -> tuple[np.ndarray, ...]:
@@ -361,6 +366,9 @@ def run_subject(worker: str, baseline_path: Path, cache_directory: Path, key_map
     if worker == "populate" and initial:
         raise AssertionError("ABI 11 populate cache must start empty")
     expected_keys = json.loads(key_map_path.read_text()) if worker == "reuse" else {}
+    expected_labels = {f"{shape_id}_{boundary}_{policy}" for shape_id, boundary, policy in cell_identities()}
+    if worker == "reuse" and set(expected_keys) != expected_labels:
+        raise AssertionError("ABI 11 reuse key map does not cover the twelve exact cells")
     counter = CacheHitCounter()
     jax.monitoring.register_event_listener(counter.observe)
     reports = []
