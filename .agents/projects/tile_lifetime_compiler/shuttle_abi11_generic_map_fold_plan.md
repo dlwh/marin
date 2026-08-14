@@ -9,9 +9,12 @@ boundary at `BF16[2048,4096]`, plus `BF16[7,13]` structural mutations.  No
 production branch may select LayerNorm, an exported function name, a fixture
 digest, or a fixed launch/slot count.
 
-This is a no-hardware implementation slice.  It must preserve the reviewed ABI
-10 branch and must not promote any evaluation cell before rebuilt-plugin H100
-evidence is separately authorized and collected.
+This is a no-hardware implementation slice. It preserves the frozen ABI 10
+evidence lineage and must not promote any evaluation cell before rebuilt-plugin
+H100 evidence is separately authorized and collected. ABI 11 admits both
+SOURCE_ORDERED and FAST to the same bounded descriptor-driven compiler path;
+their generated code is required to match while policy-bound roots, observer
+fingerprints, compiler options, and cache identities remain distinct.
 
 ## Entry contract
 
@@ -84,12 +87,12 @@ The frozen materialization graphs provide the initial resource boundary:
 
 | Shape/boundary | Tasks | Slots | Temporary bytes without reuse | Peak live bytes |
 |---|---:|---:|---:|---:|
-| 2048x4096 forward | 31 | 34 | 335,699,988 | 100,663,296 |
-| 2048x4096 backward | 73 | 76 | 704,979,008 | 167,772,160 |
-| 2048x4096 composed | 80 | 84 | 839,229,504 | 167,804,928 |
-| 7x13 forward | 31 | 34 | 4,176 | 1,092 |
-| 7x13 backward | 73 | 76 | 8,824 | 1,820 |
-| 7x13 composed | 80 | 84 | 10,384 | 1,928 |
+| 2048x4096 forward | 31 | 34 | 335,699,988 | 100,671,488 |
+| 2048x4096 backward | 73 | 76 | 704,979,008 | 167,804,932 |
+| 2048x4096 composed | 80 | 84 | 839,229,504 | 167,804,932 |
+| 7x13 forward | 31 | 34 | 4,176 | 1,120 |
+| 7x13 backward | 73 | 76 | 8,824 | 1,932 |
+| 7x13 composed | 80 | 84 | 10,384 | 1,932 |
 
 The ABI must validate actual reuse groups and total allocated group bytes; it
 must not accept the table values as workload-selection constants.
@@ -116,23 +119,45 @@ must not accept the table values as workload-selection constants.
    self-consistent transports through the same v2 handler.  It checks distinct
    Prepare states, all decoded allocations, all PTX loads, exact ordered launch
    arguments, failure propagation, and concurrent execution.
-7. Rebuilt ordinary JAX is a later required gate: disabled reference, populate,
-   and fresh-process reuse; bitwise SOURCE_ORDERED output; one attributed miss,
-   one public hit, no reuse observer events, and immutable cache bytes.
+7. Rebuilt ordinary JAX is a later required gate: disabled ordinary-JAX
+   baseline, independent float64 reference, populate, and fresh-process reuse
+   for all twelve shape/boundary/policy cells. Each cell must add one attributed
+   miss, the reuse process must report twelve public hits with no observer
+   events, and cache bytes must remain immutable. Numerical qualification uses
+   the predeclared per-output absolute-error limits; it must not replace them
+   with post-run tolerances.
+8. SOURCE_ORDERED and FAST must emit byte-identical PTX for the same structural
+   fixture while producing distinct serialized transports, observer
+   fingerprints, canonical options, and persistent-cache keys. This proves
+   policy identity only; numerical acceptance still requires the rebuilt-plugin
+   H100 run.
 
 ## Scope exclusions
 
-- No GPU FAST claim.  FAST requires a separate policy-legality and numerical
-  contract, even if its initial code stream is identical.
+- No accepted GPU FAST numerical or performance claim. ABI 11 implements and
+  locally tests FAST policy legality and identity, but the twelve-cell H100
+  correctness/cache run remains unexecuted.
 - No Contract, Scan, Relation, Transport, collective, or EventTensor codegen.
 - No H100/GB200 reservation, timing, profiling, upload, scorecard promotion,
   push, or integration.
 
+## Local implementation checkpoint
+
+The isolated ABI 11 worktree implements the generic boundary described above.
+The local contract covers six natural LayerNorm fixtures, both numerical
+policies, dynamic launch/slot/projection validation, size-aware temporary reuse,
+the v2 CUDA handler export, and a twelve-cell fresh-process acceptance driver.
+The pinned native aggregate and the Shuttle/JAX-patch Python aggregate are
+green. The real CUDA plugin has not been rebuilt for this ABI, the generated
+PTX has not been assembled by `ptxas`, and no GPU output or cache result exists.
+Those remain required gates, not inferred evidence.
+
 ## Follow-on sequence
 
-1. General multi-axis/multi-result Map/Fold LayerNorm forward, backward, and
-   composed boundaries, ABI 11, local and rebuilt-plugin gates.
-2. GPU FAST policy with an independently reviewed error contract.
+1. Seal and independently review the local ABI 11 generic Map/Fold production
+   and twelve-cell acceptance contract.
+2. Rebuild the real CUDA plugin and run the authorized untimed H100
+   correctness/cache gate for both policies.
 3. Native Contract scheduling/codegen and the four structural Contract/Map
    sweep cases.
 4. Authority-separated H100 evidence, then reviewed timing; GB200/B200 follows
