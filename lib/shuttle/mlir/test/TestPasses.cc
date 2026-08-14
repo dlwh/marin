@@ -515,7 +515,7 @@ protected:
                        ArrayAttr::get(operation.getContext(), maps));
   }
 
-  MapOp rowSingletonBroadcast() {
+  MapOp singletonBroadcast() {
     MapOp result;
     this->getOperation().walk([&](MapOp candidate) {
       if (result || candidate.getSemantics() != MapSemantics::BroadcastInDim ||
@@ -526,18 +526,41 @@ protected:
           dyn_cast<RankedTensorType>(candidate.getInputs()[0].getType());
       auto output =
           dyn_cast<RankedTensorType>(candidate.getResult(0).getType());
-      if (input && output && input.getRank() == 2 && output.getRank() == 2 &&
-          input.getDimSize(0) == 7 && input.getDimSize(1) == 1 &&
-          output.getDimSize(0) == 7 && output.getDimSize(1) == 13) {
+      if (!input || !output || candidate.getIndexingMaps().size() != 2) {
+        return;
+      }
+      AffineMap inputMap =
+          cast<AffineMapAttr>(candidate.getIndexingMaps()[0]).getValue();
+      unsigned expandingSingletons = 0;
+      for (AffineExpr expression : inputMap.getResults()) {
+        auto binary = dyn_cast<AffineBinaryOpExpr>(expression);
+        expandingSingletons +=
+            binary && binary.getKind() == AffineExprKind::FloorDiv;
+      }
+      if (expandingSingletons == 1) {
         result = candidate;
       }
     });
     if (!result) {
       this->getOperation().emitError(
-          "test fixture has no 7x1 to 7x13 broadcast Map");
+          "test fixture has no exactly-one expanding singleton broadcast Map");
       this->signalPassFailure();
     }
     return result;
+  }
+
+  std::pair<unsigned, AffineBinaryOpExpr>
+  expandedInputExpression(MapOp operation) {
+    AffineMap inputMap =
+        cast<AffineMapAttr>(operation.getIndexingMaps()[0]).getValue();
+    for (auto [position, expression] :
+         llvm::enumerate(inputMap.getResults())) {
+      auto binary = dyn_cast<AffineBinaryOpExpr>(expression);
+      if (binary && binary.getKind() == AffineExprKind::FloorDiv) {
+        return {position, binary};
+      }
+    }
+    llvm_unreachable("singletonBroadcast guarantees one floorDiv expression");
   }
 };
 
@@ -549,16 +572,25 @@ public:
     return "shuttle-test-swap-mapped-broadcast-axes";
   }
   void runOnOperation() override {
-    MapOp operation = rowSingletonBroadcast();
+    MapOp operation = singletonBroadcast();
     if (!operation) {
       return;
     }
-    MLIRContext *context = operation.getContext();
+    AffineMap inputMap =
+        cast<AffineMapAttr>(operation.getIndexingMaps()[0]).getValue();
+    SmallVector<AffineExpr> expressions(inputMap.getResults());
+    unsigned expandedPosition = expandedInputExpression(operation).first;
+    auto direct = llvm::find_if(expressions, [](AffineExpr expression) {
+      return isa<AffineDimExpr>(expression);
+    });
+    if (direct == expressions.end()) {
+      operation.emitOpError("test fixture has no direct mapped broadcast axis");
+      return signalPassFailure();
+    }
+    std::swap(*direct, expressions[expandedPosition]);
     replaceInputMap(operation,
-                    AffineMap::get(2, 0,
-                                   {getAffineDimExpr(1, context),
-                                    getAffineDimExpr(0, context).floorDiv(7)},
-                                   context));
+                    AffineMap::get(inputMap.getNumDims(), 0, expressions,
+                                   operation.getContext()));
   }
 };
 
@@ -570,16 +602,26 @@ public:
     return "shuttle-test-duplicate-mapped-broadcast-axis";
   }
   void runOnOperation() override {
-    MapOp operation = rowSingletonBroadcast();
+    MapOp operation = singletonBroadcast();
     if (!operation) {
       return;
     }
-    MLIRContext *context = operation.getContext();
+    AffineMap inputMap =
+        cast<AffineMapAttr>(operation.getIndexingMaps()[0]).getValue();
+    SmallVector<AffineExpr> expressions(inputMap.getResults());
+    auto [expandedPosition, expanded] = expandedInputExpression(operation);
+    auto direct = llvm::find_if(expressions, [](AffineExpr expression) {
+      return isa<AffineDimExpr>(expression);
+    });
+    if (direct == expressions.end()) {
+      operation.emitOpError("test fixture has no direct mapped broadcast axis");
+      return signalPassFailure();
+    }
+    expressions[expandedPosition] =
+        (*direct).floorDiv(cast<AffineConstantExpr>(expanded.getRHS()).getValue());
     replaceInputMap(operation,
-                    AffineMap::get(2, 0,
-                                   {getAffineDimExpr(0, context),
-                                    getAffineDimExpr(0, context).floorDiv(7)},
-                                   context));
+                    AffineMap::get(inputMap.getNumDims(), 0, expressions,
+                                   operation.getContext()));
   }
 };
 
@@ -591,16 +633,19 @@ public:
     return "shuttle-test-set-wrong-broadcast-divisor";
   }
   void runOnOperation() override {
-    MapOp operation = rowSingletonBroadcast();
+    MapOp operation = singletonBroadcast();
     if (!operation) {
       return;
     }
-    MLIRContext *context = operation.getContext();
+    AffineMap inputMap =
+        cast<AffineMapAttr>(operation.getIndexingMaps()[0]).getValue();
+    SmallVector<AffineExpr> expressions(inputMap.getResults());
+    auto [expandedPosition, expanded] = expandedInputExpression(operation);
+    int64_t divisor = cast<AffineConstantExpr>(expanded.getRHS()).getValue();
+    expressions[expandedPosition] = expanded.getLHS().floorDiv(divisor - 1);
     replaceInputMap(operation,
-                    AffineMap::get(2, 0,
-                                   {getAffineDimExpr(0, context),
-                                    getAffineDimExpr(1, context).floorDiv(7)},
-                                   context));
+                    AffineMap::get(inputMap.getNumDims(), 0, expressions,
+                                   operation.getContext()));
   }
 };
 
@@ -612,16 +657,18 @@ public:
     return "shuttle-test-set-broadcast-literal-zero";
   }
   void runOnOperation() override {
-    MapOp operation = rowSingletonBroadcast();
+    MapOp operation = singletonBroadcast();
     if (!operation) {
       return;
     }
-    MLIRContext *context = operation.getContext();
+    AffineMap inputMap =
+        cast<AffineMapAttr>(operation.getIndexingMaps()[0]).getValue();
+    SmallVector<AffineExpr> expressions(inputMap.getResults());
+    expressions[expandedInputExpression(operation).first] =
+        getAffineConstantExpr(0, operation.getContext());
     replaceInputMap(operation,
-                    AffineMap::get(2, 0,
-                                   {getAffineDimExpr(0, context),
-                                    getAffineConstantExpr(0, context)},
-                                   context));
+                    AffineMap::get(inputMap.getNumDims(), 0, expressions,
+                                   operation.getContext()));
   }
 };
 
@@ -633,17 +680,21 @@ public:
     return "shuttle-test-set-broadcast-composite-dividend";
   }
   void runOnOperation() override {
-    MapOp operation = rowSingletonBroadcast();
+    MapOp operation = singletonBroadcast();
     if (!operation) {
       return;
     }
-    MLIRContext *context = operation.getContext();
-    AffineExpr shiftedDimension =
-        getAffineDimExpr(1, context) + getAffineConstantExpr(1, context);
-    replaceInputMap(operation, AffineMap::get(2, 0,
-                                              {getAffineDimExpr(0, context),
-                                               shiftedDimension.floorDiv(13)},
-                                              context));
+    AffineMap inputMap =
+        cast<AffineMapAttr>(operation.getIndexingMaps()[0]).getValue();
+    SmallVector<AffineExpr> expressions(inputMap.getResults());
+    auto [expandedPosition, expanded] = expandedInputExpression(operation);
+    AffineExpr shifted =
+        expanded.getLHS() + getAffineConstantExpr(1, operation.getContext());
+    expressions[expandedPosition] = shifted.floorDiv(
+        cast<AffineConstantExpr>(expanded.getRHS()).getValue());
+    replaceInputMap(operation,
+                    AffineMap::get(inputMap.getNumDims(), 0, expressions,
+                                   operation.getContext()));
   }
 };
 
@@ -655,9 +706,14 @@ public:
     return "shuttle-test-set-wrong-broadcast-result-extent";
   }
   void runOnOperation() override {
-    if (MapOp operation = rowSingletonBroadcast()) {
-      operation.getResult(0).setType(RankedTensorType::get(
-          {7, 12}, Float32Type::get(operation.getContext())));
+    if (MapOp operation = singletonBroadcast()) {
+      auto output = cast<RankedTensorType>(operation.getResult(0).getType());
+      SmallVector<int64_t> shape(output.getShape());
+      AffineBinaryOpExpr expanded = expandedInputExpression(operation).second;
+      unsigned axis = cast<AffineDimExpr>(expanded.getLHS()).getPosition();
+      --shape[axis];
+      operation.getResult(0).setType(
+          RankedTensorType::get(shape, output.getElementType()));
     }
   }
 };
@@ -670,12 +726,18 @@ public:
     return "shuttle-test-direct-expanded-singleton";
   }
   void runOnOperation() override {
-    MapOp operation = rowSingletonBroadcast();
+    MapOp operation = singletonBroadcast();
     if (!operation) {
       return;
     }
-    MLIRContext *context = operation.getContext();
-    replaceInputMap(operation, AffineMap::getMultiDimIdentityMap(2, context));
+    AffineMap inputMap =
+        cast<AffineMapAttr>(operation.getIndexingMaps()[0]).getValue();
+    SmallVector<AffineExpr> expressions(inputMap.getResults());
+    auto [expandedPosition, expanded] = expandedInputExpression(operation);
+    expressions[expandedPosition] = expanded.getLHS();
+    replaceInputMap(operation,
+                    AffineMap::get(inputMap.getNumDims(), 0, expressions,
+                                   operation.getContext()));
   }
 };
 
@@ -687,16 +749,68 @@ public:
     return "shuttle-test-expand-nonsingleton-axis";
   }
   void runOnOperation() override {
-    MapOp operation = rowSingletonBroadcast();
+    MapOp operation = singletonBroadcast();
     if (!operation) {
       return;
     }
-    MLIRContext *context = operation.getContext();
-    replaceInputMap(operation,
-                    AffineMap::get(2, 0,
-                                   {getAffineDimExpr(0, context).floorDiv(7),
-                                    getAffineDimExpr(1, context).floorDiv(13)},
-                                   context));
+    AffineMap inputMap =
+        cast<AffineMapAttr>(operation.getIndexingMaps()[0]).getValue();
+    auto output = cast<RankedTensorType>(operation.getResult(0).getType());
+    SmallVector<AffineExpr> expressions(inputMap.getResults());
+    for (AffineExpr &expression : expressions) {
+      auto direct = dyn_cast<AffineDimExpr>(expression);
+      if (!direct) {
+        continue;
+      }
+      expression = direct.floorDiv(output.getDimSize(direct.getPosition()));
+      replaceInputMap(operation,
+                      AffineMap::get(inputMap.getNumDims(), 0, expressions,
+                                     operation.getContext()));
+      return;
+    }
+    operation.emitOpError("test fixture has no non-singleton broadcast axis");
+    signalPassFailure();
+  }
+};
+
+class BroadcastResultMapMutationPass
+    : public MapMutationPass<BroadcastResultMapMutationPass> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(BroadcastResultMapMutationPass)
+  BroadcastResultMapMutationPass() = default;
+  BroadcastResultMapMutationPass(const BroadcastResultMapMutationPass &other)
+      : MapMutationPass<BroadcastResultMapMutationPass>(other) {}
+  Option<std::string> kind{*this, "kind", llvm::cl::desc("Mutation kind"),
+                           llvm::cl::init("")};
+  StringRef getArgument() const final {
+    return "shuttle-test-mutate-broadcast-result-map";
+  }
+  void runOnOperation() override {
+    MapOp operation = singletonBroadcast();
+    if (!operation) {
+      return;
+    }
+    SmallVector<Attribute> maps(operation.getIndexingMaps().begin(),
+                                operation.getIndexingMaps().end());
+    AffineMap resultMap = cast<AffineMapAttr>(maps.back()).getValue();
+    SmallVector<AffineExpr> expressions(resultMap.getResults());
+    StringRef mutation = kind;
+    if (mutation == "permutation") {
+      if (expressions.size() < 2) {
+        operation.emitOpError("test fixture has no permutable result map");
+        return signalPassFailure();
+      }
+      std::swap(expressions.front(), expressions.back());
+    } else if (mutation == "projection") {
+      expressions.pop_back();
+    } else {
+      operation.emitOpError("unknown broadcast result map mutation kind");
+      return signalPassFailure();
+    }
+    maps.back() = AffineMapAttr::get(AffineMap::get(
+        resultMap.getNumDims(), 0, expressions, operation.getContext()));
+    operation->setAttr("indexing_maps",
+                       ArrayAttr::get(operation.getContext(), maps));
   }
 };
 
@@ -732,7 +846,7 @@ public:
     return "shuttle-test-replay-broadcast-as-reshape";
   }
   void runOnOperation() override {
-    if (MapOp operation = rowSingletonBroadcast()) {
+    if (MapOp operation = singletonBroadcast()) {
       operation->setAttr(
           "semantics",
           MapSemanticsAttr::get(operation.getContext(), MapSemantics::Reshape));
@@ -929,6 +1043,36 @@ public:
 MaterializationPlanOp materializationPlan(ModuleOp module) {
   auto plans = module.getOps<MaterializationPlanOp>();
   return plans.empty() ? MaterializationPlanOp{} : *plans.begin();
+}
+
+bool isExpandingSingletonMapTask(
+    MaterializationTaskOp task,
+    MutableArrayRef<MaterializationBufferOp> buffers) {
+  if (task.getKind() != MaterializationTaskKind::Map ||
+      task.getDomainShape().size() < 3 || task.getInputBuffers().size() != 1) {
+    return false;
+  }
+  int64_t inputOrdinal = task.getInputBuffers().front();
+  if (inputOrdinal < 0 || inputOrdinal >= static_cast<int64_t>(buffers.size())) {
+    return false;
+  }
+  auto input = dyn_cast<RankedTensorType>(buffers[inputOrdinal].getTensorType());
+  if (!input || input.getRank() !=
+                    static_cast<int64_t>(task.getDomainShape().size())) {
+    return false;
+  }
+  unsigned expansions = 0;
+  for (auto [inputExtent, outputExtent] :
+       llvm::zip_equal(input.getShape(), task.getDomainShape())) {
+    if (inputExtent == outputExtent) {
+      continue;
+    }
+    if (inputExtent != 1 || outputExtent <= 1) {
+      return false;
+    }
+    ++expansions;
+  }
+  return expansions == 1;
 }
 
 void refreshMaterializationFingerprint(MaterializationPlanOp plan) {
@@ -1341,6 +1485,61 @@ public:
       return;
     }
     getOperation().emitError("test fixture has no Fold materialization task");
+    signalPassFailure();
+  }
+};
+
+class MaterializationMapMutationPass
+    : public MutationPass<MaterializationMapMutationPass> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(MaterializationMapMutationPass)
+  MaterializationMapMutationPass() = default;
+  MaterializationMapMutationPass(const MaterializationMapMutationPass &other)
+      : MutationPass<MaterializationMapMutationPass>(other) {}
+  Option<std::string> kind{*this, "kind", llvm::cl::desc("Mutation kind"),
+                           llvm::cl::init("")};
+  StringRef getArgument() const final {
+    return "shuttle-test-mutate-map-materialization";
+  }
+  void runOnOperation() override {
+    MaterializationPlanOp plan = materializationPlan(getOperation());
+    if (!plan) {
+      getOperation().emitError("test fixture has no materialization plan");
+      return signalPassFailure();
+    }
+    SmallVector<MaterializationBufferOp> buffers(
+        plan.getBody().front().getOps<MaterializationBufferOp>());
+    for (MaterializationTaskOp task :
+         plan.getBody().front().getOps<MaterializationTaskOp>()) {
+      if (!isExpandingSingletonMapTask(task, buffers)) {
+        continue;
+      }
+      StringRef mutation = kind;
+      if (mutation == "domain") {
+        SmallVector<int64_t> domain(task.getDomainShape());
+        ++domain.back();
+        task->setAttr("domain_shape",
+                      DenseI64ArrayAttr::get(task.getContext(), domain));
+      } else if (mutation == "dependency") {
+        if (task.getDependencies().empty()) {
+          continue;
+        }
+        task->setAttr("dependencies",
+                      DenseI64ArrayAttr::get(task.getContext(), {}));
+      } else if (mutation == "output") {
+        SmallVector<int64_t> outputs(task.getOutputBuffers());
+        ++outputs.front();
+        task->setAttr("output_buffers",
+                      DenseI64ArrayAttr::get(task.getContext(), outputs));
+      } else {
+        getOperation().emitError("unknown Map materialization mutation kind");
+        return signalPassFailure();
+      }
+      refreshMaterializationFingerprint(plan);
+      return;
+    }
+    getOperation().emitError(
+        "test fixture has no expanding-singleton rank-N Map task");
     signalPassFailure();
   }
 };
@@ -1867,6 +2066,72 @@ public:
   }
 };
 
+class MapScheduleMutationPass : public MutationPass<MapScheduleMutationPass> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(MapScheduleMutationPass)
+  MapScheduleMutationPass() = default;
+  MapScheduleMutationPass(const MapScheduleMutationPass &other)
+      : MutationPass<MapScheduleMutationPass>(other) {}
+  Option<std::string> kind{*this, "kind", llvm::cl::desc("Mutation kind"),
+                           llvm::cl::init("")};
+  StringRef getArgument() const final {
+    return "shuttle-test-mutate-map-schedule";
+  }
+  void runOnOperation() override {
+    SchedulePlanOp plan = schedulePlan(getOperation());
+    if (!plan) {
+      getOperation().emitError("test fixture has no schedule plan");
+      return signalPassFailure();
+    }
+    MaterializationPlanOp materialization = materializationPlan(getOperation());
+    if (!materialization) {
+      getOperation().emitError("test fixture has no materialization plan");
+      return signalPassFailure();
+    }
+    SmallVector<MaterializationBufferOp> buffers(
+        materialization.getBody().front().getOps<MaterializationBufferOp>());
+    SmallVector<MaterializationTaskOp> materializationTasks(
+        materialization.getBody().front().getOps<MaterializationTaskOp>());
+    for (ScheduleTaskOp task :
+         plan.getBody().front().getOps<ScheduleTaskOp>()) {
+      int64_t sourceTask = task.getSourceTask();
+      if (task.getKind() != ScheduleTaskKind::Elementwise || sourceTask < 0 ||
+          sourceTask >= static_cast<int64_t>(materializationTasks.size()) ||
+          !isExpandingSingletonMapTask(materializationTasks[sourceTask],
+                                       buffers)) {
+        continue;
+      }
+      StringRef mutation = kind;
+      if (mutation == "grid") {
+        SmallVector<int64_t> grid(task.getGridShape());
+        ++grid.front();
+        task->setAttr("grid_shape",
+                      DenseI64ArrayAttr::get(task.getContext(), grid));
+      } else if (mutation == "tile") {
+        SmallVector<int64_t> tile(task.getTileShape());
+        --tile.front();
+        task->setAttr("tile_shape",
+                      DenseI64ArrayAttr::get(task.getContext(), tile));
+      } else if (mutation == "threads") {
+        task.setWorkgroupThreads(task.getWorkgroupThreads() - 32);
+      } else if (mutation == "output") {
+        SmallVector<int64_t> domain(task.getDomainShape());
+        ++domain.front();
+        task->setAttr("domain_shape",
+                      DenseI64ArrayAttr::get(task.getContext(), domain));
+      } else {
+        getOperation().emitError("unknown Map schedule mutation kind");
+        return signalPassFailure();
+      }
+      refreshScheduleFingerprint(plan);
+      return;
+    }
+    getOperation().emitError(
+        "test fixture has no expanding-singleton rank-N elementwise task");
+    signalPassFailure();
+  }
+};
+
 class ScheduleLifetimePass : public MutationPass<ScheduleLifetimePass> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ScheduleLifetimePass)
@@ -2022,6 +2287,25 @@ public:
           contract.getCodeOffset(), contract.getCodeLength())));
       refreshExecutableBundle(module, false);
       return;
+    } else if (mutation == "singleton-broadcast-body") {
+      SmallVector<int8_t> code(device.getCode());
+      for (DeviceEntryOp entry : entries) {
+        StringRef ptx(reinterpret_cast<const char *>(code.data() +
+                                                     entry.getCodeOffset()),
+                      entry.getCodeLength());
+        if (!ptx.contains("div.u64")) {
+          continue;
+        }
+        code[entry.getCodeOffset() + entry.getCodeLength() - 1] ^= 1;
+        device.setCodeAttr(DenseI8ArrayAttr::get(module.getContext(), code));
+        device.setCodeDigest(executableCodeDigest(device.getCode()));
+        entry.setCodeDigest(executableCodeDigest(device.getCode().slice(
+            entry.getCodeOffset(), entry.getCodeLength())));
+        refreshExecutableBundle(module, false);
+        return;
+      }
+      module.emitError("test fixture has no singleton broadcast PTX entry");
+      return signalPassFailure();
     } else if (mutation == "output-binding") {
       SmallVector<InvocationSlotOp> outputs;
       for (InvocationSlotOp slot : slots) {
@@ -2124,6 +2408,7 @@ void registerMutationPasses() {
   PassRegistration<BroadcastWrongResultExtentPass>();
   PassRegistration<BroadcastDirectSingletonPass>();
   PassRegistration<BroadcastExpandNonSingletonPass>();
+  PassRegistration<BroadcastResultMapMutationPass>();
   PassRegistration<MapConstantZeroPointwisePass>();
   PassRegistration<BroadcastReplayAsReshapePass>();
   PassRegistration<ReshapeReplayAsBroadcastPass>();
@@ -2143,6 +2428,7 @@ void registerMutationPasses() {
   PassRegistration<MaterializationSwapSameTypeEdgesPass>();
   PassRegistration<MaterializationContractShapePass>();
   PassRegistration<MaterializationFoldMutationPass>();
+  PassRegistration<MaterializationMapMutationPass>();
   PassRegistration<MaterializationDomainPass<true>>();
   PassRegistration<MaterializationDomainPass<false>>();
   PassRegistration<MaterializationUnknownAttributePass>();
@@ -2165,6 +2451,7 @@ void registerMutationPasses() {
   PassRegistration<ScheduleReductionOrderPass>();
   PassRegistration<ContractScheduleMutationPass>();
   PassRegistration<FoldScheduleMutationPass>();
+  PassRegistration<MapScheduleMutationPass>();
   PassRegistration<ScheduleLifetimePass>();
   PassRegistration<RenameSymbolsPass>();
   PassRegistration<SetFastRegionPolicyPass>();
