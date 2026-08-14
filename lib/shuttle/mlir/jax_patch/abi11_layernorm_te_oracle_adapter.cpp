@@ -197,11 +197,20 @@ class DeviceAllocation {
   std::size_t bytes_;
 };
 
+NVTEShape make_shape(const std::vector<std::size_t>& shape) {
+  NVTEShape result{};
+  constexpr std::size_t capacity = sizeof(result.data) / sizeof(result.data[0]);
+  if (shape.size() > capacity) throw std::invalid_argument("tensor rank exceeds NVTEShape capacity");
+  result.ndim = shape.size();
+  for (std::size_t index = 0; index < shape.size(); ++index) result.data[index] = shape[index];
+  return result;
+}
+
 class Tensor {
  public:
   explicit Tensor(TeApi* api) : api_(api), tensor_(api->create_tensor(NVTE_DELAYED_TENSOR_SCALING)) {}
   Tensor(TeApi* api, void* data, NVTEDType dtype, const std::vector<std::size_t>& shape) : Tensor(api) {
-    NVTEBasicTensor basic{.data_ptr = data, .dtype = dtype, .shape = nvte_make_shape(shape.data(), shape.size())};
+    NVTEBasicTensor basic{.data_ptr = data, .dtype = dtype, .shape = make_shape(shape)};
     api_->set_tensor_param(tensor_, kNVTERowwiseData, &basic, sizeof(basic));
   }
   ~Tensor() { api_->destroy_tensor(tensor_); }
@@ -370,7 +379,7 @@ int run(const Config& config) {
 
   std::ofstream metadata(config.outputs / "metadata.json");
   if (!metadata) throw std::runtime_error("failed to open metadata output");
-  metadata << "{\"schema_version\":1,\"status\":\"unsealed_local_hardware_observation\","
+  metadata << "{\"schema_version\":1,\"status\":\"unsealed_local_adapter_report\","
               "\"authority_sealed\":false,\"coordinate\":{\"ordinal\":"
            << config.record.ordinal
            << ",\"shape\":[" << config.record.rows << ',' << config.record.columns << "],\"boundary\":\""

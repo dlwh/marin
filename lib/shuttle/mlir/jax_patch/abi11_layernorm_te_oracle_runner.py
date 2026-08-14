@@ -21,7 +21,7 @@ import numpy as np
 CONTRACT_SHA256 = "5a3391f00bf5453d735cfe4359d8e8dff73fb70ccdf7908a0d19b592c413d005"
 PLAN_SHA256 = "f42f251961131e5b1c870161f48da14e018001e4aa762752d82d0a7a8c1a6965"
 ADAPTER = Path(__file__).with_name("abi11_layernorm_te_oracle_adapter.cpp")
-ADAPTER_SHA256 = "4743cbd5398c5be9a3a5f73b8ebaa1c6ac01d245a1178f3b3766633682e948c4"
+ADAPTER_SHA256 = "0d88f0e41cf19f11535d45f54c86ee49ba2f7965a0ef2a1de9121060eb4c0bf8"
 MAX_CONTRACT_BYTES = 1024 * 1024
 SOURCE_FILES = {
     "transformer_engine/common/include/transformer_engine/normalization.h": (
@@ -298,7 +298,7 @@ def _validate_adapter_metadata(
         "forward_backend": record["forward_backend"],
         "backward_backend": record["backward_backend"],
     }
-    if metadata["schema_version"] != 1 or metadata["status"] != "unsealed_local_hardware_observation":
+    if metadata["schema_version"] != 1 or metadata["status"] != "unsealed_local_adapter_report":
         raise ValueError("adapter metadata status drifted")
     if metadata["coordinate"] != expected_coordinate:
         raise ValueError("adapter output coordinate drifted")
@@ -349,6 +349,26 @@ def _validate_adapter_metadata(
     return metadata, output_artifacts, metadata_artifact
 
 
+def _validate_execution_tree(output: Path, input_artifacts: dict[str, dict[str, int | str]]) -> None:
+    if output.is_symlink() or not output.is_dir():
+        raise ValueError("execution output root must remain a regular directory")
+    if {path.name for path in output.iterdir()} != {"inputs", "outputs"}:
+        raise ValueError("execution output root entry set drifted")
+    inputs = output / "inputs"
+    outputs = output / "outputs"
+    if inputs.is_symlink() or not inputs.is_dir() or outputs.is_symlink() or not outputs.is_dir():
+        raise ValueError("execution input and output roots must be regular directories")
+    expected_entries = {f"{role}.bf16" for role in input_artifacts}
+    if {path.name for path in inputs.iterdir()} != expected_entries:
+        raise ValueError("canonical input directory entry set drifted")
+    for role, artifact in input_artifacts.items():
+        path = inputs / f"{role}.bf16"
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("canonical inputs must remain regular files")
+        if path.stat().st_size != artifact["bytes"] or _sha256(path) != artifact["sha256"]:
+            raise ValueError(f"canonical input artifact drifted: {role}")
+
+
 def execute_record(contract: dict[str, Any], ordinal: int, config: ExecutionConfig) -> dict[str, Any]:
     """Execute one record through the pinned adapter in this fresh process."""
     record = _validate_execution_inputs(config, contract, ordinal)
@@ -381,6 +401,7 @@ def execute_record(contract: dict[str, Any], ordinal: int, config: ExecutionConf
         str(config.transformer_engine_library),
     ]
     subprocess.run(argv, check=True)
+    _validate_execution_tree(config.output, input_artifacts)
     metadata_path = outputs / "metadata.json"
     if not metadata_path.is_file():
         raise ValueError("adapter did not emit metadata.json")
@@ -392,8 +413,8 @@ def execute_record(contract: dict[str, Any], ordinal: int, config: ExecutionConf
     )
     result = {
         "schema_version": 1,
-        "status": "unsealed_local_hardware_observation",
-        "hardware_executed": True,
+        "status": "unsealed_local_adapter_report",
+        "hardware_execution_claim": "reported_by_unsealed_caller_binary",
         "timing_collected": False,
         "authority_sealed": False,
         "scorecard_status_changed": False,

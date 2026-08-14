@@ -7,6 +7,7 @@ import copy
 import hashlib
 import json
 import math
+import shutil
 import subprocess
 import sys
 from functools import cache
@@ -698,7 +699,7 @@ def test_layernorm_te_runner_rejects_checkout_state_mutations(
 def _valid_adapter_metadata(record: dict[str, Any]) -> dict[str, Any]:
     return {
         "schema_version": 1,
-        "status": "unsealed_local_hardware_observation",
+        "status": "unsealed_local_adapter_report",
         "coordinate": record,
         "epsilon": 1e-5,
         "scaling_mode": "NVTE_DELAYED_TENSOR_SCALING",
@@ -749,7 +750,12 @@ def test_layernorm_te_runner_rejects_wrong_public_output_size(tmp_path: Path) ->
         _validate_adapter_metadata(_valid_adapter_metadata(record), record, 10, outputs, contract)
 
 
-def _fake_adapter(tmp_path: Path) -> Path:
+def _fake_adapter(tmp_path: Path, mutation: str = "") -> Path:
+    mutations = {
+        "": "",
+        "rewrite_input": '(args.inputs / "x.bf16").write_bytes(b"mutated")',
+        "extra_root_entry": '(args.outputs.parent / "extra.bin").write_bytes(b"extra")',
+    }
     adapter = tmp_path / "fake_adapter.py"
     adapter.write_text(
         """#!/usr/bin/env python3
@@ -789,7 +795,7 @@ for role in output_roles:
 backward = None if args.backward_backend == "none" else args.backward_backend
 metadata = {
     "schema_version": 1,
-    "status": "unsealed_local_hardware_observation",
+    "status": "unsealed_local_adapter_report",
     "authority_sealed": False,
     "coordinate": {
         "ordinal": args.ordinal,
@@ -809,8 +815,11 @@ metadata = {
     "timing_collected": False,
 }
 (args.outputs / "metadata.json").write_text(json.dumps(metadata, sort_keys=True) + "\\n")
-(args.outputs.parent / "observed-argv.json").write_text(json.dumps(sys.argv[1:]) + "\\n")
-"""
+(Path(__file__).parent / "observed-argv.json").write_text(json.dumps(sys.argv[1:]) + "\\n")
+__MUTATION__
+""".replace(
+            "__MUTATION__", mutations[mutation]
+        )
     )
     adapter.chmod(0o755)
     return adapter
@@ -866,9 +875,13 @@ def test_layernorm_te_runner_executes_one_fake_record_and_binds_artifacts(
     assert result["build_identity"]["authority"] == "caller_supplied_digests_not_source_derived_build_proof"
     assert result["build_identity"]["adapter_binary_sha256"] == adapter_sha256
     assert result["build_identity"]["transformer_engine_library_sha256"] == library_sha256
+    assert result["status"] == "unsealed_local_adapter_report"
+    assert result["hardware_execution_claim"] == "reported_by_unsealed_caller_binary"
+    assert "hardware_executed" not in result
     assert json.loads((output / "result.json").read_text()) == result
-    observed_argv = json.loads((output / "observed-argv.json").read_text())
+    observed_argv = json.loads((tmp_path / "observed-argv.json").read_text())
     assert observed_argv[-2:] == ["--te-library", str(library)]
+    assert {path.name for path in output.iterdir()} == {"inputs", "outputs", "result.json"}
     assert {path.stem for path in (output / "inputs").iterdir()} == input_roles
     assert result["execution_metadata_artifact"] == {
         "bytes": (output / "outputs/metadata.json").stat().st_size,
@@ -876,5 +889,105 @@ def test_layernorm_te_runner_executes_one_fake_record_and_binds_artifacts(
     }
 
 
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("rewrite_input", "canonical input artifact drifted: x"),
+        ("extra_root_entry", "execution output root entry set drifted"),
+    ],
+)
+def test_layernorm_te_runner_rejects_child_artifact_tree_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str, message: str
+) -> None:
+    contract = load_runner_contract(CONTRACT)
+    adapter = _fake_adapter(tmp_path, mutation)
+    library = tmp_path / "libtransformer_engine.so"
+    library.write_bytes(b"fake Transformer Engine library")
+    monkeypatch.setattr("abi11_layernorm_te_oracle_runner.verify_source_checkout", lambda *_args: None)
+
+    with pytest.raises(ValueError, match=message):
+        execute_record(
+            contract,
+            10,
+            ExecutionConfig(
+                source_root=tmp_path / "source",
+                adapter_binary=adapter,
+                adapter_binary_sha256=hashlib.sha256(adapter.read_bytes()).hexdigest(),
+                transformer_engine_library=library,
+                transformer_engine_library_sha256=hashlib.sha256(library.read_bytes()).hexdigest(),
+                output=tmp_path / "execution",
+                device=0,
+            ),
+        )
+
+
 def test_layernorm_te_runner_pins_adapter_source_bytes() -> None:
     assert hashlib.sha256(ADAPTER.read_bytes()).hexdigest() == ADAPTER_SHA256
+
+
+def test_layernorm_te_adapter_has_no_direct_transformer_engine_linkage(tmp_path: Path) -> None:
+    compiler = shutil.which("clang++")
+    assert compiler is not None, "clang++ is required for the adapter linkage audit"
+    include = tmp_path / "include"
+    transformer_engine = include / "transformer_engine"
+    transformer_engine.mkdir(parents=True)
+    (include / "cuda_runtime_api.h").write_text(
+        """
+#pragma once
+#include <cstddef>
+typedef int cudaError_t;
+typedef void* cudaStream_t;
+enum cudaMemcpyKind { cudaMemcpyHostToDevice, cudaMemcpyDeviceToHost };
+constexpr cudaError_t cudaSuccess = 0;
+struct cudaDeviceProp { int multiProcessorCount; };
+extern "C" const char* cudaGetErrorString(cudaError_t);
+extern "C" cudaError_t cudaMalloc(void**, std::size_t);
+extern "C" cudaError_t cudaFree(void*);
+extern "C" cudaError_t cudaMemcpyAsync(void*, const void*, std::size_t, cudaMemcpyKind, cudaStream_t);
+extern "C" cudaError_t cudaMemsetAsync(void*, int, std::size_t, cudaStream_t);
+extern "C" cudaError_t cudaStreamCreate(cudaStream_t*);
+extern "C" cudaError_t cudaStreamDestroy(cudaStream_t);
+extern "C" cudaError_t cudaStreamSynchronize(cudaStream_t);
+extern "C" cudaError_t cudaSetDevice(int);
+extern "C" cudaError_t cudaGetDeviceProperties(cudaDeviceProp*, int);
+"""
+    )
+    (transformer_engine / "transformer_engine.h").write_text(
+        """
+#pragma once
+#include <cstddef>
+enum NVTEDType { kNVTEByte, kNVTEFloat32, kNVTEBFloat16 };
+enum NVTEScalingMode { NVTE_DELAYED_TENSOR_SCALING };
+enum NVTETensorParam { kNVTERowwiseData };
+struct NVTEShape { std::size_t data[15]; std::size_t ndim; };
+struct NVTEBasicTensor { void* data_ptr; NVTEDType dtype; NVTEShape shape; };
+typedef void* NVTETensor;
+"""
+    )
+    (transformer_engine / "normalization.h").write_text('#include "transformer_engine.h"\n')
+    adapter_object = tmp_path / "adapter.o"
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++20",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-I",
+            str(include),
+            "-c",
+            str(ADAPTER),
+            "-o",
+            str(adapter_object),
+        ],
+        check=True,
+    )
+
+    undefined_symbols = subprocess.run(
+        ["nm", "-u", str(adapter_object)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "cudaSetDevice" in undefined_symbols
+    assert "nvte_" not in undefined_symbols
