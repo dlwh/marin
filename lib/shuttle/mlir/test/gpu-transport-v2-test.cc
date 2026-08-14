@@ -709,6 +709,18 @@ buildAbi13ContractFixture(llvm::StringRef source,
       policy == mlir::shuttle::NumericalPolicy::Fast ? fast : sourceOrdered);
 }
 
+std::unique_ptr<BuiltBundle>
+buildAbi14ContractVjpFixture(llvm::StringRef source,
+                             mlir::shuttle::NumericalPolicy policy) {
+  constexpr llvm::StringLiteral sourceOrdered =
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":14,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+  constexpr llvm::StringLiteral fast =
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":14,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+  return buildFixture(
+      source, policy,
+      policy == mlir::shuttle::NumericalPolicy::Fast ? fast : sourceOrdered);
+}
+
 std::unique_ptr<BuiltBundle> buildFixture() {
   auto source = fixtureSource(
       "jax-0.10.1-bf16-row_fold_scale_44d152ecc3e9ff18-forward.mlir");
@@ -1382,6 +1394,84 @@ module @f32_inputs {
   EXPECT_FALSE(buildFixture(batched));
   EXPECT_FALSE(buildFixture(multipleContractDimensions));
   EXPECT_FALSE(buildFixture(f32Inputs));
+}
+
+TEST(GpuTransportV2Test,
+     Abi14OrdinaryJaxMatmulVjpHasClosedMultiContractTransport) {
+  auto source =
+      fixtureSource("jax-0.10.1-bf16-matmul-vjp-17x33x19-backward.mlir");
+  ASSERT_TRUE(source);
+  auto sourceOrdered = buildAbi14ContractVjpFixture(
+      *source, mlir::shuttle::NumericalPolicy::SourceOrdered);
+  auto fast = buildAbi14ContractVjpFixture(
+      *source, mlir::shuttle::NumericalPolicy::Fast);
+  ASSERT_TRUE(sourceOrdered);
+  ASSERT_TRUE(fast);
+
+  auto sourceBytes =
+      mlir::shuttle::serializeGpuExecutableBundle(*sourceOrdered->module);
+  auto fastBytes = mlir::shuttle::serializeGpuExecutableBundle(*fast->module);
+  ASSERT_TRUE(mlir::succeeded(sourceBytes));
+  ASSERT_TRUE(mlir::succeeded(fastBytes));
+  EXPECT_NE(*sourceBytes, *fastBytes);
+
+  auto sourceDecoded = decodeInlineSchema2(*sourceBytes);
+  auto fastDecoded = decodeInlineSchema2(*fastBytes);
+  ASSERT_TRUE(sourceDecoded);
+  ASSERT_TRUE(fastDecoded);
+  auto sourcePublic = mlir::shuttle::GpuExecutable::Load(*sourceBytes);
+  auto fastPublic = mlir::shuttle::GpuExecutable::Load(*fastBytes);
+  ASSERT_TRUE(sourcePublic.ok()) << sourcePublic.status();
+  ASSERT_TRUE(fastPublic.ok()) << fastPublic.status();
+
+  constexpr int64_t kTaskCount = 10;
+  constexpr int64_t kSlotCount = 13;
+  constexpr int64_t kExternalSlots = 5;
+  constexpr int64_t kContractOrdinals[] = {3, 8};
+  const std::vector<std::vector<int64_t>> expectedInputs = {
+      {2}, {3}, {0}, {4, 5}, {6}, {7}, {3}, {1}, {9, 10}, {11},
+  };
+  ASSERT_EQ(expectedInputs.size(), kTaskCount);
+
+  for (const Decoded *decoded : {&*sourceDecoded, &*fastDecoded}) {
+    ASSERT_EQ(decoded->launches.size(), kTaskCount);
+    EXPECT_EQ(decoded->slots, kSlotCount);
+    EXPECT_EQ(decoded->externalSlots, kExternalSlots);
+    EXPECT_EQ(decoded->scalarSlots, 0);
+    for (int64_t ordinal = 0; ordinal < kTaskCount; ++ordinal) {
+      const auto &launch = decoded->launches[ordinal];
+      EXPECT_EQ(launch.taskOrdinal, ordinal);
+      EXPECT_EQ(launch.inputSlots, expectedInputs[ordinal]);
+      EXPECT_EQ(launch.outputSlots, (std::vector<int64_t>{3 + ordinal}));
+    }
+  }
+  EXPECT_EQ(sourceDecoded->policy, 0);
+  EXPECT_EQ(fastDecoded->policy, 1);
+  EXPECT_EQ((*sourcePublic)->launches().size(), kTaskCount);
+  EXPECT_EQ((*fastPublic)->launches().size(), kTaskCount);
+  EXPECT_EQ((*sourcePublic)->slots().size(), kSlotCount);
+  EXPECT_EQ((*fastPublic)->slots().size(), kSlotCount);
+
+  for (int64_t ordinal : kContractOrdinals) {
+    const auto sourceLaunch = sourceDecoded->launches[ordinal];
+    const auto fastLaunch = fastDecoded->launches[ordinal];
+    llvm::StringRef sourcePtx(
+        reinterpret_cast<const char *>(sourceDecoded->code.data() +
+                                       sourceLaunch.codeOffset),
+        sourceLaunch.codeLength);
+    llvm::StringRef fastPtx(
+        reinterpret_cast<const char *>(fastDecoded->code.data() +
+                                       fastLaunch.codeOffset),
+        fastLaunch.codeLength);
+    EXPECT_EQ(sourcePtx.count("fma.rn.f32"), 1u);
+    EXPECT_FALSE(sourcePtx.contains("shfl.sync.down.b32"));
+    EXPECT_EQ(fastPtx.count("fma.rn.f32"), 1u);
+    EXPECT_EQ(fastPtx.count("shfl.sync.down.b32"), 5u);
+    EXPECT_EQ(sourcePtx.count("ld.global.f32"), 2u);
+    EXPECT_FALSE(sourcePtx.contains("ld.global.u16"));
+    EXPECT_EQ(fastPtx.count("ld.global.f32"), 2u);
+    EXPECT_FALSE(fastPtx.contains("ld.global.u16"));
+  }
 }
 
 TEST(GpuTransportV2Test, FoldDynamicSharedMemoryIsDeclaredAtModuleScope) {

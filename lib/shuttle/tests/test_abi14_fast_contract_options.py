@@ -4,7 +4,7 @@
 from shuttle import ExecutionMode, Materialization, Numerics, Tuning, compiler_options, options_digest
 
 
-def test_abi13_gpu_contract_policies_have_separate_cache_identities() -> None:
+def test_abi14_gpu_contract_policies_have_separate_cache_identities() -> None:
     tuning = Tuning(
         tile_sizes=(),
         cluster_shape=(),
@@ -25,13 +25,13 @@ def test_abi13_gpu_contract_policies_have_separate_cache_identities() -> None:
 
     assert source_ordered["xla_shuttle_options"] == (
         '{"execution_mode":"gpu_executable_bundle","numerics":"source_ordered",'
-        '"pipeline_abi_version":13,"schema_version":1,'
+        '"pipeline_abi_version":14,"schema_version":1,'
         '"tuning":{"cluster_shape":[],"materialization":"automatic",'
         '"maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}}'
     )
     assert fast["xla_shuttle_options"] == (
         '{"execution_mode":"gpu_executable_bundle","numerics":"fast",'
-        '"pipeline_abi_version":13,"schema_version":1,'
+        '"pipeline_abi_version":14,"schema_version":1,'
         '"tuning":{"cluster_shape":[],"materialization":"automatic",'
         '"maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}}'
     )
@@ -41,7 +41,7 @@ def test_abi13_gpu_contract_policies_have_separate_cache_identities() -> None:
             numerics=Numerics.SOURCE_ORDERED,
             tuning=tuning,
         )
-        == "432ecf5407e7c81d32a8b3515c050681e02f2f7f90d24988eee35ea449ccb5bd"
+        == "afc685fdac734de383e70a49de385ca744287f151816fbff419668b719dd5689"
     )
     assert (
         options_digest(
@@ -49,5 +49,5 @@ def test_abi13_gpu_contract_policies_have_separate_cache_identities() -> None:
             numerics=Numerics.FAST,
             tuning=tuning,
         )
-        == "ca8b645b98c7a601ec26a037f7dcd661d2082a9602af76d9d9f845d9bf11da51"
+        == "06807ada40a32b66c33d8f4f682c1e30afd9918311c02b2f17447ae72a9290dc"
     )

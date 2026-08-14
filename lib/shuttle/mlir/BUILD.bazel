@@ -414,6 +414,7 @@ cc_test(
         "test/Inputs/jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-backward.mlir",
         "test/Inputs/jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-composed.mlir",
         "test/Inputs/jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-forward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-matmul-vjp-17x33x19-backward.mlir",
         "test/Inputs/jax-0.10.1-bf16-row_fold_scale_44d152ecc3e9ff18-forward.mlir",
     ],
     deps = [
@@ -444,6 +445,7 @@ cc_test(
     name = "xla_registration_test",
     srcs = ["test/xla-registration-test.cc"],
     data = [
+        "test/Inputs/jax-0.10.1-bf16-matmul-vjp-17x33x19-backward.mlir",
         "test/Inputs/jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-forward.mlir",
     ],
     deps = [
