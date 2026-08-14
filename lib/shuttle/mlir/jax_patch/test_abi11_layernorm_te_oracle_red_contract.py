@@ -1,7 +1,7 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Red contract for the missing ABI11 Transformer Engine LayerNorm oracle."""
+"""Contract and runner tests for the ABI11 Transformer Engine LayerNorm oracle."""
 
 import copy
 import hashlib
@@ -16,9 +16,25 @@ from typing import Any
 import ml_dtypes
 import numpy as np
 import pytest
+from abi11_layernorm_te_oracle_runner import (
+    ADAPTER,
+    ADAPTER_SHA256,
+    SUBMODULES,
+    ExecutionConfig,
+    _validate_adapter_metadata,
+    _write_inputs,
+    execute_record,
+    validate_checkout_identity,
+    verify_file_identity,
+    verify_source_checkout,
+)
+from abi11_layernorm_te_oracle_runner import (
+    load_contract as load_runner_contract,
+)
 from shuttle_jaxlib_gpu_layer_norm_acceptance import NUMERICAL_LIMITS
 
 CONTRACT = Path(__file__).with_name("abi11-layernorm-bf16-te-2.17-oracle-red-v1.json")
+RUNNER = Path(__file__).with_name("abi11_layernorm_te_oracle_runner.py")
 METRICS = ("max_absolute_error", "mean_absolute_error", "relative_linf_error", "max_bfloat16_ulp_error")
 INPUT_ROLES = ("x", "gamma", "beta", "dy")
 OUTPUT_ROLES = ("y", "dx", "dgamma", "dbeta")
@@ -543,11 +559,9 @@ def test_predeclared_metricwise_objective_checks_every_metric() -> None:
 
 
 def test_layernorm_te_runner_emits_the_closed_cpu_only_dry_run_plan() -> None:
-    """Remain red until a runner implements the reviewed no-CUDA plan boundary."""
     contract = _load_contract()
     _validate_contract(contract)
     runner = CONTRACT.parent / Path(contract["runner"]["path"]).name
-    assert runner.is_file(), "ABI11 Transformer Engine LayerNorm oracle runner is not implemented"
     result = subprocess.run(
         [sys.executable, str(runner), *contract["runner"]["dry_run_argv"]],
         cwd=CONTRACT.parent,
@@ -562,3 +576,305 @@ def test_layernorm_te_runner_emits_the_closed_cpu_only_dry_run_plan() -> None:
         "hardware_required": False,
         "records": _expected_plan_records(),
     }
+
+
+def test_layernorm_te_runner_rejects_contract_byte_drift(tmp_path: Path) -> None:
+    mutated = tmp_path / CONTRACT.name
+    mutated.write_bytes(CONTRACT.read_bytes().replace(b'"timing_collected": false', b'"timing_collected": true'))
+    result = subprocess.run(
+        [sys.executable, str(RUNNER), "--contract", str(mutated), "--print-plan"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "contract byte identity drifted" in result.stderr
+
+
+def test_layernorm_te_runner_rejects_unpinned_source_before_hardware_boundary(tmp_path: Path) -> None:
+    output = tmp_path / "execution"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(RUNNER),
+            "--contract",
+            str(CONTRACT),
+            "--execute-record",
+            "0",
+            "--source-root",
+            str(tmp_path / "missing-te"),
+            "--adapter-binary",
+            str(tmp_path / "missing-adapter"),
+            "--adapter-binary-sha256",
+            "0" * 64,
+            "--transformer-engine-library",
+            str(tmp_path / "missing-library"),
+            "--transformer-engine-library-sha256",
+            "0" * 64,
+            "--output",
+            str(output),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "Transformer Engine source root is not a readable Git checkout" in result.stderr
+    assert not output.exists()
+
+
+def test_layernorm_te_runner_rejects_nonpinned_git_head(tmp_path: Path) -> None:
+    source = tmp_path / "te"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(["git", "-C", str(source), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(source), "config", "user.name", "Test"], check=True)
+    marker = source / "marker"
+    marker.write_text("local source\n")
+    subprocess.run(["git", "-C", str(source), "add", "marker"], check=True)
+    subprocess.run(["git", "-C", str(source), "commit", "-q", "-m", "local source"], check=True)
+
+    with pytest.raises(ValueError, match="checkout HEAD drifted"):
+        verify_source_checkout(source, load_runner_contract(CONTRACT))
+
+
+def test_layernorm_te_runner_rejects_caller_supplied_binary_digest_drift(tmp_path: Path) -> None:
+    binary = tmp_path / "adapter"
+    binary.write_bytes(b"adapter")
+    binary.chmod(0o755)
+
+    with pytest.raises(ValueError, match="adapter binary identity drifted"):
+        verify_file_identity(binary, "0" * 64, "adapter binary", executable=True)
+
+
+@pytest.mark.parametrize(
+    ("ordinal", "roles"),
+    [
+        (10, {"x", "gamma", "beta"}),
+        (12, {"x", "gamma", "dy"}),
+        (16, {"x", "gamma", "beta", "dy"}),
+    ],
+)
+def test_layernorm_te_runner_materializes_exact_public_input_roles(
+    tmp_path: Path, ordinal: int, roles: set[str]
+) -> None:
+    contract = load_runner_contract(CONTRACT)
+    record = contract["runner"]["canonical_plan"][ordinal]
+    directory = tmp_path / record["boundary"]
+    artifacts = _write_inputs(directory, record, contract)
+
+    assert set(artifacts) == roles
+    assert {path.stem for path in directory.iterdir()} == roles
+    expected = contract["inputs"]["digests"]["7x13"]
+    for role, artifact in artifacts.items():
+        assert artifact["sha256"] == expected[role]["raw_sha256"]
+        assert artifact["bytes"] == (7 * 13 * 2 if role in {"x", "dy"} else 13 * 2)
+
+
+@pytest.mark.parametrize(
+    ("branch", "status", "submodules", "message"),
+    [
+        ("main", "", [f"-{revision} {path}" for path, revision in SUBMODULES.items()], "must be detached"),
+        ("", " M local", [f"-{revision} {path}" for path, revision in SUBMODULES.items()], "must be clean"),
+        ("", "", [], "submodule identities drifted"),
+        (
+            "",
+            "",
+            [f" {revision} {path}" for path, revision in SUBMODULES.items()],
+            "must remain uninitialized",
+        ),
+    ],
+)
+def test_layernorm_te_runner_rejects_checkout_state_mutations(
+    branch: str, status: str, submodules: list[str], message: str
+) -> None:
+    contract = load_runner_contract(CONTRACT)
+    with pytest.raises(ValueError, match=message):
+        validate_checkout_identity(contract["provider"]["commit"], branch, status, submodules, contract)
+
+
+def _valid_adapter_metadata(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "status": "unsealed_local_hardware_observation",
+        "coordinate": record,
+        "epsilon": 1e-5,
+        "scaling_mode": "NVTE_DELAYED_TENSOR_SCALING",
+        "layout": "row_major_contiguous_c_order",
+        "physical_sm_count": 1,
+        "workspace_queries": {"forward": {"shape": [1], "dtype": "kNVTEByte"}, "backward": None},
+        "timing_collected": False,
+        "authority_sealed": False,
+    }
+
+
+def test_layernorm_te_runner_rejects_extra_public_output_role(tmp_path: Path) -> None:
+    contract = load_runner_contract(CONTRACT)
+    record = contract["runner"]["canonical_plan"][10]
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    (outputs / "y.bf16").write_bytes(bytes(7 * 13 * 2))
+    (outputs / "dx.bf16").write_bytes(bytes(7 * 13 * 2))
+    (outputs / "metadata.json").write_text("{}\n")
+
+    with pytest.raises(ValueError, match="output directory entry set drifted"):
+        _validate_adapter_metadata(_valid_adapter_metadata(record), record, 10, outputs, contract)
+
+
+def test_layernorm_te_runner_rejects_symlinked_public_output(tmp_path: Path) -> None:
+    contract = load_runner_contract(CONTRACT)
+    record = contract["runner"]["canonical_plan"][10]
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    backing = tmp_path / "y.bf16"
+    backing.write_bytes(bytes(7 * 13 * 2))
+    (outputs / "y.bf16").symlink_to(backing)
+    (outputs / "metadata.json").write_text("{}\n")
+
+    with pytest.raises(ValueError, match="regular files"):
+        _validate_adapter_metadata(_valid_adapter_metadata(record), record, 10, outputs, contract)
+
+
+def test_layernorm_te_runner_rejects_wrong_public_output_size(tmp_path: Path) -> None:
+    contract = load_runner_contract(CONTRACT)
+    record = contract["runner"]["canonical_plan"][10]
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    (outputs / "y.bf16").write_bytes(b"too short")
+    (outputs / "metadata.json").write_text("{}\n")
+
+    with pytest.raises(ValueError, match="public output drifted: y"):
+        _validate_adapter_metadata(_valid_adapter_metadata(record), record, 10, outputs, contract)
+
+
+def _fake_adapter(tmp_path: Path) -> Path:
+    adapter = tmp_path / "fake_adapter.py"
+    adapter.write_text(
+        """#!/usr/bin/env python3
+import argparse
+import json
+import sys
+from pathlib import Path
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--ordinal", type=int, required=True)
+parser.add_argument("--boundary", required=True)
+parser.add_argument("--forward-backend", required=True)
+parser.add_argument("--backward-backend", required=True)
+parser.add_argument("--rows", type=int, required=True)
+parser.add_argument("--columns", type=int, required=True)
+parser.add_argument("--device", type=int, required=True)
+parser.add_argument("--inputs", type=Path, required=True)
+parser.add_argument("--outputs", type=Path, required=True)
+parser.add_argument("--te-library", type=Path, required=True)
+args = parser.parse_args()
+roles = {
+    "forward": ({"x", "gamma", "beta"}, {"y"}),
+    "backward_recompute": ({"x", "gamma", "dy"}, {"dx", "dgamma", "dbeta"}),
+    "composed": ({"x", "gamma", "beta", "dy"}, {"y", "dx", "dgamma", "dbeta"}),
+}
+input_roles, output_roles = roles[args.boundary]
+if {path.stem for path in args.inputs.iterdir()} != input_roles:
+    raise SystemExit(3)
+sizes = {
+    "y": args.rows * args.columns * 2,
+    "dx": args.rows * args.columns * 2,
+    "dgamma": args.columns * 2,
+    "dbeta": args.columns * 2,
+}
+for role in output_roles:
+    (args.outputs / f"{role}.bf16").write_bytes(bytes([args.ordinal]) * sizes[role])
+backward = None if args.backward_backend == "none" else args.backward_backend
+metadata = {
+    "schema_version": 1,
+    "status": "unsealed_local_hardware_observation",
+    "authority_sealed": False,
+    "coordinate": {
+        "ordinal": args.ordinal,
+        "shape": [args.rows, args.columns],
+        "boundary": args.boundary,
+        "forward_backend": args.forward_backend,
+        "backward_backend": backward,
+    },
+    "epsilon": 1e-5,
+    "scaling_mode": "NVTE_DELAYED_TENSOR_SCALING",
+    "layout": "row_major_contiguous_c_order",
+    "physical_sm_count": 1,
+    "workspace_queries": {
+        "forward": {"shape": [1], "dtype": "kNVTEByte"},
+        "backward": None if args.boundary == "forward" else {"shape": [2], "dtype": "kNVTEByte"},
+    },
+    "timing_collected": False,
+}
+(args.outputs / "metadata.json").write_text(json.dumps(metadata, sort_keys=True) + "\\n")
+(args.outputs.parent / "observed-argv.json").write_text(json.dumps(sys.argv[1:]) + "\\n")
+"""
+    )
+    adapter.chmod(0o755)
+    return adapter
+
+
+@pytest.mark.parametrize(
+    ("ordinal", "input_roles", "output_roles"),
+    [
+        (10, {"x", "gamma", "beta"}, {"y"}),
+        (12, {"x", "gamma", "dy"}, {"dx", "dgamma", "dbeta"}),
+    ],
+)
+def test_layernorm_te_runner_executes_one_fake_record_and_binds_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ordinal: int,
+    input_roles: set[str],
+    output_roles: set[str],
+) -> None:
+    contract = load_runner_contract(CONTRACT)
+    adapter = _fake_adapter(tmp_path)
+    adapter_sha256 = hashlib.sha256(adapter.read_bytes()).hexdigest()
+    library = tmp_path / "libtransformer_engine.so"
+    library.write_bytes(b"fake Transformer Engine library")
+    library_sha256 = hashlib.sha256(library.read_bytes()).hexdigest()
+    output = tmp_path / "execution"
+    monkeypatch.setattr("abi11_layernorm_te_oracle_runner.verify_source_checkout", lambda *_args: None)
+
+    result = execute_record(
+        contract,
+        ordinal,
+        ExecutionConfig(
+            source_root=tmp_path / "source",
+            adapter_binary=adapter,
+            adapter_binary_sha256=adapter_sha256,
+            transformer_engine_library=library,
+            transformer_engine_library_sha256=library_sha256,
+            output=output,
+            device=0,
+        ),
+    )
+
+    assert set(result["input_artifacts"]) == input_roles
+    assert set(result["output_artifacts"]) == output_roles
+    assert result["contract_identity"] == {
+        "contract_id": contract["contract_id"],
+        "sha256": "5a3391f00bf5453d735cfe4359d8e8dff73fb70ccdf7908a0d19b592c413d005",
+    }
+    assert result["plan_identity"] == {
+        "sha256": "f42f251961131e5b1c870161f48da14e018001e4aa762752d82d0a7a8c1a6965",
+        "ordinal": ordinal,
+    }
+    assert result["build_identity"]["authority"] == "caller_supplied_digests_not_source_derived_build_proof"
+    assert result["build_identity"]["adapter_binary_sha256"] == adapter_sha256
+    assert result["build_identity"]["transformer_engine_library_sha256"] == library_sha256
+    assert json.loads((output / "result.json").read_text()) == result
+    observed_argv = json.loads((output / "observed-argv.json").read_text())
+    assert observed_argv[-2:] == ["--te-library", str(library)]
+    assert {path.stem for path in (output / "inputs").iterdir()} == input_roles
+    assert result["execution_metadata_artifact"] == {
+        "bytes": (output / "outputs/metadata.json").stat().st_size,
+        "sha256": hashlib.sha256((output / "outputs/metadata.json").read_bytes()).hexdigest(),
+    }
+
+
+def test_layernorm_te_runner_pins_adapter_source_bytes() -> None:
+    assert hashlib.sha256(ADAPTER.read_bytes()).hexdigest() == ADAPTER_SHA256
