@@ -200,7 +200,7 @@ TEST(ShuttleObserverTestBridgeTest,
           std::string("{\"execution_mode\":\"gpu_executable_bundle\","
                       "\"numerics\":\"") +
           policy +
-          "\",\"pipeline_abi_version\":12,\"schema_version\":1,"
+          "\",\"pipeline_abi_version\":13,\"schema_version\":1,"
           "\"tuning\":{\"cluster_shape\":[],\"materialization\":"
           "\"automatic\",\"maximum_candidates\":1,\"pipeline_stages\":1,"
           "\"tile_sizes\":[]}}";
