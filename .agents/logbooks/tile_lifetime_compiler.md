@@ -4865,3 +4865,40 @@ author: dlwh
   capture, persistent-cache process transition, artifact retrieval receipt,
   timing, upload, or H100 execution. No image build, network action, hardware
   reservation, push, integration, or scorecard change occurred.
+
+### 2026-08-14 06:20 PDT - TLTC-MLIR-026 ABI 15 controller receipt red contract
+
+- Hypothesis: a controller-only Ed25519 signer can close the gap between the
+  task-authored raw export and an accepted terminal result without exposing a
+  signing capability to the task. The task may exit successfully only after it
+  verifies an `ACK` for the exact running attempt; acceptance additionally
+  requires a chained `TERMINAL` receipt issued after Iris records that attempt
+  and job as succeeded.
+- Commit hash: test-only checkpoint
+  `7ed55cef5549042e17f5b00bde794b3d5277b38f`, tree
+  `fb6b09fd59cb180d8221cbc9e54c628faf68921f`, rooted at the independently
+  reviewed unsealed ABI15 harness `f12f93c0ff0793a359d905331a4074d1df583692`.
+- Contract: canonical JSON binds the domain
+  `marin.shuttle.abi15.evidence-receipt.v1`, cluster and controller identity,
+  one RFC 7638 key ID and SPKI public key, authorization/challenge, canonical
+  launch request, image/bundle/source/verifier identities, exact job/task and
+  zero-retry attempt, and closed `ACK`/`TERMINAL` payload schemas. The embedded
+  key is RFC 8032 public test-vector data. Receipt-authority approval, secret
+  projection, controller integration, image transfer, and hardware launch
+  remain null design stops.
+- Command:
+  `/Users/dlwh/src/marin/.venv/bin/python -m pytest -q --tb=no lib/shuttle/mlir/jax_patch/test_abi15_h100_receipt_red_contract.py`.
+- Result: 38 cases collected. The canonical/unsealed contract check passes;
+  the remaining 37 fail only because `abi15_h100_receipt_verify` and
+  `iris.cluster.controller.shuttle_receipts` do not exist. Mutations cover
+  caller-resigned launch/attempt substitutions, task-forged keys, previous-key
+  fallback, open and weakly typed schemas, replay, nonzero exit, wrong states,
+  nonmonotonic log sequence, task use of a terminal record as an ACK, and
+  persistent per-stage idempotency.
+- Tooling: `./infra/pre-commit.py --changed-files --fix` passes when the
+  isolated worktree uses the existing repository virtual environment. No
+  dependency download, network call, image action, Iris mutation, hardware
+  reservation, push, or integration occurred.
+- Next action: obtain explicit approval for the controller receipt trust root,
+  then implement the task-side verifier and controller-side persistent signer
+  red-to-green. Capsule transfer and H100 launch remain separate approvals.
