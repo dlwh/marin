@@ -21,14 +21,14 @@
 namespace mlir::shuttle {
 
 inline constexpr char kGpuExecutableBundleFfiTarget[] =
-    "shuttle.gpu.executable_bundle.v1";
+    "shuttle.gpu.executable_bundle.v2";
 inline constexpr uint64_t kMaximumGpuTransportBytes = 16 * 1024 * 1024;
 inline constexpr uint64_t kMaximumGpuExecutableRecords = 256;
 inline constexpr uint64_t kMaximumGpuCodeBytes = 8 * 1024 * 1024;
 inline constexpr uint64_t kMaximumGpuEntryCodeBytes = 512 * 1024;
 inline constexpr uint64_t kMaximumGpuSlotBytes = 32 * 1024 * 1024;
 inline constexpr uint64_t kMaximumGpuTemporaryBytes = 256 * 1024 * 1024;
-inline constexpr uint64_t kMaximumGpuAggregateTaskPositions = 67129347;
+inline constexpr uint64_t kMaximumGpuAggregateTaskPositions = 256 * 1024 * 1024;
 inline constexpr uint64_t kMaximumGpuDynamicSharedMemoryBytes = 16 * 1024;
 
 struct GpuLaunch {

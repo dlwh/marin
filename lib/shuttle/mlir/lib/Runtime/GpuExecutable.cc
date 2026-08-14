@@ -204,6 +204,11 @@ absl::Status invalidTransport() {
   return absl::InvalidArgumentError("invalid Shuttle GPU executable transport");
 }
 
+absl::Status invalidTransport(StringRef detail) {
+  return absl::InvalidArgumentError(
+      (Twine("invalid Shuttle GPU executable transport: ") + detail).str());
+}
+
 struct Parsed {
   std::unique_ptr<MLIRContext> context;
   SmallVector<uint8_t> code;
@@ -243,11 +248,12 @@ absl::StatusOr<Parsed> parse(ArrayRef<uint8_t> bytes) {
   auto deviceRoot = reader.text();
   size_t deviceSuffixStart = reader.position();
   auto entryCount = reader.u64();
-  if (deviceSchema != 3 || format != 2 || policy != 0 || !schedule ||
+  if (deviceSchema != 3 || format != 2 || policy > 1 || !schedule ||
       !isDigest(*schedule) || !code || code->empty() ||
       code->size() > kMaximumGpuCodeBytes || !codeDigest ||
       *codeDigest != digest(*code) || !deviceRoot || !isDigest(*deviceRoot) ||
-      entryCount != 19)
+      !entryCount || *entryCount == 0 ||
+      *entryCount > kMaximumGpuExecutableRecords)
     return invalidTransport();
 
   Parsed parsed;
@@ -256,7 +262,8 @@ absl::StatusOr<Parsed> parse(ArrayRef<uint8_t> bytes) {
   int64_t expectedOffset = 0;
   uint64_t aggregatePositions = 0;
   DenseMap<int64_t, int64_t> producers;
-  for (int64_t ordinal = 0; ordinal < 19; ++ordinal) {
+  for (int64_t ordinal = 0; ordinal < static_cast<int64_t>(*entryCount);
+       ++ordinal) {
     auto entryOrdinal = reader.i64();
     auto sourceTask = reader.i64();
     auto codeOffset = reader.i64();
@@ -319,12 +326,10 @@ absl::StatusOr<Parsed> parse(ArrayRef<uint8_t> bytes) {
         *positions > kMaximumGpuAggregateTaskPositions - aggregatePositions ||
         !shared || *shared > kMaximumGpuDynamicSharedMemoryBytes || !arity ||
         *arity != inputs->size() + outputs->size())
-      return invalidTransport();
+      return invalidTransport("launch resource budget");
     aggregatePositions += *positions;
-    if (llvm::any_of(*inputs,
-                     [](int64_t slot) { return slot < 0 || slot >= 21; }) ||
-        llvm::any_of(*outputs,
-                     [](int64_t slot) { return slot < 0 || slot >= 21; }))
+    if (llvm::any_of(*inputs, [](int64_t slot) { return slot < 0; }) ||
+        llvm::any_of(*outputs, [](int64_t slot) { return slot < 0; }))
       return invalidTransport();
     SmallVector<int64_t> expectedDependencies;
     for (int64_t input : *inputs) {
@@ -356,12 +361,12 @@ absl::StatusOr<Parsed> parse(ArrayRef<uint8_t> bytes) {
     expectedOffset += *codeLength;
   }
   size_t invocationStart = reader.position();
-  if (expectedOffset != code->size() || producers.size() != 19 ||
+  if (expectedOffset != code->size() || producers.size() != *entryCount ||
       *deviceRoot !=
           digest(bytes.slice(deviceStart, deviceRootOffset - deviceStart),
                  bytes.slice(deviceSuffixStart,
                              invocationStart - deviceSuffixStart)))
-    return invalidTransport();
+    return invalidTransport("device closure");
 
   auto abiSchema = reader.i64();
   auto plan = reader.text();
@@ -372,17 +377,20 @@ absl::StatusOr<Parsed> parse(ArrayRef<uint8_t> bytes) {
   auto slotCount = reader.u64();
   if (abiSchema != 3 || !plan || !isDigest(*plan) || !abiSchedule ||
       *abiSchedule != *schedule || !abiRoot || !isDigest(*abiRoot) ||
-      slotCount != 21)
-    return invalidTransport();
+      !slotCount || *slotCount == 0 ||
+      *slotCount > kMaximumGpuExecutableRecords)
+    return invalidTransport("invocation header");
+  DenseMap<int64_t, uint64_t> temporaryGroupBytes;
   uint64_t temporaryBytes = 0;
-  for (int64_t ordinal = 0; ordinal < 21; ++ordinal) {
+  for (int64_t ordinal = 0; ordinal < static_cast<int64_t>(*slotCount);
+       ++ordinal) {
     auto slotOrdinal = reader.i64();
     auto sourceBuffer = reader.i64();
     auto element = reader.u8();
     auto rank = reader.u64();
     if (slotOrdinal != ordinal || sourceBuffer != ordinal || !element ||
         *element > 1 || !rank || *rank > 8)
-      return invalidTransport();
+      return invalidTransport("slot header");
     SmallVector<int64_t> shape;
     int64_t required = *element == 0 ? 2 : 4;
     for (uint64_t axis = 0; axis < *rank; ++axis) {
@@ -412,9 +420,9 @@ absl::StatusOr<Parsed> parse(ArrayRef<uint8_t> bytes) {
     if (encodedRequired != required || required > kMaximumGpuSlotBytes ||
         !strides || strides->size() != *rank || offset != 0 ||
         alignment != (*element == 0 ? 2 : 4) || addressSpace != 1 || !access ||
-        *access > 2 || !storage || *storage > 1 || alias != ordinal ||
-        reuse != ordinal || !binding || *binding > 2)
-      return invalidTransport();
+        *access > 2 || !storage || *storage > 1 || alias != ordinal || !reuse ||
+        *reuse < 0 || !binding || *binding > 2)
+      return invalidTransport("slot descriptor");
     SmallVector<int64_t> expectedStrides(*rank);
     int64_t stride = *element == 0 ? 2 : 4;
     for (int64_t axis = *rank; axis > 0; --axis) {
@@ -422,7 +430,7 @@ absl::StatusOr<Parsed> parse(ArrayRef<uint8_t> bytes) {
       stride *= shape[axis - 1];
     }
     if (*strides != expectedStrides)
-      return invalidTransport();
+      return invalidTransport("slot strides");
     auto tensor = RankedTensorType::get(
         shape, *element == 0 ? Type(BFloat16Type::get(parsed.context.get()))
                              : Type(Float32Type::get(parsed.context.get())));
@@ -436,18 +444,24 @@ absl::StatusOr<Parsed> parse(ArrayRef<uint8_t> bytes) {
                  static_cast<ExecutableAccess>(*access),
                  static_cast<MaterializationStorage>(*storage),
                  ordinal,
-                 ordinal,
+                 *reuse,
                  static_cast<ExecutableBindingKind>(*binding),
                  index.value_or(-1)};
     if (*storage == 1) {
-      if (*binding != 0 || index || *access != 2 ||
-          required > kMaximumGpuTemporaryBytes - temporaryBytes)
-        return invalidTransport();
-      temporaryBytes += required;
+      if (*binding != 0 || index || *access != 2)
+        return invalidTransport("temporary binding");
+      uint64_t prior = temporaryGroupBytes.lookup(*reuse);
+      if (static_cast<uint64_t>(required) > prior) {
+        uint64_t increase = static_cast<uint64_t>(required) - prior;
+        if (increase > kMaximumGpuTemporaryBytes - temporaryBytes)
+          return invalidTransport("temporary allocation budget");
+        temporaryBytes += increase;
+        temporaryGroupBytes[*reuse] = required;
+      }
     } else {
-      if (!index || *binding == 0 || (*binding == 1 && *access != 0) ||
-          (*binding == 2 && *access != 1))
-        return invalidTransport();
+      if (*reuse != ordinal || !index || *binding == 0 ||
+          (*binding == 1 && *access != 0) || (*binding == 2 && *access != 1))
+        return invalidTransport("external binding");
       parsed.bindings.push_back({static_cast<ExecutableBindingKind>(*binding),
                                  *index, ordinal, tensor, required,
                                  *alignment});
@@ -458,25 +472,69 @@ absl::StatusOr<Parsed> parse(ArrayRef<uint8_t> bytes) {
   if (*abiRoot !=
       digest(bytes.slice(invocationStart, abiRootOffset - invocationStart),
              bytes.slice(abiSuffixStart, bundleStart - abiSuffixStart)))
-    return invalidTransport();
-  if (parsed.bindings.size() != 3)
-    return invalidTransport();
-  auto bindingMatches = [&](size_t position, ExecutableBindingKind kind,
-                            int64_t index, int64_t slot,
-                            ArrayRef<int64_t> shape) {
-    const GpuExternalBinding &binding = parsed.bindings[position];
-    auto tensor = dyn_cast<RankedTensorType>(binding.tensorType);
-    return binding.kind == kind && binding.index == index &&
-           binding.slotOrdinal == slot && tensor &&
-           tensor.getElementType().isBF16() && tensor.getShape() == shape &&
-           binding.requiredBytes ==
-               (shape.size() == 1 ? 4096 * 2 : 2048 * 4096 * 2) &&
-           binding.alignment == 2;
-  };
-  if (!bindingMatches(0, ExecutableBindingKind::Operand, 0, 0, {2048, 4096}) ||
-      !bindingMatches(1, ExecutableBindingKind::Operand, 1, 1, {4096}) ||
-      !bindingMatches(2, ExecutableBindingKind::Result, 0, 20, {2048, 4096}))
-    return invalidTransport();
+    return invalidTransport("invocation closure");
+  SmallVector<int64_t> producer(*slotCount, -1);
+  SmallVector<int64_t> finalUse(*slotCount, -1);
+  for (const GpuLaunch &launch : parsed.launches) {
+    for (int64_t slot : launch.inputSlots) {
+      if (slot < 0 || slot >= static_cast<int64_t>(*slotCount))
+        return invalidTransport("input slot range");
+      finalUse[slot] = std::max(finalUse[slot], launch.taskOrdinal);
+    }
+    for (int64_t slot : launch.outputSlots) {
+      if (slot < 0 || slot >= static_cast<int64_t>(*slotCount) ||
+          producer[slot] != -1)
+        return invalidTransport("output slot producer");
+      producer[slot] = launch.taskOrdinal;
+      finalUse[slot] = std::max(finalUse[slot], launch.taskOrdinal);
+    }
+  }
+  int64_t operandIndex = 0;
+  int64_t resultIndex = 0;
+  llvm::SmallDenseSet<int64_t> externalReuseGroups;
+  for (const GpuSlot &slot : parsed.slots) {
+    if (slot.storage == MaterializationStorage::Temporary) {
+      if (producer[slot.ordinal] < 0 ||
+          finalUse[slot.ordinal] <= producer[slot.ordinal])
+        return invalidTransport("temporary lifetime");
+      continue;
+    }
+    externalReuseGroups.insert(slot.reuseGroup);
+    auto tensor = dyn_cast<RankedTensorType>(slot.tensorType);
+    if (!tensor || !tensor.getElementType().isBF16())
+      return invalidTransport("external type");
+    if (slot.bindingKind == ExecutableBindingKind::Operand) {
+      if (slot.bindingIndex != operandIndex++ || producer[slot.ordinal] != -1 ||
+          finalUse[slot.ordinal] < 0)
+        return invalidTransport("operand projection");
+    } else if (slot.bindingKind == ExecutableBindingKind::Result) {
+      if (slot.bindingIndex != resultIndex++ || producer[slot.ordinal] < 0)
+        return invalidTransport("result projection");
+    } else {
+      return invalidTransport("external binding kind");
+    }
+  }
+  if (operandIndex == 0 || resultIndex == 0 ||
+      parsed.bindings.size() != static_cast<size_t>(operandIndex + resultIndex))
+    return invalidTransport("binding count");
+  for (size_t left = 0; left < parsed.slots.size(); ++left) {
+    const GpuSlot &first = parsed.slots[left];
+    if (first.storage == MaterializationStorage::Temporary &&
+        externalReuseGroups.contains(first.reuseGroup))
+      return invalidTransport("external reuse collision");
+    for (size_t right = left + 1; right < parsed.slots.size(); ++right) {
+      const GpuSlot &second = parsed.slots[right];
+      if (second.storage != MaterializationStorage::Temporary ||
+          first.storage != MaterializationStorage::Temporary ||
+          first.reuseGroup != second.reuseGroup)
+        continue;
+      if (producer[first.ordinal] <= finalUse[second.ordinal] &&
+          producer[second.ordinal] <= finalUse[first.ordinal])
+        return invalidTransport("overlapping temporary reuse");
+    }
+  }
+  if (temporaryBytes == 0)
+    return invalidTransport("empty temporary allocation");
   auto bundleSchema = reader.i64();
   auto bundleSchedule = reader.text();
   auto bundleDevice = reader.text();
@@ -484,13 +542,12 @@ absl::StatusOr<Parsed> parse(ArrayRef<uint8_t> bytes) {
   auto completion = reader.u8();
   size_t bundleRootOffset = reader.position();
   auto bundleRoot = reader.text();
-  if (temporaryBytes != 201416716 || bundleSchema != 2 || !bundleSchedule ||
-      *bundleSchedule != *schedule || !bundleDevice ||
-      *bundleDevice != *deviceRoot || !bundleAbi || *bundleAbi != *abiRoot ||
-      completion != 1 || !bundleRoot ||
+  if (bundleSchema != 2 || !bundleSchedule || *bundleSchedule != *schedule ||
+      !bundleDevice || *bundleDevice != *deviceRoot || !bundleAbi ||
+      *bundleAbi != *abiRoot || completion != 1 || !bundleRoot ||
       *bundleRoot != digest(bytes.take_front(bundleRootOffset)) ||
       !reader.done())
-    return invalidTransport();
+    return invalidTransport("bundle closure");
   return parsed;
 }
 
@@ -597,10 +654,17 @@ FailureOr<SmallVector<uint8_t>> serializeGpuExecutableBundle(ModuleOp module) {
   writer.u8(1);
   writer.text(digest(writer.view()));
   SmallVector<uint8_t> bytes = writer.take();
-  if (bytes.size() > kMaximumGpuTransportBytes)
+  if (bytes.size() > kMaximumGpuTransportBytes) {
+    device.emitOpError(
+        "serialized GPU transport exceeds the closed size limit");
     return failure();
-  if (!GpuExecutable::Load(bytes).ok())
+  }
+  absl::Status loaded = GpuExecutable::Load(bytes).status();
+  if (!loaded.ok()) {
+    device.emitOpError("serialized GPU transport failed public validation: ")
+        << loaded.message();
     return failure();
+  }
   return bytes;
 }
 

@@ -34,6 +34,6 @@ diff --git a/jaxlib/cuda/cuda_plugin_extension.cc b/jaxlib/cuda/cuda_plugin_exte
 +  shuttle_handlers["execute"] = EncapsulateFfiHandler(shuttle.execute);
 +  shuttle_handlers["api_version"] = 1;
 +  shuttle_handlers["traits"] = 0;
-+  dict["shuttle.gpu.executable_bundle.v1"] = shuttle_handlers;
++  dict["shuttle.gpu.executable_bundle.v2"] = shuttle_handlers;
    return dict;
  }

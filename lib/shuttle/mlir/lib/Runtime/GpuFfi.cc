@@ -60,6 +60,7 @@ absl::Status invalid(StringRef message) {
 absl::Status projectBindings(ArrayRef<GpuExternalBinding> bindings,
                              std::vector<GpuExternalBinding> &operands,
                              std::vector<GpuExternalBinding> &results) {
+  llvm::SmallDenseSet<int64_t> slots;
   for (const GpuExternalBinding &binding : bindings) {
     std::vector<GpuExternalBinding> *projection = nullptr;
     if (binding.kind == ExecutableBindingKind::Operand)
@@ -72,21 +73,25 @@ absl::Status projectBindings(ArrayRef<GpuExternalBinding> bindings,
         static_cast<size_t>(binding.index) != projection->size())
       return invalid("GPU executable external projection is not contiguous");
     auto type = dyn_cast<RankedTensorType>(binding.tensorType);
+    int64_t elements = 1;
     if (!type || !type.getElementType().isBF16() || !type.hasStaticShape() ||
-        binding.requiredBytes <= 0 || binding.alignment != 2)
+        type.getRank() < 1 || type.getRank() > 2 || binding.slotOrdinal < 0 ||
+        !slots.insert(binding.slotOrdinal).second || binding.alignment != 2)
       return invalid("GPU executable external projection type is invalid");
+    for (int64_t extent : type.getShape()) {
+      if (extent <= 0 ||
+          elements > std::numeric_limits<int64_t>::max() / extent)
+        return invalid("GPU executable external projection shape is invalid");
+      elements *= extent;
+    }
+    if (elements > std::numeric_limits<int64_t>::max() / 2 ||
+        binding.requiredBytes != elements * 2)
+      return invalid("GPU executable external projection bytes are invalid");
     projection->push_back(binding);
   }
-  auto shapeIs = [](const GpuExternalBinding &binding,
-                    ArrayRef<int64_t> shape) {
-    auto type = cast<RankedTensorType>(binding.tensorType);
-    return type.getShape() == shape;
-  };
-  if (operands.size() != 2 || results.size() != 1 ||
-      operands[0].slotOrdinal != 0 || operands[1].slotOrdinal != 1 ||
-      results[0].slotOrdinal != 20 || !shapeIs(operands[0], {2048, 4096}) ||
-      !shapeIs(operands[1], {4096}) || !shapeIs(results[0], {2048, 4096}))
-    return invalid("GPU executable does not match the closed typed projection");
+  if (operands.empty() || results.empty() ||
+      bindings.size() > kMaximumGpuExecutableRecords)
+    return invalid("GPU executable projection count is invalid");
   return absl::OkStatus();
 }
 
@@ -204,23 +209,62 @@ prepare(InstantiateState *state, se::DeviceAddressAllocator *allocator,
     if (state == nullptr || allocator == nullptr || deviceOrdinal < 0)
       return invalid("GPU executable Prepare context is invalid");
     auto prepared = std::make_unique<PrepareState>();
+    struct TemporaryGroup {
+      int64_t reuseGroup;
+      int64_t requiredBytes;
+      int64_t alignment;
+    };
+    std::vector<TemporaryGroup> groups;
+    llvm::DenseMap<int64_t, size_t> groupIndexes;
+    uint64_t aggregateBytes = 0;
     for (const GpuSlot &slot : state->executable->slots()) {
       if (slot.storage != MaterializationStorage::Temporary)
         continue;
+      auto inserted = groupIndexes.try_emplace(slot.reuseGroup, groups.size());
+      if (inserted.second) {
+        if (slot.requiredBytes <= 0 ||
+            static_cast<uint64_t>(slot.requiredBytes) >
+                kMaximumGpuTemporaryBytes - aggregateBytes)
+          return invalid("GPU temporary allocation budget is invalid");
+        aggregateBytes += slot.requiredBytes;
+        groups.push_back({slot.reuseGroup, slot.requiredBytes, slot.alignment});
+      } else {
+        TemporaryGroup &group = groups[inserted.first->second];
+        if (slot.requiredBytes > group.requiredBytes) {
+          uint64_t increase = slot.requiredBytes - group.requiredBytes;
+          if (increase > kMaximumGpuTemporaryBytes - aggregateBytes)
+            return invalid("GPU temporary allocation budget is invalid");
+          aggregateBytes += increase;
+          group.requiredBytes = slot.requiredBytes;
+        }
+        group.alignment = std::max(group.alignment, slot.alignment);
+      }
+    }
+    llvm::DenseMap<int64_t, se::DeviceAddressBase> groupAddresses;
+    for (const TemporaryGroup &group : groups) {
       absl::StatusOr<se::ScopedDeviceAddress<uint8_t>> allocation =
-          allocator->Allocate(deviceOrdinal, slot.requiredBytes);
+          allocator->Allocate(deviceOrdinal, group.requiredBytes);
       if (!allocation.ok())
         return allocation.status();
       if (allocation->is_null() ||
           reinterpret_cast<uintptr_t>(allocation->cref().opaque()) %
-                  static_cast<uint64_t>(slot.alignment) !=
+                  static_cast<uint64_t>(group.alignment) !=
               0)
         return invalid("GPU temporary allocation does not satisfy alignment");
-      prepared->slots[slot.ordinal] = allocation->cref();
+      groupAddresses[group.reuseGroup] = allocation->cref();
       prepared->temporaries.push_back(std::move(*allocation));
     }
-    if (prepared->temporaries.size() != 18)
-      return invalid("GPU executable temporary projection is invalid");
+    for (const GpuSlot &slot : state->executable->slots()) {
+      if (slot.storage != MaterializationStorage::Temporary)
+        continue;
+      auto address = groupAddresses.find(slot.reuseGroup);
+      if (address == groupAddresses.end())
+        return invalid("GPU temporary reuse group is not allocated");
+      prepared->slots[slot.ordinal] =
+          se::DeviceAddressBase(address->second.opaque(), slot.requiredBytes);
+    }
+    if (prepared->temporaries.empty())
+      return invalid("GPU executable has no temporary allocations");
     return prepared;
   } catch (const std::bad_alloc &) {
     return absl::ResourceExhaustedError(
@@ -261,7 +305,7 @@ initialize(InstantiateState *state, se::Stream *stream,
       (*kernel)->set_metadata(metadata);
       initialized->kernels.push_back(std::move(*kernel));
     }
-    if (initialized->kernels.size() != 19)
+    if (initialized->kernels.size() != state->executable->launches().size())
       return invalid("GPU executable kernel projection is invalid");
     return initialized;
   } catch (const std::bad_alloc &) {
@@ -278,7 +322,8 @@ absl::Status execute(ffi::RemainingArgs arguments, ffi::RemainingRets results,
                      InitializeState *initialized, se::Stream *stream) {
   try {
     if (state == nullptr || prepared == nullptr || initialized == nullptr ||
-        stream == nullptr || initialized->kernels.size() != 19)
+        stream == nullptr ||
+        initialized->kernels.size() != state->executable->launches().size())
       return invalid("GPU executable Execute state is invalid");
     llvm::DenseMap<int64_t, se::DeviceAddressBase> slots = prepared->slots;
     if (absl::Status status =

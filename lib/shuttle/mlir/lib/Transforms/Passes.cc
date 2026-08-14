@@ -79,7 +79,7 @@ ShuttlePipelineOptions commandLinePipelineOptions(NumericalPolicy numerics) {
   options.numerics = numerics;
   if (numerics == NumericalPolicy::Fast) {
     options.canonicalOptions =
-        R"json({"execution_mode":"stablehlo_round_trip","numerics":"fast","pipeline_abi_version":10,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+        R"json({"execution_mode":"stablehlo_round_trip","numerics":"fast","pipeline_abi_version":11,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
   }
   return options;
 }
@@ -3877,6 +3877,7 @@ struct GpuExecutableSpec {
   SmallVector<int8_t> code;
   std::vector<GpuEntrySpec> entries;
   SmallVector<CpuSlotSpec> slots;
+  SmallVector<int64_t> reuseGroups;
 };
 
 FailureOr<int64_t> staticElementCount(RankedTensorType type) {
@@ -3887,6 +3888,101 @@ FailureOr<int64_t> staticElementCount(RankedTensorType type) {
     elements *= extent;
   }
   return elements;
+}
+
+FailureOr<SmallVector<CpuSlotSpec>>
+deriveExecutableSlots(MaterializationPlanOp materialization) {
+  SmallVector<CpuSlotSpec> slots;
+  for (MaterializationBufferOp buffer :
+       materialization.getBody().front().getOps<MaterializationBufferOp>()) {
+    auto type = dyn_cast<RankedTensorType>(buffer.getTensorType());
+    if (!type || !type.hasStaticShape() ||
+        (!type.getElementType().isBF16() && !type.getElementType().isF32()))
+      return failure();
+    const int64_t elementBytes = type.getElementType().isBF16() ? 2 : 4;
+    FailureOr<int64_t> elements = staticElementCount(type);
+    if (failed(elements) ||
+        *elements > std::numeric_limits<int64_t>::max() / elementBytes)
+      return failure();
+    SmallVector<int64_t> strides(type.getRank());
+    int64_t stride = elementBytes;
+    for (int64_t axis = type.getRank(); axis > 0; --axis) {
+      strides[axis - 1] = stride;
+      stride *= type.getDimSize(axis - 1);
+    }
+    ExecutableAccess access = ExecutableAccess::ReadWrite;
+    if (buffer.getLiveIn())
+      access = ExecutableAccess::Read;
+    else if (buffer.getLiveOut())
+      access = ExecutableAccess::Write;
+    slots.push_back(CpuSlotSpec{type, *elements * elementBytes,
+                                std::move(strides), elementBytes, access,
+                                buffer.getStorage()});
+  }
+  return slots;
+}
+
+FailureOr<SmallVector<int64_t>>
+deriveGpuReuseGroups(MaterializationPlanOp materialization,
+                     ArrayRef<CpuSlotSpec> slots) {
+  SmallVector<MaterializationBufferOp> buffers(
+      materialization.getBody().front().getOps<MaterializationBufferOp>());
+  if (buffers.size() != slots.size())
+    return failure();
+  struct Candidate {
+    int64_t ordinal;
+    int64_t lifetimeStart;
+    int64_t lifetimeEnd;
+    int64_t requiredBytes;
+  };
+  struct ReuseGroup {
+    int64_t ordinal;
+    SmallVector<std::pair<int64_t, int64_t>> intervals;
+  };
+  SmallVector<Candidate> candidates;
+  SmallVector<int64_t> groups(slots.size(), -1);
+  for (auto [ordinal, buffer, slot] : llvm::enumerate(buffers, slots)) {
+    if (slot.storage != MaterializationStorage::Temporary) {
+      groups[ordinal] = ordinal;
+      continue;
+    }
+    if (slot.requiredBytes <= 0 || buffer.getLifetimeStart() < 0 ||
+        buffer.getLifetimeEnd() < buffer.getLifetimeStart())
+      return failure();
+    candidates.push_back({static_cast<int64_t>(ordinal),
+                          static_cast<int64_t>(buffer.getLifetimeStart()),
+                          static_cast<int64_t>(buffer.getLifetimeEnd()),
+                          slot.requiredBytes});
+  }
+  llvm::sort(candidates, [](const Candidate &left, const Candidate &right) {
+    if (left.requiredBytes != right.requiredBytes)
+      return left.requiredBytes > right.requiredBytes;
+    if (left.lifetimeStart != right.lifetimeStart)
+      return left.lifetimeStart < right.lifetimeStart;
+    if (left.lifetimeEnd != right.lifetimeEnd)
+      return left.lifetimeEnd < right.lifetimeEnd;
+    return left.ordinal < right.ordinal;
+  });
+  SmallVector<ReuseGroup> available;
+  for (const Candidate &candidate : candidates) {
+    auto reusable = llvm::find_if(available, [&](const ReuseGroup &group) {
+      return llvm::all_of(group.intervals, [&](const auto &interval) {
+        return candidate.lifetimeEnd < interval.first ||
+               interval.second < candidate.lifetimeStart;
+      });
+    });
+    if (reusable == available.end()) {
+      available.push_back(
+          {static_cast<int64_t>(slots.size() + available.size()), {}});
+      reusable = std::prev(available.end());
+    }
+    reusable->intervals.push_back(
+        {candidate.lifetimeStart, candidate.lifetimeEnd});
+    groups[candidate.ordinal] = reusable->ordinal;
+  }
+  if (llvm::is_contained(groups, -1))
+    return failure();
+  return groups;
 }
 
 struct PtxEmitter {
@@ -4031,6 +4127,13 @@ FailureOr<int64_t> emitScalarBody(PtxEmitter &ptx, Block &body,
       ptx.stream << "  add.rn.f32 %f" << result << ", %f"
                  << values.lookup(add.getLhs()) << ", %f"
                  << values.lookup(add.getRhs()) << ";\n";
+    } else if (auto subtract = dyn_cast<arith::SubFOp>(operation)) {
+      ptx.stream << "  sub.rn.f32 %f" << result << ", %f"
+                 << values.lookup(subtract.getLhs()) << ", %f"
+                 << values.lookup(subtract.getRhs()) << ";\n";
+    } else if (auto negate = dyn_cast<arith::NegFOp>(operation)) {
+      ptx.stream << "  neg.f32 %f" << result << ", %f"
+                 << values.lookup(negate.getOperand()) << ";\n";
     } else if (auto multiply = dyn_cast<arith::MulFOp>(operation)) {
       ptx.stream << "  mul.rn.f32 %f" << result << ", %f"
                  << values.lookup(multiply.getLhs()) << ", %f"
@@ -4111,27 +4214,66 @@ FailureOr<std::string> emitMapPtx(MapOp map, ScheduleTaskOp task) {
 }
 
 FailureOr<std::string> emitFoldPtx(FoldOp fold, ScheduleTaskOp task) {
-  if (fold.getReductionDimensions() != ArrayRef<int64_t>({1}) ||
-      task.getDomainShape() != ArrayRef<int64_t>({2048, 4096}) ||
-      task.getWorkgroupThreads() != 256 || task.getScratchBytes() != 1024)
+  if (!isClosedRankTwoFold(fold) || fold.getInputs().size() != 1 ||
+      fold.getInitializers().size() != 1 || fold.getNumResults() != 1 ||
+      task.getDomainShape().size() != 2 ||
+      task.getDomainShape() !=
+          cast<RankedTensorType>(fold.getInputs()[0].getType()).getShape())
+    return failure();
+  const int64_t reductionAxis = fold.getReductionDimensions().front();
+  const int64_t outputAxis = 1 - reductionAxis;
+  const int64_t reductionExtent = task.getDomainShape()[reductionAxis];
+  const int64_t outputExtent = task.getDomainShape()[outputAxis];
+  const int64_t threads = task.getWorkgroupThreads();
+  const int64_t serialTiles = task.getSerialTiles();
+  auto nextPowerOfTwo = [](int64_t value) -> FailureOr<int64_t> {
+    if (value <= 0)
+      return failure();
+    int64_t power = 1;
+    while (power < value) {
+      if (power > 128)
+        return failure();
+      power *= 2;
+    }
+    return power;
+  };
+  FailureOr<int64_t> localWidth = nextPowerOfTwo(serialTiles);
+  FailureOr<int64_t> sharedWidth =
+      nextPowerOfTwo(std::min(reductionExtent, threads));
+  if (failed(localWidth) || failed(sharedWidth) || threads <= 0 ||
+      threads > 256 ||
+      task.getGridShape() != ArrayRef<int64_t>({outputExtent}) ||
+      task.getScratchBytes() != threads * static_cast<int64_t>(sizeof(float)) ||
+      *localWidth > 64 || *sharedWidth > threads)
     return failure();
   PtxEmitter ptx(3);
   ptx.header(task.getSemanticFingerprint(), /*usesDynamicSharedMemory=*/true);
   ptx.stream << "  mov.u32 %r0, %tid.x;\n"
                 "  mov.u32 %r1, %ctaid.x;\n"
-                "  setp.ge.u32 %p0, %r1, 2048;\n"
-                "  @%p0 bra $done;\n"
-                "  ld.param.u64 %rd0, [p0];\n"
-                "  cvt.u64.u32 %rd1, %r1;\n"
-                "  mul.lo.u64 %rd1, %rd1, 16384;\n"
-                "  add.u64 %rd0, %rd0, %rd1;\n"
-                "  cvt.u64.u32 %rd2, %r0;\n"
-                "  mul.lo.u64 %rd2, %rd2, 64;\n"
-                "  add.u64 %rd0, %rd0, %rd2;\n";
-  for (int64_t index = 0; index < 16; ++index)
-    ptx.stream << "  ld.global.f32 %f" << index << ", [%rd0+" << index * 4
-               << "];\n";
-  int64_t width = 16;
+                "  setp.ge.u32 %p0, %r1, "
+             << outputExtent
+             << ";\n  @%p0 bra $done;\n"
+                "  ld.param.u64 %rd0, [p0];\n";
+  for (int64_t index = 0; index < *localWidth; ++index)
+    ptx.stream << "  mov.f32 %f" << index << ", 0f00000000;\n";
+  for (int64_t index = 0; index < serialTiles; ++index) {
+    ptx.stream << "  mul.lo.u32 %r4, %r0, " << serialTiles
+               << ";\n  add.u32 %r4, %r4, " << index
+               << ";\n  setp.ge.u32 %p1, %r4, " << reductionExtent
+               << ";\n  @%p1 bra $load_skip" << index << ";\n"
+               << "  cvt.u64.u32 %rd1, %r4;\n"
+               << "  cvt.u64.u32 %rd2, %r1;\n";
+    if (reductionAxis == 1) {
+      ptx.stream << "  mad.lo.u64 %rd3, %rd2, " << reductionExtent
+                 << ", %rd1;\n";
+    } else {
+      ptx.stream << "  mad.lo.u64 %rd3, %rd1, " << outputExtent << ", %rd2;\n";
+    }
+    ptx.stream << "  mad.lo.u64 %rd3, %rd3, 4, %rd0;\n"
+               << "  ld.global.f32 %f" << index << ", [%rd3];\n$load_skip"
+               << index << ":\n";
+  }
+  int64_t width = *localWidth;
   while (width > 1) {
     for (int64_t index = 0; index < width / 2; ++index)
       ptx.stream << "  add.rn.f32 %f" << index << ", %f" << index * 2 << ", %f"
@@ -4144,7 +4286,7 @@ FailureOr<std::string> emitFoldPtx(FoldOp fold, ScheduleTaskOp task) {
                 "  add.u64 %rd3, %rd4, %rd3;\n"
                 "  st.shared.f32 [%rd3], %f0;\n"
                 "  bar.sync 0;\n";
-  for (int64_t step = 128; step >= 1; step /= 2) {
+  for (int64_t step = *sharedWidth / 2; step >= 1; step /= 2) {
     ptx.stream << "  setp.ge.u32 %p1, %r0, " << step << ";\n  @%p1 bra $skip"
                << step << ";\n"
                << "  mul.lo.u32 %r4, %r0, 2;\n"
@@ -4281,8 +4423,6 @@ deriveCpuExecutable(ModuleOp module, MaterializationPlanOp materialization,
     }
     algebra.push_back(&operation);
   }
-  SmallVector<MaterializationBufferOp> materializationBuffers(
-      materialization.getBody().front().getOps<MaterializationBufferOp>());
   SmallVector<ScheduleTaskOp> scheduleTasks(
       schedule.getBody().front().getOps<ScheduleTaskOp>());
   if (algebra.size() != scheduleTasks.size()) {
@@ -4348,42 +4488,17 @@ deriveCpuExecutable(ModuleOp module, MaterializationPlanOp materialization,
                          : ExecutablePredication::DomainBounds,
                      scheduleTask.getReductionOrder()});
   }
-  for (MaterializationBufferOp buffer : materializationBuffers) {
-    auto type = cast<RankedTensorType>(buffer.getTensorType());
-    const int64_t elementBytes = type.getElementType().isBF16() ? 2 : 4;
-    FailureOr<int64_t> elements = scheduleElementCount(type.getShape());
-    if (failed(elements) ||
-        *elements > std::numeric_limits<int64_t>::max() / elementBytes) {
-      return failure();
-    }
-    SmallVector<int64_t> strides(type.getRank());
-    int64_t stride = elementBytes;
-    for (int64_t axis = type.getRank(); axis > 0; --axis) {
-      strides[axis - 1] = stride;
-      stride *= type.getDimSize(axis - 1);
-    }
-    ExecutableAccess access = ExecutableAccess::ReadWrite;
-    if (buffer.getLiveIn()) {
-      access = ExecutableAccess::Read;
-    } else if (buffer.getLiveOut()) {
-      access = ExecutableAccess::Write;
-    }
-    spec.slots.push_back(CpuSlotSpec{type, *elements * elementBytes,
-                                     std::move(strides), elementBytes, access,
-                                     buffer.getStorage()});
-  }
+  FailureOr<SmallVector<CpuSlotSpec>> slots =
+      deriveExecutableSlots(materialization);
+  if (failed(slots))
+    return failure();
+  spec.slots = std::move(*slots);
   return spec;
 }
 
 FailureOr<GpuExecutableSpec>
 deriveGpuExecutable(ModuleOp module, MaterializationPlanOp materialization,
                     SchedulePlanOp schedule) {
-  FailureOr<CpuExecutableSpec> cpu =
-      deriveCpuExecutable(module, materialization, schedule);
-  if (failed(cpu) || cpu->codeFormat != ExecutableCodeFormat::CpuBytecodeV2 ||
-      cpu->entries.size() != 19 || cpu->slots.size() != 21 ||
-      schedule.getPolicy() != NumericalPolicy::SourceOrdered)
-    return failure();
   SmallVector<RegionOp> regions;
   module.walk([&](RegionOp region) { regions.push_back(region); });
   if (regions.size() != 1)
@@ -4394,24 +4509,41 @@ deriveGpuExecutable(ModuleOp module, MaterializationPlanOp materialization,
     algebra.push_back(&operation);
   SmallVector<ScheduleTaskOp> tasks(
       schedule.getBody().front().getOps<ScheduleTaskOp>());
-  if (algebra.size() != 19 || tasks.size() != 19)
+  if (algebra.empty() || algebra.size() != tasks.size() ||
+      algebra.size() > kMaximumGpuExecutableRecords)
     return failure();
 
   GpuExecutableSpec spec;
-  spec.slots = cpu->slots;
+  FailureOr<SmallVector<CpuSlotSpec>> slots =
+      deriveExecutableSlots(materialization);
+  if (failed(slots) || slots->empty() ||
+      slots->size() > kMaximumGpuExecutableRecords)
+    return failure();
+  spec.slots = std::move(*slots);
+  FailureOr<SmallVector<int64_t>> reuseGroups =
+      deriveGpuReuseGroups(materialization, spec.slots);
+  if (failed(reuseGroups))
+    return failure();
+  spec.reuseGroups = std::move(*reuseGroups);
   for (auto [ordinal, operation, task] : llvm::enumerate(algebra, tasks)) {
     FailureOr<std::string> ptx =
         isa<MapOp>(operation)    ? emitMapPtx(cast<MapOp>(operation), task)
         : isa<FoldOp>(operation) ? emitFoldPtx(cast<FoldOp>(operation), task)
                                  : FailureOr<std::string>(failure());
-    if (failed(ptx) || ptx->empty() || !StringRef(*ptx).ends_with("\n") ||
+    if (failed(ptx)) {
+      operation->emitOpError("cannot emit bounded generic SM90 PTX");
+      return failure();
+    }
+    if (ptx->empty() || !StringRef(*ptx).ends_with("\n") ||
         ptx->size() > kMaximumGpuEntryCodeBytes ||
         task.getGridShape().size() != 1 || task.getGridShape()[0] <= 0 ||
         task.getGridShape()[0] > UINT32_MAX ||
         task.getWorkgroupThreads() <= 0 || task.getWorkgroupThreads() > 1024 ||
         task.getScratchBytes() < 0 ||
-        task.getScratchBytes() > kMaximumGpuDynamicSharedMemoryBytes)
+        task.getScratchBytes() > kMaximumGpuDynamicSharedMemoryBytes) {
+      task.emitOpError("has invalid bounded GPU code or launch resources");
       return failure();
+    }
     int64_t offset = spec.code.size();
     spec.code.append(ptx->begin(), ptx->end());
     SmallVector<int64_t> inputs(task.getInputBuffers());
@@ -4600,8 +4732,8 @@ public:
                                                          slot.storage)),
           builder.getNamedAttr("alias_group",
                                builder.getI64IntegerAttr(ordinal)),
-          builder.getNamedAttr("reuse_group",
-                               builder.getI64IntegerAttr(ordinal)),
+          builder.getNamedAttr("reuse_group", builder.getI64IntegerAttr(
+                                                  spec->reuseGroups[ordinal])),
           builder.getNamedAttr("binding", ExecutableBindingKindAttr::get(
                                               module.getContext(), binding))};
       if (bindingIndex)
@@ -5144,7 +5276,7 @@ LogicalResult verifyGpuExecutableAgainstSource(ModuleOp module) {
       deriveGpuExecutable(module, materializations.front(), schedules.front());
   if (failed(expected) || devices.front().getSchemaVersion() != 3 ||
       devices.front().getCodeFormat() != ExecutableCodeFormat::CudaPtxSm90V1 ||
-      devices.front().getPolicy() != NumericalPolicy::SourceOrdered ||
+      devices.front().getPolicy() != schedules.front().getPolicy() ||
       devices.front().getSourceScheduleFingerprint() !=
           schedules.front().getFingerprint() ||
       abis.front().getSchemaVersion() != 3 ||
@@ -5180,7 +5312,7 @@ LogicalResult verifyGpuExecutableAgainstSource(ModuleOp module) {
   }
   int64_t operandBinding = 0;
   int64_t resultBinding = 0;
-  for (auto [actual, spec] : llvm::zip_equal(slots, expected->slots)) {
+  for (auto [ordinal, actual, spec] : llvm::enumerate(slots, expected->slots)) {
     ExecutableBindingKind binding = ExecutableBindingKind::None;
     std::optional<int64_t> bindingIndex;
     if (spec.storage == MaterializationStorage::External &&
@@ -5200,7 +5332,7 @@ LogicalResult verifyGpuExecutableAgainstSource(ModuleOp module) {
         actual.getAccess() != spec.access ||
         actual.getStorage() != spec.storage ||
         actual.getAliasGroup() != actual.getOrdinal() ||
-        actual.getReuseGroup() != actual.getOrdinal() ||
+        actual.getReuseGroup() != expected->reuseGroups[ordinal] ||
         actual.getBinding() != binding ||
         actual.getBindingIndex() != bindingIndex)
       return failure();
@@ -5235,23 +5367,68 @@ public:
       return signalPassFailure();
     }
     RegionOp region = regions.front();
-    Type matrix = RankedTensorType::get({2048, 4096},
-                                        BFloat16Type::get(module.getContext()));
-    Type vector =
-        RankedTensorType::get({4096}, BFloat16Type::get(module.getContext()));
-    if (region.getPolicy() != NumericalPolicy::SourceOrdered ||
-        region.getInputs().size() != 2 || region.getResults().size() != 1 ||
-        region.getInputs()[0].getType() != matrix ||
-        region.getInputs()[1].getType() != vector ||
-        region.getResults()[0].getType() != matrix) {
-      region.emitOpError(
-          "GPU typed-FFI bridge requires the closed large forward signature");
-      return signalPassFailure();
-    }
     SmallVector<DeviceModuleOp> devices(module.getOps<DeviceModuleOp>());
     SmallVector<InvocationAbiOp> abis(module.getOps<InvocationAbiOp>());
     SmallVector<ExecutableBundleOp> bundles(
         module.getOps<ExecutableBundleOp>());
+    if (devices.size() != 1 || abis.size() != 1 || bundles.size() != 1 ||
+        devices.front().getPolicy() != region.getPolicy()) {
+      region.emitOpError(
+          "GPU typed-FFI bridge requires one policy-bound closed "
+          "bundle");
+      return signalPassFailure();
+    }
+    auto closedExternalType = [](Value value) {
+      auto tensor = dyn_cast<RankedTensorType>(value.getType());
+      return tensor && tensor.hasStaticShape() && tensor.getRank() >= 1 &&
+             tensor.getRank() <= 2 && tensor.getElementType().isBF16();
+    };
+    if (!llvm::all_of(region.getInputs(), closedExternalType) ||
+        !llvm::all_of(region.getResults(), closedExternalType)) {
+      region.emitOpError("GPU typed-FFI bridge requires static rank-one or "
+                         "rank-two BF16 views");
+      return signalPassFailure();
+    }
+    SmallVector<InvocationSlotOp> operandSlots(region.getInputs().size());
+    SmallVector<InvocationSlotOp> resultSlots(region.getResults().size());
+    for (InvocationSlotOp slot :
+         abis.front().getBody().front().getOps<InvocationSlotOp>()) {
+      if (!slot.getBindingIndex())
+        continue;
+      SmallVector<InvocationSlotOp> *projection = nullptr;
+      if (slot.getBinding() == ExecutableBindingKind::Operand)
+        projection = &operandSlots;
+      else if (slot.getBinding() == ExecutableBindingKind::Result)
+        projection = &resultSlots;
+      else {
+        region.emitOpError(
+            "GPU typed-FFI bridge has an invalid external binding");
+        return signalPassFailure();
+      }
+      int64_t index = *slot.getBindingIndex();
+      if (index < 0 || index >= static_cast<int64_t>(projection->size()) ||
+          (*projection)[index]) {
+        region.emitOpError("GPU typed-FFI bridge projection is not contiguous");
+        return signalPassFailure();
+      }
+      (*projection)[index] = slot;
+    }
+    for (auto [index, slot] : llvm::enumerate(operandSlots)) {
+      if (!slot ||
+          slot.getTensorType() != region.getInputs()[index].getType()) {
+        region.emitOpError(
+            "GPU operand projection does not match the region ABI");
+        return signalPassFailure();
+      }
+    }
+    for (auto [index, slot] : llvm::enumerate(resultSlots)) {
+      if (!slot ||
+          slot.getTensorType() != region.getResults()[index].getType()) {
+        region.emitOpError(
+            "GPU result projection does not match the region ABI");
+        return signalPassFailure();
+      }
+    }
     OpBuilder builder(module.getContext());
     OwningOpRef<ModuleOp> stripped = ModuleOp::create(module.getLoc());
     builder.setInsertionPointToEnd(stripped->getBody());
@@ -5643,7 +5820,7 @@ void registerShuttleStablehloPipelines() {
             commandLinePipelineOptions(NumericalPolicy::SourceOrdered);
         options.executionMode = ExecutionMode::CpuExecutableBundle;
         options.canonicalOptions =
-            R"json({"execution_mode":"cpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":10,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+            R"json({"execution_mode":"cpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":11,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
         buildShuttleStablehloPipeline(manager, options);
       });
   PassPipelineRegistration<>(
@@ -5654,19 +5831,30 @@ void registerShuttleStablehloPipelines() {
             commandLinePipelineOptions(NumericalPolicy::Fast);
         options.executionMode = ExecutionMode::CpuExecutableBundle;
         options.canonicalOptions =
-            R"json({"execution_mode":"cpu_executable_bundle","numerics":"fast","pipeline_abi_version":10,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+            R"json({"execution_mode":"cpu_executable_bundle","numerics":"fast","pipeline_abi_version":11,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
         buildShuttleStablehloPipeline(manager, options);
       });
   PassPipelineRegistration<>(
       "shuttle-gpu-executable-bundle-pipeline",
-      "Replace the closed 2048x4096 source-ordered graph with a CUDA typed FFI "
+      "Replace a closed source-ordered Map/Fold graph with a CUDA typed FFI "
       "call",
       [](OpPassManager &manager) {
         ShuttlePipelineOptions options =
             commandLinePipelineOptions(NumericalPolicy::SourceOrdered);
         options.executionMode = ExecutionMode::GpuExecutableBundle;
         options.canonicalOptions =
-            R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":10,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+            R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":11,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+        buildShuttleStablehloPipeline(manager, options);
+      });
+  PassPipelineRegistration<>(
+      "shuttle-gpu-executable-bundle-fast-pipeline",
+      "Replace a closed fast-policy Map/Fold graph with a CUDA typed FFI call",
+      [](OpPassManager &manager) {
+        ShuttlePipelineOptions options =
+            commandLinePipelineOptions(NumericalPolicy::Fast);
+        options.executionMode = ExecutionMode::GpuExecutableBundle;
+        options.canonicalOptions =
+            R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":11,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
         buildShuttleStablehloPipeline(manager, options);
       });
 }

@@ -1315,9 +1315,6 @@ LogicalResult DeviceModuleOp::verifyRegions() {
     return emitOpError("requires source_ordered policy for CPU bytecode v2");
   }
   const bool gpu = getCodeFormat() == ExecutableCodeFormat::CudaPtxSm90V1;
-  if (gpu && getPolicy() != NumericalPolicy::SourceOrdered) {
-    return emitOpError("requires source_ordered policy for CUDA PTX v1");
-  }
   if (!isLowerHexDigest(getSourceScheduleFingerprint()) ||
       !isLowerHexDigest(getCodeDigest()) ||
       !isLowerHexDigest(getFingerprint())) {
@@ -1489,7 +1486,6 @@ LogicalResult InvocationAbiOp::verifyRegions() {
   }
   int64_t ordinal = 0;
   llvm::SmallDenseSet<int64_t> aliasGroups;
-  llvm::SmallDenseSet<int64_t> reuseGroups;
   int64_t operandBinding = 0;
   int64_t resultBinding = 0;
   for (Operation &operation : body.front().without_terminator()) {
@@ -1541,11 +1537,15 @@ LogicalResult InvocationAbiOp::verifyRegions() {
           "alignment");
     }
     if (!aliasGroups.insert(slot.getAliasGroup()).second ||
-        slot.getAliasGroup() != slot.getOrdinal() ||
-        !reuseGroups.insert(slot.getReuseGroup()).second ||
-        slot.getReuseGroup() != slot.getOrdinal()) {
-      return slot.emitOpError("closed CPU ABI forbids aliasing and reuse");
-    }
+        slot.getAliasGroup() != slot.getOrdinal())
+      return slot.emitOpError("closed executable ABI forbids aliasing");
+    if (slot.getReuseGroup() < 0 ||
+        (getSchemaVersion() == 2 &&
+         slot.getReuseGroup() != slot.getOrdinal()) ||
+        (slot.getStorage() == MaterializationStorage::External &&
+         slot.getReuseGroup() != slot.getOrdinal()))
+      return slot.emitOpError(
+          "reuse group is invalid for the slot storage and ABI schema");
     if (slot.getStorage() == MaterializationStorage::External &&
         slot.getAccess() == ExecutableAccess::ReadWrite) {
       return slot.emitOpError("external slots must be read-only or write-only");

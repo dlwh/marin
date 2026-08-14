@@ -11,7 +11,7 @@ from enum import StrEnum
 SCHEMA_VERSION = 1
 # Bump when unchanged JSON fields acquire new compiler semantics. This forces a
 # distinct JAX/XLA cache identity even when the wire schema itself is stable.
-PIPELINE_ABI_VERSION = 10
+PIPELINE_ABI_VERSION = 11
 ENABLE_OPTION = "xla_shuttle_enable"
 OPTIONS_OPTION = "xla_shuttle_options"
 MAXIMUM_TENSOR_RANK = 8
@@ -76,8 +76,6 @@ class Options:
             raise TypeError("execution_mode must be an ExecutionMode value")
         if type(self.tuning) is not Tuning:
             raise TypeError("tuning must be a Tuning value")
-        if self.execution_mode is ExecutionMode.GPU_EXECUTABLE_BUNDLE and self.numerics is not Numerics.SOURCE_ORDERED:
-            raise ValueError("GPU executable bundle requires source_ordered numerics")
 
 
 CompilerOptions = dict[str, bool | str]
