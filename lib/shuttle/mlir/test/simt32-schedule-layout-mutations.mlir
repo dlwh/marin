@@ -37,4 +37,4 @@
 // ORDER: Fold reduction order must equal bound Fold semantics
 // LIFETIME: schedule buffer type and lifetime must equal materialization
 // AXIS0: "shuttle.schedule_task"() <{{.*}}domain_shape = array<i64: 3, 2>{{.*}}grid_shape = array<i64: 2>{{.*}}kind = #shuttle.schedule_task_kind<column_fold>{{.*}}reduction_axis = 0{{.*}}serial_tiles = 1{{.*}}tile_shape = array<i64: 3, 1>
-// BOUNDARY: requires exactly one connected static Fold and Map region
+// BOUNDARY: requires exactly one connected static GPU algebra region

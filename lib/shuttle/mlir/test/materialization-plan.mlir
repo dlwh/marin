@@ -36,4 +36,4 @@
 // FAST-SAME: policy = #shuttle.policy<fast>
 
 // AXIS0: "shuttle.materialization_task"() <{{.*}}domain_shape = array<i64: 3, 2>{{.*}}kind = #shuttle.materialization_task_kind<fold>{{.*}}reduction_dimensions = array<i64: 0>
-// BOUNDARY: requires exactly one connected static Fold and Map region
+// BOUNDARY: requires exactly one connected static GPU algebra region
