@@ -47,3 +47,17 @@ module @public_f32 {
 }
 
 // CHECK: requires a bounded set of independently connected static GPU algebra regions
+
+// -----
+
+// ABI16 admits matrix-style Contracts with at least two parallel dimensions.
+// Batched vector dot remains outside the frozen boundary.
+module @batched_vector_dot {
+  func.func public @main(%lhs: tensor<3x13xbf16>, %rhs: tensor<3x13xbf16>) -> tensor<3xbf16> {
+    %0 = stablehlo.dot_general %lhs, %rhs, batching_dims = [0] x [0], contracting_dims = [1] x [1], precision = [DEFAULT, DEFAULT] : (tensor<3x13xbf16>, tensor<3x13xbf16>) -> tensor<3xf32>
+    %1 = stablehlo.convert %0 : (tensor<3xf32>) -> tensor<3xbf16>
+    return %1 : tensor<3xbf16>
+  }
+}
+
+// CHECK: requires a bounded set of independently connected static GPU algebra regions
