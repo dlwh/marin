@@ -139,6 +139,9 @@ struct Decoded {
   llvm::SmallVector<uint64_t> slotReuseOffsets;
   llvm::SmallVector<uint8_t> slotStorage;
   llvm::SmallVector<uint8_t> slotBinding;
+  llvm::SmallVector<llvm::SmallVector<int64_t>> slotDimensions;
+  llvm::SmallVector<llvm::SmallVector<int64_t>> slotStrides;
+  llvm::SmallVector<int64_t> slotRequiredBytes;
   llvm::SmallVector<int64_t> slotProducers;
   llvm::SmallVector<int64_t> slotFinalUses;
   llvm::SmallVector<uint64_t> launchFirstInputOffsets;
@@ -296,6 +299,9 @@ std::optional<Decoded> decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes) {
   llvm::DenseMap<int64_t, size_t> temporaryGroupIndexes;
   llvm::SmallVector<uint8_t> slotStorage;
   llvm::SmallVector<uint8_t> slotBinding;
+  llvm::SmallVector<llvm::SmallVector<int64_t>> slotDimensions;
+  llvm::SmallVector<llvm::SmallVector<int64_t>> slotStrides;
+  llvm::SmallVector<int64_t> slotRequiredBytes;
   llvm::SmallVector<int64_t> slotBindingIndex;
   for (int64_t ordinal = 0; ordinal < static_cast<int64_t>(slotCount);
        ++ordinal) {
@@ -343,6 +349,9 @@ std::optional<Decoded> decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes) {
     int64_t bindingIndex = hasBindingIndex ? reader.i64() : -1;
     slotStorage.push_back(storage);
     slotBinding.push_back(binding);
+    slotDimensions.push_back(std::move(dimensions));
+    slotStrides.push_back(std::move(strides));
+    slotRequiredBytes.push_back(required);
     slotBindingIndex.push_back(bindingIndex);
     if (rank == 0)
       ++scalarSlots;
@@ -456,6 +465,9 @@ std::optional<Decoded> decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes) {
                  std::move(slotReuseOffsets),
                  std::move(slotStorage),
                  std::move(slotBinding),
+                 std::move(slotDimensions),
+                 std::move(slotStrides),
+                 std::move(slotRequiredBytes),
                  std::move(producers),
                  std::move(finalUses),
                  std::move(launchFirstInputOffsets),
@@ -683,7 +695,7 @@ buildFixture(llvm::StringRef source,
   } else if (policy == mlir::shuttle::NumericalPolicy::Fast) {
     manager.addPass(mlir::shuttle::createFormStructuralRegionsPass(
         policy,
-        R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":16,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
+        R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":17,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
         R"json({"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json"));
   } else {
     manager.addPass(mlir::shuttle::createFormStructuralRegionsPass());
@@ -702,9 +714,9 @@ std::unique_ptr<BuiltBundle>
 buildGpuContractFixture(llvm::StringRef source,
                         mlir::shuttle::NumericalPolicy policy) {
   constexpr llvm::StringLiteral sourceOrdered =
-      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":16,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":17,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
   constexpr llvm::StringLiteral fast =
-      R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":16,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":17,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
   return buildFixture(
       source, policy,
       policy == mlir::shuttle::NumericalPolicy::Fast ? fast : sourceOrdered);
@@ -1761,6 +1773,127 @@ TEST(GpuTransportV2Test, Abi16BatchedContractFingerprintsIgnoreModuleSymbols) {
 }
 
 TEST(GpuTransportV2Test,
+     Abi17RankNFoldClosesTransportGeometryBytesAndAddressing) {
+  struct Shape {
+    llvm::StringRef stem;
+    std::vector<int64_t> inputShape;
+    std::vector<int64_t> resultShape;
+    int64_t outputCount;
+    int64_t reductionExtent;
+    uint64_t threads;
+    uint32_t scratch;
+    int64_t inputBytes;
+    int64_t resultBytes;
+    int64_t publicBytes;
+  };
+  struct Boundary {
+    llvm::StringRef suffix;
+    int64_t launches;
+    int64_t folds;
+    int64_t externalSlots;
+  };
+  const Shape shapes[] = {
+      {"2x5x17", {2, 5, 17}, {2, 5}, 10, 17, 32, 128, 680, 40, 340},
+      {"3x2x4x7x269",
+       {3, 2, 4, 7, 269},
+       {3, 2, 4, 7},
+       168,
+       269,
+       256,
+       1024,
+       180768,
+       672,
+       90384},
+  };
+  constexpr Boundary boundaries[] = {
+      {"forward", 6, 1, 2},
+      {"backward", 12, 2, 3},
+      {"composed", 14, 2, 4},
+  };
+
+  for (const Shape &shape : shapes) {
+    for (const Boundary &boundary : boundaries) {
+      std::string filename =
+          ("jax-0.10.1-bf16-rank_n_fold_map-" + shape.stem + "-" +
+           boundary.suffix + ".mlir")
+              .str();
+      SCOPED_TRACE(filename);
+      auto source = fixtureSource(filename);
+      ASSERT_TRUE(source);
+      for (mlir::shuttle::NumericalPolicy policy :
+           {mlir::shuttle::NumericalPolicy::SourceOrdered,
+            mlir::shuttle::NumericalPolicy::Fast}) {
+        auto built = buildGpuContractFixture(*source, policy);
+        ASSERT_TRUE(built);
+        auto bytes =
+            mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+        ASSERT_TRUE(mlir::succeeded(bytes));
+        auto decoded = decodeInlineSchema2(*bytes);
+        ASSERT_TRUE(decoded);
+        auto loaded = mlir::shuttle::GpuExecutable::Load(*bytes);
+        ASSERT_TRUE(loaded.ok()) << loaded.status();
+        EXPECT_EQ(decoded->launches.size(), boundary.launches);
+        EXPECT_EQ(decoded->externalSlots, boundary.externalSlots);
+        ASSERT_EQ((*loaded)->externalBindings().size(),
+                  boundary.externalSlots);
+        for (const auto &binding : (*loaded)->externalBindings())
+          EXPECT_EQ(binding.requiredBytes, shape.publicBytes);
+
+        int64_t inputSlots = 0;
+        int64_t resultSlots = 0;
+        for (size_t slot = 0; slot < decoded->slotDimensions.size(); ++slot) {
+          if (decoded->slotDimensions[slot] ==
+                  llvm::ArrayRef<int64_t>(shape.inputShape) &&
+              decoded->slotRequiredBytes[slot] == shape.inputBytes)
+            ++inputSlots;
+          if (decoded->slotDimensions[slot] ==
+                  llvm::ArrayRef<int64_t>(shape.resultShape) &&
+              decoded->slotRequiredBytes[slot] == shape.resultBytes)
+            ++resultSlots;
+        }
+        EXPECT_GE(inputSlots, boundary.folds);
+        EXPECT_GE(resultSlots, boundary.folds);
+
+        int64_t foldLaunches = 0;
+        for (const auto &launch : decoded->launches) {
+          if (launch.dynamicSharedMemoryBytes == 0)
+            continue;
+          ++foldLaunches;
+          EXPECT_EQ(launch.grid,
+                    (std::array<uint64_t, 3>{
+                        static_cast<uint64_t>(shape.outputCount), 1, 1}));
+          EXPECT_EQ(launch.block,
+                    (std::array<uint64_t, 3>{shape.threads, 1, 1}));
+          EXPECT_EQ(launch.dynamicSharedMemoryBytes, shape.scratch);
+          llvm::StringRef ptx(
+              reinterpret_cast<const char *>(decoded->code.data() +
+                                             launch.codeOffset),
+              launch.codeLength);
+          EXPECT_TRUE(ptx.contains(
+              ("setp.ge.u32 %p0, %r1, " + llvm::Twine(shape.outputCount) +
+               ";")
+                  .str()));
+          EXPECT_TRUE(ptx.contains(
+              ("mad.lo.u64 %rd3, %rd2, " +
+               llvm::Twine(shape.reductionExtent) + ", %rd1;")
+                  .str()));
+          EXPECT_TRUE(
+              ptx.contains("mad.lo.u64 %rd3, %rd3, 4, %rd0;"));
+          EXPECT_TRUE(ptx.contains("mul.lo.u64 %rd9, %rd9, 4;"));
+          EXPECT_EQ(ptx.count("ld.global.f32"),
+                    static_cast<size_t>(
+                        (shape.reductionExtent + shape.threads - 1) /
+                            shape.threads +
+                        1));
+          EXPECT_FALSE(ptx.contains("ld.global.u16"));
+        }
+        EXPECT_EQ(foldLaunches, boundary.folds);
+      }
+    }
+  }
+}
+
+TEST(GpuTransportV2Test,
      Abi14OrdinaryJaxMatmulVjpHasClosedMultiContractTransport) {
   auto source =
       fixtureSource("jax-0.10.1-bf16-matmul-vjp-17x33x19-backward.mlir");
@@ -2726,6 +2859,76 @@ TEST(GpuTransportV2Test,
                   .ok());
   EXPECT_EQ(trace->launchAttempts.load(), 6);
   auto slots = dynamicSlotAddresses(*decoded, allocator, 0xb0000000,
+                                    dynamicFrame->externalSlots);
+  expectKernelLaunches(*decoded, *trace, 0, slots);
+}
+
+TEST(GpuTransportV2Test,
+     Abi17RankNFoldUsesUnchangedFfiSchemasAndRankFiveLaunches) {
+  auto source = fixtureSource(
+      "jax-0.10.1-bf16-rank_n_fold_map-3x2x4x7x269-forward.mlir");
+  ASSERT_TRUE(source);
+  auto built = buildGpuContractFixture(
+      *source, mlir::shuttle::NumericalPolicy::SourceOrdered);
+  ASSERT_TRUE(built);
+  auto transport = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+  ASSERT_TRUE(mlir::succeeded(transport));
+  auto decoded = decodeInlineSchema2(*transport);
+  ASSERT_TRUE(decoded);
+  ASSERT_EQ(decoded->launches.size(), 6);
+  auto executable = mlir::shuttle::GpuExecutable::Load(*transport);
+  ASSERT_TRUE(executable.ok()) << executable.status();
+  ASSERT_EQ((*executable)->externalBindings().size(), 2);
+  auto dynamicFrame =
+      dynamicCallFrame(**executable, *transport,
+                       mlir::shuttle::gpuExecutableBundleDigest(*transport));
+  ASSERT_TRUE(dynamicFrame);
+
+  XLA_FFI_Handler_Bundle handlers =
+      mlir::shuttle::gpuExecutableBundleFfiHandlerBundle();
+  SyntheticAllocator allocator(0xc0000000);
+  stream_executor::MockStreamExecutor executor;
+  stream_executor::MockStream stream;
+  stream_executor::GpuComputeCapability capability{
+      stream_executor::CudaComputeCapability{9, 0}};
+  auto trace = std::make_shared<ExecutionTrace>();
+  EXPECT_CALL(stream, parent()).WillRepeatedly(testing::Return(&executor));
+  EXPECT_CALL(executor, LoadKernel(testing::_))
+      .Times(6)
+      .WillRepeatedly([trace](const stream_executor::KernelLoaderSpec &spec) {
+        return recordLoadedKernel(spec, trace);
+      });
+
+  xla::ffi::ExecutionState instantiateState;
+  xla::ffi::ExecutionState prepareState;
+  xla::ffi::ExecutionState initializeState;
+  xla::ffi::InvokeContext context;
+  context.device_ordinal = 0;
+  context.backend_context = xla::ffi::InvokeContext::GpuContext{
+      &stream, &allocator, nullptr, nullptr,
+      nullptr, nullptr,    nullptr, &capability};
+  context.state_context = {&instantiateState, &prepareState, &initializeState};
+
+  ASSERT_TRUE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(), handlers.instantiate,
+                               dynamicFrame->frame, context,
+                               XLA_FFI_ExecutionStage_INSTANTIATE)
+                  .ok());
+  ASSERT_TRUE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(), handlers.prepare,
+                               dynamicFrame->frame, context,
+                               XLA_FFI_ExecutionStage_PREPARE)
+                  .ok());
+  ASSERT_EQ(allocator.sizes, decoded->temporaryGroupBytes);
+  ASSERT_TRUE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(), handlers.initialize,
+                               dynamicFrame->frame, context,
+                               XLA_FFI_ExecutionStage_INITIALIZE)
+                  .ok());
+  expectLoadedKernels(*decoded, *trace, 0);
+  ASSERT_TRUE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(), handlers.execute,
+                               dynamicFrame->frame, context,
+                               XLA_FFI_ExecutionStage_EXECUTE)
+                  .ok());
+  EXPECT_EQ(trace->launchAttempts.load(), 6);
+  auto slots = dynamicSlotAddresses(*decoded, allocator, 0xc0000000,
                                     dynamicFrame->externalSlots);
   expectKernelLaunches(*decoded, *trace, 0, slots);
 }

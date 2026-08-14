@@ -1296,6 +1296,55 @@ public:
   }
 };
 
+class MaterializationFoldMutationPass
+    : public MutationPass<MaterializationFoldMutationPass> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(MaterializationFoldMutationPass)
+  MaterializationFoldMutationPass() = default;
+  MaterializationFoldMutationPass(const MaterializationFoldMutationPass &other)
+      : MutationPass<MaterializationFoldMutationPass>(other) {}
+  Option<std::string> kind{*this, "kind", llvm::cl::desc("Mutation kind"),
+                           llvm::cl::init("")};
+  StringRef getArgument() const final {
+    return "shuttle-test-mutate-fold-materialization";
+  }
+  void runOnOperation() override {
+    MaterializationPlanOp plan = materializationPlan(getOperation());
+    if (!plan) {
+      getOperation().emitError("test fixture has no materialization plan");
+      return signalPassFailure();
+    }
+    for (MaterializationTaskOp task :
+         plan.getBody().front().getOps<MaterializationTaskOp>()) {
+      if (task.getKind() != MaterializationTaskKind::Fold) {
+        continue;
+      }
+      SmallVector<int64_t> domain(task.getDomainShape());
+      StringRef mutation = kind;
+      if (mutation == "parallel") {
+        ++domain.front();
+        task->setAttr("domain_shape",
+                      DenseI64ArrayAttr::get(task.getContext(), domain));
+      } else if (mutation == "reduction") {
+        ++domain.back();
+        task->setAttr("domain_shape",
+                      DenseI64ArrayAttr::get(task.getContext(), domain));
+      } else if (mutation == "axis") {
+        task->setAttr("reduction_dimensions", DenseI64ArrayAttr::get(
+                                                  task.getContext(),
+                                                  {int64_t(domain.size()) - 2}));
+      } else {
+        getOperation().emitError("unknown Fold materialization mutation kind");
+        return signalPassFailure();
+      }
+      refreshMaterializationFingerprint(plan);
+      return;
+    }
+    getOperation().emitError("test fixture has no Fold materialization task");
+    signalPassFailure();
+  }
+};
+
 class ReportScheduleFingerprintPass
     : public MutationPass<ReportScheduleFingerprintPass> {
 public:
@@ -1747,6 +1796,77 @@ public:
   }
 };
 
+class FoldScheduleMutationPass
+    : public MutationPass<FoldScheduleMutationPass> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FoldScheduleMutationPass)
+  FoldScheduleMutationPass() = default;
+  FoldScheduleMutationPass(const FoldScheduleMutationPass &other)
+      : MutationPass<FoldScheduleMutationPass>(other) {}
+  Option<std::string> kind{*this, "kind", llvm::cl::desc("Mutation kind"),
+                           llvm::cl::init("")};
+  StringRef getArgument() const final {
+    return "shuttle-test-mutate-fold-schedule";
+  }
+  void runOnOperation() override {
+    SchedulePlanOp plan = schedulePlan(getOperation());
+    if (!plan) {
+      getOperation().emitError("test fixture has no schedule plan");
+      return signalPassFailure();
+    }
+    for (ScheduleTaskOp task :
+         plan.getBody().front().getOps<ScheduleTaskOp>()) {
+      if (task.getKind() != ScheduleTaskKind::RowFold) {
+        continue;
+      }
+      StringRef mutation = kind;
+      if (mutation == "grid") {
+        SmallVector<int64_t> grid(task.getGridShape());
+        ++grid.front();
+        task->setAttr("grid_shape",
+                      DenseI64ArrayAttr::get(task.getContext(), grid));
+      } else if (mutation == "tile") {
+        SmallVector<int64_t> tile(task.getTileShape());
+        ++tile.back();
+        task->setAttr("tile_shape",
+                      DenseI64ArrayAttr::get(task.getContext(), tile));
+      } else if (mutation == "serial") {
+        task.setSerialTiles(task.getSerialTiles() + 1);
+      } else if (mutation == "threads") {
+        task.setWorkgroupThreads(task.getWorkgroupThreads() + 32);
+      } else if (mutation == "subgroup") {
+        task.setSubgroupSize(64);
+      } else if (mutation == "scratch") {
+        task.setScratchBytes(task.getScratchBytes() + 4);
+      } else if (mutation == "axis") {
+        task->setAttr(
+            "reduction_axis",
+            IntegerAttr::get(task.getReductionAxisAttr().getType(),
+                             *task.getReductionAxis() - 1));
+      } else if (mutation == "output") {
+        SmallVector<int64_t> domain(task.getDomainShape());
+        ++domain.front();
+        task->setAttr("domain_shape",
+                      DenseI64ArrayAttr::get(task.getContext(), domain));
+      } else if (mutation == "order") {
+        ScheduleReductionOrder replacement =
+            task.getReductionOrder() == ScheduleReductionOrder::LeafOrderFree
+                ? ScheduleReductionOrder::SerialAscendingFmaRnF32
+                : ScheduleReductionOrder::LeafOrderFree;
+        task->setAttr("reduction_order", ScheduleReductionOrderAttr::get(
+                                               task.getContext(), replacement));
+      } else {
+        getOperation().emitError("unknown Fold schedule mutation kind");
+        return signalPassFailure();
+      }
+      refreshScheduleFingerprint(plan);
+      return;
+    }
+    getOperation().emitError("test fixture has no row Fold schedule task");
+    signalPassFailure();
+  }
+};
+
 class ScheduleLifetimePass : public MutationPass<ScheduleLifetimePass> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ScheduleLifetimePass)
@@ -2022,6 +2142,7 @@ void registerMutationPasses() {
   PassRegistration<MaterializationDuplicateAlgebraSourcePass>();
   PassRegistration<MaterializationSwapSameTypeEdgesPass>();
   PassRegistration<MaterializationContractShapePass>();
+  PassRegistration<MaterializationFoldMutationPass>();
   PassRegistration<MaterializationDomainPass<true>>();
   PassRegistration<MaterializationDomainPass<false>>();
   PassRegistration<MaterializationUnknownAttributePass>();
@@ -2043,6 +2164,7 @@ void registerMutationPasses() {
   PassRegistration<ScheduleTargetProfilePass>();
   PassRegistration<ScheduleReductionOrderPass>();
   PassRegistration<ContractScheduleMutationPass>();
+  PassRegistration<FoldScheduleMutationPass>();
   PassRegistration<ScheduleLifetimePass>();
   PassRegistration<RenameSymbolsPass>();
   PassRegistration<SetFastRegionPolicyPass>();
