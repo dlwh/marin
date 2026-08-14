@@ -65,8 +65,9 @@
 
 // PLAN-A: "shuttle.materialization_plan"() <{{.*}}schema_version = 2
 // PLAN-A-COUNT-8: "shuttle.materialization_buffer"
-// PLAN-A-COUNT-6: "shuttle.materialization_task"
+// PLAN-A-COUNT-4: "shuttle.materialization_task"
 // PLAN-A: domain_shape = array<i64: 2, 3, 5, 11, 7>{{.*}}kind = #shuttle.materialization_task_kind<contract>{{.*}}reduction_dimensions = array<i64: 4>
+// PLAN-A-COUNT-1: "shuttle.materialization_task"
 
 // PLAN-B: "shuttle.materialization_plan"() <{{.*}}schema_version = 2
 // PLAN-B: domain_shape = array<i64: 3, 2, 4, 6, 13>{{.*}}kind = #shuttle.materialization_task_kind<contract>{{.*}}reduction_dimensions = array<i64: 4>

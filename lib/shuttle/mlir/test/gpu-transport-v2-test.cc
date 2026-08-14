@@ -365,7 +365,7 @@ std::optional<Decoded> decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes) {
       ++externalSlots;
       if (reuseGroup != ordinal || binding == 0 || !hasBindingIndex ||
           (binding == 1 && access != 0) || (binding == 2 && access != 1) ||
-          elementType != 0 || rank == 0 || rank > 2)
+          elementType != 0 || rank == 0 || rank > 8)
         return std::nullopt;
     }
   }
