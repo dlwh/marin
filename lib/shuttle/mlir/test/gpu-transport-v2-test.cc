@@ -2571,6 +2571,156 @@ TEST(GpuTransportV2Test,
 }
 
 TEST(GpuTransportV2Test,
+     Abi20ProjectedParameterBroadcastClosesGeometryAndAddresses) {
+  struct Shape {
+    llvm::StringRef stem;
+    std::vector<int64_t> full;
+    std::vector<int64_t> inserted;
+    std::vector<int64_t> weight;
+    std::vector<int64_t> coordinates;
+    std::vector<int64_t> divisors;
+    uint64_t fullGrid;
+    uint64_t parameterGrid;
+    int64_t fullBytes;
+    int64_t insertedBytes;
+    int64_t weightBytes;
+    int64_t sampleInputByte;
+    int64_t sampleOutputByte;
+  };
+  const Shape shapes[] = {
+      {"2x7x19", {2, 7, 19}, {1, 1, 19}, {19}, {1, 6, 18}, {2, 7},
+       2, 1, 1064, 76, 38, 72, 1060},
+      {"3x2x5x11x263", {3, 2, 5, 11, 263}, {1, 1, 1, 1, 263},
+       {263}, {2, 1, 4, 10, 262}, {3, 2, 5, 11}, 340, 2, 347160,
+       1052, 526, 1048, 347156},
+  };
+  for (const Shape &shape : shapes) {
+    auto source = fixtureSource(
+        ("jax-0.10.1-bf16-projected_parameter_broadcast-" + shape.stem +
+         "-forward.mlir")
+            .str());
+    ASSERT_TRUE(source);
+    std::optional<llvm::SmallVector<uint8_t>> sourceTransport;
+    for (mlir::shuttle::NumericalPolicy policy :
+         {mlir::shuttle::NumericalPolicy::SourceOrdered,
+          mlir::shuttle::NumericalPolicy::Fast}) {
+      auto built = buildGpuContractFixture(*source, policy);
+      ASSERT_TRUE(built);
+      auto bytes = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+      ASSERT_TRUE(mlir::succeeded(bytes));
+      auto decoded = decodeInlineSchema2(*bytes);
+      ASSERT_TRUE(decoded);
+      auto loaded = mlir::shuttle::GpuExecutable::Load(*bytes);
+      ASSERT_TRUE(loaded.ok()) << loaded.status();
+      EXPECT_EQ(decoded->launches.size(), 19);
+      EXPECT_EQ(decoded->slots, 21);
+      EXPECT_EQ(decoded->externalSlots, 3);
+      EXPECT_EQ((*loaded)->externalBindings().size(), 3);
+      int64_t projectedLaunches = 0;
+      for (const auto &launch : decoded->launches) {
+        if (launch.inputSlots.size() != 1 || launch.outputSlots.size() != 1)
+          continue;
+        int64_t input = launch.inputSlots.front();
+        int64_t output = launch.outputSlots.front();
+        if (decoded->slotDimensions[input] !=
+                llvm::ArrayRef<int64_t>(shape.inserted) ||
+            decoded->slotDimensions[output] !=
+                llvm::ArrayRef<int64_t>(shape.full))
+          continue;
+        ++projectedLaunches;
+        EXPECT_EQ(decoded->slotRequiredBytes[input], shape.insertedBytes);
+        EXPECT_EQ(decoded->slotRequiredBytes[output], shape.fullBytes);
+        EXPECT_EQ(launch.grid,
+                  (std::array<uint64_t, 3>{shape.fullGrid, 1, 1}));
+        EXPECT_EQ(launch.block,
+                  (std::array<uint64_t, 3>{256, 1, 1}));
+        llvm::StringRef ptx(
+            reinterpret_cast<const char *>(decoded->code.data() +
+                                           launch.codeOffset),
+            launch.codeLength);
+        for (int64_t divisor : shape.divisors) {
+          std::string suffix = (", " + llvm::Twine(divisor) + ";").str();
+          int64_t affineDivisions = 0;
+          llvm::SmallVector<llvm::StringRef> lines;
+          ptx.split(lines, '\n');
+          for (llvm::StringRef line : lines)
+            if (line.starts_with("  div.u64 ") && line.ends_with(suffix) &&
+                !line.contains(", %rd0, "))
+              ++affineDivisions;
+          EXPECT_EQ(affineDivisions, 1) << divisor;
+        }
+        EXPECT_TRUE(ptx.contains("mad.lo.u64"));
+        EXPECT_TRUE(ptx.contains("ld.global.f32"));
+        EXPECT_TRUE(ptx.contains("st.global.u16"));
+        int64_t inputByte = shape.coordinates.back() * 4;
+        int64_t outputLinear = 0;
+        for (size_t axis = 0; axis < shape.full.size(); ++axis)
+          outputLinear = outputLinear * shape.full[axis] +
+                         shape.coordinates[axis];
+        EXPECT_EQ(inputByte, shape.sampleInputByte);
+        EXPECT_EQ(outputLinear * 4, shape.sampleOutputByte);
+      }
+      EXPECT_EQ(projectedLaunches, 1);
+      int64_t publicWeightBindings = 0;
+      int64_t publicFullBindings = 0;
+      for (size_t slot = 0; slot < decoded->slotDimensions.size(); ++slot) {
+        if (decoded->slotStorage[slot] != 0)
+          continue;
+        if (decoded->slotDimensions[slot] ==
+            llvm::ArrayRef<int64_t>(shape.full)) {
+          ++publicFullBindings;
+          EXPECT_EQ(decoded->slotRequiredBytes[slot], shape.fullBytes / 2);
+        }
+        if (
+            decoded->slotDimensions[slot] ==
+                llvm::ArrayRef<int64_t>(shape.weight)) {
+          ++publicWeightBindings;
+          EXPECT_EQ(decoded->slotRequiredBytes[slot], shape.weightBytes);
+        }
+      }
+      EXPECT_EQ(publicFullBindings, 2);
+      EXPECT_EQ(publicWeightBindings, 1);
+      if (policy == mlir::shuttle::NumericalPolicy::SourceOrdered)
+        sourceTransport = *bytes;
+      else {
+        ASSERT_TRUE(sourceTransport);
+        EXPECT_NE(*bytes, *sourceTransport);
+      }
+    }
+  }
+}
+
+TEST(GpuTransportV2Test,
+     Abi20ProjectedParameterTransportMutationsFailBothDecoders) {
+  auto source = fixtureSource(
+      "jax-0.10.1-bf16-projected_parameter_broadcast-"
+      "3x2x5x11x263-forward.mlir");
+  ASSERT_TRUE(source);
+  auto built = buildGpuContractFixture(
+      *source, mlir::shuttle::NumericalPolicy::SourceOrdered);
+  ASSERT_TRUE(built);
+  auto bytes = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+  ASSERT_TRUE(mlir::succeeded(bytes));
+  auto decoded = decodeInlineSchema2(*bytes);
+  ASSERT_TRUE(decoded);
+  auto expectRejected = [](llvm::ArrayRef<uint8_t> mutation) {
+    EXPECT_FALSE(decodeInlineSchema2(mutation));
+    EXPECT_FALSE(mlir::shuttle::GpuExecutable::Load(mutation).ok());
+  };
+  llvm::SmallVector<uint8_t> codeDigest(*bytes);
+  codeDigest[decoded->codeLengthOffset + sizeof(uint64_t) +
+             decoded->launches.back().codeOffset] ^= 1;
+  expectRejected(codeDigest);
+  auto reuse = overlappingTemporaryReuse(*bytes, *decoded);
+  ASSERT_FALSE(reuse.empty());
+  expectRejected(reuse);
+  auto futureResult = futureProducedResultInput(*bytes, *decoded);
+  ASSERT_FALSE(futureResult.empty());
+  expectRejected(futureResult);
+  expectRejected(oversizedLaunchGrid(*bytes, *decoded));
+}
+
+TEST(GpuTransportV2Test,
      Abi14OrdinaryJaxMatmulVjpHasClosedMultiContractTransport) {
   auto source =
       fixtureSource("jax-0.10.1-bf16-matmul-vjp-17x33x19-backward.mlir");
@@ -3676,6 +3826,77 @@ TEST(GpuTransportV2Test,
                   .ok());
   EXPECT_EQ(trace->launchAttempts.load(), 7);
   auto slots = dynamicSlotAddresses(*decoded, allocator, 0xd0000000,
+                                    dynamicFrame->externalSlots);
+  expectKernelLaunches(*decoded, *trace, 0, slots);
+}
+
+TEST(GpuTransportV2Test,
+     Abi20ProjectedParameterUsesUnchangedFfiSchemasAndThreeBindings) {
+  auto source = fixtureSource(
+      "jax-0.10.1-bf16-projected_parameter_broadcast-"
+      "3x2x5x11x263-forward.mlir");
+  ASSERT_TRUE(source);
+  auto built = buildGpuContractFixture(
+      *source, mlir::shuttle::NumericalPolicy::SourceOrdered);
+  ASSERT_TRUE(built);
+  auto transport = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+  ASSERT_TRUE(mlir::succeeded(transport));
+  auto decoded = decodeInlineSchema2(*transport);
+  ASSERT_TRUE(decoded);
+  ASSERT_EQ(decoded->launches.size(), 19);
+  auto executable = mlir::shuttle::GpuExecutable::Load(*transport);
+  ASSERT_TRUE(executable.ok()) << executable.status();
+  ASSERT_EQ((*executable)->externalBindings().size(), 3);
+  auto dynamicFrame =
+      dynamicCallFrame(**executable, *transport,
+                       mlir::shuttle::gpuExecutableBundleDigest(*transport));
+  ASSERT_TRUE(dynamicFrame);
+
+  XLA_FFI_Handler_Bundle handlers =
+      mlir::shuttle::gpuExecutableBundleFfiHandlerBundle();
+  SyntheticAllocator allocator(0xe0000000);
+  stream_executor::MockStreamExecutor executor;
+  stream_executor::MockStream stream;
+  stream_executor::GpuComputeCapability capability{
+      stream_executor::CudaComputeCapability{9, 0}};
+  auto trace = std::make_shared<ExecutionTrace>();
+  EXPECT_CALL(stream, parent()).WillRepeatedly(testing::Return(&executor));
+  EXPECT_CALL(executor, LoadKernel(testing::_))
+      .Times(19)
+      .WillRepeatedly([trace](const stream_executor::KernelLoaderSpec &spec) {
+        return recordLoadedKernel(spec, trace);
+      });
+
+  xla::ffi::ExecutionState instantiateState;
+  xla::ffi::ExecutionState prepareState;
+  xla::ffi::ExecutionState initializeState;
+  xla::ffi::InvokeContext context;
+  context.device_ordinal = 0;
+  context.backend_context = xla::ffi::InvokeContext::GpuContext{
+      &stream, &allocator, nullptr, nullptr,
+      nullptr, nullptr,    nullptr, &capability};
+  context.state_context = {&instantiateState, &prepareState, &initializeState};
+
+  ASSERT_TRUE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(), handlers.instantiate,
+                               dynamicFrame->frame, context,
+                               XLA_FFI_ExecutionStage_INSTANTIATE)
+                  .ok());
+  ASSERT_TRUE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(), handlers.prepare,
+                               dynamicFrame->frame, context,
+                               XLA_FFI_ExecutionStage_PREPARE)
+                  .ok());
+  ASSERT_EQ(allocator.sizes, decoded->temporaryGroupBytes);
+  ASSERT_TRUE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(), handlers.initialize,
+                               dynamicFrame->frame, context,
+                               XLA_FFI_ExecutionStage_INITIALIZE)
+                  .ok());
+  expectLoadedKernels(*decoded, *trace, 0);
+  ASSERT_TRUE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(), handlers.execute,
+                               dynamicFrame->frame, context,
+                               XLA_FFI_ExecutionStage_EXECUTE)
+                  .ok());
+  EXPECT_EQ(trace->launchAttempts.load(), 19);
+  auto slots = dynamicSlotAddresses(*decoded, allocator, 0xe0000000,
                                     dynamicFrame->externalSlots);
   expectKernelLaunches(*decoded, *trace, 0, slots);
 }

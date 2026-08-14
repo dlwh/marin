@@ -549,6 +549,33 @@ protected:
     return result;
   }
 
+  MapOp projectedParameterBroadcast() {
+    MapOp result;
+    this->getOperation().walk([&](MapOp candidate) {
+      if (result || candidate.getSemantics() != MapSemantics::BroadcastInDim ||
+          candidate.getInputs().size() != 1 ||
+          candidate.getIndexingMaps().size() != 2) {
+        return;
+      }
+      AffineMap inputMap =
+          cast<AffineMapAttr>(candidate.getIndexingMaps()[0]).getValue();
+      unsigned expandingSingletons = llvm::count_if(
+          inputMap.getResults(), [](AffineExpr expression) {
+            auto binary = dyn_cast<AffineBinaryOpExpr>(expression);
+            return binary && binary.getKind() == AffineExprKind::FloorDiv;
+          });
+      if (expandingSingletons > 1) {
+        result = candidate;
+      }
+    });
+    if (!result) {
+      this->getOperation().emitError(
+          "test fixture has no multiply-expanded projected parameter Map");
+      this->signalPassFailure();
+    }
+    return result;
+  }
+
   std::pair<unsigned, AffineBinaryOpExpr>
   expandedInputExpression(MapOp operation) {
     AffineMap inputMap =
@@ -561,6 +588,86 @@ protected:
       }
     }
     llvm_unreachable("singletonBroadcast guarantees one floorDiv expression");
+  }
+};
+
+class ProjectedParameterMapMutationPass
+    : public MapMutationPass<ProjectedParameterMapMutationPass> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
+      ProjectedParameterMapMutationPass)
+  ProjectedParameterMapMutationPass() = default;
+  ProjectedParameterMapMutationPass(
+      const ProjectedParameterMapMutationPass &other)
+      : MapMutationPass<ProjectedParameterMapMutationPass>(other) {}
+  Option<std::string> kind{*this, "kind", llvm::cl::desc("Mutation kind"),
+                           llvm::cl::init("")};
+  StringRef getArgument() const final {
+    return "shuttle-test-mutate-projected-parameter-map";
+  }
+  void runOnOperation() override {
+    MapOp operation = projectedParameterBroadcast();
+    if (!operation) {
+      return;
+    }
+    SmallVector<Attribute> maps(operation.getIndexingMaps().begin(),
+                                operation.getIndexingMaps().end());
+    AffineMap inputMap = cast<AffineMapAttr>(maps.front()).getValue();
+    SmallVector<AffineExpr> expressions(inputMap.getResults());
+    auto expanded = llvm::find_if(expressions, [](AffineExpr expression) {
+      auto binary = dyn_cast<AffineBinaryOpExpr>(expression);
+      return binary && binary.getKind() == AffineExprKind::FloorDiv;
+    });
+    if (expanded == expressions.end()) {
+      llvm_unreachable("projectedParameterBroadcast has expanded axes");
+    }
+    auto division = cast<AffineBinaryOpExpr>(*expanded);
+    int64_t divisor = cast<AffineConstantExpr>(division.getRHS()).getValue();
+    StringRef mutation = kind;
+    unsigned numSymbols = 0;
+    if (mutation == "divisor") {
+      *expanded = division.getLHS().floorDiv(divisor - 1);
+    } else if (mutation == "composite") {
+      *expanded = (division.getLHS() + 1).floorDiv(divisor);
+    } else if (mutation == "ceildiv") {
+      *expanded = division.getLHS().ceilDiv(divisor);
+    } else if (mutation == "mod") {
+      *expanded = division.getLHS() % divisor;
+    } else if (mutation == "symbol") {
+      *expanded = getAffineSymbolExpr(0, operation.getContext());
+      numSymbols = 1;
+    } else if (mutation == "duplicate") {
+      auto second = llvm::find_if(
+          llvm::make_range(std::next(expanded), expressions.end()),
+          [](AffineExpr expression) {
+            auto binary = dyn_cast<AffineBinaryOpExpr>(expression);
+            return binary && binary.getKind() == AffineExprKind::FloorDiv;
+          });
+      if (second == expressions.end()) {
+        operation.emitOpError("test fixture has fewer than two expansions");
+        return signalPassFailure();
+      }
+      auto secondDivision = cast<AffineBinaryOpExpr>(*second);
+      *second = division.getLHS().floorDiv(
+          cast<AffineConstantExpr>(secondDivision.getRHS()).getValue());
+    } else if (mutation == "direct") {
+      *expanded = division.getLHS();
+    } else if (mutation == "result") {
+      AffineMap resultMap = cast<AffineMapAttr>(maps.back()).getValue();
+      SmallVector<AffineExpr> resultExpressions(resultMap.getResults());
+      std::swap(resultExpressions.front(), resultExpressions.back());
+      maps.back() = AffineMapAttr::get(AffineMap::get(
+          resultMap.getNumDims(), 0, resultExpressions,
+          operation.getContext()));
+    } else {
+      operation.emitOpError("unknown projected parameter mutation kind");
+      return signalPassFailure();
+    }
+    maps.front() = AffineMapAttr::get(AffineMap::get(
+        inputMap.getNumDims(), numSymbols, expressions,
+        operation.getContext()));
+    operation->setAttr("indexing_maps",
+                       ArrayAttr::get(operation.getContext(), maps));
   }
 };
 
@@ -1075,6 +1182,36 @@ bool isExpandingSingletonMapTask(
   return expansions == 1;
 }
 
+bool isProjectedParameterMapTask(
+    MaterializationTaskOp task,
+    MutableArrayRef<MaterializationBufferOp> buffers) {
+  if (task.getKind() != MaterializationTaskKind::Map ||
+      task.getDomainShape().size() < 3 || task.getInputBuffers().size() != 1) {
+    return false;
+  }
+  int64_t inputOrdinal = task.getInputBuffers().front();
+  if (inputOrdinal < 0 || inputOrdinal >= static_cast<int64_t>(buffers.size())) {
+    return false;
+  }
+  auto input = dyn_cast<RankedTensorType>(buffers[inputOrdinal].getTensorType());
+  if (!input || input.getRank() !=
+                    static_cast<int64_t>(task.getDomainShape().size())) {
+    return false;
+  }
+  unsigned expansions = 0;
+  for (auto [inputExtent, outputExtent] :
+       llvm::zip_equal(input.getShape(), task.getDomainShape())) {
+    if (inputExtent == outputExtent) {
+      continue;
+    }
+    if (inputExtent != 1 || outputExtent <= 1) {
+      return false;
+    }
+    ++expansions;
+  }
+  return expansions > 1;
+}
+
 void refreshMaterializationFingerprint(MaterializationPlanOp plan) {
   plan.setFingerprint(materializationPlanFingerprint(plan));
 }
@@ -1509,12 +1646,14 @@ public:
     }
     SmallVector<MaterializationBufferOp> buffers(
         plan.getBody().front().getOps<MaterializationBufferOp>());
+    StringRef mutation = kind;
+    bool projected = mutation.consume_front("projected-");
     for (MaterializationTaskOp task :
          plan.getBody().front().getOps<MaterializationTaskOp>()) {
-      if (!isExpandingSingletonMapTask(task, buffers)) {
+      if (!(projected ? isProjectedParameterMapTask(task, buffers)
+                      : isExpandingSingletonMapTask(task, buffers))) {
         continue;
       }
-      StringRef mutation = kind;
       if (mutation == "domain") {
         SmallVector<int64_t> domain(task.getDomainShape());
         ++domain.back();
@@ -2092,16 +2231,20 @@ public:
         materialization.getBody().front().getOps<MaterializationBufferOp>());
     SmallVector<MaterializationTaskOp> materializationTasks(
         materialization.getBody().front().getOps<MaterializationTaskOp>());
+    StringRef mutation = kind;
+    bool projected = mutation.consume_front("projected-");
     for (ScheduleTaskOp task :
          plan.getBody().front().getOps<ScheduleTaskOp>()) {
       int64_t sourceTask = task.getSourceTask();
       if (task.getKind() != ScheduleTaskKind::Elementwise || sourceTask < 0 ||
           sourceTask >= static_cast<int64_t>(materializationTasks.size()) ||
-          !isExpandingSingletonMapTask(materializationTasks[sourceTask],
-                                       buffers)) {
+          !(projected
+                ? isProjectedParameterMapTask(materializationTasks[sourceTask],
+                                              buffers)
+                : isExpandingSingletonMapTask(materializationTasks[sourceTask],
+                                               buffers))) {
         continue;
       }
-      StringRef mutation = kind;
       if (mutation == "grid") {
         SmallVector<int64_t> grid(task.getGridShape());
         ++grid.front();
@@ -2326,6 +2469,44 @@ public:
       }
       module.emitError("test fixture has no singleton broadcast PTX entry");
       return signalPassFailure();
+    } else if (mutation == "projected-parameter-body") {
+      SchedulePlanOp schedule = schedulePlan(module);
+      MaterializationPlanOp materialization = materializationPlan(module);
+      if (!schedule || !materialization) {
+        module.emitError("test fixture has no schedule/materialization plan");
+        return signalPassFailure();
+      }
+      SmallVector<ScheduleTaskOp> scheduleTasks(
+          schedule.getBody().front().getOps<ScheduleTaskOp>());
+      SmallVector<MaterializationTaskOp> materializationTasks(
+          materialization.getBody().front().getOps<MaterializationTaskOp>());
+      SmallVector<MaterializationBufferOp> buffers(
+          materialization.getBody().front().getOps<MaterializationBufferOp>());
+      SmallVector<int8_t> code(device.getCode());
+      for (DeviceEntryOp entry : entries) {
+        int64_t sourceTask = entry.getSourceTask();
+        if (sourceTask < 0 ||
+            sourceTask >= static_cast<int64_t>(scheduleTasks.size())) {
+          continue;
+        }
+        int64_t materializationTask = scheduleTasks[sourceTask].getSourceTask();
+        if (materializationTask < 0 ||
+            materializationTask >=
+                static_cast<int64_t>(materializationTasks.size()) ||
+            !isProjectedParameterMapTask(
+                materializationTasks[materializationTask], buffers)) {
+          continue;
+        }
+        code[entry.getCodeOffset() + entry.getCodeLength() - 1] ^= 1;
+        device.setCodeAttr(DenseI8ArrayAttr::get(module.getContext(), code));
+        device.setCodeDigest(executableCodeDigest(device.getCode()));
+        entry.setCodeDigest(executableCodeDigest(device.getCode().slice(
+            entry.getCodeOffset(), entry.getCodeLength())));
+        refreshExecutableBundle(module, false);
+        return;
+      }
+      module.emitError("test fixture has no projected parameter PTX entry");
+      return signalPassFailure();
     } else if (mutation == "output-binding") {
       SmallVector<InvocationSlotOp> outputs;
       for (InvocationSlotOp slot : slots) {
@@ -2429,6 +2610,7 @@ void registerMutationPasses() {
   PassRegistration<BroadcastDirectSingletonPass>();
   PassRegistration<BroadcastExpandNonSingletonPass>();
   PassRegistration<BroadcastResultMapMutationPass>();
+  PassRegistration<ProjectedParameterMapMutationPass>();
   PassRegistration<MapConstantZeroPointwisePass>();
   PassRegistration<BroadcastReplayAsReshapePass>();
   PassRegistration<ReshapeReplayAsBroadcastPass>();
