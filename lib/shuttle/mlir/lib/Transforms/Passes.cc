@@ -79,7 +79,7 @@ ShuttlePipelineOptions commandLinePipelineOptions(NumericalPolicy numerics) {
   options.numerics = numerics;
   if (numerics == NumericalPolicy::Fast) {
     options.canonicalOptions =
-        R"json({"execution_mode":"stablehlo_round_trip","numerics":"fast","pipeline_abi_version":17,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+        R"json({"execution_mode":"stablehlo_round_trip","numerics":"fast","pipeline_abi_version":18,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
   }
   return options;
 }
@@ -356,8 +356,10 @@ bool isSupportedAffineBroadcast(Operation *operation) {
   if (expandingSingletons == 0) {
     return true;
   }
-  return input.getRank() == 2 && result.getRank() == 2 &&
-         expandingSingletons == 1;
+  const bool rankTwoExpansion = input.getRank() == 2 && result.getRank() == 2;
+  const bool rankNExpansion = input.getRank() == result.getRank() &&
+                              input.getRank() >= 3 && input.getRank() <= 8;
+  return expandingSingletons == 1 && (rankTwoExpansion || rankNExpansion);
 }
 
 bool isCopyFreeSingletonReshape(Operation *operation) {
@@ -596,6 +598,45 @@ partitionSupportedInterval(ArrayRef<Operation *> interval) {
   return sourceContiguousComponents;
 }
 
+bool isRankNExpandingSingletonBroadcast(Operation *operation) {
+  if (operation->getName().getStringRef() !=
+          stablehlo::BroadcastInDimOp::getOperationName() ||
+      !isSupportedAffineBroadcast(operation)) {
+    return false;
+  }
+  auto input = cast<RankedTensorType>(operation->getOperand(0).getType());
+  auto result = cast<RankedTensorType>(operation->getResult(0).getType());
+  if (input.getRank() < 3 || input.getRank() > 8 ||
+      input.getRank() != result.getRank()) {
+    return false;
+  }
+  auto dimensions =
+      operation->getAttrOfType<DenseI64ArrayAttr>("broadcast_dimensions");
+  return llvm::count_if(llvm::enumerate(dimensions.asArrayRef()),
+                        [&](auto indexedDimension) {
+                          return input.getDimSize(indexedDimension.index()) !=
+                                 result.getDimSize(indexedDimension.value());
+                        }) == 1;
+}
+
+bool isTerminalRankNAdditiveReduce(Operation *operation) {
+  if (!isSupportedStablehloReduce(operation)) {
+    return false;
+  }
+  auto input = cast<RankedTensorType>(operation->getOperand(0).getType());
+  auto dimensions = operation->getAttrOfType<DenseI64ArrayAttr>("dimensions");
+  return input.getRank() >= 3 && input.getRank() <= 8 &&
+         dimensions.asArrayRef() == ArrayRef<int64_t>({input.getRank() - 1});
+}
+
+bool hasRankNExpansionWithoutTerminalFold(const CandidateComponent &component) {
+  const bool hasExpansion =
+      llvm::any_of(component.operations, isRankNExpandingSingletonBroadcast);
+  const bool hasTerminalFold =
+      llvm::any_of(component.operations, isTerminalRankNAdditiveReduce);
+  return hasExpansion && !hasTerminalFold;
+}
+
 SmallVector<CandidateComponent> candidateComponents(ModuleOp module) {
   SmallVector<CandidateComponent> components;
   for (func::FuncOp function : module.getOps<func::FuncOp>()) {
@@ -605,7 +646,12 @@ SmallVector<CandidateComponent> candidateComponents(ModuleOp module) {
         if (interval.empty()) {
           return;
         }
-        llvm::append_range(components, partitionSupportedInterval(interval));
+        for (CandidateComponent &component :
+             partitionSupportedInterval(interval)) {
+          if (!hasRankNExpansionWithoutTerminalFold(component)) {
+            components.push_back(std::move(component));
+          }
+        }
         interval.clear();
       };
       for (Operation &operation : block) {
@@ -2148,11 +2194,13 @@ FailureOr<OperationState> lowerMapState(MapOp map, ValueRange operands) {
         dimensions.push_back(position);
       }
       if (expandingSingletons != 0 &&
-          (inputType.getRank() != 2 || resultType.getRank() != 2 ||
-           dimensions.size() != 2 || expandingSingletons != 1)) {
+          (inputType.getRank() != resultType.getRank() ||
+           dimensions.size() != static_cast<size_t>(inputType.getRank()) ||
+           expandingSingletons != 1 || inputType.getRank() < 2 ||
+           inputType.getRank() > 8)) {
         map.emitOpError(
             "mapped singleton broadcast requires one expanded axis in a "
-            "rank-two dimension permutation");
+            "rank-two through rank-eight dimension permutation");
         return failure();
       }
       stablehloName = stablehlo::BroadcastInDimOp::getOperationName();
@@ -3185,6 +3233,101 @@ bool isClosedTerminalRankNFold(FoldOp fold) {
   return hasExactPositiveZeroInitializer(fold);
 }
 
+bool isClosedDirectProjectedMap(MapOp map) {
+  if (map.getNumResults() != 1 ||
+      map.getIndexingMaps().size() != map.getInputs().size() + 1) {
+    return false;
+  }
+  auto result = dyn_cast<RankedTensorType>(map.getResult(0).getType());
+  ArrayRef<Attribute> maps = map.getIndexingMaps().getValue();
+  auto resultMap = dyn_cast<AffineMapAttr>(maps.back());
+  if (!result || !result.hasStaticShape() || !resultMap ||
+      !isIdentityMap(resultMap.getValue())) {
+    return false;
+  }
+  for (auto [input, attribute] :
+       llvm::zip_equal(map.getInputs(), maps.drop_back())) {
+    auto type = dyn_cast<RankedTensorType>(input.getType());
+    auto indexing = dyn_cast<AffineMapAttr>(attribute);
+    if (!type || !type.hasStaticShape() || !indexing ||
+        indexing.getValue().getNumDims() != result.getRank() ||
+        indexing.getValue().getNumSymbols() != 0 ||
+        indexing.getValue().getNumResults() != type.getRank()) {
+      return false;
+    }
+    llvm::SmallDenseSet<unsigned> dimensions;
+    for (auto [axis, expression] :
+         llvm::enumerate(indexing.getValue().getResults())) {
+      auto dimension = dyn_cast<AffineDimExpr>(expression);
+      if (!dimension || dimension.getPosition() >= result.getRank() ||
+          !dimensions.insert(dimension.getPosition()).second ||
+          type.getDimSize(axis) != result.getDimSize(dimension.getPosition())) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool isClosedRankNExpandingSingletonMap(MapOp map) {
+  if (map.getSemantics() != MapSemantics::BroadcastInDim ||
+      map.getInputs().size() != 1 || map.getNumResults() != 1 ||
+      map.getIndexingMaps().size() != 2 || map.getBody().empty()) {
+    return false;
+  }
+  auto input = dyn_cast<RankedTensorType>(map.getInputs()[0].getType());
+  auto result = dyn_cast<RankedTensorType>(map.getResult(0).getType());
+  auto inputMap = dyn_cast<AffineMapAttr>(map.getIndexingMaps()[0]);
+  auto resultMap = dyn_cast<AffineMapAttr>(map.getIndexingMaps()[1]);
+  if (!input || !result || !input.hasStaticShape() ||
+      !result.hasStaticShape() || input.getRank() < 3 || input.getRank() > 8 ||
+      input.getRank() != result.getRank() || !input.getElementType().isF32() ||
+      !result.getElementType().isF32() || !inputMap || !resultMap ||
+      inputMap.getValue().getNumSymbols() != 0 ||
+      inputMap.getValue().getNumDims() != result.getRank() ||
+      inputMap.getValue().getNumResults() != input.getRank() ||
+      !isIdentityMap(resultMap.getValue())) {
+    return false;
+  }
+
+  unsigned expandingSingletons = 0;
+  for (auto [axis, expression] :
+       llvm::enumerate(inputMap.getValue().getResults())) {
+    if (auto dimension = dyn_cast<AffineDimExpr>(expression)) {
+      if (dimension.getPosition() != axis ||
+          input.getDimSize(axis) != result.getDimSize(axis)) {
+        return false;
+      }
+      continue;
+    }
+    auto floorDiv = dyn_cast<AffineBinaryOpExpr>(expression);
+    AffineExpr dividendExpression =
+        floorDiv && floorDiv.getKind() == AffineExprKind::FloorDiv
+            ? floorDiv.getLHS()
+            : AffineExpr{};
+    AffineExpr divisorExpression =
+        floorDiv && floorDiv.getKind() == AffineExprKind::FloorDiv
+            ? floorDiv.getRHS()
+            : AffineExpr{};
+    auto dividend = dyn_cast_if_present<AffineDimExpr>(dividendExpression);
+    auto divisor = dyn_cast_if_present<AffineConstantExpr>(divisorExpression);
+    if (!dividend || !divisor || dividend.getPosition() != axis ||
+        input.getDimSize(axis) != 1 || result.getDimSize(axis) <= 1 ||
+        divisor.getValue() != result.getDimSize(axis)) {
+      return false;
+    }
+    ++expandingSingletons;
+  }
+  if (expandingSingletons != 1) {
+    return false;
+  }
+  Block &body = map.getBody().front();
+  auto yield = dyn_cast<YieldOp>(body.getTerminator());
+  return body.getNumArguments() == 1 && body.getOperations().size() == 1 &&
+         yield && yield.getValues().size() == 1 &&
+         yield.getValues()[0] == body.getArgument(0);
+}
+
 bool isClosedRankNFoldMapRegion(RegionOp region,
                                 ArrayRef<Operation *> algebra) {
   auto isExternalType = [](Type type) {
@@ -3214,25 +3357,8 @@ bool isClosedRankNFoldMapRegion(RegionOp region,
              isClosedTerminalRankNFold(fold);
     }
     auto map = dyn_cast<MapOp>(operation);
-    if (!map || map.getNumResults() != 1 ||
-        map.getIndexingMaps().size() != map.getInputs().size() + 1) {
-      return false;
-    }
-    ArrayRef<Attribute> maps = map.getIndexingMaps().getValue();
-    auto resultMap = dyn_cast<AffineMapAttr>(maps.back());
-    if (!resultMap || !isIdentityMap(resultMap.getValue())) {
-      return false;
-    }
-    return llvm::all_of(maps.drop_back(), [](Attribute attribute) {
-      auto map = dyn_cast<AffineMapAttr>(attribute);
-      llvm::SmallDenseSet<unsigned> dimensions;
-      return map &&
-             llvm::all_of(map.getValue().getResults(), [&](AffineExpr expr) {
-               auto dimension = dyn_cast<AffineDimExpr>(expr);
-               return dimension &&
-                      dimensions.insert(dimension.getPosition()).second;
-             });
-    });
+    return map && (isClosedDirectProjectedMap(map) ||
+                   isClosedRankNExpandingSingletonMap(map));
   });
 }
 
@@ -3499,7 +3625,7 @@ public:
         auto tuning = manifest ? manifest.getAs<StringAttr>("canonical_tuning")
                                : StringAttr{};
         if (!tuning || tuning.getValue() != kDefaultCanonicalTuning) {
-          module.emitError("ABI17 GPU algebra requires exact default tuning");
+          module.emitError("ABI18 GPU algebra requires exact default tuning");
           return signalPassFailure();
         }
       }
@@ -6770,7 +6896,7 @@ void registerShuttleStablehloPipelines() {
             commandLinePipelineOptions(NumericalPolicy::SourceOrdered);
         options.executionMode = ExecutionMode::CpuExecutableBundle;
         options.canonicalOptions =
-            R"json({"execution_mode":"cpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":17,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+            R"json({"execution_mode":"cpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":18,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
         buildShuttleStablehloPipeline(manager, options);
       });
   PassPipelineRegistration<>(
@@ -6781,7 +6907,7 @@ void registerShuttleStablehloPipelines() {
             commandLinePipelineOptions(NumericalPolicy::Fast);
         options.executionMode = ExecutionMode::CpuExecutableBundle;
         options.canonicalOptions =
-            R"json({"execution_mode":"cpu_executable_bundle","numerics":"fast","pipeline_abi_version":17,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+            R"json({"execution_mode":"cpu_executable_bundle","numerics":"fast","pipeline_abi_version":18,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
         buildShuttleStablehloPipeline(manager, options);
       });
   PassPipelineRegistration<>(
@@ -6793,7 +6919,7 @@ void registerShuttleStablehloPipelines() {
             commandLinePipelineOptions(NumericalPolicy::SourceOrdered);
         options.executionMode = ExecutionMode::GpuExecutableBundle;
         options.canonicalOptions =
-            R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":17,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+            R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":18,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
         buildShuttleStablehloPipeline(manager, options);
       });
   PassPipelineRegistration<>(
@@ -6804,7 +6930,7 @@ void registerShuttleStablehloPipelines() {
             commandLinePipelineOptions(NumericalPolicy::Fast);
         options.executionMode = ExecutionMode::GpuExecutableBundle;
         options.canonicalOptions =
-            R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":17,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+            R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":18,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
         buildShuttleStablehloPipeline(manager, options);
       });
 }
