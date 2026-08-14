@@ -32,11 +32,26 @@ constexpr char kGpuExecutableBundleOptions[] =
     R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":11,"schema_version":1,"tuning":{"cluster_shape":[2,1,1],"materialization":"prefer_fusion","maximum_candidates":16,"pipeline_stages":3,"tile_sizes":[64,128]}})json";
 constexpr char kGpuExecutableBundleFastOptions[] =
     R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":11,"schema_version":1,"tuning":{"cluster_shape":[2,1,1],"materialization":"prefer_fusion","maximum_candidates":16,"pipeline_stages":3,"tile_sizes":[64,128]}})json";
+constexpr char kAbi12ContractSourceOrderedOptions[] =
+    R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":12,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+constexpr char kAbi12ContractFastOptions[] =
+    R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":12,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+constexpr char kAbi12ContractNonDefaultTuningOptions[] =
+    R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":12,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":2,"pipeline_stages":1,"tile_sizes":[64]}})json";
 constexpr char kProgram[] = R"mlir(
 module {
   func.func @main(%arg0: tensor<7xf32>) -> tensor<7xf32> {
     %0 = stablehlo.tanh %arg0 : tensor<7xf32>
     return %0 : tensor<7xf32>
+  }
+}
+)mlir";
+constexpr char kContractMapProgram[] = R"mlir(
+module @anonymous {
+  func.func public @main(%lhs: tensor<3x5xbf16>, %rhs: tensor<5x2xbf16>) -> tensor<3x2xbf16> {
+    %contract = stablehlo.dot_general %lhs, %rhs, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<3x5xbf16>, tensor<5x2xbf16>) -> tensor<3x2xf32>
+    %result = stablehlo.convert %contract : (tensor<3x2xf32>) -> tensor<3x2xbf16>
+    return %result : tensor<3x2xbf16>
   }
 }
 )mlir";
@@ -116,6 +131,76 @@ TEST(ShuttleXlaOptionsTest, RejectsAdjacentGpuPipelineAbis) {
   for (const char *serialized : invalid)
     EXPECT_EQ(mlir::shuttle::parseShuttleXlaOptions(serialized).status().code(),
               absl::StatusCode::kInvalidArgument);
+}
+
+TEST(ShuttleXlaOptionsTest,
+     Abi12RunsCanonicalSourceOrderedContractMapOptions) {
+  auto options =
+      mlir::shuttle::parseShuttleXlaOptions(kAbi12ContractSourceOrderedOptions);
+  ASSERT_TRUE(options.ok()) << options.status();
+  EXPECT_EQ(options->canonicalOptions, kAbi12ContractSourceOrderedOptions);
+  EXPECT_EQ(options->canonicalTuning,
+            R"json({"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json");
+  EXPECT_EQ(mlir::shuttle::shuttlePipelineIdentity(*options).policyDigest,
+            "24b2814b329731c70f7779d90f811b959cbf92a1f2119f88ba746639d341c516");
+
+  mlir::MLIRContext context;
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      parseModule(context, kContractMapProgram);
+  ASSERT_TRUE(module);
+  ASSERT_TRUE(
+      mlir::succeeded(mlir::shuttle::runShuttleXlaTransform(*module, *options)));
+  std::string transformed;
+  llvm::raw_string_ostream output(transformed);
+  module->print(output);
+  output.flush();
+  EXPECT_EQ(transformed.find("shuttle.region"), std::string::npos);
+  EXPECT_EQ(transformed.find("stablehlo.dot_general"), std::string::npos);
+  EXPECT_NE(transformed.find("shuttle.gpu.executable_bundle.v2"),
+            std::string::npos);
+}
+
+TEST(ShuttleXlaOptionsTest,
+     Abi12PreservesFastMapFoldAndRejectsFastContract) {
+  auto options = mlir::shuttle::parseShuttleXlaOptions(
+      kAbi12ContractFastOptions);
+  ASSERT_TRUE(options.ok()) << options.status();
+
+  std::string error;
+  auto runfiles = bazel::tools::cpp::runfiles::Runfiles::CreateForTest(&error);
+  ASSERT_TRUE(runfiles) << error;
+  std::ifstream input(runfiles->Rlocation(
+      "shuttle_mlir/test/Inputs/"
+      "jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-forward.mlir"));
+  std::ostringstream source;
+  source << input.rdbuf();
+  ASSERT_TRUE(input);
+
+  mlir::MLIRContext mapFoldContext;
+  mlir::OwningOpRef<mlir::ModuleOp> mapFold =
+      parseModule(mapFoldContext, source.str());
+  ASSERT_TRUE(mapFold);
+  EXPECT_TRUE(mlir::succeeded(
+      mlir::shuttle::runShuttleXlaTransform(*mapFold, *options)));
+
+  mlir::MLIRContext contractContext;
+  mlir::OwningOpRef<mlir::ModuleOp> contract =
+      parseModule(contractContext, kContractMapProgram);
+  ASSERT_TRUE(contract);
+  EXPECT_TRUE(mlir::failed(
+      mlir::shuttle::runShuttleXlaTransform(*contract, *options)));
+}
+
+TEST(ShuttleXlaOptionsTest, Abi12ContractRejectsNonDefaultTuning) {
+  auto options = mlir::shuttle::parseShuttleXlaOptions(
+      kAbi12ContractNonDefaultTuningOptions);
+  ASSERT_TRUE(options.ok()) << options.status();
+  mlir::MLIRContext context;
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      parseModule(context, kContractMapProgram);
+  ASSERT_TRUE(module);
+  EXPECT_TRUE(
+      mlir::failed(mlir::shuttle::runShuttleXlaTransform(*module, *options)));
 }
 
 TEST(ShuttleXlaOptionsTest, RejectsInvalidOrNoncanonicalWireFormats) {

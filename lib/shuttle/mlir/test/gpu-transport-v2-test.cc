@@ -616,6 +616,37 @@ std::optional<std::string> fixtureSource(llvm::StringRef filename) {
   return source.str();
 }
 
+std::string contractMapModule(int64_t rows, int64_t reduction,
+                              int64_t columns, llvm::StringRef moduleSymbol,
+                              llvm::StringRef precision = "DEFAULT",
+                              bool convertToBf16 = true) {
+  std::string source;
+  llvm::raw_string_ostream stream(source);
+  stream << "module @" << moduleSymbol << " {\n"
+         << "  func.func public @main(%lhs: tensor<" << rows << "x"
+         << reduction << "xbf16>, %rhs: tensor<" << reduction << "x"
+         << columns << "xbf16>) -> tensor<" << rows << "x" << columns
+         << (convertToBf16 ? "xbf16" : "xf32") << "> {\n"
+         << "    %contract = stablehlo.dot_general %lhs, %rhs, "
+            "contracting_dims = [1] x [0], precision = ["
+         << precision << ", " << precision << "] : (tensor<" << rows << "x"
+         << reduction << "xbf16>, tensor<" << reduction << "x" << columns
+         << "xbf16>) -> tensor<" << rows << "x" << columns << "xf32>\n";
+  if (convertToBf16) {
+    stream << "    %result = stablehlo.convert %contract : (tensor<" << rows
+           << "x" << columns << "xf32>) -> tensor<" << rows << "x"
+           << columns << "xbf16>\n"
+           << "    return %result : tensor<" << rows << "x" << columns
+           << "xbf16>\n";
+  } else {
+    stream << "    return %contract : tensor<" << rows << "x" << columns
+           << "xf32>\n";
+  }
+  stream << "  }\n}\n";
+  stream.flush();
+  return source;
+}
+
 std::unique_ptr<BuiltBundle>
 buildFixture(llvm::StringRef source,
              mlir::shuttle::NumericalPolicy policy =
@@ -985,6 +1016,182 @@ TEST(GpuTransportV2Test, ScalarConvertPreservesBf16RoundingBoundary) {
   EXPECT_TRUE(ptx.contains("cvt.rn.bf16.f32 %h2, %f0;"));
   EXPECT_TRUE(ptx.contains("cvt.f32.bf16 %f1, %h2;"));
   EXPECT_FALSE(buildAlgebraFixture(bf16ArithmeticMapModule()));
+}
+
+TEST(GpuTransportV2Test,
+     Abi12ContractMapShapeSweepHasClosedGenericDescriptors) {
+  struct Shape {
+    int64_t rows;
+    int64_t reduction;
+    int64_t columns;
+  };
+  constexpr Shape shapes[] = {
+      {2, 3, 5},
+      {3, 5, 2},
+      {7, 13, 3},
+      {11, 3, 17},
+  };
+  for (const Shape &shape : shapes) {
+    SCOPED_TRACE(testing::Message()
+                 << "M=" << shape.rows << " K=" << shape.reduction
+                 << " N=" << shape.columns);
+    auto built = buildFixture(contractMapModule(
+        shape.rows, shape.reduction, shape.columns, "anonymous"));
+    ASSERT_TRUE(built);
+    auto bytes = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+    ASSERT_TRUE(mlir::succeeded(bytes));
+    auto independent = decodeInlineSchema2(*bytes);
+    ASSERT_TRUE(independent);
+    auto publicDescriptor = mlir::shuttle::GpuExecutable::Load(*bytes);
+    ASSERT_TRUE(publicDescriptor.ok()) << publicDescriptor.status();
+
+    ASSERT_EQ(independent->launches.size(), 2);
+    ASSERT_EQ((*publicDescriptor)->launches().size(), 2);
+    EXPECT_EQ(independent->slots, 4);
+    EXPECT_EQ(independent->externalSlots, 3);
+    EXPECT_EQ(independent->scalarSlots, 0);
+    EXPECT_EQ(independent->temporaryGroupOrder.size(), 1);
+    EXPECT_EQ(independent->temporaryBytes,
+              static_cast<uint64_t>(shape.rows * shape.columns * 4));
+    EXPECT_EQ(independent->launches[0].inputSlots,
+              (llvm::SmallVector<int64_t>{0, 1}));
+    EXPECT_EQ(independent->launches[0].outputSlots,
+              (llvm::SmallVector<int64_t>{2}));
+    EXPECT_TRUE(independent->launches[0].dependencies.empty());
+    EXPECT_EQ(independent->launches[1].inputSlots,
+              (llvm::SmallVector<int64_t>{2}));
+    EXPECT_EQ(independent->launches[1].outputSlots,
+              (llvm::SmallVector<int64_t>{3}));
+    EXPECT_EQ(independent->launches[1].dependencies,
+              (llvm::SmallVector<int64_t>{0}));
+    const uint64_t outputElements = shape.rows * shape.columns;
+    const uint64_t workgroupThreads =
+        std::min<uint64_t>(256, ((outputElements + 31) / 32) * 32);
+    const std::array<uint64_t, 3> expectedGrid{
+        (outputElements + workgroupThreads - 1) / workgroupThreads, 1, 1};
+    const std::array<uint64_t, 3> expectedBlock{workgroupThreads, 1, 1};
+    for (const auto &launch : independent->launches) {
+      EXPECT_EQ(launch.grid, expectedGrid);
+      EXPECT_EQ(launch.block, expectedBlock);
+      EXPECT_EQ(launch.dynamicSharedMemoryBytes, 0);
+    }
+  }
+}
+
+TEST(GpuTransportV2Test,
+     Abi12ContractMapPtxUsesAscendingFmaAndExplicitBf16Map) {
+  auto built = buildFixture(contractMapModule(7, 13, 3, "first_name"));
+  auto renamed = buildFixture(contractMapModule(7, 13, 3, "second_name"));
+  ASSERT_TRUE(built);
+  ASSERT_TRUE(renamed);
+  auto bytes = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+  auto renamedBytes =
+      mlir::shuttle::serializeGpuExecutableBundle(*renamed->module);
+  ASSERT_TRUE(mlir::succeeded(bytes));
+  ASSERT_TRUE(mlir::succeeded(renamedBytes));
+  auto decoded = decodeInlineSchema2(*bytes);
+  auto renamedDecoded = decodeInlineSchema2(*renamedBytes);
+  ASSERT_TRUE(decoded);
+  ASSERT_TRUE(renamedDecoded);
+  ASSERT_EQ(decoded->launches.size(), 2);
+  ASSERT_EQ(renamedDecoded->launches.size(), 2);
+  EXPECT_EQ(decoded->code, renamedDecoded->code);
+
+  const auto &contractLaunch = decoded->launches[0];
+  llvm::StringRef contractPtx(
+      reinterpret_cast<const char *>(decoded->code.data() +
+                                     contractLaunch.codeOffset),
+      contractLaunch.codeLength);
+  const auto &mapLaunch = decoded->launches[1];
+  llvm::StringRef mapPtx(
+      reinterpret_cast<const char *>(decoded->code.data() +
+                                     mapLaunch.codeOffset),
+      mapLaunch.codeLength);
+  size_t zero = contractPtx.find("0f00000000");
+  size_t fma = contractPtx.find("fma.rn.f32");
+  size_t increment = contractPtx.find("add.u64", fma);
+  if (increment == llvm::StringRef::npos)
+    increment = contractPtx.find("add.u32", fma);
+  if (increment == llvm::StringRef::npos)
+    increment = contractPtx.find("add.s64", fma);
+  if (increment == llvm::StringRef::npos)
+    increment = contractPtx.find("add.s32", fma);
+  size_t branch = contractPtx.find("bra", increment);
+  ASSERT_NE(zero, llvm::StringRef::npos);
+  ASSERT_NE(fma, llvm::StringRef::npos);
+  EXPECT_LT(zero, fma);
+  ASSERT_NE(increment, llvm::StringRef::npos);
+  EXPECT_LT(fma, increment);
+  ASSERT_NE(branch, llvm::StringRef::npos);
+  EXPECT_LT(increment, branch);
+  EXPECT_EQ(contractPtx.find("fma.rn.f32", fma + 1),
+            llvm::StringRef::npos);
+  EXPECT_FALSE(contractPtx.contains("mul.rn.f32"));
+  EXPECT_TRUE(mapPtx.contains("cvt.rn.bf16.f32"));
+  EXPECT_FALSE(mapPtx.contains("fma.rn.f32"));
+}
+
+TEST(GpuTransportV2Test, Abi12ContractMapTransportMutationsFailClosed) {
+  auto built = buildFixture(contractMapModule(3, 5, 2, "anonymous"));
+  ASSERT_TRUE(built);
+  auto bytes = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+  ASSERT_TRUE(mlir::succeeded(bytes));
+  auto decoded = decodeInlineSchema2(*bytes);
+  ASSERT_TRUE(decoded);
+
+  llvm::SmallVector<uint8_t> corruptRoot(*bytes);
+  corruptRoot.back() ^= 1;
+  EXPECT_FALSE(decodeInlineSchema2(corruptRoot));
+  EXPECT_FALSE(mlir::shuttle::GpuExecutable::Load(corruptRoot).ok());
+
+  auto oversized = oversizedLaunchGrid(*bytes, *decoded);
+  EXPECT_FALSE(decodeInlineSchema2(oversized));
+  EXPECT_FALSE(mlir::shuttle::GpuExecutable::Load(oversized).ok());
+
+  auto futureResultInput = futureProducedResultInput(*bytes, *decoded);
+  ASSERT_FALSE(futureResultInput.empty());
+  EXPECT_FALSE(decodeInlineSchema2(futureResultInput));
+  EXPECT_FALSE(mlir::shuttle::GpuExecutable::Load(futureResultInput).ok());
+}
+
+TEST(GpuTransportV2Test, Abi12ContractMapRejectsUnsupportedNumericsAndShapes) {
+  constexpr llvm::StringLiteral batched = R"mlir(
+module @batched {
+  func.func @main(%lhs: tensor<2x3x5xbf16>, %rhs: tensor<2x5x7xbf16>) -> tensor<2x3x7xbf16> {
+    %contract = stablehlo.dot_general %lhs, %rhs, batching_dims = [0] x [0], contracting_dims = [2] x [1], precision = [DEFAULT, DEFAULT] : (tensor<2x3x5xbf16>, tensor<2x5x7xbf16>) -> tensor<2x3x7xf32>
+    %result = stablehlo.convert %contract : (tensor<2x3x7xf32>) -> tensor<2x3x7xbf16>
+    return %result : tensor<2x3x7xbf16>
+  }
+}
+)mlir";
+  constexpr llvm::StringLiteral multipleContractDimensions = R"mlir(
+module @multiple_contract_dimensions {
+  func.func @main(%lhs: tensor<2x3x5xbf16>, %rhs: tensor<3x5x7xbf16>) -> tensor<2x7xbf16> {
+    %contract = stablehlo.dot_general %lhs, %rhs, contracting_dims = [1, 2] x [0, 1], precision = [DEFAULT, DEFAULT] : (tensor<2x3x5xbf16>, tensor<3x5x7xbf16>) -> tensor<2x7xf32>
+    %result = stablehlo.convert %contract : (tensor<2x7xf32>) -> tensor<2x7xbf16>
+    return %result : tensor<2x7xbf16>
+  }
+}
+)mlir";
+  constexpr llvm::StringLiteral f32Inputs = R"mlir(
+module @f32_inputs {
+  func.func @main(%lhs: tensor<3x5xf32>, %rhs: tensor<5x2xf32>) -> tensor<3x2xbf16> {
+    %contract = stablehlo.dot_general %lhs, %rhs, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<3x5xf32>, tensor<5x2xf32>) -> tensor<3x2xf32>
+    %result = stablehlo.convert %contract : (tensor<3x2xf32>) -> tensor<3x2xbf16>
+    return %result : tensor<3x2xbf16>
+  }
+}
+)mlir";
+  EXPECT_FALSE(buildFixture(contractMapModule(
+      3, 5, 2, "fast", "DEFAULT", true),
+                            mlir::shuttle::NumericalPolicy::Fast));
+  EXPECT_FALSE(buildFixture(
+      contractMapModule(3, 5, 2, "high_precision", "HIGH", true)));
+  EXPECT_FALSE(buildFixture(
+      contractMapModule(3, 5, 2, "external_f32", "DEFAULT", false)));
+  EXPECT_FALSE(buildFixture(batched));
+  EXPECT_FALSE(buildFixture(multipleContractDimensions));
+  EXPECT_FALSE(buildFixture(f32Inputs));
 }
 
 TEST(GpuTransportV2Test, FoldDynamicSharedMemoryIsDeclaredAtModuleScope) {
@@ -1640,6 +1847,72 @@ TEST(GpuTransportV2Test,
                   .ok());
   EXPECT_EQ(trace->launchAttempts.load(), decoded->launches.size());
   auto slots = dynamicSlotAddresses(*decoded, allocator, 0x90000000,
+                                    dynamicFrame->externalSlots);
+  expectKernelLaunches(*decoded, *trace, 0, slots);
+}
+
+TEST(GpuTransportV2Test,
+     Abi12ContractMapUsesUnchangedFfiSchemasAndTwoLaunchLifecycle) {
+  auto built = buildFixture(contractMapModule(3, 5, 2, "ffi_anonymous"));
+  ASSERT_TRUE(built);
+  auto transport = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+  ASSERT_TRUE(mlir::succeeded(transport));
+  auto decoded = decodeInlineSchema2(*transport);
+  ASSERT_TRUE(decoded);
+  ASSERT_EQ(decoded->launches.size(), 2);
+  auto executable = mlir::shuttle::GpuExecutable::Load(*transport);
+  ASSERT_TRUE(executable.ok()) << executable.status();
+  ASSERT_EQ((*executable)->externalBindings().size(), 3);
+  auto dynamicFrame =
+      dynamicCallFrame(**executable, *transport,
+                       mlir::shuttle::gpuExecutableBundleDigest(*transport));
+  ASSERT_TRUE(dynamicFrame);
+
+  XLA_FFI_Handler_Bundle handlers =
+      mlir::shuttle::gpuExecutableBundleFfiHandlerBundle();
+  SyntheticAllocator allocator(0xa0000000);
+  stream_executor::MockStreamExecutor executor;
+  stream_executor::MockStream stream;
+  stream_executor::GpuComputeCapability capability{
+      stream_executor::CudaComputeCapability{9, 0}};
+  auto trace = std::make_shared<ExecutionTrace>();
+  EXPECT_CALL(stream, parent()).WillRepeatedly(testing::Return(&executor));
+  EXPECT_CALL(executor, LoadKernel(testing::_))
+      .Times(2)
+      .WillRepeatedly([trace](const stream_executor::KernelLoaderSpec &spec) {
+        return recordLoadedKernel(spec, trace);
+      });
+
+  xla::ffi::ExecutionState instantiateState;
+  xla::ffi::ExecutionState prepareState;
+  xla::ffi::ExecutionState initializeState;
+  xla::ffi::InvokeContext context;
+  context.device_ordinal = 0;
+  context.backend_context = xla::ffi::InvokeContext::GpuContext{
+      &stream, &allocator, nullptr, nullptr,
+      nullptr, nullptr,    nullptr, &capability};
+  context.state_context = {&instantiateState, &prepareState, &initializeState};
+
+  ASSERT_TRUE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(), handlers.instantiate,
+                               dynamicFrame->frame, context,
+                               XLA_FFI_ExecutionStage_INSTANTIATE)
+                  .ok());
+  ASSERT_TRUE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(), handlers.prepare,
+                               dynamicFrame->frame, context,
+                               XLA_FFI_ExecutionStage_PREPARE)
+                  .ok());
+  ASSERT_EQ(allocator.sizes, (llvm::SmallVector<uint64_t>{24}));
+  ASSERT_TRUE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(), handlers.initialize,
+                               dynamicFrame->frame, context,
+                               XLA_FFI_ExecutionStage_INITIALIZE)
+                  .ok());
+  expectLoadedKernels(*decoded, *trace, 0);
+  ASSERT_TRUE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(), handlers.execute,
+                               dynamicFrame->frame, context,
+                               XLA_FFI_ExecutionStage_EXECUTE)
+                  .ok());
+  EXPECT_EQ(trace->launchAttempts.load(), 2);
+  auto slots = dynamicSlotAddresses(*decoded, allocator, 0xa0000000,
                                     dynamicFrame->externalSlots);
   expectKernelLaunches(*decoded, *trace, 0, slots);
 }
