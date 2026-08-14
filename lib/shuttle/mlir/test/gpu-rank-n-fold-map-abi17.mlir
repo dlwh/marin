@@ -38,17 +38,43 @@
 // FORWARD-ALGEBRA-SAME: fastmath = #arith.fastmath<none>
 // FORWARD-ALGEBRA: semantics = #shuttle.map_semantics<broadcast_in_dim>
 // FORWARD-ALGEBRA-NOT: stablehlo.reduce
-// BACKWARD-ALGEBRA-COUNT-2: "shuttle.fold"
-// COMPOSED-ALGEBRA-COUNT-2: "shuttle.fold"
+// BACKWARD-ALGEBRA: value = 0.000000e+00 : f32
+// BACKWARD-ALGEBRA: "shuttle.fold"
+// BACKWARD-ALGEBRA: "arith.addf"
+// BACKWARD-ALGEBRA-SAME: fastmath = #arith.fastmath<none>
+// BACKWARD-ALGEBRA: "shuttle.map"
+// BACKWARD-ALGEBRA-SAME: indexing_maps = [#[[PROJA]], #[[IDA]]]
+// BACKWARD-ALGEBRA-SAME: semantics = #shuttle.map_semantics<broadcast_in_dim>
+// BACKWARD-ALGEBRA: value = 0.000000e+00 : f32
+// BACKWARD-ALGEBRA: "shuttle.fold"
+// BACKWARD-ALGEBRA: "arith.addf"
+// BACKWARD-ALGEBRA-SAME: fastmath = #arith.fastmath<none>
+// BACKWARD-ALGEBRA: "shuttle.map"
+// BACKWARD-ALGEBRA-SAME: indexing_maps = [#[[PROJA]], #[[IDA]]]
+// BACKWARD-ALGEBRA-SAME: semantics = #shuttle.map_semantics<broadcast_in_dim>
+// COMPOSED-ALGEBRA: value = 0.000000e+00 : f32
+// COMPOSED-ALGEBRA: "shuttle.fold"
+// COMPOSED-ALGEBRA: "arith.addf"
+// COMPOSED-ALGEBRA-SAME: fastmath = #arith.fastmath<none>
+// COMPOSED-ALGEBRA: "shuttle.map"
+// COMPOSED-ALGEBRA-SAME: indexing_maps = [#[[PROJB]], #[[IDB]]]
+// COMPOSED-ALGEBRA-SAME: semantics = #shuttle.map_semantics<broadcast_in_dim>
+// COMPOSED-ALGEBRA: value = 0.000000e+00 : f32
+// COMPOSED-ALGEBRA: "shuttle.fold"
+// COMPOSED-ALGEBRA: "arith.addf"
+// COMPOSED-ALGEBRA-SAME: fastmath = #arith.fastmath<none>
+// COMPOSED-ALGEBRA: "shuttle.map"
+// COMPOSED-ALGEBRA-SAME: indexing_maps = [#[[PROJB]], #[[IDB]]]
+// COMPOSED-ALGEBRA-SAME: semantics = #shuttle.map_semantics<broadcast_in_dim>
 
 // PLAN-A: "shuttle.materialization_plan"() <{{.*}}schema_version = 1
-// PLAN-A: domain_shape = array<i64: 2, 5, 17>{{.*}}kind = #shuttle.materialization_task_kind<fold>{{.*}}reduction_dimensions = array<i64: 2>
 // PLAN-A: tensor_type = tensor<2x5x17xf32>
 // PLAN-A: tensor_type = tensor<2x5xf32>
+// PLAN-A: domain_shape = array<i64: 2, 5, 17>{{.*}}kind = #shuttle.materialization_task_kind<fold>{{.*}}reduction_dimensions = array<i64: 2>
 // PLAN-B: "shuttle.materialization_plan"() <{{.*}}schema_version = 1
-// PLAN-B: domain_shape = array<i64: 3, 2, 4, 7, 269>{{.*}}kind = #shuttle.materialization_task_kind<fold>{{.*}}reduction_dimensions = array<i64: 4>
 // PLAN-B: tensor_type = tensor<3x2x4x7x269xf32>
 // PLAN-B: tensor_type = tensor<3x2x4x7xf32>
+// PLAN-B: domain_shape = array<i64: 3, 2, 4, 7, 269>{{.*}}kind = #shuttle.materialization_task_kind<fold>{{.*}}reduction_dimensions = array<i64: 4>
 
 // SCHEDULE-A: "shuttle.schedule_plan"() <{{.*}}schema_version = 1
 // SCHEDULE-A: domain_shape = array<i64: 2, 5, 17>{{.*}}grid_shape = array<i64: 10>{{.*}}kind = #shuttle.schedule_task_kind<row_fold>{{.*}}reduction_axis = 2{{.*}}reduction_order = #shuttle.schedule_reduction_order<tree_association_free_leaf_order_fixed>{{.*}}scratch_bytes = 128{{.*}}serial_tiles = 1{{.*}}subgroup_size = 32{{.*}}tile_shape = array<i64: 1, 1, 17>{{.*}}workgroup_threads = 32
