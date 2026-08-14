@@ -45,6 +45,10 @@ def _controller_module():
     return importlib.import_module("iris.cluster.controller.shuttle_receipts")
 
 
+def _controller_db(path: Path):
+    return importlib.import_module("iris.cluster.controller.db").ControllerDB(path)
+
+
 def _ack_payload(contract: dict[str, Any]) -> dict[str, object]:
     launch = contract["launch"]
     authority = contract["authority"]
@@ -264,39 +268,51 @@ def test_controller_store_is_idempotent_per_authorization_and_stage(tmp_path: Pa
     controller = _controller_module()
     contract = _contract()
     signing_key = signing_key_from_private_pem(RFC8032_TEST_PRIVATE_KEY_PEM)
-    store = controller.ControllerReceiptStore(tmp_path, signing_key, contract)
+    database = _controller_db(tmp_path)
+    store = controller.ControllerReceiptStore(database, signing_key, contract)
     ack_payload = _ack_payload(contract)
 
-    first = store.issue_ack(ack_payload)
-    reopened = controller.ControllerReceiptStore(tmp_path, signing_key, contract)
-    second = reopened.issue_ack(deepcopy(ack_payload))
+    try:
+        first = store.issue_ack(ack_payload)
+    finally:
+        database.close()
+    reopened_database = _controller_db(tmp_path)
+    reopened = controller.ControllerReceiptStore(reopened_database, signing_key, contract)
+    try:
+        second = reopened.issue_ack(deepcopy(ack_payload))
 
-    assert first == second
-    changed = deepcopy(ack_payload)
-    changed["archive_sha256"] = "9" * 64
-    with pytest.raises(ValueError):
-        store.issue_ack(changed)
+        assert first == second
+        changed = deepcopy(ack_payload)
+        changed["archive_sha256"] = "9" * 64
+        with pytest.raises(ValueError):
+            reopened.issue_ack(changed)
+    finally:
+        reopened_database.close()
 
 
 def test_controller_store_requires_ack_running_then_terminal_success(tmp_path: Path) -> None:
     controller = _controller_module()
     contract = _contract()
+    database = _controller_db(tmp_path)
     store = controller.ControllerReceiptStore(
-        tmp_path,
+        database,
         signing_key_from_private_pem(RFC8032_TEST_PRIVATE_KEY_PEM),
         contract,
     )
     ack_payload = _ack_payload(contract)
-    unsigned_ack = _signed(ack_payload)
-    terminal_payload = _terminal_payload(contract, unsigned_ack)
+    unissued_ack = _signed(ack_payload)
+    terminal_payload = _terminal_payload(contract, unissued_ack)
 
-    with pytest.raises(ValueError):
-        store.issue_terminal(terminal_payload)
+    try:
+        with pytest.raises(ValueError):
+            store.issue_terminal(terminal_payload)
 
-    ack = store.issue_ack(ack_payload)
-    terminal_payload = _terminal_payload(contract, ack)
-    terminal = store.issue_terminal(terminal_payload)
-    assert json.loads(terminal)["payload"]["ack_receipt_sha256"] == hashlib.sha256(ack).hexdigest()
+        ack = store.issue_ack(ack_payload)
+        terminal_payload = _terminal_payload(contract, ack)
+        terminal = store.issue_terminal(terminal_payload)
+        assert json.loads(terminal)["payload"]["ack_receipt_sha256"] == hashlib.sha256(ack).hexdigest()
+    finally:
+        database.close()
 
 
 def test_controller_store_rejects_retry_or_cross_attempt_receipt(tmp_path: Path) -> None:
@@ -305,11 +321,15 @@ def test_controller_store_rejects_retry_or_cross_attempt_receipt(tmp_path: Path)
     signing_key = signing_key_from_private_pem(RFC8032_TEST_PRIVATE_KEY_PEM)
     retried = deepcopy(contract)
     retried["launch"]["max_retries"] = 1
+    database = _controller_db(tmp_path)
 
-    with pytest.raises(ValueError):
-        controller.ControllerReceiptStore(tmp_path / "retry", signing_key, retried)
-    store = controller.ControllerReceiptStore(tmp_path / "attempt", signing_key, contract)
-    other_attempt = _ack_payload(contract)
-    other_attempt["attempt_uid"] = "fedcba9876543210"
-    with pytest.raises(ValueError):
-        store.issue_ack(other_attempt)
+    try:
+        with pytest.raises(ValueError):
+            controller.ControllerReceiptStore(database, signing_key, retried)
+        store = controller.ControllerReceiptStore(database, signing_key, contract)
+        other_attempt = _ack_payload(contract)
+        other_attempt["attempt_uid"] = "fedcba9876543210"
+        with pytest.raises(ValueError):
+            store.issue_ack(other_attempt)
+    finally:
+        database.close()
