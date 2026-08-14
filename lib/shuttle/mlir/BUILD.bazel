@@ -443,6 +443,9 @@ cc_test(
 cc_test(
     name = "xla_registration_test",
     srcs = ["test/xla-registration-test.cc"],
+    data = [
+        "test/Inputs/jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-forward.mlir",
+    ],
     deps = [
         ":ShuttleXlaRegistration",
         "@com_google_absl//absl/status",
@@ -453,6 +456,7 @@ cc_test(
         "@llvm-project//mlir:IR",
         "@llvm-project//mlir:Parser",
         "@stablehlo//:register",
+        "@bazel_tools//tools/cpp/runfiles",
     ],
 )
 

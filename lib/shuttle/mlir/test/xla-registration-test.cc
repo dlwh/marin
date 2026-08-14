@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <string>
+#include <fstream>
+#include <sstream>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -12,6 +14,7 @@
 #include "shuttle/Transforms/Observer.h"
 #include "shuttle/Transforms/XlaRegistration.h"
 #include "stablehlo/dialect/Register.h"
+#include "tools/cpp/runfiles/runfiles.h"
 #include "llvm/Support/raw_ostream.h"
 #include "gtest/gtest.h"
 
@@ -27,6 +30,8 @@ constexpr char kCpuExecutableBundleFastOptions[] =
     R"json({"execution_mode":"cpu_executable_bundle","numerics":"fast","pipeline_abi_version":11,"schema_version":1,"tuning":{"cluster_shape":[2,1,1],"materialization":"prefer_fusion","maximum_candidates":16,"pipeline_stages":3,"tile_sizes":[64,128]}})json";
 constexpr char kGpuExecutableBundleOptions[] =
     R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":11,"schema_version":1,"tuning":{"cluster_shape":[2,1,1],"materialization":"prefer_fusion","maximum_candidates":16,"pipeline_stages":3,"tile_sizes":[64,128]}})json";
+constexpr char kGpuExecutableBundleFastOptions[] =
+    R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":11,"schema_version":1,"tuning":{"cluster_shape":[2,1,1],"materialization":"prefer_fusion","maximum_candidates":16,"pipeline_stages":3,"tile_sizes":[64,128]}})json";
 constexpr char kProgram[] = R"mlir(
 module {
   func.func @main(%arg0: tensor<7xf32>) -> tensor<7xf32> {
@@ -36,12 +41,13 @@ module {
 }
 )mlir";
 
-mlir::OwningOpRef<mlir::ModuleOp> parseModule(mlir::MLIRContext &context) {
+mlir::OwningOpRef<mlir::ModuleOp>
+parseModule(mlir::MLIRContext &context, llvm::StringRef source = kProgram) {
   mlir::DialectRegistry dialects;
   dialects.insert<mlir::func::FuncDialect>();
   mlir::stablehlo::registerAllDialects(dialects);
   context.appendDialectRegistry(dialects);
-  return mlir::parseSourceString<mlir::ModuleOp>(kProgram, &context);
+  return mlir::parseSourceString<mlir::ModuleOp>(source, &context);
 }
 
 TEST(ShuttleXlaOptionsTest, ParsesCanonicalPythonWireFormat) {
@@ -91,11 +97,19 @@ TEST(ShuttleXlaOptionsTest, ParsesCanonicalPythonWireFormat) {
   ASSERT_TRUE(gpuBundle.ok()) << gpuBundle.status();
   EXPECT_EQ(gpuBundle->executionMode,
             mlir::shuttle::ExecutionMode::GpuExecutableBundle);
+
+  auto gpuFast =
+      mlir::shuttle::parseShuttleXlaOptions(kGpuExecutableBundleFastOptions);
+  ASSERT_TRUE(gpuFast.ok()) << gpuFast.status();
+  EXPECT_EQ(gpuFast->executionMode,
+            mlir::shuttle::ExecutionMode::GpuExecutableBundle);
+  EXPECT_EQ(gpuFast->numerics, mlir::shuttle::NumericalPolicy::Fast);
+  EXPECT_NE(mlir::shuttle::shuttlePipelineIdentity(*gpuBundle).policyDigest,
+            mlir::shuttle::shuttlePipelineIdentity(*gpuFast).policyDigest);
 }
 
-TEST(ShuttleXlaOptionsTest, RejectsGpuFastAndAdjacentPipelineAbis) {
+TEST(ShuttleXlaOptionsTest, RejectsAdjacentGpuPipelineAbis) {
   constexpr const char *invalid[] = {
-      R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":11,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
       R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":10,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
       R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":12,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
   };
@@ -165,6 +179,34 @@ TEST(ShuttleXlaOptionsTest, RunsTheSharedPipelineFromSerializedOptions) {
   output.flush();
   EXPECT_EQ(transformed.find("shuttle."), std::string::npos);
   EXPECT_NE(transformed.find("stablehlo.tanh"), std::string::npos);
+}
+
+TEST(ShuttleXlaOptionsTest, RunsGpuFastPipelineFromSerializedOptions) {
+  std::string error;
+  auto runfiles = bazel::tools::cpp::runfiles::Runfiles::CreateForTest(&error);
+  ASSERT_TRUE(runfiles) << error;
+  std::ifstream input(runfiles->Rlocation(
+      "shuttle_mlir/test/Inputs/"
+      "jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-forward.mlir"));
+  std::ostringstream source;
+  source << input.rdbuf();
+  ASSERT_TRUE(input);
+  mlir::MLIRContext context;
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      parseModule(context, source.str());
+  ASSERT_TRUE(module);
+  EXPECT_TRUE(mlir::shuttle::runShuttleXlaTransform(
+                  *module, kGpuExecutableBundleFastOptions)
+                  .ok());
+
+  std::string transformed;
+  llvm::raw_string_ostream output(transformed);
+  module->print(output);
+  output.flush();
+  EXPECT_EQ(transformed.find("shuttle.region"), std::string::npos);
+  EXPECT_EQ(transformed.find("stablehlo.tanh"), std::string::npos);
+  EXPECT_NE(transformed.find("shuttle.gpu.executable_bundle.v2"),
+            std::string::npos);
 }
 
 } // namespace

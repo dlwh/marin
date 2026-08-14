@@ -60,7 +60,7 @@ OBSERVER_FINGERPRINTS = {
     ),
     ("81928ab3539c0f03", "forward", "fast"): (
         "38f9c6b58ea83d426a297e0e2e499e547f1ffc6e2af3eac4acdb30fa2f5d6cd3",
-        "815cfe2b3df421fdb143cfa34f68fd711642fd6a09843111b299e17bde7dcb72",
+        "64a17a580ab728cfc3ff5eb381508112f9c322a69681c545d288bc7bdb0437fe",
     ),
     ("81928ab3539c0f03", "backward", "source_ordered"): (
         "ddc1f20c8db96585d2ae722a13fcdbdb764b3d965a52a43ebe7c62d6de9d5b76",
@@ -68,7 +68,7 @@ OBSERVER_FINGERPRINTS = {
     ),
     ("81928ab3539c0f03", "backward", "fast"): (
         "139587df1e0fbe5e9c000533c1b1395a4a447c895b82c306831c76639a1dcb3f",
-        "983acd01f543bb9a12621b1be1c6ec5620ab8098f052221171b787704580dac8",
+        "ae00099b7fea645587f925f49e98ba2f344f60e137c20a7941e4fd012e3df000",
     ),
     ("81928ab3539c0f03", "composed", "source_ordered"): (
         "6b59d6a04b3e8366571b08e5ed6278ebc8594eba66d5a7dc52749ae6fdd023d4",
@@ -76,7 +76,7 @@ OBSERVER_FINGERPRINTS = {
     ),
     ("81928ab3539c0f03", "composed", "fast"): (
         "539ccc57b4cc30004f6ba3b756c3c09aaf29bfea4d2ab2a9f1d1bfb8a91af551",
-        "e0c746b39aa31b54ea51a4b0a5cd875cc422f9fa1d1b403d4c7d29b9b8c38e88",
+        "e9657c7c406ccb0037bc990287fe5f261f17c994e1e02d78c03b8086cc9b0038",
     ),
     ("44d152ecc3e9ff18", "forward", "source_ordered"): (
         "51a675acd6bf1254176267c8a0d01ccd04357710f564233d35a70a14a780fbb5",
@@ -84,7 +84,7 @@ OBSERVER_FINGERPRINTS = {
     ),
     ("44d152ecc3e9ff18", "forward", "fast"): (
         "b03a5d84794682f2eca360820fbc937656882f547cc9725395e75b7c8b944d76",
-        "368c6c11128ac97c0e5208bd66f1063336d39da3a7804205fa1e3f30a3abc4ad",
+        "055c5a4bd1e22e71037003cbe85ac2baa2a3589c53be7237acc6c10545d58858",
     ),
     ("44d152ecc3e9ff18", "backward", "source_ordered"): (
         "3b2f78ad26b3cad2758d78d5adefab0c16756838979469af41733870245bb55d",
@@ -92,7 +92,7 @@ OBSERVER_FINGERPRINTS = {
     ),
     ("44d152ecc3e9ff18", "backward", "fast"): (
         "91c44297721ebcb838332a9826e3fa93c07e55c5506fe16aa30da5e622012597",
-        "c4b7842e05659aaeb30d036499189d628c65f0cac5fd51186d627bf75d6b971f",
+        "18e412711edc31de7fe46375b94ea95692495ae43202e9f257c264e63b04319d",
     ),
     ("44d152ecc3e9ff18", "composed", "source_ordered"): (
         "8c60d2debd1344bffcd251517f9c05c9b3a886f2780c97377d93ae63be86c865",
@@ -100,7 +100,7 @@ OBSERVER_FINGERPRINTS = {
     ),
     ("44d152ecc3e9ff18", "composed", "fast"): (
         "a6fea4448ad3a907dcec72e94013132d370ee5c9fc58966912856eac5a8db954",
-        "7ef814c32e71c1fcf6981a1d192ea8510df308fd42e7e5e08626172a8764a4a6",
+        "74a606047a0a88279adae7efa80d4eaca9c614957fc806e75eb63601277e8961",
     ),
 }
 
@@ -477,7 +477,7 @@ def run_orchestrator(work_directory: Path) -> dict[str, object]:
     if reports["reuse"]["cache_hits"] != len(cell_identities()):
         raise AssertionError("reuse process omitted an ABI 11 cache hit")
     return {
-        "classification": "untimed_h100_layer_norm_correctness_and_cache_only",
+        "classification": "untimed_generic_gpu_layer_norm_correctness_and_cache_only",
         "timing_collected": False,
         "scorecard_status_changed": False,
         "workers": reports,

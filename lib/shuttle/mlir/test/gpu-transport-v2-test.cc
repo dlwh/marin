@@ -131,6 +131,8 @@ bool isDigest(llvm::StringRef value) {
 struct Decoded {
   llvm::SmallVector<uint8_t> code;
   llvm::SmallVector<mlir::shuttle::GpuLaunch> launches;
+  uint8_t policy = 0;
+  uint64_t devicePolicyOffset = 0;
   llvm::SmallVector<int64_t> slotReuseGroups;
   llvm::SmallVector<uint64_t> slotReuseOffsets;
   llvm::SmallVector<uint8_t> slotStorage;
@@ -164,8 +166,11 @@ std::optional<Decoded> decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes) {
   for (char expected : llvm::StringRef("SHUTGPU\0", 8))
     if (reader.u8() != static_cast<uint8_t>(expected))
       return std::nullopt;
-  if (reader.u32() != 2 || reader.i64() != 3 || reader.u8() != 2 ||
-      reader.u8() > 1)
+  if (reader.u32() != 2 || reader.i64() != 3 || reader.u8() != 2)
+    return std::nullopt;
+  uint64_t devicePolicyOffset = reader.position();
+  uint8_t policy = reader.u8();
+  if (policy > 1)
     return std::nullopt;
   constexpr uint64_t deviceStart = 12;
   llvm::StringRef schedule = reader.text();
@@ -430,6 +435,8 @@ std::optional<Decoded> decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes) {
   }
   return Decoded{llvm::SmallVector<uint8_t>(code),
                  std::move(launches),
+                 policy,
+                 devicePolicyOffset,
                  std::move(slotReuseGroups),
                  std::move(slotReuseOffsets),
                  std::move(slotStorage),
@@ -609,6 +616,109 @@ std::unique_ptr<BuiltBundle> buildAlternateFixture() {
   return buildFixture(*source);
 }
 
+std::string mapOnlyModule(int64_t inputs, bool permutedResult) {
+  std::string source;
+  llvm::raw_string_ostream stream(source);
+  stream << (permutedResult
+                 ? "#indexing = affine_map<(d0, d1) -> (d1, d0)>\n"
+                 : "#indexing = affine_map<(d0, d1) -> (d0, d1)>\n")
+         << "module {\n  func.func @map_only(";
+  for (int64_t index = 0; index < inputs; ++index) {
+    if (index)
+      stream << ", ";
+    stream << "%arg" << index << ": tensor<2x3xf32>";
+  }
+  if (inputs)
+    stream << ", ";
+  stream << "%init: tensor<f32>) -> tensor<2xf32> {\n"
+            "    %result = \"shuttle.region\"(";
+  for (int64_t index = 0; index < inputs; ++index) {
+    if (index)
+      stream << ", ";
+    stream << "%arg" << index;
+  }
+  if (inputs)
+    stream << ", ";
+  stream << "%init) ({\n    ^bb0(";
+  for (int64_t index = 0; index < inputs; ++index) {
+    if (index)
+      stream << ", ";
+    stream << "%region" << index << ": tensor<2x3xf32>";
+  }
+  if (inputs)
+    stream << ", ";
+  stream << "%region_init: tensor<f32>):\n"
+            "      %mapped = \"shuttle.map\"(";
+  for (int64_t index = 0; index < inputs; ++index) {
+    if (index)
+      stream << ", ";
+    stream << "%region" << index;
+  }
+  stream << ") ({\n      ^bb0(";
+  for (int64_t index = 0; index < inputs; ++index) {
+    if (index)
+      stream << ", ";
+    stream << "%value" << index << ": f32";
+  }
+  stream << "):\n        \"shuttle.yield\"(%value0) : (f32) -> ()\n"
+            "      }) {indexing_maps = [";
+  for (int64_t index = 0; index <= inputs; ++index) {
+    if (index)
+      stream << ", ";
+    stream << "#indexing";
+  }
+  stream << "], source = #shuttle.source_ref<0, 0, 0, 0>} : (";
+  for (int64_t index = 0; index < inputs; ++index) {
+    if (index)
+      stream << ", ";
+    stream << "tensor<2x3xf32>";
+  }
+  stream << ") -> tensor<2x3xf32>\n"
+            "      %folded = \"shuttle.fold\"(%mapped, %region_init) ({\n"
+            "      ^bb0(%left: f32, %right: f32):\n"
+            "        %sum = arith.addf %left, %right : f32\n"
+            "        \"shuttle.yield\"(%sum) : (f32) -> ()\n"
+            "      }) {accumulator_types = [f32], operandSegmentSizes = "
+            "array<i32: 1, 1>, order_free = true, reduction_dimensions = "
+            "array<i64: 1>, source = #shuttle.source_ref<0, 0, 1, 0>} : "
+            "(tensor<2x3xf32>, tensor<f32>) -> tensor<2xf32>\n"
+            "      \"shuttle.yield\"(%folded) : (tensor<2xf32>) -> ()\n"
+            "    }) {policy = #shuttle.policy<source_ordered>, "
+            "source_refs = [#shuttle.source_ref<0, 0, 0, 0>, "
+            "#shuttle.source_ref<0, 0, 1, 0>]} : (";
+  for (int64_t index = 0; index < inputs; ++index) {
+    if (index)
+      stream << ", ";
+    stream << "tensor<2x3xf32>";
+  }
+  if (inputs)
+    stream << ", ";
+  stream << "tensor<f32>) -> tensor<2xf32>\n"
+            "    return %result : tensor<2xf32>\n  }\n}\n";
+  stream.flush();
+  return source;
+}
+
+std::unique_ptr<BuiltBundle> buildAlgebraFixture(llvm::StringRef source) {
+  mlir::DialectRegistry registry;
+  registry.insert<mlir::arith::ArithDialect, mlir::func::FuncDialect,
+                  mlir::math::MathDialect, mlir::shuttle::ShuttleDialect>();
+  auto result = std::make_unique<BuiltBundle>();
+  result->context = std::make_unique<mlir::MLIRContext>(registry);
+  result->module =
+      mlir::parseSourceString<mlir::ModuleOp>(source, result->context.get());
+  if (!result->module)
+    return {};
+  mlir::PassManager manager(result->context.get());
+  manager.addPass(mlir::shuttle::createPlanRowFoldMaterializationPass());
+  manager.addPass(mlir::shuttle::createPlanSimt32RowFoldSchedulePass());
+  manager.addPass(mlir::shuttle::createBuildGpuExecutableBundlePass());
+  manager.addPass(mlir::shuttle::createVerifyGpuExecutableBundlePass());
+  if (mlir::failed(manager.run(*result->module)))
+    return {};
+  return result;
+}
+
 TEST(GpuTransportV2Test, IndependentInlineDecoderMatchesPublicDescriptor) {
   auto built = buildFixture();
   ASSERT_TRUE(built);
@@ -722,10 +832,37 @@ TEST(GpuTransportV2Test, FastPolicyChangesClosureWithoutSelectingCode) {
   auto fastDecoded = decodeInlineSchema2(*fastBytes);
   ASSERT_TRUE(sourceOrderedDecoded);
   ASSERT_TRUE(fastDecoded);
+  EXPECT_EQ(sourceOrderedDecoded->policy, 0);
+  EXPECT_EQ(fastDecoded->policy, 1);
   EXPECT_EQ(sourceOrderedDecoded->code, fastDecoded->code);
   EXPECT_NE(*sourceOrderedBytes, *fastBytes);
   EXPECT_NE(mlir::shuttle::gpuExecutableBundleDigest(*sourceOrderedBytes),
             mlir::shuttle::gpuExecutableBundleDigest(*fastBytes));
+
+  auto unsealedMutation = *sourceOrderedBytes;
+  unsealedMutation[sourceOrderedDecoded->devicePolicyOffset] = 1;
+  EXPECT_FALSE(decodeInlineSchema2(unsealedMutation));
+  EXPECT_FALSE(mlir::shuttle::GpuExecutable::Load(unsealedMutation).ok());
+}
+
+TEST(GpuTransportV2Test, RejectsPermutedResultMapBeforeGpuCodeEmission) {
+  ASSERT_TRUE(buildAlgebraFixture(mapOnlyModule(1, false)));
+  EXPECT_FALSE(buildAlgebraFixture(mapOnlyModule(1, true)));
+}
+
+TEST(GpuTransportV2Test, WideMapDeclaresEveryReferencedRegister) {
+  auto built = buildAlgebraFixture(mapOnlyModule(58, false));
+  ASSERT_TRUE(built);
+  auto devices = llvm::to_vector(
+      built->module->getOps<mlir::shuttle::DeviceModuleOp>());
+  ASSERT_EQ(devices.size(), 1);
+  llvm::StringRef ptx(reinterpret_cast<const char *>(devices[0].getCode().data()),
+                      devices[0].getCode().size());
+  EXPECT_TRUE(ptx.contains(".reg .b64 %rd<128>;"));
+  EXPECT_TRUE(ptx.contains(".reg .f32 %f<128>;"));
+  EXPECT_TRUE(ptx.contains("%rd126"));
+  EXPECT_TRUE(ptx.contains("%f57"));
+  EXPECT_FALSE(buildAlgebraFixture(mapOnlyModule(59, false)));
 }
 
 TEST(GpuTransportV2Test, FoldDynamicSharedMemoryIsDeclaredAtModuleScope) {
@@ -943,6 +1080,71 @@ xla::ffi::CallFrame callFrame(llvm::ArrayRef<uint8_t> transport,
   return builder.Build();
 }
 
+struct DynamicFrame {
+  xla::ffi::CallFrame frame;
+  llvm::DenseMap<int64_t, uintptr_t> externalSlots;
+};
+
+std::optional<DynamicFrame>
+dynamicCallFrame(const mlir::shuttle::GpuExecutable &executable,
+                 llvm::ArrayRef<uint8_t> transport,
+                 llvm::StringRef transportDigest) {
+  llvm::SmallVector<const mlir::shuttle::GpuExternalBinding *> operands;
+  llvm::SmallVector<const mlir::shuttle::GpuExternalBinding *> results;
+  for (const auto &binding : executable.externalBindings()) {
+    auto *projection = binding.kind == mlir::shuttle::ExecutableBindingKind::Operand
+                           ? &operands
+                       : binding.kind == mlir::shuttle::ExecutableBindingKind::Result
+                           ? &results
+                           : nullptr;
+    if (!projection || binding.index != static_cast<int64_t>(projection->size()))
+      return std::nullopt;
+    projection->push_back(&binding);
+  }
+  if (operands.empty() || results.empty())
+    return std::nullopt;
+  xla::ffi::CallFrameBuilder builder(operands.size(), results.size());
+  llvm::DenseMap<int64_t, uintptr_t> externalSlots;
+  auto add = [&](const mlir::shuttle::GpuExternalBinding &binding,
+                 bool result) {
+    auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(binding.tensorType);
+    if (!tensor || !tensor.getElementType().isBF16())
+      return false;
+    uintptr_t address = UINT64_C(0x100000000) +
+                        static_cast<uintptr_t>(binding.slotOrdinal) *
+                            UINT64_C(0x10000000);
+    stream_executor::DeviceAddressBase deviceAddress(
+        reinterpret_cast<void *>(address), binding.requiredBytes);
+    if (result)
+      builder.AddBufferRet(deviceAddress, xla::PrimitiveType::BF16,
+                           tensor.getShape());
+    else
+      builder.AddBufferArg(deviceAddress, xla::PrimitiveType::BF16,
+                           tensor.getShape());
+    externalSlots[binding.slotOrdinal] = address;
+    return true;
+  };
+  for (const auto *binding : operands)
+    if (!add(*binding, false))
+      return std::nullopt;
+  for (const auto *binding : results)
+    if (!add(*binding, true))
+      return std::nullopt;
+  xla::ffi::CallFrameBuilder::AttributesBuilder attributes;
+  attributes.Insert("bundle_bytes", std::string(reinterpret_cast<const char *>(
+                                                      transport.data()),
+                                                  transport.size()));
+  attributes.Insert("bundle_sha256", transportDigest.str());
+  attributes.Insert("bundle_size", static_cast<int64_t>(transport.size()));
+  attributes.Insert("transport_schema_version", int64_t{2});
+  attributes.Insert("device_schema_version", int64_t{3});
+  attributes.Insert("invocation_abi_schema_version", int64_t{3});
+  attributes.Insert("bundle_schema_version", int64_t{2});
+  attributes.Insert("completion", std::string("stream_ordered"));
+  builder.AddAttributes(attributes.Build());
+  return DynamicFrame{builder.Build(), std::move(externalSlots)};
+}
+
 std::unique_ptr<stream_executor::Kernel>
 recordLoadedKernel(const stream_executor::KernelLoaderSpec &spec,
                    const std::shared_ptr<ExecutionTrace> &trace) {
@@ -1010,6 +1212,24 @@ slotAddresses(const Decoded &decoded, const SyntheticAllocator &allocator,
   for (int64_t ordinal = 2; ordinal < 20; ++ordinal)
     slots[ordinal] = groups.lookup(decoded.slotReuseGroups[ordinal]);
   return slots;
+}
+
+llvm::DenseMap<int64_t, uintptr_t>
+dynamicSlotAddresses(const Decoded &decoded,
+                     const SyntheticAllocator &allocator,
+                     uintptr_t allocationBase,
+                     llvm::DenseMap<int64_t, uintptr_t> externalSlots) {
+  llvm::DenseMap<int64_t, uintptr_t> groups;
+  uintptr_t address = allocationBase;
+  for (auto [group, bytes] :
+       llvm::zip_equal(decoded.temporaryGroupOrder, allocator.sizes)) {
+    address += bytes + 256;
+    groups[group] = address;
+  }
+  for (int64_t ordinal = 0; ordinal < decoded.slots; ++ordinal)
+    if (decoded.slotStorage[ordinal] == 1)
+      externalSlots[ordinal] = groups.lookup(decoded.slotReuseGroups[ordinal]);
+  return externalSlots;
 }
 
 TEST(GpuTransportV2Test, ExportedFfiBundleOwnsEveryLifecycleStage) {
@@ -1212,6 +1432,76 @@ TEST(GpuTransportV2Test, ExportedFfiBundleOwnsEveryLifecycleStage) {
                    .ok());
   EXPECT_EQ(failingAllocator.sizes.size(), 2);
   EXPECT_EQ(failingAllocator.deallocations, 2);
+}
+
+TEST(GpuTransportV2Test,
+     ExportedFfiBundleExecutesDynamicLayerNormProjectionAndLaunchCount) {
+  auto source = fixtureSource(
+      "jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-composed.mlir");
+  ASSERT_TRUE(source);
+  auto built = buildFixture(*source);
+  ASSERT_TRUE(built);
+  auto transport = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+  ASSERT_TRUE(mlir::succeeded(transport));
+  auto decoded = decodeInlineSchema2(*transport);
+  ASSERT_TRUE(decoded);
+  ASSERT_EQ(decoded->launches.size(), 80);
+  auto executable = mlir::shuttle::GpuExecutable::Load(*transport);
+  ASSERT_TRUE(executable.ok()) << executable.status();
+  ASSERT_EQ((*executable)->externalBindings().size(), 8);
+  auto dynamicFrame = dynamicCallFrame(
+      **executable, *transport,
+      mlir::shuttle::gpuExecutableBundleDigest(*transport));
+  ASSERT_TRUE(dynamicFrame);
+
+  XLA_FFI_Handler_Bundle handlers =
+      mlir::shuttle::gpuExecutableBundleFfiHandlerBundle();
+  SyntheticAllocator allocator(0x90000000);
+  stream_executor::MockStreamExecutor executor;
+  stream_executor::MockStream stream;
+  stream_executor::GpuComputeCapability capability{
+      stream_executor::CudaComputeCapability{9, 0}};
+  auto trace = std::make_shared<ExecutionTrace>();
+  EXPECT_CALL(stream, parent()).WillRepeatedly(testing::Return(&executor));
+  EXPECT_CALL(executor, LoadKernel(testing::_))
+      .Times(decoded->launches.size())
+      .WillRepeatedly([trace](const stream_executor::KernelLoaderSpec &spec) {
+        return recordLoadedKernel(spec, trace);
+      });
+
+  xla::ffi::ExecutionState instantiateState;
+  xla::ffi::ExecutionState prepareState;
+  xla::ffi::ExecutionState initializeState;
+  xla::ffi::InvokeContext context;
+  context.device_ordinal = 0;
+  context.backend_context = xla::ffi::InvokeContext::GpuContext{
+      &stream, &allocator, nullptr, nullptr,
+      nullptr, nullptr,    nullptr, &capability};
+  context.state_context = {&instantiateState, &prepareState, &initializeState};
+
+  ASSERT_TRUE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(), handlers.instantiate,
+                               dynamicFrame->frame, context,
+                               XLA_FFI_ExecutionStage_INSTANTIATE)
+                  .ok());
+  ASSERT_TRUE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(), handlers.prepare,
+                               dynamicFrame->frame, context,
+                               XLA_FFI_ExecutionStage_PREPARE)
+                  .ok());
+  ASSERT_EQ(allocator.sizes, decoded->temporaryGroupBytes);
+  EXPECT_EQ(llvm::accumulate(allocator.sizes, uint64_t{0}), 1932);
+  ASSERT_TRUE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(), handlers.initialize,
+                               dynamicFrame->frame, context,
+                               XLA_FFI_ExecutionStage_INITIALIZE)
+                  .ok());
+  expectLoadedKernels(*decoded, *trace, 0);
+  ASSERT_TRUE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(), handlers.execute,
+                               dynamicFrame->frame, context,
+                               XLA_FFI_ExecutionStage_EXECUTE)
+                  .ok());
+  EXPECT_EQ(trace->launchAttempts.load(), decoded->launches.size());
+  auto slots = dynamicSlotAddresses(*decoded, allocator, 0x90000000,
+                                    dynamicFrame->externalSlots);
+  expectKernelLaunches(*decoded, *trace, 0, slots);
 }
 
 } // namespace
