@@ -1,0 +1,67 @@
+{
+  "calls": {
+    "backward": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9
+    ],
+    "forward": [
+      0,
+      1
+    ]
+  },
+  "datasets": [
+    "dense",
+    "sparse_policy_discriminator"
+  ],
+  "output_roles": [
+    "primal",
+    "lhs_cotangent",
+    "rhs_cotangent"
+  ],
+  "policies": [
+    "source_ordered",
+    "fast"
+  ],
+  "populate_runs": [
+    "first",
+    "sequential",
+    "thread_0",
+    "thread_1"
+  ],
+  "reuse_runs": [
+    "reuse"
+  ],
+  "schema_version": 1,
+  "static_roles": {
+    "baseline_report": "process/baseline.json",
+    "build_manifest": "build/build-manifest.json",
+    "cache_populate_after": "cache/populate-after.json",
+    "cache_populate_before": "cache/populate-before.json",
+    "cache_reuse_after": "cache/reuse-after.json",
+    "cache_reuse_before": "cache/reuse-before.json",
+    "cuda_pjrt_plugin": "runtime/xla-cuda-plugin.so",
+    "cuda_pjrt_record": "runtime/cuda-pjrt-RECORD",
+    "cuda_pjrt_wheel": "runtime/jax-cuda13-pjrt.whl",
+    "cuda_plugin_extension": "runtime/cuda-plugin-extension.so",
+    "cuda_plugin_record": "runtime/cuda-plugin-RECORD",
+    "cuda_plugin_wheel": "runtime/jax-cuda13-plugin.whl",
+    "fixture": "contract/fixture.mlir",
+    "jax_common": "runtime/libjax-common.so",
+    "jax_extension": "runtime/jax-extension.so",
+    "jaxlib_wheel": "runtime/jaxlib.whl",
+    "populate_report": "process/populate.json",
+    "prerun_contract": "contract/prerun.json",
+    "ptxas_records": "assembly/ptxas-records.json",
+    "registration_transcript": "runtime/registration.json",
+    "reuse_report": "process/reuse.json"
+  },
+  "status": "raw_subject_artifact_only"
+}
