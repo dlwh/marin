@@ -183,11 +183,6 @@ parseShuttleXlaOptions(absl::string_view serializedOptions) {
     return invalidOptions(
         "field 'numerics' must be 'source_ordered' or 'fast'");
   }
-  if (options.executionMode == ExecutionMode::GpuExecutableBundle &&
-      options.numerics != NumericalPolicy::SourceOrdered) {
-    return invalidOptions(
-        "GPU executable bundle requires source_ordered numerics");
-  }
   const llvm::json::Value *tuningValue = object->get("tuning");
   const llvm::json::Object *tuning = tuningValue->getAsObject();
   if (tuning == nullptr) {

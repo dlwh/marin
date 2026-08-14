@@ -614,7 +614,7 @@ FailureOr<SmallVector<uint8_t>> serializeGpuExecutableBundle(ModuleOp module) {
   Writer devicePrefix;
   devicePrefix.i64(3);
   devicePrefix.u8(2);
-  devicePrefix.u8(0);
+  devicePrefix.u8(static_cast<uint8_t>(device.getPolicy()));
   devicePrefix.text(device.getSourceScheduleFingerprint());
   devicePrefix.blob(device.getCode());
   devicePrefix.text(device.getCodeDigest());

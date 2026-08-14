@@ -3986,35 +3986,45 @@ deriveGpuReuseGroups(MaterializationPlanOp materialization,
 }
 
 struct PtxEmitter {
-  explicit PtxEmitter(int64_t arity) : arity(arity), stream(text) {}
+  explicit PtxEmitter(int64_t arity) : arity(arity), stream(body) {}
 
   void header(StringRef certificate, bool usesDynamicSharedMemory = false) {
-    stream << ".version 8.0\n.target sm_90\n.address_size 64\n";
-    if (usesDynamicSharedMemory)
-      stream << ".extern .shared .align 4 .b8 shuttle_smem[];\n";
-    stream << "// shuttle structural certificate: " << certificate
-           << "\n.visible .entry shuttle_entry(";
-    for (int64_t index = 0; index < arity; ++index) {
-      if (index)
-        stream << ", ";
-      stream << ".param .u64 p" << index;
-    }
-    stream << ")\n{\n"
-              "  .reg .pred %p<16>;\n"
-              "  .reg .b16 %h<16>;\n"
-              "  .reg .b32 %r<64>;\n"
-              "  .reg .b64 %rd<128>;\n"
-              "  .reg .f32 %f<128>;\n";
+    this->certificate = certificate.str();
+    this->usesDynamicSharedMemory = usesDynamicSharedMemory;
   }
 
   int64_t nextF32() { return f32++; }
   int64_t nextU64() { return u64++; }
 
-  void finish() { stream << "$done:\n  ret;\n}\n"; }
+  void finish() {
+    stream.flush();
+    llvm::raw_string_ostream output(text);
+    output << ".version 8.0\n.target sm_90\n.address_size 64\n";
+    if (usesDynamicSharedMemory)
+      output << ".extern .shared .align 4 .b8 shuttle_smem[];\n";
+    output << "// shuttle structural certificate: " << certificate
+           << "\n.visible .entry shuttle_entry(";
+    for (int64_t index = 0; index < arity; ++index) {
+      if (index)
+        output << ", ";
+      output << ".param .u64 p" << index;
+    }
+    output << ")\n{\n"
+              "  .reg .pred %p<16>;\n"
+              "  .reg .b16 %h<16>;\n"
+              "  .reg .b32 %r<64>;\n"
+           << "  .reg .b64 %rd<" << std::max<int64_t>(128, u64) << ">;\n"
+           << "  .reg .f32 %f<" << std::max<int64_t>(128, f32) << ">;\n"
+           << body << "$done:\n  ret;\n}\n";
+    output.flush();
+  }
 
   int64_t arity;
   int64_t f32 = 0;
   int64_t u64 = 8;
+  std::string certificate;
+  bool usesDynamicSharedMemory = false;
+  std::string body;
   std::string text;
   llvm::raw_string_ostream stream;
 };
@@ -4165,6 +4175,10 @@ FailureOr<std::string> emitMapPtx(MapOp map, ScheduleTaskOp task) {
   auto output = dyn_cast<RankedTensorType>(map.getResult(0).getType());
   if (!output || map.getNumResults() != 1)
     return failure();
+  ArrayRef<Attribute> maps = map.getIndexingMaps().getValue();
+  if (maps.size() != map.getInputs().size() + 1 ||
+      !isIdentityMap(cast<AffineMapAttr>(maps.back()).getValue()))
+    return failure();
   FailureOr<int64_t> elements = staticElementCount(output);
   if (failed(elements))
     return failure();
@@ -4177,9 +4191,6 @@ FailureOr<std::string> emitMapPtx(MapOp map, ScheduleTaskOp task) {
   if (failed(coordinates))
     return failure();
   SmallVector<int64_t> arguments;
-  ArrayRef<Attribute> maps = map.getIndexingMaps().getValue();
-  if (maps.size() != map.getInputs().size() + 1)
-    return failure();
   for (auto [index, input] : llvm::enumerate(map.getInputs())) {
     auto inputType = dyn_cast<RankedTensorType>(input.getType());
     auto indexing = dyn_cast<AffineMapAttr>(maps[index]);
@@ -4208,8 +4219,9 @@ FailureOr<std::string> emitMapPtx(MapOp map, ScheduleTaskOp task) {
     ptx.stream << "  st.global.f32 [%rd" << outputPointer << "], %f" << *result
                << ";\n";
   }
+  if (ptx.f32 > 128 || ptx.u64 > 128)
+    return failure();
   ptx.finish();
-  ptx.stream.flush();
   return ptx.text;
 }
 
@@ -4314,7 +4326,6 @@ FailureOr<std::string> emitFoldPtx(FoldOp fold, ScheduleTaskOp task) {
                 "  add.u64 %rd8, %rd8, %rd9;\n"
                 "  st.global.f32 [%rd8], %f37;\n";
   ptx.finish();
-  ptx.stream.flush();
   return ptx.text;
 }
 
