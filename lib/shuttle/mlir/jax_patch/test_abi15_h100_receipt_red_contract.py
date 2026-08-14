@@ -403,6 +403,23 @@ def test_task_verifier_rejects_wrong_signature_domain_prefix() -> None:
         receipts.verify_ack_receipt(_signed(_ack_payload(contract), signing_domain="attacker.receipt.v1"), contract)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("receipt_schema_version", 2),
+        ("signature_algorithm", "RSA-PSS"),
+        ("stages", ["TERMINAL"]),
+    ],
+)
+def test_task_verifier_rejects_inconsistent_contract_metadata(field: str, value: object) -> None:
+    receipts = _receipt_module()
+    contract = _contract()
+    contract[field] = value
+
+    with pytest.raises(ValueError):
+        receipts.verify_ack_receipt(_signed(_ack_payload(contract)), contract)
+
+
 def test_task_verifier_accepts_controller_minted_attempt_uid() -> None:
     receipts = _receipt_module()
     contract = _contract()

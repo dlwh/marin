@@ -118,12 +118,23 @@ def _validate_field_types(payload: dict[str, Any], integer_fields: frozenset[str
             _string(value, field)
 
 
+def _validate_contract_metadata(document: dict[str, Any], contract: dict[str, Any]) -> None:
+    if type(contract.get("receipt_schema_version")) is not int or contract["receipt_schema_version"] != 1:
+        raise ValueError("contract receipt_schema_version must equal 1")
+    if document["schema_version"] != contract["receipt_schema_version"]:
+        raise ValueError("receipt schema_version does not match the contract")
+    if contract.get("signature_algorithm") != "Ed25519":
+        raise ValueError("contract signature_algorithm must equal Ed25519")
+    if contract.get("stages") != ["ACK", "TERMINAL"]:
+        raise ValueError("contract stages must equal ACK followed by TERMINAL")
+
+
 def _verify_signature(document: dict[str, Any], contract: dict[str, Any]) -> None:
     signature = document["signature"]
     if set(signature) != _SIGNATURE_FIELDS:
         raise ValueError("signature schema is not closed")
-    if signature["algorithm"] != "Ed25519":
-        raise ValueError("signature algorithm must be Ed25519")
+    if signature["algorithm"] != contract["signature_algorithm"]:
+        raise ValueError("signature algorithm does not match the contract")
     authority = _contract_object(contract, "authority")
     if authority.get("previous_key_fallback_allowed") is not False:
         raise ValueError("previous-key fallback must remain disabled")
@@ -153,6 +164,7 @@ def _verify_signature(document: dict[str, Any], contract: dict[str, Any]) -> Non
 
 def _parse_receipt(raw: bytes, contract: dict[str, Any], field_list: str) -> dict[str, Any]:
     document = _document(raw)
+    _validate_contract_metadata(document, contract)
     fields = contract.get(field_list)
     if type(fields) is not list or not fields or any(type(field) is not str for field in fields):
         raise ValueError(f"contract {field_list} must be a nonempty string list")
