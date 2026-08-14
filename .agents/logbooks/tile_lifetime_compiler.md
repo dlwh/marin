@@ -4865,3 +4865,49 @@ author: dlwh
   capture, persistent-cache process transition, artifact retrieval receipt,
   timing, upload, or H100 execution. No image build, network action, hardware
   reservation, push, integration, or scorecard change occurred.
+
+### 2026-08-14 - TLTC-MLIR-022 ABI 16 projected-permutation batched Contract
+
+- Pipeline ABI 16 generalizes the existing rank-two Contract realization to a
+  closed matrix-style batched Contract/Map region. Contract domains may have
+  at most rank eight and contain at least two parallel dimensions followed by
+  exactly one reduction dimension. Operand indexing maps are static projected
+  permutations, the Contract result map is identity, public tensors remain
+  BF16, and precision and tuning remain the exact defaults. Admission is
+  structural and does not use workload names, shapes, operation counts, or
+  fixture digests.
+- The planner derives output count, reduction extent, launch geometry, and
+  checked resource products from the normalized domain and affine maps.
+  Generated PTX decodes every flattened result coordinate and applies the
+  operand maps when forming addresses. SOURCE_ORDERED retains ascending
+  `fma.rn.f32`; FAST retains lane-strided leaves and the fixed
+  `16,8,4,2,1` shuffle/add tree. Existing rank-two Contract code paths and
+  public result projections remain covered.
+- Six ordinary-JAX 0.10.1 fixtures freeze two anonymous non-square shape
+  families across forward, JAX-owned backward, and composed boundaries. Tests
+  cover all forward, dRHS, and dLHS operand-map orientations, both policies,
+  exact bytes and geometry, rank-five corruption, symbol renaming, serialized
+  transport, fake FFI execution, and ABI/cache rotation. Dynamic or rank-over-
+  eight shapes, multiple reductions, public FP32, nondefault tuning, mixed
+  Fold/Contract regions, and rank-one vector-dot results fail closed.
+- Only the pipeline ABI and cache identity advance from 15 to 16.
+  Materialization, schedule, transport, device, invocation, and bundle schemas
+  remain `2/2/2/3/3/2`; the CUDA FFI target remains
+  `shuttle.gpu.executable_bundle.v2`.
+- Exact local chain: initial test-only boundary
+  `f1a64cd815754017cde3eed0481ffacb5a61601d`; mutation closure
+  `0ba0f04c94970c915edb3cd74d6380c295129799` and
+  `cb0ea8bb8234c9b7969909226e11fe2b2963f695`; production
+  `d23564f139ab72f27c328701edca66a36dfca573`; test-helper repair
+  `102436e15702e74687f7eca1a1e0d2326faef5a2`; explicit matrix floor
+  `d78d26702bfbd3a819aaa6fec53ac01fc3ded295`, tree
+  `9eb85574cc51396c2a17995da06060fa5217e3dc`. Independent exact-tip review
+  returned no actionable findings. Full native coverage passes 49/49, focused
+  Python options coverage passes 17/17, and changed-files precommit passes.
+- This is a local compiler checkpoint. It contains no PTX assembly, CUDA
+  execution, numerical or cache-process acceptance, image, hardware
+  reservation, upload, timing, performance, push, integration, or scorecard
+  change. Full attention remains a design stop: normalized exponential,
+  causal masking, GQA, mixed Fold/Contract planning, score-tensor elision,
+  streaming state, dynamic shapes, and collectives require separate generic
+  semantics and evidence.
