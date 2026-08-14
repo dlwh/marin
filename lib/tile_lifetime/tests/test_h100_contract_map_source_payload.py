@@ -445,7 +445,7 @@ def test_source_capsule_artifact_export_is_closed_and_requires_exact_ack(tmp_pat
     payload.wait_for_artifact_ack(export, ready, timeout_seconds=0.01, poll_seconds=0.001)
 
 
-@pytest.mark.parametrize("mutation", ["corrupt_part", "missing_part", "extra_file", "wrong_source"])
+@pytest.mark.parametrize("mutation", ["corrupt_part", "missing_part", "extra_file", "wrong_source", "boolean_schema"])
 def test_source_capsule_retrieved_export_rejects_transport_drift(tmp_path, mutation):
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()
@@ -476,8 +476,18 @@ def test_source_capsule_retrieved_export_rejects_transport_drift(tmp_path, mutat
         (retrieval / manifest["parts"][0]["filename"]).unlink()
     elif mutation == "extra_file":
         (retrieval / "unsealed").write_text("extra")
-    else:
+    elif mutation == "wrong_source":
         expected_source = "4" * 40
+    else:
+        manifest_path = retrieval / payload.ARTIFACT_EXPORT_MANIFEST_FILENAME
+        mutated_manifest = json.loads(manifest_path.read_bytes())
+        mutated_manifest["schema_version"] = True
+        manifest_path.write_bytes(payload._canonical_json(mutated_manifest))
+        ready_path = retrieval / payload.ARTIFACT_EXPORT_READY_FILENAME
+        mutated_ready = json.loads(ready_path.read_bytes())
+        mutated_ready["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        mutated_ready["schema_version"] = True
+        ready_path.write_bytes(payload._canonical_json(mutated_ready))
 
     with pytest.raises(ValueError):
         payload.validate_retrieved_artifact_export(
@@ -486,6 +496,24 @@ def test_source_capsule_retrieved_export_rejects_transport_drift(tmp_path, mutat
             expected_source_sha=expected_source,
             expected_source_tree="2" * 40,
             expected_source_manifest_sha256="3" * 64,
+        )
+
+
+def test_source_capsule_artifact_export_rejects_noncanonical_file_mode(tmp_path):
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    accepted = artifacts / "accepted_bundle.json"
+    accepted.write_text('{"accepted":true}\n')
+    accepted.chmod(0o600)
+
+    with pytest.raises(ValueError, match="noncanonical mode"):
+        payload.prepare_artifact_export(
+            artifacts,
+            tmp_path / "export",
+            runner_exit_code=0,
+            source_sha="1" * 40,
+            source_tree="2" * 40,
+            source_manifest_sha256="3" * 64,
         )
 
 

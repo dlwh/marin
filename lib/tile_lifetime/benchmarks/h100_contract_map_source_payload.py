@@ -33,6 +33,7 @@ ARTIFACT_EXPORT_MANIFEST_FILENAME = "h100-evidence-artifact-manifest.json"
 ARTIFACT_EXPORT_READY_FILENAME = "EXPORT_READY"
 ARTIFACT_EXPORT_ACK_FILENAME = "EXPORT_ACK"
 ARTIFACT_EXPORT_CHUNK_BYTES = 256 * 1024
+MAX_ARTIFACT_EXPORT_READY_BYTES = 16 * 1024
 MAX_ARTIFACT_EXPORT_BYTES = 8 * 1024 * 1024 * 1024
 MAX_ARTIFACT_EXPORT_MEMBERS = 100_000
 MAX_ARTIFACT_EXPORT_PARTS = MAX_ARTIFACT_EXPORT_BYTES // ARTIFACT_EXPORT_CHUNK_BYTES
@@ -569,6 +570,7 @@ def _artifact_file_records(artifact_directory: Path) -> list[dict[str, Any]]:
     if artifact_directory.is_symlink() or not artifact_directory.is_dir():
         return []
     records: list[dict[str, Any]] = []
+    total_size = 0
     for path in sorted(artifact_directory.rglob("*")):
         if path.is_symlink():
             raise ValueError(f"artifact export rejects symlinks: {path}")
@@ -579,6 +581,8 @@ def _artifact_file_records(artifact_directory: Path) -> list[dict[str, Any]]:
         relative = path.relative_to(artifact_directory).as_posix()
         _validate_relative_path(relative, "artifact export path")
         mode = stat.S_IMODE(path.stat().st_mode)
+        if mode not in {0o644, 0o755}:
+            raise ValueError(f"artifact export rejects noncanonical mode {mode:04o}: {path}")
         records.append(
             {
                 "mode": f"{mode:04o}",
@@ -587,6 +591,11 @@ def _artifact_file_records(artifact_directory: Path) -> list[dict[str, Any]]:
                 "size": path.stat().st_size,
             }
         )
+        if len(records) > MAX_ARTIFACT_EXPORT_MEMBERS:
+            raise ValueError("artifact export exceeds the member-count bound")
+        total_size += path.stat().st_size
+        if total_size > MAX_ARTIFACT_EXPORT_BYTES:
+            raise ValueError("artifact export exceeds the uncompressed size bound")
     return records
 
 
@@ -627,6 +636,8 @@ def _split_artifact_archive(path: Path, export_directory: Path) -> list[dict[str
                     "size": len(contents),
                 }
             )
+            if len(records) > MAX_ARTIFACT_EXPORT_PARTS:
+                raise ValueError("artifact export archive exceeds the transport-part bound")
     if not records:
         raise ValueError("artifact export archive must produce at least one transport part")
     return records
@@ -741,6 +752,10 @@ def validate_retrieved_artifact_export(
     for path, name in ((ready_path, "READY"), (manifest_path, "manifest")):
         if path.is_symlink() or not path.is_file():
             raise ValueError(f"artifact export {name} must be a regular file")
+    if ready_path.stat().st_size > MAX_ARTIFACT_EXPORT_READY_BYTES:
+        raise ValueError("artifact export READY exceeds the metadata size bound")
+    if manifest_path.stat().st_size > MAX_MANIFEST_BYTES:
+        raise ValueError("artifact export manifest exceeds the metadata size bound")
     ready = json.loads(ready_path.read_bytes())
     manifest = json.loads(manifest_path.read_bytes())
     if not isinstance(ready, dict) or ready_path.read_bytes() != _canonical_json(ready):
@@ -772,11 +787,11 @@ def validate_retrieved_artifact_export(
         raise ValueError("artifact export manifest has unexpected fields")
     if _sha256(manifest_path) != _require_sha(ready.get("manifest_sha256"), SHA256_PATTERN, "export manifest SHA-256"):
         raise ValueError("artifact export READY does not bind the retrieved manifest")
-    if ready.get("schema_version") != ARTIFACT_EXPORT_SCHEMA_VERSION:
+    if type(ready.get("schema_version")) is not int or ready["schema_version"] != ARTIFACT_EXPORT_SCHEMA_VERSION:
         raise ValueError("artifact export READY has an unsupported schema")
     if ready.get("ready_filename") != ARTIFACT_EXPORT_READY_FILENAME:
         raise ValueError("artifact export READY filename identity is invalid")
-    if manifest.get("schema_version") != ARTIFACT_EXPORT_SCHEMA_VERSION:
+    if type(manifest.get("schema_version")) is not int or manifest["schema_version"] != ARTIFACT_EXPORT_SCHEMA_VERSION:
         raise ValueError("artifact export manifest has an unsupported schema")
     expected_source = {
         "commit": expected_source_sha,
@@ -801,7 +816,11 @@ def validate_retrieved_artifact_export(
                 expected_filename = f"{ARTIFACT_EXPORT_ARCHIVE_FILENAME}.part.{index:06d}"
                 if not isinstance(record, dict) or set(record) != {"filename", "index", "sha256", "size"}:
                     raise ValueError("artifact export part record has unexpected fields")
-                if record.get("filename") != expected_filename or record.get("index") != index:
+                if (
+                    record.get("filename") != expected_filename
+                    or type(record.get("index")) is not int
+                    or record["index"] != index
+                ):
                     raise ValueError("artifact export parts are not canonical and contiguous")
                 size = record.get("size")
                 if type(size) is not int or not 0 < size <= ARTIFACT_EXPORT_CHUNK_BYTES:
@@ -831,14 +850,23 @@ def validate_retrieved_artifact_export(
     if not isinstance(archive, dict) or set(archive) != {"filename", "sha256", "size"}:
         temporary_archive.unlink(missing_ok=True)
         raise ValueError("artifact export archive record has unexpected fields")
-    if archive.get("filename") != ARTIFACT_EXPORT_ARCHIVE_FILENAME or archive.get("size") != total_size:
+    if (
+        archive.get("filename") != ARTIFACT_EXPORT_ARCHIVE_FILENAME
+        or type(archive.get("size")) is not int
+        or archive["size"] != total_size
+    ):
         temporary_archive.unlink(missing_ok=True)
         raise ValueError("artifact export archive size or name mismatch")
     archive_sha256 = _require_sha(archive.get("sha256"), SHA256_PATTERN, "archive SHA-256")
     if _sha256(temporary_archive) != archive_sha256 or ready.get("archive_sha256") != archive_sha256:
         temporary_archive.unlink(missing_ok=True)
         raise ValueError("artifact export archive digest mismatch")
-    if ready.get("archive_size") != total_size or ready.get("part_count") != len(parts):
+    if (
+        type(ready.get("archive_size")) is not int
+        or ready["archive_size"] != total_size
+        or type(ready.get("part_count")) is not int
+        or ready["part_count"] != len(parts)
+    ):
         temporary_archive.unlink(missing_ok=True)
         raise ValueError("artifact export READY does not bind the archive layout")
 
@@ -879,7 +907,11 @@ def validate_retrieved_artifact_export(
         temporary_archive.unlink(missing_ok=True)
         raise ValueError("artifact archive member paths are not sorted and unique")
     accepted = next((record for record in members if record["path"] == "accepted_bundle.json"), None)
-    if manifest.get("accepted_bundle") != accepted or ready.get("accepted_bundle_present") is not (accepted is not None):
+    if (
+        manifest.get("accepted_bundle") != accepted
+        or type(ready.get("accepted_bundle_present")) is not bool
+        or ready["accepted_bundle_present"] is not (accepted is not None)
+    ):
         temporary_archive.unlink(missing_ok=True)
         raise ValueError("artifact export does not bind the accepted bundle record")
     runner_exit_code = manifest.get("runner_exit_code")
@@ -887,6 +919,9 @@ def validate_retrieved_artifact_export(
     if type(runner_exit_code) is not int or not 0 <= runner_exit_code <= 255:
         temporary_archive.unlink(missing_ok=True)
         raise ValueError("artifact export runner exit code is invalid")
+    if type(wrapper_exit_code) is not int or not 0 <= wrapper_exit_code <= 255:
+        temporary_archive.unlink(missing_ok=True)
+        raise ValueError("artifact export wrapper exit code is invalid")
     expected_wrapper_exit = (
         MISSING_ACCEPTED_BUNDLE_EXIT_CODE if runner_exit_code == 0 and accepted is None else runner_exit_code
     )
