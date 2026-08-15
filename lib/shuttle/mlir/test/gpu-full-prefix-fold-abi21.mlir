@@ -93,18 +93,24 @@
 // FOLD-CENSUS-COUNT-5: "shuttle.fold"
 // FOLD-CENSUS-NOT: "shuttle.fold"
 // ZERO-CENSUS-COUNT-5: value = 0.000000e+00 : f32
-// ADD-CENSUS-COUNT-5: "arith.addf"{{.*}}fastmath = #arith.fastmath<none>
+// ZERO-CENSUS-NOT: value = 0.000000e+00 : f32
+// ADD-CENSUS-COUNT-8: "arith.addf"{{.*}}fastmath = #arith.fastmath<none>
+// ADD-CENSUS-NOT: "arith.addf"
 
 // ALGEBRA-A: "shuttle.fold"{{.*}}reduction_dimensions = array<i64: 0, 1>
+// ALGEBRA-A: "arith.addf"{{.*}}fastmath = #arith.fastmath<none>
 // ALGEBRA-A: (tensor<2x7x19xf32>, tensor<f32>) -> tensor<19xf32>
 // ALGEBRA-A: "shuttle.fold"{{.*}}reduction_dimensions = array<i64: 0, 1>
+// ALGEBRA-A: "arith.addf"{{.*}}fastmath = #arith.fastmath<none>
 // ALGEBRA-A: (tensor<1x1x19xf32>, tensor<f32>) -> tensor<19xf32>
 // ALGEBRA-A: "shuttle.scalar_convert"
 // ALGEBRA-A-SAME: semantics = #shuttle.scalar_convert_semantics<round_nearest_even>
 // ALGEBRA-A-SAME: (f32) -> bf16
 // ALGEBRA-B: "shuttle.fold"{{.*}}reduction_dimensions = array<i64: 0, 1, 2, 3>
+// ALGEBRA-B: "arith.addf"{{.*}}fastmath = #arith.fastmath<none>
 // ALGEBRA-B: (tensor<3x2x5x11x263xf32>, tensor<f32>) -> tensor<263xf32>
 // ALGEBRA-B: "shuttle.fold"{{.*}}reduction_dimensions = array<i64: 0, 1, 2, 3>
+// ALGEBRA-B: "arith.addf"{{.*}}fastmath = #arith.fastmath<none>
 // ALGEBRA-B: (tensor<1x1x1x1x263xf32>, tensor<f32>) -> tensor<263xf32>
 // ALGEBRA-B: "shuttle.scalar_convert"
 // ALGEBRA-B-SAME: semantics = #shuttle.scalar_convert_semantics<round_nearest_even>
