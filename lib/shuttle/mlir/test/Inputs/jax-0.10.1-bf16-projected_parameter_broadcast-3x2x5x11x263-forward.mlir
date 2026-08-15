@@ -5,9 +5,9 @@
 // Evaluation oracle status: not_pinned
 // Hardware evidence: none
 // Generator: regenerate-jax-bf16-projected-parameter-broadcast-fixtures.py
-// Generator source SHA-256: AFB74E624C57B50563A43D20F10B60C8FEDBAF5CFEB0A05FC67E46C9A04BAE8C
+// Generator source SHA-256: 6CD255DE5BC6E9663FD4340955F6E7950050F29B501798AED66DBBEE3A4ADFB9
 // Source: jax.jit(ordinary JAX RMS normalization with projected BF16
-// weight).lower(...).compiler_ir(StableHLO)
+// weight plus JAX-owned VJP).lower(...).compiler_ir(StableHLO)
 // Case ID: projected_parameter_broadcast_a3b7dd4c87851f78
 // Structural fields: {"boundary":"forward","dimensions":[3,2,5,11,263],"weight_dimensions":[263]}
 // Inputs: x=(3, 2, 5, 11, 263):bfloat16, weight=(263,):bfloat16

@@ -23,6 +23,7 @@ JAX_REVISION = "619764c15117fbefc4ba13ab941871cb514c23f6"
 XLA_REVISION = "9b635916ecc6df6efee62d8e4b0c7ef87ef84d69"
 STABLEHLO_VERSION = "1.17.0"
 HOOK_PIPELINE = "builtin.module(func.func(stablehlo-complex-math-expander))"
+BOUNDARIES = ("forward", "backward", "composed")
 
 
 @dataclass(frozen=True)
@@ -57,16 +58,52 @@ def rms_norm_forward(x, weight):
     return (local * inverse_root * weight.astype(jnp.float32)).astype(jnp.bfloat16)
 
 
-def filename(shape: StructuralShape) -> str:
-    return f"jax-{JAX_VERSION}-bf16-projected_parameter_broadcast-{shape.shape_id}-forward.mlir"
+def boundary_function(boundary: str):
+    if boundary == "forward":
+        return rms_norm_forward
+    if boundary == "backward":
+
+        def backward(x, weight, output_cotangent):
+            _, pullback = jax.vjp(rms_norm_forward, x, weight)
+            return pullback(output_cotangent)
+
+        return backward
+    if boundary == "composed":
+
+        def composed(x, weight, output_cotangent):
+            result, pullback = jax.vjp(rms_norm_forward, x, weight)
+            input_cotangent, weight_cotangent = pullback(output_cotangent)
+            return result, input_cotangent, weight_cotangent
+
+        return composed
+    raise ValueError(f"unsupported boundary {boundary!r}")
 
 
-def export_stablehlo(shape: StructuralShape) -> str:
-    arguments = (
-        jax.ShapeDtypeStruct(shape.dimensions, jnp.bfloat16),
-        jax.ShapeDtypeStruct(shape.weight_dimensions, jnp.bfloat16),
+def input_signature(shape: StructuralShape, boundary: str) -> tuple[tuple[str, tuple[int, ...]], ...]:
+    inputs = (("x", shape.dimensions), ("weight", shape.weight_dimensions))
+    if boundary == "forward":
+        return inputs
+    return (*inputs, ("output_cotangent", shape.dimensions))
+
+
+def output_signature(shape: StructuralShape, boundary: str) -> tuple[tuple[str, tuple[int, ...]], ...]:
+    if boundary == "forward":
+        return (("result", shape.dimensions),)
+    cotangents = (("input_cotangent", shape.dimensions), ("weight_cotangent", shape.weight_dimensions))
+    if boundary == "backward":
+        return cotangents
+    return (("result", shape.dimensions), *cotangents)
+
+
+def filename(shape: StructuralShape, boundary: str) -> str:
+    return f"jax-{JAX_VERSION}-bf16-projected_parameter_broadcast-{shape.shape_id}-{boundary}.mlir"
+
+
+def export_stablehlo(shape: StructuralShape, boundary: str) -> str:
+    arguments = tuple(
+        jax.ShapeDtypeStruct(dimensions, jnp.bfloat16) for _, dimensions in input_signature(shape, boundary)
     )
-    module = jax.jit(rms_norm_forward).lower(*arguments).compiler_ir(dialect="stablehlo")
+    module = jax.jit(boundary_function(boundary)).lower(*arguments).compiler_ir(dialect="stablehlo")
     return f"{module}".rstrip() + "\n"
 
 
@@ -78,12 +115,16 @@ def hook_boundary_stablehlo(payload: str) -> str:
         return f"{module}".rstrip() + "\n"
 
 
-def audited_fixture(shape: StructuralShape) -> str:
-    payload = export_stablehlo(shape)
+def signature_header(signature: tuple[tuple[str, tuple[int, ...]], ...]) -> str:
+    return ", ".join(f"{role}={dimensions}:bfloat16" for role, dimensions in signature)
+
+
+def audited_fixture(shape: StructuralShape, boundary: str) -> str:
+    payload = export_stablehlo(shape, boundary)
     hook_payload = hook_boundary_stablehlo(payload)
     generator_digest = hashlib.sha256(Path(__file__).read_bytes()).hexdigest().upper()
     fields = json.dumps(
-        {"boundary": "forward", "dimensions": shape.dimensions, "weight_dimensions": shape.weight_dimensions},
+        {"boundary": boundary, "dimensions": shape.dimensions, "weight_dimensions": shape.weight_dimensions},
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -98,11 +139,11 @@ def audited_fixture(shape: StructuralShape) -> str:
             f"// Generator: {Path(__file__).name}",
             f"// Generator source SHA-256: {generator_digest}",
             "// Source: jax.jit(ordinary JAX RMS normalization with projected BF16",
-            "// weight).lower(...).compiler_ir(StableHLO)",
+            "// weight plus JAX-owned VJP).lower(...).compiler_ir(StableHLO)",
             f"// Case ID: {shape.case_id}",
             f"// Structural fields: {fields}",
-            f"// Inputs: x={shape.dimensions}:bfloat16, weight={shape.weight_dimensions}:bfloat16",
-            f"// Outputs: result={shape.dimensions}:bfloat16",
+            f"// Inputs: {signature_header(input_signature(shape, boundary))}",
+            f"// Outputs: {signature_header(output_signature(shape, boundary))}",
             f"// JAX: {JAX_VERSION}; jaxlib: {JAXLIB_VERSION}; JAX revision: {JAX_REVISION}",
             f"// XLA revision: {XLA_REVISION}; StableHLO current version: {STABLEHLO_VERSION}",
             f"// Raw StableHLO SHA-256: {hashlib.sha256(payload.encode()).hexdigest().upper()}",
@@ -139,13 +180,14 @@ def main() -> int:
     verify_toolchain()
     mismatches = []
     for shape in SHAPES:
-        expected = audited_fixture(shape)
-        path = arguments.output_dir / filename(shape)
-        if arguments.write:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(expected)
-        elif not path.exists() or path.read_text() != expected:
-            mismatches.append(path.name)
+        for boundary in BOUNDARIES:
+            expected = audited_fixture(shape, boundary)
+            path = arguments.output_dir / filename(shape, boundary)
+            if arguments.write:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(expected)
+            elif not path.exists() or path.read_text() != expected:
+                mismatches.append(path.name)
     if mismatches:
         parser.error("BF16 projected-parameter broadcast fixture inventory drift: " + ", ".join(mismatches))
     return 0

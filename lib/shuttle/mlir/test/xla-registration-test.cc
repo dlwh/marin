@@ -23,25 +23,25 @@
 namespace {
 
 constexpr char kDefaultOptions[] =
-    R"json({"execution_mode":"stablehlo_round_trip","numerics":"source_ordered","pipeline_abi_version":20,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+    R"json({"execution_mode":"stablehlo_round_trip","numerics":"source_ordered","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
 constexpr char kSourceOrderedOptions[] =
-    R"json({"execution_mode":"stablehlo_round_trip","numerics":"source_ordered","pipeline_abi_version":20,"schema_version":1,"tuning":{"cluster_shape":[2,1,1],"materialization":"prefer_fusion","maximum_candidates":16,"pipeline_stages":3,"tile_sizes":[64,128]}})json";
+    R"json({"execution_mode":"stablehlo_round_trip","numerics":"source_ordered","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[2,1,1],"materialization":"prefer_fusion","maximum_candidates":16,"pipeline_stages":3,"tile_sizes":[64,128]}})json";
 constexpr char kFastOptions[] =
-    R"json({"execution_mode":"stablehlo_round_trip","numerics":"fast","pipeline_abi_version":20,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+    R"json({"execution_mode":"stablehlo_round_trip","numerics":"fast","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
 constexpr char kCpuExecutableBundleOptions[] =
-    R"json({"execution_mode":"cpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":20,"schema_version":1,"tuning":{"cluster_shape":[2,1,1],"materialization":"prefer_fusion","maximum_candidates":16,"pipeline_stages":3,"tile_sizes":[64,128]}})json";
+    R"json({"execution_mode":"cpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[2,1,1],"materialization":"prefer_fusion","maximum_candidates":16,"pipeline_stages":3,"tile_sizes":[64,128]}})json";
 constexpr char kCpuExecutableBundleFastOptions[] =
-    R"json({"execution_mode":"cpu_executable_bundle","numerics":"fast","pipeline_abi_version":20,"schema_version":1,"tuning":{"cluster_shape":[2,1,1],"materialization":"prefer_fusion","maximum_candidates":16,"pipeline_stages":3,"tile_sizes":[64,128]}})json";
-constexpr char kAbi20DefaultCpuExecutableBundleOptions[] =
-    R"json({"execution_mode":"cpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":20,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+    R"json({"execution_mode":"cpu_executable_bundle","numerics":"fast","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[2,1,1],"materialization":"prefer_fusion","maximum_candidates":16,"pipeline_stages":3,"tile_sizes":[64,128]}})json";
+constexpr char kAbi21DefaultCpuExecutableBundleOptions[] =
+    R"json({"execution_mode":"cpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
 constexpr char kGpuExecutableBundleOptions[] =
-    R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":20,"schema_version":1,"tuning":{"cluster_shape":[2,1,1],"materialization":"prefer_fusion","maximum_candidates":16,"pipeline_stages":3,"tile_sizes":[64,128]}})json";
+    R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[2,1,1],"materialization":"prefer_fusion","maximum_candidates":16,"pipeline_stages":3,"tile_sizes":[64,128]}})json";
 constexpr char kGpuExecutableBundleFastOptions[] =
-    R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":20,"schema_version":1,"tuning":{"cluster_shape":[2,1,1],"materialization":"prefer_fusion","maximum_candidates":16,"pipeline_stages":3,"tile_sizes":[64,128]}})json";
-constexpr char kAbi20ProjectedParameterSourceOrderedOptions[] =
-    R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":20,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
-constexpr char kAbi20ProjectedParameterFastOptions[] =
-    R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":20,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+    R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[2,1,1],"materialization":"prefer_fusion","maximum_candidates":16,"pipeline_stages":3,"tile_sizes":[64,128]}})json";
+constexpr char kAbi21ProjectedParameterSourceOrderedOptions[] =
+    R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+constexpr char kAbi21ProjectedParameterFastOptions[] =
+    R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
 constexpr char kHistoricalAbi17GpuOptions[] =
     R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":17,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
 constexpr char kProgram[] = R"mlir(
@@ -94,7 +94,7 @@ TEST(ShuttleXlaOptionsTest, ParsesCanonicalPythonWireFormat) {
   mlir::shuttle::ShuttlePipelineIdentity sourceIdentity =
       mlir::shuttle::shuttlePipelineIdentity(*source);
   EXPECT_EQ(sourceIdentity.policyDigest,
-            "3e0ecd5ccad0afece3e8637cfbffec8769d2e614027e5fb460af65fcf186037d");
+            "95a589038ad56dc8db7734cea3ef87863a32860003db22f2b8077ff77f9cf8b3");
   EXPECT_EQ(sourceIdentity.tuningDigest,
             "ae69cb474b1ddc91067687e7351ee27afe4e3b0814ae59e310a42bec5911326f");
 
@@ -143,25 +143,26 @@ TEST(ShuttleXlaOptionsTest, RejectsAdjacentGpuPipelineAbis) {
       kHistoricalAbi17GpuOptions,
       R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":18,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
       R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":19,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
-      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":20,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
   };
   for (const char *serialized : invalid)
     EXPECT_EQ(mlir::shuttle::parseShuttleXlaOptions(serialized).status().code(),
               absl::StatusCode::kInvalidArgument);
 }
 
-TEST(ShuttleXlaOptionsTest, Abi20PreservesCanonicalSourceOrderedFoldMapOptions) {
+TEST(ShuttleXlaOptionsTest, Abi21PreservesCanonicalSourceOrderedFoldMapOptions) {
   auto options =
       mlir::shuttle::parseShuttleXlaOptions(
-          kAbi20ProjectedParameterSourceOrderedOptions);
+          kAbi21ProjectedParameterSourceOrderedOptions);
   ASSERT_TRUE(options.ok()) << options.status();
   EXPECT_EQ(options->canonicalOptions,
-            kAbi20ProjectedParameterSourceOrderedOptions);
+            kAbi21ProjectedParameterSourceOrderedOptions);
   EXPECT_EQ(
       options->canonicalTuning,
       R"json({"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json");
   EXPECT_EQ(mlir::shuttle::shuttlePipelineIdentity(*options).policyDigest,
-            "e88a2d0d73e15ed5fbfb98e0d30a5a2c0ca581b8369543225d53a1fa29bfdde2");
+            "731a06b7bd067960293e47448e483e07ca7373a6ff09bfa94fb3dc804d7de280");
 
   mlir::MLIRContext context;
   mlir::OwningOpRef<mlir::ModuleOp> module =
@@ -179,10 +180,10 @@ TEST(ShuttleXlaOptionsTest, Abi20PreservesCanonicalSourceOrderedFoldMapOptions) 
             std::string::npos);
 }
 
-TEST(ShuttleXlaOptionsTest, Abi20PreservesFastMapFold) {
+TEST(ShuttleXlaOptionsTest, Abi21PreservesFastMapFold) {
   auto options =
       mlir::shuttle::parseShuttleXlaOptions(
-          kAbi20ProjectedParameterFastOptions);
+          kAbi21ProjectedParameterFastOptions);
   ASSERT_TRUE(options.ok()) << options.status();
 
   std::string error;
@@ -203,13 +204,13 @@ TEST(ShuttleXlaOptionsTest, Abi20PreservesFastMapFold) {
       mlir::shuttle::runShuttleXlaTransform(*mapFold, *options)));
 }
 
-TEST(ShuttleXlaOptionsTest, Abi20FoldAndBroadcastRejectNonDefaultTuning) {
+TEST(ShuttleXlaOptionsTest, Abi21FoldAndBroadcastRejectNonDefaultTuning) {
   constexpr const char *nonDefault[] = {
-      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":20,"schema_version":1,"tuning":{"cluster_shape":[2,1,1],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
-      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":20,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
-      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":20,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":2,"pipeline_stages":1,"tile_sizes":[]}})json",
-      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":20,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":2,"tile_sizes":[]}})json",
-      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":20,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[64]}})json",
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[2,1,1],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":2,"pipeline_stages":1,"tile_sizes":[]}})json",
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":2,"tile_sizes":[]}})json",
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[64]}})json",
   };
   for (const char *serialized : nonDefault) {
     auto options = mlir::shuttle::parseShuttleXlaOptions(serialized);
@@ -224,30 +225,30 @@ TEST(ShuttleXlaOptionsTest, Abi20FoldAndBroadcastRejectNonDefaultTuning) {
 }
 
 TEST(ShuttleXlaOptionsTest,
-     Abi20ParsesSeparateSourceOrderedAndFastCacheIdentities) {
+     Abi21ParsesSeparateSourceOrderedAndFastCacheIdentities) {
   auto sourceOrdered =
       mlir::shuttle::parseShuttleXlaOptions(
-          kAbi20ProjectedParameterSourceOrderedOptions);
+          kAbi21ProjectedParameterSourceOrderedOptions);
   auto fast = mlir::shuttle::parseShuttleXlaOptions(
-      kAbi20ProjectedParameterFastOptions);
+      kAbi21ProjectedParameterFastOptions);
   ASSERT_TRUE(sourceOrdered.ok()) << sourceOrdered.status();
   ASSERT_TRUE(fast.ok()) << fast.status();
   EXPECT_EQ(sourceOrdered->canonicalOptions,
-            kAbi20ProjectedParameterSourceOrderedOptions);
-  EXPECT_EQ(fast->canonicalOptions, kAbi20ProjectedParameterFastOptions);
+            kAbi21ProjectedParameterSourceOrderedOptions);
+  EXPECT_EQ(fast->canonicalOptions, kAbi21ProjectedParameterFastOptions);
   EXPECT_EQ(mlir::shuttle::shuttlePipelineIdentity(*sourceOrdered).policyDigest,
-            "e88a2d0d73e15ed5fbfb98e0d30a5a2c0ca581b8369543225d53a1fa29bfdde2");
+            "731a06b7bd067960293e47448e483e07ca7373a6ff09bfa94fb3dc804d7de280");
   EXPECT_EQ(mlir::shuttle::shuttlePipelineIdentity(*fast).policyDigest,
-            "dc9a9609b9ca7ae14c9797345780c2b9c128ccf8d87ae4cf8a47088ee2d0e5c5");
+            "c658672602d79f23894da60c8300ecdaf40905acefe9f33ad58216571f48d2da");
   EXPECT_NE(mlir::shuttle::shuttlePipelineIdentity(*sourceOrdered).policyDigest,
             mlir::shuttle::shuttlePipelineIdentity(*fast).policyDigest);
 }
 
-TEST(ShuttleXlaOptionsTest, Abi20RejectsAdjacentPipelineAbis) {
+TEST(ShuttleXlaOptionsTest, Abi21RejectsAdjacentPipelineAbis) {
   constexpr const char *invalid[] = {
-      R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":18,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
       R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":19,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
-      R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":20,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
   };
   for (const char *serialized : invalid)
     EXPECT_EQ(mlir::shuttle::parseShuttleXlaOptions(serialized).status().code(),
@@ -255,10 +256,10 @@ TEST(ShuttleXlaOptionsTest, Abi20RejectsAdjacentPipelineAbis) {
 }
 
 TEST(ShuttleXlaOptionsTest,
-     Abi20PreservesOrdinaryJaxContractMapThroughBothPolicyEntries) {
+     Abi21PreservesOrdinaryJaxContractMapThroughBothPolicyEntries) {
   constexpr const char *serializedPolicies[] = {
-      kAbi20ProjectedParameterSourceOrderedOptions,
-      kAbi20ProjectedParameterFastOptions,
+      kAbi21ProjectedParameterSourceOrderedOptions,
+      kAbi21ProjectedParameterFastOptions,
   };
   for (const char *serialized : serializedPolicies) {
     auto options = mlir::shuttle::parseShuttleXlaOptions(serialized);
@@ -281,7 +282,7 @@ TEST(ShuttleXlaOptionsTest,
 }
 
 TEST(ShuttleXlaOptionsTest,
-     Abi20PreservesOrdinaryJaxMatmulVjpThroughBothPolicyEntries) {
+     Abi21PreservesOrdinaryJaxMatmulVjpThroughBothPolicyEntries) {
   std::string error;
   auto runfiles = bazel::tools::cpp::runfiles::Runfiles::CreateForTest(&error);
   ASSERT_TRUE(runfiles) << error;
@@ -293,8 +294,8 @@ TEST(ShuttleXlaOptionsTest,
   ASSERT_TRUE(input);
 
   constexpr const char *serializedPolicies[] = {
-      kAbi20ProjectedParameterSourceOrderedOptions,
-      kAbi20ProjectedParameterFastOptions,
+      kAbi21ProjectedParameterSourceOrderedOptions,
+      kAbi21ProjectedParameterFastOptions,
   };
   for (const char *serialized : serializedPolicies) {
     auto options = mlir::shuttle::parseShuttleXlaOptions(serialized);
@@ -317,7 +318,7 @@ TEST(ShuttleXlaOptionsTest,
 }
 
 TEST(ShuttleXlaOptionsTest,
-     Abi20PreservesProjectedBatchedContractThroughBothPolicyEntries) {
+     Abi21PreservesProjectedBatchedContractThroughBothPolicyEntries) {
   std::string error;
   auto runfiles = bazel::tools::cpp::runfiles::Runfiles::CreateForTest(&error);
   ASSERT_TRUE(runfiles) << error;
@@ -330,8 +331,8 @@ TEST(ShuttleXlaOptionsTest,
       "jax-0.10.1-bf16-batched_contract-3x4x2x13x6-composed.mlir",
   };
   constexpr const char *serializedPolicies[] = {
-      kAbi20ProjectedParameterSourceOrderedOptions,
-      kAbi20ProjectedParameterFastOptions,
+      kAbi21ProjectedParameterSourceOrderedOptions,
+      kAbi21ProjectedParameterFastOptions,
   };
   constexpr llvm::StringLiteral target =
       "shuttle.gpu.executable_bundle.v2";
@@ -367,7 +368,7 @@ TEST(ShuttleXlaOptionsTest,
 }
 
 TEST(ShuttleXlaOptionsTest,
-     Abi20PreservesOrdinaryJaxRankNFoldMatrixThroughBothPolicyEntries) {
+     Abi21PreservesOrdinaryJaxRankNFoldMatrixThroughBothPolicyEntries) {
   std::string error;
   auto runfiles = bazel::tools::cpp::runfiles::Runfiles::CreateForTest(&error);
   ASSERT_TRUE(runfiles) << error;
@@ -380,8 +381,8 @@ TEST(ShuttleXlaOptionsTest,
       "jax-0.10.1-bf16-rank_n_fold_map-3x2x4x7x269-composed.mlir",
   };
   constexpr const char *serializedPolicies[] = {
-      kAbi20ProjectedParameterSourceOrderedOptions,
-      kAbi20ProjectedParameterFastOptions,
+      kAbi21ProjectedParameterSourceOrderedOptions,
+      kAbi21ProjectedParameterFastOptions,
   };
   for (const char *filename : filenames) {
     SCOPED_TRACE(filename);
@@ -412,7 +413,7 @@ TEST(ShuttleXlaOptionsTest,
 }
 
 TEST(ShuttleXlaOptionsTest,
-     Abi20RunsOrdinaryJaxSingletonBroadcastMatrixThroughBothPolicyEntries) {
+     Abi21RunsOrdinaryJaxSingletonBroadcastMatrixThroughBothPolicyEntries) {
   std::string error;
   auto runfiles = bazel::tools::cpp::runfiles::Runfiles::CreateForTest(&error);
   ASSERT_TRUE(runfiles) << error;
@@ -425,8 +426,8 @@ TEST(ShuttleXlaOptionsTest,
       "jax-0.10.1-bf16-singleton_broadcast-3x2x5x11x263-composed.mlir",
   };
   constexpr const char *serializedPolicies[] = {
-      kAbi20ProjectedParameterSourceOrderedOptions,
-      kAbi20ProjectedParameterFastOptions,
+      kAbi21ProjectedParameterSourceOrderedOptions,
+      kAbi21ProjectedParameterFastOptions,
   };
   for (const char *filename : filenames) {
     SCOPED_TRACE(filename);
@@ -458,18 +459,24 @@ TEST(ShuttleXlaOptionsTest,
 }
 
 TEST(ShuttleXlaOptionsTest,
-     Abi20RunsOrdinaryJaxProjectedParameterRmsNormThroughBothPolicies) {
+     Abi21RunsOrdinaryJaxProjectedParameterRmsNormThroughBothPolicies) {
   std::string error;
   auto runfiles = bazel::tools::cpp::runfiles::Runfiles::CreateForTest(&error);
   ASSERT_TRUE(runfiles) << error;
   constexpr const char *filenames[] = {
       "jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-forward.mlir",
+      "jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-backward.mlir",
+      "jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-composed.mlir",
       "jax-0.10.1-bf16-projected_parameter_broadcast-"
       "3x2x5x11x263-forward.mlir",
+      "jax-0.10.1-bf16-projected_parameter_broadcast-"
+      "3x2x5x11x263-backward.mlir",
+      "jax-0.10.1-bf16-projected_parameter_broadcast-"
+      "3x2x5x11x263-composed.mlir",
   };
   constexpr const char *serializedPolicies[] = {
-      kAbi20ProjectedParameterSourceOrderedOptions,
-      kAbi20ProjectedParameterFastOptions,
+      kAbi21ProjectedParameterSourceOrderedOptions,
+      kAbi21ProjectedParameterFastOptions,
   };
   for (const char *filename : filenames) {
     SCOPED_TRACE(filename);
@@ -502,13 +509,13 @@ TEST(ShuttleXlaOptionsTest,
 }
 
 TEST(ShuttleXlaOptionsTest,
-     Abi20CpuRejectsProjectedParameterWithoutPartiallyRewritingModule) {
+     Abi21CpuRejectsFullPrefixFoldWithoutPartiallyRewritingModule) {
   std::string error;
   auto runfiles = bazel::tools::cpp::runfiles::Runfiles::CreateForTest(&error);
   ASSERT_TRUE(runfiles) << error;
   std::ifstream input(runfiles->Rlocation(
       "shuttle_mlir/test/Inputs/"
-      "jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-forward.mlir"));
+      "jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-backward.mlir"));
   std::ostringstream source;
   source << input.rdbuf();
   ASSERT_TRUE(input);
@@ -530,7 +537,7 @@ TEST(ShuttleXlaOptionsTest,
         return mlir::success();
       });
   absl::Status status = mlir::shuttle::runShuttleXlaTransform(
-      *module, kAbi20DefaultCpuExecutableBundleOptions);
+      *module, kAbi21DefaultCpuExecutableBundleOptions);
   EXPECT_FALSE(status.ok());
   EXPECT_NE(diagnostics.find(
                 "requires a bounded generated Map/Fold CPU bytecode subset"),
@@ -545,7 +552,7 @@ TEST(ShuttleXlaOptionsTest,
 }
 
 TEST(ShuttleXlaOptionsTest,
-     Abi20CpuStillRejectsRankNFoldWithoutPartiallyRewritingTheModule) {
+     Abi21CpuStillRejectsRankNFoldWithoutPartiallyRewritingTheModule) {
   std::string error;
   auto runfiles = bazel::tools::cpp::runfiles::Runfiles::CreateForTest(&error);
   ASSERT_TRUE(runfiles) << error;
@@ -574,7 +581,7 @@ TEST(ShuttleXlaOptionsTest,
         return mlir::success();
       });
   absl::Status status = mlir::shuttle::runShuttleXlaTransform(
-      *module, kAbi20DefaultCpuExecutableBundleOptions);
+      *module, kAbi21DefaultCpuExecutableBundleOptions);
   EXPECT_FALSE(status.ok());
   EXPECT_NE(diagnostics.find(
                 "requires a bounded generated Map/Fold CPU bytecode subset"),
@@ -589,7 +596,7 @@ TEST(ShuttleXlaOptionsTest,
 }
 
 TEST(ShuttleXlaOptionsTest,
-     Abi20CpuRejectsSingletonBroadcastWithoutPartiallyRewritingTheModule) {
+     Abi21CpuRejectsSingletonBroadcastWithoutPartiallyRewritingTheModule) {
   std::string error;
   auto runfiles = bazel::tools::cpp::runfiles::Runfiles::CreateForTest(&error);
   ASSERT_TRUE(runfiles) << error;
@@ -618,7 +625,7 @@ TEST(ShuttleXlaOptionsTest,
         return mlir::success();
       });
   absl::Status status = mlir::shuttle::runShuttleXlaTransform(
-      *module, kAbi20DefaultCpuExecutableBundleOptions);
+      *module, kAbi21DefaultCpuExecutableBundleOptions);
   EXPECT_FALSE(status.ok());
   EXPECT_NE(diagnostics.find(
                 "requires a bounded generated Map/Fold CPU bytecode subset"),
@@ -644,8 +651,8 @@ TEST(ShuttleXlaOptionsTest, RunsOrdinaryJaxComposedMatmulAsTwoGenericCalls) {
   ASSERT_TRUE(input);
 
   constexpr const char *serializedPolicies[] = {
-      kAbi20ProjectedParameterSourceOrderedOptions,
-      kAbi20ProjectedParameterFastOptions,
+      kAbi21ProjectedParameterSourceOrderedOptions,
+      kAbi21ProjectedParameterFastOptions,
   };
   for (const char *serialized : serializedPolicies) {
     auto options = mlir::shuttle::parseShuttleXlaOptions(serialized);

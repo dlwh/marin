@@ -1602,18 +1602,51 @@ public:
       }
       SmallVector<int64_t> domain(task.getDomainShape());
       StringRef mutation = kind;
+      bool prefix = mutation.consume_front("prefix-");
+      if (prefix) {
+        ArrayRef<int64_t> dimensions = task.getReductionDimensions();
+        if (domain.size() < 3 || dimensions.size() + 1 != domain.size()) {
+          continue;
+        }
+        bool fullPrefix = llvm::all_of(
+            llvm::enumerate(dimensions), [](auto indexedDimension) {
+              return indexedDimension.value() ==
+                     static_cast<int64_t>(indexedDimension.index());
+            });
+        if (!fullPrefix) {
+          continue;
+        }
+      }
       if (mutation == "parallel") {
-        ++domain.front();
+        ++domain[prefix ? domain.size() - 1 : 0];
         task->setAttr("domain_shape",
                       DenseI64ArrayAttr::get(task.getContext(), domain));
       } else if (mutation == "reduction") {
-        ++domain.back();
+        ++domain[prefix ? 0 : domain.size() - 1];
         task->setAttr("domain_shape",
                       DenseI64ArrayAttr::get(task.getContext(), domain));
       } else if (mutation == "axis") {
         task->setAttr("reduction_dimensions", DenseI64ArrayAttr::get(
-                                                  task.getContext(),
-                                                  {int64_t(domain.size()) - 2}));
+                                                  task.getContext(), {0}));
+      } else if (mutation == "omit") {
+        SmallVector<int64_t> dimensions(task.getReductionDimensions());
+        dimensions.pop_back();
+        task->setAttr("reduction_dimensions",
+                      DenseI64ArrayAttr::get(task.getContext(), dimensions));
+      } else if (mutation == "swap") {
+        SmallVector<int64_t> dimensions(task.getReductionDimensions());
+        if (dimensions.size() < 2) {
+          continue;
+        }
+        std::swap(dimensions[0], dimensions[1]);
+        task->setAttr("reduction_dimensions",
+                      DenseI64ArrayAttr::get(task.getContext(), dimensions));
+      } else if (mutation == "dependency") {
+        if (task.getDependencies().empty()) {
+          continue;
+        }
+        task->setAttr("dependencies",
+                      DenseI64ArrayAttr::get(task.getContext(), {}));
       } else {
         getOperation().emitError("unknown Fold materialization mutation kind");
         return signalPassFailure();
@@ -2154,10 +2187,12 @@ public:
     }
     for (ScheduleTaskOp task :
          plan.getBody().front().getOps<ScheduleTaskOp>()) {
-      if (task.getKind() != ScheduleTaskKind::RowFold) {
+      StringRef mutation = kind;
+      bool prefix = mutation.consume_front("prefix-");
+      if (task.getKind() != (prefix ? ScheduleTaskKind::ColumnFold
+                                    : ScheduleTaskKind::RowFold)) {
         continue;
       }
-      StringRef mutation = kind;
       if (mutation == "grid") {
         SmallVector<int64_t> grid(task.getGridShape());
         ++grid.front();
@@ -2165,7 +2200,7 @@ public:
                       DenseI64ArrayAttr::get(task.getContext(), grid));
       } else if (mutation == "tile") {
         SmallVector<int64_t> tile(task.getTileShape());
-        ++tile.back();
+        ++tile[prefix ? 0 : tile.size() - 1];
         task->setAttr("tile_shape",
                       DenseI64ArrayAttr::get(task.getContext(), tile));
       } else if (mutation == "serial") {
@@ -2180,10 +2215,10 @@ public:
         task->setAttr(
             "reduction_axis",
             IntegerAttr::get(task.getReductionAxisAttr().getType(),
-                             *task.getReductionAxis() - 1));
+                             prefix ? 1 : *task.getReductionAxis() - 1));
       } else if (mutation == "output") {
         SmallVector<int64_t> domain(task.getDomainShape());
-        ++domain.front();
+        ++domain[prefix ? domain.size() - 1 : 0];
         task->setAttr("domain_shape",
                       DenseI64ArrayAttr::get(task.getContext(), domain));
       } else if (mutation == "order") {
@@ -2200,7 +2235,7 @@ public:
       refreshScheduleFingerprint(plan);
       return;
     }
-    getOperation().emitError("test fixture has no row Fold schedule task");
+    getOperation().emitError("test fixture has no matching Fold schedule task");
     signalPassFailure();
   }
 };
@@ -2506,6 +2541,50 @@ public:
         return;
       }
       module.emitError("test fixture has no projected parameter PTX entry");
+      return signalPassFailure();
+    } else if (mutation == "prefix-fold-body") {
+      SchedulePlanOp schedule = schedulePlan(module);
+      MaterializationPlanOp materialization = materializationPlan(module);
+      if (!schedule || !materialization) {
+        module.emitError("test fixture has no schedule/materialization plan");
+        return signalPassFailure();
+      }
+      SmallVector<ScheduleTaskOp> scheduleTasks(
+          schedule.getBody().front().getOps<ScheduleTaskOp>());
+      SmallVector<MaterializationTaskOp> materializationTasks(
+          materialization.getBody().front().getOps<MaterializationTaskOp>());
+      SmallVector<int8_t> code(device.getCode());
+      for (DeviceEntryOp entry : entries) {
+        int64_t sourceTask = entry.getSourceTask();
+        if (sourceTask < 0 ||
+            sourceTask >= static_cast<int64_t>(scheduleTasks.size()) ||
+            scheduleTasks[sourceTask].getKind() !=
+                ScheduleTaskKind::ColumnFold) {
+          continue;
+        }
+        int64_t materializationTask = scheduleTasks[sourceTask].getSourceTask();
+        if (materializationTask < 0 ||
+            materializationTask >=
+                static_cast<int64_t>(materializationTasks.size())) {
+          continue;
+        }
+        MaterializationTaskOp fold =
+            materializationTasks[materializationTask];
+        if (fold.getKind() != MaterializationTaskKind::Fold ||
+            fold.getDomainShape().size() < 3 ||
+            fold.getReductionDimensions().size() + 1 !=
+                fold.getDomainShape().size()) {
+          continue;
+        }
+        code[entry.getCodeOffset() + entry.getCodeLength() - 1] ^= 1;
+        device.setCodeAttr(DenseI8ArrayAttr::get(module.getContext(), code));
+        device.setCodeDigest(executableCodeDigest(device.getCode()));
+        entry.setCodeDigest(executableCodeDigest(device.getCode().slice(
+            entry.getCodeOffset(), entry.getCodeLength())));
+        refreshExecutableBundle(module, false);
+        return;
+      }
+      module.emitError("test fixture has no full-prefix Fold PTX entry");
       return signalPassFailure();
     } else if (mutation == "output-binding") {
       SmallVector<InvocationSlotOp> outputs;
