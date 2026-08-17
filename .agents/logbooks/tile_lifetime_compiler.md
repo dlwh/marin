@@ -5311,3 +5311,23 @@ author: dlwh
   evidence rather than ABI21 GPU evidence and cannot establish threshold
   acceptance. GPU execution, PTX assembly, wheel and image identities, timing,
   and performance remain unexecuted and unsealed.
+
+### 2026-08-17 - TLTC-MLIR-035 CPU executable retirement
+
+- Commit `86e6edd87319bbbbc33102ee321e413f52af950b` removes the public CPU
+  executable option, native CPU pass pipeline, workload-specific exact-shape
+  selector, host FFI registration, CPU bytecode runtime, build edges, and
+  CPU-only tests and fixtures. StableHLO round-trip and GPU execution remain
+  the only public modes.
+- The inactive CPU device-module enumerants remain as historical wire
+  vocabulary so `CudaPtxSm90V1` retains discriminant 2. GPU pass emission,
+  runtime, FFI, CUDA integration patch, schemas, and target identity are
+  unchanged. Native build and 58/58 parser, registry, MLIR, and GPU transport
+  tests pass; Python option coverage passes 10/10.
+- Full Shuttle Python coverage passes 742 tests. The 33 receipt-controller
+  failures remain the intentional absent-module red contract, and the one
+  evaluation-manifest digest failure predates this change. Changed-files
+  precommit and the commit hook pass.
+- Independent strict review approved the exact production commit with no P1
+  or P2 findings. No GPU execution, hardware, image, network, upload, push, or
+  cluster action occurred.
