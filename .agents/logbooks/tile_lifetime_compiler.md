@@ -5181,3 +5181,86 @@ author: dlwh
   projection, task success, image transfer, and hardware launch remain absent.
   No network, Iris mutation, image, hardware, upload, push, or integration
   action occurred.
+
+### 2026-08-17 - TLTC-MLIR-030 ABI 20 projected parameter expansion
+
+- Pipeline ABI 20 admits projected lower-rank public BF16 parameters and
+  same-rank Maps with multiple expanding singleton axes only inside a closed
+  rank-three through rank-eight terminal additive Fold region. Source and
+  Shuttle-region validation both trace each expansion backward through closed
+  structural Maps to its parameter conversion or Fold. External, second-Fold,
+  nested-expansion, and out-of-component ancestry fail closed.
+- The implementation is structural. It does not inspect workload names,
+  fixture shapes, task counts, symbols, or digests. Existing affine Map PTX,
+  schedule, transport, device, invocation, bundle, resource-cap, and target-v2
+  contracts remain unchanged. SOURCE_ORDERED and FAST retain distinct option,
+  observer, and cache identities.
+- Exact local series: reviewed red contract
+  `c0a89945a9caaafb899b274a5b27098f0aafd8af`; production
+  `3fbd6b98d3069c38c6732a8d5ad0bf860ace9ef7`; test-only closure
+  `e4419435644b59595e3f8ce240882f431fb2f7fa`, tree
+  `11bcd4d9669373fca1d1305f0ff676ef4123a4a2`. Independent strict review
+  approved the final tip with no P1 or P2 findings. Native coverage passes
+  60/60. Full Shuttle Python passes 92/93; the sole failure is the unchanged
+  accepted-base evaluation-manifest digest. Changed-files precommit passes.
+- This checkpoint contains no PTX assembly, GPU execution, image, hardware
+  reservation, upload, timing, performance, push, or scorecard change.
+
+### 2026-08-17 - TLTC-MLIR-031 ABI 21 full-prefix additive Fold
+
+- Pipeline ABI 21 adds static rank-three through rank-eight additive f32 Folds
+  over exactly the complete leading prefix `{0..rank-2}`, leaving the final
+  feature axis. The initializer is exact positive zero, the combiner is exact
+  `arith.addf` without fast-math, accumulation is f32, and rank-one public
+  results are admitted only through the exact f32-to-BF16 result boundary.
+- ColumnFold scheduling flattens the prefix in row-major order. For reduction
+  extent `R=product(domain.drop_back())` and feature count `H=domain.back()`,
+  the grid is `H`, the physical reduction-axis anchor is zero, and PTX loads
+  `(leaf*H+feature)*4`. The schedule uses the existing fixed-leaf balanced tree
+  and checked resource products. Rank-two ColumnFold and rank-N terminal
+  RowFold behavior remain unchanged.
+- Pinned JAX 0.10.1 RMSNorm-shaped backward and composed fixtures cover
+  `[2,7,19]` and `[3,2,5,11,263]` under SOURCE_ORDERED and FAST. Tests bind
+  five Folds per derivative graph, exact Fold bodies, plan and schedule
+  geometry, sampled PTX addresses, transport mutations, fake FFI bindings,
+  resource caps, ABI rotation, name erasure, and transactional CPU rejection.
+- Exact local series: reviewed red contract
+  `d61e77f0b578fb023d00747e54ef1a7cf2faec88`; production
+  `a64e9f82658f7c9dc7b109c09722ed2fd402dc50`; test repair
+  `13f8a03c92423d82fd50f0809e40c8a78aabbfb8`; historical ABI test repair
+  `f5167e987ec151ac82ca68f7b945c0c599b7a6d0`, tree
+  `33b58efa7aaab7a54d87c89c4dc339b034f83d31`. Independent strict review
+  approved the final tip with no P1 or P2 findings. Focused native coverage
+  passes 62/62. The remaining native matrix passes 6/7; the sole failure is the
+  intentional ABI19 libdevice artifact-null red. Full Shuttle Python passes
+  93/94 with only the unchanged accepted-base evaluation-manifest digest.
+- Large RMSNorm acceptance remains open. Historical `2048x4096` backward and
+  composed plans exceed the current temporary cap, and the balanced reduction
+  tree differs from ordinary JAX in 815 BF16 `dx` elements. No PTX assembly,
+  GPU execution, hardware, image, timing, performance, upload, push, or
+  scorecard change occurred.
+
+### 2026-08-17 - TLTC-MLIR-032 ABI 21 evidence-lineage integration
+
+- Merge commit `521036271e94c7614e8a464f25efd3bdc53b8d3e`, tree
+  `9070f16eb5256e9ba1c83b1a60b702711e8abca8`, preserves exact ABI21 compiler
+  tip `f5167e987ec151ac82ca68f7b945c0c599b7a6d0` and exact receipt tip
+  `1c62912803da1fa155865ef8b05120366b62885a` as its two parents. The ABI15
+  preimage tip `f12f93c0ff0793a359d905331a4074d1df583692` remains an ancestor of
+  the receipt parent.
+- Historical ABI15 option and observer identities no longer inherit the
+  current ABI21 default. Commit
+  `bceb406f0a28d033e3207bd9b4bd4dcf5621e5fa` reconstructs the exact ABI15
+  canonical options text inside the sealed evidence contract. The imported
+  ABI15 preimage suite passes 159/159.
+- Commit `b563592eadf74369e64fb794130f19845f3a12e7` corrects the adjacent-ABI
+  parser diagnostic from integer 20 to integer 21 and binds the public error in
+  the native registration test. Focused native registration coverage passes
+  1/1. Changed-files precommit passes with the existing repository virtual
+  environment.
+- The receipt suite reproduces 59 passes and 33 intentional failures, all at
+  the absent controller receipt module. The merged ABI15 harness remains
+  matmul-specific and unsealed; it is reusable infrastructure, not ABI21
+  RMSNorm evidence. Controller signing, image and build identities, H100/B200
+  authority, task success, timing, and performance acceptance remain design
+  stops. No external action occurred.
