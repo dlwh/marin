@@ -27,7 +27,7 @@ namespace mlir::shuttle {
 namespace {
 
 constexpr int64_t kSchemaVersion = 1;
-constexpr int64_t kPipelineAbiVersion = 20;
+constexpr int64_t kPipelineAbiVersion = 21;
 constexpr int64_t kMaximumNativeInteger = 2147483647;
 constexpr size_t kMaximumTensorRank = 8;
 constexpr size_t kMaximumClusterRank = 3;

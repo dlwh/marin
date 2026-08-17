@@ -915,21 +915,31 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
     if (task.getKind() == MaterializationTaskKind::Fold) {
       ++foldCount;
       const int64_t domainRank = task.getDomainShape().size();
-      const int64_t reductionAxis = task.getReductionDimensions().size() == 1
-                                        ? task.getReductionDimensions().front()
+      ArrayRef<int64_t> reductionDimensions = task.getReductionDimensions();
+      const int64_t reductionAxis = reductionDimensions.size() == 1
+                                        ? reductionDimensions.front()
                                         : -1;
       const bool rankTwoFold =
           domainRank == 2 && reductionAxis >= 0 && reductionAxis < domainRank;
       const bool terminalRankNFold =
-          domainRank >= 3 && domainRank <= 8 && reductionAxis == domainRank - 1;
-      if (task.getReductionDimensions().size() != 1 ||
-          (!rankTwoFold && !terminalRankNFold) ||
+          domainRank >= 3 && domainRank <= 8 &&
+          reductionDimensions == ArrayRef<int64_t>({domainRank - 1});
+      const bool fullPrefixRankNFold =
+          domainRank >= 3 && domainRank <= 8 &&
+          reductionDimensions.size() == static_cast<size_t>(domainRank - 1) &&
+          llvm::all_of(llvm::enumerate(reductionDimensions),
+                       [](auto indexedAxis) {
+                         return indexedAxis.value() ==
+                                static_cast<int64_t>(indexedAxis.index());
+                       });
+      if ((!rankTwoFold && !terminalRankNFold && !fullPrefixRankNFold) ||
           !task.getOrderFree().value_or(false) ||
           task.getInputBuffers().size() != 2 ||
           task.getOutputBuffers().size() != 1) {
         return task.emitOpError(
             "Fold tasks require a rank-two in-range reduction or a rank-three "
-            "through rank-eight terminal-axis reduction, and order_free=true");
+            "through rank-eight terminal-axis or full-prefix reduction, and "
+            "order_free=true");
       }
       auto inputType = cast<RankedTensorType>(
           buffers[task.getInputBuffers()[0]].getTensorType());
@@ -938,7 +948,9 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
       auto resultType = cast<RankedTensorType>(
           buffers[task.getOutputBuffers()[0]].getTensorType());
       SmallVector<int64_t> expectedResultShape(task.getDomainShape());
-      expectedResultShape.erase(expectedResultShape.begin() + reductionAxis);
+      for (int64_t axis : llvm::reverse(reductionDimensions)) {
+        expectedResultShape.erase(expectedResultShape.begin() + axis);
+      }
       if (inputType.getShape() != task.getDomainShape() ||
           !inputType.getElementType().isF32() ||
           initializerType.getRank() != 0 ||
@@ -1145,29 +1157,28 @@ FailureOr<Simt32Geometry> simt32Geometry(ScheduleTaskKind kind,
       llvm::any_of(domain, [](int64_t extent) { return extent <= 0; })) {
     return failure();
   }
-  const int64_t reductionAxis =
-      kind == ScheduleTaskKind::RowFold
-          ? domain.size() - 1
-          : (kind == ScheduleTaskKind::ColumnFold && domain.size() == 2 ? 0
-                                                                        : -1);
-  if (reductionAxis < 0 ||
-      (domain.size() > 2 && kind != ScheduleTaskKind::RowFold)) {
+  const bool rowFold = kind == ScheduleTaskKind::RowFold;
+  const bool columnFold = kind == ScheduleTaskKind::ColumnFold;
+  if (!rowFold && !columnFold) {
     return failure();
   }
+  const int64_t reductionAxis = rowFold ? domain.size() - 1 : 0;
+  FailureOr<int64_t> reduction =
+      rowFold ? FailureOr<int64_t>(domain.back())
+              : staticElementCount(domain.drop_back());
   FailureOr<int64_t> outputs =
-      reductionAxis == static_cast<int64_t>(domain.size()) - 1
-          ? staticElementCount(domain.drop_back())
-          : FailureOr<int64_t>(domain[1]);
-  if (failed(outputs) || *outputs > UINT32_MAX) {
+      rowFold ? staticElementCount(domain.drop_back())
+              : FailureOr<int64_t>(domain.back());
+  if (failed(reduction) || failed(outputs) || *outputs > UINT32_MAX) {
     return failure();
   }
-  int64_t tile = std::min(domain[reductionAxis], kMaxThreads);
+  int64_t tile = std::min(*reduction, kMaxThreads);
   int64_t threads = roundUpToSubgroup(tile);
   SmallVector<int64_t> tileShape(domain.size(), 1);
   tileShape[reductionAxis] = tile;
   return Simt32Geometry{{*outputs},
                         std::move(tileShape),
-                        ceilDivPositive(domain[reductionAxis], tile),
+                        ceilDivPositive(*reduction, tile),
                         threads,
                         kSubgroup,
                         threads * static_cast<int64_t>(sizeof(float)),

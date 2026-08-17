@@ -79,7 +79,7 @@ ShuttlePipelineOptions commandLinePipelineOptions(NumericalPolicy numerics) {
   options.numerics = numerics;
   if (numerics == NumericalPolicy::Fast) {
     options.canonicalOptions =
-        R"json({"execution_mode":"stablehlo_round_trip","numerics":"fast","pipeline_abi_version":20,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+        R"json({"execution_mode":"stablehlo_round_trip","numerics":"fast","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
   }
   return options;
 }
@@ -629,6 +629,63 @@ bool isTerminalRankNAdditiveReduce(Operation *operation) {
          dimensions.asArrayRef() == ArrayRef<int64_t>({input.getRank() - 1});
 }
 
+bool isFullPrefixRankNAdditiveReduce(Operation *operation) {
+  if (!isSupportedStablehloReduce(operation)) {
+    return false;
+  }
+  auto input = cast<RankedTensorType>(operation->getOperand(0).getType());
+  auto dimensions =
+      operation->getAttrOfType<DenseI64ArrayAttr>("dimensions");
+  return input.hasStaticShape() && input.getRank() >= 3 &&
+         input.getRank() <= 8 &&
+         llvm::all_of(input.getShape(),
+                      [](int64_t extent) { return extent > 0; }) &&
+         dimensions.size() == static_cast<size_t>(input.getRank() - 1) &&
+         llvm::all_of(llvm::enumerate(dimensions.asArrayRef()),
+                      [](auto indexedDimension) {
+                        return indexedDimension.value() ==
+                               static_cast<int64_t>(indexedDimension.index());
+                      });
+}
+
+bool isRankTwoAdditiveReduce(Operation *operation) {
+  if (!isSupportedStablehloReduce(operation)) {
+    return false;
+  }
+  auto input = cast<RankedTensorType>(operation->getOperand(0).getType());
+  auto dimensions =
+      operation->getAttrOfType<DenseI64ArrayAttr>("dimensions");
+  return input.hasStaticShape() && input.getRank() == 2 &&
+         llvm::all_of(input.getShape(),
+                      [](int64_t extent) { return extent > 0; }) &&
+         dimensions.size() == 1 && dimensions[0] >= 0 &&
+         dimensions[0] < input.getRank();
+}
+
+bool isClosedRankOneBf16Result(
+    Operation *operation,
+    const llvm::SmallPtrSetImpl<Operation *> &componentOperations) {
+  if (operation->getName().getStringRef() !=
+          stablehlo::ConvertOp::getOperationName() ||
+      !isSupportedStablehlo(operation) || operation->getNumOperands() != 1 ||
+      operation->getNumResults() != 1) {
+    return false;
+  }
+  Operation *producer = operation->getOperand(0).getDefiningOp();
+  auto input = dyn_cast<RankedTensorType>(operation->getOperand(0).getType());
+  auto result = dyn_cast<RankedTensorType>(operation->getResult(0).getType());
+  return producer && componentOperations.contains(producer) &&
+         (isFullPrefixRankNAdditiveReduce(producer) ||
+          isRankTwoAdditiveReduce(producer)) &&
+         input && result &&
+         input.hasStaticShape() && result.hasStaticShape() &&
+         input.getRank() == 1 && result.getRank() == 1 &&
+         input.getShape() == result.getShape() &&
+         input.getElementType().isF32() && result.getElementType().isBF16() &&
+         llvm::all_of(result.getShape(),
+                      [](int64_t extent) { return extent > 0; });
+}
+
 bool isClosedDirectStablehloMap(Operation *operation) {
   if (!isSupportedStablehlo(operation)) {
     return false;
@@ -802,6 +859,30 @@ bool hasRankNExpansionWithoutClosedAnchor(const CandidateComponent &component) {
   });
 }
 
+bool hasUnclosedRankOneResult(const CandidateComponent &component) {
+  llvm::SmallPtrSet<Operation *, 16> componentOperations(
+      component.operations.begin(), component.operations.end());
+  return llvm::any_of(component.operations, [&](Operation *operation) {
+    return llvm::any_of(operation->getResults(), [&](Value result) {
+      auto type = dyn_cast<RankedTensorType>(result.getType());
+      SmallVector<Operation *> outsideUsers;
+      llvm::copy_if(result.getUsers(), std::back_inserter(outsideUsers),
+                    [&](Operation *user) {
+                      return !componentOperations.contains(user);
+                    });
+      if (!type || type.getRank() != 1 ||
+          !type.getElementType().isBF16() || outsideUsers.empty()) {
+        return false;
+      }
+      return !isClosedRankOneBf16Result(operation, componentOperations) ||
+             !llvm::all_of(outsideUsers,
+                           [](Operation *user) {
+                             return isa<func::ReturnOp>(user);
+                           });
+    });
+  });
+}
+
 SmallVector<CandidateComponent> candidateComponents(ModuleOp module) {
   SmallVector<CandidateComponent> components;
   for (func::FuncOp function : module.getOps<func::FuncOp>()) {
@@ -813,7 +894,8 @@ SmallVector<CandidateComponent> candidateComponents(ModuleOp module) {
         }
         for (CandidateComponent &component :
              partitionSupportedInterval(interval)) {
-          if (!hasRankNExpansionWithoutClosedAnchor(component)) {
+          if (!hasRankNExpansionWithoutClosedAnchor(component) &&
+              !hasUnclosedRankOneResult(component)) {
             components.push_back(std::move(component));
           }
         }
@@ -3404,6 +3486,62 @@ bool isClosedTerminalRankNFold(FoldOp fold) {
   return hasExactPositiveZeroInitializer(fold);
 }
 
+bool isFullPrefixReduction(ArrayRef<int64_t> dimensions, int64_t rank) {
+  return rank >= 3 && rank <= 8 &&
+         dimensions.size() == static_cast<size_t>(rank - 1) &&
+         llvm::all_of(llvm::enumerate(dimensions), [](auto indexedDimension) {
+           return indexedDimension.value() ==
+                  static_cast<int64_t>(indexedDimension.index());
+         });
+}
+
+bool isClosedFullPrefixRankNFold(FoldOp fold) {
+  auto input =
+      fold.getInputs().size() == 1
+          ? dyn_cast<RankedTensorType>(fold.getInputs()[0].getType())
+          : RankedTensorType{};
+  auto initializer =
+      fold.getInitializers().size() == 1
+          ? dyn_cast<RankedTensorType>(fold.getInitializers()[0].getType())
+          : RankedTensorType{};
+  auto result = fold.getNumResults() == 1
+                    ? dyn_cast<RankedTensorType>(fold.getResult(0).getType())
+                    : RankedTensorType{};
+  if (!input || !initializer || !result || !input.hasStaticShape() ||
+      !result.hasStaticShape() ||
+      !isFullPrefixReduction(fold.getReductionDimensions(), input.getRank()) ||
+      !input.getElementType().isF32() || initializer.getRank() != 0 ||
+      !initializer.getElementType().isF32() || result.getRank() != 1 ||
+      !result.getElementType().isF32() ||
+      result.getShape() != input.getShape().take_back() ||
+      !llvm::all_of(input.getShape(),
+                    [](int64_t extent) { return extent > 0; }) ||
+      !fold.getOrderFree() || fold.getAccumulatorTypes().size() != 1 ||
+      cast<TypeAttr>(fold.getAccumulatorTypes()[0]).getValue() !=
+          Float32Type::get(fold.getContext())) {
+    return false;
+  }
+  Block &body = fold.getCombiner().front();
+  if (body.getNumArguments() != 2 || body.getOperations().size() != 2) {
+    return false;
+  }
+  auto add = dyn_cast<arith::AddFOp>(body.front());
+  auto yield = dyn_cast<YieldOp>(body.back());
+  auto fastMath = add ? add->getAttrOfType<arith::FastMathFlagsAttr>("fastmath")
+                      : arith::FastMathFlagsAttr{};
+  return add && yield && add.getLhs() == body.getArgument(0) &&
+         add.getRhs() == body.getArgument(1) &&
+         yield.getValues().size() == 1 &&
+         yield.getValues()[0] == add.getResult() &&
+         (!fastMath || fastMath.getValue() == arith::FastMathFlags::none) &&
+         hasExactPositiveZeroInitializer(fold);
+}
+
+bool isClosedRankNFold(FoldOp fold) {
+  return isClosedTerminalRankNFold(fold) ||
+         isClosedFullPrefixRankNFold(fold);
+}
+
 bool isClosedDirectProjectedMap(MapOp map) {
   if (map.getNumResults() != 1 ||
       map.getIndexingMaps().size() != map.getInputs().size() + 1) {
@@ -3438,6 +3576,38 @@ bool isClosedDirectProjectedMap(MapOp map) {
     }
   }
   return true;
+}
+
+bool isClosedFullPrefixBf16Result(MapOp map) {
+  if (map.getSemantics() != MapSemantics::Pointwise ||
+      map.getInputs().size() != 1 || map.getNumResults() != 1 ||
+      !isClosedDirectProjectedMap(map) || map.getBody().empty()) {
+    return false;
+  }
+  auto input = dyn_cast<RankedTensorType>(map.getInputs()[0].getType());
+  auto result = dyn_cast<RankedTensorType>(map.getResult(0).getType());
+  auto fold = map.getInputs()[0].getDefiningOp<FoldOp>();
+  if (!input || !result || !fold || fold->getParentOp() != map->getParentOp() ||
+      !isClosedFullPrefixRankNFold(fold) || input.getRank() != 1 ||
+      result.getRank() != 1 || input.getShape() != result.getShape() ||
+      !input.getElementType().isF32() || !result.getElementType().isBF16() ||
+      !llvm::all_of(result.getShape(),
+                    [](int64_t extent) { return extent > 0; })) {
+    return false;
+  }
+  Block &body = map.getBody().front();
+  if (body.getNumArguments() != 1 || body.getOperations().size() != 2) {
+    return false;
+  }
+  auto convert = dyn_cast<ScalarConvertOp>(body.front());
+  auto yield = dyn_cast<YieldOp>(body.back());
+  return convert && yield && convert.getInput() == body.getArgument(0) &&
+         convert.getInput().getType().isF32() &&
+         convert.getResult().getType().isBF16() &&
+         convert.getSemantics() ==
+             ScalarConvertSemantics::RoundNearestEven &&
+         yield.getValues().size() == 1 &&
+         yield.getValues()[0] == convert.getResult();
 }
 
 std::optional<unsigned> closedRankNExpandingSingletonMaps(MapOp map) {
@@ -3717,7 +3887,7 @@ bool isClosedRankNFoldMapRegion(RegionOp region,
   };
   auto isExternalResult = [](Type type) {
     auto tensor = dyn_cast<RankedTensorType>(type);
-    return tensor && tensor.hasStaticShape() && tensor.getRank() >= 3 &&
+    return tensor && tensor.hasStaticShape() && tensor.getRank() >= 1 &&
            tensor.getRank() <= 8 && tensor.getElementType().isBF16() &&
            llvm::all_of(tensor.getShape(),
                         [](int64_t extent) { return extent > 0; });
@@ -3728,6 +3898,21 @@ bool isClosedRankNFoldMapRegion(RegionOp region,
       })) {
     return false;
   }
+  auto regionYield = dyn_cast<YieldOp>(region.getBody().front().getTerminator());
+  if (!regionYield ||
+      regionYield.getValues().size() != region.getResults().size()) {
+    return false;
+  }
+  for (auto [result, yielded] :
+       llvm::zip_equal(region.getResults(), regionYield.getValues())) {
+    auto type = cast<RankedTensorType>(result.getType());
+    if (type.getRank() < 3) {
+      auto map = yielded.getDefiningOp<MapOp>();
+      if (!map || !isClosedFullPrefixBf16Result(map)) {
+        return false;
+      }
+    }
+  }
   return llvm::all_of(algebra, [](Operation *operation) {
     if (auto fold = dyn_cast<FoldOp>(operation)) {
       auto input =
@@ -3735,7 +3920,7 @@ bool isClosedRankNFoldMapRegion(RegionOp region,
               ? dyn_cast<RankedTensorType>(fold.getInputs()[0].getType())
               : RankedTensorType{};
       return input && input.getRank() >= 3 && input.getRank() <= 8 &&
-             isClosedTerminalRankNFold(fold);
+             isClosedRankNFold(fold);
     }
     auto map = dyn_cast<MapOp>(operation);
     if (!map) {
@@ -3831,7 +4016,7 @@ FailureOr<DerivedPlan> deriveGpuPlan(RegionOp region) {
             : (isa<ContractOp>(operation) ? MaterializationTaskKind::Contract
                                           : MaterializationTaskKind::Map);
     if (auto fold = dyn_cast<FoldOp>(operation)) {
-      if (!(containsRankNFold ? isClosedTerminalRankNFold(fold)
+      if (!(containsRankNFold ? isClosedRankNFold(fold)
                               : isClosedRankTwoFold(fold))) {
         return failure();
       }
@@ -4015,7 +4200,7 @@ public:
         auto tuning = manifest ? manifest.getAs<StringAttr>("canonical_tuning")
                                : StringAttr{};
         if (!tuning || tuning.getValue() != kDefaultCanonicalTuning) {
-          module.emitError("ABI20 GPU algebra requires exact default tuning");
+          module.emitError("ABI21 GPU algebra requires exact default tuning");
           return signalPassFailure();
         }
       }
@@ -4392,28 +4577,28 @@ FailureOr<ScheduledGeometry> deriveSimt32Geometry(ScheduleTaskKind kind,
       llvm::any_of(domain, [](int64_t extent) { return extent <= 0; })) {
     return failure();
   }
-  const int64_t reductionAxis =
-      kind == ScheduleTaskKind::RowFold
-          ? domain.size() - 1
-          : (kind == ScheduleTaskKind::ColumnFold && domain.size() == 2 ? 0
-                                                                        : -1);
-  if (reductionAxis < 0 ||
-      (domain.size() > 2 && kind != ScheduleTaskKind::RowFold)) {
+  const bool rowFold = kind == ScheduleTaskKind::RowFold;
+  const bool columnFold = kind == ScheduleTaskKind::ColumnFold;
+  if (!rowFold && !columnFold) {
     return failure();
   }
-  FailureOr<int64_t> outputs = reductionAxis == domain.size() - 1
-                                   ? scheduleElementCount(domain.drop_back())
-                                   : FailureOr<int64_t>(domain[1]);
-  if (failed(outputs) || *outputs > UINT32_MAX) {
+  const int64_t reductionAxis = rowFold ? domain.size() - 1 : 0;
+  FailureOr<int64_t> reduction =
+      rowFold ? FailureOr<int64_t>(domain.back())
+              : scheduleElementCount(domain.drop_back());
+  FailureOr<int64_t> outputs =
+      rowFold ? scheduleElementCount(domain.drop_back())
+              : FailureOr<int64_t>(domain.back());
+  if (failed(reduction) || failed(outputs) || *outputs > UINT32_MAX) {
     return failure();
   }
-  int64_t tile = std::min(domain[reductionAxis], kMaxThreads);
+  int64_t tile = std::min(*reduction, kMaxThreads);
   int64_t threads = scheduleThreads(tile);
   SmallVector<int64_t> tileShape(domain.size(), 1);
   tileShape[reductionAxis] = tile;
   return ScheduledGeometry{{*outputs},
                            std::move(tileShape),
-                           ceilDivPositive(domain[reductionAxis], tile),
+                           ceilDivPositive(*reduction, tile),
                            threads,
                            kSubgroup,
                            threads * static_cast<int64_t>(sizeof(float)),
@@ -4437,16 +4622,16 @@ scheduleKindForMaterializationTask(MaterializationTaskOp task) {
     return task.getDomainShape().empty() ? ScheduleTaskKind::Scalar
                                          : ScheduleTaskKind::Elementwise;
   }
-  if (task.getKind() != MaterializationTaskKind::Fold ||
-      task.getReductionDimensions().size() != 1) {
+  if (task.getKind() != MaterializationTaskKind::Fold) {
     return failure();
   }
   const int64_t rank = task.getDomainShape().size();
-  const int64_t axis = task.getReductionDimensions().front();
-  if (axis == rank - 1) {
+  ArrayRef<int64_t> dimensions = task.getReductionDimensions();
+  if (dimensions == ArrayRef<int64_t>({rank - 1})) {
     return ScheduleTaskKind::RowFold;
   }
-  if (rank == 2 && axis == 0) {
+  if ((rank == 2 && dimensions == ArrayRef<int64_t>({0})) ||
+      isFullPrefixReduction(dimensions, rank)) {
     return ScheduleTaskKind::ColumnFold;
   }
   return failure();
@@ -5455,7 +5640,7 @@ FailureOr<std::string> emitContractPtx(ContractOp contract,
 }
 
 FailureOr<std::string> emitFoldPtx(FoldOp fold, ScheduleTaskOp task) {
-  if ((!isClosedRankTwoFold(fold) && !isClosedTerminalRankNFold(fold)) ||
+  if ((!isClosedRankTwoFold(fold) && !isClosedRankNFold(fold)) ||
       fold.getInputs().size() != 1 || fold.getInitializers().size() != 1 ||
       fold.getNumResults() != 1 ||
       task.getDomainShape() !=
@@ -5463,8 +5648,14 @@ FailureOr<std::string> emitFoldPtx(FoldOp fold, ScheduleTaskOp task) {
     return failure();
   if (!hasExactPositiveZeroInitializer(fold))
     return failure();
+  const bool fullPrefix = isClosedFullPrefixRankNFold(fold);
   const int64_t reductionAxis = fold.getReductionDimensions().front();
-  const int64_t reductionExtent = task.getDomainShape()[reductionAxis];
+  FailureOr<int64_t> reductionExtent =
+      fullPrefix
+          ? scheduleElementCount(task.getDomainShape().drop_back())
+          : FailureOr<int64_t>(task.getDomainShape()[reductionAxis]);
+  if (failed(reductionExtent))
+    return failure();
   auto resultType = cast<RankedTensorType>(fold.getResult(0).getType());
   FailureOr<int64_t> outputElements = staticElementCount(resultType);
   if (failed(outputElements) || *outputElements > UINT32_MAX)
@@ -5485,7 +5676,7 @@ FailureOr<std::string> emitFoldPtx(FoldOp fold, ScheduleTaskOp task) {
   };
   FailureOr<int64_t> localWidth = nextPowerOfTwo(serialTiles);
   FailureOr<int64_t> sharedWidth =
-      nextPowerOfTwo(std::min(reductionExtent, threads));
+      nextPowerOfTwo(std::min(*reductionExtent, threads));
   if (failed(localWidth) || failed(sharedWidth) || threads <= 0 ||
       threads > 256 ||
       task.getGridShape() != ArrayRef<int64_t>({outputExtent}) ||
@@ -5505,13 +5696,13 @@ FailureOr<std::string> emitFoldPtx(FoldOp fold, ScheduleTaskOp task) {
   for (int64_t index = 0; index < serialTiles; ++index) {
     ptx.stream << "  mul.lo.u32 %r4, %r0, " << serialTiles
                << ";\n  add.u32 %r4, %r4, " << index
-               << ";\n  setp.ge.u32 %p1, %r4, " << reductionExtent
+               << ";\n  setp.ge.u32 %p1, %r4, " << *reductionExtent
                << ";\n  @%p1 bra $load_skip" << index << ";\n"
                << "  cvt.u64.u32 %rd1, %r4;\n"
                << "  cvt.u64.u32 %rd2, %r1;\n";
     if (reductionAxis ==
         static_cast<int64_t>(task.getDomainShape().size()) - 1) {
-      ptx.stream << "  mad.lo.u64 %rd3, %rd2, " << reductionExtent
+      ptx.stream << "  mad.lo.u64 %rd3, %rd2, " << *reductionExtent
                  << ", %rd1;\n";
     } else {
       ptx.stream << "  mad.lo.u64 %rd3, %rd1, " << outputExtent << ", %rd2;\n";
@@ -7286,7 +7477,7 @@ void registerShuttleStablehloPipelines() {
             commandLinePipelineOptions(NumericalPolicy::SourceOrdered);
         options.executionMode = ExecutionMode::CpuExecutableBundle;
         options.canonicalOptions =
-            R"json({"execution_mode":"cpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":20,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+            R"json({"execution_mode":"cpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
         buildShuttleStablehloPipeline(manager, options);
       });
   PassPipelineRegistration<>(
@@ -7297,7 +7488,7 @@ void registerShuttleStablehloPipelines() {
             commandLinePipelineOptions(NumericalPolicy::Fast);
         options.executionMode = ExecutionMode::CpuExecutableBundle;
         options.canonicalOptions =
-            R"json({"execution_mode":"cpu_executable_bundle","numerics":"fast","pipeline_abi_version":20,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+            R"json({"execution_mode":"cpu_executable_bundle","numerics":"fast","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
         buildShuttleStablehloPipeline(manager, options);
       });
   PassPipelineRegistration<>(
@@ -7309,7 +7500,7 @@ void registerShuttleStablehloPipelines() {
             commandLinePipelineOptions(NumericalPolicy::SourceOrdered);
         options.executionMode = ExecutionMode::GpuExecutableBundle;
         options.canonicalOptions =
-            R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":20,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+            R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
         buildShuttleStablehloPipeline(manager, options);
       });
   PassPipelineRegistration<>(
@@ -7320,7 +7511,7 @@ void registerShuttleStablehloPipelines() {
             commandLinePipelineOptions(NumericalPolicy::Fast);
         options.executionMode = ExecutionMode::GpuExecutableBundle;
         options.canonicalOptions =
-            R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":20,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+            R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
         buildShuttleStablehloPipeline(manager, options);
       });
 }
