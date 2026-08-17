@@ -5331,3 +5331,31 @@ author: dlwh
 - Independent strict review approved the exact production commit with no P1
   or P2 findings. No GPU execution, hardware, image, network, upload, push, or
   cluster action occurred.
+
+### 2026-08-17 - TLTC-MLIR-036 ABI 21 RMSNorm prehardware contract
+
+- The versioned ABI21 prehardware contract closes the architecture-only
+  `[2,7,19]` forward, backward, and composed coordinates under SOURCE_ORDERED
+  and FAST, plus the compile-only `[3,2,5,11,263]` metamorphic sibling. The
+  representative `[2048,4096]` H100/B200 matrix remains a separate acceptance
+  tier and cannot inherit the small-shape status.
+- An independent bit-exact software oracle models the emitted adjacent-pair,
+  next-power-of-two Fold tree, final initializer placement, and singleton
+  Folds. Independent binary64 role thresholds are sealed separately. A
+  cancellation discriminator and mutations reject alternate association,
+  input drift, policy collapse, or a post-observation threshold change.
+- SOURCE_ORDERED and FAST must have equal normalized schedules, launch
+  descriptors, and PTX after policy metadata is removed. Any difference stops
+  FAST pending a separate numerical contract. Ordinary-JAX bitwise equality is
+  retained only as an optional stronger diagnostic.
+- The closed role manifest includes source, architecture, runtime process,
+  cache snapshot, policy, and artifact identities. Contract SHA-256 is
+  `af0e048a4f6bb51fe220742525c2aaf0f9d614135e11ba94f040ec9c2a8c720f`,
+  architecture SHA-256 is
+  `c055064bd84f072bd92eb3865ddc84ec643ff09077c8c5ca7f3030de942d6f89`,
+  and role-manifest SHA-256 is
+  `dd76280e915ae8334216dbef61aa829db2aea45f402b4a4205dfef3af48716ca`.
+- Focused coverage passes 35/35 and changed-files precommit passes. Independent
+  strict review found no P1 or P2 issue. Authority, build/image/wheel/tool
+  identities, GPU execution, timing, upload, and acceptance remain null or
+  absent; the launcher fails before external action.
