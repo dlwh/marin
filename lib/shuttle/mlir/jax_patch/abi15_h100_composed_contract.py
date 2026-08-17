@@ -21,7 +21,6 @@ from shuttle.options import (
     Materialization,
     Numerics,
     Tuning,
-    options_digest,
 )
 
 CONTRACT_SHA256 = "7b681b7a74eef86a3ce257f396dab442150a5cca41580f953f745add741849ba"
@@ -38,6 +37,28 @@ EXPECTED_FINAL_FINGERPRINTS = {
     "source_ordered": "036085a583909874d0c4e6c134926880af03d5b54ceffb3084d838362fe13fcc",
     "fast": "9b8de0ccb413b410c0176acd9bd6b7ac1bbca1759c1fab8e3bee60fd18e4beaa",
 }
+
+
+def abi15_options_json(*, numerics: Numerics, tuning: Tuning) -> str:
+    """Return the exact canonical options text sealed by the ABI15 contract."""
+    payload = {
+        "execution_mode": ExecutionMode.GPU_EXECUTABLE_BUNDLE.value,
+        "numerics": numerics.value,
+        "pipeline_abi_version": 15,
+        "schema_version": 1,
+        "tuning": {
+            "cluster_shape": list(tuning.cluster_shape),
+            "materialization": tuning.materialization.value,
+            "maximum_candidates": tuning.maximum_candidates,
+            "pipeline_stages": tuning.pipeline_stages,
+            "tile_sizes": list(tuning.tile_sizes),
+        },
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _historical_options_digest(*, numerics: Numerics, tuning: Tuning) -> str:
+    return hashlib.sha256(abi15_options_json(numerics=numerics, tuning=tuning).encode()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -208,11 +229,7 @@ def validate_contract_document(document: dict[str, object]) -> None:
         ("fast", Numerics.FAST),
     ):
         identity = _policy(document, policy)
-        expected_options = options_digest(
-            numerics=numerics,
-            tuning=tuning,
-            execution_mode=ExecutionMode.GPU_EXECUTABLE_BUNDLE,
-        )
+        expected_options = _historical_options_digest(numerics=numerics, tuning=tuning)
         if identity.options_sha256 != expected_options:
             raise ValueError(f"{policy} options identity drift")
         if identity.generated_fingerprint != EXPECTED_GENERATED_FINGERPRINTS[policy]:

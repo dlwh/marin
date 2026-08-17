@@ -19,7 +19,7 @@ from typing import Any
 from abi15_h100_architecture_contract import (
     FILENAME as ARCHITECTURE_BUILD_CONTRACT_FILENAME,
 )
-from abi15_h100_composed_contract import load_contract
+from abi15_h100_composed_contract import abi15_options_json, load_contract
 from abi15_h100_evidence import (
     ProcessReport,
     RawArtifact,
@@ -49,7 +49,7 @@ from abi15_h100_numerics import (
 )
 from acceptance_contract import EVENT_FIELDS, FixtureExpectation, ObserverIdentity
 
-from shuttle import ExecutionMode, Materialization, Numerics, Tuning, compiler_options
+from shuttle import Materialization, Numerics, Tuning
 
 OUTPUT_ROLES = ("primal", "lhs_cotangent", "rhs_cotangent")
 DATASETS = {"dense": dense_inputs, "sparse_policy_discriminator": sparse_policy_inputs}
@@ -71,14 +71,7 @@ def _observer_contract(policy: str) -> tuple[ObserverIdentity, FixtureExpectatio
         maximum_candidates=1,
     )
     numerics = Numerics.SOURCE_ORDERED if policy == "source_ordered" else Numerics.FAST
-    options = compiler_options(
-        execution_mode=ExecutionMode.GPU_EXECUTABLE_BUNDLE,
-        numerics=numerics,
-        tuning=tuning,
-    )
-    canonical_options = options.get("xla_shuttle_options")
-    if type(canonical_options) is not str:
-        raise ValueError("ABI15 observer options are not canonical text")
+    canonical_options = abi15_options_json(numerics=numerics, tuning=tuning)
     canonical_tuning = json.dumps(json.loads(canonical_options)["tuning"], sort_keys=True, separators=(",", ":"))
     identity = ObserverIdentity(
         policy=policy,
