@@ -149,17 +149,21 @@ after policy metadata is removed. The prehardware verifier must compare decoded
 tasks, schedules, normalized PTX, and launch descriptors pairwise. If they
 differ, FAST stops until a separate numerical policy contract is reviewed.
 
-The representative tier must not require bitwise equality to ordinary JAX
-unless the independently reviewed schedule contract says so. It must report
-the historical 815-element BF16 `dx` disagreement if reproduced. The current
-balanced, leaf-order-preserving all-five-Fold realization matches `dgamma` but
-differs from ordinary JAX in 815 of 8,388,608 BF16 `dx` elements; the best
-historical alternate tree differed in 745 elements. The existing pre-run
-bitwise-JAX SOURCE_ORDERED and identity-FAST gate therefore remains red even
-though the independent analytic comparison allows an 8-ULP envelope. Either a
-JAX-matching reduction realization must land or a separately reviewed
-numerical-policy contract must replace that bitwise gate before launch. No
-post-run tolerance change is permitted.
+ABI21 does not inherit the ABI5/Target-1 bitwise ordinary-JAX gate. StableHLO
+permits implementation-defined binary-tree association while preserving
+ascending lexicographic leaf order, and ABI21 records that contract as
+`tree_association_free_leaf_order_fixed`. The new versioned contract therefore
+requires bit-exact agreement with an independent software model of the emitted
+Fold tree plus predeclared per-role independent-reference thresholds. Ordinary
+JAX bitwise equality is recorded as an optional stronger diagnostic.
+
+The contract must still report the historical 815-element BF16 `dx`
+disagreement if reproduced. The current balanced, leaf-order-preserving
+all-five-Fold realization matches `dgamma` but differs from the historical CPU
+ordinary-JAX result in 815 of 8,388,608 BF16 `dx` elements; the best historical
+alternate tree differed in 745 elements. That observation is not ABI21 GPU
+evidence and cannot establish threshold acceptance. No threshold or tree-model
+change is permitted after GPU output is observed.
 
 ## Compiler, process, and cache state
 
@@ -307,7 +311,8 @@ closed:
 
 - hardware allocation and execution of the locally admitted representative
   167,804,936-byte live temporary plan;
-- representative numerical qualification for both reduction policies;
+- representative agreement with the sealed schedule-tree oracle and
+  independent-reference thresholds for both reduction policies;
 - installed-wheel ordinary-JAX CUDA-plugin transform reachability;
 - exact build/image/wheel/tool/PTX/cubin identities;
 - SM100 code generation and assembly for B200;

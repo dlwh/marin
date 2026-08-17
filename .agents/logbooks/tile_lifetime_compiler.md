@@ -5292,3 +5292,22 @@ author: dlwh
   separately reviewed numerical-policy contract is required before launch.
 - No ABI21 wheel, ptxas assembly, device allocation, GPU arithmetic, image,
   hardware, upload, timing, or performance evidence was produced.
+
+### 2026-08-17 - TLTC-MLIR-034 ABI 21 numerical-policy correction
+
+- Corrected the numerical stop in TLTC-MLIR-033 without rewriting that
+  append-only record. ABI21 does not inherit the ABI5/Target-1 requirement for
+  bitwise equality with ordinary JAX. StableHLO permits an
+  implementation-defined binary-tree association while preserving ascending
+  lexicographic leaf order, and ABI21 records that contract as
+  `tree_association_free_leaf_order_fixed`.
+- The versioned ABI21 evidence contract must require bit-exact agreement with
+  an independent software model of the emitted Fold tree and predeclared
+  per-role independent-reference thresholds. Ordinary-JAX bitwise equality is
+  an optional stronger diagnostic. Thresholds and the tree model must be
+  sealed before GPU output is observed.
+- The historical 815-element BF16 `dx` disagreement remains relevant evidence
+  that a bitwise-JAX rule is not the source semantic, but it is CPU-model
+  evidence rather than ABI21 GPU evidence and cannot establish threshold
+  acceptance. GPU execution, PTX assembly, wheel and image identities, timing,
+  and performance remain unexecuted and unsealed.
