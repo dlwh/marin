@@ -1,0 +1,29 @@
+{
+  "paths": [
+    ".agents/projects/tile_lifetime_compiler/shuttle_abi15_h100_composed_prerun_v1.json",
+    "LICENSE",
+    "lib/shuttle/mlir/jax_patch/0001-link-shuttle-xla-registry-adapter.patch",
+    "lib/shuttle/mlir/jax_patch/0002-add-acceptance-observer-bridge.patch",
+    "lib/shuttle/mlir/jax_patch/0003-link-shuttle-cuda-ffi.patch",
+    "lib/shuttle/mlir/jax_patch/abi15-h100-architecture-build-contract-v1.json",
+    "lib/shuttle/mlir/jax_patch/abi15-h100-composed-role-paths-v1.json",
+    "lib/shuttle/mlir/jax_patch/abi15-h100-source-allowlist-v1.json",
+    "lib/shuttle/mlir/jax_patch/abi15_h100_architecture_contract.py",
+    "lib/shuttle/mlir/jax_patch/abi15_h100_composed_contract.py",
+    "lib/shuttle/mlir/jax_patch/abi15_h100_composed_fixture.py",
+    "lib/shuttle/mlir/jax_patch/abi15_h100_evidence.py",
+    "lib/shuttle/mlir/jax_patch/abi15_h100_evidence_launcher.py",
+    "lib/shuttle/mlir/jax_patch/abi15_h100_evidence_subject.py",
+    "lib/shuttle/mlir/jax_patch/abi15_h100_evidence_verify.py",
+    "lib/shuttle/mlir/jax_patch/abi15_h100_gpu_build.py",
+    "lib/shuttle/mlir/jax_patch/abi15_h100_gpu_transport.py",
+    "lib/shuttle/mlir/jax_patch/abi15_h100_numerics.py",
+    "lib/shuttle/mlir/jax_patch/abi15_h100_source_payload.py",
+    "lib/shuttle/mlir/jax_patch/gpu_transport.py",
+    "lib/shuttle/mlir/jax_patch/shuttle_jaxlib_gpu_ffi_registration.py",
+    "lib/shuttle/mlir/jax_patch/shuttle_jaxlib_gpu_ffi_registration_abi11.py",
+    "lib/shuttle/mlir/jax_patch/shuttle_jaxlib_gpu_ffi_registration_abi15.py",
+    "lib/shuttle/mlir/test/Inputs/jax-0.10.1-bf16-matmul-vjp-33x2x34-composed.mlir"
+  ],
+  "schema_version": 1
+}

@@ -1,0 +1,162 @@
+# Copyright The Marin Authors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tests for the unsealed ABI15 pre-hardware build boundary."""
+
+from copy import deepcopy
+from pathlib import Path
+
+import pytest
+from abi15_h100_architecture_contract import load_architecture_build_contract
+from abi15_h100_gpu_build import (
+    _validate_build_candidate_against_policy,
+    assemble_transports,
+    parse_ptxas_resources,
+    validate_build_candidate,
+)
+
+SHA = "a" * 64
+
+
+def _sealed_policy() -> dict[str, object]:
+    build_policy = deepcopy(load_architecture_build_contract()["build_policy"])
+    build_policy["future_outputs"].update(
+        {
+            "bazel_path": "/tools/bazel",
+            "bazel_sha256": "9" * 64,
+            "ptxas_path": "/cuda/bin/ptxas",
+            "ptxas_sha256": "a" * 64,
+        }
+    )
+    return build_policy
+
+
+def _candidate(build_policy: dict[str, object] | None = None) -> dict[str, object]:
+    build_policy = _sealed_policy() if build_policy is None else build_policy
+    pinned_source = build_policy["source"]
+    transports = []
+    for policy_index, policy in enumerate(("source_ordered", "fast")):
+        for call_index, (call, launches) in enumerate((("forward", 2), ("backward", 10))):
+            seed = 1 + policy_index * 2 + call_index
+            transports.append(
+                {
+                    "bundle_root": f"{seed:x}" * 64,
+                    "call": call,
+                    "code_sha256": f"{(seed + 4) % 15:x}" * 64,
+                    "device_root": f"{(seed + 8) % 15:x}" * 64,
+                    "invocation_root": f"{(seed + 12) % 15:x}" * 64,
+                    "launches": launches,
+                    "policy": policy,
+                    "ptx_slices": [
+                        {
+                            "cubin_sha256": f"{(ordinal % 8) + 1:x}" * 64,
+                            "ordinal": ordinal,
+                            "ptx_sha256": f"{(ordinal % 7) + 1:x}" * 64,
+                            "registers": 12,
+                            "spill_bytes": 0,
+                        }
+                        for ordinal in range(launches)
+                    ],
+                    "transport_sha256": f"{(seed + 16) % 15:x}" * 64,
+                }
+            )
+    return {
+        "commands": build_policy["commands"],
+        "registration_transcript_sha256": "f" * 64,
+        "schema_version": 1,
+        "source": {
+            "harness_commit": "1" * 40,
+            "harness_tree": "2" * 40,
+            "jax_commit": pinned_source["jax_commit"],
+            "jax_patch_sha256": [record["sha256"] for record in pinned_source["jax_patches"]],
+            "jax_tree": pinned_source["jax_tree"],
+            "production_commit": pinned_source["production_commit"],
+            "production_tree": pinned_source["production_tree"],
+            "task_entrypoint": pinned_source["task_entrypoint"],
+            "xla_commit": pinned_source["xla_commit"],
+        },
+        "status": "pre_hardware_build_candidate_not_authority",
+        "toolchain": {
+            "bazel_path": build_policy["future_outputs"]["bazel_path"],
+            "bazel_sha256": build_policy["future_outputs"]["bazel_sha256"],
+            "bazel_version": build_policy["tool_constraints"]["bazel_version"],
+            "ptxas_path": build_policy["future_outputs"]["ptxas_path"],
+            "ptxas_sha256": build_policy["future_outputs"]["ptxas_sha256"],
+            "ptxas_version": build_policy["tool_constraints"]["ptxas_version"],
+            "target": build_policy["tool_constraints"]["ptx_target"],
+        },
+        "transports": transports,
+        "wheels": {
+            name: {"sha256": digest * 64, "size": 1}
+            for name, digest in (
+                ("cuda_plugin", "b"),
+                ("cuda_pjrt", "c"),
+                ("jaxlib", "d"),
+            )
+        },
+    }
+
+
+def test_parse_ptxas_resources_requires_one_register_and_zero_or_reported_spills() -> None:
+    assert parse_ptxas_resources("Used 32 registers\n0 bytes spill stores, 0 bytes spill loads") == (32, 0)
+
+    with pytest.raises(ValueError):
+        parse_ptxas_resources("Used 32 registers\nUsed 33 registers\n0 bytes spill stores, 0 bytes spill loads")
+
+
+def test_build_candidate_closes_four_transports_and_twenty_four_assemblies() -> None:
+    policy = _sealed_policy()
+    candidate = _candidate(policy)
+
+    validated = _validate_build_candidate_against_policy(candidate, policy)
+
+    assert sum(len(item["ptx_slices"]) for item in validated["transports"]) == 24
+    assert validated["status"] == "pre_hardware_build_candidate_not_authority"
+
+
+def test_build_candidate_stops_while_bazel_and_ptxas_identity_are_unsealed() -> None:
+    with pytest.raises(RuntimeError, match="explicitly unsealed"):
+        validate_build_candidate(_candidate())
+
+
+def test_assembly_stops_before_directory_write_or_ptxas_while_unsealed(tmp_path: Path) -> None:
+    output = tmp_path / "assembly"
+
+    with pytest.raises(RuntimeError, match="explicitly unsealed"):
+        assemble_transports(output, {}, tmp_path / "must-not-run-ptxas")
+
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("mutation", ["status", "policy", "slice", "spill", "toolchain", "source", "command"])
+def test_build_candidate_rejects_self_consistent_semantic_drift(mutation: str) -> None:
+    policy = _sealed_policy()
+    candidate = deepcopy(_candidate(policy))
+    if mutation == "status":
+        candidate["status"] = "sealed"
+    elif mutation == "policy":
+        candidate["transports"][2]["policy"] = "source_ordered"
+    elif mutation == "slice":
+        candidate["transports"][1]["ptx_slices"].pop()
+        candidate["transports"][1]["launches"] = 9
+    elif mutation == "spill":
+        candidate["transports"][3]["ptx_slices"][8]["spill_bytes"] = 4
+    elif mutation == "toolchain":
+        candidate["toolchain"]["target"] = "sm_89"
+    elif mutation == "source":
+        candidate["source"]["jax_commit"] = "f" * 40
+    else:
+        candidate["commands"][0].append("--drift")
+
+    with pytest.raises(ValueError):
+        _validate_build_candidate_against_policy(candidate, policy)
+
+
+@pytest.mark.parametrize("field", ["bazel_path", "bazel_sha256", "ptxas_path", "ptxas_sha256"])
+def test_build_candidate_requires_controller_pinned_tool_identity(field: str) -> None:
+    policy = _sealed_policy()
+    candidate = _candidate(policy)
+    candidate["toolchain"][field] = "/different/tool" if field.endswith("path") else "b" * 64
+
+    with pytest.raises(ValueError):
+        _validate_build_candidate_against_policy(candidate, policy)

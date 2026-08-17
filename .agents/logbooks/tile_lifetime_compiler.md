@@ -5081,3 +5081,103 @@ author: dlwh
   push, integration, or scorecard state changed. Production remains stopped
   until a separately authorized acquisition supplies and verifies the exact
   official artifact and license evidence.
+
+### 2026-08-14 06:20 PDT - TLTC-MLIR-027 ABI 15 controller receipt red contract
+
+- Hypothesis: a controller-only Ed25519 signer can close the gap between the
+  task-authored raw export and an accepted terminal result without exposing a
+  signing capability to the task. The task may exit successfully only after it
+  verifies an `ACK` for the exact running attempt; acceptance additionally
+  requires a chained `TERMINAL` receipt issued after Iris records that attempt
+  and job as succeeded.
+- Commit hash: test-only checkpoint
+  `7ed55cef5549042e17f5b00bde794b3d5277b38f`, tree
+  `fb6b09fd59cb180d8221cbc9e54c628faf68921f`, rooted at the independently
+  reviewed unsealed ABI15 harness `f12f93c0ff0793a359d905331a4074d1df583692`.
+- Contract: canonical JSON binds the domain
+  `marin.shuttle.abi15.evidence-receipt.v1`, cluster and controller identity,
+  one RFC 7638 key ID and SPKI public key, authorization/challenge, canonical
+  launch request, image/bundle/source/verifier identities, exact job/task and
+  zero-retry attempt, and closed `ACK`/`TERMINAL` payload schemas. The embedded
+  key is RFC 8032 public test-vector data. Receipt-authority approval, secret
+  projection, controller integration, image transfer, and hardware launch
+  remain null design stops.
+- Command:
+  `/Users/dlwh/src/marin/.venv/bin/python -m pytest -q --tb=no lib/shuttle/mlir/jax_patch/test_abi15_h100_receipt_red_contract.py`.
+- Result: 38 cases collected. The canonical/unsealed contract check passes;
+  the remaining 37 fail only because `abi15_h100_receipt_verify` and
+  `iris.cluster.controller.shuttle_receipts` do not exist. Mutations cover
+  caller-resigned launch/attempt substitutions, task-forged keys, previous-key
+  fallback, open and weakly typed schemas, replay, nonzero exit, wrong states,
+  nonmonotonic log sequence, task use of a terminal record as an ACK, and
+  persistent per-stage idempotency.
+- Tooling: `./infra/pre-commit.py --changed-files --fix` passes when the
+  isolated worktree uses the existing repository virtual environment. No
+  dependency download, network call, image action, Iris mutation, hardware
+  reservation, push, or integration occurred.
+- Next action: obtain explicit approval for the controller receipt trust root,
+  then implement the task-side verifier and controller-side persistent signer
+  red-to-green. Capsule transfer and H100 launch remain separate approvals.
+
+### 2026-08-14 14:10 PDT - TLTC-MLIR-028 ABI 15 receipt contract closure
+
+- The controller receipt red contract now binds deterministic
+  `LaunchJobRequest` protobuf bytes rather than a caller-supplied launch
+  digest. The request requires one task, controller-minted attempt zero,
+  failure/preemption/task-failure retries all zero, and error-on-existing
+  behavior. Test fixtures persist the request through a real `ControllerDB`,
+  reconstruct it byte-for-byte, and use the UID minted when Iris inserts the
+  attempt.
+- Controller issuance accepts retrieved evidence paths, invokes an internal
+  verifier over the actual archive and export manifest, derives job/task/
+  attempt state from one database snapshot, and signs digests of the exact
+  request, READY record, archive, export manifest, verifier, and returned
+  report. The test contract rejects persisted request substitutions, changed
+  evidence/report bytes, invalid READY/TERMINAL identities, nonzero retries,
+  cross-attempt state, and partial or non-idempotent receipt persistence.
+  Issued ACK and TERMINAL bytes must pass the task-side verifier end to end.
+- Exact local series: initial red contract
+  `7ed55cef5549042e17f5b00bde794b3d5277b38f`; persistent controller-state
+  checkpoint `2a0ddf060e1953cc74db9e365ef1bcfae7411de3`; launch/request repair
+  `52f9d4b3f1ba5fac5ca7e7c155e9d3313351bce0`; issuance-join repair
+  `10439382eb104b07d49ad00b26ff404cbcb9873e`; reviewed final red contract
+  `c618559b1a6e55c2e6ef8f3e8427af3cb224f66b`, tree
+  `ecc6c4985d154cd899a7dbcbeca7e1122fa6e2d7`. Independent strict review
+  returned GO with no P1 or P2 findings.
+- The final red census collects 89 cases: two controller/request controls pass
+  and 87 fail only because the task verifier and controller receipt modules do
+  not exist. The unchanged ABI15 pre-image harness passes 157/157. Required
+  changed-files precommit passes with the existing local environment.
+- This is not receipt authority or launch approval. Controller integration,
+  secret projection, trust-root approval, image transfer, hardware launch, and
+  the two implementation modules remain absent or null. No network, image,
+  Iris, hardware, upload, push, or integration action occurred.
+
+### 2026-08-14 07:16 PDT - TLTC-MLIR-029 ABI 15 task receipt verification
+
+- Implemented task-side verification for canonical controller-signed `ACK`
+  and chained `TERMINAL` receipts. The verifier closes JSON schemas and types,
+  requires the current pinned Ed25519 key with no previous-key fallback, joins
+  launch and authority identities to the governing contract, enforces running
+  and succeeded states, and requires `READY < ACK < TERMINAL` sequence order.
+- Iris mints `attempt_uid` when it inserts an attempt, so the pre-run contract
+  cannot pin that value. The task accepts the well-formed UID in the exact
+  signed `ACK`; `TERMINAL` must repeat the same UID. A prior test that treated
+  the fixture UID as preauthorized was replaced with this controller-minting
+  behavior.
+- Exact local series: implementation
+  `b9c4c371c3857b756ebd25038bd8705d0a3dea1e`; contract-metadata repair
+  `260d90329415322a2edecceb472bc78745a47552`, tree
+  `46757967bbbc77396cc18c7e2f65ecd17d4264b8`. Independent strict review
+  approved the final tip with no P1 or P2 findings.
+- Task and contract coverage passes 58/58. The complete receipt census is
+  59 passed and 33 intentional failures, all at the absent controller receipt
+  module. The unchanged ABI15 pre-image harness passes 157/157. Required
+  changed-files precommit and both commit hooks pass.
+- Controller issuance remains a design stop. A future implementation must
+  derive `READY` and `TERMINAL` records from a controller-owned log observation
+  interface and must not treat caller-supplied record files or fixture sequence
+  numbers as authority. Receipt-authority approval, signer integration, secret
+  projection, task success, image transfer, and hardware launch remain absent.
+  No network, Iris mutation, image, hardware, upload, push, or integration
+  action occurred.
