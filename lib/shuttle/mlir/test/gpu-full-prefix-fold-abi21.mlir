@@ -138,12 +138,12 @@
 // BWD-SAME: device_schema_version = 3 : i64
 // BWD-SAME: invocation_abi_schema_version = 3 : i64
 // BWD-SAME: transport_schema_version = 2 : i64
-// BWD: return %[[BWD]]#0, %[[BWD]]#1
+// BWD: return %[[BWD]]#1, %[[BWD]]#0
 // BWD-NOT: shuttle.
 // COMP: %[[COMP:[0-9]+]]:3 = stablehlo.custom_call @shuttle.gpu.executable_bundle.v2
 // COMP-SAME: bundle_schema_version = 2 : i64
 // COMP-SAME: device_schema_version = 3 : i64
 // COMP-SAME: invocation_abi_schema_version = 3 : i64
 // COMP-SAME: transport_schema_version = 2 : i64
-// COMP: return %[[COMP]]#0, %[[COMP]]#1, %[[COMP]]#2
+// COMP: return %[[COMP]]#0, %[[COMP]]#2, %[[COMP]]#1
 // COMP-NOT: shuttle.

@@ -31,5 +31,5 @@
 // GEOMETRY: {{requires a bounded set of independently connected static GPU algebra regions|schedule geometry must equal the SIMT32 derivation}}
 // AXIS: {{requires a bounded set of independently connected static GPU algebra regions|Fold schedule kind must match its reduction axis}}
 // ORDER: {{requires a bounded set of independently connected static GPU algebra regions|Fold reduction order must equal bound Fold semantics}}
-// LIFETIME: {{requires a bounded set of independently connected static GPU algebra regions|schedule buffer lifetime}}
+// LIFETIME: {{requires a bounded set of independently connected static GPU algebra regions|schedule buffer type and lifetime}}
 // PTX: {{requires a bounded set of independently connected static GPU algebra regions|CUDA PTX slice is not the closed SM90 form}}

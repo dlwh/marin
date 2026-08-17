@@ -2897,7 +2897,7 @@ TEST(GpuTransportV2Test,
        128, 1060, 532, 38, -1, -1},
       {"3x2x5x11x263", {3, 2, 5, 11, 263}, {1, 1, 1, 1, 263},
        {263}, 330, 263, 256, 2, 1024, 347156, 173580, 526,
-       5755082, 6622982},
+       5580976, 6275296},
   };
   struct Boundary {
     llvm::StringRef name;
@@ -2940,14 +2940,14 @@ TEST(GpuTransportV2Test,
                 ? std::vector<int64_t>{shape.fullPublicBytes,
                                        shape.featurePublicBytes,
                                        shape.fullPublicBytes,
-                                       shape.fullPublicBytes,
-                                       shape.featurePublicBytes}
+                                       shape.featurePublicBytes,
+                                       shape.fullPublicBytes}
                 : std::vector<int64_t>{shape.fullPublicBytes,
                                        shape.featurePublicBytes,
                                        shape.fullPublicBytes,
                                        shape.fullPublicBytes,
-                                       shape.fullPublicBytes,
-                                       shape.featurePublicBytes};
+                                       shape.featurePublicBytes,
+                                       shape.fullPublicBytes};
         ASSERT_EQ((*loaded)->externalBindings().size(),
                   expectedBindingBytes.size());
         for (auto [binding, expectedBytes] : llvm::zip_equal(
