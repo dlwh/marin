@@ -42,8 +42,8 @@ def test_contract_closes_architecture_metamorphic_and_acceptance_tiers() -> None
         "backward": 167_804_936,
         "composed": 167_804_936,
     }
-    assert contract.numerical_policy_status == "pending_independent_review"
-    assert "numerical_policy_contract_pending" in contract.readiness_blockers
+    assert contract.numerical_policy_status == "predeclared_unexecuted"
+    assert "representative_numerical_evidence_missing" in contract.readiness_blockers
     assert all("resource" not in blocker for blocker in contract.readiness_blockers)
 
 

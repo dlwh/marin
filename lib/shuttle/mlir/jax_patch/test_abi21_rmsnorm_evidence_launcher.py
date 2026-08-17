@@ -10,7 +10,7 @@ def test_launcher_rejects_before_external_or_hardware_action() -> None:
     blockers = readiness_blockers()
 
     assert blockers == (
-        "numerical_policy_contract_pending",
+        "representative_numerical_evidence_missing",
         "sealed_build_identity_missing",
         "sealed_image_identity_missing",
         "controller_authority_missing",
