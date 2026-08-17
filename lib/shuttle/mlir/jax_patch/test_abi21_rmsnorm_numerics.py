@@ -3,11 +3,13 @@
 
 from dataclasses import replace
 
+from abi15_h100_numerics import bf16_sha256
 from abi21_rmsnorm_numerics import (
     FEATURE_COUNT,
     ROW_COUNT,
     architecture_inputs,
-    bf16_sha256,
+    binary64_reference,
+    error_metrics,
     schedule_reference,
 )
 from abi21_rmsnorm_prehardware_contract import load_contract
@@ -53,3 +55,21 @@ def test_schedule_reference_keeps_finite_bf16_public_outputs() -> None:
     for values in (outputs.result, outputs.input_cotangent, outputs.weight_cotangent):
         assert values
         assert all(value & 0x7F80 != 0x7F80 for value in values)
+
+
+def test_schedule_reference_satisfies_independent_binary64_role_limits() -> None:
+    inputs = architecture_inputs()
+    schedule = schedule_reference(inputs)
+    analytic = binary64_reference(inputs)
+    limits = {
+        "result": (0.0078125, 0.002, 0.00390625, 1),
+        "input_cotangent": (0.0078125, 0.002, 0.00390625, 1),
+        "weight_cotangent": (0.03125, 0.015625, 0.00390625, 1),
+    }
+
+    for role, expected_limits in limits.items():
+        metrics = error_metrics(getattr(schedule, role), getattr(analytic, role))
+        assert metrics.maximum_absolute_error <= expected_limits[0]
+        assert metrics.mean_absolute_error <= expected_limits[1]
+        assert metrics.relative_linf_error <= expected_limits[2]
+        assert metrics.maximum_bf16_ulp_error <= expected_limits[3]

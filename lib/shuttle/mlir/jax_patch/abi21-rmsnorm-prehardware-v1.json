@@ -1,0 +1,160 @@
+{
+  "authority": {
+    "build_manifest_sha256": null,
+    "controller_trust_root_sha256": null,
+    "image_digest": null,
+    "launch_authorization_sha256": null,
+    "source_capsule_sha256": null,
+    "status": "not_authorized"
+  },
+  "contract_id": "shuttle_abi21_rmsnorm_prehardware_v1",
+  "dependencies": {
+    "architecture_contract": "abi21-rmsnorm-prehardware-architecture-v1.json",
+    "architecture_contract_sha256": "c055064bd84f072bd92eb3865ddc84ec643ff09077c8c5ca7f3030de942d6f89",
+    "role_manifest": "abi21-rmsnorm-prehardware-role-paths-v1.json",
+    "role_manifest_sha256": "b115df249b8d54053c6c42817d0f887dbdcab290b13e0b5205b497ce07e281bf"
+  },
+  "matrix": {
+    "acceptance_cells": 12,
+    "boundaries": [
+      "forward",
+      "backward",
+      "composed"
+    ],
+    "hardware": [
+      "h100",
+      "b200"
+    ],
+    "policies": [
+      "source_ordered",
+      "fast"
+    ]
+  },
+  "numerical_oracle": {
+    "analytic_limits": {
+      "input_cotangent": {
+        "maximum_absolute_error": 0.0078125,
+        "maximum_bf16_ulp_error": 1,
+        "mean_absolute_error": 0.002,
+        "relative_linf_error": 0.00390625
+      },
+      "result": {
+        "maximum_absolute_error": 0.0078125,
+        "maximum_bf16_ulp_error": 1,
+        "mean_absolute_error": 0.002,
+        "relative_linf_error": 0.00390625
+      },
+      "weight_cotangent": {
+        "maximum_absolute_error": 0.03125,
+        "maximum_bf16_ulp_error": 1,
+        "mean_absolute_error": 0.015625,
+        "relative_linf_error": 0.00390625
+      }
+    },
+    "input_sha256": {
+      "output_cotangent": "2e8a86ec06b84193c2bda9b22c9a784832130f9b4ef47f1f17c24d02f0b584af",
+      "weight": "0715b79e452102ba014450de597ceee8d194de80554f2bf4439b9be701111b39",
+      "x": "75698d1c142f9a463a82692df757d84590741b1c1ea47dcba56b1c2baa3ffbc1"
+    },
+    "reference_output_sha256": {
+      "input_cotangent": "2ecd30f160fc25a0f957c31c8e78096aef8c8922392266b97ae0ee7a22de2a83",
+      "result": "647c1ea7dd6c8f61cbeb2fb78e3fd35d6ce7d2d8b6dd4d0b4ef93ee0fe297289",
+      "weight_cotangent": "e30f769283a3b34c531526f894fb1c52d3c86a340b36f0cad2a771ef787d96ff"
+    },
+    "schedule_recurrence": {
+      "accumulator_type": "f32",
+      "epsilon": "1e-6",
+      "public_rounding": "round_nearest_even_bf16",
+      "reduction_order": "tree_association_free_leaf_order_fixed",
+      "rsqrt_realization": "sqrt_rn_f32_then_divide"
+    }
+  },
+  "numerical_policy": {
+    "analytic_thresholds_required": true,
+    "imported_target1_v1": false,
+    "normalized_code_equality_required": true,
+    "ordinary_jax_role": "recorded_comparator_optional_stronger_result",
+    "schedule_reference_required": true,
+    "status": "predeclared_unexecuted"
+  },
+  "pipeline_abi_version": 21,
+  "process_contract": {
+    "cache_entries_after_populate": 6,
+    "observer_events_after_populate": 18,
+    "observer_phases": [
+      "algebra_coverage",
+      "generated_bundle",
+      "final_erasure"
+    ],
+    "populate_hits": 0,
+    "processes": [
+      "baseline",
+      "populate",
+      "reuse"
+    ],
+    "reuse_hits": 6,
+    "reuse_observer_events": 0
+  },
+  "readiness_blockers": [
+    "representative_numerical_evidence_missing",
+    "sealed_build_identity_missing",
+    "sealed_image_identity_missing",
+    "controller_authority_missing",
+    "sm100_codegen_missing",
+    "h100_execution_missing",
+    "b200_execution_missing",
+    "performance_contract_pending"
+  ],
+  "schema_version": 1,
+  "shape_tiers": {
+    "acceptance": {
+      "dimensions": [
+        2048,
+        4096
+      ],
+      "hardware": [
+        "h100",
+        "b200"
+      ],
+      "live_temporary_bytes": {
+        "backward": 167804936,
+        "composed": 167804936
+      },
+      "role": "target1_scorecard",
+      "status": "blocked"
+    },
+    "architecture_execution": {
+      "dimensions": [
+        2,
+        7,
+        19
+      ],
+      "feature_count": 19,
+      "flattened_rows": 14,
+      "role": "untimed_runtime_cache_observer_numerical",
+      "status": "prehardware_not_executed"
+    },
+    "metamorphic_compile": {
+      "dimensions": [
+        3,
+        2,
+        5,
+        11,
+        263
+      ],
+      "feature_count": 263,
+      "flattened_rows": 330,
+      "role": "compile_only_rank_witness",
+      "status": "local_only"
+    }
+  },
+  "source_boundary": {
+    "accumulator_type": "f32",
+    "automatic_differentiation": "jax_owned_vjp",
+    "epsilon": "1e-6",
+    "jax_version": "0.10.1",
+    "jaxlib_version": "0.10.1",
+    "public_type": "bf16"
+  },
+  "status": "local_unsealed_prehardware_design"
+}

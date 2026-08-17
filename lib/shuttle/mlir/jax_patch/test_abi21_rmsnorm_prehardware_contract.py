@@ -84,6 +84,8 @@ def test_architecture_contract_binds_raw_and_live_hook_topologies() -> None:
         ("policy_identity", "policy identity"),
         ("bitwise_gate", "ordinary JAX comparator"),
         ("old_contract", "Target-1 v1"),
+        ("schedule_order", "schedule-derived recurrence"),
+        ("analytic_limit", "binary64 analytic threshold"),
         ("architecture_digest", "architecture contract"),
     ],
 )
@@ -105,6 +107,10 @@ def test_contract_rejects_self_consistent_scope_policy_or_authority_mutation(mut
         document["numerical_policy"]["ordinary_jax_role"] = "bitwise_acceptance_gate"
     elif mutation == "old_contract":
         document["numerical_policy"]["imported_target1_v1"] = True
+    elif mutation == "schedule_order":
+        document["numerical_oracle"]["schedule_recurrence"]["reduction_order"] = "serial"
+    elif mutation == "analytic_limit":
+        document["numerical_oracle"]["analytic_limits"]["result"]["maximum_absolute_error"] = 0.0
     else:
         document["dependencies"]["architecture_contract_sha256"] = "a" * 64
 

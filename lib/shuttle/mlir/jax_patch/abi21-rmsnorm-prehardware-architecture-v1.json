@@ -1,0 +1,189 @@
+{
+  "executed_matrix": {
+    "boundaries": [
+      "forward",
+      "backward",
+      "composed"
+    ],
+    "policies": [
+      "source_ordered",
+      "fast"
+    ],
+    "ptx_slices": 216,
+    "shape": [
+      2,
+      7,
+      19
+    ]
+  },
+  "metamorphic_column_folds": {
+    "main": {
+      "block_threads": 256,
+      "feature_count": 263,
+      "grid": 263,
+      "reduction_extent": 330,
+      "scratch_bytes": 1024,
+      "serial_tiles": 2,
+      "tile_shape": [
+        256,
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    "singleton": {
+      "block_threads": 32,
+      "feature_count": 263,
+      "grid": 263,
+      "reduction_extent": 1,
+      "scratch_bytes": 128,
+      "serial_tiles": 1,
+      "tile_shape": [
+        1,
+        1,
+        1,
+        1,
+        1
+      ]
+    }
+  },
+  "pipeline_abi_version": 21,
+  "public_boundaries": {
+    "backward": {
+      "inputs": [
+        "x",
+        "weight",
+        "output_cotangent"
+      ],
+      "outputs": [
+        "input_cotangent",
+        "weight_cotangent"
+      ]
+    },
+    "composed": {
+      "inputs": [
+        "x",
+        "weight",
+        "output_cotangent"
+      ],
+      "outputs": [
+        "result",
+        "input_cotangent",
+        "weight_cotangent"
+      ]
+    },
+    "forward": {
+      "inputs": [
+        "x",
+        "weight"
+      ],
+      "outputs": [
+        "result"
+      ]
+    }
+  },
+  "raw_fixture_topology": {
+    "backward": {
+      "external_bindings": 5,
+      "launches": 48,
+      "public_result_projection": [
+        1,
+        0
+      ],
+      "slots": 51,
+      "task_census": {
+        "column_fold": 2,
+        "map": 43,
+        "row_fold": 3
+      },
+      "temporary_slots": 46
+    },
+    "composed": {
+      "external_bindings": 6,
+      "launches": 51,
+      "public_result_projection": [
+        0,
+        2,
+        1
+      ],
+      "slots": 54,
+      "task_census": {
+        "column_fold": 2,
+        "map": 46,
+        "row_fold": 3
+      },
+      "temporary_slots": 48
+    },
+    "forward": {
+      "external_bindings": 3,
+      "launches": 19,
+      "public_result_projection": [
+        0
+      ],
+      "slots": 21,
+      "task_census": {
+        "column_fold": 0,
+        "map": 18,
+        "row_fold": 1
+      },
+      "temporary_slots": 18
+    }
+  },
+  "schema_version": 1,
+  "schemas": {
+    "bundle": 2,
+    "device": 3,
+    "invocation": 3,
+    "transport": 2
+  },
+  "status": "local_unsealed_architecture_design",
+  "target": "shuttle.gpu.executable_bundle.v2",
+  "xla_hook_topology": {
+    "backward": {
+      "external_bindings": 5,
+      "launches": 43,
+      "public_result_projection": [
+        1,
+        0
+      ],
+      "slots": 46,
+      "task_census": {
+        "column_fold": 2,
+        "map": 38,
+        "row_fold": 3
+      },
+      "temporary_slots": 41
+    },
+    "composed": {
+      "external_bindings": 6,
+      "launches": 46,
+      "public_result_projection": [
+        0,
+        2,
+        1
+      ],
+      "slots": 49,
+      "task_census": {
+        "column_fold": 2,
+        "map": 41,
+        "row_fold": 3
+      },
+      "temporary_slots": 43
+    },
+    "forward": {
+      "external_bindings": 3,
+      "launches": 19,
+      "public_result_projection": [
+        0
+      ],
+      "slots": 21,
+      "task_census": {
+        "column_fold": 0,
+        "map": 18,
+        "row_fold": 1
+      },
+      "temporary_slots": 18
+    }
+  }
+}
