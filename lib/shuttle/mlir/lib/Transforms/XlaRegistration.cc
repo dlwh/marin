@@ -157,7 +157,7 @@ parseShuttleXlaOptions(absl::string_view serializedOptions) {
     return invalidOptions("field 'schema_version' must be integer 1");
   }
   if (object->getInteger("pipeline_abi_version") != kPipelineAbiVersion) {
-    return invalidOptions("field 'pipeline_abi_version' must be integer 20");
+    return invalidOptions("field 'pipeline_abi_version' must be integer 21");
   }
 
   std::optional<llvm::StringRef> numerics = object->getString("numerics");

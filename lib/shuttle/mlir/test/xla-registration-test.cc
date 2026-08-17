@@ -146,9 +146,13 @@ TEST(ShuttleXlaOptionsTest, RejectsAdjacentGpuPipelineAbis) {
       R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":20,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
       R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
   };
-  for (const char *serialized : invalid)
-    EXPECT_EQ(mlir::shuttle::parseShuttleXlaOptions(serialized).status().code(),
-              absl::StatusCode::kInvalidArgument);
+  for (const char *serialized : invalid) {
+    auto parsed = mlir::shuttle::parseShuttleXlaOptions(serialized);
+    ASSERT_FALSE(parsed.ok());
+    EXPECT_EQ(parsed.status().code(), absl::StatusCode::kInvalidArgument);
+    EXPECT_NE(std::string(parsed.status().message()).find("integer 21"),
+              std::string::npos);
+  }
 }
 
 TEST(ShuttleXlaOptionsTest, Abi21PreservesCanonicalSourceOrderedFoldMapOptions) {
