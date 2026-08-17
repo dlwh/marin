@@ -81,11 +81,16 @@ def test_architecture_contract_binds_raw_and_live_hook_topologies() -> None:
         ("live_bytes", "live temporary"),
         ("drop_boundary", "boundary matrix"),
         ("authorize", "authority"),
-        ("policy_identity", "policy identity"),
+        ("schedule_identity", "schedule identity"),
+        ("ptx_identity", "PTX identity"),
+        ("fast_divergence", "FAST divergence"),
         ("bitwise_gate", "ordinary JAX comparator"),
         ("old_contract", "Target-1 v1"),
         ("schedule_order", "schedule-derived recurrence"),
+        ("schedule_tree", "schedule-derived recurrence"),
+        ("initializer_placement", "schedule-derived recurrence"),
         ("analytic_limit", "binary64 analytic threshold"),
+        ("process_snapshot", "process, cache, or observer"),
         ("architecture_digest", "architecture contract"),
     ],
 )
@@ -101,16 +106,26 @@ def test_contract_rejects_self_consistent_scope_policy_or_authority_mutation(mut
     elif mutation == "authorize":
         document["authority"]["status"] = "authorized"
         document["authority"]["image_digest"] = "sha256:" + "a" * 64
-    elif mutation == "policy_identity":
-        document["numerical_policy"]["normalized_code_equality_required"] = False
+    elif mutation == "schedule_identity":
+        document["numerical_policy"]["normalized_schedule_equality_required"] = False
+    elif mutation == "ptx_identity":
+        document["numerical_policy"]["normalized_ptx_equality_required"] = False
+    elif mutation == "fast_divergence":
+        document["numerical_policy"]["fast_divergence_action"] = "warn"
     elif mutation == "bitwise_gate":
         document["numerical_policy"]["ordinary_jax_role"] = "bitwise_acceptance_gate"
     elif mutation == "old_contract":
         document["numerical_policy"]["imported_target1_v1"] = True
     elif mutation == "schedule_order":
         document["numerical_oracle"]["schedule_recurrence"]["reduction_order"] = "serial"
+    elif mutation == "schedule_tree":
+        document["numerical_oracle"]["schedule_recurrence"]["schedule_tree"] = "shuffle_down"
+    elif mutation == "initializer_placement":
+        document["numerical_oracle"]["schedule_recurrence"]["initializer_placement"] = "per_leaf"
     elif mutation == "analytic_limit":
         document["numerical_oracle"]["analytic_limits"]["result"]["maximum_absolute_error"] = 0.0
+    elif mutation == "process_snapshot":
+        document["process_contract"]["populate_cache_entries_before"] = 1
     else:
         document["dependencies"]["architecture_contract_sha256"] = "a" * 64
 
@@ -152,6 +167,10 @@ def test_role_manifest_expands_only_the_bounded_runtime_and_compile_witness() ->
     assert "ptx_fast_backward_43" not in roles
     assert roles["cubin_source_ordered_forward_18"] == "assembly/source_ordered/forward/entry-18.cubin"
     assert roles["cache_entry_fast_composed"] == "cache/entries/fast/composed.bin"
+    assert roles["cache_snapshot_populate_before"] == "cache/snapshots/populate-before.json"
+    assert roles["cache_snapshot_reuse_after"] == "cache/snapshots/reuse-after.json"
+    assert roles["process_baseline"] == "process/baseline.json"
+    assert roles["policy_identity_composed"] == "compiler/policy-identity/composed.json"
     assert roles["output_source_ordered_backward_thread_1_input_cotangent"] == (
         "outputs/source_ordered/backward/thread_1/input-cotangent.bf16"
     )
@@ -160,7 +179,7 @@ def test_role_manifest_expands_only_the_bounded_runtime_and_compile_witness() ->
     assert len(roles) == len(set(roles.values()))
 
 
-@pytest.mark.parametrize("mutation", ["drop_policy", "extra_launch", "alias_path", "acceptance_role"])
+@pytest.mark.parametrize("mutation", ["drop_policy", "extra_launch", "alias_path", "drop_snapshot", "acceptance_role"])
 def test_role_manifest_rejects_open_or_collapsed_role_roster(mutation: str) -> None:
     document = deepcopy(_document(ROLE_MANIFEST_FILENAME))
     if mutation == "drop_policy":
@@ -169,6 +188,8 @@ def test_role_manifest_rejects_open_or_collapsed_role_roster(mutation: str) -> N
         document["calls"]["backward"].append(43)
     elif mutation == "alias_path":
         document["static_roles"]["architecture_contract"] = document["static_roles"]["contract"]
+    elif mutation == "drop_snapshot":
+        del document["static_roles"]["cache_snapshot_reuse_after"]
     else:
         document["static_roles"]["accepted_bundle"] = "accepted/bundle.json"
 

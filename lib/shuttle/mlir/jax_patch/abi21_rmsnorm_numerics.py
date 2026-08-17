@@ -82,20 +82,34 @@ def _sqrt(value: int) -> int:
     source = f32_bits_to_fraction(value)
     if source < 0:
         raise ValueError("RMSNorm variance must be nonnegative")
-    return _f32(Fraction.from_float(math.sqrt(float(source))))
+    if source == 0:
+        return 0
+    low = 0
+    high = 0x7F7FFFFF
+    while low < high:
+        candidate = (low + high + 1) // 2
+        if f32_bits_to_fraction(candidate) ** 2 <= source:
+            low = candidate
+        else:
+            high = candidate - 1
+    lower = f32_bits_to_fraction(low)
+    upper_bits = low + 1
+    upper = f32_bits_to_fraction(upper_bits)
+    midpoint = (lower + upper) / 2
+    if source < midpoint**2 or (source == midpoint**2 and low % 2 == 0):
+        return low
+    return upper_bits
 
 
-def _tree_fold(values: tuple[int, ...]) -> int:
+def schedule_tree_sum(values: tuple[int, ...]) -> int:
+    """Reduce one f32 leaf tile with ABI21's emitted adjacent-pair tree."""
     if not values or len(values) > 32:
         raise ValueError("the architecture oracle requires one nonempty SIMT32 leaf tile")
-    lanes = [0] * 32
-    for index, value in enumerate(values):
-        lanes[index] = _add(lanes[index], value)
-    for offset in (16, 8, 4, 2, 1):
-        previous = lanes.copy()
-        for lane in range(32 - offset):
-            lanes[lane] = _add(previous[lane], previous[lane + offset])
-    return lanes[0]
+    width = 1 << (len(values) - 1).bit_length()
+    level = [*values, *([0] * (width - len(values)))]
+    while len(level) > 1:
+        level = [_add(level[index], level[index + 1]) for index in range(0, len(level), 2)]
+    return _add(level[0], 0)
 
 
 def _raw_bf16(numerator: int, denominator: int) -> int:
@@ -151,7 +165,7 @@ def schedule_reference(inputs: Inputs) -> Outputs:
         row_x = x[start : start + FEATURE_COUNT]
         row_dy = output_cotangent[start : start + FEATURE_COUNT]
         squares = tuple(_multiply(value, value) for value in row_x)
-        mean_square = _divide(_tree_fold(squares), feature_count)
+        mean_square = _divide(schedule_tree_sum(squares), feature_count)
         variance_epsilon = _add(mean_square, epsilon)
         inverse_rms = _divide(one, _sqrt(variance_epsilon))
         inverse_over_variance = _divide(inverse_rms, variance_epsilon)
@@ -160,10 +174,10 @@ def schedule_reference(inputs: Inputs) -> Outputs:
         normalized = tuple(_multiply(value, inverse_rms) for value in row_x)
         normalized_rows.append(normalized)
         weighted_cotangent = tuple(_multiply(dy, gamma) for dy, gamma in zip(row_dy, weight, strict=True))
-        correlation = _tree_fold(
+        correlation = schedule_tree_sum(
             tuple(_multiply(value, cotangent) for value, cotangent in zip(row_x, weighted_cotangent, strict=True))
         )
-        derivative_scale = _divide(_multiply(correlation, variance_scale), feature_count)
+        derivative_scale = schedule_tree_sum((_divide(_multiply(correlation, variance_scale), feature_count),))
 
         for value, normalized_value, gamma, cotangent in zip(row_x, normalized, weight, weighted_cotangent, strict=True):
             results.append(f32_bits_to_bf16_bits(_multiply(normalized_value, gamma)))
@@ -178,7 +192,7 @@ def schedule_reference(inputs: Inputs) -> Outputs:
             _multiply(normalized_rows[row][feature], output_cotangent[row * FEATURE_COUNT + feature])
             for row in range(ROW_COUNT)
         )
-        weight_cotangents.append(f32_bits_to_bf16_bits(_tree_fold(products)))
+        weight_cotangents.append(f32_bits_to_bf16_bits(schedule_tree_sum((schedule_tree_sum(products),))))
     return Outputs(tuple(results), tuple(input_cotangents), tuple(weight_cotangents))
 
 

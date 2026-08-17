@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import replace
+from fractions import Fraction
 
-from abi15_h100_numerics import bf16_sha256
+from abi15_h100_numerics import bf16_sha256, fraction_to_f32_bits
 from abi21_rmsnorm_numerics import (
     FEATURE_COUNT,
     ROW_COUNT,
@@ -11,6 +12,7 @@ from abi21_rmsnorm_numerics import (
     binary64_reference,
     error_metrics,
     schedule_reference,
+    schedule_tree_sum,
 )
 from abi21_rmsnorm_prehardware_contract import load_contract
 
@@ -47,6 +49,13 @@ def test_schedule_reference_detects_one_bit_input_drift() -> None:
 
     assert bf16_sha256(changed.result) != bf16_sha256(baseline.result)
     assert bf16_sha256(changed.input_cotangent) != bf16_sha256(baseline.input_cotangent)
+
+
+def test_schedule_tree_uses_emitted_contiguous_pair_association() -> None:
+    large = fraction_to_f32_bits(Fraction(10**20))
+    leaves = (large, large ^ 0x80000000, fraction_to_f32_bits(Fraction(1)))
+
+    assert schedule_tree_sum(leaves) == fraction_to_f32_bits(Fraction(1))
 
 
 def test_schedule_reference_keeps_finite_bf16_public_outputs() -> None:

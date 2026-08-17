@@ -21,9 +21,9 @@ from abi21_rmsnorm_numerics import (
 CONTRACT_FILENAME = "abi21-rmsnorm-prehardware-v1.json"
 ARCHITECTURE_FILENAME = "abi21-rmsnorm-prehardware-architecture-v1.json"
 ROLE_MANIFEST_FILENAME = "abi21-rmsnorm-prehardware-role-paths-v1.json"
-CONTRACT_SHA256 = "df0b288c54e12f749a438bf917978754825535c618e58bb759459af1c62d11ba"
+CONTRACT_SHA256 = "af0e048a4f6bb51fe220742525c2aaf0f9d614135e11ba94f040ec9c2a8c720f"
 ARCHITECTURE_SHA256 = "c055064bd84f072bd92eb3865ddc84ec643ff09077c8c5ca7f3030de942d6f89"
-ROLE_MANIFEST_SHA256 = "b115df249b8d54053c6c42817d0f887dbdcab290b13e0b5205b497ce07e281bf"
+ROLE_MANIFEST_SHA256 = "dd76280e915ae8334216dbef61aa829db2aea45f402b4a4205dfef3af48716ca"
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
 BOUNDARIES = ("forward", "backward", "composed")
@@ -53,11 +53,21 @@ EXECUTION_RUNS = ("first", "sequential", "thread_0", "thread_1", "reuse")
 COMPILE_WITNESS_ROLES = ("algebra", "plan", "schedule", "final_mlir", "descriptor", "ptx_witness")
 STATIC_ROLES = {
     "architecture_contract": "contract/architecture.json",
+    "cache_snapshot_populate_after": "cache/snapshots/populate-after.json",
+    "cache_snapshot_populate_before": "cache/snapshots/populate-before.json",
+    "cache_snapshot_reuse_after": "cache/snapshots/reuse-after.json",
+    "cache_snapshot_reuse_before": "cache/snapshots/reuse-before.json",
     "contract": "contract/prehardware.json",
     "input_output_cotangent": "inputs/output-cotangent.bf16",
     "input_weight": "inputs/weight.bf16",
     "input_x": "inputs/x.bf16",
     "numerical_reference": "reference/schedule-derived.json",
+    "policy_identity_backward": "compiler/policy-identity/backward.json",
+    "policy_identity_composed": "compiler/policy-identity/composed.json",
+    "policy_identity_forward": "compiler/policy-identity/forward.json",
+    "process_baseline": "process/baseline.json",
+    "process_populate": "process/populate.json",
+    "process_reuse": "process/reuse.json",
     "role_manifest": "contract/role-paths.json",
     "source_allowlist": "contract/source-allowlist.json",
 }
@@ -408,9 +418,13 @@ def _validate_numerical_oracle(value: object) -> tuple[dict[str, str], dict[str,
     if oracle["schedule_recurrence"] != {
         "accumulator_type": "f32",
         "epsilon": "1e-6",
+        "initializer_placement": "single_final_f32_add",
+        "leaf_assignment": "contiguous_lane_order",
+        "padding": "positive_zero_to_next_power_of_two",
         "public_rounding": "round_nearest_even_bf16",
         "reduction_order": "tree_association_free_leaf_order_fixed",
         "rsqrt_realization": "sqrt_rn_f32_then_divide",
+        "schedule_tree": "contiguous_pair_balanced_next_power_of_two",
     }:
         raise ValueError("schedule-derived recurrence drift")
     inputs = architecture_inputs()
@@ -527,8 +541,10 @@ def validate_contract_document(document: dict[str, Any]) -> None:
         root["numerical_policy"],
         {
             "analytic_thresholds_required",
+            "fast_divergence_action",
             "imported_target1_v1",
-            "normalized_code_equality_required",
+            "normalized_ptx_equality_required",
+            "normalized_schedule_equality_required",
             "ordinary_jax_role",
             "schedule_reference_required",
             "status",
@@ -539,12 +555,18 @@ def validate_contract_document(document: dict[str, Any]) -> None:
         raise ValueError("immutable Target-1 v1 numerical gate must not be imported")
     if policy["ordinary_jax_role"] != "recorded_comparator_optional_stronger_result":
         raise ValueError("ordinary JAX comparator must not become a bitwise acceptance gate")
-    if policy["normalized_code_equality_required"] is not True:
-        raise ValueError("SOURCE_ORDERED and FAST policy identity proof drift")
+    if policy["normalized_schedule_equality_required"] is not True:
+        raise ValueError("SOURCE_ORDERED and FAST normalized schedule identity proof drift")
+    if policy["normalized_ptx_equality_required"] is not True:
+        raise ValueError("SOURCE_ORDERED and FAST normalized PTX identity proof drift")
+    if policy["fast_divergence_action"] != "stop":
+        raise ValueError("FAST divergence action must remain stop")
     if policy != {
         "analytic_thresholds_required": True,
+        "fast_divergence_action": "stop",
         "imported_target1_v1": False,
-        "normalized_code_equality_required": True,
+        "normalized_ptx_equality_required": True,
+        "normalized_schedule_equality_required": True,
         "ordinary_jax_role": "recorded_comparator_optional_stronger_result",
         "schedule_reference_required": True,
         "status": "predeclared_unexecuted",
@@ -566,7 +588,10 @@ def validate_contract_document(document: dict[str, Any]) -> None:
         "observer_events_after_populate": 18,
         "observer_phases": ["algebra_coverage", "generated_bundle", "final_erasure"],
         "populate_hits": 0,
+        "populate_cache_entries_before": 0,
         "processes": ["baseline", "populate", "reuse"],
+        "reuse_cache_entries_after": 6,
+        "reuse_cache_entries_before": 6,
         "reuse_hits": 6,
         "reuse_observer_events": 0,
     }:

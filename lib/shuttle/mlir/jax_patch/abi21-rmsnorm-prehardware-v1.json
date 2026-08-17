@@ -12,7 +12,7 @@
     "architecture_contract": "abi21-rmsnorm-prehardware-architecture-v1.json",
     "architecture_contract_sha256": "c055064bd84f072bd92eb3865ddc84ec643ff09077c8c5ca7f3030de942d6f89",
     "role_manifest": "abi21-rmsnorm-prehardware-role-paths-v1.json",
-    "role_manifest_sha256": "b115df249b8d54053c6c42817d0f887dbdcab290b13e0b5205b497ce07e281bf"
+    "role_manifest_sha256": "dd76280e915ae8334216dbef61aa829db2aea45f402b4a4205dfef3af48716ca"
   },
   "matrix": {
     "acceptance_cells": 12,
@@ -64,15 +64,21 @@
     "schedule_recurrence": {
       "accumulator_type": "f32",
       "epsilon": "1e-6",
+      "initializer_placement": "single_final_f32_add",
+      "leaf_assignment": "contiguous_lane_order",
+      "padding": "positive_zero_to_next_power_of_two",
       "public_rounding": "round_nearest_even_bf16",
       "reduction_order": "tree_association_free_leaf_order_fixed",
-      "rsqrt_realization": "sqrt_rn_f32_then_divide"
+      "rsqrt_realization": "sqrt_rn_f32_then_divide",
+      "schedule_tree": "contiguous_pair_balanced_next_power_of_two"
     }
   },
   "numerical_policy": {
     "analytic_thresholds_required": true,
+    "fast_divergence_action": "stop",
     "imported_target1_v1": false,
-    "normalized_code_equality_required": true,
+    "normalized_ptx_equality_required": true,
+    "normalized_schedule_equality_required": true,
     "ordinary_jax_role": "recorded_comparator_optional_stronger_result",
     "schedule_reference_required": true,
     "status": "predeclared_unexecuted"
@@ -86,12 +92,15 @@
       "generated_bundle",
       "final_erasure"
     ],
+    "populate_cache_entries_before": 0,
     "populate_hits": 0,
     "processes": [
       "baseline",
       "populate",
       "reuse"
     ],
+    "reuse_cache_entries_after": 6,
+    "reuse_cache_entries_before": 6,
     "reuse_hits": 6,
     "reuse_observer_events": 0
   },
