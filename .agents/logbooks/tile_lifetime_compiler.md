@@ -5264,3 +5264,31 @@ author: dlwh
   RMSNorm evidence. Controller signing, image and build identities, H100/B200
   authority, task success, timing, and performance acceptance remain design
   stops. No external action occurred.
+
+### 2026-08-17 - TLTC-MLIR-033 ABI 21 representative resource correction
+
+- Corrected the historical resource interpretation in TLTC-MLIR-031 without
+  rewriting that append-only record. The `2048x4096` backward and composed
+  figures 537,083,940 and 604,192,804 bytes are sums of every logical
+  temporary before lifetime reuse. They are not the current GPU allocator or
+  bundle-admission footprint.
+- Exact ABI21 local pipelines construct, verify, serialize, and publicly reload
+  forward, backward, and composed GPU bundles under SOURCE_ORDERED and FAST.
+  At the actual XLA hook boundary, backward and composed each require
+  167,804,936 live temporary bytes, about 160.03 MiB, under the unchanged
+  256 MiB cap. Their physical task-position totals are 144,943,108 and
+  170,108,932, also below the current bound. No local GPU resource-admission
+  blocker remains.
+- The raw checked-in StableHLO fixtures have 48/51 backward and 51/54 composed
+  tasks/slots. After the pinned StableHLO complex-math expansion, the actual
+  hook has 43/46 and 46/49. Evidence must bind the hook topology and treat the
+  raw fixture only as a regeneration witness.
+- Representative acceptance remains blocked by numerical-policy evidence, not
+  resource admission. The emitted balanced leaf-order-preserving five-Fold
+  realization historically matches `dgamma` but differs from ordinary JAX in
+  815 of 8,388,608 BF16 `dx` elements. That violates the existing bitwise-JAX
+  SOURCE_ORDERED and identity-FAST pre-run gate even though the independent
+  analytic comparison permits an 8-ULP envelope. A JAX-matching tree or a
+  separately reviewed numerical-policy contract is required before launch.
+- No ABI21 wheel, ptxas assembly, device allocation, GPU arithmetic, image,
+  hardware, upload, timing, or performance evidence was produced.
