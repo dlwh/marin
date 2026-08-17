@@ -28,10 +28,8 @@ constexpr char kSourceOrderedOptions[] =
     R"json({"execution_mode":"stablehlo_round_trip","numerics":"source_ordered","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[2,1,1],"materialization":"prefer_fusion","maximum_candidates":16,"pipeline_stages":3,"tile_sizes":[64,128]}})json";
 constexpr char kFastOptions[] =
     R"json({"execution_mode":"stablehlo_round_trip","numerics":"fast","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
-constexpr char kCpuExecutableBundleOptions[] =
+constexpr char kRetiredCpuExecutableBundleOptions[] =
     R"json({"execution_mode":"cpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[2,1,1],"materialization":"prefer_fusion","maximum_candidates":16,"pipeline_stages":3,"tile_sizes":[64,128]}})json";
-constexpr char kCpuExecutableBundleFastOptions[] =
-    R"json({"execution_mode":"cpu_executable_bundle","numerics":"fast","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[2,1,1],"materialization":"prefer_fusion","maximum_candidates":16,"pipeline_stages":3,"tile_sizes":[64,128]}})json";
 constexpr char kAbi21DefaultCpuExecutableBundleOptions[] =
     R"json({"execution_mode":"cpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
 constexpr char kGpuExecutableBundleOptions[] =
@@ -105,23 +103,6 @@ TEST(ShuttleXlaOptionsTest, ParsesCanonicalPythonWireFormat) {
   EXPECT_NE(mlir::shuttle::shuttlePipelineIdentity(*source).policyDigest,
             mlir::shuttle::shuttlePipelineIdentity(*fast).policyDigest);
 
-  absl::StatusOr<mlir::shuttle::ShuttlePipelineOptions> cpuBundle =
-      mlir::shuttle::parseShuttleXlaOptions(kCpuExecutableBundleOptions);
-  ASSERT_TRUE(cpuBundle.ok()) << cpuBundle.status();
-  EXPECT_EQ(cpuBundle->executionMode,
-            mlir::shuttle::ExecutionMode::CpuExecutableBundle);
-  EXPECT_NE(mlir::shuttle::shuttlePipelineIdentity(*source).policyDigest,
-            mlir::shuttle::shuttlePipelineIdentity(*cpuBundle).policyDigest);
-
-  absl::StatusOr<mlir::shuttle::ShuttlePipelineOptions> cpuFast =
-      mlir::shuttle::parseShuttleXlaOptions(kCpuExecutableBundleFastOptions);
-  ASSERT_TRUE(cpuFast.ok()) << cpuFast.status();
-  EXPECT_EQ(cpuFast->executionMode,
-            mlir::shuttle::ExecutionMode::CpuExecutableBundle);
-  EXPECT_EQ(cpuFast->numerics, mlir::shuttle::NumericalPolicy::Fast);
-  EXPECT_NE(mlir::shuttle::shuttlePipelineIdentity(*cpuBundle).policyDigest,
-            mlir::shuttle::shuttlePipelineIdentity(*cpuFast).policyDigest);
-
   auto gpuBundle =
       mlir::shuttle::parseShuttleXlaOptions(kGpuExecutableBundleOptions);
   ASSERT_TRUE(gpuBundle.ok()) << gpuBundle.status();
@@ -136,6 +117,13 @@ TEST(ShuttleXlaOptionsTest, ParsesCanonicalPythonWireFormat) {
   EXPECT_EQ(gpuFast->numerics, mlir::shuttle::NumericalPolicy::Fast);
   EXPECT_NE(mlir::shuttle::shuttlePipelineIdentity(*gpuBundle).policyDigest,
             mlir::shuttle::shuttlePipelineIdentity(*gpuFast).policyDigest);
+}
+
+TEST(ShuttleXlaOptionsTest, RejectsRetiredCpuExecutableMode) {
+  auto parsed =
+      mlir::shuttle::parseShuttleXlaOptions(kRetiredCpuExecutableBundleOptions);
+  EXPECT_EQ(parsed.status().code(), absl::StatusCode::kInvalidArgument)
+      << parsed.status();
 }
 
 TEST(ShuttleXlaOptionsTest, RejectsAdjacentGpuPipelineAbis) {

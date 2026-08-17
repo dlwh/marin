@@ -145,46 +145,9 @@ def test_gpu_executable_mode_has_distinct_source_ordered_and_fast_cache_identiti
     )
 
 
-def test_cpu_executable_mode_has_distinct_source_ordered_and_fast_cache_identities() -> None:
-    source_ordered = compiler_options(
-        execution_mode=ExecutionMode.CPU_EXECUTABLE_BUNDLE,
-        numerics=Numerics.SOURCE_ORDERED,
-        tuning=_tuning(),
-    )
-    fast = compiler_options(
-        execution_mode=ExecutionMode.CPU_EXECUTABLE_BUNDLE,
-        numerics=Numerics.FAST,
-        tuning=_tuning(),
-    )
-
-    assert source_ordered["xla_shuttle_options"] == (
-        '{"execution_mode":"cpu_executable_bundle","numerics":"source_ordered",'
-        '"pipeline_abi_version":21,"schema_version":1,'
-        '"tuning":{"cluster_shape":[2,1,1],"materialization":"prefer_fusion",'
-        '"maximum_candidates":16,"pipeline_stages":3,"tile_sizes":[64,128]}}'
-    )
-    assert fast["xla_shuttle_options"] == (
-        '{"execution_mode":"cpu_executable_bundle","numerics":"fast",'
-        '"pipeline_abi_version":21,"schema_version":1,'
-        '"tuning":{"cluster_shape":[2,1,1],"materialization":"prefer_fusion",'
-        '"maximum_candidates":16,"pipeline_stages":3,"tile_sizes":[64,128]}}'
-    )
-    assert (
-        options_digest(
-            execution_mode=ExecutionMode.CPU_EXECUTABLE_BUNDLE,
-            numerics=Numerics.SOURCE_ORDERED,
-            tuning=_tuning(),
-        )
-        == "09d2978eeb2e7b6533d84c3fa9caf75a378172af8729e5f5a79238854e1f4142"
-    )
-    assert (
-        options_digest(
-            execution_mode=ExecutionMode.CPU_EXECUTABLE_BUNDLE,
-            numerics=Numerics.FAST,
-            tuning=_tuning(),
-        )
-        == "f786c49880834fa6fa14bc682bf320384857dbe4fed4326becf71128b007d39d"
-    )
+def test_cpu_executable_mode_is_not_public() -> None:
+    with pytest.raises(ValueError):
+        ExecutionMode("cpu_executable_bundle")
 
 
 def test_empty_shape_hints_leave_physical_search_unconstrained() -> None:
