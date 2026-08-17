@@ -80,34 +80,19 @@ def test_execution_modes_have_distinct_cache_identity() -> None:
         numerics=Numerics.SOURCE_ORDERED,
         tuning=tuning,
     )
-    cpu_bundle = compiler_options(
-        execution_mode=ExecutionMode.CPU_EXECUTABLE_BUNDLE,
-        numerics=Numerics.SOURCE_ORDERED,
-        tuning=tuning,
-    )
-
     gpu_bundle = compiler_options(
         execution_mode=ExecutionMode.GPU_EXECUTABLE_BUNDLE,
         numerics=Numerics.SOURCE_ORDERED,
         tuning=tuning,
     )
 
-    assert (
-        len(
-            {
-                roundtrip["xla_shuttle_options"],
-                cpu_bundle["xla_shuttle_options"],
-                gpu_bundle["xla_shuttle_options"],
-            }
-        )
-        == 3
-    )
+    assert roundtrip["xla_shuttle_options"] != gpu_bundle["xla_shuttle_options"]
     assert options_digest(
         execution_mode=ExecutionMode.STABLEHLO_ROUND_TRIP,
         numerics=Numerics.SOURCE_ORDERED,
         tuning=tuning,
     ) != options_digest(
-        execution_mode=ExecutionMode.CPU_EXECUTABLE_BUNDLE,
+        execution_mode=ExecutionMode.GPU_EXECUTABLE_BUNDLE,
         numerics=Numerics.SOURCE_ORDERED,
         tuning=tuning,
     )

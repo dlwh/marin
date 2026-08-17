@@ -90,25 +90,6 @@ def ShuttleVerifySimt32RowFoldSchedulePass
   let constructor = "createVerifySimt32RowFoldSchedulePass()";
 }
 
-def ShuttleBuildCpuExecutableBundlePass
-    : Pass<"shuttle-build-cpu-executable-bundle", "::mlir::ModuleOp"> {
-  let summary = "Generate a closed local CPU bytecode bundle from Shuttle IR";
-  let dependentDialects = ["::mlir::shuttle::ShuttleDialect"];
-  let constructor = "createBuildCpuExecutableBundlePass()";
-}
-
-def ShuttleVerifyCpuExecutableBundlePass
-    : Pass<"shuttle-verify-cpu-executable-bundle", "::mlir::ModuleOp"> {
-  let summary = "Rederive and verify a local CPU bytecode executable bundle";
-  let constructor = "createVerifyCpuExecutableBundlePass()";
-}
-
-def ShuttleReplaceWithCpuExecutableBundlePass
-    : Pass<"shuttle-replace-with-cpu-executable-bundle", "::mlir::ModuleOp"> {
-  let summary = "Replace the closed 7x13 host bundle with one typed FFI call";
-  let constructor = "createReplaceWithCpuExecutableBundlePass()";
-}
-
 def ShuttleBuildGpuExecutableBundlePass
     : Pass<"shuttle-build-gpu-executable-bundle", "::mlir::ModuleOp"> {
   let summary = "Generate the closed SM90 PTX bundle from Shuttle IR";

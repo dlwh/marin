@@ -14,7 +14,6 @@ namespace mlir::shuttle {
 
 enum class ExecutionMode {
   StablehloRoundTrip,
-  CpuExecutableBundle,
   GpuExecutableBundle,
 };
 

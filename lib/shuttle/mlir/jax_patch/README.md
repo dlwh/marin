@@ -164,13 +164,6 @@ current pipelines round-trip these operations, so bitwise parity is required.
 A future non-bitwise `fast` rewrite needs a separately reviewed tolerance
 revision before any timing run.
 
-`shuttle_jaxlib_cpu_ffi_vjp_acceptance.py` is the narrower installed-wheel ABI
-9 Host execution proof for the ordinary-JAX `7x13` backward and composed
-boundaries. It uses the fixed v3 typed-FFI target, requires exact BF16 result
-parity, and proves fresh population and separate-process reuse of the two
-distinct compiled cache entries. It does not cover FAST, other shapes, GPU, or
-production acceptance.
-
 The driver is checked locally without claiming wheel execution:
 
 ```bash

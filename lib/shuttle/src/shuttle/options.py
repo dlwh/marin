@@ -30,7 +30,6 @@ class ExecutionMode(StrEnum):
     """Output language produced by the Shuttle compiler pipeline."""
 
     STABLEHLO_ROUND_TRIP = "stablehlo_round_trip"
-    CPU_EXECUTABLE_BUNDLE = "cpu_executable_bundle"
     GPU_EXECUTABLE_BUNDLE = "gpu_executable_bundle"
 
 

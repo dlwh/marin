@@ -166,14 +166,12 @@ parseShuttleXlaOptions(absl::string_view serializedOptions) {
       object->getString("execution_mode");
   if (executionMode && *executionMode == "stablehlo_round_trip") {
     options.executionMode = ExecutionMode::StablehloRoundTrip;
-  } else if (executionMode && *executionMode == "cpu_executable_bundle") {
-    options.executionMode = ExecutionMode::CpuExecutableBundle;
   } else if (executionMode && *executionMode == "gpu_executable_bundle") {
     options.executionMode = ExecutionMode::GpuExecutableBundle;
   } else {
     return invalidOptions("field 'execution_mode' must be "
-                          "'stablehlo_round_trip', 'cpu_executable_bundle', "
-                          "or 'gpu_executable_bundle'");
+                          "'stablehlo_round_trip' or "
+                          "'gpu_executable_bundle'");
   }
   if (numerics && *numerics == "source_ordered") {
     options.numerics = NumericalPolicy::SourceOrdered;

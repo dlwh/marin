@@ -30,8 +30,6 @@ constexpr char kFastOptions[] =
     R"json({"execution_mode":"stablehlo_round_trip","numerics":"fast","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
 constexpr char kRetiredCpuExecutableBundleOptions[] =
     R"json({"execution_mode":"cpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[2,1,1],"materialization":"prefer_fusion","maximum_candidates":16,"pipeline_stages":3,"tile_sizes":[64,128]}})json";
-constexpr char kAbi21DefaultCpuExecutableBundleOptions[] =
-    R"json({"execution_mode":"cpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
 constexpr char kGpuExecutableBundleOptions[] =
     R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[2,1,1],"materialization":"prefer_fusion","maximum_candidates":16,"pipeline_stages":3,"tile_sizes":[64,128]}})json";
 constexpr char kGpuExecutableBundleFastOptions[] =
@@ -500,137 +498,6 @@ TEST(ShuttleXlaOptionsTest,
   }
 }
 
-TEST(ShuttleXlaOptionsTest,
-     Abi21CpuRejectsFullPrefixFoldWithoutPartiallyRewritingModule) {
-  std::string error;
-  auto runfiles = bazel::tools::cpp::runfiles::Runfiles::CreateForTest(&error);
-  ASSERT_TRUE(runfiles) << error;
-  std::ifstream input(runfiles->Rlocation(
-      "shuttle_mlir/test/Inputs/"
-      "jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-backward.mlir"));
-  std::ostringstream source;
-  source << input.rdbuf();
-  ASSERT_TRUE(input);
-  mlir::MLIRContext context;
-  mlir::OwningOpRef<mlir::ModuleOp> module =
-      parseModule(context, source.str());
-  ASSERT_TRUE(module);
-  std::string before;
-  llvm::raw_string_ostream beforeOutput(before);
-  module->print(beforeOutput);
-  beforeOutput.flush();
-  std::string diagnostics;
-  mlir::ScopedDiagnosticHandler diagnosticHandler(
-      &context, [&](mlir::Diagnostic &diagnostic) {
-        llvm::raw_string_ostream output(diagnostics);
-        diagnostic.print(output);
-        output << '\n';
-        output.flush();
-        return mlir::success();
-      });
-  absl::Status status = mlir::shuttle::runShuttleXlaTransform(
-      *module, kAbi21DefaultCpuExecutableBundleOptions);
-  EXPECT_FALSE(status.ok());
-  EXPECT_NE(diagnostics.find(
-                "requires a bounded generated Map/Fold CPU bytecode subset"),
-            std::string::npos)
-      << diagnostics;
-  std::string after;
-  llvm::raw_string_ostream afterOutput(after);
-  module->print(afterOutput);
-  afterOutput.flush();
-  EXPECT_EQ(after, before);
-  EXPECT_EQ(after.find("shuttle.cpu.executable_bundle.v1"), std::string::npos);
-}
-
-TEST(ShuttleXlaOptionsTest,
-     Abi21CpuStillRejectsRankNFoldWithoutPartiallyRewritingTheModule) {
-  std::string error;
-  auto runfiles = bazel::tools::cpp::runfiles::Runfiles::CreateForTest(&error);
-  ASSERT_TRUE(runfiles) << error;
-  std::ifstream input(runfiles->Rlocation(
-      "shuttle_mlir/test/Inputs/"
-      "jax-0.10.1-bf16-rank_n_fold_map-2x5x17-forward.mlir"));
-  std::ostringstream source;
-  source << input.rdbuf();
-  ASSERT_TRUE(input);
-  mlir::MLIRContext context;
-  mlir::OwningOpRef<mlir::ModuleOp> module =
-      parseModule(context, source.str());
-  ASSERT_TRUE(module);
-  std::string before;
-  llvm::raw_string_ostream beforeOutput(before);
-  module->print(beforeOutput);
-  beforeOutput.flush();
-
-  std::string diagnostics;
-  mlir::ScopedDiagnosticHandler diagnosticHandler(
-      &context, [&](mlir::Diagnostic &diagnostic) {
-        llvm::raw_string_ostream output(diagnostics);
-        diagnostic.print(output);
-        output << '\n';
-        output.flush();
-        return mlir::success();
-      });
-  absl::Status status = mlir::shuttle::runShuttleXlaTransform(
-      *module, kAbi21DefaultCpuExecutableBundleOptions);
-  EXPECT_FALSE(status.ok());
-  EXPECT_NE(diagnostics.find(
-                "requires a bounded generated Map/Fold CPU bytecode subset"),
-            std::string::npos)
-      << diagnostics;
-  std::string after;
-  llvm::raw_string_ostream afterOutput(after);
-  module->print(afterOutput);
-  afterOutput.flush();
-  EXPECT_EQ(after, before);
-  EXPECT_EQ(after.find("shuttle.cpu.executable_bundle.v1"), std::string::npos);
-}
-
-TEST(ShuttleXlaOptionsTest,
-     Abi21CpuRejectsSingletonBroadcastWithoutPartiallyRewritingTheModule) {
-  std::string error;
-  auto runfiles = bazel::tools::cpp::runfiles::Runfiles::CreateForTest(&error);
-  ASSERT_TRUE(runfiles) << error;
-  std::ifstream input(runfiles->Rlocation(
-      "shuttle_mlir/test/Inputs/"
-      "jax-0.10.1-bf16-singleton_broadcast-2x7x19-forward.mlir"));
-  std::ostringstream source;
-  source << input.rdbuf();
-  ASSERT_TRUE(input);
-  mlir::MLIRContext context;
-  mlir::OwningOpRef<mlir::ModuleOp> module =
-      parseModule(context, source.str());
-  ASSERT_TRUE(module);
-  std::string before;
-  llvm::raw_string_ostream beforeOutput(before);
-  module->print(beforeOutput);
-  beforeOutput.flush();
-
-  std::string diagnostics;
-  mlir::ScopedDiagnosticHandler diagnosticHandler(
-      &context, [&](mlir::Diagnostic &diagnostic) {
-        llvm::raw_string_ostream output(diagnostics);
-        diagnostic.print(output);
-        output << '\n';
-        output.flush();
-        return mlir::success();
-      });
-  absl::Status status = mlir::shuttle::runShuttleXlaTransform(
-      *module, kAbi21DefaultCpuExecutableBundleOptions);
-  EXPECT_FALSE(status.ok());
-  EXPECT_NE(diagnostics.find(
-                "requires a bounded generated Map/Fold CPU bytecode subset"),
-            std::string::npos)
-      << diagnostics;
-  std::string after;
-  llvm::raw_string_ostream afterOutput(after);
-  module->print(afterOutput);
-  afterOutput.flush();
-  EXPECT_EQ(after, before);
-  EXPECT_EQ(after.find("shuttle.cpu.executable_bundle.v1"), std::string::npos);
-}
-
 TEST(ShuttleXlaOptionsTest, RunsOrdinaryJaxComposedMatmulAsTwoGenericCalls) {
   std::string error;
   auto runfiles = bazel::tools::cpp::runfiles::Runfiles::CreateForTest(&error);
@@ -703,18 +570,6 @@ TEST(ShuttleXlaOptionsTest, RejectsInvalidOrNoncanonicalWireFormats) {
     EXPECT_EQ(parsed.status().code(), absl::StatusCode::kInvalidArgument)
         << serialized << "\n"
         << parsed.status();
-  }
-}
-
-TEST(ShuttleXlaOptionsTest, RejectsPreviousPipelineAbiForBothCpuPolicies) {
-  constexpr const char *abi8Options[] = {
-      R"json({"execution_mode":"cpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":8,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
-      R"json({"execution_mode":"cpu_executable_bundle","numerics":"fast","pipeline_abi_version":8,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
-  };
-  for (const char *serialized : abi8Options) {
-    EXPECT_EQ(mlir::shuttle::parseShuttleXlaOptions(serialized).status().code(),
-              absl::StatusCode::kInvalidArgument)
-        << serialized;
   }
 }
 
