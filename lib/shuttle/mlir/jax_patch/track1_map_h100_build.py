@@ -238,4 +238,8 @@ def inspect_build_inputs(
 def _file_sha256(path: Path) -> str:
     if path.is_symlink() or not path.is_file():
         return "missing"
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
