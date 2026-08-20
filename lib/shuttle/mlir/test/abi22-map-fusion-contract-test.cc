@@ -8,6 +8,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "gtest/gtest.h"
@@ -105,6 +106,14 @@ struct FusionAudit {
   bool sawComposedProjectedInput = false;
 };
 
+bool sourcePrecedes(mlir::shuttle::SourceRefAttr left,
+                    mlir::shuttle::SourceRefAttr right) {
+  return std::tuple(left.getFunctionOrdinal(), left.getBlockOrdinal(),
+                    left.getOperationOrdinal(), left.getResultOrdinal()) <
+         std::tuple(right.getFunctionOrdinal(), right.getBlockOrdinal(),
+                    right.getOperationOrdinal(), right.getResultOrdinal());
+}
+
 std::vector<int64_t>
 expectedFusionGroupSizes(const FixtureExpectation &fixture) {
   if (fixture.maps == 18 && fixture.folds == 1)
@@ -190,6 +199,32 @@ build(llvm::StringRef source, mlir::shuttle::NumericalPolicy policy,
     manager.addPass(mlir::shuttle::createBuildGpuExecutableBundlePass());
     manager.addPass(mlir::shuttle::createVerifyGpuExecutableBundlePass());
   }
+  if (mlir::failed(manager.run(*result->module)))
+    return {};
+  return result;
+}
+
+std::unique_ptr<BuiltModule>
+buildAlgebra(llvm::StringRef source, mlir::shuttle::NumericalPolicy policy) {
+  mlir::DialectRegistry registry;
+  registry.insert<mlir::arith::ArithDialect, mlir::func::FuncDialect,
+                  mlir::math::MathDialect, mlir::shuttle::ShuttleDialect>();
+  auto result = std::make_unique<BuiltModule>();
+  result->context = std::make_unique<mlir::MLIRContext>(registry);
+  result->module =
+      mlir::parseSourceString<mlir::ModuleOp>(source, result->context.get());
+  if (!result->module)
+    return {};
+  result->module->walk([&](mlir::shuttle::RegionOp region) {
+    region.setPolicy(policy);
+  });
+  mlir::PassManager manager(result->context.get());
+  manager.addPass(mlir::shuttle::createPlanRowFoldMaterializationPass());
+  manager.addPass(mlir::shuttle::createVerifyMaterializationPlanPass());
+  manager.addPass(mlir::shuttle::createPlanSimt32RowFoldSchedulePass());
+  manager.addPass(mlir::shuttle::createVerifySimt32RowFoldSchedulePass());
+  manager.addPass(mlir::shuttle::createBuildGpuExecutableBundlePass());
+  manager.addPass(mlir::shuttle::createVerifyGpuExecutableBundlePass());
   if (mlir::failed(manager.run(*result->module)))
     return {};
   return result;
@@ -293,10 +328,14 @@ std::optional<FusionAudit> auditFusionGroups(mlir::ModuleOp module) {
       continue;
     ++audit.groups;
     llvm::SmallDenseSet<mlir::Attribute> group;
+    std::optional<mlir::shuttle::SourceRefAttr> previousSource;
     for (mlir::Attribute source : sources) {
+      auto sourceRef = mlir::dyn_cast<mlir::shuttle::SourceRefAttr>(source);
       auto found = maps.find(source);
-      if (found == maps.end() || !group.insert(source).second)
+      if (!sourceRef || found == maps.end() || !group.insert(source).second ||
+          (previousSource && !sourcePrecedes(*previousSource, sourceRef)))
         return std::nullopt;
+      previousSource = sourceRef;
       mlir::shuttle::MapOp map = found->second;
       std::optional<llvm::SmallVector<int64_t>> domain = mapDomainShape(map);
       if (!domain)
@@ -340,6 +379,54 @@ std::optional<FusionAudit> auditFusionGroups(mlir::ModuleOp module) {
     }
   }
   return audit;
+}
+
+bool mutateFusedTask(mlir::ModuleOp module, llvm::StringRef mutation) {
+  llvm::SmallVector<mlir::shuttle::MaterializationPlanOp> plans(
+      module.getOps<mlir::shuttle::MaterializationPlanOp>());
+  if (plans.size() != 1)
+    return false;
+  for (mlir::shuttle::MaterializationTaskOp task :
+       plans.front()
+           .getBody()
+           .front()
+           .getOps<mlir::shuttle::MaterializationTaskOp>()) {
+    auto sources = task->getAttrOfType<mlir::ArrayAttr>("fused_sources");
+    auto maps = task->getAttrOfType<mlir::ArrayAttr>("composed_input_maps");
+    if (!sources || sources.size() < 2 || !maps || maps.size() < 2)
+      continue;
+    mlir::Builder builder(module.getContext());
+    llvm::SmallVector<mlir::Attribute> changed;
+    if (mutation == "duplicate-source") {
+      llvm::append_range(changed, sources);
+      changed[1] = changed[0];
+      task->setAttr("fused_sources", builder.getArrayAttr(changed));
+    } else if (mutation == "reordered-source") {
+      llvm::append_range(changed, llvm::reverse(sources.getValue()));
+      task->setAttr("fused_sources", builder.getArrayAttr(changed));
+    } else if (mutation == "stale-source") {
+      llvm::append_range(changed, sources);
+      changed[0] = mlir::shuttle::SourceRefAttr::get(
+          module.getContext(), 99, 99, 99, 99);
+      task->setAttr("fused_sources", builder.getArrayAttr(changed));
+    } else if (mutation == "missing-map") {
+      task->setAttr("composed_input_maps",
+                    builder.getArrayAttr(maps.getValue().drop_back()));
+    } else if (mutation == "reordered-map") {
+      llvm::append_range(changed, llvm::reverse(maps.getValue()));
+      task->setAttr("composed_input_maps", builder.getArrayAttr(changed));
+    } else {
+      return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+bool verifyMaterializationPlan(mlir::ModuleOp module) {
+  mlir::PassManager manager(module.getContext());
+  manager.addPass(mlir::shuttle::createVerifyMaterializationPlanPass());
+  return mlir::succeeded(manager.run(module));
 }
 
 void expectCounts(const PlanSummary &actual,
@@ -534,6 +621,60 @@ TEST(Abi22MapFusionContract,
         EXPECT_EQ(decodedSlot.bindingIndex, slot.getBindingIndex().value_or(-1));
       }
     }
+  }
+}
+
+TEST(Abi22MapFusionContract,
+     RejectsCorruptOrderedProvenanceAndComposedInputMaps) {
+  std::optional<std::string> source = fixtureSource(kFixtures[0].filename);
+  ASSERT_TRUE(source);
+  constexpr llvm::StringLiteral mutations[] = {
+      "duplicate-source", "reordered-source", "stale-source", "missing-map",
+      "reordered-map"};
+  for (llvm::StringRef mutation : mutations) {
+    SCOPED_TRACE(mutation.str());
+    std::unique_ptr<BuiltModule> built = build(
+        *source, mlir::shuttle::NumericalPolicy::SourceOrdered, kFusionTuning,
+        false, false);
+    ASSERT_TRUE(built);
+    ASSERT_TRUE(mutateFusedTask(*built->module, mutation));
+    EXPECT_FALSE(verifyMaterializationPlan(*built->module));
+  }
+}
+
+TEST(Abi22MapFusionContract,
+     FusedPtxPreservesDependentScalarOrderAndFingerprintsEveryOperation) {
+  std::optional<std::string> source =
+      fixtureSource("abi22-map-fusion-source-order.mlir");
+  ASSERT_TRUE(source);
+  for (mlir::shuttle::NumericalPolicy policy :
+       {mlir::shuttle::NumericalPolicy::SourceOrdered,
+        mlir::shuttle::NumericalPolicy::Fast}) {
+    std::unique_ptr<BuiltModule> built = buildAlgebra(*source, policy);
+    ASSERT_TRUE(built);
+    llvm::SmallVector<mlir::shuttle::DeviceModuleOp> devices(
+        built->module->getOps<mlir::shuttle::DeviceModuleOp>());
+    ASSERT_EQ(devices.size(), 1);
+    llvm::StringRef ptx(
+        reinterpret_cast<const char *>(devices.front().getCode().data()),
+        devices.front().getCode().size());
+    size_t subtract = ptx.find("sub.rn.f32");
+    size_t divide = ptx.find("div.rn.f32");
+    ASSERT_NE(subtract, llvm::StringRef::npos);
+    ASSERT_NE(divide, llvm::StringRef::npos);
+    EXPECT_LT(subtract, divide);
+
+    std::string changed = *source;
+    size_t operation = changed.find("arith.subf");
+    ASSERT_NE(operation, std::string::npos);
+    changed.replace(operation, std::string("arith.subf").size(), "arith.addf");
+    std::unique_ptr<BuiltModule> mutated = buildAlgebra(changed, policy);
+    ASSERT_TRUE(mutated);
+    std::optional<PlanSummary> originalSummary = summary(*built->module);
+    std::optional<PlanSummary> mutatedSummary = summary(*mutated->module);
+    ASSERT_TRUE(originalSummary);
+    ASSERT_TRUE(mutatedSummary);
+    EXPECT_NE(originalSummary->fingerprint, mutatedSummary->fingerprint);
   }
 }
 
