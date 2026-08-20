@@ -1583,7 +1583,11 @@ TEST(Abi22MapFusionContract,
           EXPECT_NE(ptx.find("st.global.f32"), llvm::StringRef::npos);
           EXPECT_EQ(ptx.find("st.global.u16"), llvm::StringRef::npos);
         } else {
-          EXPECT_NE(ptx.find("0f41980000"), llvm::StringRef::npos);
+          const llvm::StringRef extent =
+              llvm::StringRef(boundary.filename).contains("263")
+                  ? "0f43838000"
+                  : "0f41980000";
+          EXPECT_NE(ptx.find(extent), llvm::StringRef::npos);
           EXPECT_NE(ptx.find("0f358637BD"), llvm::StringRef::npos);
           EXPECT_NE(ptx.find("sqrt.rn.f32"), llvm::StringRef::npos);
           EXPECT_NE(ptx.find("st.global.u16"), llvm::StringRef::npos);
