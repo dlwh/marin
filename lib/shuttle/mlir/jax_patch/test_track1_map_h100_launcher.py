@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import builtins
+import importlib
+import sys
 
 import pytest
-from track1_map_h100_launcher import main
 
 
 def test_launcher_fails_before_importing_subject_or_jax(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -15,9 +16,11 @@ def test_launcher_fails_before_importing_subject_or_jax(monkeypatch: pytest.Monk
         imported.append(name)
         return original_import(name, *args, **kwargs)
 
+    sys.modules.pop("track1_map_h100_launcher", None)
     monkeypatch.setattr(builtins, "__import__", record_import)
+    launcher = importlib.import_module("track1_map_h100_launcher")
     with pytest.raises(RuntimeError, match="explicitly unsealed"):
-        main(["--require-launch-ready"])
+        launcher.main(["--require-launch-ready"])
 
     assert "track1_map_h100_subject" not in imported
-    assert "jax" not in imported
+    assert all(name != "jax" and not name.startswith("jax.") for name in imported)
