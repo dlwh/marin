@@ -92,6 +92,7 @@ def require_offline_build_inputs(
         raise RuntimeError("offline JAX patch roster or bytes differ")
     if inputs.xla_patch_sha256 != XLA_PATCH_SHA256:
         raise RuntimeError("offline XLA patch roster or bytes differ")
+    _require_live_source_snapshot(inputs)
     _regular(inputs.bazel, "Bazel binary", executable=True)
     _regular(inputs.cuda_root / "bin/ptxas", "ptxas binary", executable=True)
     _regular(inputs.cuda_root / "bin/nvcc", "nvcc binary", executable=True)
@@ -161,6 +162,7 @@ def xla_patch_sha256(marin_repository: Path) -> tuple[str, ...]:
 
 def apply_source_patches(inputs: BuildInputs) -> None:
     """Check both exact patch sets before modifying either clean checkout."""
+    _require_live_source_snapshot(inputs)
     if patch_sha256(inputs.marin_repository) != JAX_PATCH_SHA256:
         raise RuntimeError("offline JAX patches changed before application")
     if xla_patch_sha256(inputs.marin_repository) != XLA_PATCH_SHA256:
@@ -185,6 +187,25 @@ def _git(repository: Path, *arguments: str) -> str:
         capture_output=True,
         text=True,
     ).stdout.strip()
+
+
+def _require_live_source_snapshot(inputs: BuildInputs) -> None:
+    live = (
+        _git(inputs.jax_repository, "rev-parse", "HEAD"),
+        _git(inputs.jax_repository, "rev-parse", "HEAD^{tree}"),
+        _git(inputs.jax_repository, "status", "--porcelain"),
+        _git(inputs.xla_repository, "rev-parse", "HEAD"),
+        _git(inputs.xla_repository, "status", "--porcelain"),
+    )
+    expected = (
+        inputs.jax_commit,
+        inputs.jax_tree,
+        inputs.jax_status,
+        inputs.xla_commit,
+        inputs.xla_status,
+    )
+    if live != expected:
+        raise RuntimeError("offline source changed after inspection")
 
 
 def inspect_build_inputs(
