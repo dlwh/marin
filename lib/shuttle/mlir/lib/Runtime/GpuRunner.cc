@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -99,6 +100,40 @@ absl::Status addBuffer(ffi::CallFrameBuilder &builder,
   return absl::OkStatus();
 }
 
+absl::Status validateBufferAddresses(
+    const ExternalProjection &projection,
+    llvm::ArrayRef<GpuRunnerBuffer> operands,
+    llvm::ArrayRef<GpuRunnerBuffer> results) {
+  struct Span {
+    uintptr_t begin;
+    uintptr_t end;
+  };
+  llvm::SmallVector<Span> spans;
+  auto add = [&](const GpuExternalBinding &binding,
+                 const GpuRunnerBuffer &buffer) -> absl::Status {
+    uintptr_t begin = reinterpret_cast<uintptr_t>(buffer.data);
+    if (buffer.data == nullptr || binding.alignment <= 0 ||
+        begin % static_cast<uint64_t>(binding.alignment) != 0)
+      return invalid("GPU runner buffer address is invalid");
+    if (begin > std::numeric_limits<uintptr_t>::max() -
+                    static_cast<uint64_t>(binding.requiredBytes))
+      return invalid("GPU runner buffer address overflows");
+    Span current{begin, begin + static_cast<uint64_t>(binding.requiredBytes)};
+    for (Span prior : spans)
+      if (current.begin < prior.end && prior.begin < current.end)
+        return invalid("GPU runner external buffers must not alias");
+    spans.push_back(current);
+    return absl::OkStatus();
+  };
+  for (auto [binding, buffer] : llvm::zip_equal(projection.operands, operands))
+    if (absl::Status status = add(binding, buffer); !status.ok())
+      return status;
+  for (auto [binding, buffer] : llvm::zip_equal(projection.results, results))
+    if (absl::Status status = add(binding, buffer); !status.ok())
+      return status;
+  return absl::OkStatus();
+}
+
 absl::StatusOr<ffi::CallFrame>
 buildCallFrame(llvm::ArrayRef<uint8_t> transport,
                const ExternalProjection &projection,
@@ -107,6 +142,10 @@ buildCallFrame(llvm::ArrayRef<uint8_t> transport,
   if (operands.size() != projection.operands.size() ||
       results.size() != projection.results.size())
     return invalid("GPU runner external buffer count is invalid");
+  if (absl::Status status =
+          validateBufferAddresses(projection, operands, results);
+      !status.ok())
+    return status;
   ffi::CallFrameBuilder builder(operands.size(), results.size());
   for (auto [binding, buffer] : llvm::zip_equal(projection.operands, operands))
     if (absl::Status status = addBuffer(builder, binding, buffer, false);
@@ -178,6 +217,7 @@ public:
   ffi::ExecutionState prepareState;
   ffi::ExecutionState initializeState;
   std::mutex executeMutex;
+  bool pending = false;
 
   ffi::InvokeContext context() {
     ffi::InvokeContext result;
@@ -188,14 +228,36 @@ public:
     result.state_context = {&instantiateState, &prepareState, &initializeState};
     return result;
   }
+
+  absl::Status synchronize() {
+    if (!pending)
+      return absl::OkStatus();
+    absl::Status status = stream->BlockHostUntilDone();
+    if (status.ok())
+      pending = false;
+    return status;
+  }
 };
 
 GpuRunner::GpuRunner(std::unique_ptr<Impl> implementation)
     : implementation(std::move(implementation)) {}
 
-GpuRunner::~GpuRunner() = default;
+GpuRunner::~GpuRunner() {
+  // Failed synchronization cannot prove that queued work released its owned
+  // allocations, so retain the implementation instead of risking a device UAF.
+  if (implementation && !implementation->synchronize().ok())
+    implementation.release();
+}
 GpuRunner::GpuRunner(GpuRunner &&) noexcept = default;
-GpuRunner &GpuRunner::operator=(GpuRunner &&) noexcept = default;
+GpuRunner &GpuRunner::operator=(GpuRunner &&other) noexcept {
+  if (this == &other)
+    return *this;
+  // Preserve the same fail-safe teardown rule as the destructor.
+  if (implementation && !implementation->synchronize().ok())
+    implementation.release();
+  implementation = std::move(other.implementation);
+  return *this;
+}
 
 absl::StatusOr<std::unique_ptr<GpuRunner>> GpuRunner::Create(
     llvm::ArrayRef<uint8_t> transport, se::DeviceAddressAllocator *allocator,
@@ -261,8 +323,12 @@ absl::Status GpuRunner::Execute(llvm::ArrayRef<GpuRunnerBuffer> operands,
   if (!frame.ok())
     return frame.status();
   ffi::InvokeContext context = implementation->context();
-  return ffi::Invoke(ffi::GetXlaFfiApi(), implementation->handlers.execute,
-                     *frame, context, XLA_FFI_ExecutionStage_EXECUTE);
+  implementation->pending = true;
+  absl::Status execute =
+      ffi::Invoke(ffi::GetXlaFfiApi(), implementation->handlers.execute,
+                  *frame, context, XLA_FFI_ExecutionStage_EXECUTE);
+  absl::Status completion = implementation->synchronize();
+  return execute.ok() ? completion : execute;
 }
 
 const GpuRunnerResources &GpuRunner::resources() const {

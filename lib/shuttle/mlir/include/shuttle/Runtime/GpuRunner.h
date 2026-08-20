@@ -37,6 +37,7 @@ struct GpuRunnerResources {
 };
 
 // Owns one prepared and initialized SM90 Shuttle executable invocation.
+// The caller-owned allocator and stream must outlive the runner.
 class GpuRunner {
 public:
   static absl::StatusOr<std::unique_ptr<GpuRunner>>
@@ -52,6 +53,7 @@ public:
   GpuRunner(const GpuRunner &) = delete;
   GpuRunner &operator=(const GpuRunner &) = delete;
 
+  // Enqueues the sealed launch graph and returns after the stream completes.
   absl::Status Execute(llvm::ArrayRef<GpuRunnerBuffer> operands,
                        llvm::ArrayRef<GpuRunnerBuffer> results);
   const GpuRunnerResources &resources() const;
