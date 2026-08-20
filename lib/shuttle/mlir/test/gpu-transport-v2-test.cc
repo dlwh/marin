@@ -3909,6 +3909,9 @@ TEST(GpuTransportV2Test,
        1, 3, 0, 0},
       {"jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-backward.mlir",
        3, 6, 1, 56},
+      {"jax-0.10.1-bf16-projected_parameter_broadcast-"
+       "3x2x5x11x263-backward.mlir",
+       3, 6, 1, 1320},
   };
   constexpr llvm::StringLiteral options =
       R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";

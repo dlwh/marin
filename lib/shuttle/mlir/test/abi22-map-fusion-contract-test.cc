@@ -603,6 +603,8 @@ bool mutateFoldRegionTask(mlir::ModuleOp module, llvm::StringRef mutation) {
       continue;
     mlir::Builder builder(module.getContext());
     if (mutation == "boundary-buffer") {
+      if (task.getInputBuffers().size() < 3)
+        continue;
       llvm::SmallVector<mlir::Attribute> changed(boundaryUses.getValue());
       auto use = mlir::cast<mlir::DictionaryAttr>(changed.front());
       llvm::SmallVector<mlir::NamedAttribute> fields(use.begin(), use.end());
@@ -612,7 +614,7 @@ bool mutateFoldRegionTask(mlir::ModuleOp module, llvm::StringRef mutation) {
       if (inputBuffer == fields.end())
         return false;
       *inputBuffer = builder.getNamedAttr("input_buffer",
-                                          builder.getI64IntegerAttr(999));
+                                          builder.getI64IntegerAttr(2));
       changed.front() = builder.getDictionaryAttr(fields);
       task->setAttr("fold_region_boundary_uses",
                     builder.getArrayAttr(changed));
@@ -642,6 +644,21 @@ bool mutateFoldRegionTask(mlir::ModuleOp module, llvm::StringRef mutation) {
                                              "launch_boundary"));
       changed[1] = builder.getDictionaryAttr(fields);
       task->setAttr("fold_region_phases", builder.getArrayAttr(changed));
+    } else if (mutation == "wrong-valid-phase") {
+      if (phases.size() < 2)
+        continue;
+      llvm::SmallVector<mlir::Attribute> changed(boundaryUses.getValue());
+      auto use = mlir::cast<mlir::DictionaryAttr>(changed.front());
+      llvm::SmallVector<mlir::NamedAttribute> fields(use.begin(), use.end());
+      auto phase = llvm::find_if(fields, [](mlir::NamedAttribute field) {
+        return field.getName() == "phase";
+      });
+      if (phase == fields.end())
+        return false;
+      *phase = builder.getNamedAttr("phase", builder.getI64IntegerAttr(1));
+      changed.front() = builder.getDictionaryAttr(fields);
+      task->setAttr("fold_region_boundary_uses",
+                    builder.getArrayAttr(changed));
     } else if (mutation == "dangling-recomputation") {
       llvm::SmallVector<mlir::Attribute> changed;
       if (auto recomputed = task->getAttrOfType<mlir::ArrayAttr>(
@@ -1235,13 +1252,13 @@ TEST(Abi22MapFusionContract,
       {"jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-forward.mlir",
        1, 3, 1, 0},
       {"jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-backward.mlir",
-       3, 6, 4, 1},
+       3, 6, 5, 1},
       {"jax-0.10.1-bf16-projected_parameter_broadcast-"
        "3x2x5x11x263-forward.mlir",
        1, 3, 1, 0},
       {"jax-0.10.1-bf16-projected_parameter_broadcast-"
        "3x2x5x11x263-backward.mlir",
-       3, 6, 4, 1},
+       3, 6, 5, 1},
   };
   for (const Boundary &boundary : boundaries) {
     SCOPED_TRACE(boundary.filename);
@@ -1270,6 +1287,28 @@ TEST(Abi22MapFusionContract,
                          mlir::shuttle::MaterializationStorage::Temporary;
                 }),
                 boundary.temporaryBuffers);
+      const bool backward =
+          llvm::StringRef(boundary.filename).contains("backward");
+      if (backward) {
+        auto temporary = llvm::find_if(buffers, [](auto buffer) {
+          return buffer.getStorage() ==
+                 mlir::shuttle::MaterializationStorage::Temporary;
+        });
+        ASSERT_NE(temporary, buffers.end());
+        auto type = mlir::cast<mlir::RankedTensorType>(
+            temporary->getTensorType());
+        llvm::SmallVector<int64_t> expectedShape =
+            llvm::StringRef(boundary.filename).contains("3x2x5x11x263")
+                ? llvm::SmallVector<int64_t>({3, 2, 5, 11})
+                : llvm::SmallVector<int64_t>({2, 7});
+        EXPECT_EQ(type.getShape(), llvm::ArrayRef<int64_t>(expectedShape));
+        EXPECT_TRUE(type.getElementType().isF32());
+        EXPECT_EQ(temporary->getProducer(), 0);
+        EXPECT_EQ(temporary->getConsumers(),
+                  llvm::ArrayRef<int64_t>({1, 2}));
+        EXPECT_EQ(temporary->getLifetimeStart(), 0);
+        EXPECT_EQ(temporary->getLifetimeEnd(), 2);
+      }
 
       llvm::SmallDenseMap<mlir::Attribute, mlir::Operation *>
           algebraOperations;
@@ -1289,7 +1328,7 @@ TEST(Abi22MapFusionContract,
       llvm::SmallDenseMap<mlir::Attribute, int64_t>
           recomputationDeclarations;
       int64_t phaseCount = 0;
-      for (mlir::shuttle::MaterializationTaskOp task : tasks) {
+      for (auto [taskOrdinal, task] : llvm::enumerate(tasks)) {
         EXPECT_EQ(task.getKind(), mlir::shuttle::MaterializationTaskKind::Fold);
         auto sources =
             task->getAttrOfType<mlir::ArrayAttr>("fold_region_sources");
@@ -1305,6 +1344,7 @@ TEST(Abi22MapFusionContract,
         ASSERT_FALSE(boundaryUses.empty());
         phaseCount += phases.size();
         llvm::SmallDenseSet<mlir::Attribute> taskSources;
+        llvm::SmallVector<int64_t> taskSourceOrdinals;
         std::optional<mlir::shuttle::SourceRefAttr> previousSource;
         for (mlir::Attribute sourceRef : sources) {
           auto source =
@@ -1315,7 +1355,46 @@ TEST(Abi22MapFusionContract,
           if (previousSource)
             EXPECT_TRUE(sourcePrecedes(*previousSource, source));
           previousSource = source;
+          taskSourceOrdinals.push_back(source.getOperationOrdinal());
           ++sourceOccurrences[sourceRef];
+        }
+        if (!backward) {
+          EXPECT_EQ(taskSourceOrdinals,
+                    llvm::to_vector(llvm::seq<int64_t>(0, 19)));
+          EXPECT_EQ(task.getInputBuffers(), llvm::ArrayRef<int64_t>({0, 1}));
+          EXPECT_EQ(task.getOutputBuffers(), llvm::ArrayRef<int64_t>({2}));
+          EXPECT_TRUE(task.getDependencies().empty());
+        } else {
+          const std::array<llvm::SmallVector<int64_t>, 3> expectedSources = {
+              llvm::SmallVector<int64_t>({0, 1, 2, 3}),
+              llvm::SmallVector<int64_t>(
+                  {0, 4, 5, 6, 7, 8, 9, 10, 11, 16, 17, 20, 21, 22, 23,
+                   24, 27, 28, 29}),
+              llvm::SmallVector<int64_t>(
+                  {0, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 18, 19,
+                   20, 25, 26, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
+                   40, 41, 42, 43, 44, 45, 46, 47})};
+          const std::array<llvm::SmallVector<int64_t>, 3> expectedInputs = {
+              llvm::SmallVector<int64_t>({0}),
+              llvm::SmallVector<int64_t>({0, 3, 2}),
+              llvm::SmallVector<int64_t>({0, 3, 1, 2})};
+          const std::array<llvm::SmallVector<int64_t>, 3> expectedOutputs = {
+              llvm::SmallVector<int64_t>({3}),
+              llvm::SmallVector<int64_t>({4}),
+              llvm::SmallVector<int64_t>({5})};
+          const std::array<llvm::SmallVector<int64_t>, 3>
+              expectedDependencies = {llvm::SmallVector<int64_t>(),
+                                      llvm::SmallVector<int64_t>({0}),
+                                      llvm::SmallVector<int64_t>({0})};
+          ASSERT_LT(taskOrdinal, expectedSources.size());
+          EXPECT_EQ(taskSourceOrdinals, expectedSources[taskOrdinal]);
+          EXPECT_EQ(task.getInputBuffers(),
+                    llvm::ArrayRef<int64_t>(expectedInputs[taskOrdinal]));
+          EXPECT_EQ(task.getOutputBuffers(),
+                    llvm::ArrayRef<int64_t>(expectedOutputs[taskOrdinal]));
+          EXPECT_EQ(task.getDependencies(),
+                    llvm::ArrayRef<int64_t>(
+                        expectedDependencies[taskOrdinal]));
         }
         llvm::SmallDenseSet<std::pair<mlir::Attribute, int64_t>>
             expectedBoundaryUses;
@@ -1341,6 +1420,7 @@ TEST(Abi22MapFusionContract,
           }
         }
         std::optional<mlir::shuttle::FoldOp> previousFold;
+        llvm::SmallDenseSet<mlir::Attribute> phaseSources;
         for (auto [phaseOrdinal, phaseAttribute] :
              llvm::enumerate(phases)) {
           auto phase = mlir::dyn_cast<mlir::DictionaryAttr>(phaseAttribute);
@@ -1352,6 +1432,7 @@ TEST(Abi22MapFusionContract,
               algebraOperations.lookup(phaseSource));
           ASSERT_TRUE(fold);
           EXPECT_TRUE(taskSources.contains(phaseSource));
+          EXPECT_TRUE(phaseSources.insert(phaseSource).second);
           auto domain = mlir::dyn_cast_or_null<mlir::DenseI64ArrayAttr>(
               phase.get("domain_shape"));
           auto reduction = mlir::dyn_cast_or_null<mlir::DenseI64ArrayAttr>(
@@ -1374,18 +1455,36 @@ TEST(Abi22MapFusionContract,
           if (previousFold) {
             auto previousInput = mlir::cast<mlir::RankedTensorType>(
                 previousFold->getInputs().front().getType());
-            ASSERT_EQ(previousFold->getReductionDimensions().size(), 1u);
-            ASSERT_EQ(fold.getReductionDimensions().size(), 1u);
-            int64_t previousAxis =
-                previousFold->getReductionDimensions().front();
-            int64_t axis = fold.getReductionDimensions().front();
-            EXPECT_EQ(previousAxis, previousInput.getRank() - 1);
-            EXPECT_EQ(axis, foldInput.getRank() - 1);
-            EXPECT_EQ(foldInput.getDimSize(axis), 1);
-            EXPECT_EQ(previousInput.getShape().drop_back(),
-                      foldInput.getShape().drop_back());
+            auto previousResult = mlir::cast<mlir::RankedTensorType>(
+                previousFold->getResult(0).getType());
+            auto result = mlir::cast<mlir::RankedTensorType>(
+                fold.getResult(0).getType());
+            EXPECT_EQ(previousResult, result);
+            int64_t reductionCardinality = 1;
+            for (int64_t axis : fold.getReductionDimensions())
+              reductionCardinality *= foldInput.getDimSize(axis);
+            EXPECT_EQ(reductionCardinality, 1);
+            auto dependsOnPrevious = [&](mlir::Value value,
+                                         auto &self) -> bool {
+              if (value == previousFold->getResult(0))
+                return true;
+              auto map = value.getDefiningOp<mlir::shuttle::MapOp>();
+              if (!map || !taskSources.contains(map.getSource()))
+                return false;
+              return llvm::any_of(map.getInputs(), [&](mlir::Value input) {
+                return self(input, self);
+              });
+            };
+            EXPECT_TRUE(dependsOnPrevious(fold.getInputs().front(),
+                                          dependsOnPrevious));
+            (void)previousInput;
           }
           previousFold = fold;
+        }
+        for (mlir::Attribute sourceRef : taskSources) {
+          if (mlir::isa_and_nonnull<mlir::shuttle::FoldOp>(
+                  algebraOperations.lookup(sourceRef)))
+            EXPECT_TRUE(phaseSources.contains(sourceRef));
         }
         llvm::SmallDenseSet<std::pair<mlir::Attribute, int64_t>>
             actualBoundaryUses;
@@ -1419,6 +1518,17 @@ TEST(Abi22MapFusionContract,
           ASSERT_TRUE(map);
           ASSERT_GE(operand.getInt(), 0);
           ASSERT_LT(operand.getInt(), map.getInputs().size());
+          int64_t expectedPhase = 0;
+          for (mlir::Attribute phaseAttribute : phases) {
+            auto phaseSource = mlir::cast<mlir::shuttle::SourceRefAttr>(
+                mlir::cast<mlir::DictionaryAttr>(phaseAttribute)
+                    .get("source"));
+            if (sourcePrecedes(phaseSource, useSource))
+              ++expectedPhase;
+          }
+          expectedPhase = std::min<int64_t>(expectedPhase,
+                                             phases.size() - 1);
+          EXPECT_EQ(phase.getInt(), expectedPhase);
           EXPECT_EQ(indexing,
                     mlir::cast<mlir::AffineMapAttr>(
                         map.getIndexingMaps()[operand.getInt()]));
@@ -1460,14 +1570,30 @@ TEST(Abi22MapFusionContract,
       auto entries = llvm::to_vector(
           device.getBody().front().getOps<mlir::shuttle::DeviceEntryOp>());
       ASSERT_EQ(entries.size(), boundary.tasks);
-      llvm::StringRef ptx(
-          reinterpret_cast<const char *>(device.getCode().data() +
-                                         entries.front().getCodeOffset()),
-          entries.front().getCodeLength());
-      EXPECT_NE(ptx.find("ld.global.u16"), llvm::StringRef::npos);
-      EXPECT_NE(ptx.find("cvt.f32.bf16"), llvm::StringRef::npos);
-      EXPECT_NE(ptx.find("add.rn.f32"), llvm::StringRef::npos);
-      if (llvm::StringRef(boundary.filename).contains("forward")) {
+      for (auto [entryOrdinal, entry] : llvm::enumerate(entries)) {
+        llvm::StringRef ptx(
+            reinterpret_cast<const char *>(device.getCode().data() +
+                                           entry.getCodeOffset()),
+            entry.getCodeLength());
+        EXPECT_NE(ptx.find("ld.global.u16"), llvm::StringRef::npos);
+        EXPECT_NE(ptx.find("cvt.f32.bf16"), llvm::StringRef::npos);
+        EXPECT_NE(ptx.find("add.rn.f32"), llvm::StringRef::npos);
+        if (backward && entryOrdinal == 0) {
+          EXPECT_NE(ptx.find("mul.rn.f32"), llvm::StringRef::npos);
+          EXPECT_NE(ptx.find("st.global.f32"), llvm::StringRef::npos);
+          EXPECT_EQ(ptx.find("st.global.u16"), llvm::StringRef::npos);
+        } else {
+          EXPECT_NE(ptx.find("0f41980000"), llvm::StringRef::npos);
+          EXPECT_NE(ptx.find("0f358637BD"), llvm::StringRef::npos);
+          EXPECT_NE(ptx.find("sqrt.rn.f32"), llvm::StringRef::npos);
+          EXPECT_NE(ptx.find("st.global.u16"), llvm::StringRef::npos);
+        }
+      }
+      if (!backward) {
+        llvm::StringRef ptx(
+            reinterpret_cast<const char *>(device.getCode().data() +
+                                           entries.front().getCodeOffset()),
+            entries.front().getCodeLength());
         size_t load = ptx.find("ld.global.u16");
         size_t square = ptx.find("mul.rn.f32");
         size_t reduce = ptx.find("st.shared.f32");
@@ -1482,6 +1608,8 @@ TEST(Abi22MapFusionContract,
         EXPECT_LT(square, reduce);
         EXPECT_LT(reduce, rsqrt);
         EXPECT_LT(rsqrt, store);
+        EXPECT_GE(ptx.count("ld.global.u16"), 2u);
+        EXPECT_EQ(ptx.count("st.global.u16"), 1u);
       }
 
       if (sourceOrderedFingerprint) {
@@ -1508,7 +1636,7 @@ TEST(Abi22MapFusionContract,
   ASSERT_TRUE(source);
   constexpr llvm::StringLiteral mutations[] = {
       "boundary-buffer", "missing-boundary", "duplicate-boundary",
-      "nonlocal-phase",
+      "nonlocal-phase", "wrong-valid-phase",
       "dangling-recomputation", "duplicate-recomputation",
       "missing-recomputation", "reordered-source"};
   for (llvm::StringRef mutation : mutations) {
@@ -1520,6 +1648,111 @@ TEST(Abi22MapFusionContract,
     ASSERT_TRUE(mutateFoldRegionTask(*built->module, mutation));
     EXPECT_FALSE(verifyMaterializationPlan(*built->module));
   }
+}
+
+TEST(Abi22MapFusionContract,
+     RankTwoAndLargeNormsFuseButLiveOutAndSecondFoldDoNot) {
+  constexpr llvm::StringLiteral source = R"mlir(
+module @anonymous {
+  func.func public @main(%arg0: tensor<2x19xbf16>, %arg1: tensor<19xbf16>) -> tensor<2x19xbf16> {
+    %0 = stablehlo.convert %arg0 : (tensor<2x19xbf16>) -> tensor<2x19xf32>
+    %1 = stablehlo.multiply %0, %0 : tensor<2x19xf32>
+    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %2 = stablehlo.reduce(%1 init: %cst) applies stablehlo.add across dimensions = [1] : (tensor<2x19xf32>, tensor<f32>) -> tensor<2xf32>
+    %3 = stablehlo.broadcast_in_dim %2, dims = [0] : (tensor<2xf32>) -> tensor<2x1xf32>
+    %cst_0 = stablehlo.constant dense<1.900000e+01> : tensor<f32>
+    %4 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f32>) -> tensor<2x1xf32>
+    %5 = stablehlo.divide %3, %4 : tensor<2x1xf32>
+    %cst_1 = stablehlo.constant dense<9.99999997E-7> : tensor<f32>
+    %6 = stablehlo.broadcast_in_dim %cst_1, dims = [] : (tensor<f32>) -> tensor<2x1xf32>
+    %7 = stablehlo.add %5, %6 : tensor<2x1xf32>
+    %8 = stablehlo.rsqrt %7 : tensor<2x1xf32>
+    %9 = stablehlo.broadcast_in_dim %8, dims = [0, 1] : (tensor<2x1xf32>) -> tensor<2x19xf32>
+    %10 = stablehlo.multiply %0, %9 : tensor<2x19xf32>
+    %11 = stablehlo.convert %arg1 : (tensor<19xbf16>) -> tensor<19xf32>
+    %12 = stablehlo.broadcast_in_dim %11, dims = [1] : (tensor<19xf32>) -> tensor<1x19xf32>
+    %13 = stablehlo.broadcast_in_dim %12, dims = [0, 1] : (tensor<1x19xf32>) -> tensor<2x19xf32>
+    %14 = stablehlo.multiply %10, %13 : tensor<2x19xf32>
+    %15 = stablehlo.convert %14 : (tensor<2x19xf32>) -> tensor<2x19xbf16>
+    return %15 : tensor<2x19xbf16>
+  }
+}
+)mlir";
+  auto replaceAll = [](std::string value, llvm::StringRef oldText,
+                       llvm::StringRef newText) {
+    size_t position = 0;
+    while ((position = value.find(oldText.str(), position)) !=
+           std::string::npos) {
+      value.replace(position, oldText.size(), newText.str());
+      position += newText.size();
+    }
+    return value;
+  };
+  for (std::string candidate :
+       {source.str(),
+        replaceAll(replaceAll(source.str(), "2x19", "2048x4096"),
+                   "1.900000e+01", "4.096000e+03")}) {
+    if (candidate.find("2048x4096") != std::string::npos) {
+      candidate = replaceAll(candidate, "tensor<19x", "tensor<4096x");
+      candidate = replaceAll(candidate, "1x19", "1x4096");
+      candidate = replaceAll(candidate, "tensor<2xf32>",
+                             "tensor<2048xf32>");
+      candidate = replaceAll(candidate, "2x1", "2048x1");
+    }
+    std::unique_ptr<BuiltModule> built =
+        build(candidate, mlir::shuttle::NumericalPolicy::SourceOrdered,
+              kFusionTuning, false, true);
+    ASSERT_TRUE(built);
+    auto plan =
+        *built->module->getOps<mlir::shuttle::MaterializationPlanOp>().begin();
+    EXPECT_EQ(llvm::range_size(plan.getBody().front().getOps<
+                                  mlir::shuttle::MaterializationTaskOp>()),
+              1);
+    auto task = *plan.getBody().front()
+                     .getOps<mlir::shuttle::MaterializationTaskOp>()
+                     .begin();
+    EXPECT_TRUE(task->getAttr("fold_region_sources"));
+  }
+
+  auto remainsUnfused = [&](std::string mutation) {
+    std::unique_ptr<BuiltModule> built =
+        build(mutation, mlir::shuttle::NumericalPolicy::SourceOrdered,
+              kFusionTuning, false, false);
+    ASSERT_TRUE(built);
+    auto plan =
+        *built->module->getOps<mlir::shuttle::MaterializationPlanOp>().begin();
+    EXPECT_GT(llvm::range_size(plan.getBody().front().getOps<
+                                  mlir::shuttle::MaterializationTaskOp>()),
+              1);
+    for (auto task : plan.getBody().front().getOps<
+             mlir::shuttle::MaterializationTaskOp>())
+      EXPECT_FALSE(task->getAttr("fold_region_sources"));
+  };
+  std::string liveOut = replaceAll(
+      source.str(),
+      "func.func public @main(%arg0: tensor<2x19xbf16>, %arg1: "
+      "tensor<19xbf16>) -> tensor<2x19xbf16>",
+      "func.func public @main(%arg0: tensor<2x19xbf16>, %arg1: "
+      "tensor<19xbf16>) -> (tensor<2x19xbf16>, tensor<2xf32>)");
+  liveOut = replaceAll(liveOut, "return %15 : tensor<2x19xbf16>",
+                       "return %15, %2 : tensor<2x19xbf16>, tensor<2xf32>");
+  remainsUnfused(std::move(liveOut));
+
+  std::string secondFold = replaceAll(
+      source.str(),
+      "func.func public @main(%arg0: tensor<2x19xbf16>, %arg1: "
+      "tensor<19xbf16>) -> tensor<2x19xbf16>",
+      "func.func public @main(%arg0: tensor<2x19xbf16>, %arg1: "
+      "tensor<19xbf16>) -> (tensor<2x19xbf16>, tensor<2xf32>)");
+  secondFold = replaceAll(
+      secondFold, "    %3 = stablehlo.broadcast_in_dim",
+      "    %extra = stablehlo.reduce(%1 init: %cst) applies stablehlo.add "
+      "across dimensions = [1] : (tensor<2x19xf32>, tensor<f32>) -> "
+      "tensor<2xf32>\n    %3 = stablehlo.broadcast_in_dim");
+  secondFold = replaceAll(
+      secondFold, "return %15 : tensor<2x19xbf16>",
+      "return %15, %extra : tensor<2x19xbf16>, tensor<2xf32>");
+  remainsUnfused(std::move(secondFold));
 }
 
 } // namespace
