@@ -37,9 +37,11 @@ module @eligible_projected_input attributes {
   }
 }
 
+// CHECK-DAG: #[[$PROJECTED2:map[0-9]*]] = affine_map<(d0, d1) -> (d0 floordiv 2, d1)>
+// CHECK-DAG: #[[$IDENTITY2:map[0-9]*]] = affine_map<(d0, d1) -> (d0, d1)>
 // CHECK-LABEL: sym_name = "eligible_projected_input"
 // CHECK: "shuttle.materialization_task"()
-// CHECK-SAME: composed_input_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0 floordiv 2, d1)>]
+// CHECK-SAME: composed_input_maps = [#[[$IDENTITY2]], #[[$PROJECTED2]]]
 // CHECK-SAME: fused_sources = [#shuttle.source_ref<0, 0, 0, 0>, #shuttle.source_ref<0, 0, 0, 1>]
 // CHECK: "shuttle.materialization_task"()
 // CHECK-SAME: kind = #shuttle.materialization_task_kind<fold>
@@ -82,9 +84,11 @@ module @eligible_rank5_composition attributes {
   }
 }
 
+// CHECK-DAG: #[[$IDENTITY5:map[0-9]*]] = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3, d4)>
+// CHECK-DAG: #[[$PROJECTED5:map[0-9]*]] = affine_map<(d0, d1, d2, d3, d4) -> (d0 floordiv 3, d1 floordiv 2, d2 floordiv 5, d3 floordiv 11, d4)>
 // CHECK-LABEL: sym_name = "eligible_rank5_composition"
 // CHECK: "shuttle.materialization_task"()
-// CHECK-SAME: composed_input_maps = [affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3, d4)>, affine_map<(d0, d1, d2, d3, d4) -> (d0 floordiv 3, d1 floordiv 2, d2 floordiv 5, d3 floordiv 11, d4)>]
+// CHECK-SAME: composed_input_maps = [#[[$IDENTITY5]], #[[$PROJECTED5]]]
 // CHECK-SAME: fused_sources = [#shuttle.source_ref<0, 0, 0, 0>, #shuttle.source_ref<0, 0, 0, 1>]
 // CHECK: "shuttle.materialization_task"()
 // CHECK-SAME: kind = #shuttle.materialization_task_kind<fold>
