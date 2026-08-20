@@ -27,6 +27,7 @@
 #include "shuttle/IR/ShuttleOps.h"
 #include "shuttle/Runtime/GpuExecutable.h"
 #include "shuttle/Runtime/GpuFfi.h"
+#include "shuttle/Runtime/GpuRunner.h"
 #include "shuttle/Transforms/Passes.h"
 #include "stablehlo/dialect/Register.h"
 #include "tools/cpp/runfiles/runfiles.h"
@@ -3887,6 +3888,117 @@ TEST(GpuTransportV2Test, ExportedFfiBundleOwnsEveryLifecycleStage) {
                    .ok());
   EXPECT_EQ(failingAllocator.sizes.size(), 2);
   EXPECT_EQ(failingAllocator.deallocations, 2);
+}
+
+TEST(GpuTransportV2Test,
+     StandaloneRunnerExecutesAbi22FusedRmsNormForwardAndBackward) {
+  struct Boundary {
+    const char *filename;
+    int64_t launches;
+  };
+  constexpr Boundary boundaries[] = {
+      {"jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-forward.mlir",
+       11},
+      {"jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-backward.mlir",
+       30},
+  };
+  constexpr llvm::StringLiteral options =
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+
+  for (const Boundary &boundary : boundaries) {
+    SCOPED_TRACE(boundary.filename);
+    auto source = fixtureSource(boundary.filename);
+    ASSERT_TRUE(source);
+    auto built = buildFixture(
+        *source, mlir::shuttle::NumericalPolicy::SourceOrdered, options);
+    ASSERT_TRUE(built);
+    auto transport =
+        mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+    ASSERT_TRUE(mlir::succeeded(transport));
+    auto executable = mlir::shuttle::GpuExecutable::Load(*transport);
+    ASSERT_TRUE(executable.ok()) << executable.status();
+    auto decoded = decodeInlineSchema2(*transport);
+    ASSERT_TRUE(decoded);
+    ASSERT_EQ(decoded->launches.size(), boundary.launches);
+
+    llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> operands;
+    llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> results;
+    llvm::DenseMap<int64_t, uintptr_t> externalSlots;
+    for (const mlir::shuttle::GpuExternalBinding &binding :
+         (*executable)->externalBindings()) {
+      uintptr_t address = UINT64_C(0x100000000) +
+                          static_cast<uintptr_t>(binding.slotOrdinal) *
+                              UINT64_C(0x10000000);
+      mlir::shuttle::GpuRunnerBuffer buffer{
+          reinterpret_cast<void *>(address), binding.requiredBytes};
+      if (binding.kind ==
+          mlir::shuttle::ExecutableBindingKind::Operand) {
+        ASSERT_EQ(binding.index, static_cast<int64_t>(operands.size()));
+        operands.push_back(buffer);
+      } else {
+        ASSERT_EQ(binding.kind,
+                  mlir::shuttle::ExecutableBindingKind::Result);
+        ASSERT_EQ(binding.index, static_cast<int64_t>(results.size()));
+        results.push_back(buffer);
+      }
+      externalSlots[binding.slotOrdinal] = address;
+    }
+
+    SyntheticAllocator allocator(0xa0000000);
+    stream_executor::MockStreamExecutor executor;
+    stream_executor::MockStream stream;
+    stream_executor::GpuComputeCapability capability{
+        stream_executor::CudaComputeCapability{9, 0}};
+    auto trace = std::make_shared<ExecutionTrace>();
+    EXPECT_CALL(stream, parent()).WillRepeatedly(testing::Return(&executor));
+    EXPECT_CALL(executor, LoadKernel(testing::_))
+        .Times(boundary.launches)
+        .WillRepeatedly([trace](
+                            const stream_executor::KernelLoaderSpec &spec) {
+          return recordLoadedKernel(spec, trace);
+        });
+
+    auto runner = mlir::shuttle::GpuRunner::Create(
+        *transport, &allocator, 0, &stream, &capability);
+    ASSERT_TRUE(runner.ok()) << runner.status();
+    const mlir::shuttle::GpuRunnerResources &resources =
+        (*runner)->resources();
+    EXPECT_EQ(resources.codeBytes, decoded->code.size());
+    EXPECT_EQ(resources.launchCount, boundary.launches);
+    EXPECT_EQ(resources.slotCount, decoded->slots);
+    EXPECT_EQ(resources.externalOperandCount, operands.size());
+    EXPECT_EQ(resources.externalResultCount, results.size());
+    EXPECT_EQ(resources.temporaryAllocationCount,
+              decoded->temporaryGroupOrder.size());
+    EXPECT_EQ(resources.temporaryBytes,
+              llvm::accumulate(decoded->temporaryGroupBytes, uint64_t{0}));
+    EXPECT_EQ(allocator.sizes, decoded->temporaryGroupBytes);
+    expectLoadedKernels(*decoded, *trace, 0);
+
+    ASSERT_TRUE((*runner)->Execute(operands, results).ok());
+    EXPECT_EQ(trace->launchAttempts.load(), boundary.launches);
+    auto slots = dynamicSlotAddresses(*decoded, allocator, 0xa0000000,
+                                      std::move(externalSlots));
+    expectKernelLaunches(*decoded, *trace, 0, slots);
+
+    llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> wrongOperands(operands);
+    wrongOperands.front().sizeBytes -= 2;
+    EXPECT_FALSE((*runner)->Execute(wrongOperands, results).ok());
+    EXPECT_EQ(trace->launchAttempts.load(), boundary.launches);
+
+    if (operands.size() > 1) {
+      llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> aliased(operands);
+      aliased[1].data = aliased[0].data;
+      EXPECT_FALSE((*runner)->Execute(aliased, results).ok());
+      EXPECT_EQ(trace->launchAttempts.load(), boundary.launches);
+    }
+
+    stream_executor::GpuComputeCapability unsupported{
+        stream_executor::CudaComputeCapability{8, 0}};
+    EXPECT_FALSE(mlir::shuttle::GpuRunner::Create(
+                     *transport, &allocator, 0, &stream, &unsupported)
+                     .ok());
+  }
 }
 
 TEST(GpuTransportV2Test,
