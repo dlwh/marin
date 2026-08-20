@@ -700,6 +700,9 @@ TEST(Abi22MapFusionContract,
       std::unique_ptr<BuiltModule> built =
           build(*source, policy, kFusionTuning, false, true);
       ASSERT_TRUE(built);
+      std::unique_ptr<BuiltModule> materialized =
+          build(*source, policy, kMaterializationTuning, false, true);
+      ASSERT_TRUE(materialized);
       std::optional<PlanSummary> plan = summary(*built->module);
       ASSERT_TRUE(plan);
       expectCounts(*plan, fixture, true);
@@ -713,6 +716,67 @@ TEST(Abi22MapFusionContract,
       ASSERT_EQ(devices.size(), 1);
       ASSERT_EQ(invocationAbis.size(), 1);
       ASSERT_EQ(bundles.size(), 1);
+      auto fusedPlan =
+          *built->module->getOps<mlir::shuttle::MaterializationPlanOp>()
+               .begin();
+      llvm::SmallVector<mlir::shuttle::MaterializationTaskOp> fusedTasks(
+          fusedPlan.getBody().front().getOps<
+              mlir::shuttle::MaterializationTaskOp>());
+      auto ordinaryPlan =
+          *materialized->module
+               ->getOps<mlir::shuttle::MaterializationPlanOp>()
+               .begin();
+      llvm::SmallVector<mlir::shuttle::MaterializationTaskOp> ordinaryTasks(
+          ordinaryPlan.getBody().front().getOps<
+              mlir::shuttle::MaterializationTaskOp>());
+      auto ordinaryDevice =
+          *materialized->module->getOps<mlir::shuttle::DeviceModuleOp>().begin();
+      auto fusedEntries = llvm::to_vector(
+          devices.front().getBody().front().getOps<
+              mlir::shuttle::DeviceEntryOp>());
+      auto ordinaryEntries = llvm::to_vector(
+          ordinaryDevice.getBody().front().getOps<
+              mlir::shuttle::DeviceEntryOp>());
+      for (auto [ordinal, task] : llvm::enumerate(fusedTasks)) {
+        if (!task->getAttr("fold_epilogue_sources"))
+          continue;
+        auto ordinary = llvm::find_if(ordinaryTasks, [&](auto candidate) {
+          auto left = candidate.getSource();
+          auto right = task.getSource();
+          return left.getFunctionOrdinal() == right.getFunctionOrdinal() &&
+                 left.getBlockOrdinal() == right.getBlockOrdinal() &&
+                 left.getOperationOrdinal() == right.getOperationOrdinal() &&
+                 left.getResultOrdinal() == right.getResultOrdinal();
+        });
+        ASSERT_NE(ordinary, ordinaryTasks.end());
+        const size_t ordinaryOrdinal = ordinary - ordinaryTasks.begin();
+        mlir::shuttle::DeviceEntryOp fusedEntry = fusedEntries[ordinal];
+        mlir::shuttle::DeviceEntryOp ordinaryEntry =
+            ordinaryEntries[ordinaryOrdinal];
+        EXPECT_EQ(fusedEntry.getGrid(), ordinaryEntry.getGrid());
+        EXPECT_EQ(fusedEntry.getBlock(), ordinaryEntry.getBlock());
+        EXPECT_EQ(fusedEntry.getDynamicSharedBytes(),
+                  ordinaryEntry.getDynamicSharedBytes());
+        auto code = [](mlir::shuttle::DeviceModuleOp device,
+                       mlir::shuttle::DeviceEntryOp entry) {
+          return llvm::StringRef(
+              reinterpret_cast<const char *>(device.getCode().data() +
+                                               entry.getCodeOffset()),
+              entry.getCodeLength());
+        };
+        constexpr llvm::StringLiteral reductionStart = "  mov.u32 %r0";
+        constexpr llvm::StringLiteral reductionEnd =
+            "  add.rn.f32 %f37, %f35, %f36;\n";
+        auto reductionBody = [&](llvm::StringRef ptx) {
+          size_t begin = ptx.find(reductionStart);
+          size_t end = ptx.find(reductionEnd);
+          EXPECT_NE(begin, llvm::StringRef::npos);
+          EXPECT_NE(end, llvm::StringRef::npos);
+          return ptx.slice(begin, end + reductionEnd.size());
+        };
+        EXPECT_EQ(reductionBody(code(devices.front(), fusedEntry)),
+                  reductionBody(code(ordinaryDevice, ordinaryEntry)));
+      }
       EXPECT_FALSE(devices.front().getCode().empty());
       EXPECT_EQ(llvm::range_size(
                     devices.front().getBody().front().getOps<
