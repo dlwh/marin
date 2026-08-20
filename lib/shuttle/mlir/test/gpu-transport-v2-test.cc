@@ -14,6 +14,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <type_traits>
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -3893,6 +3894,9 @@ TEST(GpuTransportV2Test, ExportedFfiBundleOwnsEveryLifecycleStage) {
 
 TEST(GpuTransportV2Test,
      StandaloneRunnerExecutesAbi22FusedRmsNormForwardAndBackward) {
+  static_assert(!std::is_move_constructible_v<mlir::shuttle::GpuRunner>);
+  static_assert(!std::is_move_assignable_v<mlir::shuttle::GpuRunner>);
+
   struct Boundary {
     const char *filename;
     int64_t launches;
@@ -3956,8 +3960,11 @@ TEST(GpuTransportV2Test,
     auto trace = std::make_shared<ExecutionTrace>();
     EXPECT_CALL(stream, parent()).WillRepeatedly(testing::Return(&executor));
     EXPECT_CALL(stream, BlockHostUntilDone())
-        .Times(1)
-        .WillOnce(testing::Return(absl::OkStatus()));
+        .Times(4)
+        .WillOnce(testing::Return(absl::OkStatus()))
+        .WillOnce(testing::Return(
+            absl::InternalError("synthetic completion failure")))
+        .WillRepeatedly(testing::Return(absl::OkStatus()));
     EXPECT_CALL(executor, LoadKernel(testing::_))
         .Times(boundary.launches)
         .WillRepeatedly([trace](
@@ -3999,6 +4006,14 @@ TEST(GpuTransportV2Test,
       EXPECT_FALSE((*runner)->Execute(aliased, results).ok());
       EXPECT_EQ(trace->launchAttempts.load(), boundary.launches);
     }
+
+    EXPECT_FALSE((*runner)->Execute(operands, results).ok());
+    EXPECT_EQ(trace->launchAttempts.load(), boundary.launches * 2);
+    EXPECT_FALSE((*runner)->Execute(operands, results).ok());
+    EXPECT_EQ(trace->launchAttempts.load(), boundary.launches * 2);
+    EXPECT_TRUE((*runner)->AwaitCompletion().ok());
+    EXPECT_TRUE((*runner)->Execute(operands, results).ok());
+    EXPECT_EQ(trace->launchAttempts.load(), boundary.launches * 3);
 
     stream_executor::GpuComputeCapability unsupported{
         stream_executor::CudaComputeCapability{8, 0}};
