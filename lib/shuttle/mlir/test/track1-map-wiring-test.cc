@@ -68,6 +68,30 @@ module @jit__lambda {
 }
 )mlir";
 
+constexpr llvm::StringLiteral kF32BoundaryProgram = R"mlir(
+module @jit__lambda {
+  func.func public @main(%arg0: tensor<2x3xf32>) -> tensor<2x3xf32> {
+    %0 = stablehlo.negate %arg0 : tensor<2x3xf32>
+    %1 = stablehlo.negate %0 : tensor<2x3xf32>
+    %2 = stablehlo.abs %1 : tensor<2x3xf32>
+    return %2 : tensor<2x3xf32>
+  }
+}
+)mlir";
+
+constexpr llvm::StringLiteral kInternalBf16Program = R"mlir(
+module @jit__lambda {
+  func.func public @main(%arg0: tensor<2x3xbf16>) -> tensor<2x3xbf16> {
+    %0 = stablehlo.convert %arg0 : (tensor<2x3xbf16>) -> tensor<2x3xf32>
+    %1 = stablehlo.convert %0 : (tensor<2x3xf32>) -> tensor<2x3xbf16>
+    %2 = stablehlo.convert %1 : (tensor<2x3xbf16>) -> tensor<2x3xf32>
+    %3 = stablehlo.convert %2 : (tensor<2x3xf32>) -> tensor<2x3xbf16>
+    %4 = stablehlo.abs %3 : tensor<2x3xbf16>
+    return %4 : tensor<2x3xbf16>
+  }
+}
+)mlir";
+
 class RecordingObserver final : public mlir::shuttle::ShuttlePipelineObserver {
 public:
   void observe(
@@ -228,6 +252,35 @@ TEST(TrackOneMapWiringTest,
   EXPECT_EQ(events[1].phase(), mlir::shuttle::ShuttlePipelinePhase::Failure);
   EXPECT_EQ(events[1].failurePass(),
             "shuttle-build-gpu-executable-bundle");
+}
+
+TEST(TrackOneMapWiringTest,
+     RejectsF32BoundariesAndBf16TemporariesTransactionally) {
+  constexpr std::array<llvm::StringLiteral, 2> invalidPrograms = {
+      kF32BoundaryProgram, kInternalBf16Program};
+  for (llvm::StringRef program : invalidPrograms) {
+    auto observer = std::make_shared<RecordingObserver>();
+    auto subscription =
+        mlir::shuttle::subscribeShuttlePipelineObserver(observer);
+    mlir::MLIRContext context;
+    mlir::OwningOpRef<mlir::ModuleOp> module = parseModule(context, program);
+    ASSERT_TRUE(module);
+    std::string before = moduleText(*module);
+
+    absl::Status status = mlir::shuttle::runShuttleXlaTransform(
+        *module, kGpuSourceOrderedOptions.str());
+
+    EXPECT_EQ(status.code(), absl::StatusCode::kInternal);
+    EXPECT_EQ(moduleText(*module), before);
+    auto events = observer->snapshot();
+    ASSERT_EQ(events.size(), 2);
+    EXPECT_EQ(events[0].phase(),
+              mlir::shuttle::ShuttlePipelinePhase::AlgebraCoverage);
+    EXPECT_EQ(events[1].phase(),
+              mlir::shuttle::ShuttlePipelinePhase::Failure);
+    EXPECT_EQ(events[1].failurePass(),
+              "shuttle-plan-row-fold-materialization");
+  }
 }
 
 } // namespace
