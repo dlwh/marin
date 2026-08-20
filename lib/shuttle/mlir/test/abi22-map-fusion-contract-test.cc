@@ -5,7 +5,9 @@
 #include <cstdint>
 #include <fstream>
 #include <memory>
+#include <map>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <tuple>
@@ -15,6 +17,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/raw_ostream.h"
@@ -187,6 +190,91 @@ std::string printType(mlir::Type type) {
   llvm::raw_string_ostream stream(result);
   type.print(stream);
   return result;
+}
+
+struct PtxStore {
+  std::string pointer;
+  std::string value;
+  bool bf16;
+};
+
+struct PtxDataflow {
+  std::map<std::string, std::set<std::string>> definitions;
+  std::vector<PtxStore> stores;
+};
+
+std::vector<std::string> ptxTokens(llvm::StringRef text) {
+  std::vector<std::string> tokens;
+  for (size_t index = 0; index < text.size();) {
+    const bool registerToken = text[index] == '%';
+    const bool parameterToken =
+        text[index] == 'p' && index + 1 < text.size() &&
+        llvm::isDigit(text[index + 1]);
+    const bool constantToken =
+        text[index] == '0' && index + 2 < text.size() &&
+        text[index + 1] == 'f' && llvm::isHexDigit(text[index + 2]);
+    if (!registerToken && !parameterToken && !constantToken) {
+      ++index;
+      continue;
+    }
+    size_t end = index + (constantToken ? 2 : 1);
+    while (end < text.size() &&
+           (llvm::isAlnum(text[end]) || text[end] == '_'))
+      ++end;
+    tokens.push_back(text.slice(index, end).str());
+    index = end;
+  }
+  return tokens;
+}
+
+PtxDataflow ptxDataflow(llvm::StringRef ptx) {
+  PtxDataflow result;
+  while (!ptx.empty()) {
+    auto [line, remainder] = ptx.split('\n');
+    ptx = remainder;
+    line = line.trim();
+    if (line.empty() || line.starts_with("//") || line.ends_with(":"))
+      continue;
+    size_t opcodeStart = line.find_first_not_of(" @%p0123456789");
+    if (opcodeStart == llvm::StringRef::npos)
+      continue;
+    llvm::StringRef instruction = line.drop_front(opcodeStart);
+    auto [opcode, operands] = instruction.split(' ');
+    std::vector<std::string> tokens = ptxTokens(operands);
+    if (opcode.starts_with("st.global.")) {
+      if (tokens.size() >= 2)
+        result.stores.push_back(
+            {tokens[0], tokens[1], opcode == "st.global.u16"});
+      continue;
+    }
+    if (tokens.empty() || tokens.front().front() != '%')
+      continue;
+    std::set<std::string> dependencies(tokens.begin() + 1, tokens.end());
+    dependencies.insert((llvm::Twine("$op:") + opcode).str());
+    if (opcode.starts_with("ld.global."))
+      dependencies.insert((llvm::Twine("$") + opcode).str());
+    if (opcode.starts_with("ld.shared."))
+      dependencies.insert("$shared");
+    result.definitions[tokens.front()] = std::move(dependencies);
+  }
+  return result;
+}
+
+std::set<std::string> ptxDependencyClosure(const PtxDataflow &flow,
+                                           llvm::StringRef root) {
+  std::set<std::string> closure;
+  std::vector<std::string> worklist{root.str()};
+  while (!worklist.empty()) {
+    std::string value = std::move(worklist.back());
+    worklist.pop_back();
+    if (!closure.insert(value).second)
+      continue;
+    auto found = flow.definitions.find(value);
+    if (found != flow.definitions.end())
+      worklist.insert(worklist.end(), found->second.begin(),
+                      found->second.end());
+  }
+  return closure;
 }
 
 std::vector<int64_t>
@@ -642,6 +730,43 @@ bool mutateFoldRegionTask(mlir::ModuleOp module, llvm::StringRef mutation) {
       *transition = builder.getNamedAttr("transition",
                                          builder.getStringAttr(
                                              "launch_boundary"));
+      changed[1] = builder.getDictionaryAttr(fields);
+      task->setAttr("fold_region_phases", builder.getArrayAttr(changed));
+    } else if (mutation == "missing-phase") {
+      if (phases.size() < 2)
+        continue;
+      task->setAttr("fold_region_phases",
+                    builder.getArrayAttr(phases.getValue().drop_back()));
+    } else if (mutation == "duplicate-phase") {
+      llvm::SmallVector<mlir::Attribute> changed(phases.getValue());
+      changed.push_back(changed.front());
+      task->setAttr("fold_region_phases", builder.getArrayAttr(changed));
+    } else if (mutation == "reordered-phase") {
+      if (phases.size() < 2)
+        continue;
+      llvm::SmallVector<mlir::Attribute> changed(
+          llvm::reverse(phases.getValue()));
+      task->setAttr("fold_region_phases", builder.getArrayAttr(changed));
+    } else if (mutation == "non-ssa-phase") {
+      if (phases.size() < 2)
+        continue;
+      mlir::Attribute unrelated;
+      module.walk([&](mlir::shuttle::FoldOp fold) {
+        if (!unrelated && !llvm::is_contained(sources, fold.getSource()))
+          unrelated = fold.getSource();
+      });
+      if (!unrelated)
+        return false;
+      llvm::SmallVector<mlir::Attribute> changed(phases.getValue());
+      auto phase = mlir::cast<mlir::DictionaryAttr>(changed[1]);
+      llvm::SmallVector<mlir::NamedAttribute> fields(phase.begin(),
+                                                     phase.end());
+      auto source = llvm::find_if(fields, [](mlir::NamedAttribute field) {
+        return field.getName() == "source";
+      });
+      if (source == fields.end())
+        return false;
+      *source = builder.getNamedAttr("source", unrelated);
       changed[1] = builder.getDictionaryAttr(fields);
       task->setAttr("fold_region_phases", builder.getArrayAttr(changed));
     } else if (mutation == "wrong-valid-phase") {
@@ -1536,6 +1661,34 @@ TEST(Abi22MapFusionContract,
           ASSERT_TRUE(buffer);
           EXPECT_EQ(buffer.getTensorType(),
                     map.getInputs()[operand.getInt()].getType());
+          const int64_t sourceOrdinal = useSource.getOperationOrdinal();
+          std::optional<int64_t> expectedBuffer;
+          if (!backward) {
+            if (sourceOrdinal == 0)
+              expectedBuffer = 0;
+            else if (sourceOrdinal == 14)
+              expectedBuffer = 1;
+          } else if (taskOrdinal == 0 && sourceOrdinal == 0) {
+            expectedBuffer = 0;
+          } else if (taskOrdinal == 1) {
+            if (sourceOrdinal == 0)
+              expectedBuffer = 0;
+            else if (sourceOrdinal == 4)
+              expectedBuffer = 3;
+            else if (sourceOrdinal == 20)
+              expectedBuffer = 2;
+          } else if (taskOrdinal == 2) {
+            if (sourceOrdinal == 0)
+              expectedBuffer = 0;
+            else if (sourceOrdinal == 4)
+              expectedBuffer = 3;
+            else if (sourceOrdinal == 18)
+              expectedBuffer = 1;
+            else if (sourceOrdinal == 20)
+              expectedBuffer = 2;
+          }
+          ASSERT_TRUE(expectedBuffer);
+          EXPECT_EQ(inputBuffer.getInt(), *expectedBuffer);
         }
         EXPECT_EQ(actualBoundaryUses.size(), expectedBoundaryUses.size());
         EXPECT_TRUE(llvm::all_of(expectedBoundaryUses, [&](auto boundaryUse) {
@@ -1578,6 +1731,28 @@ TEST(Abi22MapFusionContract,
         EXPECT_NE(ptx.find("ld.global.u16"), llvm::StringRef::npos);
         EXPECT_NE(ptx.find("cvt.f32.bf16"), llvm::StringRef::npos);
         EXPECT_NE(ptx.find("add.rn.f32"), llvm::StringRef::npos);
+        PtxDataflow flow = ptxDataflow(ptx);
+        ASSERT_EQ(flow.stores.size(), 1u);
+        const bool bf16Output = !backward || entryOrdinal != 0;
+        EXPECT_EQ(flow.stores.front().bf16, bf16Output);
+        std::set<std::string> valueDependencies =
+            ptxDependencyClosure(flow, flow.stores.front().value);
+        std::set<std::string> pointerDependencies =
+            ptxDependencyClosure(flow, flow.stores.front().pointer);
+        EXPECT_TRUE(valueDependencies.count("$shared"));
+        EXPECT_TRUE(valueDependencies.count("$op:add.rn.f32"));
+        EXPECT_TRUE(valueDependencies.count("$op:mul.rn.f32"));
+        EXPECT_TRUE(valueDependencies.count("$ld.global.u16"));
+        for (int64_t parameter = 0;
+             parameter < static_cast<int64_t>(
+                             tasks[entryOrdinal].getInputBuffers().size());
+             ++parameter)
+          EXPECT_TRUE(valueDependencies.count(
+              (llvm::Twine("p") + llvm::Twine(parameter)).str()));
+        EXPECT_TRUE(pointerDependencies.count(
+            (llvm::Twine("p") +
+             llvm::Twine(tasks[entryOrdinal].getInputBuffers().size()))
+                .str()));
         if (backward && entryOrdinal == 0) {
           EXPECT_NE(ptx.find("mul.rn.f32"), llvm::StringRef::npos);
           EXPECT_NE(ptx.find("st.global.f32"), llvm::StringRef::npos);
@@ -1591,6 +1766,11 @@ TEST(Abi22MapFusionContract,
           EXPECT_NE(ptx.find("0f358637BD"), llvm::StringRef::npos);
           EXPECT_NE(ptx.find("sqrt.rn.f32"), llvm::StringRef::npos);
           EXPECT_NE(ptx.find("st.global.u16"), llvm::StringRef::npos);
+          EXPECT_TRUE(valueDependencies.count("$op:sqrt.rn.f32"));
+          EXPECT_TRUE(valueDependencies.count(extent.str()));
+          EXPECT_TRUE(valueDependencies.count("0f358637BD"));
+          EXPECT_TRUE(
+              valueDependencies.count("$op:cvt.rn.bf16.f32"));
         }
       }
       if (!backward) {
@@ -1640,7 +1820,8 @@ TEST(Abi22MapFusionContract,
   ASSERT_TRUE(source);
   constexpr llvm::StringLiteral mutations[] = {
       "boundary-buffer", "missing-boundary", "duplicate-boundary",
-      "nonlocal-phase", "wrong-valid-phase",
+      "nonlocal-phase", "missing-phase", "duplicate-phase",
+      "reordered-phase", "non-ssa-phase", "wrong-valid-phase",
       "dangling-recomputation", "duplicate-recomputation",
       "missing-recomputation", "reordered-source"};
   for (llvm::StringRef mutation : mutations) {
@@ -1742,20 +1923,23 @@ module @anonymous {
                        "return %15, %2 : tensor<2x19xbf16>, tensor<2xf32>");
   remainsUnfused(std::move(liveOut));
 
-  std::string secondFold = replaceAll(
-      source.str(),
-      "func.func public @main(%arg0: tensor<2x19xbf16>, %arg1: "
-      "tensor<19xbf16>) -> tensor<2x19xbf16>",
-      "func.func public @main(%arg0: tensor<2x19xbf16>, %arg1: "
-      "tensor<19xbf16>) -> (tensor<2x19xbf16>, tensor<2xf32>)");
+  std::string secondFold = source.str();
   secondFold = replaceAll(
       secondFold, "    %3 = stablehlo.broadcast_in_dim",
       "    %extra = stablehlo.reduce(%1 init: %cst) applies stablehlo.add "
       "across dimensions = [1] : (tensor<2x19xf32>, tensor<f32>) -> "
       "tensor<2xf32>\n    %3 = stablehlo.broadcast_in_dim");
   secondFold = replaceAll(
-      secondFold, "return %15 : tensor<2x19xbf16>",
-      "return %15, %extra : tensor<2x19xbf16>, tensor<2xf32>");
+      secondFold,
+      "    %15 = stablehlo.convert %14 : (tensor<2x19xf32>) -> "
+      "tensor<2x19xbf16>",
+      "    %extra_1 = stablehlo.broadcast_in_dim %extra, dims = [0] : "
+      "(tensor<2xf32>) -> tensor<2x1xf32>\n"
+      "    %extra_2 = stablehlo.broadcast_in_dim %extra_1, dims = [0, 1] : "
+      "(tensor<2x1xf32>) -> tensor<2x19xf32>\n"
+      "    %joined = stablehlo.add %14, %extra_2 : tensor<2x19xf32>\n"
+      "    %15 = stablehlo.convert %joined : (tensor<2x19xf32>) -> "
+      "tensor<2x19xbf16>");
   remainsUnfused(std::move(secondFold));
 }
 
