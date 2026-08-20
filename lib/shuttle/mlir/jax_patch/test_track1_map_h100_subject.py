@@ -2,11 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import hashlib
+from pathlib import Path
 
 import jax
 import ml_dtypes
 import numpy as np
 import pytest
+import track1_map_h100_subject as subject
 from track1_map_h100_subject import (
     Coordinate,
     Mode,
@@ -166,3 +168,83 @@ def test_cache_attribution_requires_six_unique_coordinate_entries() -> None:
     missing.pop(Coordinate.all()[-1])
     with pytest.raises(ValueError, match="six"):
         cache_attribution(missing)
+
+
+def test_matrix_populates_then_reuses_six_attributed_cache_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache_directory = tmp_path / "cache"
+    cache_directory.mkdir()
+    listeners = []
+
+    monkeypatch.setattr(subject, "require_h100", lambda: None)
+    monkeypatch.setattr(subject, "configure_cache", lambda directory: None)
+    monkeypatch.setattr(
+        subject.jax.monitoring,
+        "register_event_listener",
+        listeners.append,
+    )
+
+    def arrays(coordinate: Coordinate) -> tuple[np.ndarray, np.ndarray]:
+        value = deterministic_input(coordinate.rank)
+        return (
+            np.abs(-value.astype(np.float32)).astype(ml_dtypes.bfloat16),
+            np.where(value > 0, 1, -1).astype(ml_dtypes.bfloat16),
+        )
+
+    def populate(coordinate: Coordinate):
+        (cache_directory / f"jit_{coordinate.label}-{coordinate.rank:064x}-cache").write_bytes(coordinate.label.encode())
+        snapshot = () if coordinate.mode is Mode.DISABLED else _successful_snapshot(coordinate)
+        return arrays(coordinate), snapshot
+
+    monkeypatch.setattr(subject, "_execute", populate)
+    populated = subject.run_matrix(cache_directory, reuse=False)
+    attribution = {result.coordinate: result.cache_entry for result in populated}
+
+    assert len(populated) == 6
+    assert len(set(attribution.values())) == 6
+    assert sum(result.observer is not None for result in populated) == 4
+    populate_bytes = subject.cache_snapshot(cache_directory)
+
+    def reuse(coordinate: Coordinate):
+        listeners[-1](subject.CACHE_HIT_EVENT)
+        return arrays(coordinate), ()
+
+    monkeypatch.setattr(subject, "_execute", reuse)
+    reused = subject.run_matrix(
+        cache_directory,
+        reuse=True,
+        expected_attribution=attribution,
+    )
+
+    assert [result.primal_sha256 for result in reused] == [result.primal_sha256 for result in populated]
+    assert [result.gradient_sha256 for result in reused] == [result.gradient_sha256 for result in populated]
+    assert all(result.observer is None for result in reused)
+    assert subject.cache_snapshot(cache_directory) == populate_bytes
+
+
+def test_reuse_rejects_cache_drift_before_executing_subject(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cache_directory = tmp_path / "cache"
+    cache_directory.mkdir()
+    attribution = {}
+    for ordinal, coordinate in enumerate(Coordinate.all()):
+        name = f"jit_{coordinate.label}-{ordinal:064x}-cache"
+        content = coordinate.label.encode()
+        (cache_directory / name).write_bytes(content)
+        attribution[coordinate] = (name, len(content), hashlib.sha256(content).hexdigest())
+    (cache_directory / attribution[Coordinate.all()[-1]][0]).write_bytes(b"drift")
+
+    monkeypatch.setattr(subject, "require_h100", lambda: None)
+    monkeypatch.setattr(subject, "configure_cache", lambda directory: None)
+    monkeypatch.setattr(
+        subject,
+        "_execute",
+        lambda coordinate: pytest.fail(f"executed {coordinate.label}"),
+    )
+
+    with pytest.raises(RuntimeError, match="bytes differ"):
+        subject.run_matrix(
+            cache_directory,
+            reuse=True,
+            expected_attribution=attribution,
+        )
