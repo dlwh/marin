@@ -3901,12 +3901,14 @@ TEST(GpuTransportV2Test,
     const char *filename;
     int64_t launches;
     int64_t slots;
+    int64_t temporaryGroups;
+    uint64_t temporaryBytes;
   };
   constexpr Boundary boundaries[] = {
       {"jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-forward.mlir",
-       10, 12},
+       10, 12, 6, 2268},
       {"jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-backward.mlir",
-       27, 30},
+       27, 30, 9, 4452},
   };
   constexpr llvm::StringLiteral options =
       R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
@@ -3930,6 +3932,9 @@ TEST(GpuTransportV2Test,
     ASSERT_TRUE(decoded);
     ASSERT_EQ(decoded->launches.size(), boundary.launches);
     ASSERT_EQ(decoded->slots, boundary.slots);
+    EXPECT_EQ(decoded->temporaryGroupOrder.size(), boundary.temporaryGroups);
+    EXPECT_EQ(llvm::accumulate(decoded->temporaryGroupBytes, uint64_t{0}),
+              boundary.temporaryBytes);
 
     llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> operands;
     llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> results;
@@ -3985,9 +3990,8 @@ TEST(GpuTransportV2Test,
     EXPECT_EQ(resources.externalOperandCount, operands.size());
     EXPECT_EQ(resources.externalResultCount, results.size());
     EXPECT_EQ(resources.temporaryAllocationCount,
-              decoded->temporaryGroupOrder.size());
-    EXPECT_EQ(resources.temporaryBytes,
-              llvm::accumulate(decoded->temporaryGroupBytes, uint64_t{0}));
+              boundary.temporaryGroups);
+    EXPECT_EQ(resources.temporaryBytes, boundary.temporaryBytes);
     EXPECT_EQ(allocator.sizes, decoded->temporaryGroupBytes);
     expectLoadedKernels(*decoded, *trace, 0);
 

@@ -535,6 +535,54 @@ bool mutateFusedTask(mlir::ModuleOp module, llvm::StringRef mutation) {
   return false;
 }
 
+bool mutateFoldEpilogueTask(mlir::ModuleOp module,
+                            llvm::StringRef mutation) {
+  llvm::SmallVector<mlir::shuttle::MaterializationPlanOp> plans(
+      module.getOps<mlir::shuttle::MaterializationPlanOp>());
+  if (plans.size() != 1)
+    return false;
+  for (mlir::shuttle::MaterializationTaskOp task :
+       plans.front()
+           .getBody()
+           .front()
+           .getOps<mlir::shuttle::MaterializationTaskOp>()) {
+    auto sources =
+        task->getAttrOfType<mlir::ArrayAttr>("fold_epilogue_sources");
+    auto maps = task->getAttrOfType<mlir::ArrayAttr>("epilogue_input_maps");
+    if (!sources || sources.size() < 2 || !maps || maps.size() < 2)
+      continue;
+    mlir::Builder builder(module.getContext());
+    llvm::SmallVector<mlir::Attribute> changed;
+    if (mutation == "duplicate-source") {
+      llvm::append_range(changed, sources);
+      changed[1] = changed[0];
+      task->setAttr("fold_epilogue_sources", builder.getArrayAttr(changed));
+    } else if (mutation == "reordered-source") {
+      llvm::append_range(changed, llvm::reverse(sources.getValue()));
+      task->setAttr("fold_epilogue_sources", builder.getArrayAttr(changed));
+    } else if (mutation == "stale-source") {
+      llvm::append_range(changed, sources);
+      changed[0] = mlir::shuttle::SourceRefAttr::get(
+          module.getContext(), 99, 99, 99, 99);
+      task->setAttr("fold_epilogue_sources", builder.getArrayAttr(changed));
+    } else if (mutation == "missing-map") {
+      task->setAttr("epilogue_input_maps",
+                    builder.getArrayAttr(maps.getValue().drop_back()));
+    } else if (mutation == "reordered-map") {
+      llvm::append_range(changed, llvm::reverse(maps.getValue()));
+      if (maps.getValue() == llvm::ArrayRef<mlir::Attribute>(changed))
+        continue;
+      task->setAttr("epilogue_input_maps", builder.getArrayAttr(changed));
+    } else {
+      return false;
+    }
+    plans.front().setFingerprint(
+        mlir::shuttle::materializationPlanFingerprint(plans.front()));
+    return true;
+  }
+  return false;
+}
+
 bool verifyMaterializationPlan(mlir::ModuleOp module) {
   mlir::PassManager manager(module.getContext());
   manager.addPass(mlir::shuttle::createVerifyMaterializationPlanPass());
@@ -665,11 +713,11 @@ TEST(Abi22MapFusionContract,
       EXPECT_EQ(llvm::range_size(
                     devices.front().getBody().front().getOps<
                         mlir::shuttle::DeviceEntryOp>()),
-                fixture.fusedTasks);
+                fixture.fusedTasks - plan->eligibleFoldMapEdges);
       EXPECT_EQ(llvm::range_size(
                     invocationAbis.front().getBody().front().getOps<
                         mlir::shuttle::InvocationSlotOp>()),
-                fixture.fusedBuffers);
+                fixture.fusedBuffers - plan->eligibleFoldMapEdges);
       for (mlir::shuttle::DeviceEntryOp entry :
            devices.front().getBody().front().getOps<
                mlir::shuttle::DeviceEntryOp>()) {
@@ -682,8 +730,10 @@ TEST(Abi22MapFusionContract,
       auto decoded = mlir::shuttle::GpuExecutable::Load(*transport);
       ASSERT_TRUE(decoded.ok()) << decoded.status();
       EXPECT_EQ((*decoded)->codeBytes().size(), devices.front().getCode().size());
-      EXPECT_EQ((*decoded)->launches().size(), fixture.fusedTasks);
-      EXPECT_EQ((*decoded)->slots().size(), fixture.fusedBuffers);
+      EXPECT_EQ((*decoded)->launches().size(),
+                fixture.fusedTasks - plan->eligibleFoldMapEdges);
+      EXPECT_EQ((*decoded)->slots().size(),
+                fixture.fusedBuffers - plan->eligibleFoldMapEdges);
 
       auto entries = llvm::to_vector(devices.front()
                                          .getBody()
@@ -747,18 +797,28 @@ TEST(Abi22MapFusionContract,
 TEST(Abi22MapFusionContract,
      RejectsCorruptOrderedProvenanceAndComposedInputMaps) {
   std::optional<std::string> source = fixtureSource(kFixtures[0].filename);
+  std::optional<std::string> foldSource =
+      fixtureSource(kFixtures[1].filename);
   ASSERT_TRUE(source);
+  ASSERT_TRUE(foldSource);
   constexpr llvm::StringLiteral mutations[] = {
       "duplicate-source", "reordered-source", "stale-source", "missing-map",
       "reordered-map"};
   for (llvm::StringRef mutation : mutations) {
-    SCOPED_TRACE(mutation.str());
-    std::unique_ptr<BuiltModule> built = build(
-        *source, mlir::shuttle::NumericalPolicy::SourceOrdered, kFusionTuning,
-        false, false);
-    ASSERT_TRUE(built);
-    ASSERT_TRUE(mutateFusedTask(*built->module, mutation));
-    EXPECT_FALSE(verifyMaterializationPlan(*built->module));
+    for (bool foldEpilogue : {false, true}) {
+      SCOPED_TRACE((llvm::Twine(foldEpilogue ? "Fold epilogue " : "Map ") +
+                    mutation)
+                       .str());
+      std::unique_ptr<BuiltModule> built = build(
+          foldEpilogue ? *foldSource : *source,
+          mlir::shuttle::NumericalPolicy::SourceOrdered,
+          kFusionTuning, false, false);
+      ASSERT_TRUE(built);
+      ASSERT_TRUE(foldEpilogue
+                      ? mutateFoldEpilogueTask(*built->module, mutation)
+                      : mutateFusedTask(*built->module, mutation));
+      EXPECT_FALSE(verifyMaterializationPlan(*built->module));
+    }
   }
 }
 
