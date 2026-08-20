@@ -17,6 +17,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/Support/raw_ostream.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -112,6 +113,13 @@ bool sourcePrecedes(mlir::shuttle::SourceRefAttr left,
                     left.getOperationOrdinal(), left.getResultOrdinal()) <
          std::tuple(right.getFunctionOrdinal(), right.getBlockOrdinal(),
                     right.getOperationOrdinal(), right.getResultOrdinal());
+}
+
+std::string printType(mlir::Type type) {
+  std::string result;
+  llvm::raw_string_ostream stream(result);
+  type.print(stream);
+  return result;
 }
 
 std::vector<int64_t>
@@ -618,7 +626,8 @@ TEST(Abi22MapFusionContract,
       for (auto [ordinal, slot, decodedSlot] :
            llvm::enumerate(slots, (*decoded)->slots())) {
         EXPECT_EQ(decodedSlot.ordinal, ordinal);
-        EXPECT_EQ(decodedSlot.tensorType, slot.getTensorType());
+        EXPECT_EQ(printType(decodedSlot.tensorType),
+                  printType(slot.getTensorType()));
         EXPECT_EQ(decodedSlot.requiredBytes, slot.getRequiredBytes());
         EXPECT_EQ(decodedSlot.byteStrides,
                   llvm::SmallVector<int64_t>(slot.getStrides()));
@@ -664,6 +673,12 @@ TEST(Abi22MapFusionContract,
         mlir::shuttle::NumericalPolicy::Fast}) {
     std::unique_ptr<BuiltModule> built = buildAlgebra(*source, policy);
     ASSERT_TRUE(built);
+    std::optional<PlanSummary> originalSummary = summary(*built->module);
+    ASSERT_TRUE(originalSummary);
+    EXPECT_EQ(originalSummary->tasks, 4);
+    EXPECT_EQ(originalSummary->buffers, 6);
+    EXPECT_EQ(originalSummary->fusedMapGroupSizes,
+              std::vector<int64_t>({2}));
     llvm::SmallVector<mlir::shuttle::DeviceModuleOp> devices(
         built->module->getOps<mlir::shuttle::DeviceModuleOp>());
     ASSERT_EQ(devices.size(), 1);
@@ -682,9 +697,7 @@ TEST(Abi22MapFusionContract,
     changed.replace(operation, std::string("arith.subf").size(), "arith.addf");
     std::unique_ptr<BuiltModule> mutated = buildAlgebra(changed, policy);
     ASSERT_TRUE(mutated);
-    std::optional<PlanSummary> originalSummary = summary(*built->module);
     std::optional<PlanSummary> mutatedSummary = summary(*mutated->module);
-    ASSERT_TRUE(originalSummary);
     ASSERT_TRUE(mutatedSummary);
     EXPECT_NE(originalSummary->fingerprint, mutatedSummary->fingerprint);
   }
