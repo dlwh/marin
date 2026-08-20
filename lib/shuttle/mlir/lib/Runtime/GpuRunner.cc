@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <exception>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -243,20 +244,9 @@ GpuRunner::GpuRunner(std::unique_ptr<Impl> implementation)
     : implementation(std::move(implementation)) {}
 
 GpuRunner::~GpuRunner() {
-  // Failed synchronization cannot prove that queued work released its owned
-  // allocations, so retain the implementation instead of risking a device UAF.
+  // Destruction cannot return while caller-owned buffers may still be in use.
   if (implementation && !implementation->synchronize().ok())
-    implementation.release();
-}
-GpuRunner::GpuRunner(GpuRunner &&) noexcept = default;
-GpuRunner &GpuRunner::operator=(GpuRunner &&other) noexcept {
-  if (this == &other)
-    return *this;
-  // Preserve the same fail-safe teardown rule as the destructor.
-  if (implementation && !implementation->synchronize().ok())
-    implementation.release();
-  implementation = std::move(other.implementation);
-  return *this;
+    std::terminate();
 }
 
 absl::StatusOr<std::unique_ptr<GpuRunner>> GpuRunner::Create(
@@ -317,6 +307,9 @@ absl::StatusOr<std::unique_ptr<GpuRunner>> GpuRunner::Create(
 absl::Status GpuRunner::Execute(llvm::ArrayRef<GpuRunnerBuffer> operands,
                                 llvm::ArrayRef<GpuRunnerBuffer> results) {
   std::lock_guard lock(implementation->executeMutex);
+  if (implementation->pending)
+    return absl::FailedPreconditionError(
+        "GPU runner completion is pending; call AwaitCompletion");
   absl::StatusOr<ffi::CallFrame> frame =
       buildCallFrame(implementation->transport, implementation->projection,
                      operands, results);
@@ -328,7 +321,12 @@ absl::Status GpuRunner::Execute(llvm::ArrayRef<GpuRunnerBuffer> operands,
       ffi::Invoke(ffi::GetXlaFfiApi(), implementation->handlers.execute,
                   *frame, context, XLA_FFI_ExecutionStage_EXECUTE);
   absl::Status completion = implementation->synchronize();
-  return execute.ok() ? completion : execute;
+  return completion.ok() ? execute : completion;
+}
+
+absl::Status GpuRunner::AwaitCompletion() {
+  std::lock_guard lock(implementation->executeMutex);
+  return implementation->synchronize();
 }
 
 const GpuRunnerResources &GpuRunner::resources() const {

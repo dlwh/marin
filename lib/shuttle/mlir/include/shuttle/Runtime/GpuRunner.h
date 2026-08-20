@@ -46,16 +46,20 @@ public:
          int32_t deviceOrdinal, stream_executor::Stream *stream,
          const stream_executor::GpuComputeCapability *capability);
 
+  // Retries pending completion and terminates if quiescence cannot be proven.
   ~GpuRunner();
-  GpuRunner(GpuRunner &&) noexcept;
-  GpuRunner &operator=(GpuRunner &&) noexcept;
-
   GpuRunner(const GpuRunner &) = delete;
   GpuRunner &operator=(const GpuRunner &) = delete;
+  GpuRunner(GpuRunner &&) = delete;
+  GpuRunner &operator=(GpuRunner &&) = delete;
 
-  // Enqueues the sealed launch graph and returns after the stream completes.
+  // Enqueues the sealed launch graph and waits for stream completion. If the
+  // completion fence fails, every buffer and caller-owned dependency must
+  // remain alive until AwaitCompletion succeeds.
   absl::Status Execute(llvm::ArrayRef<GpuRunnerBuffer> operands,
                        llvm::ArrayRef<GpuRunnerBuffer> results);
+  // Retries a failed Execute completion fence without enqueueing new work.
+  absl::Status AwaitCompletion();
   const GpuRunnerResources &resources() const;
 
 private:
