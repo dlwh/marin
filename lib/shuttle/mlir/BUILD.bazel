@@ -444,6 +444,7 @@ cc_test(
     name = "track1_map_wiring_test",
     srcs = ["test/track1-map-wiring-test.cc"],
     deps = [
+        ":ShuttleGpuExecutable",
         ":ShuttleXlaRegistration",
         "@com_google_absl//absl/status",
         "@com_google_googletest//:gtest_main",

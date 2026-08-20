@@ -1,6 +1,7 @@
 // Copyright The Marin Authors
 // SPDX-License-Identifier: Apache-2.0
 
+#include <algorithm>
 #include <array>
 #include <memory>
 #include <mutex>
@@ -12,6 +13,7 @@
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/Parser/Parser.h"
+#include "shuttle/Runtime/GpuExecutable.h"
 #include "shuttle/Transforms/Observer.h"
 #include "shuttle/Transforms/XlaRegistration.h"
 #include "stablehlo/dialect/Register.h"
@@ -222,6 +224,35 @@ TEST(TrackOneMapWiringTest,
       EXPECT_EQ(transformed.find("stablehlo.convert"), std::string::npos);
       EXPECT_EQ(transformed.find("stablehlo.negate"), std::string::npos);
       EXPECT_EQ(transformed.find("shuttle.region"), std::string::npos);
+      EXPECT_NE(transformed.find("api_version = 4 : i32"), std::string::npos);
+
+      mlir::Operation *customCall = nullptr;
+      module->walk([&](mlir::Operation *operation) {
+        if (operation->getName().getStringRef() == "stablehlo.custom_call") {
+          customCall = operation;
+        }
+      });
+      ASSERT_NE(customCall, nullptr);
+      auto backendConfig =
+          customCall->getAttrOfType<mlir::DictionaryAttr>("backend_config");
+      ASSERT_TRUE(backendConfig);
+      auto bundleBytes = backendConfig.getAs<mlir::StringAttr>("bundle_bytes");
+      ASSERT_TRUE(bundleBytes);
+      llvm::StringRef serialized = bundleBytes.getValue();
+      auto loaded = mlir::shuttle::GpuExecutable::Load(
+          llvm::ArrayRef<uint8_t>(
+              reinterpret_cast<const uint8_t *>(serialized.data()),
+              serialized.size()));
+      ASSERT_TRUE(loaded.ok()) << loaded.status();
+      EXPECT_EQ((*loaded)->launches().size(), 3);
+      EXPECT_EQ((*loaded)->slots().size(), 4);
+      EXPECT_EQ((*loaded)->externalBindings().size(), 2);
+      EXPECT_EQ(std::count_if((*loaded)->slots().begin(),
+                              (*loaded)->slots().end(), [](const auto &slot) {
+                  return slot.storage ==
+                         mlir::shuttle::MaterializationStorage::Temporary;
+                }),
+                2);
       expectObservedSuccess(
           observer->snapshot(),
           mlir::shuttle::ShuttlePipelinePhase::GeneratedBundle);
