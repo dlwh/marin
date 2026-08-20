@@ -353,7 +353,8 @@ std::optional<PlanSummary> summary(mlir::ModuleOp module) {
           foldEpilogueSources.getValue().front());
       if (!firstSource)
         return std::nullopt;
-      fusedGroups.emplace_back(firstSource, foldEpilogueSources.size());
+      if (foldEpilogueSources.size() > 1)
+        fusedGroups.emplace_back(firstSource, foldEpilogueSources.size());
       result.fusedFoldMapGroupSizes.push_back(foldEpilogueSources.size());
       for (mlir::Attribute source : foldEpilogueSources) {
         if (!mlir::isa<mlir::shuttle::SourceRefAttr>(source) ||
@@ -600,7 +601,10 @@ TEST(Abi22MapFusionContract,
       expectCounts(*fusedSummary, fixture, true);
       std::optional<FusionAudit> audit = auditFusionGroups(*fused->module);
       ASSERT_TRUE(audit);
-      EXPECT_EQ(audit->groups,
+      const int64_t epilogueMapGroups = llvm::count_if(
+          fusedSummary->fusedFoldMapGroupSizes,
+          [](int64_t size) { return size > 1; });
+      EXPECT_EQ(audit->groups + epilogueMapGroups,
                 static_cast<int64_t>(expectedFusionGroupSizes(fixture).size()));
       if (llvm::StringRef(fixture.filename).contains(
               "projected_parameter_broadcast"))
