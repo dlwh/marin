@@ -4051,8 +4051,17 @@ struct DerivedPlan {
   bool hasRankNFold = false;
 };
 
+bool hasIdentityResultMap(MapOp map) {
+  if (map.getNumResults() != 1 ||
+      map.getIndexingMaps().size() != map.getInputs().size() + 1)
+    return false;
+  auto resultMap =
+      dyn_cast<AffineMapAttr>(map.getIndexingMaps().getValue().back());
+  return resultMap && resultMap.getValue().isIdentity();
+}
+
 bool isEligibleF32Map(MapOp map) {
-  if (map.getNumResults() != 1)
+  if (!hasIdentityResultMap(map))
     return false;
   FailureOr<SmallVector<int64_t>> domain = mapDomainShape(map);
   if (failed(domain))
@@ -5672,7 +5681,8 @@ emitFusedMapPtx(SmallVectorImpl<MapOp> &maps,
                 MaterializationTaskOp materializationTask,
                 SmallVectorImpl<MaterializationBufferOp> &buffers,
                 ScheduleTaskOp scheduleTask) {
-  if (maps.size() < 2 || materializationTask.getOutputBuffers().size() != 1)
+  if (maps.size() < 2 || materializationTask.getOutputBuffers().size() != 1 ||
+      llvm::any_of(maps, [](MapOp map) { return !hasIdentityResultMap(map); }))
     return failure();
   int64_t outputBuffer = materializationTask.getOutputBuffers().front();
   if (outputBuffer < 0 || outputBuffer >= buffers.size())

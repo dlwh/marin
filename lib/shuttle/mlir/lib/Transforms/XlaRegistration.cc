@@ -27,7 +27,8 @@ namespace mlir::shuttle {
 namespace {
 
 constexpr int64_t kSchemaVersion = 1;
-constexpr int64_t kPipelineAbiVersion = 21;
+constexpr int64_t kHistoricalPipelineAbiVersion = 21;
+constexpr int64_t kPipelineAbiVersion = 22;
 constexpr int64_t kMaximumNativeInteger = 2147483647;
 constexpr size_t kMaximumTensorRank = 8;
 constexpr size_t kMaximumClusterRank = 3;
@@ -156,8 +157,12 @@ parseShuttleXlaOptions(absl::string_view serializedOptions) {
   if (object->getInteger("schema_version") != kSchemaVersion) {
     return invalidOptions("field 'schema_version' must be integer 1");
   }
-  if (object->getInteger("pipeline_abi_version") != kPipelineAbiVersion) {
-    return invalidOptions("field 'pipeline_abi_version' must be integer 21");
+  std::optional<int64_t> pipelineAbiVersion =
+      object->getInteger("pipeline_abi_version");
+  if (pipelineAbiVersion != kHistoricalPipelineAbiVersion &&
+      pipelineAbiVersion != kPipelineAbiVersion) {
+    return invalidOptions(
+        "field 'pipeline_abi_version' must be integer 21 or 22");
   }
 
   std::optional<llvm::StringRef> numerics = object->getString("numerics");
