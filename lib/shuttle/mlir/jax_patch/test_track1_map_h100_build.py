@@ -16,6 +16,7 @@ from track1_map_h100_build import (
     XLA_PATCH_SHA256,
     BuildInputs,
     BuildToolDigests,
+    _require_live_source_snapshot,
     apply_source_patches,
     inspect_build_inputs,
     offline_wheel_command,
@@ -71,9 +72,12 @@ def _tool_digests(inputs: BuildInputs) -> BuildToolDigests:
     )
 
 
-def test_offline_build_preflight_is_closed_over_source_tools_and_image(tmp_path: Path) -> None:
+def test_offline_build_preflight_is_closed_over_source_tools_and_image(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     inputs = _inputs(tmp_path)
     _materialize(inputs)
+    monkeypatch.setattr("track1_map_h100_build._require_live_source_snapshot", lambda value: None)
     require_offline_build_inputs(inputs, expected_tool_sha256=_tool_digests(inputs))
 
     mutations = (
@@ -99,9 +103,12 @@ def test_offline_build_preflight_is_closed_over_source_tools_and_image(tmp_path:
         require_offline_build_inputs(inputs, expected_tool_sha256=_tool_digests(inputs))
 
 
-def test_offline_build_gate_rehashes_live_inputs_and_requires_executable_builder(tmp_path: Path) -> None:
+def test_offline_build_gate_rehashes_live_inputs_and_requires_executable_builder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     inputs = _inputs(tmp_path)
     _materialize(inputs)
+    monkeypatch.setattr("track1_map_h100_build._require_live_source_snapshot", lambda value: None)
     expected = _tool_digests(inputs)
 
     inputs.bazel.write_bytes(b"drift")
@@ -151,6 +158,8 @@ def test_inspection_reads_separate_git_repositories_and_live_file_hashes(tmp_pat
     assert inspected.xla_repository == xla_repository
 
     (xla_repository / "xla/pjrt/marker").write_text("dirty\n")
+    with pytest.raises(RuntimeError, match="source changed after inspection"):
+        _require_live_source_snapshot(inspected)
     assert inspect_build_inputs(
         marin_repository=MARIN_REPOSITORY,
         jax_repository=jax_repository,
@@ -168,6 +177,7 @@ def test_source_patching_checks_both_repositories_before_applying(
     _materialize(inputs)
     run = Mock()
     monkeypatch.setattr("track1_map_h100_build.subprocess.run", run)
+    monkeypatch.setattr("track1_map_h100_build._require_live_source_snapshot", lambda value: None)
 
     apply_source_patches(inputs)
 
@@ -187,6 +197,7 @@ def test_source_patch_check_failure_applies_neither_repository(tmp_path: Path, m
     _materialize(inputs)
     run = Mock(side_effect=[None, RuntimeError("xla check failed")])
     monkeypatch.setattr("track1_map_h100_build.subprocess.run", run)
+    monkeypatch.setattr("track1_map_h100_build._require_live_source_snapshot", lambda value: None)
 
     with pytest.raises(RuntimeError, match="xla check failed"):
         apply_source_patches(inputs)
