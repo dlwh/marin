@@ -317,6 +317,84 @@ module @nonidentity_cross_domain_boundary attributes {
 // -----
 
 #id = affine_map<(d0, d1) -> (d0, d1)>
+#transpose = affine_map<(d0, d1) -> (d1, d0)>
+
+module @permuted_producer_result_boundary attributes {
+  shuttle.coverage_manifest = {
+    canonical_tuning = "{\22cluster_shape\22:[],\22materialization\22:\22prefer_fusion\22,\22maximum_candidates\22:1,\22pipeline_stages\22:1,\22tile_sizes\22:[]}"
+  }
+} {
+  func.func @anonymous(%input: tensor<2x2xf32>, %init: tensor<f32>)
+      -> tensor<2xf32> {
+    %result = "shuttle.region"(%input, %init) ({
+    ^bb0(%region_input: tensor<2x2xf32>, %region_init: tensor<f32>):
+      %permuted = "shuttle.map"(%region_input) ({
+      ^bb0(%element: f32):
+        %negative = arith.negf %element : f32
+        "shuttle.yield"(%negative) : (f32) -> ()
+      }) {indexing_maps = [#id, #transpose], source = #shuttle.source_ref<0, 0, 0, 0>} : (tensor<2x2xf32>) -> tensor<2x2xf32>
+      %squared = "shuttle.map"(%permuted) ({
+      ^bb0(%element: f32):
+        %square = arith.mulf %element, %element : f32
+        "shuttle.yield"(%square) : (f32) -> ()
+      }) {indexing_maps = [#id, #id], source = #shuttle.source_ref<0, 0, 0, 1>} : (tensor<2x2xf32>) -> tensor<2x2xf32>
+      %folded = "shuttle.fold"(%squared, %region_init) ({
+      ^bb0(%element: f32, %accumulator: f32):
+        %sum = arith.addf %element, %accumulator : f32
+        "shuttle.yield"(%sum) : (f32) -> ()
+      }) {accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 2>} : (tensor<2x2xf32>, tensor<f32>) -> tensor<2xf32>
+      "shuttle.yield"(%folded) : (tensor<2xf32>) -> ()
+    }) {policy = #shuttle.policy<source_ordered>, source_refs = [#shuttle.source_ref<0, 0, 0, 0>, #shuttle.source_ref<0, 0, 0, 1>, #shuttle.source_ref<0, 0, 0, 2>]} : (tensor<2x2xf32>, tensor<f32>) -> tensor<2xf32>
+    return %result : tensor<2xf32>
+  }
+}
+
+// CHECK-LABEL: sym_name = "permuted_producer_result_boundary"
+// CHECK-COUNT-3: "shuttle.materialization_task"
+// CHECK-NOT: fused_sources
+
+// -----
+
+#id = affine_map<(d0, d1) -> (d0, d1)>
+#transpose = affine_map<(d0, d1) -> (d1, d0)>
+
+module @permuted_consumer_result_boundary attributes {
+  shuttle.coverage_manifest = {
+    canonical_tuning = "{\22cluster_shape\22:[],\22materialization\22:\22prefer_fusion\22,\22maximum_candidates\22:1,\22pipeline_stages\22:1,\22tile_sizes\22:[]}"
+  }
+} {
+  func.func @anonymous(%input: tensor<2x2xf32>, %init: tensor<f32>)
+      -> tensor<2xf32> {
+    %result = "shuttle.region"(%input, %init) ({
+    ^bb0(%region_input: tensor<2x2xf32>, %region_init: tensor<f32>):
+      %negative = "shuttle.map"(%region_input) ({
+      ^bb0(%element: f32):
+        %value = arith.negf %element : f32
+        "shuttle.yield"(%value) : (f32) -> ()
+      }) {indexing_maps = [#id, #id], source = #shuttle.source_ref<0, 0, 0, 0>} : (tensor<2x2xf32>) -> tensor<2x2xf32>
+      %permuted = "shuttle.map"(%negative) ({
+      ^bb0(%element: f32):
+        %square = arith.mulf %element, %element : f32
+        "shuttle.yield"(%square) : (f32) -> ()
+      }) {indexing_maps = [#id, #transpose], source = #shuttle.source_ref<0, 0, 0, 1>} : (tensor<2x2xf32>) -> tensor<2x2xf32>
+      %folded = "shuttle.fold"(%permuted, %region_init) ({
+      ^bb0(%element: f32, %accumulator: f32):
+        %sum = arith.addf %element, %accumulator : f32
+        "shuttle.yield"(%sum) : (f32) -> ()
+      }) {accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 2>} : (tensor<2x2xf32>, tensor<f32>) -> tensor<2xf32>
+      "shuttle.yield"(%folded) : (tensor<2xf32>) -> ()
+    }) {policy = #shuttle.policy<source_ordered>, source_refs = [#shuttle.source_ref<0, 0, 0, 0>, #shuttle.source_ref<0, 0, 0, 1>, #shuttle.source_ref<0, 0, 0, 2>]} : (tensor<2x2xf32>, tensor<f32>) -> tensor<2xf32>
+    return %result : tensor<2xf32>
+  }
+}
+
+// CHECK-LABEL: sym_name = "permuted_consumer_result_boundary"
+// CHECK-COUNT-3: "shuttle.materialization_task"
+// CHECK-NOT: fused_sources
+
+// -----
+
+#id = affine_map<(d0, d1) -> (d0, d1)>
 
 module @bf16_boundary attributes {
   shuttle.coverage_manifest = {

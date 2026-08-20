@@ -1182,6 +1182,13 @@ std::unique_ptr<BuiltBundle> buildAlgebraFixture(llvm::StringRef source) {
       mlir::parseSourceString<mlir::ModuleOp>(source, result->context.get());
   if (!result->module)
     return {};
+  mlir::Builder builder(result->context.get());
+  result->module->getOperation()->setAttr(
+      "shuttle.coverage_manifest",
+      builder.getDictionaryAttr(builder.getNamedAttr(
+          "canonical_tuning",
+          builder.getStringAttr(
+              R"json({"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json"))));
   mlir::PassManager manager(result->context.get());
   manager.addPass(mlir::shuttle::createPlanRowFoldMaterializationPass());
   manager.addPass(mlir::shuttle::createPlanSimt32RowFoldSchedulePass());
