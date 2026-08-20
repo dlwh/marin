@@ -912,7 +912,8 @@ bool mutateFoldRegionTask(mlir::ModuleOp module, llvm::StringRef mutation) {
         replacement = builder.getDenseI64ArrayAttr({0});
       } else {
         field = "order_free";
-        replacement = builder.getBoolAttr(true);
+        auto orderFree = mlir::cast<mlir::BoolAttr>(phase.get(field));
+        replacement = builder.getBoolAttr(!orderFree.getValue());
       }
       changed.front() = replaceField(phase, field, replacement);
       if (!changed.front())
