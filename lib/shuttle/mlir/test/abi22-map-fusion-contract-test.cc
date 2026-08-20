@@ -232,6 +232,7 @@ buildAlgebra(llvm::StringRef source, mlir::shuttle::NumericalPolicy policy) {
 
 std::optional<PlanSummary> summary(mlir::ModuleOp module) {
   PlanSummary result;
+  std::vector<std::pair<mlir::shuttle::SourceRefAttr, int64_t>> fusedGroups;
   llvm::SmallDenseSet<mlir::Attribute> algebraSources;
   module.walk([&](mlir::shuttle::MapOp) { ++result.maps; });
   module.walk([&](mlir::shuttle::FoldOp) { ++result.folds; });
@@ -264,7 +265,11 @@ std::optional<PlanSummary> summary(mlir::ModuleOp module) {
       if (fusedSources.size() < 2 ||
           fusedSources.getValue().back() != task.getSource())
         return std::nullopt;
-      result.fusedMapGroupSizes.push_back(fusedSources.size());
+      auto firstSource = mlir::dyn_cast<mlir::shuttle::SourceRefAttr>(
+          fusedSources.getValue().front());
+      if (!firstSource)
+        return std::nullopt;
+      fusedGroups.emplace_back(firstSource, fusedSources.size());
       for (mlir::Attribute source : fusedSources) {
         if (!mlir::isa<mlir::shuttle::SourceRefAttr>(source) ||
             !plannedSources.insert(source).second)
@@ -291,6 +296,11 @@ std::optional<PlanSummary> summary(mlir::ModuleOp module) {
       llvm::all_of(plannedSources, [&](mlir::Attribute source) {
         return algebraSources.contains(source);
       });
+  llvm::sort(fusedGroups, [](const auto &left, const auto &right) {
+    return sourcePrecedes(left.first, right.first);
+  });
+  for (const auto &group : fusedGroups)
+    result.fusedMapGroupSizes.push_back(group.second);
   return result;
 }
 
