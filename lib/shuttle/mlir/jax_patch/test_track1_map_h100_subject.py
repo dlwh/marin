@@ -48,8 +48,9 @@ def _event(
 def _successful_snapshot(coordinate: Coordinate) -> tuple[tuple[object, ...], ...]:
     membership = (
         "[[#shuttle.source_ref<0, 0, 0, 0>, #shuttle.source_ref<0, 0, 1, 0>, "
-        "#shuttle.source_ref<0, 0, 2, 0>], [#shuttle.source_ref<0, 0, 12, 0>, "
-        "#shuttle.source_ref<0, 0, 13, 0>, #shuttle.source_ref<0, 0, 14, 0>]]"
+        "#shuttle.source_ref<0, 0, 2, 0>], [#shuttle.source_ref<0, 0, 4, 0>, "
+        "#shuttle.source_ref<0, 0, 5, 0>, #shuttle.source_ref<0, 0, 6, 0>, "
+        "#shuttle.source_ref<0, 0, 7, 0>]]"
     )
     manifest = "selected_regions = " + membership + ", reason = unsupported_operation"
     return (
@@ -127,7 +128,7 @@ def test_observer_contract_attributes_both_map_islands_and_final_erasure() -> No
     bad_membership[0] = tuple(
         [
             *bad_membership[0][:5],
-            str(bad_membership[0][5]).replace("source_ref<0, 0, 14, 0>", ""),
+            str(bad_membership[0][5]).replace("source_ref<0, 0, 7, 0>", ""),
             *bad_membership[0][6:],
         ]
     )
