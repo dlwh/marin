@@ -112,9 +112,9 @@ def offline_wheel_command(
     marin_repository: Path,
     bazel: Path,
     bazel_output_root: Path,
+    cuda_root: Path,
     wheel_output: Path,
     xla_repository: Path,
-    cuda_root: Path | None = None,
 ) -> list[str]:
     """Return the closed, download-disabled patched wheel build argv."""
     return [
@@ -132,7 +132,7 @@ def offline_wheel_command(
         f"--bazel_startup_options=--output_user_root={bazel_output_root}",
         f"--bazel_options=--override_repository=xla={xla_repository}",
         f"--bazel_options=--override_repository=shuttle_mlir={marin_repository / 'lib/shuttle/mlir'}",
-        *([] if cuda_root is None else [f"--bazel_options=--repo_env=LOCAL_CUDA_PATH={cuda_root}"]),
+        f"--bazel_options=--repo_env=LOCAL_CUDA_PATH={cuda_root}",
     ]
 
 
