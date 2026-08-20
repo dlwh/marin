@@ -945,7 +945,9 @@ std::unique_ptr<BuiltBundle>
 buildFixture(llvm::StringRef source,
              mlir::shuttle::NumericalPolicy policy =
                  mlir::shuttle::NumericalPolicy::SourceOrdered,
-             llvm::StringRef canonicalOptions = {}) {
+             llvm::StringRef canonicalOptions = {},
+             llvm::StringRef canonicalTuning =
+                 R"json({"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json") {
   mlir::DialectRegistry registry;
   mlir::stablehlo::registerAllDialects(registry);
   registry.insert<mlir::arith::ArithDialect, mlir::func::FuncDialect,
@@ -960,8 +962,7 @@ buildFixture(llvm::StringRef source,
   manager.addPass(mlir::shuttle::createAnnotateSourcePass());
   if (!canonicalOptions.empty()) {
     manager.addPass(mlir::shuttle::createFormStructuralRegionsPass(
-        policy, canonicalOptions.str(),
-        R"json({"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json"));
+        policy, canonicalOptions.str(), canonicalTuning.str()));
   } else if (policy == mlir::shuttle::NumericalPolicy::Fast) {
     manager.addPass(mlir::shuttle::createFormStructuralRegionsPass(
         policy,
@@ -3904,13 +3905,16 @@ TEST(GpuTransportV2Test,
   };
   constexpr llvm::StringLiteral options =
       R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+  constexpr llvm::StringLiteral tuning =
+      R"json({"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json";
 
   for (const Boundary &boundary : boundaries) {
     SCOPED_TRACE(boundary.filename);
     auto source = fixtureSource(boundary.filename);
     ASSERT_TRUE(source);
     auto built = buildFixture(
-        *source, mlir::shuttle::NumericalPolicy::SourceOrdered, options);
+        *source, mlir::shuttle::NumericalPolicy::SourceOrdered, options,
+        tuning);
     ASSERT_TRUE(built);
     auto transport =
         mlir::shuttle::serializeGpuExecutableBundle(*built->module);
