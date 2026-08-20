@@ -441,6 +441,21 @@ cc_test(
 )
 
 cc_test(
+    name = "track1_map_wiring_test",
+    srcs = ["test/track1-map-wiring-test.cc"],
+    deps = [
+        ":ShuttleXlaRegistration",
+        "@com_google_absl//absl/status",
+        "@com_google_googletest//:gtest_main",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:FuncDialect",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Parser",
+        "@stablehlo//:register",
+    ],
+)
+
+cc_test(
     name = "xla_registry_adapter_test",
     srcs = ["test/xla-registry-adapter-test.cc"],
     deps = [
