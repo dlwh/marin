@@ -23,6 +23,7 @@
 #include "xla/ffi/ffi.h"
 #include "xla/ffi/invoke.h"
 #include "xla/pjrt/stablehlo_module_transform.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/raw_ostream.h"
 #include "gtest/gtest.h"
@@ -60,6 +61,39 @@ module @jit__lambda attributes {mhlo.num_partitions = 1 : i32, mhlo.num_replicas
     %2 = stablehlo.convert %1 : (tensor<2x3x5xf32>) -> tensor<2x3x5xbf16>
     %3 = stablehlo.abs %2 : tensor<2x3x5xbf16>
     return %3 : tensor<2x3x5xbf16>
+  }
+}
+)mlir";
+
+// Emitted by JAX 0.10.1 from the Track 1 value and analytic-gradient subject.
+constexpr llvm::StringLiteral kRankTwoValueAndGradientProgram = R"mlir(
+module @jit_mixed_map_value_and_gradient attributes {mhlo.num_partitions = 1 : i32, mhlo.num_replicas = 1 : i32} {
+  func.func public @main(%arg0: tensor<2x3xbf16>) -> (tensor<2x3xbf16> {jax.result_info = "result[0]"}, tensor<2x3xbf16> {jax.result_info = "result[1]"}) {
+    %0 = stablehlo.convert %arg0 : (tensor<2x3xbf16>) -> tensor<2x3xf32>
+    %1 = stablehlo.negate %0 : tensor<2x3xf32>
+    %2 = stablehlo.convert %1 : (tensor<2x3xf32>) -> tensor<2x3xbf16>
+    %3 = stablehlo.abs %2 : tensor<2x3xbf16>
+    %4 = stablehlo.convert %3 : (tensor<2x3xbf16>) -> tensor<2x3xf32>
+    %5 = stablehlo.convert %arg0 : (tensor<2x3xbf16>) -> tensor<2x3xf32>
+    %6 = stablehlo.divide %4, %5 : tensor<2x3xf32>
+    %7 = stablehlo.convert %6 : (tensor<2x3xf32>) -> tensor<2x3xbf16>
+    return %3, %7 : tensor<2x3xbf16>, tensor<2x3xbf16>
+  }
+}
+)mlir";
+
+constexpr llvm::StringLiteral kRankThreeValueAndGradientProgram = R"mlir(
+module @jit_mixed_map_value_and_gradient attributes {mhlo.num_partitions = 1 : i32, mhlo.num_replicas = 1 : i32} {
+  func.func public @main(%arg0: tensor<2x3x5xbf16>) -> (tensor<2x3x5xbf16> {jax.result_info = "result[0]"}, tensor<2x3x5xbf16> {jax.result_info = "result[1]"}) {
+    %0 = stablehlo.convert %arg0 : (tensor<2x3x5xbf16>) -> tensor<2x3x5xf32>
+    %1 = stablehlo.negate %0 : tensor<2x3x5xf32>
+    %2 = stablehlo.convert %1 : (tensor<2x3x5xf32>) -> tensor<2x3x5xbf16>
+    %3 = stablehlo.abs %2 : tensor<2x3x5xbf16>
+    %4 = stablehlo.convert %3 : (tensor<2x3x5xbf16>) -> tensor<2x3x5xf32>
+    %5 = stablehlo.convert %arg0 : (tensor<2x3x5xbf16>) -> tensor<2x3x5xf32>
+    %6 = stablehlo.divide %4, %5 : tensor<2x3x5xf32>
+    %7 = stablehlo.convert %6 : (tensor<2x3x5xf32>) -> tensor<2x3x5xbf16>
+    return %3, %7 : tensor<2x3x5xbf16>, tensor<2x3x5xbf16>
   }
 }
 )mlir";
@@ -352,6 +386,77 @@ TEST(TrackOneMapWiringTest,
       expectObservedSuccess(
           observer->snapshot(),
           mlir::shuttle::ShuttlePipelinePhase::GeneratedBundle);
+    }
+  }
+}
+
+TEST(TrackOneMapWiringTest,
+     BundlesBothValueAndGradientMapIslandsThroughRegisteredFfi) {
+  constexpr std::array<llvm::StringLiteral, 2> programs = {
+      kRankTwoValueAndGradientProgram, kRankThreeValueAndGradientProgram};
+  constexpr std::array<llvm::StringLiteral, 2> policies = {
+      kGpuSourceOrderedOptions, kGpuFastOptions};
+  for (llvm::StringRef program : programs) {
+    for (llvm::StringRef policy : policies) {
+      SCOPED_TRACE(policy.str());
+      auto observer = std::make_shared<RecordingObserver>();
+      auto subscription =
+          mlir::shuttle::subscribeShuttlePipelineObserver(observer);
+      mlir::MLIRContext context;
+      mlir::OwningOpRef<mlir::ModuleOp> module = parseModule(context, program);
+      ASSERT_TRUE(module);
+      absl::Status status =
+          xla::StablehloModuleTransformRegistry::Global().Run(
+              *module, policy.str(), "shuttle");
+      ASSERT_TRUE(status.ok()) << status;
+
+      llvm::SmallVector<mlir::Operation *> customCalls;
+      mlir::Operation *absolute = nullptr;
+      mlir::func::ReturnOp functionReturn;
+      module->walk([&](mlir::Operation *operation) {
+        if (operation->getName().getStringRef() == "stablehlo.custom_call")
+          customCalls.push_back(operation);
+        if (operation->getName().getStringRef() == "stablehlo.abs")
+          absolute = operation;
+        if (auto returnOperation =
+                mlir::dyn_cast<mlir::func::ReturnOp>(operation))
+          functionReturn = returnOperation;
+      });
+      ASSERT_EQ(customCalls.size(), 2);
+      ASSERT_NE(absolute, nullptr);
+      ASSERT_TRUE(functionReturn);
+      ASSERT_EQ(functionReturn.getNumOperands(), 2);
+      EXPECT_EQ(absolute->getOperand(0).getDefiningOp(), customCalls[0]);
+      EXPECT_EQ(functionReturn.getOperand(0).getDefiningOp(), absolute);
+      EXPECT_EQ(functionReturn.getOperand(1).getDefiningOp(), customCalls[1]);
+
+      size_t launches = 0;
+      for (mlir::Operation *customCall : customCalls) {
+        auto backendConfig =
+            customCall->getAttrOfType<mlir::DictionaryAttr>("backend_config");
+        ASSERT_TRUE(backendConfig);
+        expectFfiInstantiationAccepts(backendConfig);
+        auto bundleBytes =
+            backendConfig.getAs<mlir::StringAttr>("bundle_bytes");
+        ASSERT_TRUE(bundleBytes);
+        llvm::StringRef serialized = bundleBytes.getValue();
+        auto loaded = mlir::shuttle::GpuExecutable::Load(
+            llvm::ArrayRef<uint8_t>(
+                reinterpret_cast<const uint8_t *>(serialized.data()),
+                serialized.size()));
+        ASSERT_TRUE(loaded.ok()) << loaded.status();
+        launches += (*loaded)->launches().size();
+      }
+      EXPECT_EQ(launches, 7);
+      auto events = observer->snapshot();
+      expectObservedSuccess(
+          events, mlir::shuttle::ShuttlePipelinePhase::GeneratedBundle);
+      for (int64_t operation : {4, 5, 6, 7}) {
+        EXPECT_NE(events[0].regionMembership().find(
+                      ("#shuttle.source_ref<0, 0, " +
+                       std::to_string(operation) + ", 0>")),
+                  std::string::npos);
+      }
     }
   }
 }
