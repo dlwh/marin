@@ -53,6 +53,7 @@ class BuildInputs:
     jax_repository: Path
     jax_status: str
     jax_tree: str
+    marin_repository: Path
     nvcc_sha256: str
     platform: str
     ptxas_sha256: str
@@ -91,6 +92,11 @@ def require_offline_build_inputs(
         raise RuntimeError("offline JAX patch roster or bytes differ")
     if inputs.xla_patch_sha256 != XLA_PATCH_SHA256:
         raise RuntimeError("offline XLA patch roster or bytes differ")
+    _regular(inputs.bazel, "Bazel binary", executable=True)
+    _regular(inputs.cuda_root / "bin/ptxas", "ptxas binary", executable=True)
+    _regular(inputs.cuda_root / "bin/nvcc", "nvcc binary", executable=True)
+    _regular(inputs.image_archive, "image archive")
+    _regular(inputs.jax_repository / "build/build.py", "JAX build entrypoint", executable=True)
     observed_tools = BuildToolDigests(
         bazel=inputs.bazel_sha256,
         image=inputs.image_sha256,
@@ -99,11 +105,18 @@ def require_offline_build_inputs(
     )
     if observed_tools != expected_tool_sha256:
         raise RuntimeError("offline tool or image bytes differ from launch authority")
-    _regular(inputs.bazel, "Bazel binary", executable=True)
-    _regular(inputs.cuda_root / "bin/ptxas", "ptxas binary", executable=True)
-    _regular(inputs.cuda_root / "bin/nvcc", "nvcc binary", executable=True)
-    _regular(inputs.image_archive, "image archive")
-    _regular(inputs.jax_repository / "build/build.py", "JAX build entrypoint")
+    live_tools = BuildToolDigests(
+        bazel=_file_sha256(inputs.bazel),
+        image=_file_sha256(inputs.image_archive),
+        nvcc=_file_sha256(inputs.cuda_root / "bin/nvcc"),
+        ptxas=_file_sha256(inputs.cuda_root / "bin/ptxas"),
+    )
+    if live_tools != observed_tools:
+        raise RuntimeError("offline tool or image changed after inspection")
+    if patch_sha256(inputs.marin_repository) != inputs.jax_patch_sha256:
+        raise RuntimeError("offline JAX patches changed after inspection")
+    if xla_patch_sha256(inputs.marin_repository) != inputs.xla_patch_sha256:
+        raise RuntimeError("offline XLA patches changed after inspection")
 
 
 def offline_wheel_command(
@@ -146,10 +159,14 @@ def xla_patch_sha256(marin_repository: Path) -> tuple[str, ...]:
     return tuple(hashlib.sha256((patch_root / name).read_bytes()).hexdigest() for name in XLA_PATCH_NAMES)
 
 
-def apply_source_patches(inputs: BuildInputs, marin_repository: Path) -> None:
+def apply_source_patches(inputs: BuildInputs) -> None:
     """Check both exact patch sets before modifying either clean checkout."""
-    jax_patches = [marin_repository / "lib/shuttle/mlir/jax_patch" / name for name in PATCH_NAMES]
-    xla_patches = [marin_repository / "lib/shuttle/mlir/xla_patch" / name for name in XLA_PATCH_NAMES]
+    if patch_sha256(inputs.marin_repository) != JAX_PATCH_SHA256:
+        raise RuntimeError("offline JAX patches changed before application")
+    if xla_patch_sha256(inputs.marin_repository) != XLA_PATCH_SHA256:
+        raise RuntimeError("offline XLA patches changed before application")
+    jax_patches = [inputs.marin_repository / "lib/shuttle/mlir/jax_patch" / name for name in PATCH_NAMES]
+    xla_patches = [inputs.marin_repository / "lib/shuttle/mlir/xla_patch" / name for name in XLA_PATCH_NAMES]
     commands = (
         (inputs.jax_repository, ["git", "apply", "--check", *map(str, jax_patches)]),
         (inputs.xla_repository, ["git", "apply", "--check", *map(str, xla_patches)]),
@@ -207,6 +224,7 @@ def inspect_build_inputs(
         jax_repository=jax_repository,
         jax_status=jax_status,
         jax_tree=jax_tree,
+        marin_repository=marin_repository,
         nvcc_sha256=_file_sha256(nvcc),
         platform=platform.system().lower(),
         ptxas_sha256=_file_sha256(ptxas),
