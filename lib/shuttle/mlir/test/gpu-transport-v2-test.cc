@@ -595,8 +595,8 @@ decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes,
           bytes.slice(invocationSuffixStart,
                       bundleStart - invocationSuffixStart)))
     return std::nullopt;
-  if (temporaryBytes == 0 || temporaryBytes > limits.temporaryBytes ||
-      externalSlots == 0 || reader.i64() != 2 || reader.text() != schedule)
+  if (temporaryBytes > limits.temporaryBytes || externalSlots == 0 ||
+      reader.i64() != 2 || reader.text() != schedule)
     return std::nullopt;
   uint64_t bundleDeviceRootPayloadOffset = 0;
   if (reader.text(&bundleDeviceRootPayloadOffset) != deviceRoot)
