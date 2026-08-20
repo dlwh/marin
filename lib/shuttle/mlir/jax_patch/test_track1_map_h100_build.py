@@ -16,7 +16,6 @@ from track1_map_h100_build import (
     XLA_PATCH_SHA256,
     BuildInputs,
     BuildToolDigests,
-    _require_live_source_snapshot,
     apply_source_patches,
     inspect_build_inputs,
     offline_wheel_command,
@@ -159,7 +158,7 @@ def test_inspection_reads_separate_git_repositories_and_live_file_hashes(tmp_pat
 
     (xla_repository / "xla/pjrt/marker").write_text("dirty\n")
     with pytest.raises(RuntimeError, match="source changed after inspection"):
-        _require_live_source_snapshot(inspected)
+        apply_source_patches(inspected)
     assert inspect_build_inputs(
         marin_repository=MARIN_REPOSITORY,
         jax_repository=jax_repository,
