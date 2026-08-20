@@ -616,6 +616,15 @@ bool mutateFoldRegionTask(mlir::ModuleOp module, llvm::StringRef mutation) {
       changed.front() = builder.getDictionaryAttr(fields);
       task->setAttr("fold_region_boundary_uses",
                     builder.getArrayAttr(changed));
+    } else if (mutation == "missing-boundary") {
+      task->setAttr(
+          "fold_region_boundary_uses",
+          builder.getArrayAttr(boundaryUses.getValue().drop_back()));
+    } else if (mutation == "duplicate-boundary") {
+      llvm::SmallVector<mlir::Attribute> changed(boundaryUses.getValue());
+      changed.push_back(changed.front());
+      task->setAttr("fold_region_boundary_uses",
+                    builder.getArrayAttr(changed));
     } else if (mutation == "nonlocal-phase") {
       if (phases.size() < 2)
         continue;
@@ -642,6 +651,23 @@ bool mutateFoldRegionTask(mlir::ModuleOp module, llvm::StringRef mutation) {
           module.getContext(), 99, 99, 99, 99));
       task->setAttr("fold_region_recomputed_sources",
                     builder.getArrayAttr(changed));
+    } else if (mutation == "duplicate-recomputation") {
+      auto recomputed = task->getAttrOfType<mlir::ArrayAttr>(
+          "fold_region_recomputed_sources");
+      if (!recomputed || recomputed.empty())
+        continue;
+      llvm::SmallVector<mlir::Attribute> changed(recomputed.getValue());
+      changed.push_back(changed.front());
+      task->setAttr("fold_region_recomputed_sources",
+                    builder.getArrayAttr(changed));
+    } else if (mutation == "missing-recomputation") {
+      auto recomputed = task->getAttrOfType<mlir::ArrayAttr>(
+          "fold_region_recomputed_sources");
+      if (!recomputed || recomputed.empty())
+        continue;
+      task->setAttr(
+          "fold_region_recomputed_sources",
+          builder.getArrayAttr(recomputed.getValue().drop_back()));
     } else if (mutation == "reordered-source") {
       llvm::SmallVector<mlir::Attribute> changed(
           llvm::reverse(sources.getValue()));
@@ -1279,11 +1305,40 @@ TEST(Abi22MapFusionContract,
         ASSERT_FALSE(boundaryUses.empty());
         phaseCount += phases.size();
         llvm::SmallDenseSet<mlir::Attribute> taskSources;
+        std::optional<mlir::shuttle::SourceRefAttr> previousSource;
         for (mlir::Attribute sourceRef : sources) {
-          ASSERT_TRUE(mlir::isa<mlir::shuttle::SourceRefAttr>(sourceRef));
+          auto source =
+              mlir::dyn_cast<mlir::shuttle::SourceRefAttr>(sourceRef);
+          ASSERT_TRUE(source);
           EXPECT_TRUE(algebraOperations.contains(sourceRef));
           EXPECT_TRUE(taskSources.insert(sourceRef).second);
+          if (previousSource)
+            EXPECT_TRUE(sourcePrecedes(*previousSource, source));
+          previousSource = source;
           ++sourceOccurrences[sourceRef];
+        }
+        llvm::SmallDenseSet<std::pair<mlir::Attribute, int64_t>>
+            expectedBoundaryUses;
+        for (mlir::Attribute sourceRef : taskSources) {
+          auto map = mlir::dyn_cast_or_null<mlir::shuttle::MapOp>(
+              algebraOperations.lookup(sourceRef));
+          if (!map)
+            continue;
+          for (auto [operandOrdinal, operand] :
+               llvm::enumerate(map.getInputs())) {
+            mlir::Operation *producer = operand.getDefiningOp();
+            mlir::Attribute producerSource;
+            if (auto producerMap =
+                    mlir::dyn_cast_or_null<mlir::shuttle::MapOp>(producer))
+              producerSource = producerMap.getSource();
+            else if (auto producerFold =
+                         mlir::dyn_cast_or_null<mlir::shuttle::FoldOp>(
+                             producer))
+              producerSource = producerFold.getSource();
+            if (!producerSource || !taskSources.contains(producerSource))
+              expectedBoundaryUses.insert(
+                  {sourceRef, static_cast<int64_t>(operandOrdinal)});
+          }
         }
         std::optional<mlir::shuttle::FoldOp> previousFold;
         for (auto [phaseOrdinal, phaseAttribute] :
@@ -1296,6 +1351,7 @@ TEST(Abi22MapFusionContract,
           auto fold = mlir::dyn_cast_or_null<mlir::shuttle::FoldOp>(
               algebraOperations.lookup(phaseSource));
           ASSERT_TRUE(fold);
+          EXPECT_TRUE(taskSources.contains(phaseSource));
           auto domain = mlir::dyn_cast_or_null<mlir::DenseI64ArrayAttr>(
               phase.get("domain_shape"));
           auto reduction = mlir::dyn_cast_or_null<mlir::DenseI64ArrayAttr>(
@@ -1331,6 +1387,8 @@ TEST(Abi22MapFusionContract,
           }
           previousFold = fold;
         }
+        llvm::SmallDenseSet<std::pair<mlir::Attribute, int64_t>>
+            actualBoundaryUses;
         for (mlir::Attribute useAttribute : boundaryUses) {
           auto use = mlir::dyn_cast<mlir::DictionaryAttr>(useAttribute);
           ASSERT_TRUE(use);
@@ -1349,6 +1407,9 @@ TEST(Abi22MapFusionContract,
           ASSERT_TRUE(operand);
           ASSERT_TRUE(indexing);
           ASSERT_TRUE(phase);
+          EXPECT_TRUE(taskSources.contains(useSource));
+          EXPECT_TRUE(actualBoundaryUses.insert(
+              {useSource, operand.getInt()}).second);
           EXPECT_TRUE(llvm::is_contained(task.getInputBuffers(),
                                          inputBuffer.getInt()));
           EXPECT_GE(phase.getInt(), 0);
@@ -1366,12 +1427,18 @@ TEST(Abi22MapFusionContract,
           EXPECT_EQ(buffer.getTensorType(),
                     map.getInputs()[operand.getInt()].getType());
         }
+        EXPECT_EQ(actualBoundaryUses.size(), expectedBoundaryUses.size());
+        EXPECT_TRUE(llvm::all_of(expectedBoundaryUses, [&](auto boundaryUse) {
+          return actualBoundaryUses.contains(boundaryUse);
+        }));
         if (auto recomputed = task->getAttrOfType<mlir::ArrayAttr>(
                 "fold_region_recomputed_sources")) {
+          llvm::SmallDenseSet<mlir::Attribute> taskRecomputations;
           for (mlir::Attribute sourceRef : recomputed) {
             EXPECT_TRUE(taskSources.contains(sourceRef));
             EXPECT_TRUE(mlir::isa_and_nonnull<mlir::shuttle::MapOp>(
                 algebraOperations.lookup(sourceRef)));
+            EXPECT_TRUE(taskRecomputations.insert(sourceRef).second);
             ++recomputationDeclarations[sourceRef];
           }
         }
@@ -1440,8 +1507,10 @@ TEST(Abi22MapFusionContract,
       "jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-backward.mlir");
   ASSERT_TRUE(source);
   constexpr llvm::StringLiteral mutations[] = {
-      "boundary-buffer", "nonlocal-phase", "dangling-recomputation",
-      "reordered-source"};
+      "boundary-buffer", "missing-boundary", "duplicate-boundary",
+      "nonlocal-phase",
+      "dangling-recomputation", "duplicate-recomputation",
+      "missing-recomputation", "reordered-source"};
   for (llvm::StringRef mutation : mutations) {
     SCOPED_TRACE(mutation.str());
     std::unique_ptr<BuiltModule> built =
