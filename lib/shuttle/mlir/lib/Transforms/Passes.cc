@@ -4035,6 +4035,7 @@ struct PlannedTask {
   SmallVector<int64_t> dependencies;
   SmallVector<Operation *> fusedOperations;
   SmallVector<AffineMap> composedInputMaps;
+  Operation *fusedFold = nullptr;
 };
 
 struct PlannedBuffer {
@@ -4075,9 +4076,68 @@ bool isEligibleF32Map(MapOp map) {
       });
 }
 
+bool isEligibleFoldMapEdge(FoldOp fold, MapOp map, unsigned operandNumber) {
+  if (!isClosedAdditivePlanningFold(fold) ||
+      !hasExactPositiveZeroInitializer(fold) ||
+      fold.getNumResults() != 1 || !fold.getResult(0).hasOneUse() ||
+      !isEligibleF32Map(map) || operandNumber >= map.getInputs().size())
+    return false;
+  auto folded = dyn_cast<RankedTensorType>(fold.getResult(0).getType());
+  auto output = dyn_cast<RankedTensorType>(map.getResult(0).getType());
+  auto edge = dyn_cast<AffineMapAttr>(map.getIndexingMaps()[operandNumber]);
+  if (!folded || !output || !edge ||
+      edge.getValue().getNumDims() != output.getRank() ||
+      edge.getValue().getNumSymbols() != 0 ||
+      edge.getValue().getNumResults() != folded.getRank())
+    return false;
+  auto elementCount = [](RankedTensorType type) -> FailureOr<int64_t> {
+    int64_t count = 1;
+    for (int64_t extent : type.getShape()) {
+      if (extent <= 0 || count > std::numeric_limits<int64_t>::max() / extent)
+        return failure();
+      count *= extent;
+    }
+    return count;
+  };
+  FailureOr<int64_t> foldedElements = elementCount(folded);
+  FailureOr<int64_t> outputElements = elementCount(output);
+  if (failed(foldedElements) || failed(outputElements) ||
+      *foldedElements != *outputElements)
+    return false;
+  llvm::SmallDenseSet<unsigned> mapped;
+  std::optional<unsigned> previousDimension;
+  for (auto [axis, expression] :
+       llvm::enumerate(edge.getValue().getResults())) {
+    auto dimension = dyn_cast<AffineDimExpr>(expression);
+    if (!dimension || dimension.getPosition() >= output.getRank() ||
+        !mapped.insert(dimension.getPosition()).second ||
+        (previousDimension &&
+         dimension.getPosition() <= *previousDimension) ||
+        folded.getDimSize(axis) !=
+            output.getDimSize(dimension.getPosition()))
+      return false;
+    previousDimension = dimension.getPosition();
+  }
+  return llvm::all_of(llvm::enumerate(output.getShape()), [&](auto item) {
+    return mapped.contains(item.index()) || item.value() == 1;
+  });
+}
+
 std::string fusedMapFingerprint(ArrayRef<Operation *> operations) {
   std::string normalized("map-dag-v1\n");
   for (Operation *operation : operations) {
+    normalized.append(semanticTaskFingerprint(operation));
+    normalized.push_back('\n');
+  }
+  return sha256(normalized);
+}
+
+std::string fusedFoldMapFingerprint(FoldOp fold,
+                                    ArrayRef<Operation *> maps) {
+  std::string normalized("fold-map-v1\n");
+  normalized.append(semanticTaskFingerprint(fold));
+  normalized.push_back('\n');
+  for (Operation *operation : maps) {
     normalized.append(semanticTaskFingerprint(operation));
     normalized.push_back('\n');
   }
@@ -4129,6 +4189,25 @@ FailureOr<DerivedPlan> fuseEligibleMapTasks(RegionOp region,
       continue;
     merge(ordinal, consumerIndex->second);
   }
+  for (auto [ordinal, operation] : llvm::enumerate(algebra)) {
+    auto fold = dyn_cast<FoldOp>(operation);
+    if (!fold || fold.getNumResults() != 1 ||
+        !fold.getResult(0).hasOneUse())
+      continue;
+    OpOperand &use = *fold.getResult(0).getUses().begin();
+    auto consumer = dyn_cast<MapOp>(use.getOwner());
+    auto consumerIndex = consumer ? index.find(consumer) : index.end();
+    if (!consumer || consumerIndex == index.end() ||
+        !isEligibleFoldMapEdge(fold, consumer, use.getOperandNumber()))
+      continue;
+    const bool anotherFoldInput = llvm::any_of(
+        consumer.getInputs(), [&](Value input) {
+          auto other = input.getDefiningOp<FoldOp>();
+          return other && other != fold;
+        });
+    if (!anotherFoldInput)
+      merge(ordinal, consumerIndex->second);
+  }
 
   SmallVector<SmallVector<unsigned>> members(algebra.size());
   for (unsigned ordinal = 0; ordinal < algebra.size(); ++ordinal)
@@ -4151,22 +4230,38 @@ FailureOr<DerivedPlan> fuseEligibleMapTasks(RegionOp region,
     if (ordinal != group.back())
       continue;
     PlannedTask task;
-    task.operation = operation;
-    task.kind = initialTask.lookup(operation)->kind;
-    task.domain = initialTask.lookup(operation)->domain;
+    Operation *foldMember = nullptr;
+    for (unsigned member : group) {
+      if (!isa<FoldOp>(algebra[member]))
+        continue;
+      if (foldMember)
+        return failure();
+      foldMember = algebra[member];
+    }
+    task.operation = foldMember ? foldMember : operation;
+    task.kind = initialTask.lookup(task.operation)->kind;
+    task.domain = initialTask.lookup(task.operation)->domain;
     task.reductionDimensions =
-        initialTask.lookup(operation)->reductionDimensions;
-    task.orderFree = initialTask.lookup(operation)->orderFree;
+        initialTask.lookup(task.operation)->reductionDimensions;
+    task.orderFree = initialTask.lookup(task.operation)->orderFree;
     llvm::SmallDenseSet<Operation *> groupSet;
     for (unsigned member : group)
       groupSet.insert(algebra[member]);
     if (group.size() > 1) {
-      if (!llvm::all_of(group, [&](unsigned member) {
-            return isa<MapOp>(algebra[member]);
-          }))
+      for (unsigned member : group) {
+        Operation *memberOperation = algebra[member];
+        if (isa<MapOp>(memberOperation))
+          task.fusedOperations.push_back(memberOperation);
+        else if (!foldMember || memberOperation != foldMember)
+          return failure();
+      }
+      if (foldMember) {
+        if (task.fusedOperations.empty())
+          return failure();
+        task.fusedFold = foldMember;
+      } else if (task.fusedOperations.size() != group.size()) {
         return failure();
-      for (unsigned member : group)
-        task.fusedOperations.push_back(algebra[member]);
+      }
     }
     unsigned singletonMember = ordinal;
     ArrayRef<unsigned> taskMembers =
@@ -4174,6 +4269,27 @@ FailureOr<DerivedPlan> fuseEligibleMapTasks(RegionOp region,
                                      : group;
     llvm::SmallDenseMap<Value, AffineMap> boundaryMaps;
     const bool fusedGroup = !task.fusedOperations.empty();
+    auto addInput = [&](Value operand) -> LogicalResult {
+      auto found = bufferForValue.find(operand);
+      if (found == bufferForValue.end())
+        return failure();
+      task.inputs.push_back(found->second);
+      PlannedBuffer &buffer = fused.buffers[found->second];
+      if (buffer.consumers.empty() ||
+          buffer.consumers.back() !=
+              static_cast<int64_t>(fused.tasks.size()))
+        buffer.consumers.push_back(fused.tasks.size());
+      if (buffer.producer &&
+          !llvm::is_contained(task.dependencies, *buffer.producer))
+        task.dependencies.push_back(*buffer.producer);
+      return success();
+    };
+    if (foldMember) {
+      for (Value operand : foldMember->getOperands()) {
+        if (failed(addInput(operand)))
+          return failure();
+      }
+    }
     for (unsigned member : llvm::reverse(taskMembers)) {
       Operation *memberOperation = algebra[member];
       auto memberMap = dyn_cast<MapOp>(memberOperation);
@@ -4181,9 +4297,8 @@ FailureOr<DerivedPlan> fuseEligibleMapTasks(RegionOp region,
            llvm::enumerate(memberOperation->getOperands())) {
         if (groupSet.contains(operand.getDefiningOp()))
           continue;
-        auto found = bufferForValue.find(operand);
-        if (found == bufferForValue.end())
-          return failure();
+        if (foldMember && memberOperation == foldMember)
+          continue;
         AffineMap composedMap;
         if (memberMap)
           composedMap = cast<AffineMapAttr>(
@@ -4197,17 +4312,10 @@ FailureOr<DerivedPlan> fuseEligibleMapTasks(RegionOp region,
         }
         if (fusedGroup && memberMap)
           boundaryMaps.try_emplace(operand, composedMap);
-        task.inputs.push_back(found->second);
+        if (failed(addInput(operand)))
+          return failure();
         if (fusedGroup && memberMap)
           task.composedInputMaps.push_back(composedMap);
-        PlannedBuffer &buffer = fused.buffers[found->second];
-        if (buffer.consumers.empty() ||
-            buffer.consumers.back() !=
-                static_cast<int64_t>(fused.tasks.size()))
-          buffer.consumers.push_back(fused.tasks.size());
-        if (buffer.producer &&
-            !llvm::is_contained(task.dependencies, *buffer.producer))
-          task.dependencies.push_back(*buffer.producer);
       }
     }
     llvm::sort(task.dependencies);
@@ -4561,7 +4669,8 @@ public:
                                     attrs);
       }
       for (auto [ordinal, task] : llvm::enumerate(tasks)) {
-        const bool fusedMap = task.fusedOperations.size() > 1;
+        const bool fusedFoldMap = task.fusedFold != nullptr;
+        const bool fusedMap = !fusedFoldMap && task.fusedOperations.size() > 1;
         auto source = isa<MapOp>(task.operation)
                           ? cast<MapOp>(task.operation).getSource()
                       : isa<FoldOp>(task.operation)
@@ -4590,10 +4699,24 @@ public:
             builder.getNamedAttr(
                 "semantic_fingerprint",
                 builder.getStringAttr(
-                    fusedMap ? fusedMapFingerprint(task.fusedOperations)
-                             : semanticTaskFingerprint(task.operation))),
+                    fusedFoldMap
+                        ? fusedFoldMapFingerprint(cast<FoldOp>(task.fusedFold),
+                                                  task.fusedOperations)
+                    : fusedMap ? fusedMapFingerprint(task.fusedOperations)
+                               : semanticTaskFingerprint(task.operation))),
             builder.getNamedAttr("source", source)};
-        if (fusedMap) {
+        if (fusedFoldMap) {
+          SmallVector<Attribute> sources;
+          for (Operation *operation : task.fusedOperations)
+            sources.push_back(cast<MapOp>(operation).getSource());
+          SmallVector<Attribute> maps;
+          for (AffineMap map : task.composedInputMaps)
+            maps.push_back(AffineMapAttr::get(map));
+          attrs.push_back(builder.getNamedAttr(
+              "fold_epilogue_sources", builder.getArrayAttr(sources)));
+          attrs.push_back(builder.getNamedAttr(
+              "epilogue_input_maps", builder.getArrayAttr(maps)));
+        } else if (fusedMap) {
           SmallVector<Attribute> sources;
           for (Operation *operation : task.fusedOperations)
             sources.push_back(cast<MapOp>(operation).getSource());
@@ -4661,6 +4784,21 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
     auto fusedSources = task->getAttrOfType<ArrayAttr>("fused_sources");
     auto composedMaps =
         task->getAttrOfType<ArrayAttr>("composed_input_maps");
+    auto epilogueSources =
+        task->getAttrOfType<ArrayAttr>("fold_epilogue_sources");
+    auto epilogueMaps =
+        task->getAttrOfType<ArrayAttr>("epilogue_input_maps");
+    if (fusedSources && epilogueSources) {
+      task.emitOpError("cannot mix Map fusion and Fold epilogue provenance");
+      return failure();
+    }
+    auto found = sourceOperations.find(task.getSource());
+    if (found == sourceOperations.end() ||
+        duplicateSources.contains(task.getSource())) {
+      task.emitOpError("source must uniquely bind one surviving algebra task");
+      return failure();
+    }
+    Operation *source = found->second;
     SmallVector<Operation *> fusedOperations;
     if (fusedSources) {
       if (task.getKind() != MaterializationTaskKind::Map ||
@@ -4696,15 +4834,47 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
           return failure();
         }
       }
+    } else if (epilogueSources) {
+      auto fold = dyn_cast<FoldOp>(source);
+      if (!fold || task.getKind() != MaterializationTaskKind::Fold ||
+          epilogueSources.empty() || !epilogueMaps ||
+          task.getInputBuffers().size() < fold->getNumOperands() ||
+          epilogueMaps.size() !=
+              task.getInputBuffers().size() - fold->getNumOperands() ||
+          !bound.insert(source).second) {
+        task.emitOpError(
+            "Fold epilogue provenance and composed inputs must be aligned");
+        return failure();
+      }
+      for (Attribute epilogueSource : epilogueSources) {
+        auto epilogue = sourceOperations.find(epilogueSource);
+        if (!isa<SourceRefAttr>(epilogueSource) ||
+            epilogue == sourceOperations.end() ||
+            duplicateSources.contains(epilogueSource) ||
+            !isa<MapOp>(epilogue->second) ||
+            !bound.insert(epilogue->second).second) {
+          task.emitOpError(
+              "fold_epilogue_sources must uniquely bind ordered Maps");
+          return failure();
+        }
+        fusedOperations.push_back(epilogue->second);
+      }
+      if (task.getSemanticFingerprint() !=
+          fusedFoldMapFingerprint(fold, fusedOperations)) {
+        task.emitOpError("does not fingerprint the Fold and every epilogue");
+        return failure();
+      }
+      for (Attribute map : epilogueMaps) {
+        if (!isa<AffineMapAttr>(map)) {
+          task.emitOpError("epilogue_input_maps must contain affine maps");
+          return failure();
+        }
+      }
     }
-    auto found = sourceOperations.find(task.getSource());
-    if (found == sourceOperations.end() ||
-        duplicateSources.contains(task.getSource()) ||
-        (!fusedSources && !bound.insert(found->second).second)) {
+    if (!fusedSources && !epilogueSources && !bound.insert(source).second) {
       task.emitOpError("source must uniquely bind one surviving algebra task");
       return failure();
     }
-    Operation *source = found->second;
     const bool kindMatches =
         (task.getKind() == MaterializationTaskKind::Map &&
          isa<MapOp>(source)) ||
@@ -4713,10 +4883,13 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
         (task.getKind() == MaterializationTaskKind::Contract &&
          isa<ContractOp>(source));
     const std::string expectedFingerprint =
-        fusedSources ? fusedMapFingerprint(fusedOperations)
-                     : semanticTaskFingerprint(source);
+        fusedSources
+            ? fusedMapFingerprint(fusedOperations)
+        : epilogueSources
+            ? fusedFoldMapFingerprint(cast<FoldOp>(source), fusedOperations)
+            : semanticTaskFingerprint(source);
     const bool arityMatches =
-        fusedSources ||
+        fusedSources || epilogueSources ||
         (task.getInputBuffers().size() == source->getNumOperands() &&
          task.getOutputBuffers().size() == source->getNumResults());
     if (!kindMatches ||
@@ -4725,7 +4898,7 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
       task.emitOpError("does not match its bound algebra semantics");
       return failure();
     }
-    if (!fusedSources) {
+    if (!fusedSources && !epilogueSources) {
       for (auto [bufferOrdinal, value] :
            llvm::zip_equal(task.getInputBuffers(), source->getOperands())) {
         if (buffers[bufferOrdinal].getTensorType() != value.getType()) {
@@ -4739,6 +4912,25 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
           task.emitOpError("output buffer type does not match bound algebra");
           return failure();
         }
+      }
+    } else if (epilogueSources) {
+      auto fold = cast<FoldOp>(source);
+      for (auto [bufferOrdinal, value] : llvm::zip_equal(
+               task.getInputBuffers().take_front(fold->getNumOperands()),
+               source->getOperands())) {
+        if (bufferOrdinal < 0 || bufferOrdinal >= buffers.size() ||
+            buffers[bufferOrdinal].getTensorType() != value.getType()) {
+          task.emitOpError("Fold input buffer type does not match algebra");
+          return failure();
+        }
+      }
+      if (task.getOutputBuffers().size() != 1 ||
+          task.getOutputBuffers().front() < 0 ||
+          task.getOutputBuffers().front() >= buffers.size() ||
+          buffers[task.getOutputBuffers().front()].getTensorType() !=
+              fusedOperations.back()->getResult(0).getType()) {
+        task.emitOpError("Fold epilogue output does not match final Map");
+        return failure();
       }
     }
     SmallVector<int64_t> expectedDomain;
@@ -4809,13 +5001,27 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
     auto actualSources = actual->getAttrOfType<ArrayAttr>("fused_sources");
     auto actualMaps =
         actual->getAttrOfType<ArrayAttr>("composed_input_maps");
+    auto actualEpilogueSources =
+        actual->getAttrOfType<ArrayAttr>("fold_epilogue_sources");
+    auto actualEpilogueMaps =
+        actual->getAttrOfType<ArrayAttr>("epilogue_input_maps");
+    const bool expectedFoldMap = expectedTask.fusedFold != nullptr;
     if (expectedTask.operation != sourceOperations.lookup(actual.getSource()) ||
-        (expectedSources.empty() != !actualSources) ||
-        (!expectedSources.empty() &&
+        (expectedFoldMap && (actualSources || actualMaps)) ||
+        (!expectedFoldMap &&
+         (expectedSources.empty() != !actualSources)) ||
+        (!expectedFoldMap && !expectedSources.empty() &&
          actualSources.getValue() != ArrayRef<Attribute>(expectedSources)) ||
-        (expectedMaps.empty() != !actualMaps) ||
-        (!expectedMaps.empty() &&
+        (!expectedFoldMap && (expectedMaps.empty() != !actualMaps)) ||
+        (!expectedFoldMap && !expectedMaps.empty() &&
          actualMaps.getValue() != ArrayRef<Attribute>(expectedMaps)) ||
+        (expectedFoldMap != static_cast<bool>(actualEpilogueSources)) ||
+        (expectedFoldMap &&
+         actualEpilogueSources.getValue() !=
+             ArrayRef<Attribute>(expectedSources)) ||
+        (expectedFoldMap != static_cast<bool>(actualEpilogueMaps)) ||
+        (expectedFoldMap &&
+         actualEpilogueMaps.getValue() != ArrayRef<Attribute>(expectedMaps)) ||
         actual.getReductionDimensions() !=
             ArrayRef<int64_t>(expectedTask.reductionDimensions) ||
         actual.getOrderFree().value_or(false) != expectedTask.orderFree ||
@@ -5941,7 +6147,11 @@ FailureOr<std::string> emitContractPtx(ContractOp contract,
   return ptx.text;
 }
 
-FailureOr<std::string> emitFoldPtx(FoldOp fold, ScheduleTaskOp task) {
+FailureOr<std::string> emitFoldMapPtx(
+    FoldOp fold, ScheduleTaskOp task, ArrayRef<MapOp> epilogueMaps,
+    MaterializationTaskOp materializationTask,
+    SmallVectorImpl<MaterializationBufferOp> *buffers) {
+  const bool fused = !epilogueMaps.empty();
   if ((!isClosedRankTwoFold(fold) && !isClosedRankNFold(fold)) ||
       fold.getInputs().size() != 1 || fold.getInitializers().size() != 1 ||
       fold.getNumResults() != 1 ||
@@ -5985,7 +6195,12 @@ FailureOr<std::string> emitFoldPtx(FoldOp fold, ScheduleTaskOp task) {
       task.getScratchBytes() != threads * static_cast<int64_t>(sizeof(float)) ||
       *localWidth > 64 || *sharedWidth > threads)
     return failure();
-  PtxEmitter ptx(3);
+  if (fused &&
+      (!materializationTask || !buffers ||
+       materializationTask.getInputBuffers().size() < fold->getNumOperands() ||
+       materializationTask.getOutputBuffers().size() != 1))
+    return failure();
+  PtxEmitter ptx(fused ? materializationTask.getInputBuffers().size() + 1 : 3);
   ptx.header(task.getSemanticFingerprint(), /*usesDynamicSharedMemory=*/true);
   ptx.stream << "  mov.u32 %r0, %tid.x;\n"
                 "  mov.u32 %r1, %ctaid.x;\n"
@@ -6047,14 +6262,119 @@ FailureOr<std::string> emitFoldPtx(FoldOp fold, ScheduleTaskOp task) {
                 "  ld.shared.f32 %f35, [%rd4];\n"
                 "  ld.param.u64 %rd7, [p1];\n"
                 "  ld.global.f32 %f36, [%rd7];\n"
-                "  add.rn.f32 %f37, %f35, %f36;\n"
-                "  ld.param.u64 %rd8, [p2];\n"
-                "  cvt.u64.u32 %rd9, %r1;\n"
-                "  mul.lo.u64 %rd9, %rd9, 4;\n"
-                "  add.u64 %rd8, %rd8, %rd9;\n"
-                "  st.global.f32 [%rd8], %f37;\n";
+                "  add.rn.f32 %f37, %f35, %f36;\n";
+  if (!fused) {
+    ptx.stream << "  ld.param.u64 %rd8, [p2];\n"
+                  "  cvt.u64.u32 %rd9, %r1;\n"
+                  "  mul.lo.u64 %rd9, %rd9, 4;\n"
+                  "  add.u64 %rd8, %rd8, %rd9;\n"
+                  "  st.global.f32 [%rd8], %f37;\n";
+    ptx.finish();
+    return ptx.text;
+  }
+
+  unsigned foldConsumers = 0;
+  for (MapOp map : epilogueMaps) {
+    for (auto [operandNumber, operand] : llvm::enumerate(map.getInputs())) {
+      if (operand != fold.getResult(0))
+        continue;
+      if (!isEligibleFoldMapEdge(fold, map, operandNumber))
+        return failure();
+      ++foldConsumers;
+    }
+  }
+  if (foldConsumers != 1)
+    return failure();
+  int64_t outputBuffer = materializationTask.getOutputBuffers().front();
+  if (outputBuffer < 0 || outputBuffer >= buffers->size())
+    return failure();
+  auto output =
+      dyn_cast<RankedTensorType>((*buffers)[outputBuffer].getTensorType());
+  auto mapAttributes = materializationTask->getAttrOfType<ArrayAttr>(
+      "epilogue_input_maps");
+  if (!output || !output.getElementType().isF32() || !mapAttributes ||
+      mapAttributes.size() != materializationTask.getInputBuffers().size() -
+                                  fold->getNumOperands())
+    return failure();
+  FailureOr<int64_t> finalElements = staticElementCount(output);
+  if (failed(finalElements) || *finalElements != outputExtent)
+    return failure();
+  ptx.stream << "  cvt.u64.u32 %rd0, %r1;\n";
+  FailureOr<SmallVector<int64_t>> coordinates =
+      emitOutputCoordinates(ptx, output);
+  if (failed(coordinates))
+    return failure();
+
+  llvm::SmallDenseSet<Operation *> group;
+  group.insert(fold.getOperation());
+  for (MapOp map : epilogueMaps)
+    group.insert(map.getOperation());
+  SmallVector<Value> boundaryInputs;
+  llvm::SmallDenseSet<Value> seenBoundary;
+  for (MapOp map : llvm::reverse(epilogueMaps)) {
+    for (Value operand : map.getInputs()) {
+      if (!group.contains(operand.getDefiningOp()) &&
+          seenBoundary.insert(operand).second)
+        boundaryInputs.push_back(operand);
+    }
+  }
+  if (boundaryInputs.size() != mapAttributes.size())
+    return failure();
+  DenseMap<Value, int64_t> values;
+  values[fold.getResult(0)] = 37;
+  ptx.f32 = 38;
+  ptx.u64 = std::max<int64_t>(ptx.u64, 10);
+  ArrayRef<int64_t> mapBuffers =
+      materializationTask.getInputBuffers().drop_front(fold->getNumOperands());
+  for (auto [ordinal, value, bufferOrdinal, mapAttribute] : llvm::enumerate(
+           boundaryInputs, mapBuffers, mapAttributes.getValue())) {
+    if (bufferOrdinal < 0 || bufferOrdinal >= buffers->size())
+      return failure();
+    auto input = dyn_cast<RankedTensorType>(
+        (*buffers)[bufferOrdinal].getTensorType());
+    auto indexing = dyn_cast<AffineMapAttr>(mapAttribute);
+    if (!input || !indexing || input != value.getType())
+      return failure();
+    FailureOr<int64_t> loaded = emitMapInput(
+        ptx, fold->getNumOperands() + ordinal, input, indexing.getValue(),
+        *coordinates);
+    if (failed(loaded))
+      return failure();
+    values[value] = *loaded;
+  }
+  for (MapOp map : epilogueMaps) {
+    SmallVector<int64_t> arguments;
+    for (Value operand : map.getInputs()) {
+      auto found = values.find(operand);
+      if (found == values.end())
+        return failure();
+      arguments.push_back(found->second);
+    }
+    FailureOr<int64_t> result =
+        emitScalarBody(ptx, map.getBody().front(), arguments);
+    if (failed(result) || map.getNumResults() != 1)
+      return failure();
+    values[map.getResult(0)] = *result;
+  }
+  MapOp finalMap = epilogueMaps.back();
+  auto result = values.find(finalMap.getResult(0));
+  if (result == values.end())
+    return failure();
+  int64_t outputPointer = ptx.nextU64();
+  int64_t outputParameter = materializationTask.getInputBuffers().size();
+  ptx.stream << "  ld.param.u64 %rd" << outputPointer << ", [p"
+             << outputParameter << "];\n  mad.lo.u64 %rd" << outputPointer
+             << ", %rd0, 4, %rd" << outputPointer
+             << ";\n  st.global.f32 [%rd" << outputPointer << "], %f"
+             << result->second << ";\n";
+  if (ptx.f32 > 128 || ptx.u64 > 128 || ptx.bf16 > 16)
+    return failure();
   ptx.finish();
   return ptx.text;
+}
+
+FailureOr<std::string> emitFoldPtx(FoldOp fold, ScheduleTaskOp task) {
+  return emitFoldMapPtx(fold, task, {}, {}, nullptr);
 }
 
 FailureOr<GpuExecutableSpec>
@@ -6101,7 +6421,22 @@ deriveGpuExecutable(RegionOp region, MaterializationPlanOp materialization,
     if (!operation)
       return failure();
     FailureOr<std::string> ptx = failure();
-    if (auto fusedSources = materializationTask->getAttrOfType<ArrayAttr>(
+    if (auto epilogueSources = materializationTask->getAttrOfType<ArrayAttr>(
+            "fold_epilogue_sources")) {
+      auto fold = dyn_cast<FoldOp>(operation);
+      SmallVector<MapOp> maps;
+      for (Attribute source : epilogueSources) {
+        auto map = dyn_cast_or_null<MapOp>(sourceOperations.lookup(source));
+        if (!map)
+          return failure();
+        maps.push_back(map);
+      }
+      if (!fold)
+        return failure();
+      ptx = emitFoldMapPtx(fold, task, maps, materializationTask,
+                           &materializationBuffers);
+    } else if (auto fusedSources =
+                   materializationTask->getAttrOfType<ArrayAttr>(
             "fused_sources")) {
       SmallVector<MapOp> maps;
       for (Attribute source : fusedSources) {

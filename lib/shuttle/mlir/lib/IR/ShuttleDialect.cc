@@ -914,6 +914,9 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
     }
     if (task.getKind() == MaterializationTaskKind::Fold) {
       ++foldCount;
+      const bool hasEpilogue =
+          static_cast<bool>(task->getAttrOfType<ArrayAttr>(
+              "fold_epilogue_sources"));
       const int64_t domainRank = task.getDomainShape().size();
       ArrayRef<int64_t> reductionDimensions = task.getReductionDimensions();
       const int64_t reductionAxis = reductionDimensions.size() == 1
@@ -934,7 +937,8 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
                        });
       if ((!rankTwoFold && !terminalRankNFold && !fullPrefixRankNFold) ||
           !task.getOrderFree().value_or(false) ||
-          task.getInputBuffers().size() != 2 ||
+          (hasEpilogue ? task.getInputBuffers().size() < 2
+                       : task.getInputBuffers().size() != 2) ||
           task.getOutputBuffers().size() != 1) {
         return task.emitOpError(
             "Fold tasks require a rank-two in-range reduction or a rank-three "
@@ -951,12 +955,35 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
       for (int64_t axis : llvm::reverse(reductionDimensions)) {
         expectedResultShape.erase(expectedResultShape.begin() + axis);
       }
+      auto isSingletonInsertion = [](ArrayRef<int64_t> source,
+                                     ArrayRef<int64_t> destination) {
+        size_t sourceAxis = 0;
+        for (int64_t extent : destination) {
+          if (sourceAxis < source.size() && extent == source[sourceAxis]) {
+            ++sourceAxis;
+          } else if (extent != 1) {
+            return false;
+          }
+        }
+        return sourceAxis == source.size();
+      };
+      const bool resultShapeMatches =
+          resultType.getShape() == ArrayRef<int64_t>(expectedResultShape) ||
+          (hasEpilogue && isSingletonInsertion(
+                              expectedResultShape, resultType.getShape()));
       if (inputType.getShape() != task.getDomainShape() ||
           !inputType.getElementType().isF32() ||
           initializerType.getRank() != 0 ||
           !initializerType.getElementType().isF32() ||
-          resultType.getShape() != ArrayRef<int64_t>(expectedResultShape) ||
-          !resultType.getElementType().isF32()) {
+          !resultShapeMatches || !resultType.getElementType().isF32() ||
+          (hasEpilogue &&
+           llvm::any_of(task.getInputBuffers().drop_front(2),
+                        [&](int64_t bufferOrdinal) {
+                          auto type = cast<RankedTensorType>(
+                              buffers[bufferOrdinal].getTensorType());
+                          return !type.hasStaticShape() ||
+                                 !type.getElementType().isF32();
+                        }))) {
         return task.emitOpError(
             "Fold buffer types must match its f32 domain and accumulator");
       }
