@@ -862,4 +862,48 @@ TEST(Abi22MapFusionContract,
   }
 }
 
+TEST(Abi22MapFusionContract, RejectsPermutedFoldResultEdge) {
+  constexpr llvm::StringLiteral source = R"mlir(
+#input = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+#transpose = affine_map<(d0, d1) -> (d1, d0)>
+#output = affine_map<(d0, d1) -> (d0, d1)>
+#scalar = affine_map<() -> ()>
+module attributes {
+  shuttle.coverage_manifest = {
+    canonical_tuning = "{\22cluster_shape\22:[],\22materialization\22:\22prefer_fusion\22,\22maximum_candidates\22:1,\22pipeline_stages\22:1,\22tile_sizes\22:[]}"
+  }
+} {
+  func.func @anonymous(%input: tensor<2x3x4xf32>) -> tensor<3x2xf32> {
+    %result = "shuttle.region"(%input) ({
+    ^bb0(%region_input: tensor<2x3x4xf32>):
+      %init = "shuttle.map"() ({
+      ^bb0:
+        %zero = arith.constant 0.000000e+00 : f32
+        "shuttle.yield"(%zero) : (f32) -> ()
+      }) {indexing_maps = [#scalar], source = #shuttle.source_ref<0, 0, 0, 0>} : () -> tensor<f32>
+      %folded = "shuttle.fold"(%region_input, %init) ({
+      ^bb0(%element: f32, %accumulator: f32):
+        %sum = arith.addf %element, %accumulator : f32
+        "shuttle.yield"(%sum) : (f32) -> ()
+      }) {accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 2>, source = #shuttle.source_ref<0, 0, 0, 1>} : (tensor<2x3x4xf32>, tensor<f32>) -> tensor<2x3xf32>
+      %transposed = "shuttle.map"(%folded) ({
+      ^bb0(%element: f32):
+        "shuttle.yield"(%element) : (f32) -> ()
+      }) {indexing_maps = [#transpose, #output], source = #shuttle.source_ref<0, 0, 0, 2>} : (tensor<2x3xf32>) -> tensor<3x2xf32>
+      "shuttle.yield"(%transposed) : (tensor<3x2xf32>) -> ()
+    }) {policy = #shuttle.policy<source_ordered>, source_refs = [#shuttle.source_ref<0, 0, 0, 0>, #shuttle.source_ref<0, 0, 0, 1>, #shuttle.source_ref<0, 0, 0, 2>]} : (tensor<2x3x4xf32>) -> tensor<3x2xf32>
+    return %result : tensor<3x2xf32>
+  }
+}
+)mlir";
+  std::unique_ptr<BuiltModule> built =
+      buildAlgebra(source, mlir::shuttle::NumericalPolicy::SourceOrdered);
+  ASSERT_TRUE(built);
+  std::optional<PlanSummary> plan = summary(*built->module);
+  ASSERT_TRUE(plan);
+  EXPECT_EQ(plan->tasks, 3);
+  EXPECT_EQ(plan->buffers, 4);
+  EXPECT_TRUE(plan->fusedFoldMapGroupSizes.empty());
+}
+
 } // namespace
