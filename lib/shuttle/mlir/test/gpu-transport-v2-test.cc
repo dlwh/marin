@@ -3906,9 +3906,9 @@ TEST(GpuTransportV2Test,
   };
   constexpr Boundary boundaries[] = {
       {"jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-forward.mlir",
-       10, 12, 6, 2268},
+       1, 3, 0, 0},
       {"jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-backward.mlir",
-       27, 30, 9, 4452},
+       3, 6, 1, 56},
   };
   constexpr llvm::StringLiteral options =
       R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";

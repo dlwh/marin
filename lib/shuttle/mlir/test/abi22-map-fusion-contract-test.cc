@@ -1128,4 +1128,168 @@ module attributes {
   }
 }
 
+TEST(Abi22MapFusionContract,
+     FusedNormFoldRegionsBindCompactBoundariesAndCtaLocalPhases) {
+  struct Boundary {
+    const char *filename;
+    int64_t tasks;
+    int64_t buffers;
+    int64_t phases;
+    int64_t temporaryBuffers;
+  };
+  constexpr Boundary boundaries[] = {
+      {"jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-forward.mlir",
+       1, 3, 1, 0},
+      {"jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-backward.mlir",
+       3, 6, 4, 1},
+      {"jax-0.10.1-bf16-projected_parameter_broadcast-"
+       "3x2x5x11x263-forward.mlir",
+       1, 3, 1, 0},
+      {"jax-0.10.1-bf16-projected_parameter_broadcast-"
+       "3x2x5x11x263-backward.mlir",
+       3, 6, 4, 1},
+  };
+  for (const Boundary &boundary : boundaries) {
+    SCOPED_TRACE(boundary.filename);
+    std::optional<std::string> source = fixtureSource(boundary.filename);
+    ASSERT_TRUE(source);
+    std::optional<std::string> sourceOrderedFingerprint;
+    for (mlir::shuttle::NumericalPolicy policy :
+         {mlir::shuttle::NumericalPolicy::SourceOrdered,
+          mlir::shuttle::NumericalPolicy::Fast}) {
+      std::unique_ptr<BuiltModule> built =
+          build(*source, policy, kFusionTuning, false, true);
+      ASSERT_TRUE(built);
+      auto plan =
+          *built->module->getOps<mlir::shuttle::MaterializationPlanOp>().begin();
+      EXPECT_EQ(plan.getSchemaVersion(), 2);
+      auto tasks = llvm::to_vector(
+          plan.getBody().front().getOps<
+              mlir::shuttle::MaterializationTaskOp>());
+      auto buffers = llvm::to_vector(
+          plan.getBody().front().getOps<
+              mlir::shuttle::MaterializationBufferOp>());
+      ASSERT_EQ(tasks.size(), boundary.tasks);
+      ASSERT_EQ(buffers.size(), boundary.buffers);
+      EXPECT_EQ(llvm::count_if(buffers, [](auto buffer) {
+                  return buffer.getStorage() ==
+                         mlir::shuttle::MaterializationStorage::Temporary;
+                }),
+                boundary.temporaryBuffers);
+
+      llvm::SmallDenseMap<mlir::Attribute, int64_t> sourceOccurrences;
+      int64_t phaseCount = 0;
+      for (mlir::shuttle::MaterializationTaskOp task : tasks) {
+        EXPECT_EQ(task.getKind(), mlir::shuttle::MaterializationTaskKind::Fold);
+        auto sources =
+            task->getAttrOfType<mlir::ArrayAttr>("fold_region_sources");
+        auto phases =
+            task->getAttrOfType<mlir::ArrayAttr>("fold_region_phases");
+        auto boundaryUses =
+            task->getAttrOfType<mlir::ArrayAttr>("fold_region_boundary_uses");
+        ASSERT_TRUE(sources);
+        ASSERT_TRUE(phases);
+        ASSERT_TRUE(boundaryUses);
+        ASSERT_FALSE(sources.empty());
+        ASSERT_FALSE(phases.empty());
+        phaseCount += phases.size();
+        for (mlir::Attribute sourceRef : sources) {
+          ASSERT_TRUE(mlir::isa<mlir::shuttle::SourceRefAttr>(sourceRef));
+          ++sourceOccurrences[sourceRef];
+        }
+        for (mlir::Attribute phaseAttribute : phases) {
+          auto phase = mlir::dyn_cast<mlir::DictionaryAttr>(phaseAttribute);
+          ASSERT_TRUE(phase);
+          EXPECT_TRUE(mlir::isa<mlir::shuttle::SourceRefAttr>(
+              phase.get("source")));
+          EXPECT_TRUE(mlir::isa<mlir::DenseI64ArrayAttr>(
+              phase.get("domain_shape")));
+          EXPECT_TRUE(mlir::isa<mlir::DenseI64ArrayAttr>(
+              phase.get("reduction_dimensions")));
+          EXPECT_TRUE(mlir::isa<mlir::BoolAttr>(phase.get("order_free")));
+          auto transition =
+              mlir::dyn_cast_or_null<mlir::StringAttr>(phase.get("transition"));
+          ASSERT_TRUE(transition);
+          EXPECT_TRUE(transition.getValue() == "launch_boundary" ||
+                      transition.getValue() == "cta_local");
+        }
+        for (mlir::Attribute useAttribute : boundaryUses) {
+          auto use = mlir::dyn_cast<mlir::DictionaryAttr>(useAttribute);
+          ASSERT_TRUE(use);
+          EXPECT_TRUE(mlir::isa<mlir::IntegerAttr>(use.get("input_buffer")));
+          EXPECT_TRUE(mlir::isa<mlir::shuttle::SourceRefAttr>(
+              use.get("source")));
+          EXPECT_TRUE(mlir::isa<mlir::IntegerAttr>(use.get("operand")));
+          EXPECT_TRUE(mlir::isa<mlir::AffineMapAttr>(
+              use.get("indexing_map")));
+        }
+      }
+      EXPECT_EQ(phaseCount, boundary.phases);
+
+      llvm::SmallDenseSet<mlir::Attribute> declaredRecomputations;
+      for (mlir::shuttle::MaterializationTaskOp task : tasks) {
+        auto recomputed = task->getAttrOfType<mlir::ArrayAttr>(
+            "fold_region_recomputed_sources");
+        if (!recomputed)
+          continue;
+        for (mlir::Attribute sourceRef : recomputed) {
+          EXPECT_TRUE(mlir::isa<mlir::shuttle::SourceRefAttr>(sourceRef));
+          declaredRecomputations.insert(sourceRef);
+        }
+      }
+      for (auto [sourceRef, occurrences] : sourceOccurrences) {
+        EXPECT_EQ(occurrences > 1,
+                  declaredRecomputations.contains(sourceRef));
+      }
+      if (llvm::StringRef(boundary.filename).contains("backward"))
+        EXPECT_FALSE(declaredRecomputations.empty());
+      else
+        EXPECT_TRUE(declaredRecomputations.empty());
+
+      auto device =
+          *built->module->getOps<mlir::shuttle::DeviceModuleOp>().begin();
+      auto entries = llvm::to_vector(
+          device.getBody().front().getOps<mlir::shuttle::DeviceEntryOp>());
+      ASSERT_EQ(entries.size(), boundary.tasks);
+      llvm::StringRef ptx(
+          reinterpret_cast<const char *>(device.getCode().data() +
+                                         entries.front().getCodeOffset()),
+          entries.front().getCodeLength());
+      EXPECT_NE(ptx.find("ld.global.u16"), llvm::StringRef::npos);
+      EXPECT_NE(ptx.find("cvt.f32.bf16"), llvm::StringRef::npos);
+      EXPECT_NE(ptx.find("add.rn.f32"), llvm::StringRef::npos);
+      if (llvm::StringRef(boundary.filename).contains("forward")) {
+        size_t load = ptx.find("ld.global.u16");
+        size_t square = ptx.find("mul.rn.f32");
+        size_t reduce = ptx.find("st.shared.f32");
+        size_t rsqrt = ptx.find("sqrt.rn.f32");
+        size_t store = ptx.find("st.global.u16");
+        ASSERT_NE(load, llvm::StringRef::npos);
+        ASSERT_NE(square, llvm::StringRef::npos);
+        ASSERT_NE(reduce, llvm::StringRef::npos);
+        ASSERT_NE(rsqrt, llvm::StringRef::npos);
+        ASSERT_NE(store, llvm::StringRef::npos);
+        EXPECT_LT(load, square);
+        EXPECT_LT(square, reduce);
+        EXPECT_LT(reduce, rsqrt);
+        EXPECT_LT(rsqrt, store);
+      }
+
+      if (sourceOrderedFingerprint) {
+        EXPECT_NE(*sourceOrderedFingerprint, plan.getFingerprint());
+      } else {
+        sourceOrderedFingerprint = plan.getFingerprint().str();
+      }
+      std::unique_ptr<BuiltModule> renamed =
+          build(*source, policy, kFusionTuning, true, true);
+      ASSERT_TRUE(renamed);
+      auto renamedPlan = *renamed->module
+                              ->getOps<
+                                  mlir::shuttle::MaterializationPlanOp>()
+                              .begin();
+      EXPECT_EQ(plan.getFingerprint(), renamedPlan.getFingerprint());
+    }
+  }
+}
+
 } // namespace
