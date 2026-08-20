@@ -381,14 +381,23 @@ index 50111fd..f94b6f7 100644
 +  EXPECT_TRUE(debug_options.xla_shuttle_enable());
 +  EXPECT_EQ(debug_options.xla_shuttle_options(), "{\"numerics\":\"fast\"}");
    EXPECT_THAT(debug_options.xla_gpu_disable_async_collectives(),
-@@ -153,2 +157,23 @@ TEST(ExecuteOptionsTest, ApplyOptionsCanParseStringsAndEnums) {
+@@ -153,2 +157,42 @@ TEST(ExecuteOptionsTest, ApplyOptionsCanParseStringsAndEnums) {
 
-+TEST(CompileOptionsTest, ShuttleOptionsRemainDistinctWhenSerialized) {
++TEST(CompileOptionsTest, ShuttleEnableAndPoliciesRemainDistinctWhenSerialized) {
++  CompileOptions disabled;
++  TF_ASSERT_OK_AND_ASSIGN(CompileOptionsProto disabled_proto,
++                          disabled.ToProto());
++
 +  CompileOptions source_ordered;
 +  source_ordered.env_option_overrides = {
 +      {"xla_shuttle_enable", true},
 +      {"xla_shuttle_options",
-+       std::string("{\"numerics\":\"source_ordered\"}")}};
++       std::string("{\"execution_mode\":\"gpu_executable_bundle\","
++                   "\"numerics\":\"source_ordered\","
++                   "\"pipeline_abi_version\":21,\"schema_version\":1,"
++                   "\"tuning\":{\"cluster_shape\":[],\"materialization\":"
++                   "\"automatic\",\"maximum_candidates\":1,"
++                   "\"pipeline_stages\":1,\"tile_sizes\":[]}}")}};
 +  TF_ASSERT_OK(source_ordered.ApplyAllOptionOverrides());
 +  TF_ASSERT_OK_AND_ASSIGN(CompileOptionsProto source_ordered_proto,
 +                          source_ordered.ToProto());
@@ -396,10 +405,20 @@ index 50111fd..f94b6f7 100644
 +  CompileOptions fast;
 +  fast.env_option_overrides = {
 +      {"xla_shuttle_enable", true},
-+      {"xla_shuttle_options", std::string("{\"numerics\":\"fast\"}")}};
++      {"xla_shuttle_options",
++       std::string("{\"execution_mode\":\"gpu_executable_bundle\","
++                   "\"numerics\":\"fast\",\"pipeline_abi_version\":21,"
++                   "\"schema_version\":1,\"tuning\":{\"cluster_shape\":[],"
++                   "\"materialization\":\"automatic\","
++                   "\"maximum_candidates\":1,\"pipeline_stages\":1,"
++                   "\"tile_sizes\":[]}}")}};
 +  TF_ASSERT_OK(fast.ApplyAllOptionOverrides());
 +  TF_ASSERT_OK_AND_ASSIGN(CompileOptionsProto fast_proto, fast.ToProto());
 +
++  EXPECT_NE(disabled_proto.SerializeAsString(),
++            source_ordered_proto.SerializeAsString());
++  EXPECT_NE(disabled_proto.SerializeAsString(),
++            fast_proto.SerializeAsString());
 +  EXPECT_NE(source_ordered_proto.SerializeAsString(),
 +            fast_proto.SerializeAsString());
 +}
