@@ -4200,12 +4200,18 @@ FailureOr<DerivedPlan> fuseEligibleMapTasks(RegionOp region,
     if (!consumer || consumerIndex == index.end() ||
         !isEligibleFoldMapEdge(fold, consumer, use.getOperandNumber()))
       continue;
-    const bool anotherFoldInput = llvm::any_of(
-        consumer.getInputs(), [&](Value input) {
-          auto other = input.getDefiningOp<FoldOp>();
-          return other && other != fold;
+    const unsigned consumerRoot = root(consumerIndex->second);
+    const bool anotherFoldBoundary = llvm::any_of(
+        llvm::enumerate(algebra), [&](auto member) {
+          auto memberMap = dyn_cast<MapOp>(member.value());
+          if (!memberMap || root(member.index()) != consumerRoot)
+            return false;
+          return llvm::any_of(memberMap.getInputs(), [&](Value input) {
+            auto other = input.getDefiningOp<FoldOp>();
+            return other && other != fold;
+          });
         });
-    if (!anotherFoldInput)
+    if (!anotherFoldBoundary)
       merge(ordinal, consumerIndex->second);
   }
 
