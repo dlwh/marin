@@ -3900,12 +3900,13 @@ TEST(GpuTransportV2Test,
   struct Boundary {
     const char *filename;
     int64_t launches;
+    int64_t slots;
   };
   constexpr Boundary boundaries[] = {
       {"jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-forward.mlir",
-       11},
+       10, 12},
       {"jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-backward.mlir",
-       30},
+       27, 30},
   };
   constexpr llvm::StringLiteral options =
       R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
@@ -3928,6 +3929,7 @@ TEST(GpuTransportV2Test,
     auto decoded = decodeInlineSchema2(*transport);
     ASSERT_TRUE(decoded);
     ASSERT_EQ(decoded->launches.size(), boundary.launches);
+    ASSERT_EQ(decoded->slots, boundary.slots);
 
     llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> operands;
     llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> results;

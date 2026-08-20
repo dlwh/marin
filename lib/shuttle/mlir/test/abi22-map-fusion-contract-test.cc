@@ -97,10 +97,73 @@ struct PlanSummary {
   int64_t mapTasks = 0;
   int64_t foldTasks = 0;
   int64_t contractTasks = 0;
+  int64_t eligibleFoldMapEdges = 0;
   std::vector<int64_t> fusedMapGroupSizes;
+  std::vector<int64_t> fusedFoldMapGroupSizes;
   bool exactSourceCoverage = false;
   std::string fingerprint;
 };
+
+int64_t staticElementCount(mlir::RankedTensorType type) {
+  int64_t count = 1;
+  for (int64_t extent : type.getShape())
+    count *= extent;
+  return count;
+}
+
+bool isOneToOneFoldMapEdge(mlir::shuttle::FoldOp fold,
+                           mlir::shuttle::MapOp map,
+                           unsigned operandNumber) {
+  if (fold.getNumResults() != 1 || !fold.getResult(0).hasOneUse() ||
+      fold.getInputs().size() != 1 || fold.getInitializers().size() != 1 ||
+      !fold.getOrderFree() ||
+      map.getNumResults() != 1 ||
+      map.getIndexingMaps().size() != map.getInputs().size() + 1)
+    return false;
+  auto foldInput = mlir::dyn_cast<mlir::RankedTensorType>(
+      fold.getInputs().front().getType());
+  auto initializer = mlir::dyn_cast<mlir::RankedTensorType>(
+      fold.getInitializers().front().getType());
+  auto folded = mlir::dyn_cast<mlir::RankedTensorType>(
+      fold.getResult(0).getType());
+  auto output =
+      mlir::dyn_cast<mlir::RankedTensorType>(map.getResult(0).getType());
+  auto edge = mlir::dyn_cast<mlir::AffineMapAttr>(
+      map.getIndexingMaps()[operandNumber]);
+  auto resultMap = mlir::dyn_cast<mlir::AffineMapAttr>(
+      map.getIndexingMaps().getValue().back());
+  if (!foldInput || !initializer || !folded || !output ||
+      !foldInput.hasStaticShape() || !foldInput.getElementType().isF32() ||
+      initializer.getRank() != 0 || !initializer.getElementType().isF32() ||
+      !folded.hasStaticShape() ||
+      !output.hasStaticShape() || !folded.getElementType().isF32() ||
+      !output.getElementType().isF32() || !edge || !resultMap ||
+      !resultMap.getValue().isIdentity() ||
+      staticElementCount(folded) != staticElementCount(output) ||
+      edge.getValue().getNumDims() != output.getRank() ||
+      edge.getValue().getNumSymbols() != 0 ||
+      edge.getValue().getNumResults() != folded.getRank())
+    return false;
+  for (mlir::Type type : map.getOperandTypes()) {
+    auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type);
+    if (!tensor || !tensor.hasStaticShape() ||
+        !tensor.getElementType().isF32())
+      return false;
+  }
+  llvm::SmallDenseSet<unsigned> mapped;
+  for (auto [axis, expression] :
+       llvm::enumerate(edge.getValue().getResults())) {
+    auto dimension = mlir::dyn_cast<mlir::AffineDimExpr>(expression);
+    if (!dimension || !mapped.insert(dimension.getPosition()).second ||
+        folded.getDimSize(axis) !=
+            output.getDimSize(dimension.getPosition()))
+      return false;
+  }
+  return llvm::all_of(llvm::enumerate(output.getShape()),
+                      [&](auto item) {
+    return mapped.contains(item.index()) || item.value() == 1;
+  });
+}
 
 struct FusionAudit {
   int64_t groups = 0;
@@ -254,6 +317,14 @@ std::optional<PlanSummary> summary(mlir::ModuleOp module) {
                  mlir::dyn_cast<mlir::shuttle::ContractOp>(operation))
       algebraSources.insert(contract.getSource());
   });
+  module.walk([&](mlir::shuttle::FoldOp fold) {
+    if (fold.getNumResults() != 1 || !fold.getResult(0).hasOneUse())
+      return;
+    mlir::OpOperand &use = *fold.getResult(0).getUses().begin();
+    auto map = mlir::dyn_cast<mlir::shuttle::MapOp>(use.getOwner());
+    if (map && isOneToOneFoldMapEdge(fold, map, use.getOperandNumber()))
+      ++result.eligibleFoldMapEdges;
+  });
   llvm::SmallVector<mlir::shuttle::MaterializationPlanOp> plans(
       module.getOps<mlir::shuttle::MaterializationPlanOp>());
   if (plans.size() != 1)
@@ -269,7 +340,27 @@ std::optional<PlanSummary> summary(mlir::ModuleOp module) {
     if (!task)
       continue;
     auto fusedSources = task->getAttrOfType<mlir::ArrayAttr>("fused_sources");
-    if (fusedSources) {
+    auto foldEpilogueSources =
+        task->getAttrOfType<mlir::ArrayAttr>("fold_epilogue_sources");
+    if (fusedSources && foldEpilogueSources)
+      return std::nullopt;
+    if (foldEpilogueSources) {
+      if (task.getKind() != mlir::shuttle::MaterializationTaskKind::Fold ||
+          foldEpilogueSources.empty() ||
+          !plannedSources.insert(task.getSource()).second)
+        return std::nullopt;
+      auto firstSource = mlir::dyn_cast<mlir::shuttle::SourceRefAttr>(
+          foldEpilogueSources.getValue().front());
+      if (!firstSource)
+        return std::nullopt;
+      fusedGroups.emplace_back(firstSource, foldEpilogueSources.size());
+      result.fusedFoldMapGroupSizes.push_back(foldEpilogueSources.size());
+      for (mlir::Attribute source : foldEpilogueSources) {
+        if (!mlir::isa<mlir::shuttle::SourceRefAttr>(source) ||
+            !plannedSources.insert(source).second)
+          return std::nullopt;
+      }
+    } else if (fusedSources) {
       if (fusedSources.size() < 2 ||
           fusedSources.getValue().back() != task.getSource())
         return std::nullopt;
@@ -455,9 +546,11 @@ void expectCounts(const PlanSummary &actual,
   EXPECT_EQ(actual.folds, expected.folds);
   EXPECT_EQ(actual.contracts, 0);
   EXPECT_EQ(actual.tasks,
-            fused ? expected.fusedTasks : expected.materializedTasks);
+            fused ? expected.fusedTasks - actual.eligibleFoldMapEdges
+                  : expected.materializedTasks);
   EXPECT_EQ(actual.buffers,
-            fused ? expected.fusedBuffers : expected.materializedBuffers);
+            fused ? expected.fusedBuffers - actual.eligibleFoldMapEdges
+                  : expected.materializedBuffers);
   EXPECT_EQ(actual.foldTasks, expected.folds);
   EXPECT_EQ(actual.contractTasks, 0);
   EXPECT_EQ(actual.mapTasks, actual.tasks - actual.foldTasks);
@@ -465,6 +558,8 @@ void expectCounts(const PlanSummary &actual,
   EXPECT_EQ(actual.fusedMapGroupSizes,
             fused ? expectedFusionGroupSizes(expected)
                   : std::vector<int64_t>{});
+  EXPECT_EQ(actual.fusedFoldMapGroupSizes.size(),
+            fused ? actual.eligibleFoldMapEdges : 0);
 }
 
 TEST(Abi22MapFusionContract,
