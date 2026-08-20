@@ -1010,7 +1010,29 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
     }
   }
   if (foldCount == 0 && contractCount == 0) {
-    return emitOpError("requires at least one Fold or Contract task");
+    if (tasks.size() < 2) {
+      return emitOpError("requires at least two Map tasks");
+    }
+    bool hasTemporary = false;
+    for (MaterializationBufferOp buffer : buffers) {
+      auto type = cast<RankedTensorType>(buffer.getTensorType());
+      if (buffer.getStorage() == MaterializationStorage::External) {
+        if (type.getRank() < 1 || type.getRank() > 8 ||
+            !type.getElementType().isBF16()) {
+          return buffer.emitOpError(
+              "Map-only external buffers require rank-one through rank-eight "
+              "bf16 tensors");
+        }
+        continue;
+      }
+      if (!type.getElementType().isF32()) {
+        return buffer.emitOpError("Map-only temporary buffers require f32");
+      }
+      hasTemporary = true;
+    }
+    if (!hasTemporary) {
+      return emitOpError("Map-only plans require a temporary f32 buffer");
+    }
   }
   if (getSchemaVersion() != (contractCount == 0 ? 1 : 2)) {
     return emitOpError(
@@ -1342,8 +1364,8 @@ LogicalResult SchedulePlanOp::verifyRegions() {
       ++contractCount;
     }
   }
-  if (foldCount == 0 && contractCount == 0) {
-    return emitOpError("requires at least one Fold or Contract schedule task");
+  if (foldCount == 0 && contractCount == 0 && tasks.size() < 2) {
+    return emitOpError("requires at least two Map schedule tasks");
   }
   if (getSchemaVersion() != (contractCount == 0 ? 1 : 2)) {
     return emitOpError("schedule schema must equal the admitted task family");

@@ -4077,9 +4077,6 @@ FailureOr<DerivedPlan> deriveGpuPlan(RegionOp region) {
     }
     tasks.push_back(std::move(task));
   }
-  if (foldCount == 0 && contractCount == 0) {
-    return failure();
-  }
   auto regionYield = cast<YieldOp>(region.getBody().front().getTerminator());
   for (Value value : regionYield.getValues()) {
     auto found = bufferForValue.find(value);
@@ -4094,15 +4091,47 @@ FailureOr<DerivedPlan> deriveGpuPlan(RegionOp region) {
     }
   }
 
-  llvm::SmallDenseSet<Operation *> connected;
-  SmallVector<Operation *> worklist;
-  for (Operation *operation : algebra) {
-    if (isa<FoldOp, ContractOp>(operation)) {
-      connected.insert(operation);
-      worklist.push_back(operation);
-      break;
+  const bool containsOnlyMaps = foldCount == 0 && contractCount == 0;
+  if (containsOnlyMaps) {
+    if (algebra.size() < 2) {
+      return failure();
+    }
+    for (Operation *operation : algebra) {
+      auto map = cast<MapOp>(operation);
+      if (map.getSemantics() != MapSemantics::Pointwise ||
+          !llvm::all_of(map.getIndexingMaps().getValue(),
+                        [](Attribute indexing) {
+                          return isIdentityMap(
+                              cast<AffineMapAttr>(indexing).getValue());
+                        })) {
+        return failure();
+      }
+    }
+    bool hasTemporary = false;
+    for (const PlannedBuffer &buffer : buffers) {
+      auto type = cast<RankedTensorType>(buffer.value.getType());
+      const bool external = !buffer.producer || buffer.liveOut;
+      if (external) {
+        if (type.getRank() < 1 || type.getRank() > 8 ||
+            !type.getElementType().isBF16() ||
+            (buffer.liveOut && !buffer.consumers.empty())) {
+          return failure();
+        }
+        continue;
+      }
+      if (!type.getElementType().isF32()) {
+        return failure();
+      }
+      hasTemporary = true;
+    }
+    if (!hasTemporary) {
+      return failure();
     }
   }
+
+  llvm::SmallDenseSet<Operation *> connected;
+  SmallVector<Operation *> worklist{algebra.front()};
+  connected.insert(algebra.front());
   while (!worklist.empty()) {
     Operation *operation = worklist.pop_back_val();
     for (Operation *candidate : algebra) {
