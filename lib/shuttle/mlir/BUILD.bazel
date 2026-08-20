@@ -157,6 +157,26 @@ cc_library(
 )
 
 cc_library(
+    name = "ShuttleGpuRunner",
+    srcs = ["lib/Runtime/GpuRunner.cc"],
+    hdrs = ["include/shuttle/Runtime/GpuRunner.h"],
+    strip_include_prefix = "include",
+    deps = [
+        ":ShuttleGpuExecutable",
+        ":ShuttleGpuFfi",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:IR",
+        "@xla//xla/ffi",
+        "@xla//xla/ffi:invoke",
+        "@xla//xla/stream_executor:device_address_allocator",
+        "@xla//xla/stream_executor:device_description",
+        "@xla//xla/stream_executor:stream",
+    ],
+)
+
+cc_library(
     name = "ShuttleTestPasses",
     testonly = True,
     srcs = ["test/TestPasses.cc"],
