@@ -52,7 +52,11 @@ def _successful_snapshot(coordinate: Coordinate) -> tuple[tuple[object, ...], ..
         "#shuttle.source_ref<0, 0, 5, 0>, #shuttle.source_ref<0, 0, 6, 0>, "
         "#shuttle.source_ref<0, 0, 7, 0>]]"
     )
-    manifest = "selected_regions = " + membership + ", reason = unsupported_operation"
+    manifest = (
+        "selected_regions = "
+        + membership
+        + ", excluded = #shuttle.source_ref<0, 0, 3, 0>, reason = unsupported_operation"
+    )
     return (
         _event(
             "algebra_coverage",
@@ -125,13 +129,14 @@ def test_observer_contract_attributes_both_map_islands_and_final_erasure() -> No
         validate_observer_snapshot(coordinate, tuple(bad_phase))
 
     bad_membership = list(snapshot)
-    bad_membership[0] = tuple(
-        [
-            *bad_membership[0][:5],
-            str(bad_membership[0][5]).replace("source_ref<0, 0, 7, 0>", ""),
-            *bad_membership[0][6:],
-        ]
-    )
+    for index in (0, 1):
+        bad_membership[index] = tuple(
+            [
+                *bad_membership[index][:5],
+                str(bad_membership[index][5]).replace("source_ref<0, 0, 7, 0>", ""),
+                *bad_membership[index][6:],
+            ]
+        )
     with pytest.raises(ValueError, match="Map source"):
         validate_observer_snapshot(coordinate, tuple(bad_membership))
 
