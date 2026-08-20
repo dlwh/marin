@@ -115,7 +115,9 @@ def Shuttle_MaterializationTaskOp
       DenseI64ArrayAttr:$reduction_dimensions,
       DenseI64ArrayAttr:$input_buffers, DenseI64ArrayAttr:$output_buffers,
       DenseI64ArrayAttr:$dependencies, OptionalAttr<BoolAttr>:$order_free,
-      StrAttr:$semantic_fingerprint, Shuttle_SourceRefAttr:$source);
+      StrAttr:$semantic_fingerprint, Shuttle_SourceRefAttr:$source,
+      OptionalAttr<ArrayAttr>:$fused_sources,
+      OptionalAttr<AffineMapArrayAttr>:$composed_input_maps);
 }
 
 def Shuttle_MaterializationPlanYieldOp
