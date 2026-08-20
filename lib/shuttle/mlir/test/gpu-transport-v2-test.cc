@@ -3955,6 +3955,9 @@ TEST(GpuTransportV2Test,
         stream_executor::CudaComputeCapability{9, 0}};
     auto trace = std::make_shared<ExecutionTrace>();
     EXPECT_CALL(stream, parent()).WillRepeatedly(testing::Return(&executor));
+    EXPECT_CALL(stream, BlockHostUntilDone())
+        .Times(1)
+        .WillOnce(testing::Return(absl::OkStatus()));
     EXPECT_CALL(executor, LoadKernel(testing::_))
         .Times(boundary.launches)
         .WillRepeatedly([trace](
