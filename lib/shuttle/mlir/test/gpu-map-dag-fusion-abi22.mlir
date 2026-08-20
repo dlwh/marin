@@ -139,6 +139,11 @@ module @fanout_boundary attributes {
 // CHECK: "shuttle.materialization_task"()
 // CHECK-SAME: source = #shuttle.source_ref<0, 0, 0, 0>
 // CHECK-NOT: fused_sources
+// CHECK: "shuttle.materialization_task"()
+// CHECK-SAME: fused_sources = [#shuttle.source_ref<0, 0, 0, 1>, #shuttle.source_ref<0, 0, 0, 2>, #shuttle.source_ref<0, 0, 0, 3>]
+// CHECK: "shuttle.materialization_task"()
+// CHECK-SAME: kind = #shuttle.materialization_task_kind<fold>
+// CHECK-NOT: "shuttle.materialization_task"()
 
 // -----
 
@@ -185,11 +190,6 @@ module @disconnected_same_domain_sibling attributes {
 // CHECK: "shuttle.materialization_task"()
 // CHECK-SAME: source = #shuttle.source_ref<0, 0, 0, 2>
 // CHECK-NOT: fused_sources
-// CHECK: "shuttle.materialization_task"()
-// CHECK-SAME: kind = #shuttle.materialization_task_kind<fold>
-// CHECK-NOT: "shuttle.materialization_task"()
-// CHECK: "shuttle.materialization_task"()
-// CHECK-SAME: fused_sources = [#shuttle.source_ref<0, 0, 0, 1>, #shuttle.source_ref<0, 0, 0, 2>, #shuttle.source_ref<0, 0, 0, 3>]
 // CHECK: "shuttle.materialization_task"()
 // CHECK-SAME: kind = #shuttle.materialization_task_kind<fold>
 // CHECK-NOT: "shuttle.materialization_task"()

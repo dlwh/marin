@@ -18,19 +18,23 @@ module attributes {
       ^bb0(%element: f32):
         "shuttle.yield"(%element) : (f32) -> ()
       }) {indexing_maps = [#projected, #id], semantics = #shuttle.map_semantics<broadcast_in_dim>, source = #shuttle.source_ref<0, 0, 0, 0>} : (tensor<1x4xf32>) -> tensor<2x4xf32>
-      %normalized = "shuttle.map"(%region_input, %broadcast) ({
+      %centered = "shuttle.map"(%region_input, %broadcast) ({
       ^bb0(%left: f32, %right: f32):
         %difference = arith.subf %left, %right : f32
-        %quotient = arith.divf %difference, %right : f32
-        "shuttle.yield"(%quotient) : (f32) -> ()
+        "shuttle.yield"(%difference) : (f32) -> ()
       }) {indexing_maps = [#id, #id, #id], source = #shuttle.source_ref<0, 0, 0, 1>} : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
+      %normalized = "shuttle.map"(%centered, %broadcast) ({
+      ^bb0(%left: f32, %right: f32):
+        %quotient = arith.divf %left, %right : f32
+        "shuttle.yield"(%quotient) : (f32) -> ()
+      }) {indexing_maps = [#id, #id, #id], source = #shuttle.source_ref<0, 0, 0, 2>} : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
       %folded = "shuttle.fold"(%normalized, %region_init) ({
       ^bb0(%element: f32, %accumulator: f32):
         %sum = arith.addf %element, %accumulator : f32
         "shuttle.yield"(%sum) : (f32) -> ()
-      }) {accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 2>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
+      }) {accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 3>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
       "shuttle.yield"(%folded) : (tensor<2xf32>) -> ()
-    }) {policy = #shuttle.policy<source_ordered>, source_refs = [#shuttle.source_ref<0, 0, 0, 0>, #shuttle.source_ref<0, 0, 0, 1>, #shuttle.source_ref<0, 0, 0, 2>]} : (tensor<1x4xf32>, tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
+    }) {policy = #shuttle.policy<source_ordered>, source_refs = [#shuttle.source_ref<0, 0, 0, 0>, #shuttle.source_ref<0, 0, 0, 1>, #shuttle.source_ref<0, 0, 0, 2>, #shuttle.source_ref<0, 0, 0, 3>]} : (tensor<1x4xf32>, tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
     return %result : tensor<2xf32>
   }
 }

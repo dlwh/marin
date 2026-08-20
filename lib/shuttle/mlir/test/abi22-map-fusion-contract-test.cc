@@ -418,6 +418,8 @@ bool mutateFusedTask(mlir::ModuleOp module, llvm::StringRef mutation) {
     } else {
       return false;
     }
+    plans.front().setFingerprint(
+        mlir::shuttle::materializationPlanFingerprint(plans.front()));
     return true;
   }
   return false;
