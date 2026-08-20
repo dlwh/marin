@@ -151,13 +151,17 @@ bool isOneToOneFoldMapEdge(mlir::shuttle::FoldOp fold,
       return false;
   }
   llvm::SmallDenseSet<unsigned> mapped;
+  std::optional<unsigned> previousDimension;
   for (auto [axis, expression] :
        llvm::enumerate(edge.getValue().getResults())) {
     auto dimension = mlir::dyn_cast<mlir::AffineDimExpr>(expression);
     if (!dimension || !mapped.insert(dimension.getPosition()).second ||
+        (previousDimension &&
+         dimension.getPosition() <= *previousDimension) ||
         folded.getDimSize(axis) !=
             output.getDimSize(dimension.getPosition()))
       return false;
+    previousDimension = dimension.getPosition();
   }
   return llvm::all_of(llvm::enumerate(output.getShape()),
                       [&](auto item) {
