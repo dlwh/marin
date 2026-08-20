@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import hashlib
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock
@@ -16,9 +17,12 @@ from track1_map_h100_build import (
     BuildInputs,
     BuildToolDigests,
     apply_source_patches,
+    inspect_build_inputs,
     offline_wheel_command,
     require_offline_build_inputs,
 )
+
+MARIN_REPOSITORY = Path(__file__).parents[4]
 
 
 def _inputs(tmp_path: Path) -> BuildInputs:
@@ -33,6 +37,7 @@ def _inputs(tmp_path: Path) -> BuildInputs:
         jax_repository=tmp_path / "jax",
         jax_status="",
         jax_tree=JAX_TREE,
+        marin_repository=MARIN_REPOSITORY,
         nvcc_sha256=hashlib.sha256(b"nvcc").hexdigest(),
         platform="linux",
         ptxas_sha256=hashlib.sha256(b"ptxas").hexdigest(),
@@ -52,8 +57,9 @@ def _materialize(inputs: BuildInputs) -> None:
     (inputs.cuda_root / "bin/ptxas").chmod(0o755)
     (inputs.cuda_root / "bin/nvcc").write_bytes(b"nvcc")
     (inputs.cuda_root / "bin/nvcc").chmod(0o755)
-    (inputs.jax_repository / "build").mkdir(parents=True)
+    (inputs.jax_repository / "build").mkdir(parents=True, exist_ok=True)
     (inputs.jax_repository / "build/build.py").write_text("# pinned JAX builder\n")
+    (inputs.jax_repository / "build/build.py").chmod(0o755)
 
 
 def _tool_digests(inputs: BuildInputs) -> BuildToolDigests:
@@ -93,6 +99,68 @@ def test_offline_build_preflight_is_closed_over_source_tools_and_image(tmp_path:
         require_offline_build_inputs(inputs, expected_tool_sha256=_tool_digests(inputs))
 
 
+def test_offline_build_gate_rehashes_live_inputs_and_requires_executable_builder(tmp_path: Path) -> None:
+    inputs = _inputs(tmp_path)
+    _materialize(inputs)
+    expected = _tool_digests(inputs)
+
+    inputs.bazel.write_bytes(b"drift")
+    with pytest.raises(RuntimeError, match="changed after inspection"):
+        require_offline_build_inputs(inputs, expected_tool_sha256=expected)
+
+    inputs.bazel.write_bytes(b"bazel")
+    inputs.jax_repository.joinpath("build/build.py").chmod(0o644)
+    with pytest.raises(RuntimeError, match="build entrypoint must be executable"):
+        require_offline_build_inputs(inputs, expected_tool_sha256=expected)
+
+
+def test_inspection_reads_separate_git_repositories_and_live_file_hashes(tmp_path: Path) -> None:
+    def initialize(repository: Path, relative_path: str, content: str) -> None:
+        path = repository / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+        if relative_path == "build/build.py":
+            path.chmod(0o755)
+        subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+        subprocess.run(["git", "add", "."], cwd=repository, check=True)
+        subprocess.run(
+            ["git", "-c", "user.name=Track One", "-c", "user.email=track1@example.invalid", "commit", "-qm", "fixture"],
+            cwd=repository,
+            check=True,
+        )
+
+    jax_repository = tmp_path / "jax"
+    xla_repository = tmp_path / "xla"
+    inputs = _inputs(tmp_path)
+    _materialize(inputs)
+    initialize(jax_repository, "build/build.py", "#!/usr/bin/env python3\n")
+    initialize(xla_repository, "xla/pjrt/marker", "xla\n")
+
+    inspected = inspect_build_inputs(
+        marin_repository=MARIN_REPOSITORY,
+        jax_repository=jax_repository,
+        bazel=inputs.bazel,
+        cuda_root=inputs.cuda_root,
+        image_archive=inputs.image_archive,
+        xla_repository=xla_repository,
+    )
+
+    assert inspected.jax_status == ""
+    assert inspected.xla_status == ""
+    assert inspected.bazel_sha256 == hashlib.sha256(b"bazel").hexdigest()
+    assert inspected.xla_repository == xla_repository
+
+    (xla_repository / "xla/pjrt/marker").write_text("dirty\n")
+    assert inspect_build_inputs(
+        marin_repository=MARIN_REPOSITORY,
+        jax_repository=jax_repository,
+        bazel=inputs.bazel,
+        cuda_root=inputs.cuda_root,
+        image_archive=inputs.image_archive,
+        xla_repository=xla_repository,
+    ).xla_status.startswith("M ")
+
+
 def test_source_patching_checks_both_repositories_before_applying(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -101,7 +169,7 @@ def test_source_patching_checks_both_repositories_before_applying(
     run = Mock()
     monkeypatch.setattr("track1_map_h100_build.subprocess.run", run)
 
-    apply_source_patches(inputs, tmp_path / "marin")
+    apply_source_patches(inputs)
 
     commands = [call.args[0] for call in run.call_args_list]
     assert commands[0][0:3] == ["git", "apply", "--check"]
@@ -121,7 +189,7 @@ def test_source_patch_check_failure_applies_neither_repository(tmp_path: Path, m
     monkeypatch.setattr("track1_map_h100_build.subprocess.run", run)
 
     with pytest.raises(RuntimeError, match="xla check failed"):
-        apply_source_patches(inputs, tmp_path / "marin")
+        apply_source_patches(inputs)
 
     assert run.call_count == 2
 
