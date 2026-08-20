@@ -413,6 +413,7 @@ cc_test(
     ],
     deps = [
         ":ShuttleDialect",
+        ":ShuttleGpuExecutable",
         ":ShuttlePasses",
         "@com_google_googletest//:gtest_main",
         "@llvm-project//llvm:Support",

@@ -25,6 +25,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "shuttle/IR/ShuttleDialect.h"
 #include "shuttle/IR/ShuttleOps.h"
+#include "shuttle/Runtime/GpuExecutable.h"
 #include "shuttle/Transforms/Passes.h"
 #include "stablehlo/dialect/Register.h"
 #include "tools/cpp/runfiles/runfiles.h"
@@ -467,6 +468,70 @@ TEST(Abi22MapFusionContract,
            devices.front().getBody().front().getOps<
                mlir::shuttle::DeviceEntryOp>()) {
         EXPECT_GT(entry.getCodeLength(), 0);
+      }
+
+      mlir::FailureOr<llvm::SmallVector<uint8_t>> transport =
+          mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+      ASSERT_TRUE(mlir::succeeded(transport));
+      auto decoded = mlir::shuttle::GpuExecutable::Load(*transport);
+      ASSERT_TRUE(decoded.ok()) << decoded.status();
+      EXPECT_EQ((*decoded)->codeBytes().size(), devices.front().getCode().size());
+      EXPECT_EQ((*decoded)->launches().size(), fixture.fusedTasks);
+      EXPECT_EQ((*decoded)->slots().size(), fixture.fusedBuffers);
+
+      auto entries = llvm::to_vector(devices.front()
+                                         .getBody()
+                                         .front()
+                                         .getOps<mlir::shuttle::DeviceEntryOp>());
+      for (auto [ordinal, entry, launch] :
+           llvm::enumerate(entries, (*decoded)->launches())) {
+        EXPECT_EQ(launch.taskOrdinal, ordinal);
+        EXPECT_EQ(launch.codeOffset, entry.getCodeOffset());
+        EXPECT_EQ(launch.codeLength, entry.getCodeLength());
+        EXPECT_EQ(launch.codeDigest, entry.getCodeDigest());
+        EXPECT_EQ(launch.inputSlots,
+                  std::vector<int64_t>(entry.getInputBuffers()));
+        EXPECT_EQ(launch.outputSlots,
+                  std::vector<int64_t>(entry.getOutputBuffers()));
+        EXPECT_EQ(launch.dependencies,
+                  std::vector<int64_t>(entry.getDependencies()));
+        ASSERT_TRUE(entry.getGrid());
+        ASSERT_TRUE(entry.getBlock());
+        EXPECT_EQ(launch.grid,
+                  (std::array<uint64_t, 3>{
+                      static_cast<uint64_t>((*entry.getGrid())[0]),
+                      static_cast<uint64_t>((*entry.getGrid())[1]),
+                      static_cast<uint64_t>((*entry.getGrid())[2])}));
+        EXPECT_EQ(launch.block,
+                  (std::array<uint64_t, 3>{
+                      static_cast<uint64_t>((*entry.getBlock())[0]),
+                      static_cast<uint64_t>((*entry.getBlock())[1]),
+                      static_cast<uint64_t>((*entry.getBlock())[2])}));
+        EXPECT_EQ(launch.dynamicSharedMemoryBytes,
+                  static_cast<uint64_t>(*entry.getDynamicSharedBytes()));
+      }
+
+      auto slots = llvm::to_vector(
+          invocationAbis.front()
+              .getBody()
+              .front()
+              .getOps<mlir::shuttle::InvocationSlotOp>());
+      for (auto [ordinal, slot, decodedSlot] :
+           llvm::enumerate(slots, (*decoded)->slots())) {
+        EXPECT_EQ(decodedSlot.ordinal, ordinal);
+        EXPECT_EQ(decodedSlot.tensorType, slot.getTensorType());
+        EXPECT_EQ(decodedSlot.requiredBytes, slot.getRequiredBytes());
+        EXPECT_EQ(decodedSlot.byteStrides,
+                  llvm::SmallVector<int64_t>(slot.getStrides()));
+        EXPECT_EQ(decodedSlot.byteOffset, slot.getOffset());
+        EXPECT_EQ(decodedSlot.alignment, slot.getAlignment());
+        EXPECT_EQ(decodedSlot.addressSpace, slot.getAddressSpace());
+        EXPECT_EQ(decodedSlot.access, slot.getAccess());
+        EXPECT_EQ(decodedSlot.storage, slot.getStorage());
+        EXPECT_EQ(decodedSlot.aliasGroup, slot.getAliasGroup());
+        EXPECT_EQ(decodedSlot.reuseGroup, slot.getReuseGroup());
+        EXPECT_EQ(decodedSlot.bindingKind, slot.getBinding());
+        EXPECT_EQ(decodedSlot.bindingIndex, slot.getBindingIndex().value_or(-1));
       }
     }
   }

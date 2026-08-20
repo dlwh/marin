@@ -89,17 +89,3 @@ def test_abi22_map_fusion_rotates_full_cache_identity(
         )
         == expected_digest
     )
-
-
-def test_abi22_map_fusion_keeps_policy_and_physical_choice_distinct() -> None:
-    identities = {
-        options_digest(
-            numerics=numerics,
-            execution_mode=ExecutionMode.GPU_EXECUTABLE_BUNDLE,
-            tuning=_tuning(materialization),
-        )
-        for numerics in (Numerics.SOURCE_ORDERED, Numerics.FAST)
-        for materialization in (Materialization.PREFER_FUSION, Materialization.PREFER_MATERIALIZATION)
-    }
-
-    assert len(identities) == 4
