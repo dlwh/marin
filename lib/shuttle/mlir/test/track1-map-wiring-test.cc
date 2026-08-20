@@ -14,9 +14,15 @@
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/Parser/Parser.h"
 #include "shuttle/Runtime/GpuExecutable.h"
+#include "shuttle/Runtime/GpuFfi.h"
 #include "shuttle/Transforms/Observer.h"
 #include "shuttle/Transforms/XlaRegistration.h"
 #include "stablehlo/dialect/Register.h"
+#include "xla/ffi/call_frame.h"
+#include "xla/ffi/execution_state.h"
+#include "xla/ffi/ffi.h"
+#include "xla/ffi/invoke.h"
+#include "xla/pjrt/stablehlo_module_transform.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/raw_ostream.h"
 #include "gtest/gtest.h"
@@ -153,6 +159,20 @@ void expectObservedSuccess(
   EXPECT_EQ(events[0].regionMembership(), events[1].regionMembership());
   EXPECT_FALSE(events[0].coverageManifest().empty());
   EXPECT_EQ(events[0].coverageManifest(), events[1].coverageManifest());
+  for (int64_t operation = 0; operation < 3; ++operation) {
+    EXPECT_NE(events[0].regionMembership().find(
+                  ("#shuttle.source_ref<0, 0, " +
+                   std::to_string(operation) + ", 0>")),
+              std::string::npos);
+  }
+  EXPECT_EQ(events[0].regionMembership().find(
+                "#shuttle.source_ref<0, 0, 3, 0>"),
+            std::string::npos);
+  EXPECT_NE(events[0].coverageManifest().find(
+                "#shuttle.source_ref<0, 0, 3, 0>"),
+            std::string::npos);
+  EXPECT_NE(events[0].coverageManifest().find("unsupported_operation"),
+            std::string::npos);
   EXPECT_FALSE(events[0].unsupportedFingerprint().empty());
   EXPECT_EQ(events[0].unsupportedFingerprint(),
             events[1].unsupportedFingerprint());
@@ -163,6 +183,67 @@ void expectObservedSuccess(
   EXPECT_TRUE(events[2].unsupportedFingerprint().empty());
   EXPECT_TRUE(events[2].noShuttleSemantics());
   EXPECT_FALSE(events[2].normalizedModuleFingerprint().empty());
+}
+
+void expectUnsupportedAbsConsumes(mlir::ModuleOp module,
+                                  mlir::Operation *producer) {
+  mlir::Operation *absolute = nullptr;
+  mlir::func::ReturnOp functionReturn;
+  module.walk([&](mlir::Operation *operation) {
+    if (operation->getName().getStringRef() == "stablehlo.abs")
+      absolute = operation;
+    if (auto returnOperation = mlir::dyn_cast<mlir::func::ReturnOp>(operation))
+      functionReturn = returnOperation;
+  });
+  ASSERT_NE(absolute, nullptr);
+  ASSERT_TRUE(functionReturn);
+  ASSERT_EQ(absolute->getNumOperands(), 1);
+  ASSERT_EQ(functionReturn.getNumOperands(), 1);
+  EXPECT_EQ(absolute->getOperand(0).getDefiningOp(), producer);
+  EXPECT_EQ(functionReturn.getOperand(0).getDefiningOp(), absolute);
+}
+
+xla::ffi::CallFrame ffiInstantiationFrame(mlir::DictionaryAttr config) {
+  auto integer = [&](llvm::StringRef name) {
+    auto attribute = config.getAs<mlir::IntegerAttr>(name);
+    EXPECT_TRUE(attribute) << name.str();
+    return attribute ? attribute.getInt() : int64_t{-1};
+  };
+  auto string = [&](llvm::StringRef name) {
+    auto attribute = config.getAs<mlir::StringAttr>(name);
+    EXPECT_TRUE(attribute) << name.str();
+    return attribute ? attribute.getValue().str() : std::string{};
+  };
+  xla::ffi::CallFrameBuilder builder(/*num_args=*/0, /*num_rets=*/0);
+  xla::ffi::CallFrameBuilder::AttributesBuilder attributes;
+  attributes.Insert("transport_schema_version",
+                    integer("transport_schema_version"));
+  attributes.Insert("bundle_bytes", string("bundle_bytes"));
+  attributes.Insert("bundle_size", integer("bundle_size"));
+  attributes.Insert("bundle_sha256", string("bundle_sha256"));
+  attributes.Insert("device_schema_version", integer("device_schema_version"));
+  attributes.Insert("invocation_abi_schema_version",
+                    integer("invocation_abi_schema_version"));
+  attributes.Insert("bundle_schema_version", integer("bundle_schema_version"));
+  attributes.Insert("completion", string("completion"));
+  builder.AddAttributes(attributes.Build());
+  return builder.Build();
+}
+
+void expectFfiInstantiationAccepts(mlir::DictionaryAttr backendConfig) {
+  xla::ffi::CallFrame frame = ffiInstantiationFrame(backendConfig);
+  XLA_FFI_Handler_Bundle handlers =
+      mlir::shuttle::gpuExecutableBundleFfiHandlerBundle();
+  ASSERT_NE(handlers.instantiate, nullptr);
+  xla::ffi::ExecutionState instantiateState;
+  xla::ffi::ExecutionState prepareState;
+  xla::ffi::ExecutionState initializeState;
+  xla::ffi::InvokeContext context;
+  context.state_context = {&instantiateState, &prepareState, &initializeState};
+  EXPECT_TRUE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(), handlers.instantiate,
+                               frame, context,
+                               XLA_FFI_ExecutionStage_INSTANTIATE)
+                  .ok());
 }
 
 TEST(TrackOneMapWiringTest,
@@ -181,7 +262,8 @@ TEST(TrackOneMapWiringTest,
       mlir::OwningOpRef<mlir::ModuleOp> module = parseModule(context, program);
       ASSERT_TRUE(module);
       absl::Status status =
-          mlir::shuttle::runShuttleXlaTransform(*module, policy.str());
+          xla::StablehloModuleTransformRegistry::Global().Run(
+              *module, policy.str(), "shuttle");
       ASSERT_TRUE(status.ok()) << status;
 
       std::string transformed = moduleText(*module);
@@ -190,6 +272,17 @@ TEST(TrackOneMapWiringTest,
       EXPECT_EQ(countOccurrences(transformed, "stablehlo.abs"), 1);
       EXPECT_EQ(transformed.find("stablehlo.custom_call"), std::string::npos);
       EXPECT_EQ(transformed.find("shuttle."), std::string::npos);
+      mlir::Operation *negate = nullptr;
+      module->walk([&](mlir::Operation *operation) {
+        if (operation->getName().getStringRef() == "stablehlo.negate")
+          negate = operation;
+      });
+      ASSERT_NE(negate, nullptr);
+      mlir::Operation *roundTripProducer = negate;
+      for (mlir::Operation *user : negate->getUsers())
+        if (user->getName().getStringRef() == "stablehlo.convert")
+          roundTripProducer = user;
+      expectUnsupportedAbsConsumes(*module, roundTripProducer);
       expectObservedSuccess(
           observer->snapshot(),
           mlir::shuttle::ShuttlePipelinePhase::LoweredCoverage);
@@ -213,7 +306,8 @@ TEST(TrackOneMapWiringTest,
       mlir::OwningOpRef<mlir::ModuleOp> module = parseModule(context, program);
       ASSERT_TRUE(module);
       absl::Status status =
-          mlir::shuttle::runShuttleXlaTransform(*module, policy.str());
+          xla::StablehloModuleTransformRegistry::Global().Run(
+              *module, policy.str(), "shuttle");
       ASSERT_TRUE(status.ok()) << status;
 
       std::string transformed = moduleText(*module);
@@ -236,6 +330,8 @@ TEST(TrackOneMapWiringTest,
       auto backendConfig =
           customCall->getAttrOfType<mlir::DictionaryAttr>("backend_config");
       ASSERT_TRUE(backendConfig);
+      expectUnsupportedAbsConsumes(*module, customCall);
+      expectFfiInstantiationAccepts(backendConfig);
       auto bundleBytes = backendConfig.getAs<mlir::StringAttr>("bundle_bytes");
       ASSERT_TRUE(bundleBytes);
       llvm::StringRef serialized = bundleBytes.getValue();

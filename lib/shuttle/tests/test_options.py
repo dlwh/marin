@@ -106,6 +106,7 @@ def test_execution_modes_have_distinct_cache_identity() -> None:
 
 
 def test_gpu_executable_mode_has_distinct_source_ordered_and_fast_cache_identities() -> None:
+    disabled: dict[str, bool | str] = {}
     source_ordered = compiler_options(
         execution_mode=ExecutionMode.GPU_EXECUTABLE_BUNDLE,
         numerics=Numerics.SOURCE_ORDERED,
@@ -117,6 +118,10 @@ def test_gpu_executable_mode_has_distinct_source_ordered_and_fast_cache_identiti
         tuning=_tuning(),
     )
 
+    assert disabled != source_ordered
+    assert disabled != fast
+    assert source_ordered["xla_shuttle_enable"] is True
+    assert fast["xla_shuttle_enable"] is True
     assert source_ordered["xla_shuttle_options"] != fast["xla_shuttle_options"]
     assert json.loads(fast["xla_shuttle_options"])["numerics"] == "fast"
     assert options_digest(
