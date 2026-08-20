@@ -1034,4 +1034,98 @@ module attributes {
   EXPECT_TRUE(plan->fusedFoldMapGroupSizes.empty());
 }
 
+TEST(Abi22MapFusionContract,
+     FoldEpiloguePtxBindsAffineInputAndStoresFinalScalarResult) {
+  constexpr llvm::StringLiteral source = R"mlir(
+#fold_input = affine_map<(d0, d1) -> (d0, d1)>
+#fold_result = affine_map<(d0, d1) -> (d0)>
+#boundary = affine_map<(d0, d1) -> (d1, d0)>
+#output = affine_map<(d0, d1) -> (d0, d1)>
+#scalar = affine_map<() -> ()>
+module attributes {
+  shuttle.coverage_manifest = {
+    canonical_tuning = "{\22cluster_shape\22:[],\22materialization\22:\22prefer_fusion\22,\22maximum_candidates\22:1,\22pipeline_stages\22:1,\22tile_sizes\22:[]}"
+  }
+} {
+  func.func @anonymous(%input: tensor<2x4xf32>, %boundary_input: tensor<1x2xf32>) -> tensor<2x1xf32> {
+    %result = "shuttle.region"(%input, %boundary_input) ({
+    ^bb0(%region_input: tensor<2x4xf32>, %region_boundary: tensor<1x2xf32>):
+      %init = "shuttle.map"() ({
+      ^bb0:
+        %zero = arith.constant 0.000000e+00 : f32
+        "shuttle.yield"(%zero) : (f32) -> ()
+      }) {indexing_maps = [#scalar], source = #shuttle.source_ref<0, 0, 0, 0>} : () -> tensor<f32>
+      %folded = "shuttle.fold"(%region_input, %init) ({
+      ^bb0(%element: f32, %accumulator: f32):
+        %sum = arith.addf %element, %accumulator : f32
+        "shuttle.yield"(%sum) : (f32) -> ()
+      }) {accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 1>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
+      %subtracted = "shuttle.map"(%folded, %region_boundary) ({
+      ^bb0(%lhs: f32, %rhs: f32):
+        %difference = arith.subf %lhs, %rhs : f32
+        "shuttle.yield"(%difference) : (f32) -> ()
+      }) {indexing_maps = [#fold_result, #boundary, #output], source = #shuttle.source_ref<0, 0, 0, 2>} : (tensor<2xf32>, tensor<1x2xf32>) -> tensor<2x1xf32>
+      %divided = "shuttle.map"(%subtracted, %region_boundary) ({
+      ^bb0(%lhs: f32, %rhs: f32):
+        %quotient = arith.divf %lhs, %rhs : f32
+        "shuttle.yield"(%quotient) : (f32) -> ()
+      }) {indexing_maps = [#output, #boundary, #output], source = #shuttle.source_ref<0, 0, 0, 3>} : (tensor<2x1xf32>, tensor<1x2xf32>) -> tensor<2x1xf32>
+      "shuttle.yield"(%divided) : (tensor<2x1xf32>) -> ()
+    }) {policy = #shuttle.policy<source_ordered>, source_refs = [#shuttle.source_ref<0, 0, 0, 0>, #shuttle.source_ref<0, 0, 0, 1>, #shuttle.source_ref<0, 0, 0, 2>, #shuttle.source_ref<0, 0, 0, 3>]} : (tensor<2x4xf32>, tensor<1x2xf32>) -> tensor<2x1xf32>
+    return %result : tensor<2x1xf32>
+  }
+}
+)mlir";
+  for (mlir::shuttle::NumericalPolicy policy :
+       {mlir::shuttle::NumericalPolicy::SourceOrdered,
+        mlir::shuttle::NumericalPolicy::Fast}) {
+    std::unique_ptr<BuiltModule> built = buildAlgebra(source, policy);
+    ASSERT_TRUE(built);
+    auto device =
+        *built->module->getOps<mlir::shuttle::DeviceModuleOp>().begin();
+    auto entry = llvm::find_if(
+        device.getBody().front().getOps<mlir::shuttle::DeviceEntryOp>(),
+        [](auto candidate) {
+          return candidate.getDynamicSharedBytes().value_or(0) != 0;
+        });
+    ASSERT_NE(entry,
+              device.getBody()
+                  .front()
+                  .getOps<mlir::shuttle::DeviceEntryOp>()
+                  .end());
+    mlir::shuttle::DeviceEntryOp foldEntry = *entry;
+    llvm::StringRef ptx(
+        reinterpret_cast<const char *>(device.getCode().data() +
+                                       foldEntry.getCodeOffset()),
+        foldEntry.getCodeLength());
+    constexpr llvm::StringLiteral indexedLoad =
+        "  mov.u64 %rd10, 0;\n"
+        "  mad.lo.u64 %rd10, %rd10, 1, %rd9;\n"
+        "  mad.lo.u64 %rd10, %rd10, 2, %rd8;\n"
+        "  ld.param.u64 %rd11, [p2];\n"
+        "  mad.lo.u64 %rd11, %rd10, 4, %rd11;\n"
+        "  ld.global.f32 %f38, [%rd11];\n";
+    constexpr llvm::StringLiteral subtract =
+        "  sub.rn.f32 %f39, %f37, %f38;\n";
+    constexpr llvm::StringLiteral divide =
+        "  div.rn.f32 %f40, %f39, %f38;\n";
+    constexpr llvm::StringLiteral finalStore =
+        "  ld.param.u64 %rd12, [p3];\n"
+        "  mad.lo.u64 %rd12, %rd0, 4, %rd12;\n"
+        "  st.global.f32 [%rd12], %f40;\n";
+    size_t loadPosition = ptx.find(indexedLoad);
+    size_t subtractPosition = ptx.find(subtract);
+    size_t dividePosition = ptx.find(divide);
+    size_t storePosition = ptx.find(finalStore);
+    ASSERT_NE(loadPosition, llvm::StringRef::npos);
+    ASSERT_NE(subtractPosition, llvm::StringRef::npos);
+    ASSERT_NE(dividePosition, llvm::StringRef::npos);
+    ASSERT_NE(storePosition, llvm::StringRef::npos);
+    EXPECT_LT(loadPosition, subtractPosition);
+    EXPECT_LT(subtractPosition, dividePosition);
+    EXPECT_LT(dividePosition, storePosition);
+    EXPECT_EQ(ptx.count("st.global.f32"), 1u);
+  }
+}
+
 } // namespace
