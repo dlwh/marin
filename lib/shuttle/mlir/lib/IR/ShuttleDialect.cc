@@ -822,6 +822,7 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
   unsigned foldCount = 0;
   unsigned contractCount = 0;
   unsigned foldRegionCount = 0;
+  unsigned contractRegionCount = 0;
   SmallVector<SmallVector<int64_t>> actualConsumers(buffers.size());
   for (auto [position, buffer] : llvm::enumerate(buffers)) {
     if (buffer.getOrdinal() != static_cast<int64_t>(position)) {
@@ -919,6 +920,23 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
         task->hasAttr("fold_region_boundary_uses");
     const bool hasFoldRegionRecomputedSources =
         task->hasAttr("fold_region_recomputed_sources");
+    const bool hasContractRegionSources =
+        task->hasAttr("contract_region_sources");
+    const bool hasContractRegionStrategy =
+        task->hasAttr("contract_region_strategy");
+    const bool hasContractRegionFold =
+        task->hasAttr("contract_region_fold_source");
+    const bool hasContractRegionContract =
+        task->hasAttr("contract_region_contract_source");
+    const bool hasContractRegionBoundary =
+        task->hasAttr("contract_region_bf16_boundary_source");
+    const bool hasContractRegionEpilogue =
+        task->hasAttr("contract_region_epilogue_sources");
+    const bool hasContractRegionOperand =
+        task->hasAttr("contract_region_normalized_operand");
+    const bool hasContractRegionCost = task->hasAttr("contract_region_cost");
+    const bool hasContractRegionRecomputed =
+        task->hasAttr("contract_region_recomputed_sources");
     if ((hasFoldRegionPhases || hasFoldRegionBoundaryUses ||
          hasFoldRegionRecomputedSources) &&
         !hasFoldRegionSources) {
@@ -929,6 +947,19 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
     if (hasFoldRegionSources &&
         task.getKind() != MaterializationTaskKind::Fold) {
       return task.emitOpError("Fold-region provenance requires a Fold task");
+    }
+    if ((hasContractRegionStrategy || hasContractRegionFold ||
+         hasContractRegionContract || hasContractRegionBoundary ||
+         hasContractRegionEpilogue || hasContractRegionOperand ||
+         hasContractRegionCost || hasContractRegionRecomputed) &&
+        !hasContractRegionSources) {
+      return task.emitOpError(
+          "Contract-region metadata requires Contract-region sources");
+    }
+    if (hasContractRegionSources &&
+        task.getKind() != MaterializationTaskKind::Contract) {
+      return task.emitOpError(
+          "Contract-region provenance requires a Contract task");
     }
     if (task.getKind() == MaterializationTaskKind::Fold) {
       ++foldCount;
@@ -1116,6 +1147,162 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
       }
     } else if (task.getKind() == MaterializationTaskKind::Contract) {
       ++contractCount;
+      auto contractSources =
+          task->getAttrOfType<ArrayAttr>("contract_region_sources");
+      if (contractSources) {
+        ++contractRegionCount;
+        auto strategy =
+            task->getAttrOfType<StringAttr>("contract_region_strategy");
+        auto foldSource =
+            task->getAttrOfType<SourceRefAttr>("contract_region_fold_source");
+        auto contractSource = task->getAttrOfType<SourceRefAttr>(
+            "contract_region_contract_source");
+        auto boundarySource = task->getAttrOfType<SourceRefAttr>(
+            "contract_region_bf16_boundary_source");
+        auto epilogueSources =
+            task->getAttrOfType<ArrayAttr>("contract_region_epilogue_sources");
+        auto normalizedOperand = task->getAttrOfType<IntegerAttr>(
+            "contract_region_normalized_operand");
+        auto cost = task->getAttrOfType<DictionaryAttr>("contract_region_cost");
+        auto recomputed = task->getAttrOfType<ArrayAttr>(
+            "contract_region_recomputed_sources");
+        if (getSchemaVersion() != 2 || contractSources.empty() || !strategy ||
+            !foldSource || !contractSource || !boundarySource ||
+            !epilogueSources || epilogueSources.empty() || !normalizedOperand ||
+            normalizedOperand.getInt() != 0 || !cost ||
+            task->getAttr("fused_sources") ||
+            task->getAttr("composed_input_maps") ||
+            task->getAttr("fold_epilogue_sources") ||
+            task->getAttr("epilogue_input_maps") ||
+            task->getAttr("fold_region_sources") || task.getOrderFree() ||
+            task.getOutputBuffers().size() != 1) {
+          return task.emitOpError(
+              "schema-v2 Contract regions require closed provenance, cost, "
+              "and one output");
+        }
+        const bool inlineFold = strategy.getValue() == "inline_fold";
+        const bool compactStat = strategy.getValue() == "compact_stat";
+        if ((!inlineFold && !compactStat) ||
+            task.getInputBuffers().size() != (inlineFold ? 3 : 4)) {
+          return task.emitOpError(
+              "Contract-region strategy must bind inline or compact inputs");
+        }
+        llvm::SmallDenseSet<Attribute> sourceSet;
+        std::optional<SourceRefAttr> previous;
+        for (Attribute attribute : contractSources) {
+          auto source = dyn_cast<SourceRefAttr>(attribute);
+          if (!source || !sourceSet.insert(source).second ||
+              (previous && std::tuple(previous->getFunctionOrdinal(),
+                                      previous->getBlockOrdinal(),
+                                      previous->getOperationOrdinal(),
+                                      previous->getResultOrdinal()) >=
+                               std::tuple(source.getFunctionOrdinal(),
+                                          source.getBlockOrdinal(),
+                                          source.getOperationOrdinal(),
+                                          source.getResultOrdinal()))) {
+            return task.emitOpError(
+                "Contract region sources must be unique and source ordered");
+          }
+          previous = source;
+        }
+        if (!sourceSet.contains(contractSource) ||
+            !sourceSet.contains(boundarySource) ||
+            (inlineFold && !sourceSet.contains(foldSource))) {
+          return task.emitOpError(
+              "Contract-region designated sources must bind its provenance");
+        }
+        llvm::SmallDenseSet<Attribute> epilogueSet;
+        for (Attribute source : epilogueSources) {
+          if (!isa<SourceRefAttr>(source) || !sourceSet.contains(source) ||
+              !epilogueSet.insert(source).second) {
+            return task.emitOpError(
+                "Contract-region epilogues must be unique task sources");
+          }
+        }
+        llvm::SmallDenseSet<Attribute> recomputedSet;
+        if (recomputed) {
+          for (Attribute source : recomputed) {
+            if (!isa<SourceRefAttr>(source) || !sourceSet.contains(source) ||
+                !recomputedSet.insert(source).second) {
+              return task.emitOpError(
+                  "Contract-region recomputation must be unique task sources");
+            }
+          }
+        }
+        constexpr StringLiteral costFields[] = {"rows",
+                                                "reduction",
+                                                "columns",
+                                                "output_tile",
+                                                "output_tiles",
+                                                "duplicated_fold_elements",
+                                                "normalized_temporary_bytes",
+                                                "contract_temporary_bytes",
+                                                "compact_stat_bytes"};
+        if (cost.size() != std::size(costFields))
+          return task.emitOpError(
+              "Contract-region cost requires the closed structural fields");
+        SmallVector<int64_t> costValues;
+        for (StringRef field : costFields) {
+          auto value = cost.getAs<IntegerAttr>(field);
+          if (!value || value.getInt() < 0)
+            return task.emitOpError(
+                "Contract-region cost fields must be nonnegative i64");
+          costValues.push_back(value.getInt());
+        }
+        auto [rows, reduction, columns, tile, tiles, duplicated,
+              normalizedBytes, contractBytes, compactBytes] =
+            std::tuple(costValues[0], costValues[1], costValues[2],
+                       costValues[3], costValues[4], costValues[5],
+                       costValues[6], costValues[7], costValues[8]);
+        auto product = [](std::initializer_list<int64_t> factors)
+            -> std::optional<int64_t> {
+          int64_t value = 1;
+          for (int64_t factor : factors) {
+            if (factor < 0 ||
+                (factor != 0 &&
+                 value > std::numeric_limits<int64_t>::max() / factor))
+              return std::nullopt;
+            value *= factor;
+          }
+          return value;
+        };
+        if (rows <= 0 || reduction <= 0 || columns <= 0 || tile <= 0 ||
+            tiles <= 0 || tile > columns ||
+            tiles != (columns + tile - 1) / tile ||
+            product({rows, reduction, tiles - 1}) != duplicated ||
+            product({2, rows, reduction}) != normalizedBytes ||
+            product({4, rows, columns}) != contractBytes ||
+            (inlineFold ? compactBytes != 0
+                        : product({4, rows}) != compactBytes)) {
+          return task.emitOpError(
+              "Contract-region cost must equal structural work and traffic");
+        }
+        ArrayRef<int64_t> domain = task.getDomainShape();
+        const int64_t reductionAxis = domain.size() - 1;
+        auto outputType = cast<RankedTensorType>(
+            buffers[task.getOutputBuffers().front()].getTensorType());
+        if (domain.size() < 3 || domain.size() > 9 ||
+            task.getReductionDimensions() !=
+                ArrayRef<int64_t>({reductionAxis}) ||
+            outputType.getShape() != domain.drop_back() ||
+            !outputType.getElementType().isBF16()) {
+          return task.emitOpError(
+              "Contract-region domain and BF16 output must bind its cost");
+        }
+        for (auto [inputOrdinal, bufferOrdinal] :
+             llvm::enumerate(task.getInputBuffers())) {
+          auto type =
+              cast<RankedTensorType>(buffers[bufferOrdinal].getTensorType());
+          const bool compactScale = compactStat && inputOrdinal == 1;
+          if ((compactScale && !type.getElementType().isF32()) ||
+              (!compactScale && !type.getElementType().isBF16())) {
+            return task.emitOpError(
+                "Contract-region inputs must preserve BF16 and compact f32 "
+                "boundaries");
+          }
+        }
+        continue;
+      }
       ArrayRef<int64_t> domain = task.getDomainShape();
       const int64_t reductionAxis = domain.size() - 1;
       if (domain.size() < 3 || domain.size() > 9 ||
@@ -1166,7 +1353,14 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
   if (foldCount == 0 && contractCount == 0) {
     return emitOpError("requires at least one Fold or Contract task");
   }
-  if ((contractCount != 0 && foldRegionCount != 0) ||
+  bool compactContractRegion = false;
+  for (MaterializationTaskOp task : tasks) {
+    auto strategy = task->getAttrOfType<StringAttr>("contract_region_strategy");
+    compactContractRegion |= strategy && strategy.getValue() == "compact_stat";
+  }
+  if (contractRegionCount > 1 ||
+      (contractCount != contractRegionCount && foldRegionCount != 0) ||
+      (foldRegionCount != 0 && !compactContractRegion && contractCount != 0) ||
       getSchemaVersion() !=
           (contractCount != 0 || foldRegionCount != 0 ? 2 : 1)) {
     return emitOpError(
@@ -1341,6 +1535,42 @@ FailureOr<Simt32Geometry> simt32Geometry(ScheduleTaskKind kind,
                         reductionAxis};
 }
 
+FailureOr<Simt32Geometry> contractRegionGeometry(ScheduleTaskOp task,
+                                                 NumericalPolicy policy) {
+  auto strategy = task->getAttrOfType<StringAttr>("contract_region_strategy");
+  auto cost = task->getAttrOfType<DictionaryAttr>("contract_region_cost");
+  if (!strategy || !cost || task.getKind() != ScheduleTaskKind::Contract)
+    return failure();
+  auto rows = cost.getAs<IntegerAttr>("rows");
+  auto reduction = cost.getAs<IntegerAttr>("reduction");
+  auto tile = cost.getAs<IntegerAttr>("output_tile");
+  auto tiles = cost.getAs<IntegerAttr>("output_tiles");
+  if (!rows || !reduction || !tile || !tiles || rows.getInt() <= 0 ||
+      reduction.getInt() <= 0 || tile.getInt() <= 0 || tiles.getInt() <= 0)
+    return failure();
+  const bool inlineFold = strategy.getValue() == "inline_fold";
+  const bool compactStat = strategy.getValue() == "compact_stat";
+  if (!inlineFold && !compactStat)
+    return failure();
+  const bool fast = policy == NumericalPolicy::Fast;
+  const int64_t threads =
+      fast ? tile.getInt() * 32 : roundUpToSubgroup(tile.getInt());
+  const int64_t scratch = inlineFold
+                              ? roundUpToSubgroup(reduction.getInt()) *
+                                    static_cast<int64_t>(sizeof(float))
+                              : std::min<int64_t>(reduction.getInt(), 256) * 2;
+  if (threads <= 0 || threads > 1024 || scratch < 0 || scratch > 16 * 1024)
+    return failure();
+  return Simt32Geometry{{rows.getInt(), tiles.getInt()},
+                        {tile.getInt()},
+                        fast ? ceilDivPositive(reduction.getInt(), 32)
+                             : reduction.getInt(),
+                        threads,
+                        32,
+                        scratch,
+                        static_cast<int64_t>(task.getDomainShape().size()) - 1};
+}
+
 } // namespace
 
 LogicalResult SchedulePlanOp::verifyRegions() {
@@ -1479,8 +1709,18 @@ LogicalResult SchedulePlanOp::verifyRegions() {
                        "Contract semantics"
                      : "Fold reduction order must equal bound Fold semantics");
     }
+    const bool hasContractStrategy = task->hasAttr("contract_region_strategy");
+    const bool hasContractCost = task->hasAttr("contract_region_cost");
+    if (hasContractStrategy != hasContractCost ||
+        (hasContractStrategy && !isContract)) {
+      return task.emitOpError(
+          "Contract-region schedule metadata requires a Contract task");
+    }
     FailureOr<Simt32Geometry> expected =
-        simt32Geometry(task.getKind(), task.getDomainShape(), getPolicy());
+        hasContractStrategy
+            ? contractRegionGeometry(task, getPolicy())
+            : simt32Geometry(task.getKind(), task.getDomainShape(),
+                             getPolicy());
     if (failed(expected) ||
         task.getGridShape() != ArrayRef<int64_t>(expected->grid) ||
         task.getTileShape() != ArrayRef<int64_t>(expected->tile) ||

@@ -123,7 +123,16 @@ def Shuttle_MaterializationTaskOp
       OptionalAttr<ArrayAttr>:$fold_region_sources,
       OptionalAttr<ArrayAttr>:$fold_region_phases,
       OptionalAttr<ArrayAttr>:$fold_region_boundary_uses,
-      OptionalAttr<ArrayAttr>:$fold_region_recomputed_sources);
+      OptionalAttr<ArrayAttr>:$fold_region_recomputed_sources,
+      OptionalAttr<ArrayAttr>:$contract_region_sources,
+      OptionalAttr<StrAttr>:$contract_region_strategy,
+      OptionalAttr<Shuttle_SourceRefAttr>:$contract_region_fold_source,
+      OptionalAttr<Shuttle_SourceRefAttr>:$contract_region_contract_source,
+      OptionalAttr<Shuttle_SourceRefAttr>:$contract_region_bf16_boundary_source,
+      OptionalAttr<ArrayAttr>:$contract_region_epilogue_sources,
+      OptionalAttr<I64Attr>:$contract_region_normalized_operand,
+      OptionalAttr<DictionaryAttr>:$contract_region_cost,
+      OptionalAttr<ArrayAttr>:$contract_region_recomputed_sources);
 }
 
 def Shuttle_MaterializationPlanYieldOp
@@ -169,7 +178,9 @@ def Shuttle_ScheduleTaskOp
       DenseI64ArrayAttr:$input_buffers, DenseI64ArrayAttr:$output_buffers,
       DenseI64ArrayAttr:$dependencies, OptionalAttr<I64Attr>:$reduction_axis,
       OptionalAttr<Shuttle_ScheduleReductionOrderAttr>:$reduction_order,
-      StrAttr:$semantic_fingerprint);
+      StrAttr:$semantic_fingerprint,
+      OptionalAttr<StrAttr>:$contract_region_strategy,
+      OptionalAttr<DictionaryAttr>:$contract_region_cost);
 }
 
 def Shuttle_SchedulePlanYieldOp
