@@ -591,7 +591,7 @@ def test_execute_oracle_prints_and_persists_raw_policy_evidence_before_rejection
         status = _fake_oracle_invoke(paths, calls, argv)
         if (
             argv[0] == str(paths.te_runner)
-            and ACCEPTANCE_PATTERN in argv
+            and any(ACCEPTANCE_PATTERN in argument for argument in argv)
             and argv[argv.index("--boundary") + 1] == "forward"
             and "repeat0" in argv[-1]
         ):
