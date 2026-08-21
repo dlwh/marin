@@ -125,3 +125,19 @@ predeclared per-role acceptance threshold. The r2 stop is a canary-policy false
 negative caused by treating the diagnostic disabled-JAX bitwise comparison as
 an acceptance gate, not evidence of unsafe admission or incorrect generated
 GPU code.
+
+## ABI22 runtime-policy correction
+
+The sealed ABI21 artifact made rank 5 compile-only, so it cannot serve as
+rank-5 runtime acceptance. ABI21 supplies only the already approved epsilon and
+independent binary64 per-role limits. A new versioned Track 1 policy
+predeclares the rank-3 and rank-5 input, emitted-tree, and rounded-binary64 role
+digests before another hardware run.
+
+The ABI22 recurrence is recorded independently rather than imported as
+schedule-exact ABI21 identity. Its PTX initializes every lane leaf register to
+positive zero before conditional loads, performs a per-lane adjacent-pair tree,
+then a shared-memory adjacent-pair tree, and finally adds the Fold initializer.
+That distinction is benign for the preserved r2 square and correlation leaves,
+but it remains part of the new immutable bit oracle. The r2 execution is not
+retroactively promoted to acceptance evidence.

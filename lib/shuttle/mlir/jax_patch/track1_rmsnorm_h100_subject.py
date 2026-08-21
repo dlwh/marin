@@ -16,10 +16,18 @@ import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 from jaxlib import _jax
+from track1_rmsnorm_numerical_policy import (
+    POLICY_SHA256,
+    SHAPES,
+    NumericalMetrics,
+    array_sha256,
+    binary64_oracle,
+    deterministic_inputs,
+    load_numerical_policy,
+    numerical_metrics,
+)
 
 from shuttle import ExecutionMode, Materialization, Numerics, Tuning, compiler_options
-
-SHAPES = ((2, 7, 19), (3, 2, 5, 11, 263))
 
 
 class Boundary(StrEnum):
@@ -68,7 +76,12 @@ class ObserverEvidence:
 class CoordinateResult:
     coordinate: Coordinate
     results: dict[str, str]
-    host_oracle: dict[str, str]
+    repeat_results: dict[str, str]
+    analytic_oracle: dict[str, str]
+    emitted_tree_oracle: dict[str, str]
+    numerics: dict[str, dict[str, float | int]]
+    disabled_jax: dict[str, str]
+    disabled_jax_bitwise_equal: dict[str, bool]
     observer: ObserverEvidence | None
 
 
@@ -108,19 +121,6 @@ def observer_identity(coordinate: Coordinate) -> ObserverIdentity:
     )
 
 
-def deterministic_inputs(shape: tuple[int, ...]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    if shape not in SHAPES:
-        raise ValueError("Track 1 RMSNorm shape is outside the canary matrix")
-    size = int(np.prod(shape))
-    ordinal = np.arange(size, dtype=np.float32)
-    magnitude = 0.25 + (ordinal % 29) / 8.0
-    sign = np.where((ordinal.astype(np.int64) % 2) == 0, 1.0, -1.0)
-    x = (magnitude * sign).astype(ml_dtypes.bfloat16).reshape(shape)
-    weight = np.linspace(0.5, 1.5, shape[-1], dtype=np.float32).astype(ml_dtypes.bfloat16)
-    cotangent = (0.375 + (ordinal % 17) / 7.0).astype(ml_dtypes.bfloat16).reshape(shape)
-    return x, weight, cotangent
-
-
 def rms_norm_forward(x: jax.Array, weight: jax.Array) -> jax.Array:
     local = x.astype(jnp.float32)
     mean_square = jnp.mean(local * local, axis=-1, keepdims=True)
@@ -157,39 +157,43 @@ def boundary_function(boundary: Boundary) -> Callable[[jax.Array, jax.Array, jax
     return subject
 
 
-def host_oracle(shape: tuple[int, ...], boundary: Boundary) -> tuple[np.ndarray, ...]:
-    """Evaluate an independently derived float32 RMSNorm/VJP oracle on the host."""
-    x_bf16, weight_bf16, cotangent_bf16 = deterministic_inputs(shape)
-    x = x_bf16.astype(np.float32)
-    weight = weight_bf16.astype(np.float32)
-    cotangent = cotangent_bf16.astype(np.float32)
-    mean_square = np.mean(x * x, axis=-1, keepdims=True, dtype=np.float32)
-    inverse_root = np.float32(1.0) / np.sqrt(mean_square + np.float32(1e-6))
-    result = (x * inverse_root * weight).astype(ml_dtypes.bfloat16)
-    weighted_cotangent = cotangent * weight
-    projection = np.mean(weighted_cotangent * x, axis=-1, keepdims=True, dtype=np.float32)
-    input_cotangent = np.asarray(
-        weighted_cotangent * inverse_root - x * inverse_root * inverse_root * inverse_root * projection,
-        dtype=ml_dtypes.bfloat16,
+def _metrics_document(metrics: NumericalMetrics) -> dict[str, float | int]:
+    return {
+        "maximum_absolute_error": metrics.maximum_absolute_error,
+        "maximum_bf16_ulp_error": metrics.maximum_bf16_ulp_error,
+        "mean_absolute_error": metrics.mean_absolute_error,
+        "relative_linf_error": metrics.relative_linf_error,
+    }
+
+
+def _require_accepted_numerics(
+    coordinate: Coordinate,
+    role: str,
+    metrics: NumericalMetrics,
+    limits: dict[str, float | int],
+) -> None:
+    observed = _metrics_document(metrics)
+    exceeded = tuple(name for name, limit in limits.items() if observed[name] > limit)
+    if not exceeded:
+        return
+    evidence = {
+        "boundary": coordinate.boundary.value,
+        "exceeded": list(exceeded),
+        "limits": limits,
+        "metrics": observed,
+        "mode": coordinate.mode.value,
+        "role": role,
+        "schema_version": 1,
+        "shape": list(coordinate.shape),
+    }
+    raise RuntimeError(
+        "Track 1 RMSNorm result exceeds its independent binary64 threshold: "
+        + json.dumps(evidence, sort_keys=True, separators=(",", ":"), allow_nan=False)
     )
-    prefix_axes = tuple(range(len(shape) - 1))
-    weight_cotangent = np.asarray(
-        np.sum(cotangent * x * inverse_root, axis=prefix_axes, dtype=np.float32),
-        dtype=ml_dtypes.bfloat16,
-    )
-    if boundary is Boundary.FORWARD:
-        return (result,)
-    if boundary is Boundary.BACKWARD:
-        return input_cotangent, weight_cotangent
-    return result, input_cotangent, weight_cotangent
 
 
 def _sha_array(value: np.ndarray) -> str:
-    digest = hashlib.sha256()
-    digest.update(str(value.dtype).encode())
-    digest.update(str(value.shape).encode())
-    digest.update(value.tobytes(order="C"))
-    return digest.hexdigest()
+    return array_sha256(value)
 
 
 def _array_bytes_equal(actual: np.ndarray, expected: np.ndarray) -> bool:
@@ -202,31 +206,6 @@ def _array_bytes_equal(actual: np.ndarray, expected: np.ndarray) -> bool:
 
 def _grouped(digest: str) -> str:
     return ":".join(digest[index : index + 8] for index in range(0, len(digest), 8))
-
-
-def _numerical_mismatch(
-    coordinate: Coordinate,
-    role: str,
-    actual: np.ndarray,
-    expected: np.ndarray,
-) -> RuntimeError:
-    evidence = {
-        "actual_dtype": str(actual.dtype),
-        "actual_sha256": _grouped(_sha_array(actual)),
-        "actual_shape": list(actual.shape),
-        "boundary": coordinate.boundary.value,
-        "expected_dtype": str(expected.dtype),
-        "expected_sha256": _grouped(_sha_array(expected)),
-        "expected_shape": list(expected.shape),
-        "mode": coordinate.mode.value,
-        "role": role,
-        "schema_version": 1,
-        "shape": list(coordinate.shape),
-    }
-    payload = json.dumps(evidence, sort_keys=True, separators=(",", ":"), allow_nan=False)
-    if len(payload) >= 960:
-        raise RuntimeError("Track 1 RMSNorm mismatch evidence exceeds its bound")
-    return RuntimeError(f"Track 1 RMSNorm numerical mismatch: {payload}")
 
 
 def _sha(value: object, name: str) -> str:
@@ -300,7 +279,9 @@ def require_h100() -> None:
         raise RuntimeError("Track 1 RMSNorm subject requires one visible H100")
 
 
-def _execute(coordinate: Coordinate) -> tuple[tuple[np.ndarray, ...], tuple[tuple[object, ...], ...]]:
+def _execute(
+    coordinate: Coordinate,
+) -> tuple[tuple[np.ndarray, ...], tuple[np.ndarray, ...], tuple[tuple[object, ...], ...]]:
     x, weight, cotangent = deterministic_inputs(coordinate.shape)
     options = compiler_options_for(coordinate.mode)
     function = boundary_function(coordinate.boundary)
@@ -308,50 +289,83 @@ def _execute(coordinate: Coordinate) -> tuple[tuple[np.ndarray, ...], tuple[tupl
     with _bridge().subscribe() as capture:
         outputs = compiled(x, weight, cotangent)
         arrays = tuple(np.asarray(output.block_until_ready()) for output in outputs)
+        repeated = compiled(x, weight, cotangent)
+        repeat_arrays = tuple(np.asarray(output.block_until_ready()) for output in repeated)
         snapshot = tuple(capture.snapshot_with_bundle_shape())
-    return arrays, snapshot
+    return arrays, repeat_arrays, snapshot
 
 
 def run_matrix() -> tuple[CoordinateResult, ...]:
     """Execute the full ordinary-JAX RMSNorm canary matrix on one H100."""
     require_h100()
+    policy = load_numerical_policy()
+    acceptance = policy["acceptance"]
+    shape_policies = policy["shapes"]
+    if type(acceptance) is not dict or type(shape_policies) is not dict:
+        raise RuntimeError("Track 1 RMSNorm numerical policy is malformed")
+    thresholds = acceptance["independent_binary64_thresholds"]
+    if type(thresholds) is not dict:
+        raise RuntimeError("Track 1 RMSNorm numerical thresholds are malformed")
     baselines: dict[tuple[tuple[int, ...], Boundary], tuple[np.ndarray, ...]] = {}
     results = []
     for coordinate in Coordinate.all():
-        arrays, snapshot = _execute(coordinate)
+        arrays, repeat_arrays, snapshot = _execute(coordinate)
         observer = validate_observer_snapshot(coordinate, snapshot)
         roles = result_roles(coordinate.boundary)
         expected_shapes = tuple(
             (coordinate.shape[-1],) if role == "weight_cotangent" else coordinate.shape for role in roles
         )
-        if len(arrays) != len(roles):
+        if len(arrays) != len(roles) or len(repeat_arrays) != len(roles):
             raise RuntimeError("Track 1 RMSNorm result count differs from its public boundary")
-        for role, array, expected_shape in zip(roles, arrays, expected_shapes, strict=True):
-            if array.shape != expected_shape or array.dtype != np.dtype(ml_dtypes.bfloat16):
-                raise RuntimeError(f"Track 1 RMSNorm {role} result type differs from its public boundary")
-        oracle = host_oracle(coordinate.shape, coordinate.boundary)
+        for observed_arrays in (arrays, repeat_arrays):
+            for role, array, expected_shape in zip(roles, observed_arrays, expected_shapes, strict=True):
+                if array.shape != expected_shape or array.dtype != np.dtype(ml_dtypes.bfloat16):
+                    raise RuntimeError(f"Track 1 RMSNorm {role} result type differs from its public boundary")
+                if not np.isfinite(array.astype(np.float32)).all():
+                    raise RuntimeError(f"Track 1 RMSNorm {role} result must be finite")
+        for role, actual, repeated in zip(roles, arrays, repeat_arrays, strict=True):
+            if not _array_bytes_equal(actual, repeated):
+                raise RuntimeError(
+                    f"Track 1 RMSNorm {role} repeat result drift: "
+                    f"first={_grouped(_sha_array(actual))},repeat={_grouped(_sha_array(repeated))}"
+                )
+        shape_id = "x".join(map(str, coordinate.shape))
+        shape_policy = shape_policies[shape_id]
+        if type(shape_policy) is not dict:
+            raise RuntimeError("Track 1 RMSNorm shape policy is malformed")
+        analytic_by_role = binary64_oracle(coordinate.shape)
+        oracle = tuple(analytic_by_role[role] for role in roles)
+        role_metrics = {
+            role: numerical_metrics(actual, expected)
+            for role, actual, expected in zip(roles, arrays, oracle, strict=True)
+        }
+        for role, metrics in role_metrics.items():
+            limits = thresholds[role]
+            if type(limits) is not dict:
+                raise RuntimeError("Track 1 RMSNorm role thresholds are malformed")
+            _require_accepted_numerics(coordinate, role, metrics, limits)
+            expected_schedule_sha256 = shape_policy["emitted_tree_outputs"][role]
+            if coordinate.mode is not Mode.DISABLED and _sha_array(arrays[roles.index(role)]) != (
+                expected_schedule_sha256
+            ):
+                raise RuntimeError(f"Track 1 RMSNorm {role} differs from its predeclared emitted-tree oracle")
         key = (coordinate.shape, coordinate.boundary)
         if coordinate.mode is Mode.DISABLED:
-            for role, actual, expected in zip(roles, arrays, oracle, strict=True):
-                if not np.allclose(
-                    actual.astype(np.float32),
-                    expected.astype(np.float32),
-                    rtol=0.02,
-                    atol=0.02,
-                    equal_nan=False,
-                ):
-                    raise RuntimeError(f"Track 1 RMSNorm {role} differs from the independent host oracle")
             baselines[key] = arrays
-        else:
-            expected_arrays = baselines[key]
-            for role, actual, expected in zip(roles, arrays, expected_arrays, strict=True):
-                if not _array_bytes_equal(actual, expected):
-                    raise _numerical_mismatch(coordinate, role, actual, expected)
+        disabled_arrays = baselines[key]
         results.append(
             CoordinateResult(
                 coordinate=coordinate,
                 results={role: _sha_array(array) for role, array in zip(roles, arrays, strict=True)},
-                host_oracle={role: _sha_array(array) for role, array in zip(roles, oracle, strict=True)},
+                repeat_results={role: _sha_array(array) for role, array in zip(roles, repeat_arrays, strict=True)},
+                analytic_oracle={role: shape_policy["binary64_rounded_outputs"][role] for role in roles},
+                emitted_tree_oracle={role: shape_policy["emitted_tree_outputs"][role] for role in roles},
+                numerics={role: _metrics_document(metrics) for role, metrics in role_metrics.items()},
+                disabled_jax={role: _sha_array(array) for role, array in zip(roles, disabled_arrays, strict=True)},
+                disabled_jax_bitwise_equal={
+                    role: _array_bytes_equal(array, baseline)
+                    for role, array, baseline in zip(roles, arrays, disabled_arrays, strict=True)
+                },
                 observer=observer,
             )
         )
@@ -362,9 +376,13 @@ def result_document(results: tuple[CoordinateResult, ...]) -> dict[str, object]:
     return {
         "coordinates": [
             {
+                "analytic_oracle": result.analytic_oracle,
                 "boundary": result.coordinate.boundary.value,
-                "host_oracle": result.host_oracle,
+                "disabled_jax": result.disabled_jax,
+                "disabled_jax_bitwise_equal": result.disabled_jax_bitwise_equal,
+                "emitted_tree_oracle": result.emitted_tree_oracle,
                 "mode": result.coordinate.mode.value,
+                "numerics": result.numerics,
                 "observer": (
                     None
                     if result.observer is None
@@ -376,12 +394,14 @@ def result_document(results: tuple[CoordinateResult, ...]) -> dict[str, object]:
                         "temporary_count": result.observer.temporary_count,
                     }
                 ),
+                "repeat_results": result.repeat_results,
                 "results": result.results,
                 "shape": list(result.coordinate.shape),
             }
             for result in results
         ],
+        "numerical_policy_sha256": POLICY_SHA256,
         "pid": os.getpid(),
         "schema": "track1_rmsnorm_h100_result",
-        "schema_version": 1,
+        "schema_version": 2,
     }

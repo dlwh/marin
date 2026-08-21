@@ -27,6 +27,7 @@ from track1_map_h100_prototype import (
     validate_rmsnorm_result,
     wheel_set,
 )
+from track1_rmsnorm_numerical_policy import POLICY_FILENAME, POLICY_SHA256, load_numerical_policy
 
 MARIN_REPOSITORY = Path(__file__).parents[4]
 AUTHORIZATION_PATH = MARIN_REPOSITORY / "scripts/shuttle/track1_map_h100_prototype_authorization.json"
@@ -63,8 +64,12 @@ def _document() -> dict[str, object]:
                     "forward": {"launches": 1, "temporaries": 0},
                 },
                 "disabled_jax_reference": True,
-                "host_oracle": "independent_float32_rmsnorm_vjp",
+                "disabled_jax_role": "diagnostic_only_optional_stronger_result",
+                "emitted_tree_oracle": "abi22_emitted_ptx_v1",
+                "host_oracle": "independent_binary64_rmsnorm_vjp",
                 "modes": ["disabled", "source_ordered", "fast"],
+                "numerical_policy": {"path": f"lib/shuttle/mlir/jax_patch/{POLICY_FILENAME}", "sha256": POLICY_SHA256},
+                "repeat_bitwise_required": True,
                 "shapes": [[2, 7, 19], [3, 2, 5, 11, 263]],
             },
         },
@@ -137,6 +142,7 @@ def _authorization(tmp_path: Path) -> tuple[Path, str, Authorization]:
         (("sources", "xla", "commit"), "e" * 40),
         (("sources", "xla", "patch_sha256"), list(reversed(XLA_PATCH_SHA256))),
         (("subjects", "rmsnorm", "host_oracle"), "disabled_jax_only"),
+        (("subjects", "rmsnorm", "numerical_policy", "sha256"), "0" * 64),
         (("toolchain", "bazel", "sha256"), "f" * 64),
         (("toolchain", "cuda", "build_distribution"), "local"),
         (("toolchain", "cuda", "build_version"), "13.2.0"),
@@ -306,6 +312,7 @@ def _worker_document(worker: str, pid: int) -> dict[str, object]:
 
 
 def _rmsnorm_document() -> dict[str, object]:
+    policy = load_numerical_policy()
     coordinates = []
     for shape in ((2, 7, 19), (3, 2, 5, 11, 263)):
         for boundary, roles in (
@@ -313,15 +320,25 @@ def _rmsnorm_document() -> dict[str, object]:
             ("backward", ("input_cotangent", "weight_cotangent")),
             ("composed", ("result", "input_cotangent", "weight_cotangent")),
         ):
+            shape_policy = policy["shapes"]["x".join(map(str, shape))]
             for mode in ("disabled", "source_ordered", "fast"):
                 coordinates.append(
                     {
+                        "analytic_oracle": {role: shape_policy["binary64_rounded_outputs"][role] for role in roles},
                         "boundary": boundary,
-                        "host_oracle": {
-                            role: hashlib.sha256(f"host:{shape}:{boundary}:{role}".encode()).hexdigest()
+                        "disabled_jax": {role: shape_policy["emitted_tree_outputs"][role] for role in roles},
+                        "disabled_jax_bitwise_equal": {role: True for role in roles},
+                        "emitted_tree_oracle": {role: shape_policy["emitted_tree_outputs"][role] for role in roles},
+                        "mode": mode,
+                        "numerics": {
+                            role: {
+                                "maximum_absolute_error": 0.0,
+                                "maximum_bf16_ulp_error": 0,
+                                "mean_absolute_error": 0.0,
+                                "relative_linf_error": 0.0,
+                            }
                             for role in roles
                         },
-                        "mode": mode,
                         "observer": (
                             None
                             if mode == "disabled"
@@ -333,29 +350,55 @@ def _rmsnorm_document() -> dict[str, object]:
                                 "temporary_count": 0 if boundary == "forward" else 1,
                             }
                         ),
-                        "results": {
-                            role: hashlib.sha256(f"{shape}:{boundary}:{role}".encode()).hexdigest() for role in roles
-                        },
+                        "repeat_results": {role: shape_policy["emitted_tree_outputs"][role] for role in roles},
+                        "results": {role: shape_policy["emitted_tree_outputs"][role] for role in roles},
                         "shape": list(shape),
                     }
                 )
-    return {"coordinates": coordinates, "pid": 303, "schema": "track1_rmsnorm_h100_result", "schema_version": 1}
+    return {
+        "coordinates": coordinates,
+        "numerical_policy_sha256": POLICY_SHA256,
+        "pid": 303,
+        "schema": "track1_rmsnorm_h100_result",
+        "schema_version": 2,
+    }
 
 
 def test_rmsnorm_result_requires_exact_coordinate_output_and_observer_closure() -> None:
     document = _rmsnorm_document()
     assert validate_rmsnorm_result(document) == document
 
-    for mutation in ("coordinate", "result", "observer"):
+    for mutation in ("coordinate", "result", "observer", "repeat", "threshold", "nonfinite", "diagnostic"):
         changed = deepcopy(document)
         if mutation == "coordinate":
             changed["coordinates"][0]["boundary"] = "composed"
         elif mutation == "result":
             changed["coordinates"][4]["results"].pop("weight_cotangent")
-        else:
+        elif mutation == "observer":
             changed["coordinates"][1]["observer"] = None
+        elif mutation == "repeat":
+            changed["coordinates"][1]["repeat_results"]["result"] = "3" * 64
+        elif mutation == "threshold":
+            changed["coordinates"][1]["numerics"]["result"]["maximum_bf16_ulp_error"] = 2
+        elif mutation == "nonfinite":
+            changed["coordinates"][1]["numerics"]["result"]["mean_absolute_error"] = float("inf")
+        else:
+            changed["coordinates"][1]["disabled_jax_bitwise_equal"]["result"] = False
         with pytest.raises(ValueError, match="RMSNorm"):
             validate_rmsnorm_result(changed)
+
+
+def test_rmsnorm_result_retains_disabled_jax_as_a_nonacceptance_diagnostic() -> None:
+    document = _rmsnorm_document()
+    disabled_sha256 = "3" * 64
+    for index in (0, 1, 2):
+        item = document["coordinates"][index]
+        item["disabled_jax"]["result"] = disabled_sha256
+        item["disabled_jax_bitwise_equal"]["result"] = index == 0
+    document["coordinates"][0]["results"]["result"] = disabled_sha256
+    document["coordinates"][0]["repeat_results"]["result"] = disabled_sha256
+
+    assert validate_rmsnorm_result(document) == document
 
 
 def test_result_pair_requires_fresh_process_reuse_of_exact_outputs_and_cache() -> None:

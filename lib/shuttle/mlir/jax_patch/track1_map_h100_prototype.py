@@ -33,6 +33,7 @@ from track1_map_h100_build import (
     require_source_checkouts_unchanged,
     source_checkouts_identity,
 )
+from track1_rmsnorm_numerical_policy import POLICY_FILENAME, POLICY_SHA256, load_numerical_policy
 
 INTEGRATION_COMMIT = "41502f2079385df29fccbf1137bce553aa090297"
 INTEGRATION_TREE = "a1c4babf2b5822ac8f1a96b0d6a133b61426d72a"
@@ -186,6 +187,7 @@ def _sha256_file(path: Path) -> str:
 
 
 def _expected_authorization(source_manifest_sha256: str) -> dict[str, object]:
+    load_numerical_policy()
     return {
         "attempts": 1,
         "base_image": BASE_IMAGE,
@@ -212,8 +214,12 @@ def _expected_authorization(source_manifest_sha256: str) -> dict[str, object]:
                     "forward": {"launches": 1, "temporaries": 0},
                 },
                 "disabled_jax_reference": True,
-                "host_oracle": "independent_float32_rmsnorm_vjp",
+                "disabled_jax_role": "diagnostic_only_optional_stronger_result",
+                "emitted_tree_oracle": "abi22_emitted_ptx_v1",
+                "host_oracle": "independent_binary64_rmsnorm_vjp",
                 "modes": ["disabled", "source_ordered", "fast"],
+                "numerical_policy": {"path": f"lib/shuttle/mlir/jax_patch/{POLICY_FILENAME}", "sha256": POLICY_SHA256},
+                "repeat_bitwise_required": True,
                 "shapes": [[2, 7, 19], [3, 2, 5, 11, 263]],
             },
         },
@@ -578,13 +584,16 @@ def validate_rmsnorm_result(document: object) -> dict[str, object]:
     """Validate the exact 18-coordinate RMSNorm H100 canary result."""
     if type(document) is not dict or set(document) != {
         "coordinates",
+        "numerical_policy_sha256",
         "pid",
         "schema",
         "schema_version",
     }:
         raise ValueError("RMSNorm result has the wrong root schema")
-    if document["schema"] != "track1_rmsnorm_h100_result" or document["schema_version"] != 1:
+    if document["schema"] != "track1_rmsnorm_h100_result" or document["schema_version"] != 2:
         raise ValueError("RMSNorm result has the wrong schema identity")
+    if document["numerical_policy_sha256"] != POLICY_SHA256:
+        raise ValueError("RMSNorm result numerical policy differs")
     if type(document["pid"]) is not int or document["pid"] <= 0:
         raise ValueError("RMSNorm result PID must be positive")
     coordinates = document["coordinates"]
@@ -599,14 +608,26 @@ def validate_rmsnorm_result(document: object) -> dict[str, object]:
     expected = [
         (shape, boundary, roles, mode) for shape in shapes for boundary, roles in boundaries for mode in WORKER_MODES
     ]
+    policy = load_numerical_policy()
+    acceptance = policy["acceptance"]
+    shape_policies = policy["shapes"]
+    if type(acceptance) is not dict or type(shape_policies) is not dict:
+        raise ValueError("RMSNorm numerical policy is malformed")
+    thresholds = acceptance["independent_binary64_thresholds"]
+    if type(thresholds) is not dict:
+        raise ValueError("RMSNorm numerical thresholds are malformed")
     baselines: dict[tuple[tuple[int, ...], str], dict[str, str]] = {}
-    oracle_baselines: dict[tuple[tuple[int, ...], str], dict[str, str]] = {}
     for item, (shape, boundary, roles, mode) in zip(coordinates, expected, strict=True):
         if type(item) is not dict or set(item) != {
+            "analytic_oracle",
             "boundary",
-            "host_oracle",
+            "disabled_jax",
+            "disabled_jax_bitwise_equal",
+            "emitted_tree_oracle",
             "mode",
+            "numerics",
             "observer",
+            "repeat_results",
             "results",
             "shape",
         }:
@@ -618,20 +639,61 @@ def validate_rmsnorm_result(document: object) -> dict[str, object]:
             raise ValueError("RMSNorm result output roles differ")
         for role in roles:
             _sha(results[role], f"RMSNorm {role}")
-        host_oracle = item["host_oracle"]
-        if type(host_oracle) is not dict or tuple(host_oracle) != roles:
-            raise ValueError("RMSNorm host oracle output roles differ")
+        repeat_results = item["repeat_results"]
+        if type(repeat_results) is not dict or repeat_results != results:
+            raise ValueError("RMSNorm repeat result differs")
+        analytic_oracle = item["analytic_oracle"]
+        emitted_tree_oracle = item["emitted_tree_oracle"]
+        shape_policy = shape_policies["x".join(map(str, shape))]
+        if (
+            type(shape_policy) is not dict
+            or type(analytic_oracle) is not dict
+            or tuple(analytic_oracle) != roles
+            or analytic_oracle != {role: shape_policy["binary64_rounded_outputs"][role] for role in roles}
+            or type(emitted_tree_oracle) is not dict
+            or tuple(emitted_tree_oracle) != roles
+            or emitted_tree_oracle != {role: shape_policy["emitted_tree_outputs"][role] for role in roles}
+        ):
+            raise ValueError("RMSNorm numerical oracle identity differs")
+        numerics = item["numerics"]
+        if type(numerics) is not dict or tuple(numerics) != roles:
+            raise ValueError("RMSNorm numerical metric roles differ")
         for role in roles:
-            _sha(host_oracle[role], f"RMSNorm host oracle {role}")
+            metrics = numerics[role]
+            limits = thresholds[role]
+            if (
+                type(metrics) is not dict
+                or set(metrics)
+                != {
+                    "maximum_absolute_error",
+                    "maximum_bf16_ulp_error",
+                    "mean_absolute_error",
+                    "relative_linf_error",
+                }
+                or type(limits) is not dict
+            ):
+                raise ValueError("RMSNorm numerical metric schema differs")
+            for name, limit in limits.items():
+                value = metrics[name]
+                expected_type = int if name == "maximum_bf16_ulp_error" else float
+                if type(value) is not expected_type or not math.isfinite(value) or value < 0 or value > limit:
+                    raise ValueError(f"RMSNorm {role} exceeds its independent binary64 threshold")
         key = (shape, boundary)
         if mode == "disabled":
             baselines[key] = results
-        elif results != baselines[key]:
-            raise ValueError("RMSNorm enabled result differs from its disabled baseline")
-        if mode == "disabled":
-            oracle_baselines[key] = host_oracle
-        elif host_oracle != oracle_baselines[key]:
-            raise ValueError("RMSNorm host oracle differs across modes")
+        elif results != emitted_tree_oracle:
+            raise ValueError("RMSNorm enabled result differs from its predeclared emitted-tree oracle")
+        disabled_jax = item["disabled_jax"]
+        disabled_equal = item["disabled_jax_bitwise_equal"]
+        if (
+            type(disabled_jax) is not dict
+            or disabled_jax != baselines[key]
+            or type(disabled_equal) is not dict
+            or tuple(disabled_equal) != roles
+            or any(type(disabled_equal[role]) is not bool for role in roles)
+            or disabled_equal != {role: results[role] == disabled_jax[role] for role in roles}
+        ):
+            raise ValueError("RMSNorm disabled-JAX diagnostic differs")
         observer = item["observer"]
         if mode == "disabled":
             if observer is not None:
