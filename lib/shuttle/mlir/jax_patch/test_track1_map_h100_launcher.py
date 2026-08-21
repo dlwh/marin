@@ -54,7 +54,7 @@ def test_launcher_dry_run_emits_canonical_plan_without_importing_subject_or_jax(
             [
                 "--authorization-file",
                 str(authorization),
-                "--authorization-sha256",
+                "--approved-authorization-sha256",
                 hashlib.sha256(raw).hexdigest(),
                 "--workspace",
                 str(tmp_path / "workspace"),

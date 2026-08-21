@@ -136,7 +136,8 @@ def test_checked_in_authorization_is_the_exact_canonical_prototype_scope() -> No
 
 def test_checked_in_source_manifest_matches_the_live_iris_bundle_closure(tmp_path: Path) -> None:
     raw = AUTHORIZATION_PATH.read_bytes()
-    authorization = load_authorization(AUTHORIZATION_PATH, hashlib.sha256(raw).hexdigest())
+    approved_sha256 = hashlib.sha256(raw).hexdigest()
+    authorization = load_authorization(AUTHORIZATION_PATH, approved_sha256)
 
     assert require_source_bundle(MARIN_REPOSITORY, authorization) == source_bundle_document(MARIN_REPOSITORY)
 
@@ -145,9 +146,9 @@ def test_checked_in_source_manifest_matches_the_live_iris_bundle_closure(tmp_pat
     changed_raw = canonical_json(changed_document)
     changed_path = tmp_path / "mutated-authorization.json"
     changed_path.write_bytes(changed_raw)
-    changed = load_authorization(changed_path, hashlib.sha256(changed_raw).hexdigest())
-    with pytest.raises(RuntimeError, match="manifest SHA-256"):
-        require_source_bundle(MARIN_REPOSITORY, changed)
+    assert hashlib.sha256(changed_raw).hexdigest() != approved_sha256
+    with pytest.raises(ValueError, match="external approval binding"):
+        load_authorization(changed_path, approved_sha256)
 
 
 def test_dry_run_renders_one_network_hydration_then_offline_build_and_two_workers(tmp_path: Path) -> None:
