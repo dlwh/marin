@@ -5,12 +5,15 @@ import builtins
 import hashlib
 import importlib
 import json
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 from test_track1_map_h100_prototype import _document
 from track1_map_h100_prototype import BASE_IMAGE, canonical_json
+
+JAX_PATCH = Path(__file__).parent
 
 
 def test_launcher_fails_before_importing_subject_or_jax(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -30,6 +33,21 @@ def test_launcher_fails_before_importing_subject_or_jax(monkeypatch: pytest.Monk
 
     assert "track1_map_h100_subject" not in imported
     assert all(name != "jax" and not name.startswith("jax.") for name in imported)
+
+
+def test_launcher_reaches_fail_closed_boundary_with_only_stdlib_imports() -> None:
+    environment = {"PYTHONPATH": str(JAX_PATCH)}
+    result = subprocess.run(
+        [sys.executable, "-S", str(JAX_PATCH / "track1_map_h100_launcher.py"), "--require-launch-ready"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "explicitly unsealed" in result.stderr
+    assert "ModuleNotFoundError" not in result.stderr
 
 
 def test_launcher_dry_run_emits_canonical_plan_without_importing_subject_or_jax(
