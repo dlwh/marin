@@ -366,6 +366,9 @@ cc_test(
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-forward.mlir",
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-backward.mlir",
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-composed.mlir",
+        "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2048x4096-backward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2048x4096-composed.mlir",
+        "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2048x4096-forward.mlir",
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-3x2x5x11x263-forward.mlir",
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-3x2x5x11x263-backward.mlir",
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-3x2x5x11x263-composed.mlir",
@@ -454,6 +457,40 @@ sh_test(
         "manual",
         "requires-gpu-nvidia",
     ],
+)
+
+sh_binary(
+    name = "run_h100_shuttle_rmsnorm_representative",
+    srcs = ["test/run-h100-shuttle-rmsnorm-representative.sh"],
+    args = ["$(rootpath :gpu_transport_v2_test)"],
+    data = [":gpu_transport_v2_test"],
+    testonly = True,
+)
+
+sh_binary(
+    name = "run_h100_shuttle_rmsnorm_representative_matrix",
+    srcs = ["test/run-h100-shuttle-rmsnorm-representative-matrix.sh"],
+    args = [
+        "$(rootpath jax_patch/abi22_shuttle_rmsnorm_representative.py)",
+        "$(rootpath :run_h100_shuttle_rmsnorm_representative)",
+        "$(rootpath :gpu_transport_v2_test)",
+        "$(rootpath artifacts/track2-te-rmsnorm-r12-success-20260821/result-v4.json)",
+        "$(rootpath artifacts/track2-te-rmsnorm-r12-success-20260821/policy-raw-v4.json)",
+    ],
+    data = [
+        ":gpu_transport_v2_test",
+        ":run_h100_shuttle_rmsnorm_representative",
+        "artifacts/track2-te-rmsnorm-r12-success-20260821/policy-raw-v4.json",
+        "artifacts/track2-te-rmsnorm-r12-success-20260821/result-v4.json",
+        "jax_patch/abi22_shuttle_rmsnorm_representative.py",
+        "jax_patch/abi22_te_rmsnorm_oracle_v2.py",
+    ],
+    tags = [
+        "h100",
+        "manual",
+        "requires-gpu-nvidia",
+    ],
+    testonly = True,
 )
 
 sh_test(
@@ -551,6 +588,98 @@ py_test(
     main = "jax_patch/test_abi22_te_rmsnorm_oracle_v2.py",
 )
 
+py_test(
+    name = "abi22_te_rmsnorm_policy_v3_test",
+    srcs = [
+        "jax_patch/abi22_te_rmsnorm_oracle_v2.py",
+        "jax_patch/test_abi22_te_rmsnorm_policy_v3.py",
+    ],
+    deps = [
+        "@pypi//ml_dtypes",
+        "@pypi//numpy",
+    ],
+    imports = ["jax_patch"],
+    main = "jax_patch/test_abi22_te_rmsnorm_policy_v3.py",
+)
+
+py_test(
+    name = "track2_te_h100_policy_v3_test",
+    srcs = [
+        "jax_patch/abi15_h100_numerics.py",
+        "jax_patch/abi21_rmsnorm_numerics.py",
+        "jax_patch/abi21_rmsnorm_prehardware_contract.py",
+        "jax_patch/abi22_te_rmsnorm_oracle_v2.py",
+        "jax_patch/test_track2_te_h100_policy_v3.py",
+        "jax_patch/track1_map_h100_build.py",
+        "jax_patch/track1_map_h100_prototype.py",
+        "jax_patch/track1_rmsnorm_numerical_policy.py",
+        "jax_patch/track2_te_h100_batch.py",
+    ],
+    data = ["jax_patch/track1-rmsnorm-h100-numerical-policy-v1.json"],
+    deps = [
+        "@pypi//ml_dtypes",
+        "@pypi//numpy",
+    ],
+    imports = ["jax_patch"],
+    main = "jax_patch/test_track2_te_h100_policy_v3.py",
+)
+
+py_test(
+    name = "abi22_te_rmsnorm_policy_v4_test",
+    srcs = [
+        "jax_patch/abi22_te_rmsnorm_oracle_v2.py",
+        "jax_patch/test_abi22_te_rmsnorm_policy_v4.py",
+    ],
+    deps = [
+        "@pypi//ml_dtypes",
+        "@pypi//numpy",
+    ],
+    imports = ["jax_patch"],
+    main = "jax_patch/test_abi22_te_rmsnorm_policy_v4.py",
+)
+
+py_test(
+    name = "abi22_shuttle_rmsnorm_representative_test",
+    srcs = [
+        "jax_patch/abi22_te_rmsnorm_oracle_v2.py",
+        "jax_patch/abi22_shuttle_rmsnorm_representative.py",
+        "jax_patch/test_abi22_shuttle_rmsnorm_representative.py",
+    ],
+    data = [
+        "artifacts/track2-te-rmsnorm-r12-success-20260821/policy-raw-v4.json",
+        "artifacts/track2-te-rmsnorm-r12-success-20260821/result-v4.json",
+        "test/run-h100-shuttle-rmsnorm-representative.sh",
+    ],
+    deps = [
+        "@pypi//ml_dtypes",
+        "@pypi//numpy",
+    ],
+    imports = ["jax_patch"],
+    main = "jax_patch/test_abi22_shuttle_rmsnorm_representative.py",
+)
+
+py_test(
+    name = "track2_te_h100_policy_v4_test",
+    srcs = [
+        "jax_patch/abi15_h100_numerics.py",
+        "jax_patch/abi21_rmsnorm_numerics.py",
+        "jax_patch/abi21_rmsnorm_prehardware_contract.py",
+        "jax_patch/abi22_te_rmsnorm_oracle_v2.py",
+        "jax_patch/test_track2_te_h100_policy_v4.py",
+        "jax_patch/track1_map_h100_build.py",
+        "jax_patch/track1_map_h100_prototype.py",
+        "jax_patch/track1_rmsnorm_numerical_policy.py",
+        "jax_patch/track2_te_h100_batch.py",
+    ],
+    data = ["jax_patch/track1-rmsnorm-h100-numerical-policy-v1.json"],
+    deps = [
+        "@pypi//ml_dtypes",
+        "@pypi//numpy",
+    ],
+    imports = ["jax_patch"],
+    main = "jax_patch/test_track2_te_h100_policy_v4.py",
+)
+
 cc_test(
     name = "abi19_libdevice_contract_test",
     srcs = ["test/abi19-libdevice-contract-test.cc"],
@@ -586,6 +715,9 @@ cc_test(
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-backward.mlir",
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-composed.mlir",
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-forward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2048x4096-backward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2048x4096-composed.mlir",
+        "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2048x4096-forward.mlir",
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-3x2x5x11x263-backward.mlir",
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-3x2x5x11x263-composed.mlir",
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-3x2x5x11x263-forward.mlir",

@@ -13,18 +13,45 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import jaxlib
 import ml_dtypes
 import numpy as np
 from abi22_te_rmsnorm_oracle_v2 import (
     BOUNDARIES,
     CALL_SEQUENCES,
     EPSILON,
-    INPUT_DIGESTS,
+    JAX_REVISION,
     MEASURED_INVOCATIONS,
     OUTPUT_ROLES,
     SHAPES,
     WARMUP_INVOCATIONS,
+    error_metrics,
+    error_metrics_v3,
 )
+from jaxlib import version as jaxlib_version
+
+
+def _observed_runtime() -> dict[str, Any]:
+    if jax.default_backend() != "gpu":
+        raise RuntimeError("ordinary-JAX RMSNorm evidence requires the GPU backend")
+    devices = jax.devices("gpu")
+    if len(devices) != 1 or "H100" not in devices[0].device_kind.upper():
+        raise RuntimeError("ordinary-JAX RMSNorm evidence requires one visible H100")
+    if jax.__version__ != "0.10.1" or jaxlib.__version__ != "0.10.1":
+        raise RuntimeError("ordinary-JAX RMSNorm evidence requires JAX and jaxlib 0.10.1")
+    if jaxlib_version._git_hash != JAX_REVISION:
+        raise RuntimeError("ordinary-JAX RMSNorm evidence JAX revision differs")
+    device = devices[0]
+    return {
+        "backend": "gpu",
+        "device_count": 1,
+        "device_id": device.id,
+        "device_kind": device.device_kind,
+        "jax_git_commit": jaxlib_version._git_hash,
+        "jax_version": jax.__version__,
+        "jaxlib_version": jaxlib.__version__,
+        "platform_version": device.client.platform_version,
+    }
 
 
 def _read_bf16(path: Path, shape: tuple[int, ...]) -> np.ndarray:
@@ -36,20 +63,6 @@ def _read_bf16(path: Path, shape: tuple[int, ...]) -> np.ndarray:
 
 def _digest(value: np.ndarray) -> str:
     return hashlib.sha256(value.view(np.uint16).tobytes(order="C")).hexdigest()
-
-
-def _ordered_bf16(value: np.ndarray) -> np.ndarray:
-    bits = value.view(np.uint16).astype(np.int32)
-    return np.where((bits & 0x8000) != 0, 0x7FFF - (bits & 0x7FFF), 0x8000 + bits)
-
-
-def _metrics(actual: np.ndarray, reference: np.ndarray) -> dict[str, float | int]:
-    return {
-        "max_absolute_error": float(
-            np.max(np.abs(actual.astype(np.float32) - reference.astype(np.float32)), initial=0.0)
-        ),
-        "max_bfloat16_ulp": int(np.max(np.abs(_ordered_bf16(actual) - _ordered_bf16(reference)), initial=0)),
-    }
 
 
 def _rmsnorm(x: jax.Array, gamma: jax.Array) -> jax.Array:
@@ -87,10 +100,16 @@ def _arrays(value: Any) -> tuple[np.ndarray, ...]:
     return tuple(np.asarray(leaf) for leaf in jax.tree.leaves(value))
 
 
-def run_cell(boundary: str, shape: tuple[int, int], case_directory: Path) -> dict[str, Any]:
+def run_cell(
+    boundary: str,
+    shape: tuple[int, int],
+    case_directory: Path,
+    output_files_directory: Path | None = None,
+) -> dict[str, Any]:
     """Run one XLA cell with host-blocking samples and BF16 output evidence."""
     if boundary not in BOUNDARIES or shape not in SHAPES:
         raise ValueError("cell is outside the RMSNorm v2 matrix")
+    observed_runtime = _observed_runtime()
     _, features = shape
     operands = [
         _read_bf16(case_directory / "x.bf16", shape),
@@ -98,6 +117,8 @@ def run_cell(boundary: str, shape: tuple[int, int], case_directory: Path) -> dic
     ]
     if boundary != "forward":
         operands.append(_read_bf16(case_directory / "dy.bf16", shape))
+    input_roles = ("x", "gamma") if boundary == "forward" else ("x", "gamma", "dy")
+    input_digests = {role: _digest(operand) for role, operand in zip(input_roles, operands, strict=True)}
     device_operands = tuple(jax.device_put(operand) for operand in operands)
     compiled = jax.jit(_function(boundary)).lower(*device_operands).compile()
     for _ in range(WARMUP_INVOCATIONS):
@@ -111,30 +132,39 @@ def run_cell(boundary: str, shape: tuple[int, int], case_directory: Path) -> dic
     if result is None:
         raise AssertionError("measurement loop did not execute")
     outputs = []
+    output_files = {}
+    if output_files_directory is not None:
+        output_files_directory.mkdir(parents=True, exist_ok=True)
     for role, actual in zip(OUTPUT_ROLES[boundary], _arrays(result), strict=True):
         reference_shape = shape if role != "dgamma" else (features,)
         reference = _read_bf16(case_directory / f"reference_{role}.bf16", reference_shape)
+        if output_files_directory is not None:
+            output_path = output_files_directory / f"{role}.bf16"
+            output_path.write_bytes(actual.view(np.uint16).tobytes(order="C"))
+            output_files[role] = str(output_path)
         outputs.append(
             {
                 "role": role,
                 "digest": _digest(actual),
                 "reference_digest": _digest(reference),
-                **_metrics(actual, reference),
+                **(
+                    error_metrics_v3(actual, reference, role=role)
+                    if output_files_directory is not None
+                    else error_metrics(actual, reference, role=role)
+                ),
             }
         )
-    return {
+    document = {
         "shape": list(shape),
-        "scope": "architecture_fixture" if shape == SHAPES[0] else "representative_acceptance",
+        "scope": "architecture_fixture" if shape == SHAPES[0] else "representative_performance_qualification",
         "boundary": boundary,
-        "input_digests": {
-            role: INPUT_DIGESTS[shape][role]
-            for role in (("x", "gamma") if boundary == "forward" else ("x", "gamma", "dy"))
-        },
+        "input_digests": input_digests,
         "execution": {
             "call_sequence": list(CALL_SEQUENCES[boundary]),
             "rsigma_state": "invocation_local_not_public",
         },
         "outputs": outputs,
+        "observed_runtime": observed_runtime,
         "timing": {
             "warmup_invocations": WARMUP_INVOCATIONS,
             "raw_host_blocking_ns": samples,
@@ -142,6 +172,9 @@ def run_cell(boundary: str, shape: tuple[int, int], case_directory: Path) -> dic
             "raw_cuda_event_ns": None,
         },
     }
+    if output_files_directory is not None:
+        document["output_files"] = output_files
+    return document
 
 
 def main() -> None:
@@ -152,10 +185,16 @@ def main() -> None:
     parser.add_argument("--epsilon", type=float, required=True)
     parser.add_argument("--case-directory", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--output-files-directory", type=Path)
     arguments = parser.parse_args()
     if arguments.epsilon != EPSILON:
         parser.error("epsilon must be exactly 1e-6")
-    document = run_cell(arguments.boundary, (arguments.rows, arguments.features), arguments.case_directory)
+    document = run_cell(
+        arguments.boundary,
+        (arguments.rows, arguments.features),
+        arguments.case_directory,
+        arguments.output_files_directory,
+    )
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
     arguments.output.write_text(json.dumps(document, sort_keys=True) + "\n")
 

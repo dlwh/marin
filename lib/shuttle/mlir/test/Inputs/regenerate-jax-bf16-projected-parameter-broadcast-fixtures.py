@@ -48,6 +48,7 @@ class StructuralShape:
 SHAPES = (
     StructuralShape(dimensions=(2, 7, 19)),
     StructuralShape(dimensions=(3, 2, 5, 11, 263)),
+    StructuralShape(dimensions=(2048, 4096)),
 )
 
 

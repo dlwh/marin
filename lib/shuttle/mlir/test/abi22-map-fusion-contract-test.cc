@@ -3017,6 +3017,167 @@ TEST(Abi22MapFusionContract,
 }
 
 TEST(Abi22MapFusionContract,
+     RepresentativeRmsNormBindsExactForwardBackwardAndComposedResources) {
+  struct Boundary {
+    llvm::StringLiteral name;
+    llvm::StringLiteral fixture;
+    int64_t launches;
+    int64_t slots;
+    int64_t operands;
+    int64_t results;
+    int64_t temporaryAllocations;
+    int64_t temporaryBytes;
+    int64_t rowLaunches;
+    int64_t columnLaunches;
+  };
+  constexpr Boundary boundaries[] = {
+      {"forward",
+       "jax-0.10.1-bf16-projected_parameter_broadcast-2048x4096-forward.mlir",
+       1, 3, 2, 1, 0, 0, 1, 0},
+      {"backward_recompute",
+       "jax-0.10.1-bf16-projected_parameter_broadcast-2048x4096-backward.mlir",
+       3, 6, 3, 2, 1, 8192, 2, 1},
+      {"composed",
+       "jax-0.10.1-bf16-projected_parameter_broadcast-2048x4096-composed.mlir",
+       4, 7, 3, 3, 1, 8192, 3, 1},
+  };
+  for (const Boundary &boundary : boundaries) {
+    SCOPED_TRACE(boundary.name.str());
+    std::optional<std::string> source = fixtureSource(boundary.fixture);
+    ASSERT_TRUE(source);
+    for (mlir::shuttle::NumericalPolicy policy :
+         {mlir::shuttle::NumericalPolicy::SourceOrdered,
+          mlir::shuttle::NumericalPolicy::Fast}) {
+      SCOPED_TRACE(policy == mlir::shuttle::NumericalPolicy::SourceOrdered
+                       ? "source_ordered"
+                       : "fast");
+      std::unique_ptr<BuiltModule> built =
+          build(*source, policy, kFusionTuning, false, true);
+      ASSERT_TRUE(built);
+      auto plan = *built->module->getOps<mlir::shuttle::MaterializationPlanOp>()
+                       .begin();
+      auto tasks = llvm::to_vector(
+          plan.getBody()
+              .front()
+              .getOps<mlir::shuttle::MaterializationTaskOp>());
+      auto buffers = llvm::to_vector(
+          plan.getBody()
+              .front()
+              .getOps<mlir::shuttle::MaterializationBufferOp>());
+      EXPECT_EQ(tasks.size(), boundary.launches);
+      EXPECT_EQ(buffers.size(), boundary.slots);
+      EXPECT_EQ(llvm::count_if(buffers, [](auto buffer) {
+                  return buffer.getStorage() ==
+                         mlir::shuttle::MaterializationStorage::Temporary;
+                }),
+                boundary.temporaryAllocations);
+
+      auto serialized =
+          mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+      ASSERT_TRUE(mlir::succeeded(serialized));
+      auto executable = mlir::shuttle::GpuExecutable::Load(*serialized);
+      ASSERT_TRUE(executable.ok()) << executable.status();
+      EXPECT_EQ((*executable)->launches().size(), boundary.launches);
+      EXPECT_EQ((*executable)->slots().size(), boundary.slots);
+      struct ExpectedBinding {
+        mlir::shuttle::ExecutableBindingKind kind;
+        int64_t index;
+        int64_t slot;
+        int64_t bytes;
+        llvm::SmallVector<int64_t> shape;
+      };
+      constexpr int64_t fullBytes = 2048LL * 4096 * sizeof(uint16_t);
+      constexpr int64_t featureBytes = 4096LL * sizeof(uint16_t);
+      llvm::SmallVector<ExpectedBinding> expectedBindings = {
+          {mlir::shuttle::ExecutableBindingKind::Operand, 0, 0, fullBytes,
+           {2048, 4096}},
+          {mlir::shuttle::ExecutableBindingKind::Operand, 1, 1, featureBytes,
+           {4096}},
+      };
+      if (boundary.name != "forward")
+        expectedBindings.push_back(
+            {mlir::shuttle::ExecutableBindingKind::Operand, 2, 2, fullBytes,
+             {2048, 4096}});
+      if (boundary.name == "forward") {
+        expectedBindings.push_back(
+            {mlir::shuttle::ExecutableBindingKind::Result, 0, 2, fullBytes,
+             {2048, 4096}});
+      } else if (boundary.name == "backward_recompute") {
+        expectedBindings.append({
+            {mlir::shuttle::ExecutableBindingKind::Result, 0, 5, fullBytes,
+             {2048, 4096}},
+            {mlir::shuttle::ExecutableBindingKind::Result, 1, 4,
+             featureBytes, {4096}},
+        });
+      } else {
+        expectedBindings.append({
+            {mlir::shuttle::ExecutableBindingKind::Result, 0, 4, fullBytes,
+             {2048, 4096}},
+            {mlir::shuttle::ExecutableBindingKind::Result, 1, 6, fullBytes,
+             {2048, 4096}},
+            {mlir::shuttle::ExecutableBindingKind::Result, 2, 5,
+             featureBytes, {4096}},
+        });
+      }
+      ASSERT_EQ((*executable)->externalBindings().size(),
+                expectedBindings.size());
+      for (auto [binding, expected] : llvm::zip_equal(
+               (*executable)->externalBindings(), expectedBindings)) {
+        EXPECT_EQ(binding.kind, expected.kind);
+        EXPECT_EQ(binding.index, expected.index);
+        EXPECT_EQ(binding.slotOrdinal, expected.slot);
+        EXPECT_EQ(binding.requiredBytes, expected.bytes);
+        EXPECT_EQ(binding.alignment, 2);
+        auto type = mlir::dyn_cast<mlir::RankedTensorType>(binding.tensorType);
+        ASSERT_TRUE(type);
+        EXPECT_EQ(type.getShape(), llvm::ArrayRef<int64_t>(expected.shape));
+        EXPECT_TRUE(type.getElementType().isBF16());
+      }
+      EXPECT_EQ(llvm::count_if((*executable)->externalBindings(), [](auto binding) {
+                  return binding.kind ==
+                         mlir::shuttle::ExecutableBindingKind::Operand;
+                }),
+                boundary.operands);
+      EXPECT_EQ(llvm::count_if((*executable)->externalBindings(), [](auto binding) {
+                  return binding.kind ==
+                         mlir::shuttle::ExecutableBindingKind::Result;
+                }),
+                boundary.results);
+      int64_t temporaryAllocations = 0;
+      int64_t temporaryBytes = 0;
+      for (const mlir::shuttle::GpuSlot &slot : (*executable)->slots()) {
+        if (slot.storage != mlir::shuttle::MaterializationStorage::Temporary)
+          continue;
+        ++temporaryAllocations;
+        temporaryBytes += slot.requiredBytes;
+        auto type = mlir::cast<mlir::RankedTensorType>(slot.tensorType);
+        EXPECT_EQ(type.getShape(), llvm::ArrayRef<int64_t>({2048}));
+        EXPECT_TRUE(type.getElementType().isF32());
+      }
+      EXPECT_EQ(temporaryAllocations, boundary.temporaryAllocations);
+      EXPECT_EQ(temporaryBytes, boundary.temporaryBytes);
+
+      int64_t rowLaunches = 0;
+      int64_t columnLaunches = 0;
+      for (const mlir::shuttle::GpuLaunch &launch :
+           (*executable)->launches()) {
+        EXPECT_EQ(launch.block, (std::array<uint64_t, 3>{256, 1, 1}));
+        EXPECT_EQ(launch.dynamicSharedMemoryBytes, 1024u);
+        EXPECT_FALSE(launch.codeDigest.empty());
+        if (launch.grid == std::array<uint64_t, 3>{2048, 1, 1})
+          ++rowLaunches;
+        else if (launch.grid == std::array<uint64_t, 3>{4096, 1, 1})
+          ++columnLaunches;
+        else
+          ADD_FAILURE() << "unexpected representative RMSNorm grid";
+      }
+      EXPECT_EQ(rowLaunches, boundary.rowLaunches);
+      EXPECT_EQ(columnLaunches, boundary.columnLaunches);
+    }
+  }
+}
+
+TEST(Abi22MapFusionContract,
      RejectsCorruptFoldRegionProvenanceAffineUsesAndPhaseLocality) {
   std::optional<std::string> source = fixtureSource(
       "jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-backward.mlir");

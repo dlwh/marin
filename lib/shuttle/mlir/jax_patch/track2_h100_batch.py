@@ -13,6 +13,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from abi22_shuttle_rmsnorm_representative import validate_shuttle_evidence
 from track1_map_h100_build import (
     HERMETIC_CUDA_COMPUTE_CAPABILITIES,
     XLA_COMMIT,
@@ -29,6 +30,7 @@ from track1_map_h100_prototype import (
 SOURCE_MANIFEST_SCHEMA = "shuttle_track2_h100_source_manifest_v1"
 SOURCE_MANIFEST_NAME = ".shuttle-track2-source-manifest.json"
 RESULT_SCHEMA = "shuttle_track2_h100_batch_result_v1"
+REPRESENTATIVE_RESULT_SCHEMA = "shuttle_track2_rmsnorm_representative_batch_result_v1"
 TRACK2_HERMETIC_CUDA_VERSION = "12.9.1"
 XLA_WORKSPACE_PATCH = Path("lib/shuttle/mlir/jax_patch/track2_xla_workspace.patch")
 RUNTIME_PYTHON = Path("/opt/h100-evidence-runtime/bin/python")
@@ -50,6 +52,9 @@ class BatchPaths:
     shuttle_validated: Path
     exploratory_comparison: Path
     result: Path
+    cases: Path
+    raw: Path
+    representative_report: Path
 
     @classmethod
     def under(cls, workspace: Path) -> "BatchPaths":
@@ -67,6 +72,9 @@ class BatchPaths:
             shuttle_validated=reports / "shuttle.validated.json",
             exploratory_comparison=reports / "exploratory-host.json",
             result=reports / "result.json",
+            cases=workspace / "cases",
+            raw=workspace / "raw",
+            representative_report=reports / "shuttle-representative.json",
         )
 
 
@@ -137,20 +145,20 @@ def validate_source_manifest(runner_repository: Path, manifest_path: Path) -> di
     }
 
 
-def _common_bazel(paths: BatchPaths, runner_repository: Path) -> list[str]:
-    return [
+def _common_bazel(paths: BatchPaths, runner_repository: Path, *, command: str = "test") -> list[str]:
+    common = [
         str(paths.bazel),
         f"--output_user_root={paths.bazel_output}",
-        "test",
+        command,
         f"--override_repository=shuttle_mlir={runner_repository / 'lib/shuttle/mlir'}",
         "--config=cuda",
         f"--repo_env=HERMETIC_CUDA_VERSION={TRACK2_HERMETIC_CUDA_VERSION}",
         "--repo_env=HERMETIC_CUDA_COMPUTE_CAPABILITIES=" + ",".join(HERMETIC_CUDA_COMPUTE_CAPABILITIES),
         "--define=SHUTTLE_TEST_OBSERVER=1",
-        "--nocache_test_results",
-        "--test_output=streamed",
-        "--test_timeout=3600",
     ]
+    if command == "test":
+        common.extend(["--nocache_test_results", "--test_output=streamed", "--test_timeout=3600"])
+    return common
 
 
 def _test_env(name: str, value: object) -> str:
@@ -229,6 +237,55 @@ def batch_plan(*, workspace: Path, runner_repository: Path, compiler_identity: s
             {"name": "shuttle", "argv": shuttle},
         ],
         "schema": "shuttle_track2_h100_batch_plan_v1",
+        "workspace": str(workspace),
+    }
+
+
+def representative_batch_plan(*, workspace: Path, runner_repository: Path) -> dict[str, object]:
+    """Return the exact one-H100 representative Shuttle execution plan."""
+    paths = BatchPaths.under(workspace)
+    hydration = batch_plan(
+        workspace=workspace,
+        runner_repository=runner_repository,
+        compiler_identity=f"shuttle-abi22:{'0' * 40}:{'0' * 40}:{'0' * 64}",
+    )["phases"][:9]
+    hydration[1] = {
+        "name": "source_permissions",
+        "argv": [
+            "chmod",
+            "755",
+            str(runner_repository / "lib/shuttle/mlir/test/run-h100-shuttle-rmsnorm-representative.sh"),
+            str(runner_repository / "lib/shuttle/mlir/test/run-h100-shuttle-rmsnorm-representative-matrix.sh"),
+        ],
+    }
+    build = [
+        *_common_bazel(paths, runner_repository, command="build"),
+        "@shuttle_mlir//:run_h100_shuttle_rmsnorm_representative_matrix",
+    ]
+    execute = [
+        *_common_bazel(paths, runner_repository, command="run"),
+        "@shuttle_mlir//:run_h100_shuttle_rmsnorm_representative_matrix",
+        "--",
+        "--python",
+        str(RUNTIME_PYTHON),
+        "--case-root",
+        str(paths.cases),
+        "--raw-root",
+        str(paths.raw),
+        "--reports-root",
+        str(paths.reports),
+        "--output",
+        str(paths.representative_report),
+    ]
+    return {
+        "base_image": BASE_IMAGE,
+        "hardware": {"gpu_count": 1, "gpu_model": "H100"},
+        "phases": [
+            *hydration,
+            {"name": "shuttle_build", "argv": build},
+            {"name": "shuttle_execute", "argv": execute},
+        ],
+        "schema": "shuttle_track2_rmsnorm_representative_batch_plan_v1",
         "workspace": str(workspace),
     }
 
@@ -332,6 +389,76 @@ def execute_batch(
     return result
 
 
+def execute_representative_batch(
+    *,
+    workspace: Path,
+    runner_repository: Path,
+    manifest_path: Path,
+    observed_base_image: str,
+) -> dict[str, object]:
+    """Build and execute the reviewed representative Shuttle matrix."""
+    if observed_base_image != BASE_IMAGE:
+        raise RuntimeError("observed base image differs from the sealed batch request")
+    if workspace.exists() or workspace.is_symlink():
+        raise RuntimeError("batch workspace must be fresh")
+    if platform.system() != "Linux":
+        raise RuntimeError("Track 2 H100 batch requires Linux")
+    source = validate_source_manifest(runner_repository, manifest_path)
+    workspace.mkdir(mode=0o700)
+    paths = BatchPaths.under(workspace)
+    paths.logs.mkdir()
+    paths.reports.mkdir()
+    paths.bazel.parent.mkdir()
+    phases = representative_batch_plan(workspace=workspace, runner_repository=runner_repository)["phases"]
+    device = _device_identity(paths, phases[0])
+    _run(phases[1]["argv"], cwd=None, log=paths.logs / "source_permissions.log", phase="source_permissions")
+    _fetch_xla(paths, phases[2:8])
+    _run(phases[8]["argv"], cwd=None, log=paths.logs / "bazel_fetch.log", phase="bazel_fetch")
+    if _file_sha256(paths.bazel) != BAZEL_SHA256:
+        raise RuntimeError("hydrated Bazel SHA-256 differs")
+    paths.bazel.chmod(0o755)
+    _run(phases[9]["argv"], cwd=paths.xla, log=paths.logs / "shuttle_build.log", phase="shuttle_build")
+    _run(phases[10]["argv"], cwd=paths.xla, log=paths.logs / "shuttle_execute.log", phase="shuttle_execute")
+    evidence = _read_json(paths.representative_report, "representative Shuttle report")
+    r12_root = runner_repository / "lib/shuttle/mlir/artifacts/track2-te-rmsnorm-r12-success-20260821"
+    validate_shuttle_evidence(
+        evidence,
+        r12_result=r12_root / "result-v4.json",
+        r12_policy_raw=r12_root / "policy-raw-v4.json",
+        raw_root=paths.raw,
+        case_root=paths.cases,
+    )
+    log_identities = {
+        path.name: {"sha256": _file_sha256(path), "size": path.stat().st_size} for path in sorted(paths.logs.iterdir())
+    }
+    report_identities = {
+        path.name: {"sha256": _file_sha256(path), "size": path.stat().st_size}
+        for path in sorted(paths.reports.iterdir())
+        if path != paths.result
+    }
+    result = {
+        "base_image": BASE_IMAGE,
+        "device": device,
+        "evidence": evidence,
+        "reports": report_identities,
+        "schema": REPRESENTATIVE_RESULT_SCHEMA,
+        "source": source,
+        "tools": {
+            "bazel": {"sha256": BAZEL_SHA256, "version": BAZEL_VERSION},
+            "cuda": {
+                "build_version": TRACK2_HERMETIC_CUDA_VERSION,
+                "compute_capabilities": list(HERMETIC_CUDA_COMPUTE_CAPABILITIES),
+                "physical_root": str(PHYSICAL_CUDA_TOOLS_ROOT),
+            },
+            "logs": log_identities,
+            "xla_commit": XLA_COMMIT,
+            "xla_workspace_patch_sha256": _file_sha256(runner_repository / XLA_WORKSPACE_PATCH),
+        },
+    }
+    paths.result.write_bytes(canonical_json(result))
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--workspace", required=True, type=Path)
@@ -341,8 +468,22 @@ def main(argv: list[str] | None = None) -> int:
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument("--plan", action="store_true")
     action.add_argument("--execute", action="store_true")
+    action.add_argument("--plan-representative", action="store_true")
+    action.add_argument("--execute-representative", action="store_true")
     arguments = parser.parse_args(argv)
-    if arguments.plan:
+    if arguments.plan_representative:
+        result = representative_batch_plan(
+            workspace=arguments.workspace,
+            runner_repository=arguments.runner_repository,
+        )
+    elif arguments.execute_representative:
+        result = execute_representative_batch(
+            workspace=arguments.workspace,
+            runner_repository=arguments.runner_repository,
+            manifest_path=arguments.source_manifest,
+            observed_base_image=arguments.base_image,
+        )
+    elif arguments.plan:
         source = validate_source_manifest(arguments.runner_repository, arguments.source_manifest)
         result = batch_plan(
             workspace=arguments.workspace,

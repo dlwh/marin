@@ -1,0 +1,27 @@
+I20260821 13:59:45 8418467456 iris.cluster.config Loading config from lib/iris/config/cw-rno2a.yaml
+I20260821 13:59:45 8418467456 iris.cli.connect Establishing tunnel to controller...
+I20260821 13:59:45 8418467456 iris.cluster.platforms.k8s.service Tunnel ready: 127.0.0.1:10002 -> iris-controller-svc:10000
+Job: /dlwh/shuttle-track2-rmsnorm-h100-r1 (/dlwh/shuttle-track2-rmsnorm-h100-r1)
+State: failed  exit=0  failures=1  preemptions=0
+Tasks: 0/1 completed  failed=1
+Error: s, Critical Path: 0.02s
+INFO: 1 process: 1 internal.
+INFO: Build completed successfully, 1 total action
+INFO: Running command line: bazel-bin/external/shuttle_mlir/run_h100_shuttle_rmsnorm_representative_matrix external/shuttle_mlir/jax_patch/abi22_shuttle_rmsnorm_representative.py external/shuttle_mlir/run_h100_shuttle_rmsnorm_representative external/shuttle_mlir/artifacts/track2-te-rmsnorm-r12-success-20260821/result-v4.json external/shuttle_mlir/artifacts/track2-te-rmsnorm-r12-success-20260821/policy-raw-v4.json --python /opt/h100-evidence-runtime/bin/python --case-root /tmp/shuttle-track2-h100/cases --raw-root /tmp/shuttle-track2-h100/raw --reports-root /tmp/shuttle-track2-h100/reports --output /tmp/shuttle-track2-h100/reports/shuttle-representative.json
+unknown argument: /tmp/shuttle-track2-h100/cases
+Traceback (most recent call last):
+  File "/tmp/shuttle-track2-h100/bazel-output/5eca87bbd3fb6b39bfe995b88f759ede/execroot/xla/bazel-out/k8-opt/bin/external/shuttle_mlir/run_h100_shuttle_rmsnorm_representative_matrix.runfiles/xla/external/shuttle_mlir/jax_patch/abi22_shuttle_rmsnorm_representative.py", line 812, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "/tmp/shuttle-track2-h100/bazel-output/5eca87bbd3fb6b39bfe995b88f759ede/execroot/xla/bazel-out/k8-opt/bin/external/shuttle_mlir/run_h100_shuttle_rmsnorm_representative_matrix.runfiles/xla/external/shuttle_mlir/jax_patch/abi22_shuttle_rmsnorm_representative.py", line 796, in main
+    evidence = execute_representative(
+               ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/shuttle-track2-h100/bazel-output/5eca87bbd3fb6b39bfe995b88f759ede/execroot/xla/bazel-out/k8-opt/bin/external/shuttle_mlir/run_h100_shuttle_rmsnorm_representative_matrix.runfiles/xla/external/shuttle_mlir/jax_patch/abi22_shuttle_rmsnorm_representative.py", line 744, in execute_representative
+    raise ValueError(f"representative Shuttle runner failed for {coordinate}: {status}")
+ValueError: representative Shuttle runner failed for source_ordered/forward/repeat0: 2
+
+
+
+  TASK  STATE      EXIT  DURATION                     PEAK MEM    CUR MEM    ERROR
+     0  failed        1  3 minutes and 44.55 seconds  -           -          s, Critical Path: 0.02s
+                                                                             INFO: 1 process: 1 interna...

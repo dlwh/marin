@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <future>
 #include <limits>
@@ -7122,6 +7123,289 @@ TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
     for (auto &device : cell.deviceOperands)
       (*executor)->Deallocate(&device);
   }
+}
+
+TEST(GpuTransportV2Test,
+     H100RepresentativeRmsNormRunnerWritesOneAuthenticatedRawCell) {
+  const char *run = std::getenv("SHUTTLE_RUN_H100_REPRESENTATIVE");
+  if (run == nullptr || llvm::StringRef(run) != "1")
+    GTEST_SKIP() << "set SHUTTLE_RUN_H100_REPRESENTATIVE=1 on an H100 worker";
+  const char *caseRoot = std::getenv("SHUTTLE_REP_CASE_ROOT");
+  const char *rawRoot = std::getenv("SHUTTLE_REP_RAW_ROOT");
+  const char *policyValue = std::getenv("SHUTTLE_REP_POLICY");
+  const char *boundaryValue = std::getenv("SHUTTLE_REP_BOUNDARY");
+  const char *repeatValue = std::getenv("SHUTTLE_REP_REPEAT");
+  ASSERT_NE(caseRoot, nullptr);
+  ASSERT_NE(rawRoot, nullptr);
+  ASSERT_NE(policyValue, nullptr);
+  ASSERT_NE(boundaryValue, nullptr);
+  ASSERT_NE(repeatValue, nullptr);
+  llvm::StringRef policyName(policyValue);
+  llvm::StringRef boundary(boundaryValue);
+  ASSERT_TRUE(policyName == "source_ordered" || policyName == "fast");
+  ASSERT_TRUE(boundary == "forward" || boundary == "backward_recompute" ||
+              boundary == "composed");
+  int64_t repeat = -1;
+  ASSERT_FALSE(llvm::StringRef(repeatValue).getAsInteger(10, repeat));
+  ASSERT_TRUE(repeat == 0 || repeat == 1);
+
+  llvm::StringRef fixture =
+      boundary == "forward"
+          ? "jax-0.10.1-bf16-projected_parameter_broadcast-2048x4096-"
+            "forward.mlir"
+      : boundary == "backward_recompute"
+          ? "jax-0.10.1-bf16-projected_parameter_broadcast-2048x4096-"
+            "backward.mlir"
+          : "jax-0.10.1-bf16-projected_parameter_broadcast-2048x4096-"
+            "composed.mlir";
+  auto source = fixtureSource(fixture);
+  ASSERT_TRUE(source)
+      << "representative fixture unavailable: " << fixture.str()
+      << " RUNFILES_DIR="
+      << (std::getenv("RUNFILES_DIR") == nullptr
+              ? "<unset>"
+              : std::getenv("RUNFILES_DIR"))
+      << " TEST_SRCDIR="
+      << (std::getenv("TEST_SRCDIR") == nullptr
+              ? "<unset>"
+              : std::getenv("TEST_SRCDIR"));
+  constexpr llvm::StringLiteral sourceOrderedOptions =
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+  constexpr llvm::StringLiteral fastOptions =
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+  constexpr llvm::StringLiteral tuning =
+      R"json({"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json";
+  mlir::shuttle::NumericalPolicy policy =
+      policyName == "source_ordered"
+          ? mlir::shuttle::NumericalPolicy::SourceOrdered
+          : mlir::shuttle::NumericalPolicy::Fast;
+  auto built = buildFixture(
+      *source, policy,
+      policyName == "source_ordered" ? sourceOrderedOptions : fastOptions,
+      tuning);
+  ASSERT_TRUE(built);
+  auto serialized = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+  ASSERT_TRUE(mlir::succeeded(serialized));
+  auto executable = mlir::shuttle::GpuExecutable::Load(*serialized);
+  ASSERT_TRUE(executable.ok()) << executable.status();
+
+  auto platform = stream_executor::PlatformManager::PlatformWithName("CUDA");
+  ASSERT_TRUE(platform.ok()) << platform.status();
+  auto executor = (*platform)->ExecutorForDevice(0);
+  ASSERT_TRUE(executor.ok()) << executor.status();
+  ASSERT_NE((*executor)->GetDeviceDescription().name().find("H100"),
+            std::string::npos);
+  auto stream = (*executor)->CreateStream();
+  ASSERT_TRUE(stream.ok()) << stream.status();
+  stream_executor::StreamExecutorAddressAllocator allocator(*executor);
+  const auto &capability =
+      (*executor)->GetDeviceDescription().gpu_compute_capability();
+  auto runner = mlir::shuttle::GpuRunner::Create(*serialized, &allocator, 0,
+                                                 stream->get(), &capability);
+  ASSERT_TRUE(runner.ok()) << runner.status();
+
+  constexpr int64_t rows = 2048;
+  constexpr int64_t features = 4096;
+  constexpr int64_t fullElements = rows * features;
+  const std::filesystem::path cases =
+      std::filesystem::path(caseRoot) / "heldout_splitmix64_v3";
+  auto read = [&](llvm::StringRef name,
+                  int64_t elements) -> std::vector<uint16_t> {
+    std::vector<uint16_t> values(elements);
+    std::ifstream input(cases / name.str(), std::ios::binary);
+    EXPECT_TRUE(input.good());
+    input.read(reinterpret_cast<char *>(values.data()),
+               values.size() * sizeof(uint16_t));
+    EXPECT_EQ(input.gcount(),
+              static_cast<std::streamsize>(values.size() * sizeof(uint16_t)));
+    EXPECT_EQ(input.peek(), std::ifstream::traits_type::eof());
+    return values;
+  };
+  std::vector<std::vector<uint16_t>> hostOperands{read("x.bf16", fullElements),
+                                                  read("gamma.bf16", features)};
+  if (boundary != "forward")
+    hostOperands.push_back(read("dy.bf16", fullElements));
+  std::vector<int64_t> resultElements;
+  if (boundary == "forward")
+    resultElements = {fullElements};
+  else if (boundary == "backward_recompute")
+    resultElements = {fullElements, features};
+  else
+    resultElements = {fullElements, fullElements, features};
+
+  std::vector<stream_executor::DeviceAddressBase> deviceOperands;
+  std::vector<stream_executor::DeviceAddressBase> deviceResults;
+  llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> operands;
+  llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> results;
+  for (const auto &host : hostOperands) {
+    auto device = (*executor)->AllocateArray<uint16_t>(host.size());
+    ASSERT_TRUE(device);
+    ASSERT_TRUE((*executor)
+                    ->SynchronousMemcpyH2D(
+                        host.data(), host.size() * sizeof(uint16_t), &device)
+                    .ok());
+    operands.push_back({device.opaque(), static_cast<int64_t>(device.size())});
+    deviceOperands.push_back(device);
+  }
+  std::vector<std::vector<uint16_t>> hostResults;
+  for (int64_t elements : resultElements) {
+    hostResults.emplace_back(elements);
+    auto device = (*executor)->AllocateArray<uint16_t>(elements);
+    ASSERT_TRUE(device);
+    std::vector<uint16_t> poison(elements, UINT16_C(0x7FC1));
+    ASSERT_TRUE((*executor)
+                    ->SynchronousMemcpyH2D(poison.data(),
+                                           poison.size() * sizeof(uint16_t),
+                                           &device)
+                    .ok());
+    results.push_back({device.opaque(), static_cast<int64_t>(device.size())});
+    deviceResults.push_back(device);
+  }
+
+  constexpr int64_t warmupIterations = 10;
+  constexpr int64_t measuredIterations = 20;
+  for (int64_t iteration = 0; iteration < warmupIterations; ++iteration)
+    ASSERT_TRUE((*runner)->Execute(operands, results).ok());
+  llvm::json::Array hostSamples;
+  for (int64_t iteration = 0; iteration < measuredIterations; ++iteration) {
+    auto start = std::chrono::steady_clock::now();
+    ASSERT_TRUE((*runner)->Execute(operands, results).ok());
+    int64_t elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - start)
+                          .count();
+    ASSERT_GT(elapsed, 0);
+    hostSamples.push_back(elapsed);
+  }
+  llvm::json::Array eventSamples;
+  for (int64_t iteration = 0; iteration < measuredIterations; ++iteration) {
+    auto elapsed = (*runner)->ExecuteTimed(operands, results);
+    ASSERT_TRUE(elapsed.ok()) << elapsed.status();
+    ASSERT_GT(*elapsed, 0);
+    eventSamples.push_back(*elapsed);
+  }
+
+  const std::filesystem::path outputDirectory =
+      std::filesystem::path(rawRoot) / policyName.str() / boundary.str() /
+      ("repeat-" + std::to_string(repeat));
+  ASSERT_TRUE(std::filesystem::create_directories(outputDirectory) ||
+              std::filesystem::is_directory(outputDirectory));
+  llvm::json::Array externalBindings;
+  llvm::StringRef operandRoles[] = {"x", "gamma", "dy"};
+  llvm::SmallVector<llvm::StringRef> resultRoles;
+  if (boundary == "forward")
+    resultRoles = {"y"};
+  else if (boundary == "backward_recompute")
+    resultRoles = {"dx", "dgamma"};
+  else
+    resultRoles = {"y", "dx", "dgamma"};
+  size_t resultIndex = 0;
+  for (const auto &binding : (*executable)->externalBindings()) {
+    llvm::json::Object record{
+        {"kind", binding.kind == mlir::shuttle::ExecutableBindingKind::Operand
+                     ? "operand"
+                     : "result"},
+        {"runner_index", binding.index},
+        {"slot_ordinal", binding.slotOrdinal},
+        {"required_bytes", binding.requiredBytes},
+        {"tensor_type", binding.requiredBytes == features * 2
+                            ? "bf16[4096]"
+                            : "bf16[2048,4096]"},
+        {"alignment", binding.alignment},
+    };
+    if (binding.kind == mlir::shuttle::ExecutableBindingKind::Operand) {
+      ASSERT_LT(binding.index, static_cast<int64_t>(std::size(operandRoles)));
+      record["role"] = operandRoles[binding.index];
+    } else {
+      ASSERT_LT(resultIndex, hostResults.size());
+      ASSERT_EQ(binding.index, static_cast<int64_t>(resultIndex));
+      record["role"] = resultRoles[resultIndex];
+      record["public_result_index"] = binding.index;
+      ASSERT_TRUE((*executor)
+                      ->SynchronousMemcpyD2H(deviceResults[resultIndex],
+                                             hostResults[resultIndex].size() *
+                                                 sizeof(uint16_t),
+                                             hostResults[resultIndex].data())
+                      .ok());
+      std::filesystem::path outputPath =
+          outputDirectory /
+          ("result-" + std::to_string(binding.index) + ".bf16");
+      std::ofstream output(outputPath, std::ios::binary | std::ios::trunc);
+      ASSERT_TRUE(output.good());
+      output.write(
+          reinterpret_cast<const char *>(hostResults[resultIndex].data()),
+          hostResults[resultIndex].size() * sizeof(uint16_t));
+      output.close();
+      ASSERT_TRUE(output.good());
+      auto bytes = llvm::ArrayRef<uint8_t>(
+          reinterpret_cast<const uint8_t *>(hostResults[resultIndex].data()),
+          hostResults[resultIndex].size() * sizeof(uint16_t));
+      record["artifact"] = llvm::json::Object{
+          {"path", outputPath.string()},
+          {"byte_count", static_cast<int64_t>(bytes.size())},
+          {"sha256", sha256(bytes)},
+      };
+      ++resultIndex;
+    }
+    externalBindings.push_back(std::move(record));
+  }
+  ASSERT_EQ(resultIndex, hostResults.size());
+
+  const auto &resources = (*runner)->resources();
+  llvm::json::Array ptxDigests;
+  for (const auto &launch : (*executable)->launches())
+    ptxDigests.push_back(launch.codeDigest);
+  llvm::json::Object raw{
+      {"schema", "shuttle_abi22_rmsnorm_representative_raw_cell_v1"},
+      {"policy", policyName},
+      {"boundary", boundary},
+      {"repeat", repeat},
+      {"runner_api",
+       llvm::json::Object{
+           {"host", "GpuRunner::Execute_BlockHostUntilDone"},
+           {"cuda_event", "GpuRunner::ExecuteTimed"},
+       }},
+      {"external_bindings", std::move(externalBindings)},
+      {"resources",
+       llvm::json::Object{
+           {"launch_count", resources.launchCount},
+           {"slot_count", resources.slotCount},
+           {"external_operand_count", resources.externalOperandCount},
+           {"external_result_count", resources.externalResultCount},
+           {"temporary_allocation_count", resources.temporaryAllocationCount},
+           {"temporary_bytes", resources.temporaryBytes},
+       }},
+      {"transport",
+       llvm::json::Object{
+           {"contract_operation_count", 0},
+           {"code_bytes",
+            static_cast<int64_t>((*executable)->codeBytes().size())},
+           {"executable_digest",
+            mlir::shuttle::gpuExecutableBundleDigest(*serialized)},
+           {"module_load_digest", sha256((*executable)->codeBytes())},
+           {"ptx_digests", std::move(ptxDigests)},
+       }},
+      {"timing",
+       llvm::json::Object{
+           {"warmup_iterations", warmupIterations},
+           {"measured_iterations", measuredIterations},
+           {"host_clock", "steady_clock_execute_block_host_until_done_ns"},
+           {"host_samples_ns", std::move(hostSamples)},
+           {"cuda_event_status", "supplemental_not_acceptance"},
+           {"cuda_event_samples_ns", std::move(eventSamples)},
+       }},
+  };
+  std::ofstream rawOutput(outputDirectory / "cell.json",
+                          std::ios::binary | std::ios::trunc);
+  ASSERT_TRUE(rawOutput.good());
+  rawOutput << llvm::formatv("{0}\n", llvm::json::Value(std::move(raw))).str();
+  rawOutput.close();
+  ASSERT_TRUE(rawOutput.good());
+
+  runner->reset();
+  for (auto &device : deviceResults)
+    (*executor)->Deallocate(&device);
+  for (auto &device : deviceOperands)
+    (*executor)->Deallocate(&device);
 }
 
 TEST(GpuTransportV2Test,
