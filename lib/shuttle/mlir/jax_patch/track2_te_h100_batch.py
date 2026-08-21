@@ -60,8 +60,7 @@ RUNTIME_LIBRARY_PATHS = {
     "cudnn": NVIDIA_SITE_PACKAGES / "cudnn/lib/libcudnn.so.9",
     "nccl": NVIDIA_SITE_PACKAGES / "nccl/lib/libnccl.so.2",
     "cudart": CUDA_ROOT / "lib64/libcudart.so.13",
-    "nvrtc": CUDA_ROOT / "lib64/libnvrtc.so.13",
-    "curand": CUDA_ROOT / "lib64/libcurand.so.10",
+    "nvrtc": NVIDIA_SITE_PACKAGES / "cuda_nvrtc/lib/libnvrtc.so.13",
 }
 RUNNER_SOURCE = Path("lib/shuttle/mlir/jax_patch/abi22_te_rmsnorm_oracle_runner_v2.cpp")
 XLA_RUNNER = Path("lib/shuttle/mlir/jax_patch/abi22_xla_rmsnorm_oracle_v2.py")
