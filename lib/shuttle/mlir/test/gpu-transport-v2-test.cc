@@ -4,7 +4,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <future>
@@ -15,6 +17,7 @@
 #include <sstream>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -39,6 +42,8 @@
 #include "xla/stream_executor/device_address_allocator.h"
 #include "xla/stream_executor/mock_stream.h"
 #include "xla/stream_executor/mock_stream_executor.h"
+#include "xla/stream_executor/platform_manager.h"
+#include "xla/stream_executor/stream_executor_address_allocator.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
@@ -4029,6 +4034,203 @@ TEST(GpuTransportV2Test,
     EXPECT_FALSE(mlir::shuttle::GpuRunner::Create(
                      *transport, &allocator, 0, &stream, &unsupported)
                      .ok());
+  }
+}
+
+uint16_t roundToBf16(float value) {
+  uint32_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  bits += UINT32_C(0x7fff) + ((bits >> 16) & 1);
+  return static_cast<uint16_t>(bits >> 16);
+}
+
+float expandBf16(uint16_t value) {
+  uint32_t bits = static_cast<uint32_t>(value) << 16;
+  float result;
+  std::memcpy(&result, &bits, sizeof(result));
+  return result;
+}
+
+std::vector<uint16_t> rmsNormForwardReference(
+    llvm::ArrayRef<uint16_t> x, llvm::ArrayRef<uint16_t> weight,
+    int64_t rows, int64_t features) {
+  std::vector<uint16_t> result(x.size());
+  for (int64_t row = 0; row < rows; ++row) {
+    float squareSum = 0.0f;
+    for (int64_t feature = 0; feature < features; ++feature) {
+      float value = expandBf16(x[row * features + feature]);
+      squareSum += value * value;
+    }
+    float inverseRoot =
+        1.0f / std::sqrt(squareSum / static_cast<float>(features) + 1e-6f);
+    for (int64_t feature = 0; feature < features; ++feature) {
+      float value = expandBf16(x[row * features + feature]);
+      float scale = expandBf16(weight[feature]);
+      result[row * features + feature] =
+          roundToBf16(value * inverseRoot * scale);
+    }
+  }
+  return result;
+}
+
+std::pair<std::vector<uint16_t>, std::vector<uint16_t>>
+rmsNormBackwardReference(llvm::ArrayRef<uint16_t> x,
+                         llvm::ArrayRef<uint16_t> weight,
+                         llvm::ArrayRef<uint16_t> cotangent, int64_t rows,
+                         int64_t features) {
+  std::vector<uint16_t> inputCotangent(x.size());
+  std::vector<float> weightCotangent(features, 0.0f);
+  for (int64_t row = 0; row < rows; ++row) {
+    float squareSum = 0.0f;
+    for (int64_t feature = 0; feature < features; ++feature) {
+      float value = expandBf16(x[row * features + feature]);
+      squareSum += value * value;
+    }
+    float inverseRoot =
+        1.0f / std::sqrt(squareSum / static_cast<float>(features) + 1e-6f);
+    float innerProduct = 0.0f;
+    for (int64_t feature = 0; feature < features; ++feature) {
+      float value = expandBf16(x[row * features + feature]);
+      float upstream = expandBf16(cotangent[row * features + feature]);
+      float scale = expandBf16(weight[feature]);
+      innerProduct += value * upstream * scale;
+      weightCotangent[feature] += upstream * value * inverseRoot;
+    }
+    float derivativeScale = inverseRoot * inverseRoot * inverseRoot /
+                            static_cast<float>(features);
+    for (int64_t feature = 0; feature < features; ++feature) {
+      float value = expandBf16(x[row * features + feature]);
+      float upstream = expandBf16(cotangent[row * features + feature]);
+      float scale = expandBf16(weight[feature]);
+      inputCotangent[row * features + feature] = roundToBf16(
+          upstream * scale * inverseRoot -
+          value * derivativeScale * innerProduct);
+    }
+  }
+  std::vector<uint16_t> roundedWeightCotangent(features);
+  for (int64_t feature = 0; feature < features; ++feature)
+    roundedWeightCotangent[feature] =
+        roundToBf16(weightCotangent[feature]);
+  return {std::move(inputCotangent), std::move(roundedWeightCotangent)};
+}
+
+TEST(GpuTransportV2Test,
+     H100RunnerMatchesIndependentRmsNormForwardAndVjpOracle) {
+  if (std::getenv("SHUTTLE_RUN_H100_NUMERICS") == nullptr)
+    GTEST_SKIP() << "set SHUTTLE_RUN_H100_NUMERICS=1 on an H100 worker";
+
+  auto platform = stream_executor::PlatformManager::PlatformWithName("CUDA");
+  ASSERT_TRUE(platform.ok()) << platform.status();
+  auto executor = (*platform)->ExecutorForDevice(0);
+  ASSERT_TRUE(executor.ok()) << executor.status();
+  ASSERT_NE((*executor)->GetDeviceDescription().name().find("H100"),
+            std::string::npos);
+  auto stream = (*executor)->CreateStream();
+  ASSERT_TRUE(stream.ok()) << stream.status();
+  stream_executor::StreamExecutorAddressAllocator allocator(*executor);
+  const auto &capability =
+      (*executor)->GetDeviceDescription().gpu_compute_capability();
+
+  constexpr int64_t rows = 14;
+  constexpr int64_t features = 19;
+  std::vector<uint16_t> x(rows * features);
+  std::vector<uint16_t> weight(features);
+  std::vector<uint16_t> cotangent(rows * features);
+  for (size_t index = 0; index < x.size(); ++index)
+    x[index] = roundToBf16(-0.75f + 1.625f * index / (x.size() - 1));
+  for (size_t index = 0; index < weight.size(); ++index)
+    weight[index] =
+        roundToBf16(0.5f + 0.75f * index / (weight.size() - 1));
+  for (size_t index = 0; index < cotangent.size(); ++index)
+    cotangent[index] =
+        roundToBf16(-0.5f + 1.125f * index / (cotangent.size() - 1));
+
+  constexpr llvm::StringLiteral options =
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+  constexpr llvm::StringLiteral tuning =
+      R"json({"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json";
+  for (bool backward : {false, true}) {
+    SCOPED_TRACE(backward ? "VJP" : "forward");
+    auto source = fixtureSource(
+        backward
+            ? "jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-"
+              "backward.mlir"
+            : "jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-"
+              "forward.mlir");
+    ASSERT_TRUE(source);
+    auto built = buildFixture(*source,
+                              mlir::shuttle::NumericalPolicy::SourceOrdered,
+                              options, tuning);
+    ASSERT_TRUE(built);
+    auto transport =
+        mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+    ASSERT_TRUE(mlir::succeeded(transport));
+    auto runner = mlir::shuttle::GpuRunner::Create(
+        *transport, &allocator, 0, stream->get(), &capability);
+    ASSERT_TRUE(runner.ok()) << runner.status();
+    EXPECT_EQ((*runner)->resources().launchCount, backward ? 3 : 1);
+
+    std::vector<std::vector<uint16_t>> hostOperands{x, weight};
+    if (backward)
+      hostOperands.push_back(cotangent);
+    std::vector<std::vector<uint16_t>> hostResults;
+    hostResults.emplace_back(x.size());
+    if (backward)
+      hostResults.emplace_back(weight.size());
+    std::vector<stream_executor::DeviceAddressBase> deviceOperands;
+    std::vector<stream_executor::DeviceAddressBase> deviceResults;
+    llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> operands;
+    llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> results;
+    for (const auto &host : hostOperands) {
+      auto device = (*executor)->AllocateArray<uint16_t>(host.size());
+      ASSERT_TRUE(device);
+      ASSERT_TRUE(stream->get()
+                      ->Memcpy(&device, host.data(), host.size() * sizeof(uint16_t))
+                      .ok());
+      deviceOperands.push_back(device);
+      operands.push_back(
+          {device.opaque(), static_cast<int64_t>(device.size())});
+    }
+    for (auto &host : hostResults) {
+      auto device = (*executor)->AllocateArray<uint16_t>(host.size());
+      ASSERT_TRUE(device);
+      deviceResults.push_back(device);
+      results.push_back(
+          {device.opaque(), static_cast<int64_t>(device.size())});
+    }
+    ASSERT_TRUE((*runner)->Execute(operands, results).ok());
+    ASSERT_TRUE((*runner)->AwaitCompletion().ok());
+    for (auto [index, host] : llvm::enumerate(hostResults))
+      ASSERT_TRUE(stream->get()
+                      ->Memcpy(host.data(), deviceResults[index],
+                               host.size() * sizeof(uint16_t))
+                      .ok());
+    ASSERT_TRUE(stream->get()->BlockHostUntilDone().ok());
+
+    std::vector<std::vector<uint16_t>> expected;
+    if (backward) {
+      auto [dx, dw] = rmsNormBackwardReference(x, weight, cotangent, rows,
+                                               features);
+      expected = {std::move(dx), std::move(dw)};
+    } else {
+      expected = {rmsNormForwardReference(x, weight, rows, features)};
+    }
+    ASSERT_EQ(hostResults.size(), expected.size());
+    for (auto [resultIndex, actual] : llvm::enumerate(hostResults)) {
+      ASSERT_EQ(actual.size(), expected[resultIndex].size());
+      for (auto [element, actualBits] : llvm::enumerate(actual)) {
+        float actualValue = expandBf16(actualBits);
+        float expectedValue = expandBf16(expected[resultIndex][element]);
+        float tolerance = std::max(0.015625f, std::abs(expectedValue) * 0.02f);
+        EXPECT_NEAR(actualValue, expectedValue, tolerance)
+            << "result " << resultIndex << " element " << element;
+      }
+    }
+    runner->reset();
+    for (auto &device : deviceResults)
+      (*executor)->Deallocate(&device);
+    for (auto &device : deviceOperands)
+      (*executor)->Deallocate(&device);
   }
 }
 

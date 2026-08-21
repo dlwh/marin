@@ -391,6 +391,8 @@ cc_test(
         "@xla//xla/stream_executor:device_address_allocator",
         "@xla//xla/stream_executor:mock_stream",
         "@xla//xla/stream_executor:mock_stream_executor",
+        "@xla//xla/stream_executor:platform_manager",
+        "@xla//xla/stream_executor:stream_executor_address_allocator",
         "@bazel_tools//tools/cpp/runfiles",
     ],
 )
