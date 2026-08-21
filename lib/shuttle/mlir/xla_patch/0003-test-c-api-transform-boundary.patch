@@ -1,6 +1,7 @@
 --- a/xla/pjrt/c_api_client/pjrt_c_api_client_test.cc
 +++ b/xla/pjrt/c_api_client/pjrt_c_api_client_test.cc
-@@ -32,6 +32,7 @@
+@@ -32,6 +32,8 @@
++#include "absl/cleanup/cleanup.h"
  #include "absl/synchronization/blocking_counter.h"
  #include "absl/types/span.h"
  #include "llvm/ADT/StringRef.h"
