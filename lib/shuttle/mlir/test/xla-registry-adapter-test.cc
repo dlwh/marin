@@ -164,14 +164,22 @@ TEST(ShuttleXlaRegistryAdapterTest,
   EXPECT_NE(transformed.find("shuttle.gpu.executable_bundle.v2"),
             std::string::npos);
   mlir::Operation *customCall = nullptr;
+  int64_t customCallCount = 0;
   module->walk([&](mlir::Operation *operation) {
-    if (operation->getName().getStringRef() == "stablehlo.custom_call")
+    if (operation->getName().getStringRef() == "stablehlo.custom_call") {
       customCall = operation;
+      ++customCallCount;
+    }
   });
+  EXPECT_EQ(customCallCount, 1);
   ASSERT_NE(customCall, nullptr);
   auto backendConfig =
       customCall->getAttrOfType<mlir::DictionaryAttr>("backend_config");
   ASSERT_TRUE(backendConfig);
+  auto deviceSchemaVersion =
+      backendConfig.getAs<mlir::IntegerAttr>("device_schema_version");
+  ASSERT_TRUE(deviceSchemaVersion);
+  EXPECT_EQ(deviceSchemaVersion.getInt(), 4);
   auto bundleBytes = backendConfig.getAs<mlir::StringAttr>("bundle_bytes");
   ASSERT_TRUE(bundleBytes);
   llvm::StringRef serialized = bundleBytes.getValue();
