@@ -33,6 +33,7 @@ from track1_rmsnorm_contract_numerical_policy import (
 from shuttle import ExecutionMode, Materialization, Numerics, Tuning, compiler_options
 
 MAX_CELL_REPORT_BYTES = 4096
+MAX_PRIMAL_CHECKPOINT_BYTES = 4096
 
 
 class Boundary(StrEnum):
@@ -468,12 +469,14 @@ def _execute(
 def run_matrix(
     *,
     report_cell: Callable[[dict[str, object]], None] | None = None,
+    report_primal_checkpoint: Callable[[dict[str, object]], None] | None = None,
 ) -> tuple[CoordinateResult, ...]:
     """Execute all 12 coordinates on one H100."""
     require_h100()
     load_numerical_policy()
     results = []
     disabled_results: dict[tuple[tuple[int, int, int], Boundary], tuple[np.ndarray, ...]] = {}
+    primal_coordinate_count = len(SHAPES) * len(Mode)
     for coordinate in Coordinate.all():
         arrays, repeated, snapshot = _execute(coordinate)
         key = (coordinate.shape, coordinate.boundary)
@@ -492,7 +495,53 @@ def run_matrix(
                 report_cell=report_cell,
             )
         )
+        if len(results) == primal_coordinate_count and report_primal_checkpoint is not None:
+            report_primal_checkpoint(primal_checkpoint_document(tuple(results)))
     return tuple(results)
+
+
+def primal_checkpoint_document(results: tuple[CoordinateResult, ...]) -> dict[str, object]:
+    """Return the bounded canonical evidence completed before composed execution."""
+    expected = [Coordinate(shape, Boundary.PRIMAL, mode) for shape in SHAPES for mode in Mode]
+    if [result.coordinate for result in results] != expected:
+        raise ValueError("RMSNorm Contract primal checkpoint coordinate order differs")
+    coordinates = []
+    for result in results:
+        observer = result.observer
+        coordinates.append(
+            {
+                "analytic_oracle": result.analytic_oracle["result"],
+                "disabled_jax_equal": result.disabled_jax_equal["result"],
+                "mode": result.coordinate.mode.value,
+                "numerics": result.numerics["result"],
+                "observer": (
+                    None
+                    if observer is None
+                    else {
+                        "final_module_sha256": observer.final_module_sha256,
+                        "generated_bundle_sha256": observer.generated_bundle_sha256,
+                        "invocation_id": observer.invocation_id,
+                        "launch_count": observer.launch_count,
+                        "temporary_count": observer.temporary_count,
+                        "topology_status": observer.topology_status,
+                    }
+                ),
+                "repeat_bitwise_equal": result.repeat_results == result.results,
+                "result": result.results["result"],
+                "shape": list(result.coordinate.shape),
+            }
+        )
+    document = {
+        "coordinates": coordinates,
+        "numerical_policy_sha256": POLICY_SHA256,
+        "schema": "track1_rmsnorm_contract_h100_primal_checkpoint",
+        "schema_version": 1,
+    }
+    if len(json.dumps(document, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()) >= (
+        MAX_PRIMAL_CHECKPOINT_BYTES
+    ):
+        raise RuntimeError("RMSNorm Contract primal checkpoint exceeds its bounded size")
+    return document
 
 
 def result_document(results: tuple[CoordinateResult, ...]) -> dict[str, object]:

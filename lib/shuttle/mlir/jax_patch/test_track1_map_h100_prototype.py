@@ -306,7 +306,12 @@ def test_dry_run_renders_one_network_hydration_then_offline_build_and_four_worke
     assert phases[9]["argv"][phases[9]["argv"].index("--role") + 1] == "populate"
     assert phases[10]["argv"][phases[10]["argv"].index("--role") + 1] == "reuse"
     assert phases[11]["argv"][-2:] == ["--output", str(workspace / "rmsnorm.json")]
-    assert phases[12]["argv"][-2:] == ["--output", str(workspace / "rmsnorm-contract.json")]
+    assert phases[12]["argv"][-4:] == [
+        "--output",
+        str(workspace / "rmsnorm-contract.json"),
+        "--primal-checkpoint",
+        str(workspace / "rmsnorm-contract-primal.json"),
+    ]
     assert not workspace.exists()
 
     workspace.mkdir()
