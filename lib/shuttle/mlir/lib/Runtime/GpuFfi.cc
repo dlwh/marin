@@ -263,8 +263,6 @@ prepare(InstantiateState *state, se::DeviceAddressAllocator *allocator,
       prepared->slots[slot.ordinal] =
           se::DeviceAddressBase(address->second.opaque(), slot.requiredBytes);
     }
-    if (prepared->temporaries.empty())
-      return invalid("GPU executable has no temporary allocations");
     return prepared;
   } catch (const std::bad_alloc &) {
     return absl::ResourceExhaustedError(

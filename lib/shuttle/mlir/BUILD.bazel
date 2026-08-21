@@ -6,6 +6,8 @@ load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("@xla//xla:lit.bzl", "lit_test_suite")
+load("@xla//third_party/rules_python/python:py_test.bzl", "py_test")
+load("@xla//xla/tsl/platform/default:cuda_build_defs.bzl", "if_cuda_is_configured")
 
 package(
     default_visibility = ["//visibility:public"],
@@ -128,6 +130,7 @@ cc_library(
         ":ShuttleDialect",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/time",
         "@llvm-project//llvm:Support",
         "@llvm-project//mlir:IR",
         "@llvm-project//mlir:Support",
@@ -152,6 +155,27 @@ cc_library(
         "@xla//xla/stream_executor:device_address_allocator",
         "@xla//xla/stream_executor:kernel",
         "@xla//xla/stream_executor:kernel_spec",
+        "@xla//xla/stream_executor:stream",
+    ],
+)
+
+cc_library(
+    name = "ShuttleGpuRunner",
+    srcs = ["lib/Runtime/GpuRunner.cc"],
+    hdrs = ["include/shuttle/Runtime/GpuRunner.h"],
+    strip_include_prefix = "include",
+    deps = [
+        ":ShuttleGpuExecutable",
+        ":ShuttleGpuFfi",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:IR",
+        "@xla//xla/ffi",
+        "@xla//xla/ffi:invoke",
+        "@xla//xla/stream_executor:device_address_allocator",
+        "@xla//xla/stream_executor:device_description",
+        "@xla//xla/stream_executor:event_based_timer",
         "@xla//xla/stream_executor:stream",
     ],
 )
@@ -348,12 +372,15 @@ cc_test(
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-3x2x5x11x263-forward.mlir",
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-3x2x5x11x263-backward.mlir",
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-3x2x5x11x263-composed.mlir",
+        "test/Inputs/jax-0.10.1-bf16-rmsnorm_contract-5x19x7-forward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-rmsnorm_contract-5x19x257-forward.mlir",
         "test/Inputs/jax-0.10.1-bf16-row_fold_scale_44d152ecc3e9ff18-forward.mlir",
     ],
     deps = [
         ":ShuttleDialect",
         ":ShuttleGpuExecutable",
         ":ShuttleGpuFfi",
+        ":ShuttleGpuRunner",
         ":ShuttlePasses",
         "@com_google_googletest//:gtest_main",
         "@llvm-project//llvm:Support",
@@ -370,8 +397,52 @@ cc_test(
         "@xla//xla/stream_executor:device_address_allocator",
         "@xla//xla/stream_executor:mock_stream",
         "@xla//xla/stream_executor:mock_stream_executor",
+        "@xla//xla/stream_executor:platform_manager",
+        "@xla//xla/stream_executor:stream_executor_address_allocator",
         "@bazel_tools//tools/cpp/runfiles",
+    ] + if_cuda_is_configured([
+        "@xla//xla/stream_executor/cuda:cuda_platform",
+    ]),
+)
+
+sh_test(
+    name = "gpu_transport_v2_h100_numerics_test",
+    srcs = ["test/run-h100-rmsnorm-numerics.sh"],
+    args = ["$(rootpath :gpu_transport_v2_test)"],
+    data = [":gpu_transport_v2_test"],
+    tags = [
+        "h100",
+        "manual",
+        "requires-gpu-nvidia",
     ],
+)
+
+sh_test(
+    name = "gpu_transport_v2_h100_performance_test",
+    srcs = ["test/run-h100-performance.sh"],
+    args = [
+        "$(rootpath :gpu_transport_v2_test)",
+        "$(rootpath jax_patch/abi22_h100_performance.py)",
+    ],
+    data = [
+        ":gpu_transport_v2_test",
+        "jax_patch/abi22_h100_performance.py",
+    ],
+    tags = [
+        "h100",
+        "manual",
+        "requires-gpu-nvidia",
+    ],
+)
+
+py_test(
+    name = "abi22_h100_performance_protocol_test",
+    srcs = [
+        "jax_patch/abi22_h100_performance.py",
+        "jax_patch/test_abi22_h100_performance.py",
+    ],
+    imports = ["jax_patch"],
+    main = "jax_patch/test_abi22_h100_performance.py",
 )
 
 cc_test(
@@ -380,6 +451,46 @@ cc_test(
     data = ["test/Inputs/abi19-bf16-terminal-fold-exp.mlir"],
     deps = [
         ":ShuttleDialect",
+        ":ShuttlePasses",
+        "@com_google_googletest//:gtest_main",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:ArithDialect",
+        "@llvm-project//mlir:FuncDialect",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:MathDialect",
+        "@llvm-project//mlir:Parser",
+        "@llvm-project//mlir:Pass",
+        "@stablehlo//:register",
+        "@bazel_tools//tools/cpp/runfiles",
+    ],
+)
+
+cc_test(
+    name = "abi22_map_fusion_contract_test",
+    srcs = ["test/abi22-map-fusion-contract-test.cc"],
+    data = [
+        "test/Inputs/abi22-map-fusion-source-order.mlir",
+        "test/Inputs/jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-backward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-composed.mlir",
+        "test/Inputs/jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-forward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-backward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-composed.mlir",
+        "test/Inputs/jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-forward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-backward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-composed.mlir",
+        "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-forward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-3x2x5x11x263-backward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-3x2x5x11x263-composed.mlir",
+        "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-3x2x5x11x263-forward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-rmsnorm_contract-3x2x5x11x263x521-forward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-rmsnorm_contract-5x19x257-forward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-rmsnorm_contract-5x19x7-forward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-rmsnorm_contract-5x19x9-forward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-rmsnorm_contract-5x65x7-forward.mlir",
+    ],
+    deps = [
+        ":ShuttleDialect",
+        ":ShuttleGpuExecutable",
         ":ShuttlePasses",
         "@com_google_googletest//:gtest_main",
         "@llvm-project//llvm:Support",
