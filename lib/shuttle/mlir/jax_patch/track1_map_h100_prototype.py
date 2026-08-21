@@ -38,7 +38,7 @@ BASE_IMAGE = (
     "@sha256:2efa83fbf8f2073a4175eef919a9f0c6c2db435d7c1ec9ed79017e1ea0d10cef"
 )
 BAZEL_VERSION = "7.7.0"
-BAZEL_SHA256 = "953f1235a590546a4a9a83d757c075ecf7c7d8dbc30221fd086959a20d8c7a69"
+BAZEL_SHA256 = "fe7e799cbc9140f986b063e06800a3d4c790525075c877d00a7112669824acbf"
 BAZEL_URL = f"https://github.com/bazelbuild/bazel/releases/download/{BAZEL_VERSION}/bazel-{BAZEL_VERSION}-linux-x86_64"
 JAX_URL = "https://github.com/jax-ml/jax.git"
 XLA_URL = "https://github.com/openxla/xla.git"
@@ -585,8 +585,9 @@ def execute_prototype(
         cwd=None,
         log=paths.logs / "bazel-fetch.log",
     )
-    if _sha256_file(paths.bazel) != BAZEL_SHA256:
-        raise RuntimeError("hydrated Bazel bytes differ from authorization")
+    observed_bazel_sha256 = _sha256_file(paths.bazel)
+    if observed_bazel_sha256 != BAZEL_SHA256:
+        raise RuntimeError(f"hydrated Bazel SHA-256 differs: expected {BAZEL_SHA256}, observed {observed_bazel_sha256}")
     paths.bazel.chmod(0o755)
     paths.image_identity.write_text(BASE_IMAGE + "\n")
 

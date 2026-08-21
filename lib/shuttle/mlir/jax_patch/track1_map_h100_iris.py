@@ -31,7 +31,6 @@ from track1_map_h100_prototype import (
     require_source_bundle,
 )
 
-JOB_NAME = JobName.root("dlwh", "shuttle-track1-map-h100-prototype").to_wire()
 AUTHORIZATION_RELATIVE = Path("scripts/shuttle/track1_map_h100_prototype_authorization.json")
 REQUEST_SCHEMA = "track1_map_h100_iris_launch_request"
 WORKSPACE = Path("/tmp/shuttle-track1-map-h100-prototype")
@@ -43,6 +42,14 @@ CLIENT_REVISION_DATE = client_revision_date()
 FILE_MODE = 0o644
 ZIP_DATE = (1980, 1, 1, 0, 0, 0)
 SHA256 = re.compile(r"[0-9a-f]{64}")
+MAX_RETRY = 9999
+
+
+def job_name(retry: int) -> str:
+    """Return the deterministic Iris job identity for one retry ordinal."""
+    if type(retry) is not int or retry < 1 or retry > MAX_RETRY:
+        raise ValueError(f"retry must be a positive integer no greater than {MAX_RETRY}")
+    return JobName.root("dlwh", f"shuttle-track1-map-h100-prototype-r{retry}").to_wire()
 
 
 def _entrypoint_command(approved_authorization_sha256: str) -> list[str]:
@@ -120,6 +127,7 @@ def build_launch_request(
     bundle_root: Path,
     authorization_path: Path,
     approved_authorization_sha256: str,
+    retry: int,
 ) -> controller_pb2.Controller.LaunchJobRequest:
     """Build the real Iris request without constructing a client or issuing an RPC."""
     if bundle_root.is_symlink() or not bundle_root.is_dir():
@@ -138,7 +146,7 @@ def build_launch_request(
         device=gpu_device("H100", 1),
     ).to_proto()
     request = controller_pb2.Controller.LaunchJobRequest(
-        name=JOB_NAME,
+        name=job_name(retry),
         entrypoint=entrypoint,
         resources=resources,
         environment=environment,
@@ -155,7 +163,7 @@ def build_launch_request(
     request.timeout.CopyFrom(duration_to_proto(TIMEOUT))
     request.bundle_id = content_id(blob)
     request.bundle_blob = blob
-    validate_launch_request(request, approved_authorization_sha256=approved_authorization_sha256)
+    validate_launch_request(request, approved_authorization_sha256=approved_authorization_sha256, retry=retry)
     return request
 
 
@@ -238,12 +246,13 @@ def validate_launch_request(
     request: controller_pb2.Controller.LaunchJobRequest,
     *,
     approved_authorization_sha256: str,
+    retry: int,
 ) -> None:
     """Validate every execution-affecting field in a decoded Iris request."""
     if SHA256.fullmatch(approved_authorization_sha256) is None:
         raise ValueError("LaunchJobRequest approval SHA-256 is invalid")
     _require_no_unknown_fields(request, "root")
-    if request.name != JOB_NAME:
+    if request.name != job_name(retry):
         raise ValueError("LaunchJobRequest job name differs")
     if request.task_image != BASE_IMAGE or request.bundle_init_image:
         raise ValueError("LaunchJobRequest task or staging image differs")
@@ -295,6 +304,7 @@ def decode_launch_request(
     raw: bytes,
     *,
     approved_authorization_sha256: str,
+    retry: int,
 ) -> controller_pb2.Controller.LaunchJobRequest:
     """Parse canonical protobuf bytes and revalidate their complete launch scope."""
     request = controller_pb2.Controller.LaunchJobRequest()
@@ -304,7 +314,7 @@ def decode_launch_request(
         raise ValueError("LaunchJobRequest protobuf is malformed") from error
     if request.SerializeToString(deterministic=True) != raw:
         raise ValueError("LaunchJobRequest protobuf is not canonical")
-    validate_launch_request(request, approved_authorization_sha256=approved_authorization_sha256)
+    validate_launch_request(request, approved_authorization_sha256=approved_authorization_sha256, retry=retry)
     return request
 
 
@@ -312,8 +322,9 @@ def _request_summary(
     raw: bytes,
     *,
     approved_authorization_sha256: str,
+    retry: int,
 ) -> dict[str, object]:
-    request = decode_launch_request(raw, approved_authorization_sha256=approved_authorization_sha256)
+    request = decode_launch_request(raw, approved_authorization_sha256=approved_authorization_sha256, retry=retry)
     return {
         "authorization_sha256": approved_authorization_sha256,
         "bundle_sha256": request.bundle_id,
@@ -323,6 +334,7 @@ def _request_summary(
         "job_name": request.name,
         "request_sha256": hashlib.sha256(raw).hexdigest(),
         "request_size": len(raw),
+        "retry": retry,
         "schema": REQUEST_SCHEMA,
         "schema_version": 1,
     }
@@ -349,6 +361,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bundle-root", type=Path)
     parser.add_argument("--authorization-file", type=Path)
     parser.add_argument("--approved-authorization-sha256")
+    parser.add_argument("--retry", type=int)
     parser.add_argument("--request-output", type=Path)
     arguments = parser.parse_args(argv)
     if not arguments.dry_run:
@@ -357,6 +370,7 @@ def main(argv: list[str] | None = None) -> int:
         "bundle root": arguments.bundle_root,
         "authorization file": arguments.authorization_file,
         "approved authorization SHA-256": arguments.approved_authorization_sha256,
+        "retry": arguments.retry,
         "request output": arguments.request_output,
     }
     missing = [name for name, value in required.items() if value is None]
@@ -366,9 +380,14 @@ def main(argv: list[str] | None = None) -> int:
         bundle_root=arguments.bundle_root,
         authorization_path=arguments.authorization_file,
         approved_authorization_sha256=arguments.approved_authorization_sha256,
+        retry=arguments.retry,
     )
     raw = request.SerializeToString(deterministic=True)
-    summary = _request_summary(raw, approved_authorization_sha256=arguments.approved_authorization_sha256)
+    summary = _request_summary(
+        raw,
+        approved_authorization_sha256=arguments.approved_authorization_sha256,
+        retry=arguments.retry,
+    )
     _write_create_only(arguments.request_output, raw)
     print(canonical_json(summary).decode(), end="")
     return 0

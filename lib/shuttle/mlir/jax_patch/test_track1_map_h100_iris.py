@@ -74,6 +74,7 @@ def test_dry_run_emits_and_decodes_the_real_fail_closed_launch_request(
     assert summary["bundle_sha256"] == request.bundle_id
     assert summary["authorization_sha256"] == approved
     assert summary["job_name"] == job_name(1)
+    assert summary["retry"] == 1
 
     assert request.name == "/dlwh/shuttle-track1-map-h100-prototype-r1"
     assert request.client_revision_date == CLIENT_REVISION_DATE
