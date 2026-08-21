@@ -27,10 +27,12 @@ JAX_PATCH_SHA256 = (
 XLA_PATCH_NAMES = (
     "0001-add-stablehlo-module-transform-hook.patch",
     "0002-anchor-lit-labels-to-xla-repository.patch",
+    "0003-test-c-api-transform-boundary.patch",
 )
 XLA_PATCH_SHA256 = (
     "8e50020606758a431f7e96b80e2720ef5ca40986746449cc6a20ab6ae9c7bb1e",
     "e4f3121f3123d7e2ee781cc5ee92f1ddeb0df662b6702d37615bcae821ecbc99",
+    "a0aa22a0c4189be6a76c3ad4969b2983ea3c6f84cc277ab7ecfbd786581c0151",
 )
 HERMETIC_CUDA_VERSION = "13.0.0"
 HERMETIC_CUDA_COMPUTE_CAPABILITIES = ("9.0",)

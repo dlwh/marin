@@ -14,6 +14,7 @@
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/Parser/Parser.h"
 #include "shuttle/Transforms/Observer.h"
+#include "shuttle/Transforms/XlaRegistration.h"
 #include "stablehlo/dialect/Register.h"
 #include "xla/pjrt/stablehlo_module_transform.h"
 #include "llvm/ADT/StringRef.h"
@@ -86,6 +87,7 @@ std::string moduleText(mlir::ModuleOp module) {
 
 TEST(ShuttleXlaRegistryAdapterTest,
      RegistersAndRunsTheExactObservedPipelineTransactionally) {
+  ASSERT_TRUE(mlir::shuttle::registerShuttleXlaTransform().ok());
   auto observer = std::make_shared<RecordingObserver>();
   auto subscription = mlir::shuttle::subscribeShuttlePipelineObserver(observer);
   mlir::MLIRContext context;

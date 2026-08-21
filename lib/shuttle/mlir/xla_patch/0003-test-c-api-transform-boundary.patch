@@ -1,0 +1,83 @@
+--- a/xla/pjrt/c_api_client/pjrt_c_api_client_test.cc
++++ b/xla/pjrt/c_api_client/pjrt_c_api_client_test.cc
+@@ -34,0 +35 @@
++#include "mlir/IR/BuiltinAttributes.h"
+@@ -59,0 +61,2 @@
++#include "xla/pjrt/proto/compile_options.pb.h"
++#include "xla/pjrt/stablehlo_module_transform.h"
+@@ -481,0 +485,68 @@
++TEST(PjRtClientTest, AppliesRegisteredStableHloTransformBeforePluginBoundary) {
++  SetUpCpuPjRtApi();
++  TF_ASSERT_OK_AND_ASSIGN(const PJRT_Api* c_api, pjrt::PjrtApi("cpu"));
++  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<PjRtClient> client,
++                          GetCApiClient("cpu"));
++  TF_ASSERT_OK(StablehloModuleTransformRegistry::Global().Register(
++      "shuttle", [](mlir::ModuleOp module, absl::string_view options) {
++        if (options != "test-options") {
++          return absl::InvalidArgumentError("unexpected transform options");
++        }
++        module->setAttr("test.shuttle_applied",
++                        mlir::UnitAttr::get(module.getContext()));
++        return absl::OkStatus();
++      }));
++
++  static auto PJRT_Client_Compile_Orig = c_api->PJRT_Client_Compile;
++  static bool saw_transformed_module = false;
++  static bool saw_consumed_options = false;
++  saw_transformed_module = false;
++  saw_consumed_options = false;
++  const_cast<PJRT_Api*>(c_api)->PJRT_Client_Compile =
++      [](PJRT_Client_Compile_Args* args) -> PJRT_Error* {
++    mlir::MLIRContext context;
++    auto module = ParseMlirModuleString(
++        llvm::StringRef(args->program->code, args->program->code_size),
++        context);
++    saw_transformed_module =
++        module.ok() && (*module)->hasAttr("test.shuttle_applied");
++
++    CompileOptionsProto options_proto;
++    if (options_proto.ParseFromArray(args->compile_options,
++                                     args->compile_options_size)) {
++      bool has_shuttle_override = false;
++      for (const auto& entry : options_proto.env_option_overrides()) {
++        has_shuttle_override |= entry.first == "xla_shuttle_enable" ||
++                                entry.first == "xla_shuttle_options";
++      }
++      saw_consumed_options =
++          !options_proto.executable_build_options()
++               .debug_options()
++               .xla_shuttle_enable() &&
++          !has_shuttle_override;
++    }
++    return PJRT_Client_Compile_Orig(args);
++  };
++  auto restore_compile = absl::MakeCleanup([c_api] {
++    const_cast<PJRT_Api*>(c_api)->PJRT_Client_Compile =
++        PJRT_Client_Compile_Orig;
++  });
++
++  constexpr char kProgram[] = "func.func @main() {return}";
++  auto context = std::make_unique<mlir::MLIRContext>();
++  TF_ASSERT_OK_AND_ASSIGN(mlir::OwningOpRef<mlir::ModuleOp> module,
++                          ParseMlirModuleString(kProgram, *context));
++  CompileOptions options;
++  options.env_option_overrides = {{"xla_shuttle_enable", true},
++                                  {"xla_shuttle_options",
++                                   std::string("test-options")}};
++  TF_ASSERT_OK_AND_ASSIGN(
++      std::unique_ptr<PjRtLoadedExecutable> executable,
++      client->CompileAndLoad(
++          MaybeOwningMlirModule(std::move(context), std::move(module)),
++          options));
++  EXPECT_NE(executable, nullptr);
++  EXPECT_TRUE(saw_transformed_module);
++  EXPECT_TRUE(saw_consumed_options);
++}
++
+--- a/xla/pjrt/c_api_client/BUILD
++++ b/xla/pjrt/c_api_client/BUILD
+@@ -175,0 +176,2 @@
++        "//xla/pjrt:stablehlo_module_transform",
++        "//xla/pjrt/proto:compile_options_proto",
+@@ -186,0 +189 @@
++        "@com_google_absl//absl/cleanup",
