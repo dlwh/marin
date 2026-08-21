@@ -6,8 +6,6 @@
 import argparse
 from pathlib import Path
 
-from track1_map_h100_prototype import canonical_json, execute_prototype, load_authorization, prototype_plan
-
 
 def require_launch_ready() -> None:
     """Stop before importing JAX, starting a process, or discovering a device."""
@@ -30,6 +28,16 @@ def main(argv: list[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     if arguments.require_launch_ready or arguments.authorization_file is None:
         require_launch_ready()
+
+    # The fail-closed preflight runs under a stdlib-only interpreter before the
+    # numerical-policy dependencies are installed.
+    from track1_map_h100_prototype import (  # noqa: PLC0415
+        canonical_json,
+        execute_prototype,
+        load_authorization,
+        prototype_plan,
+    )
+
     required = {
         "approved authorization SHA-256": arguments.approved_authorization_sha256,
         "workspace": arguments.workspace,
