@@ -262,9 +262,10 @@ def representative_batch_plan(*, workspace: Path, runner_repository: Path) -> di
         *_common_bazel(paths, runner_repository, command="build"),
         "@shuttle_mlir//:run_h100_shuttle_rmsnorm_representative_matrix",
     ]
-    matrix = paths.xla / "bazel-bin/external/shuttle_mlir/run_h100_shuttle_rmsnorm_representative_matrix"
     execute = [
-        str(matrix),
+        *_common_bazel(paths, runner_repository, command="run"),
+        "@shuttle_mlir//:run_h100_shuttle_rmsnorm_representative_matrix",
+        "--",
         "--python",
         str(RUNTIME_PYTHON),
         "--case-root",
