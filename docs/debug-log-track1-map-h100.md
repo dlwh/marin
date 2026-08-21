@@ -194,7 +194,42 @@ r7 evidence also does not establish a rank-2-specific defect: rank 2 is simply
 the first enabled coordinate. With no semantic root cause proven, r8 is a
 diagnostic-only canary.
 
+## r8 primal all-zero failure
+
+r8 reproduced the enabled rank-2 `SOURCE_ORDERED` failure after build, runtime
+preflight, disabled execution, enabled GPU completion, and observer validation.
+The new evidence identifies the primal, not the gradient:
+
+```json
+{"actual_bits":"0x0000","actual_dtype":"bfloat16","actual_sha256":"effc8e52:b773f967:5c398204:9235ead3:6a090ffa:41091bac:dd3b0c1f:dad84758","actual_shape":[2,3],"actual_value":0.0,"coordinate":"rank2_source_ordered","expected_bits":"0x4040","expected_dtype":"bfloat16","expected_sha256":"4b105800:1f2bd0f8:65be72c6:cd88a1aa:ef71216a:7b8d51ed:c2387ceb:471bbc13","expected_shape":[2,3],"expected_value":3.0,"first_index":[0,0],"max_abs":3.0,"mismatch_count":6,"role":"primal","schema_version":1}
+```
+
+All six primal elements differ and the first actual BF16 value is zero. The
+disabled baseline is correct. Comparison stops at the primal, so r8 does not
+report the enabled gradient. This makes a small numerical-ordering discrepancy
+unlikely and prioritizes first-call output projection, dispatch, launch
+geometry, or store/completion behavior.
+
+## r9 PTX lifetime root cause
+
+The first custom call contains three launches: BF16-to-f32 conversion, f32
+negation, and f32-to-BF16 conversion. `GpuFfi::initialize` previously created
+one owning PTX loader specification per loop iteration, loaded its kernel, and
+then destroyed the specification. CUDA StreamExecutor keys its loaded-module
+cache by the PTX data pointer and requires the canonical PTX storage to outlive
+the kernel. Destroying each local specification violated that contract and
+allowed the allocator to reuse one address for later, different PTX strings.
+Those launches could consequently resolve `shuttle_entry` from an earlier
+module. Reusing the BF16-to-f32 kernel for the f32 temporary reads its low 16
+bits, which are zero for these BF16-expanded values and explains the all-zero
+chain observed by r8.
+
+Initialize state now owns every PTX string for at least as long as its loaded
+kernel. It reserves both vectors before taking string views; member destruction
+also destroys kernels before their backing PTX. A manual H100 regression builds
+the minimal three-Map BF16 chain, executes it through the public `GpuRunner`,
+and requires six exact nonzero negated results.
+
 ## Future work
 
-- [ ] Use r8 evidence to distinguish a primal, gradient, or shared Map dataflow
-      defect before changing lowering semantics.
+- [ ] Confirm the retained-PTX repair through the r9 ordinary-JAX canary.

@@ -50,6 +50,7 @@ struct PrepareState {
 };
 
 struct InitializeState {
+  std::vector<std::string> ptx;
   std::vector<std::unique_ptr<se::Kernel>> kernels;
 };
 
@@ -285,14 +286,16 @@ initialize(InstantiateState *state, se::Stream *stream,
     if (cuda == nullptr || cuda->major != 9 || cuda->minor != 0)
       return invalid("GPU executable requires CUDA compute capability 9.0");
     auto initialized = std::make_unique<InitializeState>();
+    initialized->ptx.reserve(state->executable->launches().size());
+    initialized->kernels.reserve(state->executable->launches().size());
     for (const GpuLaunch &launch : state->executable->launches()) {
       ArrayRef<uint8_t> slice = state->executable->codeBytes().slice(
           launch.codeOffset, launch.codeLength);
-      std::string ptx(reinterpret_cast<const char *>(slice.data()),
-                      slice.size());
+      initialized->ptx.emplace_back(
+          reinterpret_cast<const char *>(slice.data()), slice.size());
       se::KernelLoaderSpec spec =
-          se::KernelLoaderSpec::CreateOwningCudaPtxInMemorySpec(
-              std::move(ptx), "shuttle_entry",
+          se::KernelLoaderSpec::CreateCudaPtxInMemorySpec(
+              initialized->ptx.back(), "shuttle_entry",
               launch.inputSlots.size() + launch.outputSlots.size());
       absl::StatusOr<std::unique_ptr<se::Kernel>> kernel =
           stream->parent()->LoadKernel(spec);
