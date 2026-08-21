@@ -33,6 +33,7 @@ from track2_te_h100_batch import (
 
 REQUEST_SCHEMA = "shuttle_track2_te_h100_iris_request_v1"
 REQUEST_SCHEMA_V3 = "shuttle_track2_te_h100_iris_request_v3"
+REQUEST_SCHEMA_V4 = "shuttle_track2_te_h100_iris_request_v4"
 RUNNER_REPOSITORY = Path("/app")
 WORKSPACE = Path("/tmp/shuttle-track2-te-h100")
 SOURCE_MANIFEST_PATH = RUNNER_REPOSITORY / SOURCE_MANIFEST_NAME
@@ -155,6 +156,12 @@ def _entrypoint_command_v3() -> list[str]:
     return command
 
 
+def _entrypoint_command_v4() -> list[str]:
+    command = _entrypoint_command()
+    command[-1] = "--execute-v4"
+    return command
+
+
 def build_launch_request(*, bundle_root: Path, run: int) -> controller_pb2.Controller.LaunchJobRequest:
     """Build the batch-priority, zero-retry request without connecting."""
     if bundle_root.is_symlink() or not bundle_root.is_dir():
@@ -208,6 +215,34 @@ def build_launch_request_v3(*, bundle_root: Path, run: int) -> controller_pb2.Co
     )
     request.timeout.CopyFrom(duration_to_proto(TIMEOUT))
     validate_launch_request_v3(request, run=run)
+    return request
+
+
+def build_launch_request_v4(*, bundle_root: Path, run: int) -> controller_pb2.Controller.LaunchJobRequest:
+    """Build the versioned v4 batch-priority request without connecting."""
+    if bundle_root.is_symlink() or not bundle_root.is_dir():
+        raise ValueError("Iris bundle root must be one directory, not a symlink")
+    blob = _exact_bundle(bundle_root)
+    environment = job_pb2.EnvironmentConfig(setup_scripts=[])
+    request = controller_pb2.Controller.LaunchJobRequest(
+        name=job_name(run),
+        entrypoint=build_runtime_entrypoint(Entrypoint.from_command(*_entrypoint_command_v4()), environment),
+        resources=ResourceSpec(cpu=32, memory="128GB", disk="500GB", device=gpu_device("H100", 1)).to_proto(),
+        environment=environment,
+        bundle_id=content_id(blob),
+        bundle_blob=blob,
+        replicas=1,
+        max_retries_failure=0,
+        max_retries_preemption=0,
+        max_task_failures=0,
+        fail_if_exists=True,
+        existing_job_policy=job_pb2.EXISTING_JOB_POLICY_ERROR,
+        priority_band=job_pb2.PRIORITY_BAND_BATCH,
+        task_image=BASE_IMAGE,
+        client_revision_date=CLIENT_REVISION_DATE,
+    )
+    request.timeout.CopyFrom(duration_to_proto(TIMEOUT))
+    validate_launch_request_v4(request, run=run)
     return request
 
 
@@ -324,6 +359,11 @@ def validate_launch_request_v3(request: controller_pb2.Controller.LaunchJobReque
     _validate_launch_request(request, run=run, entrypoint_command=_entrypoint_command_v3())
 
 
+def validate_launch_request_v4(request: controller_pb2.Controller.LaunchJobRequest, *, run: int) -> None:
+    """Validate every v4 execution-affecting field before submission."""
+    _validate_launch_request(request, run=run, entrypoint_command=_entrypoint_command_v4())
+
+
 def decode_launch_request(raw: bytes, *, run: int) -> controller_pb2.Controller.LaunchJobRequest:
     """Decode canonical request bytes and revalidate their complete scope."""
     request = controller_pb2.Controller.LaunchJobRequest()
@@ -347,6 +387,19 @@ def decode_launch_request_v3(raw: bytes, *, run: int) -> controller_pb2.Controll
     if request.SerializeToString(deterministic=True) != raw:
         raise ValueError("LaunchJobRequest protobuf is not canonical")
     validate_launch_request_v3(request, run=run)
+    return request
+
+
+def decode_launch_request_v4(raw: bytes, *, run: int) -> controller_pb2.Controller.LaunchJobRequest:
+    """Decode canonical v4 request bytes and revalidate their complete scope."""
+    request = controller_pb2.Controller.LaunchJobRequest()
+    try:
+        request.ParseFromString(raw)
+    except DecodeError as error:
+        raise ValueError("LaunchJobRequest protobuf is malformed") from error
+    if request.SerializeToString(deterministic=True) != raw:
+        raise ValueError("LaunchJobRequest protobuf is not canonical")
+    validate_launch_request_v4(request, run=run)
     return request
 
 
@@ -379,6 +432,23 @@ def _summary_v3(raw: bytes, *, run: int) -> dict[str, object]:
         "request_size": len(raw),
         "run": run,
         "schema": REQUEST_SCHEMA_V3,
+        "source_commit": manifest["commit"],
+        "source_tree": manifest["tree"],
+    }
+
+
+def _summary_v4(raw: bytes, *, run: int) -> dict[str, object]:
+    request = decode_launch_request_v4(raw, run=run)
+    manifest = _validated_bundle(request.bundle_blob)
+    return {
+        "bundle_sha256": request.bundle_id,
+        "bundle_size": len(request.bundle_blob),
+        "image": request.task_image,
+        "job_name": request.name,
+        "request_sha256": hashlib.sha256(raw).hexdigest(),
+        "request_size": len(raw),
+        "run": run,
+        "schema": REQUEST_SCHEMA_V4,
         "source_commit": manifest["commit"],
         "source_tree": manifest["tree"],
     }
@@ -423,12 +493,12 @@ def _submit(request: controller_pb2.Controller.LaunchJobRequest, *, config: Path
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="action", required=True)
-    for name in ("render", "render-v3"):
+    for name in ("render", "render-v3", "render-v4"):
         render = subparsers.add_parser(name)
         render.add_argument("--bundle-root", required=True, type=Path)
         render.add_argument("--run", required=True, type=int)
         render.add_argument("--output", required=True, type=Path)
-    for name in ("submit", "submit-v3"):
+    for name in ("submit", "submit-v3", "submit-v4"):
         submit = subparsers.add_parser(name)
         submit.add_argument("--request", required=True, type=Path)
         submit.add_argument("--expected-request-sha256", required=True)
@@ -436,16 +506,22 @@ def main(argv: list[str] | None = None) -> int:
         submit.add_argument("--config", required=True, type=Path)
         submit.add_argument("--receipt", required=True, type=Path)
     arguments = parser.parse_args(argv)
-    if arguments.action in ("render", "render-v3"):
-        v3 = arguments.action == "render-v3"
-        request = (
-            build_launch_request_v3(bundle_root=arguments.bundle_root, run=arguments.run)
-            if v3
-            else build_launch_request(bundle_root=arguments.bundle_root, run=arguments.run)
-        )
+    if arguments.action in ("render", "render-v3", "render-v4"):
+        version = arguments.action.removeprefix("render")
+        if version == "-v4":
+            request = build_launch_request_v4(bundle_root=arguments.bundle_root, run=arguments.run)
+        elif version == "-v3":
+            request = build_launch_request_v3(bundle_root=arguments.bundle_root, run=arguments.run)
+        else:
+            request = build_launch_request(bundle_root=arguments.bundle_root, run=arguments.run)
         raw = request.SerializeToString(deterministic=True)
         _write_create_only(arguments.output, raw)
-        summary = _summary_v3(raw, run=arguments.run) if v3 else _summary(raw, run=arguments.run)
+        if version == "-v4":
+            summary = _summary_v4(raw, run=arguments.run)
+        elif version == "-v3":
+            summary = _summary_v3(raw, run=arguments.run)
+        else:
+            summary = _summary(raw, run=arguments.run)
         print(canonical_json(summary).decode(), end="")
         return 0
 
@@ -455,14 +531,30 @@ def main(argv: list[str] | None = None) -> int:
         arguments.expected_request_sha256
     ):
         raise ValueError("reviewed request SHA-256 differs")
-    v3 = arguments.action == "submit-v3"
-    request = decode_launch_request_v3(raw, run=arguments.run) if v3 else decode_launch_request(raw, run=arguments.run)
-    request_summary = _summary_v3(raw, run=arguments.run) if v3 else _summary(raw, run=arguments.run)
+    version = arguments.action.removeprefix("submit")
+    if version == "-v4":
+        request = decode_launch_request_v4(raw, run=arguments.run)
+        request_summary = _summary_v4(raw, run=arguments.run)
+    elif version == "-v3":
+        request = decode_launch_request_v3(raw, run=arguments.run)
+        request_summary = _summary_v3(raw, run=arguments.run)
+    else:
+        request = decode_launch_request(raw, run=arguments.run)
+        request_summary = _summary(raw, run=arguments.run)
     receipt_descriptor = _reserve_create_only(arguments.receipt)
+    receipt_schema = (
+        "shuttle_track2_te_h100_submit_receipt_v4"
+        if version == "-v4"
+        else (
+            "shuttle_track2_te_h100_submit_receipt_v3"
+            if version == "-v3"
+            else "shuttle_track2_te_h100_submit_receipt_v1"
+        )
+    )
     pending = {
         "config": str(arguments.config),
         "request": request_summary,
-        "schema": "shuttle_track2_te_h100_submit_receipt_v3" if v3 else "shuttle_track2_te_h100_submit_receipt_v1",
+        "schema": receipt_schema,
         "status": "submission_pending",
     }
     _replace_reserved(receipt_descriptor, canonical_json(pending))
@@ -474,7 +566,7 @@ def main(argv: list[str] | None = None) -> int:
             "config": str(arguments.config),
             "job_id": submitted_job,
             "request": request_summary,
-            "schema": "shuttle_track2_te_h100_submit_receipt_v3" if v3 else "shuttle_track2_te_h100_submit_receipt_v1",
+            "schema": receipt_schema,
             "status": "submitted",
         }
         _replace_reserved(receipt_descriptor, canonical_json(receipt))

@@ -209,6 +209,60 @@ POLICY_V3_PARTITION_COUNTS = {
         "dgamma": {"below_floor": 5, "above_floor": 4_091},
     },
 }
+POLICY_V4_ACCEPTANCE_PATTERN = "heldout_splitmix64_v3"
+POLICY_V4_QUALIFICATION_PATTERNS = (
+    QUALIFICATION_PATTERN,
+    HELDOUT_PATTERN,
+    ACCEPTANCE_PATTERN,
+    POLICY_V3_ACCEPTANCE_PATTERN,
+)
+POLICY_V4_SEED_PREIMAGES = {
+    "x": "shuttle_abi22_rmsnorm_role_policy_v4/x",
+    "gamma": "shuttle_abi22_rmsnorm_role_policy_v4/gamma",
+    "dy": "shuttle_abi22_rmsnorm_role_policy_v4/dy",
+}
+POLICY_V4_SEEDS = {
+    "x": 0x628E8AB85F0D2BAD,
+    "gamma": 0xD105A656E9DF5E9D,
+    "dy": 0x717C9E023B564D40,
+}
+POLICY_V4_ACCEPTANCE_LIMITS = {role: dict(limits) for role, limits in POLICY_V3_ACCEPTANCE_LIMITS.items()}
+NUMERICAL_POLICY_V4 = {
+    "schema": "shuttle_abi22_rmsnorm_role_policy_v4",
+    "qualification_patterns": list(POLICY_V4_QUALIFICATION_PATTERNS),
+    "acceptance_patterns": [POLICY_V4_ACCEPTANCE_PATTERN],
+    "repeat_count": 2,
+    "generator": {
+        "algorithm": "splitmix64_counter_high24_to_bfloat16_v1",
+        "seed_derivation": "sha256_utf8_first_8_bytes_big_endian",
+        "seed_preimages": POLICY_V4_SEED_PREIMAGES,
+        "seeds": POLICY_V4_SEEDS,
+    },
+    "limits_by_role": POLICY_V4_ACCEPTANCE_LIMITS,
+    "dgamma_mean_limit_basis": "prospective_l1_budget_4_over_4096_not_empirically_calibrated",
+    "qualification_disposition": "diagnostic_only_cannot_reject_acceptance",
+    "acceptance_repeatability": "exact_bfloat16_digest_per_provider_boundary_role",
+    "rejection_rule": "acceptance_pattern_only_no_post_result_widening_or_promotion",
+}
+POLICY_V4_ACCEPTANCE_INPUT_DIGESTS = {
+    "x": "1528589b5505fba379086deffe6c699c36114d3dc72600bbfe464e17947d71b2",
+    "gamma": "7d44ce0c29c1cdd0b59ee5be57f1cc3656563d68095c9d73769bea144cc7bd09",
+    "dy": "d1565501f4b951240b46d328a0459b81c1426a44f39cd0d6066cedb3eac0005d",
+}
+POLICY_V4_ACCEPTANCE_REFERENCE_DIGESTS = {
+    "y": "437e9adc3e7cfd518132cfac8455d253a34bbfcc081109632611ff7ba4e62a70",
+    "dx": "558ae600e406ade38183c4c9726bbfed16b60c07bb0888b4021b38c87408d3f8",
+    "dgamma": "28d69308ae4d26785592deb62547d5db17ba50c20c8a21b6e4108349929f55f6",
+}
+POLICY_V4_REFERENCE_MAXIMA = {"y": 2.640625, "dx": 2.65625, "dgamma": 92.5}
+POLICY_V4_PARTITION_COUNTS = {
+    **POLICY_V3_PARTITION_COUNTS,
+    POLICY_V4_ACCEPTANCE_PATTERN: {
+        "y": {"below_floor": 84_000, "above_floor": 8_304_608},
+        "dx": {"below_floor": 672_162, "above_floor": 7_716_446},
+        "dgamma": {"below_floor": 4, "above_floor": 4_092},
+    },
+}
 
 
 _RUNTIME_IDENTITY_SEAL = object()
@@ -491,6 +545,64 @@ def prepare_policy_v3_cases(case_root: Path) -> dict[str, dict[str, dict[str, st
     return result
 
 
+def _policy_v4_acceptance_inputs() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    rows, features = REPRESENTATIVE_SHAPE
+    return (
+        _splitmix_values(rows * features, POLICY_V4_SEEDS["x"], -1.0, 1.0).reshape(rows, features),
+        _splitmix_values(features, POLICY_V4_SEEDS["gamma"], 0.5, 1.5),
+        _splitmix_values(rows * features, POLICY_V4_SEEDS["dy"], -1.0, 1.0).reshape(rows, features),
+    )
+
+
+def _policy_v4_acceptance_case_files() -> dict[str, tuple[int, str]]:
+    rows, features = REPRESENTATIVE_SHAPE
+    return {
+        "x.bf16": (rows * features * 2, POLICY_V4_ACCEPTANCE_INPUT_DIGESTS["x"]),
+        "gamma.bf16": (features * 2, POLICY_V4_ACCEPTANCE_INPUT_DIGESTS["gamma"]),
+        "dy.bf16": (rows * features * 2, POLICY_V4_ACCEPTANCE_INPUT_DIGESTS["dy"]),
+        "reference_y.bf16": (rows * features * 2, POLICY_V4_ACCEPTANCE_REFERENCE_DIGESTS["y"]),
+        "reference_dx.bf16": (rows * features * 2, POLICY_V4_ACCEPTANCE_REFERENCE_DIGESTS["dx"]),
+        "reference_dgamma.bf16": (features * 2, POLICY_V4_ACCEPTANCE_REFERENCE_DIGESTS["dgamma"]),
+    }
+
+
+def _verify_policy_v4_cases(case_root: Path) -> None:
+    _verify_policy_v3_cases(case_root)
+    for name, (size, digest) in _policy_v4_acceptance_case_files().items():
+        path = case_root / POLICY_V4_ACCEPTANCE_PATTERN / name
+        if not path.is_file():
+            raise ValueError(f"case file missing: {path}")
+        payload = path.read_bytes()
+        if len(payload) != size:
+            raise ValueError(f"case file size drifted: {path}")
+        if _sha256_bytes(payload) != digest:
+            raise ValueError(f"case file digest drifted: {path}")
+
+
+def prepare_policy_v4_cases(case_root: Path) -> dict[str, dict[str, dict[str, str]]]:
+    """Write all diagnostic cases and the untouched v4 acceptance case."""
+    result = prepare_policy_v3_cases(case_root)
+    directory = case_root / POLICY_V4_ACCEPTANCE_PATTERN
+    directory.mkdir(parents=True, exist_ok=True)
+    x, gamma, dy = _policy_v4_acceptance_inputs()
+    y, dx, dgamma = _reference(x, gamma, dy, EPSILON)
+    for name, value in {
+        "x.bf16": x,
+        "gamma.bf16": gamma,
+        "dy.bf16": dy,
+        "reference_y.bf16": y,
+        "reference_dx.bf16": dx,
+        "reference_dgamma.bf16": dgamma,
+    }.items():
+        (directory / name).write_bytes(_bf16_bytes(value))
+    result[POLICY_V4_ACCEPTANCE_PATTERN] = {
+        "input_digests": POLICY_V4_ACCEPTANCE_INPUT_DIGESTS,
+        "reference_digests": POLICY_V4_ACCEPTANCE_REFERENCE_DIGESTS,
+    }
+    _verify_policy_v4_cases(case_root)
+    return result
+
+
 def _ordered_bf16(value: np.ndarray) -> np.ndarray:
     bits = value.view(np.uint16).astype(np.int32)
     return np.where((bits & 0x8000) != 0, 0x7FFF - (bits & 0x7FFF), 0x8000 + bits)
@@ -749,6 +861,90 @@ def execute_qualification_plan_v3(plan: Mapping[str, Any], invoke: Callable[[lis
             raise RuntimeError(f"{run['producer']} qualification producer exited with status {status}")
 
 
+def qualification_plan_v4(
+    te_runner: str,
+    xla_runner: str,
+    python: str,
+    case_root: Path,
+) -> ValidatedQualificationPlan:
+    """Return the exact repeated five-pattern v4 policy matrix."""
+    _verify_case_directory(case_root)
+    _verify_policy_v4_cases(case_root)
+    rows, features = REPRESENTATIVE_SHAPE
+    runs = []
+    patterns = (*POLICY_V4_QUALIFICATION_PATTERNS, POLICY_V4_ACCEPTANCE_PATTERN)
+    for pattern in patterns:
+        directory = case_root / (f"{rows}x{features}" if pattern == QUALIFICATION_PATTERN else pattern)
+        for boundary in BOUNDARIES:
+            for producer in PRODUCERS:
+                prefix = [te_runner] if producer == "transformer_engine_2_17" else [python, xla_runner]
+                for repeat in range(NUMERICAL_POLICY_V4["repeat_count"]):
+                    output = case_root.parent / "raw" / f"policy-{producer}-{pattern}-{boundary}-repeat{repeat}.json"
+                    persistence = (
+                        ["--output-files-directory", str(output.parent / f"{output.stem}-outputs")]
+                        if producer == "ordinary_jax_xla"
+                        else []
+                    )
+                    runs.append(
+                        {
+                            "shape": [rows, features],
+                            "scope": (
+                                "representative_policy_acceptance"
+                                if pattern == POLICY_V4_ACCEPTANCE_PATTERN
+                                else "representative_policy_qualification"
+                            ),
+                            "input_pattern": pattern,
+                            "boundary": boundary,
+                            "producer": producer,
+                            "repeat": repeat,
+                            "argv": [
+                                *prefix,
+                                "--boundary",
+                                boundary,
+                                "--rows",
+                                str(rows),
+                                "--features",
+                                str(features),
+                                "--epsilon",
+                                "1e-06",
+                                "--case-directory",
+                                str(directory),
+                                "--output",
+                                str(output),
+                                *persistence,
+                            ],
+                        }
+                    )
+    return ValidatedQualificationPlan(
+        schema="shuttle_abi22_rmsnorm_policy_plan_v4",
+        policy=NUMERICAL_POLICY_V4,
+        case_root=str(case_root),
+        executables={"te": te_runner, "xla": xla_runner, "python": python},
+        runs=runs,
+    )
+
+
+def execute_qualification_plan_v4(plan: Mapping[str, Any], invoke: Callable[[list[str]], int]) -> None:
+    """Execute only an exact canonically derived v4 policy plan."""
+    if not isinstance(plan, ValidatedQualificationPlan):
+        raise ValueError("qualification plan was not returned by canonical derivation")
+    executables = plan.get("executables")
+    if not isinstance(executables, Mapping) or set(executables) != {"te", "xla", "python"}:
+        raise ValueError("qualification plan executable identities drifted")
+    expected = qualification_plan_v4(
+        _string(executables["te"], "TE executable"),
+        _string(executables["xla"], "XLA executable"),
+        _string(executables["python"], "Python executable"),
+        Path(_string(plan.get("case_root"), "case_root")),
+    )
+    if plan != expected:
+        raise ValueError("qualification plan differs from canonical v4 derivation")
+    for run in plan["runs"]:
+        status = invoke(list(run["argv"]))
+        if status != 0:
+            raise RuntimeError(f"{run['producer']} qualification producer exited with status {status}")
+
+
 def _string(value: object, name: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{name} must be a nonempty string")
@@ -960,6 +1156,16 @@ def repeat_output_diagnostics_v3(first: np.ndarray, second: np.ndarray) -> dict[
     }
 
 
+def error_metrics_v4(actual: np.ndarray, reference: np.ndarray, *, role: str) -> dict[str, float | int | bool | str]:
+    """Return the frozen v4 piecewise role metrics."""
+    return error_metrics_v3(actual, reference, role=role)
+
+
+def repeat_output_diagnostics_v4(first: np.ndarray, second: np.ndarray) -> dict[str, float | int]:
+    """Return file-backed repeat diagnostics for v4 evidence."""
+    return repeat_output_diagnostics_v3(first, second)
+
+
 def load_te_raw_cell(
     path: Path,
     case_directory: Path,
@@ -1073,6 +1279,38 @@ def load_te_raw_cell_v3(
                 "digest": _sha256_bytes(_bf16_bytes(actual)),
                 "reference_digest": _sha256_bytes(_bf16_bytes(reference)),
                 **error_metrics_v3(actual, reference, role=role),
+            }
+        )
+    cell["outputs"] = outputs
+    return cell
+
+
+def load_te_raw_cell_v4(
+    path: Path,
+    case_directory: Path,
+    *,
+    expected_input_digests: Mapping[str, str],
+    expected_pattern: str | None,
+) -> dict[str, Any]:
+    """Load one TE policy cell with frozen v4 metrics."""
+    cell = load_te_raw_cell(
+        path,
+        case_directory,
+        expected_input_digests=expected_input_digests,
+        expected_pattern=expected_pattern,
+    )
+    raw = json.loads(path.read_text())
+    outputs = []
+    for role in OUTPUT_ROLES[cell["boundary"]]:
+        shape = _output_shape(tuple(cell["shape"]), role)
+        actual = _read_bf16_file(Path(_string(raw["output_files"][role], f"raw {role} path")), shape)
+        reference = _read_bf16_file(case_directory / f"reference_{role}.bf16", shape)
+        outputs.append(
+            {
+                "role": role,
+                "digest": _sha256_bytes(_bf16_bytes(actual)),
+                "reference_digest": _sha256_bytes(_bf16_bytes(reference)),
+                **error_metrics_v4(actual, reference, role=role),
             }
         )
     cell["outputs"] = outputs
@@ -1556,6 +1794,171 @@ def validate_policy_v3_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _policy_v4_digests(pattern: str) -> tuple[Mapping[str, str], Mapping[str, str]]:
+    if pattern in POLICY_V4_QUALIFICATION_PATTERNS:
+        return _policy_v3_digests(pattern)
+    if pattern == POLICY_V4_ACCEPTANCE_PATTERN:
+        return POLICY_V4_ACCEPTANCE_INPUT_DIGESTS, POLICY_V4_ACCEPTANCE_REFERENCE_DIGESTS
+    raise ValueError("policy v4 input pattern drifted")
+
+
+def validate_policy_v4_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate v4 structure while gating numerics only on the untouched pattern."""
+    document = dict(value)
+    if set(document) not in ({"schema", "cells"}, {"schema", "policy", "cells"}):
+        raise ValueError("qualification evidence fields drifted")
+    if document.get("schema") != "shuttle_abi22_rmsnorm_policy_evidence_v4":
+        raise ValueError("qualification evidence schema drifted")
+    if "policy" in document and document["policy"] != NUMERICAL_POLICY_V4:
+        raise ValueError("qualification numerical policy drifted")
+    patterns = (*POLICY_V4_QUALIFICATION_PATTERNS, POLICY_V4_ACCEPTANCE_PATTERN)
+    expected_coordinates = [
+        (producer, pattern, boundary, repeat)
+        for producer in PRODUCERS
+        for pattern in patterns
+        for boundary in BOUNDARIES
+        for repeat in range(NUMERICAL_POLICY_V4["repeat_count"])
+    ]
+    cells = document.get("cells")
+    if not isinstance(cells, list) or len(cells) != len(expected_coordinates):
+        raise ValueError("qualification cell matrix drifted")
+    digests: dict[tuple[str, str, str, int, str], str] = {}
+    for cell, (producer, pattern, boundary, repeat) in zip(cells, expected_coordinates, strict=True):
+        if not isinstance(cell, Mapping):
+            raise ValueError("qualification cell is not an object")
+        expected_scope = (
+            "representative_policy_acceptance"
+            if pattern == POLICY_V4_ACCEPTANCE_PATTERN
+            else "representative_policy_qualification"
+        )
+        if (
+            cell.get("producer") != producer
+            or cell.get("input_pattern") != pattern
+            or cell.get("boundary") != boundary
+            or cell.get("repeat") != repeat
+            or tuple(cell.get("shape", ())) != REPRESENTATIVE_SHAPE
+            or cell.get("scope") != expected_scope
+        ):
+            raise ValueError("qualification coordinate drifted")
+        input_digests, reference_digests = _policy_v4_digests(pattern)
+        input_roles = ("x", "gamma") if boundary == "forward" else ("x", "gamma", "dy")
+        if cell.get("input_digests") != {role: input_digests[role] for role in input_roles}:
+            raise ValueError("qualification input provenance drifted")
+        if cell.get("execution") != _expected_execution(boundary):
+            raise ValueError("qualification call sequence drifted")
+        outputs = cell.get("outputs")
+        roles = OUTPUT_ROLES[boundary]
+        if not isinstance(outputs, list) or [output.get("role") for output in outputs] != list(roles):
+            raise ValueError("qualification output role drifted")
+        for output, role in zip(outputs, roles, strict=True):
+            digest = _sha(output.get("digest"), "qualification output digest")
+            if _sha(output.get("reference_digest"), "qualification reference digest") != reference_digests[role]:
+                raise ValueError("qualification reference digest drifted")
+            if output.get("all_finite") is not True:
+                raise ValueError("qualification all_finite must be true")
+            absolute = _finite_nonnegative(output.get("max_absolute_error"), "qualification max_absolute_error")
+            mean_absolute = _finite_nonnegative(output.get("mean_absolute_error"), "qualification mean_absolute_error")
+            below_absolute = _finite_nonnegative(
+                output.get("max_absolute_error_below_floor"),
+                "qualification max_absolute_error_below_floor",
+            )
+            above_absolute = _finite_nonnegative(
+                output.get("max_absolute_error_above_floor"),
+                "qualification max_absolute_error_above_floor",
+            )
+            relative = _finite_nonnegative(
+                output.get("max_relative_error_above_absolute_floor"),
+                "qualification max_relative_error_above_absolute_floor",
+            )
+            raw_ulp = output.get("max_bfloat16_ulp")
+            masked_ulp = output.get("max_bfloat16_ulp_above_absolute_floor")
+            if type(raw_ulp) is not int or raw_ulp < 0 or type(masked_ulp) is not int or masked_ulp < 0:
+                raise ValueError("qualification BF16 ULP metrics must be nonnegative integers")
+            limits = POLICY_V4_ACCEPTANCE_LIMITS[role]
+            if output.get("absolute_floor") != limits["absolute_floor"]:
+                raise ValueError("qualification absolute_floor drifted")
+            counts = POLICY_V4_PARTITION_COUNTS[pattern][role]
+            below_count = output.get("below_floor_count")
+            above_count = output.get("eligible_count")
+            if below_count != counts["below_floor"] or above_count != counts["above_floor"]:
+                raise ValueError("qualification partition count drifted")
+            output_size = REPRESENTATIVE_SHAPE[1] if role == "dgamma" else math.prod(REPRESENTATIVE_SHAPE)
+            if below_count + above_count != output_size:
+                raise ValueError("qualification partition counts do not cover the output")
+            if absolute != max(below_absolute, above_absolute):
+                raise ValueError("qualification whole max_absolute_error differs from partition maxima")
+            raw_index = output.get("raw_max_bfloat16_ulp_index")
+            if type(raw_index) is not int or raw_index < 0 or raw_index >= output_size:
+                raise ValueError("qualification raw_max_bfloat16_ulp_index drifted")
+            for field in ("raw_max_bfloat16_ulp_actual", "raw_max_bfloat16_ulp_reference"):
+                raw_value = output.get(field)
+                if type(raw_value) not in (int, float) or not math.isfinite(float(raw_value)):
+                    raise ValueError(f"qualification {field} must be finite")
+            coordinate = f"{producer}/{pattern}/{boundary}/repeat{repeat}/{role}"
+            if pattern == POLICY_V4_ACCEPTANCE_PATTERN:
+                for observed, field in (
+                    (below_absolute, "max_absolute_error_below_floor"),
+                    (above_absolute, "max_absolute_error_above_floor"),
+                    (mean_absolute, "max_mean_absolute_error"),
+                    (relative, "max_relative_error_above_absolute_floor"),
+                    (masked_ulp, "max_bfloat16_ulp_above_absolute_floor"),
+                ):
+                    if observed > limits[field]:
+                        raise ValueError(f"{coordinate}: {field} {observed} exceeds role limit {limits[field]}")
+            digests[(producer, pattern, boundary, repeat, role)] = digest
+        timing = cell.get("timing")
+        if not isinstance(timing, Mapping) or timing.get("warmup_invocations") != WARMUP_INVOCATIONS:
+            raise ValueError("qualification timing drifted")
+        host = _positive_samples(timing.get("raw_host_blocking_ns"), "qualification host", permitted_none=False)
+        assert host is not None
+        if timing.get("median_host_blocking_ns") != statistics.median(host):
+            raise ValueError("qualification host median drifted")
+        cuda = _positive_samples(
+            timing.get("raw_cuda_event_ns"),
+            "qualification CUDA-event",
+            permitted_none=producer == "ordinary_jax_xla",
+        )
+        if (producer == "transformer_engine_2_17") != (cuda is not None):
+            raise ValueError("qualification CUDA-event provider contract drifted")
+
+    qualification_drifts = []
+    for producer in PRODUCERS:
+        for pattern in patterns:
+            for boundary in BOUNDARIES:
+                for role in OUTPUT_ROLES[boundary]:
+                    first = digests[(producer, pattern, boundary, 0, role)]
+                    second = digests[(producer, pattern, boundary, 1, role)]
+                    if first == second:
+                        continue
+                    if pattern == POLICY_V4_ACCEPTANCE_PATTERN:
+                        raise ValueError("acceptance repeat output digest drifted")
+                    qualification_drifts.append(
+                        {
+                            "producer": producer,
+                            "input_pattern": pattern,
+                            "boundary": boundary,
+                            "role": role,
+                            "repeat0_digest": first,
+                            "repeat1_digest": second,
+                        }
+                    )
+    return {
+        "schema": "shuttle_abi22_rmsnorm_policy_evidence_v4",
+        "policy": NUMERICAL_POLICY_V4,
+        "cells": [dict(cell) for cell in cells],
+        "acceptance": {
+            "status": "accepted",
+            "input_pattern": POLICY_V4_ACCEPTANCE_PATTERN,
+            "repeat_coordinate_count": sum(len(OUTPUT_ROLES[boundary]) for boundary in BOUNDARIES) * len(PRODUCERS),
+        },
+        "qualification": {
+            "status": "diagnostic_only",
+            "patterns": list(POLICY_V4_QUALIFICATION_PATTERNS),
+            "repeat_digest_drifts": qualification_drifts,
+        },
+    }
+
+
 def build_matched_acceptance(
     te_report: Mapping[str, Any],
     xla_report: Mapping[str, Any],
@@ -1672,6 +2075,73 @@ def build_matched_acceptance_v3(
             "partition_closure": "whole_max_equals_max_of_disjoint_partition_maxima",
             "raw_global_bfloat16_ulp": "diagnostic_only",
             "repeatability": "exact_bfloat16_output_digest_per_coordinate",
+        },
+        "qualification": qualified,
+        "performance": {
+            "status": "reported_without_threshold",
+            "clock": "host_blocking_ns",
+            "input_pattern": QUALIFICATION_PATTERN,
+            "median_ratio_te_over_xla": ratios,
+        },
+        "norm_contract": {"status": "unavailable", "blocker": NORM_CONTRACT_BLOCKER},
+    }
+
+
+def build_matched_acceptance_v4(
+    te_report: Mapping[str, Any],
+    xla_report: Mapping[str, Any],
+    *,
+    qualification: Mapping[str, Any],
+    expected_te_identity: ValidatedTeRuntimeIdentity,
+) -> dict[str, Any]:
+    """Build v4 acceptance from the untouched pattern and diagnostic qualification."""
+    for report in (te_report, xla_report):
+        cells = report.get("cells", [])
+        if not any(tuple(cell.get("shape", ())) == REPRESENTATIVE_SHAPE for cell in cells):
+            raise ValueError("representative cells are missing")
+    te = validate_report(
+        te_report,
+        expected_producer="transformer_engine_2_17",
+        expected_te_identity=expected_te_identity,
+    )
+    xla = validate_report(xla_report, expected_producer="ordinary_jax_xla")
+    qualified = validate_policy_v4_evidence(qualification)
+    if te["device"] != xla["device"]:
+        raise ValueError("producer device identities differ")
+    ratios = {}
+    for boundary in BOUNDARIES:
+        te_cell = next(
+            cell for cell in te["cells"] if tuple(cell["shape"]) == REPRESENTATIVE_SHAPE and cell["boundary"] == boundary
+        )
+        xla_cell = next(
+            cell
+            for cell in xla["cells"]
+            if tuple(cell["shape"]) == REPRESENTATIVE_SHAPE and cell["boundary"] == boundary
+        )
+        if te_cell["input_digests"] != xla_cell["input_digests"]:
+            raise ValueError("producer input digests differ")
+        ratios[boundary] = te_cell["timing"]["median_host_blocking_ns"] / xla_cell["timing"]["median_host_blocking_ns"]
+    return {
+        "schema": "shuttle_abi22_te_xla_rmsnorm_acceptance_v4",
+        "status": "heldout_splitmix64_v3_numerics_accepted",
+        "accepted_input_pattern": POLICY_V4_ACCEPTANCE_PATTERN,
+        "accepted_shape": list(REPRESENTATIVE_SHAPE),
+        "accepted_boundaries": list(BOUNDARIES),
+        "excluded_architecture_fixture_shape": list(ARCHITECTURE_SHAPE),
+        "numerical_policy": NUMERICAL_POLICY_V4,
+        "metric_scope": {
+            "whole_output": ["all_finite", "mean_absolute_error"],
+            "below_absolute_floor": ["exact_count", "max_absolute_error"],
+            "above_absolute_floor": [
+                "exact_count",
+                "max_absolute_error",
+                "max_relative_error",
+                "max_bfloat16_ulp",
+            ],
+            "partition_closure": "whole_max_equals_max_of_disjoint_partition_maxima",
+            "raw_global_bfloat16_ulp": "diagnostic_only",
+            "repeatability": "exact_bfloat16_output_digest_per_acceptance_coordinate",
+            "qualification_repeatability": "diagnostic_only_reported_without_rejection",
         },
         "qualification": qualified,
         "performance": {
