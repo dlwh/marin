@@ -55,7 +55,7 @@ def test_dry_run_emits_and_decodes_the_real_fail_closed_launch_request(
                 "--approved-authorization-sha256",
                 approved,
                 "--retry",
-                "1",
+                "2",
                 "--request-output",
                 str(output),
             ]
@@ -66,17 +66,17 @@ def test_dry_run_emits_and_decodes_the_real_fail_closed_launch_request(
     raw = output.read_bytes()
     request = controller_pb2.Controller.LaunchJobRequest()
     request.ParseFromString(raw)
-    decoded = decode_launch_request(raw, approved_authorization_sha256=approved, retry=1)
+    decoded = decode_launch_request(raw, approved_authorization_sha256=approved, retry=2)
     summary = json.loads(capsys.readouterr().out)
 
     assert request == decoded
     assert summary["request_sha256"] == hashlib.sha256(raw).hexdigest()
     assert summary["bundle_sha256"] == request.bundle_id
     assert summary["authorization_sha256"] == approved
-    assert summary["job_name"] == job_name(1)
-    assert summary["retry"] == 1
+    assert summary["job_name"] == job_name(2)
+    assert summary["retry"] == 2
 
-    assert request.name == "/dlwh/shuttle-track1-map-h100-prototype-r1"
+    assert request.name == "/dlwh/shuttle-track1-map-h100-prototype-r2"
     assert request.client_revision_date == CLIENT_REVISION_DATE
     assert request.task_image == BASE_IMAGE
     assert request.bundle_init_image == ""

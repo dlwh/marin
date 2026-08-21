@@ -313,25 +313,34 @@ def test_source_bundle_manifest_rejects_missing_extra_symlink_and_hash_mutations
 
 
 @pytest.mark.parametrize(
-    ("observed_bazel_sha256", "mutate_during_hydration", "expected_error"),
+    ("observed_bazel_sha256", "mutate_during_hydration", "fail_hydration", "expected_error"),
     [
         (
             MISMATCHED_BAZEL_SHA256,
+            False,
             False,
             f"expected {EXPECTED_BAZEL_SHA256}, observed {MISMATCHED_BAZEL_SHA256}",
         ),
         (
             EXPECTED_BAZEL_SHA256,
             True,
+            False,
             "network hydration changed patched JAX or XLA source",
+        ),
+        (
+            EXPECTED_BAZEL_SHA256,
+            False,
+            True,
+            r"(?s)phase hydrate_bazel_repositories exited with status 23.*final useful failure",
         ),
     ],
 )
-def test_execute_rejects_bazel_or_hydration_drift_before_offline_build(
+def test_execute_rejects_bazel_or_hydration_failure_before_offline_build(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     observed_bazel_sha256: str,
     mutate_during_hydration: bool,
+    fail_hydration: bool,
     expected_error: str,
 ) -> None:
     _, _, authorization = _authorization(tmp_path)
@@ -389,20 +398,42 @@ def test_execute_rejects_bazel_or_hydration_drift_before_offline_build(
         (inputs.jax_repository / "source.cc").write_text("approved JAX patch\n")
         (inputs.xla_repository / "source.cc").write_text("approved XLA patch\n")
 
+    real_run = prototype._run
+
     def run(
         command: list[str],
         *,
         cwd: Path | None,
         log: Path,
         environment: dict[str, str] | None = None,
+        phase: str = "",
     ) -> None:
-        del cwd, log, environment
         nonlocal offline_started
         if command[0] == "curl":
             Path(command[command.index("--output") + 1]).write_bytes(b"bazel")
             return
         if "--bazel_options=--repository_disable_download" in command:
             offline_started = True
+            return
+        if command[0].endswith("build/build.py") and fail_hydration:
+            real_run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import sys; "
+                        "print('x' * 20000); "
+                        "print('API_TOKEN=do-not-leak'); "
+                        "print('https://user:password@example.invalid/private'); "
+                        "print('final useful failure'); "
+                        "sys.exit(23)"
+                    ),
+                ],
+                cwd=cwd,
+                log=log,
+                environment=environment,
+                phase=phase,
+            )
             return
         if mutate_during_hydration:
             (workspace / "jax/source.cc").write_text("network hydration mutation\n")
@@ -436,7 +467,7 @@ def test_execute_rejects_bazel_or_hydration_drift_before_offline_build(
         os, "access", lambda path, mode: True if Path(path) in cuda_tools else original_access(path, mode)
     )
 
-    with pytest.raises(RuntimeError, match=expected_error):
+    with pytest.raises(RuntimeError, match=expected_error) as raised:
         prototype.execute_prototype(
             authorization,
             workspace=workspace,
@@ -447,3 +478,8 @@ def test_execute_rejects_bazel_or_hydration_drift_before_offline_build(
         )
 
     assert not offline_started
+    if fail_hydration:
+        assert "do-not-leak" not in str(raised.value)
+        assert "user:password" not in str(raised.value)
+        assert "[REDACTED]" in str(raised.value)
+        assert len(str(raised.value)) <= 9_000
