@@ -635,7 +635,7 @@ def validate_rmsnorm_result(document: object) -> dict[str, object]:
         if item["shape"] != list(shape) or item["boundary"] != boundary or item["mode"] != mode:
             raise ValueError("RMSNorm result coordinate order differs")
         results = item["results"]
-        if type(results) is not dict or tuple(results) != roles:
+        if type(results) is not dict or set(results) != set(roles):
             raise ValueError("RMSNorm result output roles differ")
         for role in roles:
             _sha(results[role], f"RMSNorm {role}")
@@ -648,15 +648,15 @@ def validate_rmsnorm_result(document: object) -> dict[str, object]:
         if (
             type(shape_policy) is not dict
             or type(analytic_oracle) is not dict
-            or tuple(analytic_oracle) != roles
+            or set(analytic_oracle) != set(roles)
             or analytic_oracle != {role: shape_policy["binary64_rounded_outputs"][role] for role in roles}
             or type(emitted_tree_oracle) is not dict
-            or tuple(emitted_tree_oracle) != roles
+            or set(emitted_tree_oracle) != set(roles)
             or emitted_tree_oracle != {role: shape_policy["emitted_tree_outputs"][role] for role in roles}
         ):
             raise ValueError("RMSNorm numerical oracle identity differs")
         numerics = item["numerics"]
-        if type(numerics) is not dict or tuple(numerics) != roles:
+        if type(numerics) is not dict or set(numerics) != set(roles):
             raise ValueError("RMSNorm numerical metric roles differ")
         for role in roles:
             metrics = numerics[role]
@@ -689,7 +689,7 @@ def validate_rmsnorm_result(document: object) -> dict[str, object]:
             type(disabled_jax) is not dict
             or disabled_jax != baselines[key]
             or type(disabled_equal) is not dict
-            or tuple(disabled_equal) != roles
+            or set(disabled_equal) != set(roles)
             or any(type(disabled_equal[role]) is not bool for role in roles)
             or disabled_equal != {role: results[role] == disabled_jax[role] for role in roles}
         ):
