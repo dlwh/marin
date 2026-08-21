@@ -193,7 +193,7 @@ def _valid_cell(shape: tuple[int, int], boundary: str, *, te: bool) -> dict:
 
 def _fake_oracle_invoke(paths: BatchPaths, calls: list[list[str]], argv: list[str]) -> int:
     calls.append(argv)
-    argument = {argv[index][2:]: argv[index + 1] for index in range(1, len(argv), 2)}
+    argument = {value[2:]: argv[index + 1] for index, value in enumerate(argv[:-1]) if value.startswith("--")}
     shape = (int(argument["rows"]), int(argument["features"]))
     boundary = argument["boundary"]
     output = paths.workspace / argument["output"]
