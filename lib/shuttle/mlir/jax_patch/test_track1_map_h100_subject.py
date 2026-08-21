@@ -230,6 +230,73 @@ def test_matrix_populates_then_reuses_six_attributed_cache_entries(
     assert subject.cache_snapshot(cache_directory) == populate_bytes
 
 
+def test_matrix_numerical_failure_reports_one_bounded_role_specific_difference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache_directory = tmp_path / "cache"
+    cache_directory.mkdir()
+    monkeypatch.setattr(subject, "require_h100", lambda: None)
+    monkeypatch.setattr(subject, "configure_cache", lambda directory: None)
+    monkeypatch.setattr(subject.jax.monitoring, "register_event_listener", lambda listener: None)
+
+    def execute(coordinate: Coordinate):
+        value = deterministic_input(coordinate.rank)
+        primal = np.abs(-value.astype(np.float32)).astype(ml_dtypes.bfloat16)
+        gradient = np.where(value > 0, 1, -1).astype(ml_dtypes.bfloat16)
+        if coordinate == Coordinate(2, Mode.SOURCE_ORDERED):
+            gradient = gradient.copy()
+            gradient[1, 2] = ml_dtypes.bfloat16(0.5)
+        cache_directory.joinpath(f"jit_{coordinate.label}-{coordinate.rank:064x}-cache").write_bytes(
+            coordinate.label.encode()
+        )
+        snapshot = () if coordinate.mode is Mode.DISABLED else _successful_snapshot(coordinate)
+        return (primal, gradient), snapshot
+
+    monkeypatch.setattr(subject, "_execute", execute)
+
+    with pytest.raises(RuntimeError, match="Track 1 numerical mismatch") as raised:
+        subject.run_matrix(cache_directory, reuse=False)
+
+    prefix, raw_evidence = str(raised.value).split(": ", 1)
+    assert prefix == "Track 1 numerical mismatch"
+    evidence = json.loads(raw_evidence)
+    rank_two_value = deterministic_input(2)
+    expected_gradient = np.where(rank_two_value > 0, 1, -1).astype(ml_dtypes.bfloat16)
+    actual_gradient = expected_gradient.copy()
+    actual_gradient[1, 2] = ml_dtypes.bfloat16(0.5)
+
+    def grouped_sha256(value: np.ndarray) -> str:
+        digest = hashlib.sha256()
+        digest.update(str(value.dtype).encode())
+        digest.update(str(value.shape).encode())
+        digest.update(value.tobytes(order="C"))
+        text = digest.hexdigest()
+        return ":".join(text[index : index + 8] for index in range(0, len(text), 8))
+
+    assert evidence == {
+        "actual_bits": "0x3f00",
+        "actual_dtype": "bfloat16",
+        "actual_sha256": grouped_sha256(actual_gradient),
+        "actual_shape": [2, 3],
+        "actual_value": 0.5,
+        "coordinate": "rank2_source_ordered",
+        "expected_bits": "0x3f80",
+        "expected_dtype": "bfloat16",
+        "expected_sha256": grouped_sha256(expected_gradient),
+        "expected_shape": [2, 3],
+        "expected_value": 1.0,
+        "first_index": [1, 2],
+        "max_abs": 0.5,
+        "mismatch_count": 1,
+        "role": "gradient",
+        "schema_version": 1,
+    }
+    for digest in (evidence["actual_sha256"], evidence["expected_sha256"]):
+        assert len(digest.split(":")) == 8
+        assert all(len(chunk) == 8 for chunk in digest.split(":"))
+    assert len(str(raised.value)) < 1_024
+
+
 def test_reuse_rejects_cache_drift_before_executing_subject(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cache_directory = tmp_path / "cache"
     cache_directory.mkdir()
