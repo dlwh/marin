@@ -54,6 +54,7 @@ RUNTIME_PYTHON = Path("/opt/h100-evidence-runtime/bin/python")
 RUNTIME_SITE_PACKAGES = Path("/opt/h100-evidence-runtime/lib/python3.12/site-packages")
 CUDA_ROOT = Path("/usr/local/cuda-13.2")
 NVIDIA_SITE_PACKAGES = RUNTIME_SITE_PACKAGES / "nvidia"
+NVTE_CUDA_INCLUDE_DIR = NVIDIA_SITE_PACKAGES / "cuda_runtime/include"
 RUNTIME_LIBRARY_PATHS = {
     "cublas": NVIDIA_SITE_PACKAGES / "cublas/lib/libcublas.so.13",
     "cublas_lt": NVIDIA_SITE_PACKAGES / "cublas/lib/libcublasLt.so.13",
@@ -334,6 +335,7 @@ def runtime_environment(paths: BatchPaths) -> dict[str, str]:
     environment.pop("LD_PRELOAD", None)
     environment.pop("LD_BIND_NOW", None)
     environment["LD_LIBRARY_PATH"] = ":".join(unique)
+    environment["NVTE_CUDA_INCLUDE_DIR"] = str(NVTE_CUDA_INCLUDE_DIR)
     return environment
 
 
@@ -372,6 +374,24 @@ def _validated_runtime_libraries(
             "soname": soname,
         }
     return identities
+
+
+def _validated_cuda_include(include_directory: Path, *, approved_root: Path) -> dict[str, str]:
+    try:
+        resolved_directory = include_directory.resolve(strict=True)
+        resolved_root = approved_root.resolve(strict=True)
+        header = (resolved_directory / "cuda_runtime_api.h").resolve(strict=True)
+    except FileNotFoundError as error:
+        raise RuntimeError("NVRTC CUDA runtime headers are missing") from error
+    if not resolved_directory.is_dir() or not resolved_directory.is_relative_to(resolved_root):
+        raise RuntimeError("NVRTC CUDA include directory is outside the approved runtime root")
+    if not header.is_file() or header.is_symlink() or not header.is_relative_to(resolved_root):
+        raise RuntimeError("NVRTC CUDA header is outside the approved runtime root")
+    return {
+        "include_directory": str(include_directory),
+        "header_path": str(header),
+        "header_sha256": _file_sha256(header),
+    }
 
 
 def _validate_link_closure(log: Path, libraries: Mapping[str, Mapping[str, str]]) -> None:
@@ -427,6 +447,7 @@ def _execute_hydration(paths: BatchPaths, plan: dict[str, Any]) -> dict[str, Any
     _run(phases[6]["argv"], cwd=None, log=paths.logs / "te_wheel_extract.log", phase="te_wheel_extract")
     runner_repository = Path(plan["runner_repository"])
     validate_build_manifest(runner_repository / BUILD_MANIFEST, runner_repository / RUNNER_SOURCE)
+    cuda_runtime_headers = _validated_cuda_include(NVTE_CUDA_INCLUDE_DIR, approved_root=NVIDIA_SITE_PACKAGES)
     runtime_libraries = _validated_runtime_libraries(
         RUNTIME_LIBRARY_PATHS,
         approved_roots=(CUDA_ROOT, NVIDIA_SITE_PACKAGES),
@@ -444,6 +465,7 @@ def _execute_hydration(paths: BatchPaths, plan: dict[str, Any]) -> dict[str, Any
     _validate_link_closure(link_log, runtime_libraries)
     observed["transformer_engine"] = validate_te_hydration(paths)
     observed["runtime_libraries"] = runtime_libraries
+    observed["cuda_runtime_headers"] = cuda_runtime_headers
     return observed
 
 
@@ -599,6 +621,7 @@ def execute_batch(
         "schema": RESULT_SCHEMA,
         "source": source,
         "tools": {
+            "cuda_runtime_headers": hydration["cuda_runtime_headers"],
             "logs": logs,
             "runner_binary_sha256": _file_sha256(paths.te_runner),
             "runtime_libraries": hydration["runtime_libraries"],
