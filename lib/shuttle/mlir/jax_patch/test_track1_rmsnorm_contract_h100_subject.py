@@ -105,26 +105,33 @@ def test_boundary_function_matches_public_primal_and_vjp_role_order_on_host() ->
             assert tuple(validated.results) == roles
 
 
-def test_observer_requires_normative_primal_topology_but_records_composed_topology_diagnostically() -> None:
+def test_observer_requires_exact_primal_and_reviewed_hybrid_topology() -> None:
     primal_inline = Coordinate((5, 19, 7), Boundary.PRIMAL, Mode.SOURCE_ORDERED)
     primal_compact = Coordinate((5, 19, 257), Boundary.PRIMAL, Mode.FAST)
-    composed = Coordinate((5, 19, 7), Boundary.COMPOSED, Mode.SOURCE_ORDERED)
+    composed_inline = Coordinate((5, 19, 7), Boundary.COMPOSED, Mode.SOURCE_ORDERED)
+    composed_compact = Coordinate((5, 19, 257), Boundary.COMPOSED, Mode.FAST)
 
     inline = subject.validate_observer_snapshot(primal_inline, _observer_snapshot(primal_inline, 1, 0))
     compact = subject.validate_observer_snapshot(primal_compact, _observer_snapshot(primal_compact, 2, 1))
-    diagnostic = subject.validate_observer_snapshot(composed, _observer_snapshot(composed, 42, 38))
+    hybrid_inline = subject.validate_observer_snapshot(composed_inline, _observer_snapshot(composed_inline, 39, 36))
+    hybrid_compact = subject.validate_observer_snapshot(composed_compact, _observer_snapshot(composed_compact, 40, 37))
     assert (inline.launch_count, inline.temporary_count, inline.topology_status) == (1, 0, "normative_primal")
     assert (compact.launch_count, compact.temporary_count, compact.topology_status) == (2, 1, "normative_primal")
-    assert (diagnostic.launch_count, diagnostic.temporary_count, diagnostic.topology_status) == (
-        42,
-        38,
-        "diagnostic_non_performant",
+    assert (hybrid_inline.launch_count, hybrid_inline.temporary_count, hybrid_inline.topology_status) == (
+        39,
+        36,
+        "reviewed_hybrid_exact",
+    )
+    assert (hybrid_compact.launch_count, hybrid_compact.temporary_count, hybrid_compact.topology_status) == (
+        40,
+        37,
+        "reviewed_hybrid_exact",
     )
 
     with pytest.raises(ValueError, match="primal bundle topology"):
         subject.validate_observer_snapshot(primal_inline, _observer_snapshot(primal_inline, 2, 1))
-    with pytest.raises(ValueError, match="bounded positive topology"):
-        subject.validate_observer_snapshot(composed, _observer_snapshot(composed, 0, 0))
+    with pytest.raises(ValueError, match="composed bundle topology"):
+        subject.validate_observer_snapshot(composed_inline, _observer_snapshot(composed_inline, 42, 38))
 
 
 def test_validate_coordinate_rejects_repeat_nonfinite_role_and_threshold_drift() -> None:
@@ -133,7 +140,7 @@ def test_validate_coordinate_rejects_repeat_nonfinite_role_and_threshold_drift()
     arrays = tuple(
         value.astype(ml_dtypes.bfloat16) for value in (binary64_oracle(coordinate.shape)[role] for role in roles)
     )
-    snapshot = _observer_snapshot(coordinate, 42, 38)
+    snapshot = _observer_snapshot(coordinate, 39, 36)
     accepted = subject.validate_coordinate(coordinate, arrays, tuple(value.copy() for value in arrays), snapshot)
     assert tuple(accepted.results) == roles
     assert accepted.repeat_results == accepted.results
@@ -186,7 +193,7 @@ def test_disabled_jax_is_diagnostic_but_enabled_masked_ulp_is_gated() -> None:
             enabled,
             changed_tuple,
             tuple(value.copy() for value in changed_tuple),
-            _observer_snapshot(enabled, 42, 38),
+            _observer_snapshot(enabled, 39, 36),
             disabled_jax=arrays,
         )
 
@@ -237,7 +244,7 @@ def test_threshold_failure_reports_every_role_before_rejecting_the_coordinate() 
             coordinate,
             tuple(exceeded),
             tuple(value.copy() for value in exceeded),
-            _observer_snapshot(coordinate, 42, 38),
+            _observer_snapshot(coordinate, 39, 36),
             report_cell=reports.append,
         )
 

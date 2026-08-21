@@ -5067,10 +5067,15 @@ TEST(Abi22MapFusionContract,
   struct Boundary {
     const char *filename;
     int64_t columns;
+    int64_t expectedLaunches;
+    int64_t expectedTemporaries;
+    int64_t expectedTemporaryBytes;
   };
   constexpr Boundary boundaries[] = {
-      {"jax-0.10.1-bf16-rmsnorm_contract-5x19x7-composed.mlir", 7},
-      {"jax-0.10.1-bf16-rmsnorm_contract-5x19x257-composed.mlir", 257},
+      {"jax-0.10.1-bf16-rmsnorm_contract-5x19x7-composed.mlir", 7,
+       39, 36, 6996},
+      {"jax-0.10.1-bf16-rmsnorm_contract-5x19x257-composed.mlir", 257,
+       40, 37, 79016},
   };
   for (const Boundary &boundary : boundaries) {
     SCOPED_TRACE(boundary.filename);
@@ -5204,7 +5209,19 @@ TEST(Abi22MapFusionContract,
       ASSERT_TRUE(mlir::succeeded(transport));
       auto executable = mlir::shuttle::GpuExecutable::Load(*transport);
       ASSERT_TRUE(executable.ok()) << executable.status();
-      ASSERT_EQ((*executable)->launches().size(), tasks.size());
+      ASSERT_EQ((*executable)->launches().size(),
+                static_cast<size_t>(boundary.expectedLaunches));
+      EXPECT_EQ(tasks.size(), static_cast<size_t>(boundary.expectedLaunches));
+      int64_t temporaryCount = 0;
+      int64_t temporaryBytes = 0;
+      for (const mlir::shuttle::GpuSlot &slot : (*executable)->slots()) {
+        if (slot.storage != mlir::shuttle::MaterializationStorage::Temporary)
+          continue;
+        ++temporaryCount;
+        temporaryBytes += slot.requiredBytes;
+      }
+      EXPECT_EQ(temporaryCount, boundary.expectedTemporaries);
+      EXPECT_EQ(temporaryBytes, boundary.expectedTemporaryBytes);
       auto device =
           *built->module->getOps<mlir::shuttle::DeviceModuleOp>().begin();
       auto entries = llvm::to_vector(
