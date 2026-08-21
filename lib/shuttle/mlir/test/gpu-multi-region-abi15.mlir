@@ -23,7 +23,7 @@
 // SOURCE-SAME: api_version = 4 : i32
 // SOURCE: %[[BACKWARD:[0-9]+]]:2 = stablehlo.custom_call @shuttle.gpu.executable_bundle.v2
 // SOURCE-SAME: api_version = 4 : i32
-// SOURCE: return %[[FORWARD]], %[[BACKWARD]]#1, %[[BACKWARD]]#0
+// SOURCE: return %[[FORWARD]], %[[BACKWARD]]#0, %[[BACKWARD]]#1
 // SOURCE-NOT: shuttle.
 // SOURCE-NOT: stablehlo.dot_general
 
@@ -32,7 +32,7 @@
 // FAST-SAME: api_version = 4 : i32
 // FAST: %[[BACKWARD:[0-9]+]]:2 = stablehlo.custom_call @shuttle.gpu.executable_bundle.v2
 // FAST-SAME: api_version = 4 : i32
-// FAST: return %[[FORWARD]], %[[BACKWARD]]#1, %[[BACKWARD]]#0
+// FAST: return %[[FORWARD]], %[[BACKWARD]]#0, %[[BACKWARD]]#1
 // FAST-NOT: shuttle.
 // FAST-NOT: stablehlo.dot_general
 

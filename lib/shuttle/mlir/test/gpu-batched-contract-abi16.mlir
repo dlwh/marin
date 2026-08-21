@@ -90,11 +90,11 @@
 // FORWARD-NOT: stablehlo.dot_general
 
 // BACKWARD: %[[CALL:[0-9]+]]:2 = stablehlo.custom_call @shuttle.gpu.executable_bundle.v2
-// BACKWARD: return %[[CALL]]#1, %[[CALL]]#0
+// BACKWARD: return %[[CALL]]#0, %[[CALL]]#1
 // BACKWARD-NOT: shuttle.
 // BACKWARD-NOT: stablehlo.dot_general
 
 // COMPOSED: %[[CALL:[0-9]+]]:3 = stablehlo.custom_call @shuttle.gpu.executable_bundle.v2
-// COMPOSED: return %[[CALL]]#0, %[[CALL]]#2, %[[CALL]]#1
+// COMPOSED: return %[[CALL]]#0, %[[CALL]]#1, %[[CALL]]#2
 // COMPOSED-NOT: shuttle.
 // COMPOSED-NOT: stablehlo.dot_general
