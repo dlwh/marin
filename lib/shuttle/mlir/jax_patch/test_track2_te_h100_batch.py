@@ -21,6 +21,7 @@ from abi22_te_rmsnorm_oracle_v2 import (
 )
 from track2_te_h100_batch import (
     BASE_IMAGE,
+    RUNTIME_LIBRARY_PATHS,
     SHUTTLE_BLOCKER,
     TE_SOURCE_COMMIT,
     TE_SOURCE_TREE,
@@ -29,6 +30,7 @@ from track2_te_h100_batch import (
     BatchPaths,
     _invoke_oracle,
     _validate_link_closure,
+    _validated_runtime_libraries,
     _validated_xla_raw_cell,
     batch_plan,
     canonical_json,
@@ -127,6 +129,13 @@ def test_batch_plan_pins_te_wheel_source_build_and_exact_v2_matrix(tmp_path: Pat
     assert compile_argv[:4] == ["/usr/bin/g++", "-std=c++20", "-O3", "-Wall"]
     assert "-Werror" in compile_argv
     assert "-Wl,--allow-shlib-undefined" in compile_argv
+    libraries = [str(path) for path in RUNTIME_LIBRARY_PATHS.values()]
+    no_as_needed = compile_argv.index("-Wl,--no-as-needed")
+    assert compile_argv[no_as_needed : no_as_needed + len(libraries) + 2] == [
+        "-Wl,--no-as-needed",
+        *libraries,
+        "-Wl,--as-needed",
+    ]
     te_include = str(BatchPaths.under(workspace).te_source / "transformer_engine/common/include")
     assert compile_argv[compile_argv.index("-isystem") : compile_argv.index("-isystem") + 2] == [
         "-isystem",
@@ -177,7 +186,10 @@ def test_hydration_binds_source_tree_wheel_and_resolved_library(tmp_path: Path, 
         "library_path": str(paths.te_library),
         "library_sha256": hashlib.sha256(b"library").hexdigest(),
     }
-    assert runtime_environment(paths)["LD_LIBRARY_PATH"].split(":")[0] == str(paths.te_library.parent)
+    monkeypatch.setenv("LD_BIND_NOW", "1")
+    environment = runtime_environment(paths)
+    assert environment["LD_LIBRARY_PATH"].split(":")[0] == str(paths.te_library.parent)
+    assert "LD_BIND_NOW" not in environment
     for field, value in (("commit", "0" * 40), ("tree", "0" * 40), ("status", "dirty")):
         mutated = dict(observed)
         mutated[field] = value
@@ -197,22 +209,75 @@ def test_hydration_binds_source_tree_wheel_and_resolved_library(tmp_path: Path, 
         validate_te_hydration(paths)
 
 
-def test_link_closure_rejects_any_unresolved_runtime_dependency(tmp_path: Path) -> None:
-    log = tmp_path / "ldd.log"
-    log.write_text(
-        "libtransformer_engine.so => /tmp/runtime/libtransformer_engine.so\n"
-        "libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6\n"
+def test_runtime_libraries_bind_resolved_paths_sonames_and_bytes(tmp_path: Path) -> None:
+    root = tmp_path / "approved"
+    root.mkdir()
+    library_paths = {}
+    sonames = {}
+    for index, role in enumerate(RUNTIME_LIBRARY_PATHS):
+        target = root / f"{role}.so.{index}"
+        target.write_bytes(f"library-{role}".encode())
+        link = root / f"{role}.so"
+        link.symlink_to(target.name)
+        library_paths[role] = link
+        sonames[target] = f"lib{role}.so.{index}"
+
+    identities = _validated_runtime_libraries(
+        library_paths,
+        approved_roots=(root,),
+        soname_reader=lambda path: sonames[path],
     )
 
-    _validate_link_closure(log)
+    assert set(identities) == set(RUNTIME_LIBRARY_PATHS)
+    for role, identity in identities.items():
+        target = library_paths[role].resolve()
+        assert identity == {
+            "requested_path": str(library_paths[role]),
+            "resolved_path": str(target),
+            "sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+            "soname": sonames[target],
+        }
+
+    outside = tmp_path / "outside.so"
+    outside.write_bytes(b"outside")
+    library_paths["nvrtc"].unlink()
+    library_paths["nvrtc"].symlink_to(outside)
+    with pytest.raises(RuntimeError, match="approved runtime root"):
+        _validated_runtime_libraries(
+            library_paths,
+            approved_roots=(root,),
+            soname_reader=lambda path: path.name,
+        )
+
+
+def test_link_closure_rejects_any_unresolved_or_substituted_dependency(tmp_path: Path) -> None:
+    libraries = {}
+    lines = ["libtransformer_engine.so => /tmp/runtime/libtransformer_engine.so (0x1)"]
+    for role in RUNTIME_LIBRARY_PATHS:
+        path = tmp_path / f"lib{role}.so"
+        path.write_bytes(f"library-{role}".encode())
+        soname = f"lib{role}.so.1"
+        libraries[role] = {
+            "requested_path": str(path),
+            "resolved_path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "soname": soname,
+        }
+        lines.append(f"{soname} => {path} (0x1)")
+    log = tmp_path / "ldd.log"
+    log.write_text("\n".join(lines) + "\n")
+
+    _validate_link_closure(log, libraries)
 
     log.write_text("libnccl.so.2 => not found\n")
     with pytest.raises(RuntimeError, match="runtime dependency closure"):
-        _validate_link_closure(log)
+        _validate_link_closure(log, libraries)
 
-    log.write_text("libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6\n")
+    substituted = tmp_path / "substituted.so"
+    substituted.write_bytes(b"substituted")
+    log.write_text("\n".join([*lines[:-1], f"{libraries[role]['soname']} => {substituted} (0x1)"]) + "\n")
     with pytest.raises(RuntimeError, match="runtime dependency closure"):
-        _validate_link_closure(log)
+        _validate_link_closure(log, libraries)
 
 
 def _valid_cell(shape: tuple[int, int], boundary: str, *, te: bool) -> dict:
