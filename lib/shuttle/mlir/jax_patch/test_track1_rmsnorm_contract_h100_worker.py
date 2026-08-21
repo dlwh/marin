@@ -6,6 +6,7 @@ import json
 import sys
 
 import pytest
+import track1_map_h100_prototype as prototype
 import track1_rmsnorm_contract_h100_worker as worker
 
 
@@ -44,3 +45,7 @@ def test_worker_flushes_canonical_cell_evidence_before_subject_failure(monkeypat
     assert line.startswith(worker.CELL_REPORT_PREFIX)
     assert json.loads(line.removeprefix(worker.CELL_REPORT_PREFIX)) == cell
     assert output.flush_count >= 1
+    phase_log = tmp_path / "rmsnorm-contract.log"
+    phase_log.write_text(line)
+
+    assert prototype._sanitized_log_tail(phase_log) == line.rstrip("\n")
