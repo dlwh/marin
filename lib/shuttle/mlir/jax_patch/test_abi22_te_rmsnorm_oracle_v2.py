@@ -706,7 +706,20 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
             te, xla, qualification=qualification, expected_te_identity=_expected_te_identity()
         )
 
-        self.assertEqual(accepted["status"], "representative_numerics_accepted")
+        self.assertEqual(accepted["status"], "heldout_splitmix64_numerics_accepted")
+        self.assertEqual(accepted["accepted_input_pattern"], ACCEPTANCE_PATTERN)
+        self.assertEqual(
+            accepted["metric_scope"],
+            {
+                "whole_output": ["all_finite", "max_absolute_error", "mean_absolute_error"],
+                "above_absolute_floor": [
+                    "eligible_count_nonzero",
+                    "max_relative_error",
+                    "max_bfloat16_ulp",
+                ],
+                "raw_global_bfloat16_ulp": "diagnostic_only",
+            },
+        )
         self.assertEqual(accepted["accepted_shape"], [2048, 4096])
         self.assertEqual(accepted["accepted_boundaries"], list(BOUNDARIES))
         self.assertEqual(accepted["excluded_architecture_fixture_shape"], [7, 13])

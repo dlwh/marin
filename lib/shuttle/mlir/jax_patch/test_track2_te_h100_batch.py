@@ -566,7 +566,8 @@ def test_execute_oracle_runs_exact_matrix_and_builds_matched_acceptance(
         for call in calls[:12:2]
     ] == [(str(shape[0]), str(shape[1]), boundary) for shape in SHAPES for boundary in BOUNDARIES]
     assert all(call[call.index("--epsilon") + 1] == "1e-06" for call in calls)
-    assert result["acceptance"]["status"] == "representative_numerics_accepted"
+    assert result["acceptance"]["status"] == "heldout_splitmix64_numerics_accepted"
+    assert result["acceptance"]["accepted_input_pattern"] == ACCEPTANCE_PATTERN
     assert result["acceptance"]["accepted_shape"] == [2048, 4096]
     assert result["acceptance"]["performance"]["median_ratio_te_over_xla"] == {boundary: 0.5 for boundary in BOUNDARIES}
     assert result["observed_xla_runtime"] == XLA_OBSERVED_RUNTIME
