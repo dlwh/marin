@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from track2_h100_batch import (
     BASE_IMAGE,
+    TRACK2_HERMETIC_CUDA_VERSION,
     BatchPaths,
     batch_plan,
     canonical_json,
@@ -79,6 +80,9 @@ def test_batch_plan_runs_xla_then_shuttle_on_one_workspace_and_device(tmp_path: 
     assert "@shuttle_mlir//:abi22_h100_xla_baseline_test" in xla_command
     assert "@shuttle_mlir//:gpu_transport_v2_h100_performance_test" in shuttle_command
     assert xla_command[0:2] == shuttle_command[0:2]
+    assert TRACK2_HERMETIC_CUDA_VERSION == "12.9.1"
+    assert f"--repo_env=HERMETIC_CUDA_VERSION={TRACK2_HERMETIC_CUDA_VERSION}" in xla_command
+    assert not any(value == "--repo_env=HERMETIC_CUDA_VERSION=13.0.0" for value in xla_command)
     assert any("SHUTTLE_H100_XLA_HOST_REPORT=" in value for value in xla_command)
     assert any("SHUTTLE_H100_XLA_HOST_REPORT=" in value for value in shuttle_command)
     assert any("SHUTTLE_H100_PERF_EXPLORATORY=1" in value for value in shuttle_command)
