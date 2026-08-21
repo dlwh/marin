@@ -216,3 +216,27 @@ author: dlwh
   No norm-to-Contract claim is in scope.
 - Artifact:
   [`track2-te-rmsnorm-r12-success-20260821`](../../lib/shuttle/mlir/artifacts/track2-te-rmsnorm-r12-success-20260821/README.md).
+
+### 2026-08-21 13:59 - T2-SHUTTLE-001 r1 harness rejection
+
+- Hypothesis: the reviewed standalone GpuRunner matrix would execute RMSNorm
+  F/B/C under SOURCE_ORDERED and FAST on the exact r12
+  `heldout_splitmix64_v3` `[2048,4096]` input.
+- Commit Hash: source `280a712d8572fcdda1abddf13c2bbae3e575eae8`, tree
+  `e258a93d4e164aeb5e57c47c140421a14a68bdf6`.
+- Command: sealed Iris job `/dlwh/shuttle-track2-rmsnorm-h100-r1`, request
+  SHA-256 `29e8be6a35d29d10904169fbce77446a4916402c572b995df8b688c2054e988d`.
+- Config: one H100, batch priority, one replica, zero failure, preemption, and
+  task-failure budgets; Shuttle RMSNorm `[2048,4096]`; epsilon `1e-6`; F/B/C;
+  SOURCE_ORDERED and FAST; two repeats.
+- Result: harness hypothesis rejected before the first kernel launch. The
+  hermetic build completed, then the shell wrapper rejected the bare case path
+  because the referenced `sh_binary` did not carry its Bazel default GPU-test
+  argument. Iris recorded task exit 1, one task failure, and zero preemptions.
+- Interpretation: r1 contains no GPU numerical, resource, or performance
+  evidence. The failure is isolated to argv construction; no compiler or
+  numerical policy was exercised.
+- Next action: pass the GPU transport executable explicitly, freeze the
+  behavior regression, review a fresh request, and run r2 once.
+- Artifact:
+  [`track2-shuttle-rmsnorm-r1-failure-20260821`](../../lib/shuttle/mlir/artifacts/track2-shuttle-rmsnorm-r1-failure-20260821/README.md).

@@ -1,0 +1,7 @@
+I20260821 13:59:45 8418467456 iris.cluster.config Loading config from lib/iris/config/cw-rno2a.yaml
+I20260821 13:59:45 8418467456 iris.cli.connect Establishing tunnel to controller...
+I20260821 13:59:45 8418467456 iris.cluster.platforms.k8s.service Tunnel ready: 127.0.0.1:10000 -> iris-controller-svc:10000
+JOB ID                                STATE    SUBMITTED                         REASON
+/dlwh/shuttle-track2-rmsnorm-h100-r1  failed   2026-08-21T20:53:49.861000+00:00  s, Critical Path: 0.02s
+                                                                                 INFO: 1 process: 1 internal.
+                                                                                 INFO: B...
