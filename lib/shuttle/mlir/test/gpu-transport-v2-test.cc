@@ -4069,7 +4069,8 @@ TEST(GpuTransportV2Test,
     EXPECT_EQ(allocator.sizes, decoded->temporaryGroupBytes);
     expectLoadedKernels(*decoded, *trace, 0);
 
-    ASSERT_TRUE((*runner)->Execute(operands, results).ok());
+    absl::Status execution = (*runner)->Execute(operands, results);
+    ASSERT_TRUE(execution.ok()) << execution;
     EXPECT_EQ(trace->launchAttempts.load(), boundary.launches);
     auto slots = dynamicSlotAddresses(*decoded, allocator, 0xa0000000,
                                       std::move(externalSlots));
@@ -4812,11 +4813,15 @@ TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
   }
   ASSERT_EQ(cells.size(), 8u);
 
-  for (PerformanceCell &cell : cells)
-    for (int64_t iteration = 0; iteration < warmupIterations; ++iteration)
-      ASSERT_TRUE(cell.runner
-                      ->Execute(cell.operandBindings, cell.resultBindings)
-                      .ok());
+  for (PerformanceCell &cell : cells) {
+    for (int64_t iteration = 0; iteration < warmupIterations; ++iteration) {
+      absl::Status execution =
+          cell.runner->Execute(cell.operandBindings, cell.resultBindings);
+      ASSERT_TRUE(execution.ok())
+          << execution << " " << cell.spec->caseName << " "
+          << mlir::shuttle::stringifyNumericalPolicy(cell.policy);
+    }
+  }
   for (int64_t round = 0; round < measuredIterations; ++round) {
     for (size_t position = 0; position < cells.size(); ++position) {
       size_t cellIndex = round % 2 == 0 ? position : cells.size() - 1 - position;
