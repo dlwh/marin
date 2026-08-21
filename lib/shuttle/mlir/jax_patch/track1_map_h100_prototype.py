@@ -198,6 +198,25 @@ def _expected_authorization(source_manifest_sha256: str) -> dict[str, object]:
         "permissions": {"build": True, "network_hydration": True, "run": True},
         "schema": AUTHORIZATION_SCHEMA,
         "schema_version": 1,
+        "subjects": {
+            "map": {
+                "boundaries": ["mixed_value_gradient"],
+                "modes": ["disabled", "source_ordered", "fast"],
+                "ranks": [2, 3],
+            },
+            "rmsnorm": {
+                "boundaries": ["forward", "backward", "composed"],
+                "bundle_shapes": {
+                    "backward": {"launches": 3, "temporaries": 1},
+                    "composed": {"launches": 4, "temporaries": 1},
+                    "forward": {"launches": 1, "temporaries": 0},
+                },
+                "disabled_jax_reference": True,
+                "host_oracle": "independent_float32_rmsnorm_vjp",
+                "modes": ["disabled", "source_ordered", "fast"],
+                "shapes": [[2, 7, 19], [3, 2, 5, 11, 263]],
+            },
+        },
         "sources": {
             "jax": {
                 "commit": JAX_COMMIT,
