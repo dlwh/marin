@@ -246,7 +246,8 @@ bool hasDisjointContiguousFoldLoop(llvm::StringRef ptx,
   for (size_t laneLine = 0; laneLine < lines.size(); ++laneLine) {
     std::vector<std::string> laneTokens = ptxTokens(lines[laneLine]);
     if (!lines[laneLine].starts_with("mov.u32 ") ||
-        laneTokens.size() != 2 || laneTokens[1] != "%tid")
+        !lines[laneLine].ends_with(", %tid.x;") || laneTokens.size() != 2 ||
+        laneTokens[1] != "%tid")
       continue;
     llvm::StringRef lane = laneTokens[0];
     for (size_t startLine = laneLine + 1; startLine < lines.size();
@@ -269,6 +270,8 @@ bool hasDisjointContiguousFoldLoop(llvm::StringRef ptx,
           endTokens.size() != 2 || endTokens[1] != start)
         return false;
       llvm::StringRef end = endTokens[0];
+      if (end == start)
+        return false;
       const std::string extentSuffix =
           (llvm::Twine(", ") + llvm::Twine(reductionExtent) + ";").str();
       std::vector<std::string> minTokens = ptxTokens(lines[startLine + 2]);
@@ -304,6 +307,8 @@ bool hasDisjointContiguousFoldLoop(llvm::StringRef ptx,
       const std::string exitLabel = (llvm::Twine(exit) + ":").str();
       for (size_t line = loopLine + 3; line + 2 < lines.size(); ++line) {
         if (lines[line] == exitLabel ||
+            lines[line].starts_with("bra ") ||
+            lines[line].contains(" bra ") ||
             (defines(lines[line], start) && lines[line] != increment))
           return false;
         if (lines[line] == increment)
@@ -1727,6 +1732,18 @@ $finished:
            replace(correctFoldLoop, "bra $load;", "bra $loaded;"),
            replace(correctFoldLoop, "mov.u32 %r0, %tid.x;",
                    "mov.u32 %r0, %ctaid.x;"),
+           replace(correctFoldLoop, "mov.u32 %r0, %tid.x;",
+                   "mov.u32 %r0, %tid.y;"),
+           replace(
+               replace(
+                   replace(correctFoldLoop, "add.u32 %r7, %r4, 2;",
+                           "add.u32 %r4, %r4, 2;"),
+                   "min.u32 %r7, %r7, 330;",
+                   "min.u32 %r4, %r4, 330;"),
+               "setp.ge.u32 %p1, %r4, %r7;",
+               "setp.ge.u32 %p1, %r4, %r4;"),
+           replace(correctFoldLoop, "ld.global.f32 %f1, [%rd0];",
+                   "bra $loaded;\n  ld.global.f32 %f1, [%rd0];"),
        })
     EXPECT_FALSE(hasDisjointContiguousFoldLoop(mutation, 330, 2));
 }
