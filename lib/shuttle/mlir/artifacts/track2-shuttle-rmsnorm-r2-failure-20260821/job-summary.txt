@@ -1,0 +1,42 @@
+I20260821 14:19:07 8418467456 iris.cluster.config Loading config from lib/iris/config/cw-rno2a.yaml
+I20260821 14:19:07 8418467456 iris.cli.connect Establishing tunnel to controller...
+I20260821 14:19:08 8418467456 iris.cluster.platforms.k8s.service Tunnel ready: 127.0.0.1:10003 -> iris-controller-svc:10000
+Job: /dlwh/shuttle-track2-rmsnorm-h100-r2 (/dlwh/shuttle-track2-rmsnorm-h100-r2)
+State: failed  exit=0  failures=1  preemptions=0
+Tasks: 0/1 completed  failed=1
+Error: tiveRmsNormRunnerWritesOneAuthenticatedRawCell
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from GpuTransportV2Test
+[ RUN      ] GpuTransportV2Test.H100RepresentativeRmsNormRunnerWritesOneAuthenticatedRawCell
+external/shuttle_mlir/test/gpu-transport-v2-test.cc:6272: Failure
+Value of: source
+  Actual: false
+Expected: true
+
+[  FAILED  ] GpuTransportV2Test.H100RepresentativeRmsNormRunnerWritesOneAuthenticatedRawCell (0 ms)
+[----------] 1 test from GpuTransportV2Test (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (0 ms total)
+[  PASSED  ] 0 tests.
+[  FAILED  ] 1 test, listed below:
+[  FAILED  ] GpuTransportV2Test.H100RepresentativeRmsNormRunnerWritesOneAuthenticatedRawCell
+
+ 1 FAILED TEST
+Traceback (most recent call last):
+  File "/tmp/shuttle-track2-h100/bazel-output/5eca87bbd3fb6b39bfe995b88f759ede/execroot/xla/bazel-out/k8-opt/bin/external/shuttle_mlir/run_h100_shuttle_rmsnorm_representative_matrix.runfiles/xla/external/shuttle_mlir/jax_patch/abi22_shuttle_rmsnorm_representative.py", line 821, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "/tmp/shuttle-track2-h100/bazel-output/5eca87bbd3fb6b39bfe995b88f759ede/execroot/xla/bazel-out/k8-opt/bin/external/shuttle_mlir/run_h100_shuttle_rmsnorm_representative_matrix.runfiles/xla/external/shuttle_mlir/jax_patch/abi22_shuttle_rmsnorm_representative.py", line 804, in main
+    evidence = execute_representative(
+               ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/shuttle-track2-h100/bazel-output/5eca87bbd3fb6b39bfe995b88f759ede/execroot/xla/bazel-out/k8-opt/bin/external/shuttle_mlir/run_h100_shuttle_rmsnorm_representative_matrix.runfiles/xla/external/shuttle_mlir/jax_patch/abi22_shuttle_rmsnorm_representative.py", line 751, in execute_representative
+    raise ValueError(f"representative Shuttle runner failed for {coordinate}: {status}")
+ValueError: representative Shuttle runner failed for source_ordered/forward/repeat0: 1
+
+
+
+  TASK  STATE      EXIT  DURATION                     PEAK MEM    CUR MEM    ERROR
+     0  failed        1  3 minutes and 40.24 seconds  -           -          tiveRmsNormRunnerWritesOneAuthenticatedRawCell
+                                                                             [==...

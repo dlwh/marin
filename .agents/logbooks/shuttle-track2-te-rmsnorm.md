@@ -240,3 +240,27 @@ author: dlwh
   behavior regression, review a fresh request, and run r2 once.
 - Artifact:
   [`track2-shuttle-rmsnorm-r1-failure-20260821`](../../lib/shuttle/mlir/artifacts/track2-shuttle-rmsnorm-r1-failure-20260821/README.md).
+
+### 2026-08-21 14:19 - T2-SHUTTLE-002 r2 runfiles rejection
+
+- Hypothesis: explicitly carrying the GPU test path would let the standalone
+  GpuRunner matrix compile and execute the exact r12 held-out RMSNorm input.
+- Commit Hash: source `c166a957628950f9fc55f4d76ef63e67aee30e3f`, tree
+  `163908c0a3e30695d7489b1ed9b3517253ab6afe`.
+- Command: sealed Iris job `/dlwh/shuttle-track2-rmsnorm-h100-r2`, request
+  SHA-256 `e499cd37b943f6cdb7fbbefda0de7f11d780975d02fdfce85681eddf3da34b24`.
+- Config: one H100, batch priority, one replica, zero failure, preemption, and
+  task-failure budgets; Shuttle RMSNorm `[2048,4096]`; epsilon `1e-6`; F/B/C;
+  SOURCE_ORDERED and FAST; two repeats.
+- Result: harness hypothesis rejected before source compilation. The argv
+  repair worked and the intended H100 gtest started, but `fixtureSource`
+  returned no source on the first SOURCE_ORDERED forward coordinate. Iris
+  recorded task exit 1, one task failure, and zero preemptions.
+- Interpretation: the nested Bazel runfiles tree contains the fixture, but the
+  test-only C++ lookup reads `TEST_SRCDIR` while `bazel run` exposes
+  `RUNFILES_DIR`. r2 contains no compiled module, kernel launch, numerical,
+  resource, or performance evidence.
+- Next action: bind the runfiles directory at the shell boundary, add a local
+  behavior regression, and require full code and request review before r3.
+- Artifact:
+  [`track2-shuttle-rmsnorm-r2-failure-20260821`](../../lib/shuttle/mlir/artifacts/track2-shuttle-rmsnorm-r2-failure-20260821/README.md).
