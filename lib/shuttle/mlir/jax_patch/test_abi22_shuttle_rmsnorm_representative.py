@@ -758,6 +758,55 @@ def test_shell_wrapper_bridges_bazel_runfiles_directory_for_fixture_lookup(tmp_p
     assert capture.read_text().strip() == str(tmp_path / "runfiles")
 
 
+def test_shell_wrapper_derives_runfiles_root_when_bazel_omits_environment(tmp_path: Path) -> None:
+    runner = Path(__file__).parents[1] / "test" / "run-h100-shuttle-rmsnorm-representative.sh"
+    runfiles_root = tmp_path / "matrix.runfiles"
+    invocation_root = runfiles_root / "xla"
+    fixture = (
+        runfiles_root
+        / "shuttle_mlir"
+        / "test"
+        / "Inputs"
+        / "jax-0.10.1-bf16-projected_parameter_broadcast-2048x4096-forward.mlir"
+    )
+    fixture.parent.mkdir(parents=True)
+    fixture.write_text("module {}\n")
+    relative_gpu_test = Path("external/shuttle_mlir/gpu_transport_v2_test")
+    gpu_transport_test = invocation_root / relative_gpu_test
+    gpu_transport_test.parent.mkdir(parents=True)
+    capture = tmp_path / "derived-test-srcdir.txt"
+    gpu_transport_test.write_text(
+        "#!/bin/sh\n"
+        'test -r "$TEST_SRCDIR/shuttle_mlir/test/Inputs/'
+        'jax-0.10.1-bf16-projected_parameter_broadcast-2048x4096-forward.mlir" || exit 23\n'
+        'printf \'%s\\n\' "$TEST_SRCDIR" > "$CAPTURE"\n'
+    )
+    gpu_transport_test.chmod(0o755)
+    plan = execution_plan(
+        runner=runner,
+        gpu_transport_test=relative_gpu_test,
+        case_root=tmp_path / "cases",
+        raw_root=tmp_path / "raw",
+    )
+
+    environment = dict(os.environ)
+    environment.pop("TEST_SRCDIR", None)
+    environment.pop("RUNFILES_DIR", None)
+    environment.pop("RUNFILES_MANIFEST_FILE", None)
+    environment["CAPTURE"] = str(capture)
+    result = subprocess.run(
+        plan["runs"][0]["argv"],
+        cwd=invocation_root,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert capture.read_text().strip() == str(runfiles_root)
+
+
 def test_every_acceptance_cell_enforces_metrics_roles_and_resources(
     provider: str,
     boundary: str,
@@ -1000,6 +1049,9 @@ class RepresentativeRmsNormTest(unittest.TestCase):
         test_execution_plan_is_exact_fresh_process_matrix(self.temporary_path("plan"))
         test_execution_plan_invokes_shell_wrapper_with_explicit_gpu_test(self.temporary_path("wrapper-argv"))
         test_shell_wrapper_bridges_bazel_runfiles_directory_for_fixture_lookup(self.temporary_path("wrapper-runfiles"))
+        test_shell_wrapper_derives_runfiles_root_when_bazel_omits_environment(
+            self.temporary_path("wrapper-runfiles-derived")
+        )
 
     def test_process_and_raw_claim_failures(self) -> None:
         for index, failure in enumerate(FAILURE_MUTATIONS):
