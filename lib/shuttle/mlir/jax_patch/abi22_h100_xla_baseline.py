@@ -14,11 +14,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import jax
-import jax.numpy as jnp
-import jaxlib
 import ml_dtypes
 import numpy as np
+
+try:
+    import jax
+    import jax.numpy as jnp
+    import jaxlib
+except ModuleNotFoundError:
+    jax = None
+    jaxlib = None
+    jnp = None
+
 from abi22_h100_performance import (
     CELL_KEYS,
     EXPLORATORY_MODE,
@@ -112,7 +119,7 @@ def _rmsnorm_backward(x: jax.Array, weight: jax.Array, cotangent: jax.Array) -> 
 
 def _rmsnorm_contract(x: jax.Array, weight: jax.Array, projection: jax.Array) -> jax.Array:
     normalized = _rmsnorm(x, weight)
-    return (normalized.astype(jnp.float32) @ projection.astype(jnp.float32)).astype(jnp.bfloat16)
+    return jnp.matmul(normalized, projection, preferred_element_type=jnp.float32).astype(jnp.bfloat16)
 
 
 _FUNCTIONS: dict[str, Callable[..., Any]] = {
@@ -250,6 +257,8 @@ def _compile_cells(device: jax.Device) -> list[CompiledCell]:
 
 
 def _require_h100() -> jax.Device:
+    if jax is None:
+        raise RuntimeError("ordinary-JAX baseline requires JAX and jaxlib")
     if jax.default_backend() != "gpu":
         raise RuntimeError("ordinary-JAX baseline requires the GPU backend")
     devices = jax.devices("gpu")

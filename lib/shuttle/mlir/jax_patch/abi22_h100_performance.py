@@ -59,6 +59,7 @@ _RESOURCE_FIELDS = (
 EXPLORATORY_MODE = "exploratory_host_v1"
 HOST_CLOCK = "host_block_until_ready"
 TE_UNAVAILABLE_BLOCKER = "te_2_17_runner_lacks_required_shapes_epsilon_and_norm_contract"
+EXPLORATORY_MAX_BF16_ULP = 4
 
 
 def _mapping(value: object, label: str) -> dict[str, Any]:
@@ -389,6 +390,11 @@ def validate_exploratory_report(report: object, *, expected_producer: str) -> di
             _digest(digest, f"{case}.output.digests[{result_index}]")
         maximum_absolute_error = _finite(output.get("max_abs_error"), f"{case}.output.max_abs_error")
         maximum_ulp = _integer(output.get("max_bf16_ulp"), f"{case}.output.max_bf16_ulp")
+        if maximum_ulp > EXPLORATORY_MAX_BF16_ULP:
+            raise ValueError(
+                f"{case} {policy} exceeds the exploratory independent-oracle bound "
+                f"of {EXPLORATORY_MAX_BF16_ULP} BF16 ULP"
+            )
         identity = _mapping(cell.get("identity"), f"{case}.identity")
         workload = _digest(identity.get("workload_digest"), f"{case}.identity.workload_digest")
         executable = _digest(identity.get("executable_digest"), f"{case}.identity.executable_digest")
