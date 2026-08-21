@@ -4375,7 +4375,8 @@ TEST(GpuTransportV2Test,
       results.push_back(
           {device.opaque(), static_cast<int64_t>(device.size())});
     }
-    ASSERT_TRUE((*runner)->Execute(operands, results).ok());
+    absl::Status execution = (*runner)->Execute(operands, results);
+    ASSERT_TRUE(execution.ok()) << execution;
     ASSERT_TRUE((*runner)->AwaitCompletion().ok());
     for (auto [index, host] : llvm::enumerate(hostResults))
       ASSERT_TRUE((*executor)
