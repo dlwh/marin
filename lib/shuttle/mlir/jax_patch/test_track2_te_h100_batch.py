@@ -388,7 +388,7 @@ def _valid_cell(shape: tuple[int, int], boundary: str, *, te: bool) -> dict:
     samples = [scale * (100_000 + index * 1_000) for index in range(20)]
     cell = {
         "shape": list(shape),
-        "scope": "architecture_fixture" if shape == SHAPES[0] else "representative_acceptance",
+        "scope": "architecture_fixture" if shape == SHAPES[0] else "representative_performance_qualification",
         "boundary": boundary,
         "input_digests": {role: INPUT_DIGESTS[shape][role] for role in input_roles},
         "execution": {
@@ -577,6 +577,7 @@ def test_execute_oracle_runs_exact_matrix_and_builds_matched_acceptance(
     assert result["acceptance"]["accepted_input_pattern"] == ACCEPTANCE_PATTERN
     assert result["acceptance"]["accepted_shape"] == [2048, 4096]
     assert result["acceptance"]["performance"]["median_ratio_te_over_xla"] == {boundary: 0.5 for boundary in BOUNDARIES}
+    assert result["acceptance"]["performance"]["input_pattern"] == QUALIFICATION_PATTERN
     assert result["observed_xla_runtime"] == XLA_OBSERVED_RUNTIME
     assert result["shuttle"] == {"status": "pending", "blocker": SHUTTLE_BLOCKER}
     assert set(result["reports"]) == {"transformer_engine_2_17", "ordinary_jax_xla"}

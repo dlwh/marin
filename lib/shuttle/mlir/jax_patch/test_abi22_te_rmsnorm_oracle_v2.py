@@ -84,7 +84,7 @@ def _cell(shape: tuple[int, int], boundary: str, *, provider: str) -> dict:
     }[boundary]
     return {
         "shape": list(shape),
-        "scope": "architecture_fixture" if shape == ARCHITECTURE_SHAPE else "representative_acceptance",
+        "scope": "architecture_fixture" if shape == ARCHITECTURE_SHAPE else "representative_performance_qualification",
         "boundary": boundary,
         "input_digests": {role: INPUT_DIGESTS[shape][role] for role in input_roles},
         "execution": {
@@ -250,7 +250,7 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
             },
         )
 
-    def test_plan_separates_architecture_from_representative_acceptance(self) -> None:
+    def test_plan_separates_architecture_from_representative_performance_qualification(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         case_root = Path(temporary.name) / "cases"
@@ -300,7 +300,7 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
                 (shape, scope, boundary, producer)
                 for shape, scope in (
                     (ARCHITECTURE_SHAPE, "architecture_fixture"),
-                    (REPRESENTATIVE_SHAPE, "representative_acceptance"),
+                    (REPRESENTATIVE_SHAPE, "representative_performance_qualification"),
                 )
                 for boundary in BOUNDARIES
                 for producer in ("transformer_engine_2_17", "ordinary_jax_xla")
@@ -498,7 +498,10 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
         for mutation, diagnostic in (
             (lambda report: report.update(epsilon=1.0e-5), "epsilon"),
             (lambda report: report["cells"].pop(), "matrix"),
-            (lambda report: report["cells"][0].update(scope="representative_acceptance"), "scope"),
+            (
+                lambda report: report["cells"][0].update(scope="representative_performance_qualification"),
+                "scope",
+            ),
             (
                 lambda report: report["capabilities"]["norm_contract"].update(status="supported"),
                 "norm_contract",
@@ -748,6 +751,7 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
         self.assertEqual(accepted["numerical_policy"], NUMERICAL_POLICY)
         self.assertEqual(accepted["qualification"], qualification)
         self.assertEqual(accepted["performance"]["clock"], "host_blocking_ns")
+        self.assertEqual(accepted["performance"]["input_pattern"], QUALIFICATION_PATTERN)
         self.assertEqual(set(accepted["performance"]["median_ratio_te_over_xla"]), set(BOUNDARIES))
         self.assertEqual(
             accepted["performance"]["median_ratio_te_over_xla"],
