@@ -50,7 +50,7 @@ def _fake_invoke(
     *,
     acceptance_drift: bool = True,
     qualification_drift: bool = False,
-    alias_te_outputs: bool = False,
+    alias_policy_producer: str | None = None,
 ) -> int:
     calls.append(argv)
     arguments = _arguments(argv)
@@ -61,13 +61,20 @@ def _fake_invoke(
     output.parent.mkdir(parents=True, exist_ok=True)
     roles = oracle.OUTPUT_ROLES[boundary]
     input_roles = ("x", "gamma") if boundary == "forward" else ("x", "gamma", "dy")
+    producer = "transformer_engine_2_17" if argv[0] == str(paths.te_runner) else "ordinary_jax_xla"
+    alias_policy_outputs = (
+        producer == alias_policy_producer
+        and any(ACCEPTANCE_PATTERN in argument for argument in argv)
+        and boundary == "forward"
+        and "repeat0" in output.name
+    )
 
     if argv[0] == str(paths.te_runner):
         output_files = {}
         for role in roles:
             reference_path = case / f"reference_{role}.bf16"
-            output_path = reference_path if alias_te_outputs else output.parent / f"{output.stem}-{role}.bf16"
-            if not alias_te_outputs:
+            output_path = reference_path if alias_policy_outputs else output.parent / f"{output.stem}-{role}.bf16"
+            if not alias_policy_outputs:
                 shutil.copyfile(reference_path, output_path)
             output_files[role] = str(output_path)
         output.write_text(
@@ -97,8 +104,9 @@ def _fake_invoke(
     output_directory.mkdir(parents=True, exist_ok=True)
     for role in roles:
         reference_path = case / f"reference_{role}.bf16"
-        actual_path = output_directory / f"{role}.bf16"
-        actual_path.write_bytes(reference_path.read_bytes())
+        actual_path = reference_path if alias_policy_outputs else output_directory / f"{role}.bf16"
+        if not alias_policy_outputs:
+            actual_path.write_bytes(reference_path.read_bytes())
         output_files[role] = str(actual_path)
         output_shape = shape if role != "dgamma" else (shape[1],)
         actual = np.fromfile(actual_path, dtype=np.uint16).view(ml_dtypes.bfloat16).reshape(output_shape)
@@ -289,29 +297,31 @@ class Track2TeH100PolicyV4Test(unittest.TestCase):
         )
         self.assertEqual(len(calls), 72)
 
-    def test_worker_rejects_te_output_paths_that_alias_case_inputs(self) -> None:
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        paths = BatchPaths.under(Path(temporary.name) / "workspace")
-        paths.workspace.mkdir()
-        paths.reports.mkdir()
-        paths.raw.mkdir()
-        paths.te_runner.write_bytes(b"runner-binary")
-        paths.te_library.parent.mkdir(parents=True)
-        paths.te_library.write_bytes(b"resolved-te-library")
+    def test_worker_rejects_each_policy_producer_output_alias_to_reference(self) -> None:
+        for producer in oracle.PRODUCERS:
+            with self.subTest(producer=producer):
+                temporary = tempfile.TemporaryDirectory()
+                self.addCleanup(temporary.cleanup)
+                paths = BatchPaths.under(Path(temporary.name) / "workspace")
+                paths.workspace.mkdir()
+                paths.reports.mkdir()
+                paths.raw.mkdir()
+                paths.te_runner.write_bytes(b"runner-binary")
+                paths.te_library.parent.mkdir(parents=True)
+                paths.te_library.write_bytes(b"resolved-te-library")
 
-        with self.assertRaisesRegex(ValueError, "output.*path|raw output"):
-            batch.execute_oracle_v4(
-                paths=paths,
-                device=DEVICE,
-                invoke=lambda argv: _fake_invoke(
-                    paths,
-                    [],
-                    argv,
-                    acceptance_drift=False,
-                    alias_te_outputs=True,
-                ),
-            )
+                with self.assertRaisesRegex(ValueError, "policy.*output.*path|raw output"):
+                    batch.execute_oracle_v4(
+                        paths=paths,
+                        device=DEVICE,
+                        invoke=lambda argv, paths=paths, producer=producer: _fake_invoke(
+                            paths,
+                            [],
+                            argv,
+                            acceptance_drift=False,
+                            alias_policy_producer=producer,
+                        ),
+                    )
 
     def test_worker_persists_raw_outputs_and_repeat_diagnostics_before_rejection(self) -> None:
         temporary = tempfile.TemporaryDirectory()
