@@ -539,8 +539,6 @@ absl::StatusOr<Parsed> parse(ArrayRef<uint8_t> bytes) {
         return invalidTransport("overlapping temporary reuse");
     }
   }
-  if (temporaryBytes == 0)
-    return invalidTransport("empty temporary allocation");
   auto bundleSchema = reader.i64();
   auto bundleSchedule = reader.text();
   auto bundleDevice = reader.text();

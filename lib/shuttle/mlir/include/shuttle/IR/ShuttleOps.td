@@ -110,16 +110,20 @@ def Shuttle_MaterializationTaskOp
     : Shuttle_Op<"materialization_task",
                  [ParentOneOf<["::mlir::shuttle::MaterializationPlanOp"]>]> {
   let summary = "One generic Map, Fold, or Contract task family";
-  let arguments = (ins I64Attr:$ordinal, Shuttle_MaterializationTaskKindAttr:$kind,
-      DenseI64ArrayAttr:$domain_shape,
-      DenseI64ArrayAttr:$reduction_dimensions,
+  let arguments = (ins I64Attr:$ordinal,
+      Shuttle_MaterializationTaskKindAttr:$kind,
+      DenseI64ArrayAttr:$domain_shape, DenseI64ArrayAttr:$reduction_dimensions,
       DenseI64ArrayAttr:$input_buffers, DenseI64ArrayAttr:$output_buffers,
       DenseI64ArrayAttr:$dependencies, OptionalAttr<BoolAttr>:$order_free,
       StrAttr:$semantic_fingerprint, Shuttle_SourceRefAttr:$source,
       OptionalAttr<ArrayAttr>:$fused_sources,
       OptionalAttr<AffineMapArrayAttr>:$composed_input_maps,
       OptionalAttr<ArrayAttr>:$fold_epilogue_sources,
-      OptionalAttr<AffineMapArrayAttr>:$epilogue_input_maps);
+      OptionalAttr<AffineMapArrayAttr>:$epilogue_input_maps,
+      OptionalAttr<ArrayAttr>:$fold_region_sources,
+      OptionalAttr<ArrayAttr>:$fold_region_phases,
+      OptionalAttr<ArrayAttr>:$fold_region_boundary_uses,
+      OptionalAttr<ArrayAttr>:$fold_region_recomputed_sources);
 }
 
 def Shuttle_MaterializationPlanYieldOp

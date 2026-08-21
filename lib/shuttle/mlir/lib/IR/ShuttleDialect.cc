@@ -821,6 +821,7 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
 
   unsigned foldCount = 0;
   unsigned contractCount = 0;
+  unsigned foldRegionCount = 0;
   SmallVector<SmallVector<int64_t>> actualConsumers(buffers.size());
   for (auto [position, buffer] : llvm::enumerate(buffers)) {
     if (buffer.getOrdinal() != static_cast<int64_t>(position)) {
@@ -914,6 +915,115 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
     }
     if (task.getKind() == MaterializationTaskKind::Fold) {
       ++foldCount;
+      auto foldRegionSources =
+          task->getAttrOfType<ArrayAttr>("fold_region_sources");
+      if (foldRegionSources) {
+        ++foldRegionCount;
+        auto phases = task->getAttrOfType<ArrayAttr>("fold_region_phases");
+        auto boundaryUses =
+            task->getAttrOfType<ArrayAttr>("fold_region_boundary_uses");
+        auto recomputed =
+            task->getAttrOfType<ArrayAttr>("fold_region_recomputed_sources");
+        if (getSchemaVersion() != 2 || foldRegionSources.empty() || !phases ||
+            phases.empty() || !boundaryUses || boundaryUses.empty() ||
+            task->getAttr("fused_sources") ||
+            task->getAttr("composed_input_maps") ||
+            task->getAttr("fold_epilogue_sources") ||
+            task->getAttr("epilogue_input_maps") ||
+            task.getInputBuffers().empty() ||
+            task.getOutputBuffers().size() != 1 ||
+            !task.getOrderFree().value_or(false)) {
+          return task.emitOpError(
+              "schema-v2 Fold regions require closed sources, phases, "
+              "boundary uses, and one output");
+        }
+        llvm::SmallDenseSet<Attribute> sourceSet;
+        std::optional<SourceRefAttr> previousSource;
+        for (Attribute attribute : foldRegionSources) {
+          auto source = dyn_cast<SourceRefAttr>(attribute);
+          if (!source || !sourceSet.insert(source).second ||
+              (previousSource &&
+               std::tuple(previousSource->getFunctionOrdinal(),
+                          previousSource->getBlockOrdinal(),
+                          previousSource->getOperationOrdinal(),
+                          previousSource->getResultOrdinal()) >=
+                   std::tuple(source.getFunctionOrdinal(),
+                              source.getBlockOrdinal(),
+                              source.getOperationOrdinal(),
+                              source.getResultOrdinal()))) {
+            return task.emitOpError(
+                "Fold region sources must be unique and source ordered");
+          }
+          previousSource = source;
+        }
+        for (auto [phaseOrdinal, attribute] : llvm::enumerate(phases)) {
+          auto phase = dyn_cast<DictionaryAttr>(attribute);
+          auto source =
+              phase ? dyn_cast_or_null<SourceRefAttr>(phase.get("source"))
+                    : SourceRefAttr{};
+          auto domain = phase ? dyn_cast_or_null<DenseI64ArrayAttr>(
+                                    phase.get("domain_shape"))
+                              : DenseI64ArrayAttr{};
+          auto reduction = phase ? dyn_cast_or_null<DenseI64ArrayAttr>(
+                                       phase.get("reduction_dimensions"))
+                                 : DenseI64ArrayAttr{};
+          auto orderFree =
+              phase ? dyn_cast_or_null<BoolAttr>(phase.get("order_free"))
+                    : BoolAttr{};
+          auto transition =
+              phase ? dyn_cast_or_null<StringAttr>(phase.get("transition"))
+                    : StringAttr{};
+          if (!phase || phase.size() != 5 || !source || !domain || !reduction ||
+              !orderFree || !transition || !sourceSet.contains(source) ||
+              transition.getValue() !=
+                  (phaseOrdinal == 0 ? "launch_boundary" : "cta_local") ||
+              (phaseOrdinal == 0 &&
+               (domain.asArrayRef() != task.getDomainShape() ||
+                reduction.asArrayRef() != task.getReductionDimensions() ||
+                orderFree.getValue() != task.getOrderFree().value_or(false)))) {
+            return task.emitOpError(
+                "Fold region phases must close ordered launch-local "
+                "reductions");
+          }
+        }
+        llvm::SmallDenseSet<std::pair<Attribute, int64_t>> boundarySet;
+        for (Attribute attribute : boundaryUses) {
+          auto use = dyn_cast<DictionaryAttr>(attribute);
+          auto input =
+              use ? dyn_cast_or_null<IntegerAttr>(use.get("input_buffer"))
+                  : IntegerAttr{};
+          auto source = use ? dyn_cast_or_null<SourceRefAttr>(use.get("source"))
+                            : SourceRefAttr{};
+          auto operand = use ? dyn_cast_or_null<IntegerAttr>(use.get("operand"))
+                             : IntegerAttr{};
+          auto indexing =
+              use ? dyn_cast_or_null<AffineMapAttr>(use.get("indexing_map"))
+                  : AffineMapAttr{};
+          auto phase = use ? dyn_cast_or_null<IntegerAttr>(use.get("phase"))
+                           : IntegerAttr{};
+          if (!use || use.size() != 5 || !input || !source || !operand ||
+              !indexing || !phase || !sourceSet.contains(source) ||
+              operand.getInt() < 0 || phase.getInt() < 0 ||
+              phase.getInt() >= static_cast<int64_t>(phases.size()) ||
+              !llvm::is_contained(task.getInputBuffers(), input.getInt()) ||
+              !boundarySet.insert({source, operand.getInt()}).second) {
+            return task.emitOpError(
+                "Fold region boundary uses must uniquely bind task inputs");
+          }
+        }
+        llvm::SmallDenseSet<Attribute> recomputedSet;
+        if (recomputed) {
+          for (Attribute source : recomputed) {
+            if (!isa<SourceRefAttr>(source) || !sourceSet.contains(source) ||
+                !recomputedSet.insert(source).second) {
+              return task.emitOpError(
+                  "Fold region recomputation declarations must be unique "
+                  "task sources");
+            }
+          }
+        }
+        continue;
+      }
       const bool hasEpilogue =
           static_cast<bool>(task->getAttrOfType<ArrayAttr>(
               "fold_epilogue_sources"));
@@ -1039,7 +1149,9 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
   if (foldCount == 0 && contractCount == 0) {
     return emitOpError("requires at least one Fold or Contract task");
   }
-  if (getSchemaVersion() != (contractCount == 0 ? 1 : 2)) {
+  if ((contractCount != 0 && foldRegionCount != 0) ||
+      getSchemaVersion() !=
+          (contractCount != 0 || foldRegionCount != 0 ? 2 : 1)) {
     return emitOpError(
         "materialization schema must equal the admitted task family");
   }
@@ -1372,7 +1484,9 @@ LogicalResult SchedulePlanOp::verifyRegions() {
   if (foldCount == 0 && contractCount == 0) {
     return emitOpError("requires at least one Fold or Contract schedule task");
   }
-  if (getSchemaVersion() != (contractCount == 0 ? 1 : 2)) {
+  if ((contractCount != 0 && getSchemaVersion() != 2) ||
+      (contractCount == 0 && getSchemaVersion() != 1 &&
+       getSchemaVersion() != 2)) {
     return emitOpError("schedule schema must equal the admitted task family");
   }
   if (getFingerprint() != schedulePlanFingerprint(*this)) {
