@@ -5577,11 +5577,12 @@ author: dlwh
   canonical result, terminal summary, submission receipt, sanitized result
   log, reconstructable gate-source patch, request SHA-256 and size, and file
   checksum manifest. The 6,363,268-byte request protobuf is omitted. The
-  12,795-byte compressed full-index patch expands to 47,430 bytes and
-  reconstructs gate tree
-  `abb539d85b53ba38b3e297b7756a95327574ae3d` from the reachable production
-  commit and has SHA-256
-  `366a15e1cb201225b475a896e517b560e30aff3884a6917a2f3c51e1c84dad21`.
+  12,795-byte compressed patch has SHA-256
+  `a9c48e70f8e7cbd69b0822f010957183dff5096aeb29d02093375d7c3d845456`.
+  It expands to a 47,430-byte full-index patch with SHA-256
+  `366a15e1cb201225b475a896e517b560e30aff3884a6917a2f3c51e1c84dad21`
+  and reconstructs gate tree `abb539d85b53ba38b3e297b7756a95327574ae3d`
+  from the reachable production commit.
   The task-internal portability, device, Bazel, and XLA logs were not
   downloaded; their hashes and sizes in the canonical result are self-reported.
   Verification command:
