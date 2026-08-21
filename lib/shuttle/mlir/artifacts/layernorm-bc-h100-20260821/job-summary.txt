@@ -1,0 +1,6 @@
+Job: /dlwh/shuttle-layernorm-bc-h100-r2 (/dlwh/shuttle-layernorm-bc-h100-r2)
+State: succeeded  exit=0  failures=0  preemptions=0
+Tasks: 1/1 completed  succeeded=1
+
+  TASK  STATE        EXIT  DURATION                    PEAK MEM    CUR MEM    ERROR
+     0  succeeded       0  4 minutes and 5.82 seconds  -           -

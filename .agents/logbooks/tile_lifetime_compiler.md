@@ -5718,3 +5718,62 @@ author: dlwh
 - Next action: keep performance under a separately reviewed CUDA-event
   protocol and qualify backward/composed or ordinary-JAX boundaries through
   their own versioned contracts rather than extending this claim.
+
+### 2026-08-21 - TLTC-ABI22-004 prospective LayerNorm B/C contract on H100
+
+- Hypothesis: the generic two-task shared-stat partition can execute LayerNorm
+  backward and composed boundaries on one H100, preserve the public result
+  projection, match the prospectively sealed f32 schedules bitwise, and remain
+  inside independent binary64 limits for SOURCE_ORDERED and FAST.
+- Executed source: reviewed commit
+  `481a91743f8122b7c0996822e94e3dfcf0d3bced`, tree
+  `060b9eb9cbbb8da1f75b40ec42e6cfd28fe7e680`, source-manifest SHA-256
+  `b8336bb1e682d45254923848705becad617ee1de690985f659835356b6e9e65b`.
+  Contract `shuttle_abi22_layernorm_bc_numerical_contract_v1` has SHA-256
+  `c28aa8657fa9b854e2015c9fe734da23092c8b0897076cc0d15a780cd13415aa`.
+  The preceding forward-only qualification is `TLTC-ABI22-003`; its evidence
+  remains separate under
+  `lib/shuttle/mlir/artifacts/layernorm-forward-h100-20260821/`.
+- Config: `/dlwh/shuttle-layernorm-bc-h100-r2` ran on one batch-priority H100
+  in `cw-rno2a`, with 32 CPU, 128 GiB memory, 500 GiB disk, one replica, a
+  four-hour timeout, and all retry/failure budgets zero. The 7,032,069-byte
+  request has SHA-256
+  `f191c8fb5067d48c2d03adcb491b9aa0c798519ab739501fc35ce57fb9024d04`;
+  its 7,025,390-byte source bundle has SHA-256
+  `7b83d36042a3aa361b2da38289cb8604a5690a37739137964fb4759c529d0091`.
+  Two independent reviews found no P0-P3 issue, and the clean-source rerender
+  was byte-identical.
+- Result: Iris reports one successful task, exit code zero, no failure or
+  preemption, and 4 minutes 5.82 seconds duration. All eight coordinates formed
+  by backward/composed, `7x13`/`2048x4096`, and SOURCE_ORDERED/FAST executed
+  twice. All 28 public-role observations had zero schedule and repeatability
+  differences. Both the host contract and manual H100 targets passed.
+- Public order and resources: backward binds `[x,gamma,dy]` to
+  `[dx,dgamma,dbeta]` through result slots `[7,6,5]`; composed binds
+  `[x,gamma,beta,dy]` to `[y,dx,dgamma,dbeta]` through slots `[6,9,8,7]`.
+  Every coordinate used exactly two launches and two compact row-stat
+  temporaries. Temporary bytes were 56 at `7x13` and 16,384 at `2048x4096`.
+  The feature launch depended on the row launch; the contract seals all input
+  and output slots, grids, blocks, and dynamic shared-memory sizes.
+- Numerical result: all `7x13` role metrics were zero. At `2048x4096`, the
+  per-role worst `(max abs, mean abs, relative Linf, BF16 ULP)` values were
+  `y=(0.015625,6.057504975398587e-8,0.004291845493562232,67)`,
+  `dx=(0.0078125,3.725514735597457e-8,3.838689072327044e-7,4)`,
+  `dgamma=(0,0,0,0)`, and
+  `dbeta=(1,0.000244140625,0.0064516129032258064,1)`. SOURCE_ORDERED and FAST
+  matched the same sealed schedules on this matrix.
+- Artifacts:
+  `lib/shuttle/mlir/artifacts/layernorm-bc-h100-20260821/` preserves the
+  canonical result and 28 metrics, byte-identical contract with all held-out
+  digests and resource descriptors, exact Iris task log, terminal summary,
+  receipt, monitoring metadata, request identity, and file checksums. The
+  request bytes remain external. Verification command:
+  `(cd lib/shuttle/mlir/artifacts/layernorm-bc-h100-20260821 && shasum -a 256 -c SHA256SUMS)`.
+- Interpretation: this accepts the direct Shuttle LayerNorm backward/composed
+  functional coordinates above on one H100. It is not ordinary-JAX plugin,
+  representative-shape, performance, kernel-timing, register, occupancy,
+  compiler-cost, or another-architecture evidence. The task duration includes
+  bootstrap, compilation, and tests.
+- Next action: define a separately reviewed CUDA-event performance protocol
+  against ordinary JAX/XLA and an available strong oracle before another
+  hardware run.

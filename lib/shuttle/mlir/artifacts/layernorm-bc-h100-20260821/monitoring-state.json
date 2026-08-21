@@ -1,0 +1,14 @@
+{
+  "ts": 1787342679000,
+  "job_id": "/dlwh/shuttle-layernorm-bc-h100-r2",
+  "config": "lib/iris/config/cw-rno2a.yaml",
+  "resubmit_command": "DISABLED: zero-retry sealed request; any replacement requires a newly rendered and reviewed request identity",
+  "restart_count": 0,
+  "monitoring_owner": "/root/layernorm_next_target",
+  "terminal_state": "succeeded",
+  "exit_code": 0,
+  "failures": 0,
+  "preemptions": 0,
+  "duration": "4 minutes and 5.82 seconds",
+  "evidence": "/private/tmp/shuttle-layernorm-bc-h100-r2-481a9174.preserved.json"
+}
