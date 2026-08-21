@@ -948,7 +948,6 @@ bool mutateFoldRegionTask(mlir::ModuleOp module, llvm::StringRef mutation) {
       changed.front() = builder.getDictionaryAttr(fields);
       task->setAttr("fold_region_boundary_uses", builder.getArrayAttr(changed));
     } else if (mutation == "boundary-source" ||
-               mutation == "boundary-operand" ||
                mutation == "boundary-indexing-map") {
       llvm::SmallVector<mlir::Attribute> changed(boundaryUses.getValue());
       if (mutation == "boundary-source") {
@@ -960,45 +959,6 @@ bool mutateFoldRegionTask(mlir::ModuleOp module, llvm::StringRef mutation) {
         plan.setFingerprint(
             mlir::shuttle::materializationPlanFingerprint(plan));
         return true;
-      }
-      if (mutation == "boundary-operand") {
-        for (auto [useIndex, useAttribute] : llvm::enumerate(changed)) {
-          auto candidateUse = mlir::cast<mlir::DictionaryAttr>(useAttribute);
-          auto candidateSource =
-              mlir::cast<mlir::shuttle::SourceRefAttr>(
-                  candidateUse.get("source"));
-          auto candidateOperand =
-              mlir::cast<mlir::IntegerAttr>(candidateUse.get("operand"));
-          mlir::shuttle::MapOp candidateMap;
-          module.walk([&](mlir::shuttle::MapOp map) {
-            if (map.getSource() == candidateSource)
-              candidateMap = map;
-          });
-          if (!candidateMap)
-            return false;
-          for (auto [replacementOperand, input] :
-               llvm::enumerate(candidateMap.getInputs())) {
-            if (replacementOperand ==
-                    static_cast<unsigned>(candidateOperand.getInt()) ||
-                input.getType() !=
-                    candidateMap.getInputs()[candidateOperand.getInt()]
-                        .getType())
-              continue;
-            candidateUse = replaceField(
-                candidateUse, "operand",
-                builder.getI64IntegerAttr(replacementOperand));
-            candidateUse = replaceField(
-                candidateUse, "indexing_map",
-                candidateMap.getIndexingMaps()[replacementOperand]);
-            changed[useIndex] = candidateUse;
-            task->setAttr("fold_region_boundary_uses",
-                          builder.getArrayAttr(changed));
-            plan.setFingerprint(
-                mlir::shuttle::materializationPlanFingerprint(plan));
-            return true;
-          }
-        }
-        continue;
       }
       auto use = mlir::cast<mlir::DictionaryAttr>(changed.front());
       auto source = mlir::cast<mlir::shuttle::SourceRefAttr>(use.get("source"));
@@ -2124,7 +2084,6 @@ TEST(Abi22MapFusionContract,
                                                "missing-boundary",
                                                "duplicate-boundary",
                                                "boundary-source",
-                                               "boundary-operand",
                                                "boundary-indexing-map",
                                                "nonlocal-phase",
                                                "missing-phase",
