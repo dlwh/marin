@@ -185,3 +185,34 @@ author: dlwh
   repeatability hypothesis.
 - Artifact:
   [`track2-te-rmsnorm-r11-failure-20260821`](../../lib/shuttle/mlir/artifacts/track2-te-rmsnorm-r11-failure-20260821/README.md).
+
+### 2026-08-21 12:03 - T2-TE-007 r12 v4 held-out acceptance
+
+- Hypothesis: after separating qualification diagnostics from acceptance, the
+  reviewed piecewise v4 policy and untouched `heldout_splitmix64_v3` input
+  would pass numerical and exact-repeat gates for Transformer Engine 2.17 and
+  ordinary JAX/XLA RMSNorm.
+- Commit Hash: source `597850f2ff5e4f613d8d2f5e7ec13d4e897f5488`, tree
+  `d55449389e8ba53f22326b407287ecdc555007a8`.
+- Command: sealed Iris job `/dlwh/shuttle-track2-te-h100-r12`, request SHA-256
+  `4c3cb77f327f3a632009c313bf7c51f7201a15dc67bbb06644c054b4a3d9b9ac`.
+- Config: one H100, batch priority, one replica, zero failure, preemption, and
+  task-failure budgets; RMSNorm `[2048,4096]`; epsilon `1e-6`; F/B/C; two
+  repeats over five patterns. Only `heldout_splitmix64_v3` was acceptance
+  evidence; the prior four patterns remained diagnostic.
+- Result: hypothesis accepted for the exact v4 scope. All 12 acceptance repeat
+  coordinates were bit-identical. Every one of the 24 output observations
+  passed the frozen finite, partition, absolute, mean, relative, and masked-ULP
+  gates. The task completed with exit 0, no failures, and no preemptions.
+- Interpretation: the result qualifies the exact TE 2.17 and ordinary-JAX/XLA
+  providers, input, H100, shape, epsilon, boundaries, and v4 hybrid numerical
+  guarantee. Two ordinary-JAX/XLA composed-`dx` repeat drifts on old patterns
+  remain reported qualification diagnostics. Performance is host-blocking
+  qualification data without a threshold. Raw BF16 worker files were not
+  retained, so pointwise metrics cannot be independently recomputed from this
+  archive.
+- Next action: integrate the accepted v4 lineage and evidence, then freeze and
+  review a Shuttle producer for the same held-out input before any new H100 run.
+  No norm-to-Contract claim is in scope.
+- Artifact:
+  [`track2-te-rmsnorm-r12-success-20260821`](../../lib/shuttle/mlir/artifacts/track2-te-rmsnorm-r12-success-20260821/README.md).
