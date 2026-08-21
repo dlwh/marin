@@ -83,6 +83,7 @@ def _document() -> dict[str, object]:
                 "expected_base_version": "0.10.1",
                 "install_method": "site-packages-pth",
                 "network": False,
+                "runtime_isolation": "venv_without_system_site_packages",
                 "source": "pinned_hydrated_checkout",
             },
             "python": "3.12",
@@ -129,6 +130,7 @@ def _authorization(tmp_path: Path) -> tuple[Path, str, Authorization]:
         (("toolchain", "python_package", "expected_base_version"), "0.10.0"),
         (("toolchain", "python_package", "install_method"), "registry-wheel"),
         (("toolchain", "python_package", "network"), True),
+        (("toolchain", "python_package", "runtime_isolation"), "system-site-packages"),
         (("toolchain", "python_package", "source"), "registry"),
         (("toolchain", "python"), "3.13"),
     ],
@@ -227,6 +229,7 @@ def test_dry_run_renders_one_network_hydration_then_offline_build_and_two_worker
     assert "--bazel_options=--repository_disable_download" not in hydration
     assert "--bazel_options=--repository_disable_download" in offline
     assert "--disable-pip-version-check" in phases[6]["argv"]
+    assert "--system-site-packages" not in phases[5]["argv"]
     assert "--no-deps" in phases[6]["argv"]
     assert "--no-index" in phases[6]["argv"]
     assert phases[7]["argv"][-4:] == [

@@ -74,8 +74,10 @@ repeats the three-wheel build with repository downloads disabled. The physical
 CUDA 13.2 compiler tools are identity evidence only; neither build phase sets
 `LOCAL_CUDA_PATH`. The isolated runtime installs the three compiled wheels with
 dependency and index access disabled, adds the exact pinned JAX checkout as its
-pure-Python source, and verifies that source and base version before populate.
-Populate and reuse run as separate Python processes. Build
+pure-Python source, reuses dependency packages from the immutable base-image
+runtime behind that source, and verifies the JAX origin and base version before
+populate. The child environment does not expose system site packages. Populate
+and reuse run as separate Python processes. Build
 logs and wheels remain under the ephemeral workspace; stdout contains one
 canonical result document.
 

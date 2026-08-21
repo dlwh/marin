@@ -55,6 +55,7 @@ LOG_TAIL_MAX_LINES = 80
 WHEEL_PREFIXES = ("jaxlib-", "jax_cuda13_plugin-", "jax_cuda13_pjrt-")
 JAX_PYTHON_VERSION = "0.10.1"
 JAX_SOURCE_HELPER_RELATIVE = Path("lib/shuttle/mlir/jax_patch/track1_map_h100_jax_source.py")
+BASE_RUNTIME_SITE_PACKAGES = Path("/opt/h100-evidence-runtime/lib/python3.12/site-packages")
 WORKER_MODES = ("disabled", "source_ordered", "fast")
 SOURCE_MANIFEST_RELATIVE = Path("scripts/shuttle/track1_map_h100_source_manifest.json")
 SOURCE_ROOTS = (Path("lib/shuttle/mlir"), Path("lib/shuttle/src/shuttle"))
@@ -220,10 +221,13 @@ def _expected_authorization(source_manifest_sha256: str) -> dict[str, object]:
             },
             "python_package": {
                 "dependency_resolution": False,
+                "dependency_site_packages": str(BASE_RUNTIME_SITE_PACKAGES),
+                "dependency_source": "immutable_base_image_runtime",
                 "distribution": "jax",
                 "expected_base_version": JAX_PYTHON_VERSION,
                 "install_method": "site-packages-pth",
                 "network": False,
+                "runtime_isolation": "venv_without_system_site_packages",
                 "source": "pinned_hydrated_checkout",
             },
             "python": "3.12",
@@ -290,12 +294,15 @@ def _worker_command(paths: PrototypePaths, runner_repository: Path, role: str) -
 
 
 def _jax_source_command(paths: PrototypePaths, runner_repository: Path, action: str) -> list[str]:
-    return [
+    command = [
         str(paths.runtime / "bin/python"),
         str(runner_repository / JAX_SOURCE_HELPER_RELATIVE),
         action,
         str(paths.jax),
     ]
+    if action == "install":
+        command.extend(("--dependency-site-packages", str(BASE_RUNTIME_SITE_PACKAGES)))
+    return command
 
 
 def prototype_plan(
@@ -359,7 +366,7 @@ def prototype_plan(
         {"name": "offline_wheel_build", "argv": offline, "cwd": str(paths.jax)},
         {
             "name": "create_runtime",
-            "argv": [str(python), "-m", "venv", "--system-site-packages", str(paths.runtime)],
+            "argv": [str(python), "-m", "venv", str(paths.runtime)],
         },
         {
             "name": "install_wheels",
@@ -822,7 +829,7 @@ def execute_prototype(
     wheels = wheel_set(paths.wheels)
 
     _run(
-        [str(python), "-m", "venv", "--system-site-packages", str(paths.runtime)],
+        [str(python), "-m", "venv", str(paths.runtime)],
         cwd=None,
         log=paths.logs / "runtime.log",
         phase="create_runtime",

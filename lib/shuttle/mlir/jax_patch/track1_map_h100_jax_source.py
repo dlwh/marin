@@ -13,7 +13,8 @@ import sysconfig
 from pathlib import Path
 
 EXPECTED_JAX_VERSION = "0.10.1"
-SOURCE_PATH_FILE = "track1-pinned-jax.pth"
+SOURCE_PATH_FILE = "00-track1-pinned-jax.pth"
+DEPENDENCY_PATH_FILE = "10-track1-base-runtime.pth"
 
 
 def _regular_file(path: Path) -> None:
@@ -51,17 +52,34 @@ def _require_repository(repository: Path) -> Path:
     return repository.resolve()
 
 
-def install_jax_source(repository: Path, site_packages: Path) -> Path:
-    """Expose an exact JAX checkout through one create-only site path file."""
+def install_jax_source(
+    repository: Path,
+    site_packages: Path,
+    dependency_site_packages: Path,
+) -> tuple[Path, Path]:
+    """Expose exact JAX source and immutable-image dependencies without resolution."""
     source = _require_repository(repository)
     if site_packages.is_symlink() or not site_packages.is_dir():
         raise RuntimeError("JAX source install target must be one site-packages directory")
-    installed = site_packages / SOURCE_PATH_FILE
+    if (
+        not dependency_site_packages.is_absolute()
+        or dependency_site_packages.is_symlink()
+        or not dependency_site_packages.is_dir()
+    ):
+        raise RuntimeError("JAX source dependency site-packages must be one absolute directory, not a symlink")
+    installed = (site_packages / SOURCE_PATH_FILE, site_packages / DEPENDENCY_PATH_FILE)
+    if any(path.exists() or path.is_symlink() for path in installed):
+        raise RuntimeError("JAX source path file already exists")
+    created = []
     try:
-        with installed.open("x", encoding="utf-8") as stream:
-            stream.write(f"{source}{os.linesep}")
-    except FileExistsError as error:
-        raise RuntimeError("JAX source path file already exists") from error
+        for path, target in zip(installed, (source, dependency_site_packages.resolve()), strict=True):
+            with path.open("x", encoding="utf-8") as stream:
+                stream.write(f"{target}{os.linesep}")
+            created.append(path)
+    except BaseException:
+        for path in created:
+            path.unlink()
+        raise
     return installed
 
 
@@ -88,10 +106,19 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("action", choices=("install", "verify"))
     parser.add_argument("repository", type=Path)
+    parser.add_argument("--dependency-site-packages", type=Path)
     arguments = parser.parse_args(argv)
     if arguments.action == "install":
-        install_jax_source(arguments.repository, Path(sysconfig.get_path("purelib")))
+        if arguments.dependency_site_packages is None:
+            parser.error("install requires --dependency-site-packages")
+        install_jax_source(
+            arguments.repository,
+            Path(sysconfig.get_path("purelib")),
+            arguments.dependency_site_packages,
+        )
     else:
+        if arguments.dependency_site_packages is not None:
+            parser.error("verify does not accept --dependency-site-packages")
         print(json.dumps(require_jax_source(arguments.repository), sort_keys=True, separators=(",", ":")))
     return 0
 
