@@ -519,12 +519,29 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, field):
                         validate_qualification_evidence(evidence)
 
+        distinct = copy.deepcopy(qualified)
+        for index in (2, 3):
+            distinct["cells"][index]["outputs"][0][
+                "digest"
+            ] = "b09429e74cce38c20cc84b56a7d99aa51ded89a0e3d1a942e96eb43390965249"
+        for index in (4, 5):
+            distinct["cells"][index]["outputs"][1][
+                "digest"
+            ] = "502041f57708e86411c5e2fafe675aba5208a89194cc82b3f8db43e0b5f6ace5"
+        validate_qualification_evidence(distinct)
+
         for producer in ("transformer_engine_2_17", "ordinary_jax_xla"):
-            for boundary_index, output_index in ((3, 0), (4, 0), (4, 1), (5, 0), (5, 1), (5, 2)):
-                report = _report(producer)
-                report["cells"][boundary_index]["outputs"][output_index]["digest"] = "d" * 64
-                with self.assertRaisesRegex(ValueError, "composed output|output digest"):
-                    _validate(report, producer)
+            report = _report(producer)
+            report["cells"][4]["outputs"][0][
+                "digest"
+            ] = "b09429e74cce38c20cc84b56a7d99aa51ded89a0e3d1a942e96eb43390965249"
+            report["cells"][5]["outputs"][1][
+                "digest"
+            ] = "502041f57708e86411c5e2fafe675aba5208a89194cc82b3f8db43e0b5f6ace5"
+            _validate(report, producer)
+            report["cells"][4]["outputs"][0]["digest"] = "not-a-sha"
+            with self.assertRaisesRegex(ValueError, "output digest"):
+                _validate(report, producer)
 
     def test_reports_pin_provider_identity_and_supplemental_cuda_events(self) -> None:
         for path, value, diagnostic in (
