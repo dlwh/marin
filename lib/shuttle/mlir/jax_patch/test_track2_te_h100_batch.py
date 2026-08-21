@@ -138,6 +138,10 @@ def test_batch_plan_pins_te_wheel_source_build_and_exact_v2_matrix(tmp_path: Pat
     assert compile_argv[:4] == ["/usr/bin/g++", "-std=c++20", "-O3", "-Wall"]
     assert "-Werror" in compile_argv
     assert "-Wl,--allow-shlib-undefined" in compile_argv
+    assert set(RUNTIME_LIBRARY_PATHS) == {"cublas", "cublas_lt", "cudnn", "nccl", "cudart", "nvrtc"}
+    assert RUNTIME_LIBRARY_PATHS["nvrtc"] == (
+        Path("/opt/h100-evidence-runtime/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib/libnvrtc.so.13")
+    )
     libraries = [str(path) for path in RUNTIME_LIBRARY_PATHS.values()]
     no_as_needed = compile_argv.index("-Wl,--no-as-needed")
     assert compile_argv[no_as_needed : no_as_needed + len(libraries) + 2] == [
