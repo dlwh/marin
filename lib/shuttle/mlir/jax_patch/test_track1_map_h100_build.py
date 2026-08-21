@@ -20,9 +20,32 @@ from track1_map_h100_build import (
     inspect_build_inputs,
     offline_wheel_command,
     require_offline_build_inputs,
+    require_source_checkouts_unchanged,
+    source_checkouts_identity,
 )
 
 MARIN_REPOSITORY = Path(__file__).parents[4]
+
+
+def _run_git(repository: Path, *arguments: str) -> None:
+    subprocess.run(
+        ["git", "-c", "user.name=Track One", "-c", "user.email=track1@example.invalid", *arguments],
+        cwd=repository,
+        check=True,
+    )
+
+
+def _git_repository(repository: Path, files: dict[str, str]) -> None:
+    repository.mkdir()
+    for relative_path, content in files.items():
+        path = repository / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+        if relative_path == "build/build.py":
+            path.chmod(0o755)
+    _run_git(repository, "init", "-q")
+    _run_git(repository, "add", ".")
+    _run_git(repository, "commit", "-qm", "fixture")
 
 
 def _inputs(tmp_path: Path) -> BuildInputs:
@@ -121,26 +144,12 @@ def test_offline_build_gate_rehashes_live_inputs_and_requires_executable_builder
 
 
 def test_inspection_reads_separate_git_repositories_and_live_file_hashes(tmp_path: Path) -> None:
-    def initialize(repository: Path, relative_path: str, content: str) -> None:
-        path = repository / relative_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
-        if relative_path == "build/build.py":
-            path.chmod(0o755)
-        subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
-        subprocess.run(["git", "add", "."], cwd=repository, check=True)
-        subprocess.run(
-            ["git", "-c", "user.name=Track One", "-c", "user.email=track1@example.invalid", "commit", "-qm", "fixture"],
-            cwd=repository,
-            check=True,
-        )
-
     jax_repository = tmp_path / "jax"
     xla_repository = tmp_path / "xla"
     inputs = _inputs(tmp_path)
     _materialize(inputs)
-    initialize(jax_repository, "build/build.py", "#!/usr/bin/env python3\n")
-    initialize(xla_repository, "xla/pjrt/marker", "xla\n")
+    _git_repository(jax_repository, {"build/build.py": "#!/usr/bin/env python3\n"})
+    _git_repository(xla_repository, {"xla/pjrt/marker": "xla\n"})
 
     inspected = inspect_build_inputs(
         marin_repository=MARIN_REPOSITORY,
@@ -167,6 +176,37 @@ def test_inspection_reads_separate_git_repositories_and_live_file_hashes(tmp_pat
         image_archive=inputs.image_archive,
         xla_repository=xla_repository,
     ).xla_status.startswith("M ")
+
+
+def test_hydration_source_identity_rejects_tracked_untracked_and_head_drift(tmp_path: Path) -> None:
+    jax = tmp_path / "jax"
+    xla = tmp_path / "xla"
+    _git_repository(jax, {"source.cc": "jax\n"})
+    _git_repository(xla, {"source.cc": "xla\n"})
+    (jax / "source.cc").write_text("approved jax patch\n")
+    (xla / "source.cc").write_text("approved xla patch\n")
+    approved = source_checkouts_identity(jax_repository=jax, xla_repository=xla)
+
+    require_source_checkouts_unchanged(approved, jax_repository=jax, xla_repository=xla)
+
+    for mutation in ("tracked", "untracked", "head"):
+        case_jax = tmp_path / f"jax-{mutation}"
+        case_xla = tmp_path / f"xla-{mutation}"
+        _git_repository(case_jax, {"source.cc": "jax\n"})
+        _git_repository(case_xla, {"source.cc": "xla\n"})
+        (case_jax / "source.cc").write_text("approved jax patch\n")
+        (case_xla / "source.cc").write_text("approved xla patch\n")
+        expected = source_checkouts_identity(jax_repository=case_jax, xla_repository=case_xla)
+        if mutation == "tracked":
+            (case_jax / "source.cc").write_text("hydration mutation\n")
+        elif mutation == "untracked":
+            (case_xla / "injected.bzl").write_text("hydration mutation\n")
+        else:
+            _run_git(case_jax, "add", "source.cc")
+            _run_git(case_jax, "commit", "-m", "unexpected hydration commit")
+
+        with pytest.raises(RuntimeError, match="hydration changed patched JAX or XLA source"):
+            require_source_checkouts_unchanged(expected, jax_repository=case_jax, xla_repository=case_xla)
 
 
 def test_source_patching_checks_both_repositories_before_applying(
