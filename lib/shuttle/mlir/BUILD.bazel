@@ -518,6 +518,7 @@ py_test(
         "jax_patch/test_abi22_layernorm_bc_numerical_contract.py",
     ],
     data = [
+        "jax_patch/abi11-layernorm-bf16-te-2.17-oracle-red-v1.json",
         "jax_patch/abi22-layernorm-bc-numerical-contract-v1.json",
         "jax_patch/abi22-layernorm-forward-numerical-contract-v1.json",
         "jax_patch/target1-rowwise-bf16-numerical-oracle-v1.json",

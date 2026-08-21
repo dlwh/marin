@@ -39,8 +39,9 @@ class LayerNormBCNumericalContractTest(unittest.TestCase):
                 cell["input_digests"],
             )
             self.assertEqual(set(cell["input_digests"]), set(PUBLIC_ROLES[boundary]["inputs"]))
-            analytic = binary64_reference(inputs, boundary)
-            scheduled = scheduled_reference(inputs, boundary)
+            public_inputs = {role: inputs[role] for role in PUBLIC_ROLES[boundary]["inputs"]}
+            analytic = binary64_reference(public_inputs, boundary)
+            scheduled = scheduled_reference(public_inputs, boundary)
             self.assertEqual(list(scheduled), PUBLIC_ROLES[boundary]["outputs"])
             self.assertEqual(cell["resources"]["temporary_bytes"], shape[0] * 8)
             for role in PUBLIC_ROLES[boundary]["outputs"]:
@@ -62,8 +63,13 @@ class LayerNormBCNumericalContractTest(unittest.TestCase):
 
     def test_inputs_are_fresh_and_all_streams_are_semantically_live(self) -> None:
         directory = Path(__file__).parent
+        abi11 = json.loads((directory / "abi11-layernorm-bf16-te-2.17-oracle-red-v1.json").read_text())
+        abi11_digests = {
+            evidence["array_sha256"] for shape in abi11["inputs"]["digests"].values() for evidence in shape.values()
+        }
+        self.assertEqual(len(abi11_digests), 8)
         forward = json.loads((directory / "abi22-layernorm-forward-numerical-contract-v1.json").read_text())
-        prior = {digest for cell in forward["cells"] for digest in cell["input_digests"].values()}
+        prior = abi11_digests | {digest for cell in forward["cells"] for digest in cell["input_digests"].values()}
         target1 = json.loads((directory / "target1-rowwise-bf16-numerical-oracle-v1.json").read_text())
         prior.update(digest for digests in target1["inputs"]["digests"].values() for digest in digests)
         rmsnorm = json.loads((directory / "track1-rmsnorm-h100-numerical-policy-v1.json").read_text())
@@ -71,6 +77,13 @@ class LayerNormBCNumericalContractTest(unittest.TestCase):
         for shape in SHAPES:
             inputs = fixed_inputs(*shape)
             self.assertFalse({array_digest(value) for value in inputs.values()} & prior)
+        current = {role: array_digest(value) for role, value in fixed_inputs(7, 13).items()}
+        for beta_digest in (
+            "74bf1cbac5e6448acebd23da739e2f12a1a9fd4ee2d3a98364a04abc60ddf2fa",
+            "7e63bd3ff9da45ea73fe965f0ca25c5b868a892ec2361aa303292d2631b73434",
+        ):
+            collision = {**current, "beta": beta_digest}
+            self.assertEqual(set(collision.values()) & prior, {beta_digest})
         inputs = fixed_inputs(7, 13)
         expected = scheduled_reference(inputs, "composed")
         mutations = {
@@ -113,7 +126,7 @@ class LayerNormBCNumericalContractTest(unittest.TestCase):
                 with self.assertRaises(AssertionError):
                     require_accepted(error_metrics(actual, reference[role]), role)
 
-    def test_schedule_is_not_reassociated_binary64_on_large_boundary(self) -> None:
+    def test_feature_fold_schedule_is_observable_after_bf16_rounding(self) -> None:
         inputs = fixed_inputs(2048, 4096)
         scheduled = scheduled_reference(inputs, "composed")
         analytic = binary64_reference(inputs, "composed")
@@ -121,6 +134,46 @@ class LayerNormBCNumericalContractTest(unittest.TestCase):
         self.assertNotEqual(array_digest(scheduled["dx"]), array_digest(analytic["dx"]))
         self.assertNotEqual(array_digest(scheduled["dbeta"]), array_digest(analytic["dbeta"]))
         self.assertEqual(error_metrics(scheduled["dbeta"], analytic["dbeta"]).max_bfloat16_ulp_error, 1)
+        self.assertEqual(scheduled["dbeta"][:2].view(np.uint16).tolist(), [0x4303, 0x4304])
+
+        dy = inputs["dy"].astype(np.float32)
+
+        def serial(values: np.ndarray) -> np.float32:
+            accumulator = np.float32(0.0)
+            for value in values:
+                accumulator = np.add(accumulator, value, dtype=np.float32)
+            return accumulator
+
+        def adjacent_pair(values: np.ndarray) -> np.float32:
+            partials = values.copy()
+            while partials.size > 1:
+                pairs = partials.size // 2
+                reduced = np.empty((partials.size + 1) // 2, dtype=np.float32)
+                reduced[:pairs] = np.add(partials[: pairs * 2 : 2], partials[1 : pairs * 2 : 2], dtype=np.float32)
+                if partials.size % 2:
+                    reduced[pairs] = partials[-1]
+                partials = reduced
+            return partials[0]
+
+        wrong_folds = {
+            "serial": serial,
+            "global_adjacent_pair": adjacent_pair,
+            "reverse_serial": lambda values: serial(values[::-1]),
+        }
+        for name, fold in wrong_folds.items():
+            wrong = scheduled["dbeta"].copy()
+            wrong[:2] = np.array([fold(dy[:, feature]) for feature in range(2)], dtype=ml_dtypes.bfloat16)
+            self.assertNotEqual(array_digest(wrong), array_digest(scheduled["dbeta"]), name)
+
+    def test_backward_oracles_accept_exact_public_inputs_and_reject_beta(self) -> None:
+        full = fixed_inputs(7, 13)
+        public = {role: full[role] for role in PUBLIC_ROLES["backward"]["inputs"]}
+        self.assertEqual(list(scheduled_reference(public, "backward")), PUBLIC_ROLES["backward"]["outputs"])
+        self.assertEqual(list(binary64_reference(public, "backward")), PUBLIC_ROLES["backward"]["outputs"])
+        with self.assertRaisesRegex(ValueError, "input roles differ"):
+            scheduled_reference({**public, "beta": full["beta"]}, "backward")
+        with self.assertRaisesRegex(ValueError, "input roles differ"):
+            binary64_reference({**public, "beta": full["beta"]}, "backward")
 
     def test_binary64_oracle_rounds_directly_to_bf16(self) -> None:
         value = np.array([1.00390625 + math.ldexp(1.0, -30)], dtype=np.float64)

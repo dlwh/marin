@@ -100,11 +100,13 @@ def fixed_inputs(rows: int, features: int) -> dict[str, np.ndarray]:
     beta = ((_mix32(features, 3).astype(np.int64) % 257 - 128).astype(np.float32) * scale).astype(ml_dtypes.bfloat16)
     if (rows, features) == (2048, 4096):
         dy = dy.reshape(rows, features)
-        dy[:, 0] = ml_dtypes.bfloat16(0.0)
-        dy[:9, 0] = np.array(
-            [16384.0, 2**-11, -16384.0, 2**-11, 16384.0, 2**-11, -16384.0, 2**-11, 0.25],
+        dy[:, :2] = ml_dtypes.bfloat16(0.0)
+        sentinel = np.array(
+            [-(2**-11), 512.0, -0.5, 4.0, -16384.0, 16384.0, -256.0, -128.0],
             dtype=ml_dtypes.bfloat16,
         )
+        dy[np.arange(8) * 8, 0] = sentinel
+        dy[np.arange(8), 1] = sentinel
         dy = dy.reshape(-1)
     return {
         "x": x.reshape(rows, features),
@@ -116,7 +118,7 @@ def fixed_inputs(rows: int, features: int) -> dict[str, np.ndarray]:
 
 def binary64_reference(inputs: dict[str, np.ndarray], boundary: str) -> dict[str, np.ndarray]:
     """Evaluate the analytic LayerNorm F/VJP formulas in binary64."""
-    x, gamma, beta, dy = _inputs(inputs)
+    x, gamma, beta, dy = _inputs(inputs, boundary)
     features = x.shape[1]
     mean = np.sum(x, axis=1, dtype=np.float64) / features
     centered = x - mean[:, None]
@@ -156,7 +158,7 @@ def round_binary64_to_bf16(value: np.ndarray) -> np.ndarray:
 
 def scheduled_reference(inputs: dict[str, np.ndarray], boundary: str) -> dict[str, np.ndarray]:
     """Evaluate the two-task f32 operation and Fold schedule exactly."""
-    x64, gamma64, beta64, dy64 = _inputs(inputs)
+    x64, gamma64, beta64, dy64 = _inputs(inputs, boundary)
     x = x64.astype(np.float32)
     gamma = gamma64.astype(np.float32)
     beta = beta64.astype(np.float32)
@@ -362,7 +364,7 @@ def validate_contract(document: object) -> None:
     if document["hardware_evidence"] != "none_before_independent_approval":
         raise ValueError("hardware evidence boundary differs")
     if document["generator"] != {
-        "algorithm": "mix32_power_of_two_bf16_with_large_dbeta_order_sentinel_v1",
+        "algorithm": "mix32_power_of_two_bf16_with_large_feature_fold_order_sentinels_v2",
         "seed": GENERATOR_SEED,
         "streams": {"beta": 3, "dy": 4, "gamma": 2, "x": 1},
     }:
@@ -423,13 +425,17 @@ def validate_contract(document: object) -> None:
         raise ValueError("contract cell coverage differs")
 
 
-def _inputs(inputs: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    if type(inputs) is not dict or set(inputs) != {"x", "gamma", "beta", "dy"}:
+def _inputs(inputs: dict[str, np.ndarray], boundary: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if boundary not in PUBLIC_ROLES or type(inputs) is not dict or set(inputs) != set(PUBLIC_ROLES[boundary]["inputs"]):
         raise ValueError("LayerNorm input roles differ")
     x = _bf16_array(inputs["x"], "x", 2)
     gamma = _bf16_array(inputs["gamma"], "gamma", 1)
-    beta = _bf16_array(inputs["beta"], "beta", 1)
     dy = _bf16_array(inputs["dy"], "dy", 2)
+    beta = (
+        _bf16_array(inputs["beta"], "beta", 1)
+        if boundary == "composed"
+        else np.zeros_like(gamma, dtype=ml_dtypes.bfloat16)
+    )
     if tuple(x.shape) not in SHAPES or dy.shape != x.shape or gamma.shape != (x.shape[1],) or beta.shape != gamma.shape:
         raise ValueError("LayerNorm input shapes differ from the contract")
     return tuple(value.astype(np.float64) for value in (x, gamma, beta, dy))
@@ -457,9 +463,10 @@ def _sealed_cell_evidence() -> dict[tuple[str, tuple[int, int]], dict[str, objec
     for shape in SHAPES:
         inputs = fixed_inputs(*shape)
         for boundary in BOUNDARIES:
-            input_digests = {role: array_digest(inputs[role]) for role in PUBLIC_ROLES[boundary]["inputs"]}
-            binary64 = binary64_reference(inputs, boundary)
-            scheduled = scheduled_reference(inputs, boundary)
+            public_inputs = {role: inputs[role] for role in PUBLIC_ROLES[boundary]["inputs"]}
+            input_digests = {role: array_digest(value) for role, value in public_inputs.items()}
+            binary64 = binary64_reference(public_inputs, boundary)
+            scheduled = scheduled_reference(public_inputs, boundary)
             output_evidence = {}
             for role in PUBLIC_ROLES[boundary]["outputs"]:
                 output_evidence[role] = {

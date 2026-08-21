@@ -4935,19 +4935,19 @@ constexpr ProspectiveLayerNormBCShape prospectiveLayerNormBCShapes[] = {
      "cd79bea91b72f77223c17571eb70bec5e68b374aae15b974928232fb88ef9596",
      "1218887097652ad93aaf40297de7f801e4d2fa49d39376d2af5455b6c51a69cd",
      "01b877aa71cd4723ff43634507d1fe887a598a8a9a1324f2a9f68457bd0241d9",
-     "39862bee15a6f16c858b0c91a644e54cce542a574a9c34e4367bc2069637a190",
+     "286540355c5a50b6bfed5fe663ee90d3e52fc0316e29b2858062e72f0262001e",
      "f7b1ab8d1f466f89b1d2abc58812de657c72872aeae50b9bb93d474d0c17ce04",
      "1205d82496299537fb10e24372188ee75ff16792e1756e3d9ddeb08ee06d047a",
      {0.015625, 6.057504975398587e-08, 0.004291845493562232, 67},
-     "df1af2bd9c6df4b8abf7dbb79c49d2e6a5ba9efe34fec23da214570f296a084d",
-     "b3dfd9f70b2ab544448f9f968b98ecdfd71766292c33f3c00ad6e2ae138e45fe",
-     {0.03125, 4.841351208817457e-08, 1.937624007936508e-06, 2},
-     "748c4e0bc0dbddd9a7ab9c52da1966ee8cdf4b3360a8d176c940171720bb05d8",
-     "748c4e0bc0dbddd9a7ab9c52da1966ee8cdf4b3360a8d176c940171720bb05d8",
+     "d8e8882b084dae37cef5bf249c29567621a44bf9695bad7c4a246afeedba4ad9",
+     "acee3c6ca9328e9f0cdc79224eb76c0ec15a733f6b74bbaa1e75c57b0c122b07",
+     {0.0078125, 3.725514735597457e-08, 3.838689072327044e-07, 4},
+     "4fe9f3882c6d5b3a496f5af15788e099bec54f72499d722df43c1dd6bc65c4db",
+     "4fe9f3882c6d5b3a496f5af15788e099bec54f72499d722df43c1dd6bc65c4db",
      {},
-     "b9bf04bddb73664ecfe5bcf33407b6f1b7813d3a7c51d023b4bc082f0a2b84ed",
-     "d6e071075d7903a6c2fa77c589157860ddf1aaf6b3d65388965dbe8eac93e7da",
-     {0.001953125, 4.76837158203125e-07, 1.2600806451612903e-05, 1}},
+     "ff5cd3c12d2677dc34e53bdf7a0339a5201b54269463e68b4ae9f3c9298f301e",
+     "44470b91df4564c1c10b4088bc100c6c7ea2656ec2aeb2628fc04338e26f75c6",
+     {1.0, 0.000244140625, 0.0064516129032258064, 1}},
 };
 
 constexpr mlir::shuttle::NumericalPolicy prospectiveLayerNormBCPolicies[] = {
@@ -4999,15 +4999,18 @@ ProspectiveLayerNormBCInputs prospectiveLayerNormBCInputs(
         roundToBf16(static_cast<float>(beta) / 128.0f);
   }
   if (shape.rows == 2048 && shape.features == 4096) {
-    for (int64_t row = 0; row < shape.rows; ++row)
+    for (int64_t row = 0; row < shape.rows; ++row) {
       inputs.dy[row * shape.features] = roundToBf16(0.0f);
+      inputs.dy[row * shape.features + 1] = roundToBf16(0.0f);
+    }
     constexpr float sentinel[] = {
-        16384.0f, 1.0f / 2048.0f, -16384.0f, 1.0f / 2048.0f,
-        16384.0f, 1.0f / 2048.0f, -16384.0f, 1.0f / 2048.0f,
-        0.25f,
+        -1.0f / 2048.0f, 512.0f,   -0.5f,    4.0f,
+        -16384.0f,        16384.0f, -256.0f, -128.0f,
     };
-    for (auto [row, value] : llvm::enumerate(sentinel))
-      inputs.dy[row * shape.features] = roundToBf16(value);
+    for (auto [index, value] : llvm::enumerate(sentinel)) {
+      inputs.dy[index * 8 * shape.features] = roundToBf16(value);
+      inputs.dy[index * shape.features + 1] = roundToBf16(value);
+    }
   }
   return inputs;
 }
@@ -5453,6 +5456,56 @@ TEST(GpuTransportV2Test,
     ASSERT_TRUE(swappedFeature);
     EXPECT_TRUE(swappedFeature->maxAbsoluteError > 2.0 ||
                 swappedFeature->maxBf16UlpError > 2);
+
+    if (shape.rows == 2048 && shape.features == 4096) {
+      ASSERT_GE(scheduled.dbeta.size(), 2u);
+      EXPECT_EQ(scheduled.dbeta[0], UINT16_C(0x4303));
+      EXPECT_EQ(scheduled.dbeta[1], UINT16_C(0x4304));
+      std::array<std::vector<float>, 2> columns;
+      for (int64_t feature = 0; feature < 2; ++feature) {
+        columns[feature].reserve(shape.rows);
+        for (int64_t row = 0; row < shape.rows; ++row)
+          columns[feature].push_back(
+              expandBf16(inputs.dy[row * shape.features + feature]));
+      }
+      auto expectWrongFold = [&](llvm::StringRef name, auto fold) {
+        std::vector<uint16_t> wrong = scheduled.dbeta;
+        for (int64_t feature = 0; feature < 2; ++feature)
+          wrong[feature] = roundToBf16(fold(columns[feature]));
+        EXPECT_NE(prospectiveBf16Digest(wrong, {shape.features}),
+                  shape.dbetaScheduleDigest)
+            << name.str();
+      };
+      expectWrongFold("serial", [](llvm::ArrayRef<float> values) {
+        float accumulator = 0.0f;
+        for (float value : values)
+          accumulator = prospectiveAdd(accumulator, value);
+        return accumulator;
+      });
+      expectWrongFold("global_adjacent_pair",
+                      [](llvm::ArrayRef<float> values) {
+                        std::vector<float> partials(values.begin(),
+                                                    values.end());
+                        while (partials.size() > 1) {
+                          std::vector<float> reduced((partials.size() + 1) /
+                                                     2);
+                          size_t pairs = partials.size() / 2;
+                          for (size_t pair = 0; pair < pairs; ++pair)
+                            reduced[pair] = prospectiveAdd(
+                                partials[pair * 2], partials[pair * 2 + 1]);
+                          if ((partials.size() & 1) != 0)
+                            reduced[pairs] = partials.back();
+                          partials = std::move(reduced);
+                        }
+                        return partials.front();
+                      });
+      expectWrongFold("reverse_serial", [](llvm::ArrayRef<float> values) {
+        float accumulator = 0.0f;
+        for (float value : llvm::reverse(values))
+          accumulator = prospectiveAdd(accumulator, value);
+        return accumulator;
+      });
+    }
   }
 
   std::vector<uint16_t> nearZero{roundToBf16(-2.6077032089233398e-08f)};
