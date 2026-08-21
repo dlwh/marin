@@ -4684,8 +4684,11 @@ double prospectiveBinary64Epsilon() {
 
 std::vector<uint16_t>
 prospectiveBinary64LayerNorm(const LayerNormInputs &inputs, int64_t rows,
-                             int64_t features) {
+                             int64_t features,
+                             std::vector<double> *unroundedOutput = nullptr) {
   std::vector<uint16_t> output(inputs.x.size());
+  if (unroundedOutput)
+    unroundedOutput->assign(inputs.x.size(), 0.0);
   for (int64_t row = 0; row < rows; ++row) {
     double sum = 0.0;
     for (int64_t feature = 0; feature < features; ++feature)
@@ -4708,6 +4711,8 @@ prospectiveBinary64LayerNorm(const LayerNormInputs &inputs, int64_t rows,
           centered * inverse *
               static_cast<double>(expandBf16(inputs.gamma[feature])) +
           static_cast<double>(expandBf16(inputs.beta[feature]));
+      if (unroundedOutput)
+        (*unroundedOutput)[element] = value;
       output[element] = roundToBf16(static_cast<float>(value));
     }
   }
@@ -4769,8 +4774,19 @@ void expectProspectiveLayerNormMetrics(
 
 TEST(GpuTransportV2Test,
      ProspectiveLayerNormBinary64OraclePromotesPublicF32Epsilon) {
-  EXPECT_NE(1.0e-5, static_cast<double>(1.0e-5f));
-  EXPECT_EQ(prospectiveBinary64Epsilon(), static_cast<double>(1.0e-5f));
+  LayerNormInputs inputs{
+      {roundToBf16(0.0f), roundToBf16(2.0f)},
+      {roundToBf16(1.0f), roundToBf16(1.0f)},
+      {roundToBf16(0.0f), roundToBf16(0.0f)},
+  };
+  std::vector<double> unrounded;
+  prospectiveBinary64LayerNorm(inputs, 1, 2, &unrounded);
+  const double promotedF32 =
+      -1.0 / std::sqrt(1.0 + static_cast<double>(1.0e-5f));
+  const double nativeBinary64 = -1.0 / std::sqrt(1.0 + 1.0e-5);
+  ASSERT_EQ(unrounded.size(), 2u);
+  EXPECT_NE(promotedF32, nativeBinary64);
+  EXPECT_DOUBLE_EQ(unrounded[0], promotedF32);
 }
 
 TEST(GpuTransportV2Test,

@@ -138,6 +138,11 @@ The C++ binary64 model initially added the binary64 literal `1e-5`, while the
 Python model promotes the public f32 epsilon. A focused host assertion failed
 with `1e-5` versus `9.9999997473787516e-06`. The C++ model now explicitly uses
 `static_cast<double>(1.0e-5f)`, matching the declared public operation.
+Review then found that this assertion observed only the epsilon helper, not its
+use by the oracle. A pre-BF16 sentinel with inputs `[0, 2]` now observes the
+actual analytic LayerNorm output. Mutating the oracle call site back to the
+binary64 literal fails with `-0.99999500003749975` instead of the declared
+`-0.99999500003762609`, even though both values round to the same BF16 output.
 
 Finally, the H100 test now requires exactly the two sealed fixture boundaries,
 four unique case-and-shape cells, and the two numerical policies. The resulting
