@@ -519,6 +519,14 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, field):
                         validate_qualification_evidence(evidence)
 
+        diagnostic = copy.deepcopy(qualified)
+        diagnostic["cells"][12]["outputs"][0]["max_bfloat16_ulp"] = 3
+        with self.assertRaisesRegex(
+            ValueError,
+            "ordinary_jax_xla/qualification_linspace_v2/forward/repeat0/y: " "max_bfloat16_ulp 3 exceeds role limit 2",
+        ):
+            validate_qualification_evidence(diagnostic)
+
         distinct = copy.deepcopy(qualified)
         for index in (2, 3):
             distinct["cells"][index]["outputs"][0][
