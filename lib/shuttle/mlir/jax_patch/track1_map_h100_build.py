@@ -28,7 +28,7 @@ XLA_PATCH_NAMES = (
     "0002-anchor-lit-labels-to-xla-repository.patch",
 )
 XLA_PATCH_SHA256 = (
-    "742aaaa7147fd3dca0b5231bd4370181b128d1e1e5fd025e780d319d461135ae",
+    "8e50020606758a431f7e96b80e2720ef5ca40986746449cc6a20ab6ae9c7bb1e",
     "e4f3121f3123d7e2ee781cc5ee92f1ddeb0df662b6702d37615bcae821ecbc99",
 )
 
