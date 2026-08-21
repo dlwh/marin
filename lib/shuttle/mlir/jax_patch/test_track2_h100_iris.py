@@ -4,6 +4,7 @@
 import hashlib
 import io
 import json
+import subprocess
 import zipfile
 from copy import deepcopy
 from pathlib import Path
@@ -13,6 +14,7 @@ from iris.rpc import controller_pb2, job_pb2
 from track2_h100_batch import BASE_IMAGE
 from track2_h100_iris import (
     SOURCE_MANIFEST_NAME,
+    _require_clean_source_closure,
     build_launch_request,
     decode_launch_request,
     job_name,
@@ -109,6 +111,72 @@ def test_render_is_create_only_and_submit_requires_reviewed_request_hash(tmp_pat
             ]
         )
     assert not (tmp_path / "receipt.json").exists()
+
+
+def test_submit_reserves_receipt_before_external_rpc(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    request = tmp_path / "reviewed.pb"
+    raw = _request().SerializeToString(deterministic=True)
+    request.write_bytes(raw)
+    receipt = tmp_path / "receipt.json"
+    receipt.write_bytes(b"keep")
+    submitted = False
+
+    def fake_submit(*args: object, **kwargs: object) -> str:
+        nonlocal submitted
+        submitted = True
+        return "/dlwh/shuttle-track2-h100-r1"
+
+    monkeypatch.setattr("track2_h100_iris._submit", fake_submit)
+    with pytest.raises(FileExistsError, match="receipt"):
+        main(
+            [
+                "submit",
+                "--request",
+                str(request),
+                "--expected-request-sha256",
+                hashlib.sha256(raw).hexdigest(),
+                "--run",
+                "1",
+                "--config",
+                "lib/iris/config/cw-us-east-02a.yaml",
+                "--receipt",
+                str(receipt),
+            ]
+        )
+    assert not submitted
+    assert receipt.read_bytes() == b"keep"
+
+
+def test_source_closure_rejects_dirty_tracked_and_untracked_bytes(tmp_path: Path) -> None:
+    source = tmp_path / "lib/shuttle/mlir/source.cc"
+    source.parent.mkdir(parents=True)
+    source.write_text("clean\n")
+    subprocess.run(["git", "init", "--quiet"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "add", str(source.relative_to(tmp_path))], cwd=tmp_path, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Track 2 test",
+            "-c",
+            "user.email=track2@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixture",
+        ],
+        cwd=tmp_path,
+        check=True,
+    )
+    _require_clean_source_closure(tmp_path)
+
+    source.write_text("dirty\n")
+    with pytest.raises(RuntimeError, match="source closure is dirty"):
+        _require_clean_source_closure(tmp_path)
+    source.write_text("clean\n")
+    (source.parent / "untracked.cc").write_text("untracked\n")
+    with pytest.raises(RuntimeError, match="source closure is dirty"):
+        _require_clean_source_closure(tmp_path)
 
 
 def test_job_name_rejects_unbounded_run_ordinals() -> None:

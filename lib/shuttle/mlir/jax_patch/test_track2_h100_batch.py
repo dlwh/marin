@@ -41,20 +41,48 @@ def _manifest(root: Path, relative: str, payload: bytes) -> Path:
 
 def test_batch_plan_runs_xla_then_shuttle_on_one_workspace_and_device(tmp_path: Path) -> None:
     workspace = tmp_path / "work"
-    plan = batch_plan(workspace=workspace, runner_repository=Path("/app"))
+    compiler_identity = "shuttle-abi22:" + "a" * 64
+    plan = batch_plan(
+        workspace=workspace,
+        runner_repository=Path("/app"),
+        compiler_identity=compiler_identity,
+    )
     phases = plan["phases"]
 
     assert plan["base_image"] == BASE_IMAGE
     assert plan["hardware"] == {"gpu_count": 1, "gpu_model": "H100"}
-    assert [phase["name"] for phase in phases] == ["fetch_xla", "fetch_bazel", "xla", "shuttle"]
-    xla_command = phases[2]["argv"]
-    shuttle_command = phases[3]["argv"]
+    assert [phase["name"] for phase in phases] == [
+        "device",
+        "xla_init",
+        "xla_remote",
+        "xla_fetch",
+        "xla_checkout",
+        "bazel_fetch",
+        "xla",
+        "shuttle",
+    ]
+    assert phases[1]["argv"] == ["git", "init", "--quiet"]
+    assert phases[2]["argv"] == ["git", "remote", "add", "origin", "https://github.com/openxla/xla.git"]
+    assert phases[3]["argv"][0:4] == ["git", "fetch", "--depth=1", "origin"]
+    assert phases[4]["argv"] == ["git", "checkout", "--detach", "FETCH_HEAD"]
+    assert phases[5]["argv"][0:7] == [
+        "curl",
+        "--fail",
+        "--location",
+        "--proto",
+        "=https",
+        "--proto-redir",
+        "=https",
+    ]
+    xla_command = phases[6]["argv"]
+    shuttle_command = phases[7]["argv"]
     assert "@shuttle_mlir//:abi22_h100_xla_baseline_test" in xla_command
     assert "@shuttle_mlir//:gpu_transport_v2_h100_performance_test" in shuttle_command
     assert xla_command[0:2] == shuttle_command[0:2]
     assert any("SHUTTLE_H100_XLA_HOST_REPORT=" in value for value in xla_command)
     assert any("SHUTTLE_H100_XLA_HOST_REPORT=" in value for value in shuttle_command)
     assert any("SHUTTLE_H100_PERF_EXPLORATORY=1" in value for value in shuttle_command)
+    assert f"--test_env=SHUTTLE_COMPILER_IDENTITY={compiler_identity}" in shuttle_command
     assert not any("SHUTTLE_H100_PERF_ACCEPTANCE" in value for value in shuttle_command)
 
 
