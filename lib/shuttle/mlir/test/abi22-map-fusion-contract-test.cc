@@ -236,9 +236,14 @@ bool hasDisjointContiguousFoldLoop(llvm::StringRef ptx,
   for (llvm::StringRef &line : lines)
     line = line.trim();
   auto defines = [](llvm::StringRef line, llvm::StringRef reg) {
-    if (line.empty() || line.starts_with("@") || line.starts_with("st.") ||
-        line.starts_with("bra ") || line.starts_with("bar.") ||
-        line == "ret;" || line.ends_with(":"))
+    if (line.starts_with("@")) {
+      size_t instruction = line.find(' ');
+      if (instruction == llvm::StringRef::npos)
+        return false;
+      line = line.drop_front(instruction + 1);
+    }
+    if (line.empty() || line.starts_with("st.") || line.starts_with("bra ") ||
+        line.starts_with("bar.") || line == "ret;" || line.ends_with(":"))
       return false;
     std::vector<std::string> tokens = ptxTokens(line);
     return !tokens.empty() && tokens.front() == reg;
@@ -285,6 +290,10 @@ bool hasDisjointContiguousFoldLoop(llvm::StringRef ptx,
         ++loopLine;
       if (loopLine + 2 >= lines.size())
         return false;
+      for (size_t line = startLine + 3; line < loopLine; ++line) {
+        if (defines(lines[line], start) || defines(lines[line], end))
+          return false;
+      }
       llvm::StringRef loop = lines[loopLine].drop_back();
       std::vector<std::string> predicateTokens =
           ptxTokens(lines[loopLine + 1]);
@@ -309,6 +318,7 @@ bool hasDisjointContiguousFoldLoop(llvm::StringRef ptx,
         if (lines[line] == exitLabel ||
             lines[line].starts_with("bra ") ||
             lines[line].contains(" bra ") ||
+            defines(lines[line], end) ||
             (defines(lines[line], start) && lines[line] != increment))
           return false;
         if (lines[line] == increment)
@@ -1744,6 +1754,10 @@ $finished:
                "setp.ge.u32 %p1, %r4, %r4;"),
            replace(correctFoldLoop, "ld.global.f32 %f1, [%rd0];",
                    "bra $loaded;\n  ld.global.f32 %f1, [%rd0];"),
+           replace(correctFoldLoop, "$load:",
+                   "mov.u32 %r7, 0;\n$load:"),
+           replace(correctFoldLoop, "ld.global.f32 %f1, [%rd0];",
+                   "@%p2 mov.u32 %r7, 0;\n  ld.global.f32 %f1, [%rd0];"),
        })
     EXPECT_FALSE(hasDisjointContiguousFoldLoop(mutation, 330, 2));
 }
