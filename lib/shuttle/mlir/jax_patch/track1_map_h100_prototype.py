@@ -4,7 +4,9 @@
 """Authorization-bound single-job prototype for the Track 1 Map subject."""
 
 import hashlib
+import itertools
 import json
+import math
 import os
 import platform
 import re
@@ -13,7 +15,6 @@ import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from rigging.redaction import REDACTED_VALUE, is_sensitive_key_name, redact_string
 from track1_map_h100_build import (
     JAX_COMMIT,
     JAX_PATCH_SHA256,
@@ -53,6 +54,57 @@ WORKER_MODES = ("disabled", "source_ordered", "fast")
 SOURCE_MANIFEST_RELATIVE = Path("scripts/shuttle/track1_map_h100_source_manifest.json")
 SOURCE_ROOTS = (Path("lib/shuttle/mlir"), Path("lib/shuttle/src/shuttle"))
 IGNORED_SOURCE_PARTS = frozenset({"__pycache__", ".pytest_cache"})
+REDACTED_VALUE = "[REDACTED]"
+KEY_LIKE_LOG_VALUE = re.compile(r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{32,}={0,2}(?![A-Za-z0-9+/_=-])")
+PREFIXED_LOG_SECRET = re.compile(
+    r"-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----[\s\S]+?-----END (?:[A-Z]+ )*PRIVATE KEY-----"
+    r"|(?<![A-Za-z0-9_-])(?:"
+    r"sk-[A-Za-z0-9_-]{20,}"
+    r"|AKIA[0-9A-Z]{16}"
+    r"|ASIA[0-9A-Z]{16}"
+    r"|gh[pousr]_[A-Za-z0-9]{36,}"
+    r"|xox[abprs]-[A-Za-z0-9-]{10,}"
+    r"|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
+    r")(?![A-Za-z0-9_-])"
+)
+SENSITIVE_LOG_WORDS = frozenset(
+    {
+        "apikey",
+        "auth",
+        "authentication",
+        "authorization",
+        "bearer",
+        "credential",
+        "credentials",
+        "passphrase",
+        "passwd",
+        "password",
+        "pwd",
+        "secret",
+        "session",
+        "token",
+    }
+)
+SENSITIVE_LOG_PHRASES = frozenset({("access", "key"), ("api", "key"), ("private", "key")})
+COUNT_LOG_WORDS = frozenset(
+    {
+        "avg",
+        "budget",
+        "count",
+        "len",
+        "length",
+        "limit",
+        "max",
+        "mean",
+        "min",
+        "num",
+        "size",
+        "sum",
+        "total",
+        "window",
+    }
+)
+LOG_KEY_WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z]+|[a-z]+|[0-9]+")
 AUTHORIZATION_LOG_VALUE = re.compile(r"(?im)\b((?:proxy[-_])?authorization\s*[:=]\s*)[^\r\n]*")
 SENSITIVE_LOG_VALUE = re.compile(
     r"""(?i)(?<![A-Za-z0-9_-])(["']?([A-Za-z][A-Za-z0-9_-]{0,127})["']?\s*[:=]\s*)"""
@@ -462,6 +514,32 @@ def _load_canonical_document(path: Path, name: str) -> dict[str, object]:
     return document
 
 
+def _log_value_entropy(value: str) -> float:
+    frequencies: dict[str, int] = {}
+    for character in value:
+        frequencies[character] = frequencies.get(character, 0) + 1
+    length = len(value)
+    return -sum((count / length) * math.log2(count / length) for count in frequencies.values())
+
+
+def _redact_key_like_log_value(match: re.Match[str]) -> str:
+    value = match.group(0)
+    return REDACTED_VALUE if _log_value_entropy(value) >= 3.5 else value
+
+
+def _redact_log_tokens(value: str) -> str:
+    value = PREFIXED_LOG_SECRET.sub(REDACTED_VALUE, value)
+    return KEY_LIKE_LOG_VALUE.sub(_redact_key_like_log_value, value)
+
+
+def _is_sensitive_log_key(name: str) -> bool:
+    words = [word.lower() for word in LOG_KEY_WORD.findall(name)]
+    hits = {word for word in words if word in SENSITIVE_LOG_WORDS}
+    if hits <= {"token"} and any(word in COUNT_LOG_WORDS for word in words):
+        hits = set()
+    return bool(hits) or any(pair in SENSITIVE_LOG_PHRASES for pair in itertools.pairwise(words))
+
+
 def _sanitized_log_tail(log: Path) -> str:
     with log.open("rb") as stream:
         stream.seek(0, os.SEEK_END)
@@ -473,11 +551,12 @@ def _sanitized_log_tail(log: Path) -> str:
         _, newline, suffix = raw.partition(b"\n")
         if newline:
             raw = suffix
-    tail = redact_string(raw.decode(errors="replace"))
+    # This runs under the sealed stdlib-only interpreter, before the wheel environment exists.
+    tail = _redact_log_tokens(raw.decode(errors="replace"))
     tail = AUTHORIZATION_LOG_VALUE.sub(rf"\1{REDACTED_VALUE}", tail)
 
     def redact_sensitive_value(match: re.Match[str]) -> str:
-        if is_sensitive_key_name(match.group(2)):
+        if _is_sensitive_log_key(match.group(2)):
             return f"{match.group(1)}{REDACTED_VALUE}"
         return match.group(0)
 

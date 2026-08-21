@@ -97,7 +97,7 @@ def test_dry_run_emits_and_decodes_the_real_fail_closed_launch_request(
     assert dict(request.environment.env_vars) == {}
     assert list(request.entrypoint.setup_commands) == []
     command = list(request.entrypoint.run_command.argv)
-    assert command[0] == "/app/.venv/bin/python"
+    assert command[0] == "/opt/h100-evidence-runtime/bin/python"
     assert command[command.index("--python") + 1] == "/opt/h100-evidence-runtime/bin/python"
     assert command.count(approved) == 1
     assert command[-1] == "--execute"
