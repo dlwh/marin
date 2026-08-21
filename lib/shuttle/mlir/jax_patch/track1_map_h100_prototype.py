@@ -922,6 +922,7 @@ def validate_rmsnorm_contract_primal_checkpoint(document: object) -> dict[str, o
         raise ValueError("RMSNorm Contract primal checkpoint coverage differs")
     policy = contract_policy.load_numerical_policy()
     invocation_ids: set[int] = set()
+    disabled_results: dict[tuple[int, int, int], str] = {}
     for item, (shape, mode) in zip(coordinates, expected, strict=True):
         if type(item) is not dict or set(item) != {
             "analytic_oracle",
@@ -954,7 +955,12 @@ def validate_rmsnorm_contract_primal_checkpoint(document: object) -> dict[str, o
         if mode == "disabled":
             if observer is not None:
                 raise ValueError("RMSNorm Contract disabled primal checkpoint has an observer")
+            disabled_results[shape] = item["result"]
+            if item["disabled_jax_equal"] is not True:
+                raise ValueError("RMSNorm Contract primal checkpoint disabled diagnostic differs")
             continue
+        if item["disabled_jax_equal"] != (item["result"] == disabled_results[shape]):
+            raise ValueError("RMSNorm Contract primal checkpoint disabled diagnostic differs")
         if item["result"] != shape_policy["primal_emitted_outputs"][mode]:
             raise ValueError("RMSNorm Contract primal checkpoint emitted result differs")
         if any(metrics[name] > limit for name, limit in contract_policy.LIMITS["result"].items()):
