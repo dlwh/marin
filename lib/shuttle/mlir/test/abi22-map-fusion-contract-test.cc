@@ -376,6 +376,7 @@ bool hasDisjointContiguousFoldLoop(llvm::StringRef ptx, int64_t outputExtent,
       const std::string backedge = (llvm::Twine("bra ") + loop + ";").str();
       const std::string exitLabel = (llvm::Twine(exit) + ":").str();
       bool accumulatedIndexedLeaf = false;
+      int64_t accumulatedLeafUpdates = 0;
       for (size_t line = loopLine + 3; line + 2 < lines.size(); ++line) {
         if (lines[line] == exitLabel || lines[line].starts_with("bra ") ||
             lines[line].contains(" bra ") || lines[line] == "ret;" ||
@@ -429,14 +430,16 @@ bool hasDisjointContiguousFoldLoop(llvm::StringRef ptx, int64_t outputExtent,
               accumulatedIndexedLeaf |= unpredicatedStartConversion;
             }
           }
+          ++accumulatedLeafUpdates;
           ++line;
           continue;
         }
         if (defines(lines[line], accumulator))
           return false;
         if (lines[line] == increment)
-          return accumulatedIndexedLeaf && outputExit != exit &&
-                 lines[line + 1] == backedge && lines[line + 2] == exitLabel &&
+          return accumulatedIndexedLeaf && accumulatedLeafUpdates == 1 &&
+                 outputExit != exit && lines[line + 1] == backedge &&
+                 lines[line + 2] == exitLabel &&
                  llvm::is_contained(llvm::ArrayRef(lines).drop_front(line + 3),
                                     (llvm::Twine(outputExit) + ":").str());
       }
@@ -1900,6 +1903,9 @@ $all_done:
                    "@%p1 mov.f32 %f3, %f1;\n  add.rn.f32 %f2, %f0, %f3;"),
            replace(correctFoldLoop, "add.rn.f32 %f2, %f0, %f1;",
                    "mul.rn.f32 %f1, %f1, %f0;\n  add.rn.f32 %f2, %f0, %f1;"),
+           replace(correctFoldLoop, "add.u32 %r4, %r4, 1;",
+                   "add.rn.f32 %f3, %f0, %f1;\n  mov.f32 %f0, %f3;\n  "
+                   "add.u32 %r4, %r4, 1;"),
            replace(correctFoldLoop, "mov.f32 %f0, 0f00000000;",
                    "mov.f32 %f0, 0f00000000;\n  mov.f32 %f0, 0f3F800000;"),
            replace(replace(correctFoldLoop, "cvt.u64.u32 %rd0, %r4;", "nop;"),
