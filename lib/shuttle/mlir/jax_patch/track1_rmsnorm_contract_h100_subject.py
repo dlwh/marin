@@ -18,6 +18,7 @@ import numpy as np
 from jaxlib import _jax
 from track1_rmsnorm_contract_numerical_policy import (
     LIMITS,
+    MASKED_ULP_ABSOLUTE_FLOORS,
     POLICY_SHA256,
     SHAPES,
     NumericalMetrics,
@@ -57,7 +58,7 @@ class Coordinate:
 
     @classmethod
     def all(cls) -> tuple["Coordinate", ...]:
-        return tuple(cls(shape, boundary, mode) for shape in SHAPES for boundary in Boundary for mode in Mode)
+        return tuple(cls(shape, boundary, mode) for boundary in Boundary for shape in SHAPES for mode in Mode)
 
 
 @dataclass(frozen=True)
@@ -225,6 +226,7 @@ def _metrics_document(metrics: NumericalMetrics) -> dict[str, float | int]:
     return {
         "maximum_absolute_error": metrics.maximum_absolute_error,
         "maximum_bf16_ulp_error": metrics.maximum_bf16_ulp_error,
+        "maximum_masked_bf16_ulp_error": metrics.maximum_masked_bf16_ulp_error,
         "mean_absolute_error": metrics.mean_absolute_error,
         "relative_linf_error": metrics.relative_linf_error,
     }
@@ -320,8 +322,8 @@ def _cell_report(
             "repeat": _grouped_sha256(repeated),
         },
         "role": role,
-        "schema": "rmsnorm_contract_cell_v1",
-        "schema_version": 1,
+        "schema": "rmsnorm_contract_cell_v2",
+        "schema_version": 2,
         "shape": list(coordinate.shape),
         "sign_crossing_count": int(np.count_nonzero(((actual_bits ^ rounded_bits) & np.uint16(0x8000)) != np.uint16(0))),
         "threshold_exceeded": sorted(name for name, limit in LIMITS[role].items() if observed[name] > limit),
@@ -393,14 +395,26 @@ def validate_coordinate(
         if value.shape != _expected_shape(coordinate.shape, role) or value.dtype != np.dtype(ml_dtypes.bfloat16):
             raise RuntimeError(f"disabled JAX {role} diagnostic type differs from the public boundary")
     analytic = binary64_oracle(coordinate.shape)
-    role_metrics = {role: numerical_metrics(actual, analytic[role]) for role, actual in zip(roles, arrays, strict=True)}
+    role_metrics = {
+        role: numerical_metrics(
+            actual,
+            analytic[role],
+            masked_ulp_absolute_floor=MASKED_ULP_ABSOLUTE_FLOORS[role],
+        )
+        for role, actual in zip(roles, arrays, strict=True)
+    }
     if report_cell is not None:
         for role, actual, repeated, reference in zip(roles, arrays, repeat_arrays, diagnostic, strict=True):
             report_cell(_cell_report(coordinate, role, actual, repeated, reference, analytic[role], role_metrics[role]))
-    for role, metrics in role_metrics.items():
-        observed = _metrics_document(metrics)
-        if any(observed[name] > limit for name, limit in LIMITS[role].items()):
-            raise RuntimeError(f"RMSNorm Contract {role} exceeds its independent binary64 threshold")
+    if coordinate.mode is not Mode.DISABLED:
+        for role, metrics in role_metrics.items():
+            observed = _metrics_document(metrics)
+            for name, limit in LIMITS[role].items():
+                if observed[name] <= limit:
+                    continue
+                if name == "maximum_masked_bf16_ulp_error":
+                    raise RuntimeError(f"RMSNorm Contract {role} exceeds its masked BF16 ULP threshold")
+                raise RuntimeError(f"RMSNorm Contract {role} exceeds its independent binary64 threshold")
     if coordinate.mode is not Mode.DISABLED and coordinate.boundary is Boundary.PRIMAL:
         expected = emitted_primal_oracle(coordinate.shape, fast=coordinate.mode is Mode.FAST)
         if not _array_bytes_equal(arrays[0], expected):
@@ -512,5 +526,5 @@ def result_document(results: tuple[CoordinateResult, ...]) -> dict[str, object]:
         "numerical_policy_sha256": POLICY_SHA256,
         "pid": os.getpid(),
         "schema": "track1_rmsnorm_contract_h100_result",
-        "schema_version": 1,
+        "schema_version": 2,
     }

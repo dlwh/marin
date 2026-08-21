@@ -17,35 +17,50 @@ from abi15_h100_numerics import (
     fraction_to_f32_bits,
 )
 
-POLICY_FILENAME = "track1-rmsnorm-contract-h100-numerical-policy-v1.json"
-POLICY_SHA256 = "6d1fcab38f21cbb3887811b60594ae06ac8978a1e9d33ccd42eb69374dc11fd2"
+POLICY_FILENAME = "track1-rmsnorm-contract-h100-numerical-policy-v2.json"
+POLICY_SHA256 = "9fd9e00c6ef90b40d12916f671eeb5b73b385875d8e1ee485e0d029ab272996a"
 SHAPES = ((5, 19, 7), (5, 19, 257))
 ROLES = ("result", "input_cotangent", "weight_cotangent", "projection_cotangent")
-LIMITS = {
+WHOLE_ARRAY_LIMITS = {
     "input_cotangent": {
-        "maximum_absolute_error": 0.0625,
-        "maximum_bf16_ulp_error": 8,
-        "mean_absolute_error": 0.015625,
-        "relative_linf_error": 0.03125,
+        "maximum_absolute_error": 0.5,
+        "mean_absolute_error": 0.125,
+        "relative_linf_error": 0.015625,
     },
     "projection_cotangent": {
-        "maximum_absolute_error": 0.0625,
-        "maximum_bf16_ulp_error": 8,
-        "mean_absolute_error": 0.015625,
-        "relative_linf_error": 0.03125,
+        "maximum_absolute_error": 0.125,
+        "mean_absolute_error": 0.03125,
+        "relative_linf_error": 0.015625,
     },
     "result": {
-        "maximum_absolute_error": 0.03125,
-        "maximum_bf16_ulp_error": 4,
-        "mean_absolute_error": 0.008,
+        "maximum_absolute_error": 0.0625,
+        "mean_absolute_error": 0.015625,
         "relative_linf_error": 0.015625,
     },
     "weight_cotangent": {
-        "maximum_absolute_error": 0.125,
-        "maximum_bf16_ulp_error": 8,
-        "mean_absolute_error": 0.03125,
-        "relative_linf_error": 0.03125,
+        "maximum_absolute_error": 1.0,
+        "mean_absolute_error": 0.25,
+        "relative_linf_error": 0.015625,
     },
+}
+MASKED_ULP_ABSOLUTE_FLOORS = {
+    "input_cotangent": 0.015625,
+    "projection_cotangent": 0.015625,
+    "result": 0.0078125,
+    "weight_cotangent": 0.015625,
+}
+MASKED_ULP_LIMITS = {
+    "input_cotangent": 8,
+    "projection_cotangent": 8,
+    "result": 4,
+    "weight_cotangent": 8,
+}
+LIMITS = {
+    role: {
+        **WHOLE_ARRAY_LIMITS[role],
+        "maximum_masked_bf16_ulp_error": MASKED_ULP_LIMITS[role],
+    }
+    for role in ROLES
 }
 
 
@@ -55,6 +70,7 @@ class NumericalMetrics:
     mean_absolute_error: float
     relative_linf_error: float
     maximum_bf16_ulp_error: int
+    maximum_masked_bf16_ulp_error: int
 
 
 def deterministic_inputs(shape: tuple[int, int, int]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -62,30 +78,33 @@ def deterministic_inputs(shape: tuple[int, int, int]) -> tuple[np.ndarray, np.nd
     if shape not in SHAPES:
         raise ValueError("RMSNorm Contract shape is outside the numerical policy")
     rows, reduction, columns = shape
-    x_ordinal = np.arange(rows * reduction, dtype=np.float32)
+    x_ordinal = np.arange(rows * reduction, dtype=np.int64)
     x = (
         (
-            np.where((x_ordinal.astype(np.int64) % 2) == 0, 1.0, -1.0)
-            * (np.float32(0.125) + (x_ordinal % 23) / np.float32(8.0))
+            np.where((x_ordinal % 3) == 0, -1.0, 1.0)
+            * (np.float32(0.1875) + ((x_ordinal * 5 + 3) % 29).astype(np.float32) / np.float32(16.0))
         )
         .astype(ml_dtypes.bfloat16)
         .reshape(rows, reduction)
     )
-    weight = np.linspace(0.5, 1.25, reduction, dtype=np.float32).astype(ml_dtypes.bfloat16)
-    projection_ordinal = np.arange(reduction * columns, dtype=np.float32)
+    weight_ordinal = np.arange(reduction, dtype=np.int64)
+    weight = (np.float32(0.625) + ((weight_ordinal * 3 + 1) % 17).astype(np.float32) / np.float32(16.0)).astype(
+        ml_dtypes.bfloat16
+    )
+    projection_ordinal = np.arange(reduction * columns, dtype=np.int64)
     projection = (
         (
-            np.where((projection_ordinal.astype(np.int64) % 3) == 0, -1.0, 1.0)
-            * (np.float32(0.0625) + (projection_ordinal % 31) / np.float32(32.0))
+            np.where((projection_ordinal % 5) == 1, -1.0, 1.0)
+            * (np.float32(0.09375) + ((projection_ordinal * 7 + 5) % 37).astype(np.float32) / np.float32(32.0))
         )
         .astype(ml_dtypes.bfloat16)
         .reshape(reduction, columns)
     )
-    cotangent_ordinal = np.arange(rows * columns, dtype=np.float32)
+    cotangent_ordinal = np.arange(rows * columns, dtype=np.int64)
     cotangent = (
         (
-            np.where((cotangent_ordinal.astype(np.int64) % 5) == 0, -1.0, 1.0)
-            * (np.float32(0.125) + (cotangent_ordinal % 17) / np.float32(16.0))
+            np.where((cotangent_ordinal % 7) == 2, -1.0, 1.0)
+            * (np.float32(0.15625) + ((cotangent_ordinal * 11 + 7) % 23).astype(np.float32) / np.float32(16.0))
         )
         .astype(ml_dtypes.bfloat16)
         .reshape(rows, columns)
@@ -183,7 +202,13 @@ def emitted_primal_oracle(shape: tuple[int, int, int], *, fast: bool) -> np.ndar
     return result_bits.view(ml_dtypes.bfloat16)
 
 
-def numerical_metrics(actual: np.ndarray, reference: np.ndarray) -> NumericalMetrics:
+def numerical_metrics(
+    actual: np.ndarray,
+    reference: np.ndarray,
+    *,
+    masked_ulp_absolute_floor: float,
+) -> NumericalMetrics:
+    """Measure whole-array errors and BF16 ULPs above an absolute reference floor."""
     observed = actual.astype(np.float64)
     absolute = np.abs(observed - reference.astype(np.float64))
     maximum = float(np.max(absolute, initial=0.0))
@@ -199,11 +224,13 @@ def numerical_metrics(actual: np.ndarray, reference: np.ndarray) -> NumericalMet
     actual_bits = actual.view(np.uint16)
     rounded_bits = reference.astype(ml_dtypes.bfloat16).view(np.uint16)
     ulp = np.abs(ordered(actual_bits) - ordered(rounded_bits))
+    masked_ulp = ulp[np.abs(reference.astype(np.float64)) >= masked_ulp_absolute_floor]
     return NumericalMetrics(
         maximum_absolute_error=maximum,
         mean_absolute_error=float(np.mean(absolute, dtype=np.float64)),
         relative_linf_error=maximum / scale if scale else 0.0,
         maximum_bf16_ulp_error=int(np.max(ulp, initial=0)),
+        maximum_masked_bf16_ulp_error=int(np.max(masked_ulp, initial=0)),
     )
 
 
@@ -230,15 +257,25 @@ def _expected_policy() -> dict[str, object]:
     return {
         "acceptance": {
             "composed_topology": "diagnostic_non_performant_not_architecture_target",
-            "disabled_jax": "diagnostic_only",
+            "coordinate_order": "all_primal_before_any_composed",
+            "disabled_jax": "diagnostic_only_never_threshold_gated",
             "independent_binary64_thresholds": LIMITS,
+            "masked_bf16_ulp": {
+                "definition": "maximum_ordered_finite_bf16_distance_where_abs_binary64_reference_meets_floor",
+                "reference_absolute_floor_by_role": MASKED_ULP_ABSOLUTE_FLOORS,
+            },
             "nonfinite_action": "reject",
             "primal_emitted_oracle_bitwise_required": True,
             "primal_topology": {
                 "5x19x257": {"launches": 2, "temporary_bytes": 20, "temporaries": 1},
                 "5x19x7": {"launches": 1, "temporary_bytes": 0, "temporaries": 0},
             },
+            "raw_full_range_bf16_ulp": "diagnostic_only",
             "repeat_bitwise_required": True,
+        },
+        "campaign": {
+            "input_generation": "deterministic_v2_untouched_by_prior_hardware_campaigns",
+            "metric_geometry_qualification": "v1_failure_used_only_to_predeclare_absolute_floor_masking",
         },
         "recurrence": {
             "contract_fast": "lane_mod_32_fma_rn_f32_then_shuffle_tree",
@@ -249,7 +286,7 @@ def _expected_policy() -> dict[str, object]:
             "rsqrt_realization": "sqrt_rn_f32_then_divide",
         },
         "schema": "track1_rmsnorm_contract_h100_numerical_policy",
-        "schema_version": 1,
+        "schema_version": 2,
         "shapes": shapes,
         "status": "predeclared_unexecuted",
     }

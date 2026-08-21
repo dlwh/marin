@@ -88,9 +88,11 @@ def _document() -> dict[str, object]:
             "rmsnorm_contract": {
                 "boundaries": ["primal", "composed"],
                 "composed_topology": "diagnostic_non_performant_not_architecture_target",
+                "coordinate_order": "all_primal_before_any_composed",
                 "disabled_jax_reference": True,
-                "disabled_jax_role": "diagnostic_only",
+                "disabled_jax_role": "diagnostic_only_never_threshold_gated",
                 "host_oracle": "independent_binary64_rmsnorm_contract_vjp",
+                "masked_bf16_ulp": "role_floor_then_ordered_finite_distance",
                 "modes": ["disabled", "source_ordered", "fast"],
                 "numerical_policy": {
                     "path": f"lib/shuttle/mlir/jax_patch/{CONTRACT_POLICY_FILENAME}",
@@ -100,6 +102,7 @@ def _document() -> dict[str, object]:
                     "5x19x257": {"launches": 2, "temporary_bytes": 20, "temporaries": 1},
                     "5x19x7": {"launches": 1, "temporary_bytes": 0, "temporaries": 0},
                 },
+                "raw_full_range_bf16_ulp": "diagnostic_only",
                 "repeat_bitwise_required": True,
                 "shapes": [list(shape) for shape in CONTRACT_SHAPES],
             },
@@ -401,13 +404,13 @@ def _rmsnorm_contract_document() -> dict[str, object]:
     policy = load_contract_numerical_policy()
     coordinates = []
     invocation_id = 0
-    for shape in CONTRACT_SHAPES:
-        shape_key = "x".join(map(str, shape))
-        shape_policy = policy["shapes"][shape_key]
-        for boundary, roles in (
-            ("primal", ("result",)),
-            ("composed", ("result", "input_cotangent", "weight_cotangent", "projection_cotangent")),
-        ):
+    for boundary, roles in (
+        ("primal", ("result",)),
+        ("composed", ("result", "input_cotangent", "weight_cotangent", "projection_cotangent")),
+    ):
+        for shape in CONTRACT_SHAPES:
+            shape_key = "x".join(map(str, shape))
+            shape_policy = policy["shapes"][shape_key]
             baseline = {role: shape_policy["binary64_rounded_outputs"][role] for role in roles}
             for mode in ("disabled", "source_ordered", "fast"):
                 results = dict(baseline)
@@ -440,6 +443,7 @@ def _rmsnorm_contract_document() -> dict[str, object]:
                             role: {
                                 "maximum_absolute_error": 0.0,
                                 "maximum_bf16_ulp_error": 0,
+                                "maximum_masked_bf16_ulp_error": 0,
                                 "mean_absolute_error": 0.0,
                                 "relative_linf_error": 0.0,
                             }
@@ -456,7 +460,7 @@ def _rmsnorm_contract_document() -> dict[str, object]:
         "numerical_policy_sha256": CONTRACT_POLICY_SHA256,
         "pid": 404,
         "schema": "track1_rmsnorm_contract_h100_result",
-        "schema_version": 1,
+        "schema_version": 2,
     }
 
 
@@ -467,17 +471,17 @@ def test_rmsnorm_contract_result_requires_oracle_roles_repeatability_and_topolog
     for mutation in ("role", "repeat", "threshold", "observer", "primal_topology", "diagnostic_topology"):
         changed = deepcopy(document)
         if mutation == "role":
-            changed["coordinates"][3]["results"].pop("projection_cotangent")
+            changed["coordinates"][6]["results"].pop("projection_cotangent")
         elif mutation == "repeat":
             changed["coordinates"][1]["repeat_results"]["result"] = "3" * 64
         elif mutation == "threshold":
-            changed["coordinates"][4]["numerics"]["input_cotangent"]["maximum_absolute_error"] = 1.0
+            changed["coordinates"][7]["numerics"]["input_cotangent"]["maximum_absolute_error"] = 1.0
         elif mutation == "observer":
             changed["coordinates"][1]["observer"] = None
         elif mutation == "primal_topology":
             changed["coordinates"][1]["observer"]["launch_count"] = 2
         else:
-            changed["coordinates"][4]["observer"]["topology_status"] = "normative_primal"
+            changed["coordinates"][7]["observer"]["topology_status"] = "normative_primal"
         with pytest.raises(ValueError, match="RMSNorm Contract"):
             validate_rmsnorm_contract_result(changed)
 
@@ -487,6 +491,22 @@ def test_rmsnorm_contract_result_survives_the_worker_canonical_json_boundary() -
     reloaded = json.loads(canonical_json(document))
 
     assert validate_rmsnorm_contract_result(reloaded) == reloaded
+
+
+def test_rmsnorm_contract_result_keeps_disabled_and_raw_ulp_metrics_diagnostic() -> None:
+    document = _rmsnorm_contract_document()
+    disabled = document["coordinates"][6]["numerics"]["input_cotangent"]
+    disabled["maximum_absolute_error"] = 1024.0
+    disabled["maximum_masked_bf16_ulp_error"] = 1024
+    for coordinate in document["coordinates"]:
+        for metrics in coordinate["numerics"].values():
+            metrics["maximum_bf16_ulp_error"] = 65535
+
+    assert validate_rmsnorm_contract_result(document) == document
+
+    document["coordinates"][7]["numerics"]["input_cotangent"]["maximum_masked_bf16_ulp_error"] = 9
+    with pytest.raises(ValueError, match="independent binary64 threshold"):
+        validate_rmsnorm_contract_result(document)
 
 
 def test_rmsnorm_result_requires_exact_coordinate_output_and_observer_closure() -> None:

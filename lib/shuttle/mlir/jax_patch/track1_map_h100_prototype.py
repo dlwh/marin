@@ -229,9 +229,11 @@ def _expected_authorization(source_manifest_sha256: str) -> dict[str, object]:
             "rmsnorm_contract": {
                 "boundaries": ["primal", "composed"],
                 "composed_topology": "diagnostic_non_performant_not_architecture_target",
+                "coordinate_order": "all_primal_before_any_composed",
                 "disabled_jax_reference": True,
-                "disabled_jax_role": "diagnostic_only",
+                "disabled_jax_role": "diagnostic_only_never_threshold_gated",
                 "host_oracle": "independent_binary64_rmsnorm_contract_vjp",
+                "masked_bf16_ulp": "role_floor_then_ordered_finite_distance",
                 "modes": ["disabled", "source_ordered", "fast"],
                 "numerical_policy": {
                     "path": f"lib/shuttle/mlir/jax_patch/{contract_policy.POLICY_FILENAME}",
@@ -241,6 +243,7 @@ def _expected_authorization(source_manifest_sha256: str) -> dict[str, object]:
                     "5x19x257": {"launches": 2, "temporary_bytes": 20, "temporaries": 1},
                     "5x19x7": {"launches": 1, "temporary_bytes": 0, "temporaries": 0},
                 },
+                "raw_full_range_bf16_ulp": "diagnostic_only",
                 "repeat_bitwise_required": True,
                 "shapes": [list(shape) for shape in contract_policy.SHAPES],
             },
@@ -767,7 +770,7 @@ def validate_rmsnorm_contract_result(document: object) -> dict[str, object]:
         "schema_version",
     }:
         raise ValueError("RMSNorm Contract result has the wrong root schema")
-    if document["schema"] != "track1_rmsnorm_contract_h100_result" or document["schema_version"] != 1:
+    if document["schema"] != "track1_rmsnorm_contract_h100_result" or document["schema_version"] != 2:
         raise ValueError("RMSNorm Contract result has the wrong schema identity")
     if document["numerical_policy_sha256"] != contract_policy.POLICY_SHA256:
         raise ValueError("RMSNorm Contract result numerical policy differs")
@@ -782,8 +785,8 @@ def validate_rmsnorm_contract_result(document: object) -> dict[str, object]:
     )
     expected = [
         (shape, boundary, roles, mode)
-        for shape in contract_policy.SHAPES
         for boundary, roles in boundaries
+        for shape in contract_policy.SHAPES
         for mode in WORKER_MODES
     ]
     policy = contract_policy.load_numerical_policy()
@@ -825,12 +828,18 @@ def validate_rmsnorm_contract_result(document: object) -> dict[str, object]:
             raise ValueError("RMSNorm Contract numerical metric roles differ")
         for role in roles:
             metrics = numerics[role]
-            if type(metrics) is not dict or set(metrics) != set(contract_policy.LIMITS[role]):
+            expected_metrics = set(contract_policy.LIMITS[role]) | {"maximum_bf16_ulp_error"}
+            if type(metrics) is not dict or set(metrics) != expected_metrics:
                 raise ValueError("RMSNorm Contract numerical metric schema differs")
+            for name, value in metrics.items():
+                expected_type = int if name in {"maximum_bf16_ulp_error", "maximum_masked_bf16_ulp_error"} else float
+                if type(value) is not expected_type or not math.isfinite(value) or value < 0:
+                    raise ValueError("RMSNorm Contract numerical metric is invalid")
+            if mode == "disabled":
+                continue
             for name, limit in contract_policy.LIMITS[role].items():
                 value = metrics[name]
-                expected_type = int if name == "maximum_bf16_ulp_error" else float
-                if type(value) is not expected_type or not math.isfinite(value) or value < 0 or value > limit:
+                if value > limit:
                     raise ValueError(f"RMSNorm Contract {role} exceeds its independent binary64 threshold")
         key = (shape, boundary)
         if mode == "disabled":

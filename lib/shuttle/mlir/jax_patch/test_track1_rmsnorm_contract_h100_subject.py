@@ -9,7 +9,13 @@ import numpy as np
 import pytest
 import track1_rmsnorm_contract_h100_subject as subject
 from track1_rmsnorm_contract_h100_subject import Boundary, Coordinate, Mode
-from track1_rmsnorm_contract_numerical_policy import SHAPES, binary64_oracle, deterministic_inputs
+from track1_rmsnorm_contract_numerical_policy import (
+    MASKED_ULP_ABSOLUTE_FLOORS,
+    MASKED_ULP_LIMITS,
+    SHAPES,
+    binary64_oracle,
+    deterministic_inputs,
+)
 
 
 def _observer_snapshot(coordinate: Coordinate, launches: int, temporaries: int) -> tuple[tuple[object, ...], ...]:
@@ -160,10 +166,10 @@ def test_disabled_jax_is_diagnostic_but_enabled_masked_ulp_is_gated() -> None:
     changed = [value.copy() for value in arrays]
     role = "input_cotangent"
     reference = oracle[role]
-    eligible = np.flatnonzero(np.abs(reference.reshape(-1)) >= subject.MASKED_ULP_ABSOLUTE_FLOORS[role])
+    eligible = np.flatnonzero(np.abs(reference.reshape(-1)) >= MASKED_ULP_ABSOLUTE_FLOORS[role])
     flat_index = int(eligible[0])
     bits = changed[1].view(np.uint16).reshape(-1)
-    bits[flat_index] = np.uint16(int(bits[flat_index]) + subject.MASKED_ULP_LIMITS[role] + 1)
+    bits[flat_index] = np.uint16(int(bits[flat_index]) + MASKED_ULP_LIMITS[role] + 1)
     changed_tuple = tuple(changed)
 
     accepted = subject.validate_coordinate(
@@ -172,7 +178,7 @@ def test_disabled_jax_is_diagnostic_but_enabled_masked_ulp_is_gated() -> None:
         tuple(value.copy() for value in changed_tuple),
         (),
     )
-    assert accepted.numerics[role]["maximum_masked_bf16_ulp_error"] > subject.MASKED_ULP_LIMITS[role]
+    assert accepted.numerics[role]["maximum_masked_bf16_ulp_error"] > MASKED_ULP_LIMITS[role]
 
     enabled = Coordinate(shape, Boundary.COMPOSED, Mode.SOURCE_ORDERED)
     with pytest.raises(RuntimeError, match="masked BF16 ULP threshold"):
@@ -213,7 +219,7 @@ def test_run_matrix_completes_every_primal_coordinate_before_composed_execution(
 
 
 def test_threshold_failure_reports_every_role_before_rejecting_the_coordinate() -> None:
-    coordinate = Coordinate((5, 19, 7), Boundary.COMPOSED, Mode.DISABLED)
+    coordinate = Coordinate((5, 19, 7), Boundary.COMPOSED, Mode.SOURCE_ORDERED)
     roles = subject.result_roles(coordinate.boundary)
     oracle = binary64_oracle(coordinate.shape)
     arrays = tuple(oracle[role].astype(ml_dtypes.bfloat16) for role in roles)
@@ -226,17 +232,17 @@ def test_threshold_failure_reports_every_role_before_rejecting_the_coordinate() 
             coordinate,
             tuple(exceeded),
             tuple(value.copy() for value in exceeded),
-            (),
+            _observer_snapshot(coordinate, 42, 38),
             report_cell=reports.append,
         )
 
     assert [report["role"] for report in reports] == list(roles)
     failing = reports[1]
-    assert failing["schema"] == "rmsnorm_contract_cell_v1"
-    assert failing["schema_version"] == 1
+    assert failing["schema"] == "rmsnorm_contract_cell_v2"
+    assert failing["schema_version"] == 2
     assert failing["shape"] == [5, 19, 7]
     assert failing["boundary"] == "composed"
-    assert failing["mode"] == "disabled"
+    assert failing["mode"] == "source_ordered"
     assert failing["threshold_exceeded"]
     assert failing["first_mismatch"]["index"] == [0, 3]
     assert failing["first_mismatch"]["actual_value"] == 1024.0
