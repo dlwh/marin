@@ -951,6 +951,55 @@ bool mutateFoldRegionTask(mlir::ModuleOp module, llvm::StringRef mutation) {
                mutation == "boundary-operand" ||
                mutation == "boundary-indexing-map") {
       llvm::SmallVector<mlir::Attribute> changed(boundaryUses.getValue());
+      if (mutation == "boundary-source") {
+        if (changed.size() < 2)
+          continue;
+        std::swap(changed.front(), changed.back());
+        task->setAttr("fold_region_boundary_uses",
+                      builder.getArrayAttr(changed));
+        plan.setFingerprint(
+            mlir::shuttle::materializationPlanFingerprint(plan));
+        return true;
+      }
+      if (mutation == "boundary-operand") {
+        for (auto [useIndex, useAttribute] : llvm::enumerate(changed)) {
+          auto candidateUse = mlir::cast<mlir::DictionaryAttr>(useAttribute);
+          auto candidateSource =
+              mlir::cast<mlir::shuttle::SourceRefAttr>(
+                  candidateUse.get("source"));
+          auto candidateOperand =
+              mlir::cast<mlir::IntegerAttr>(candidateUse.get("operand"));
+          mlir::shuttle::MapOp candidateMap;
+          module.walk([&](mlir::shuttle::MapOp map) {
+            if (map.getSource() == candidateSource)
+              candidateMap = map;
+          });
+          if (!candidateMap)
+            return false;
+          for (auto [replacementOperand, input] :
+               llvm::enumerate(candidateMap.getInputs())) {
+            if (replacementOperand ==
+                    static_cast<unsigned>(candidateOperand.getInt()) ||
+                input.getType() !=
+                    candidateMap.getInputs()[candidateOperand.getInt()]
+                        .getType())
+              continue;
+            candidateUse = replaceField(
+                candidateUse, "operand",
+                builder.getI64IntegerAttr(replacementOperand));
+            candidateUse = replaceField(
+                candidateUse, "indexing_map",
+                candidateMap.getIndexingMaps()[replacementOperand]);
+            changed[useIndex] = candidateUse;
+            task->setAttr("fold_region_boundary_uses",
+                          builder.getArrayAttr(changed));
+            plan.setFingerprint(
+                mlir::shuttle::materializationPlanFingerprint(plan));
+            return true;
+          }
+        }
+        continue;
+      }
       auto use = mlir::cast<mlir::DictionaryAttr>(changed.front());
       auto source = mlir::cast<mlir::shuttle::SourceRefAttr>(use.get("source"));
       auto operand = mlir::cast<mlir::IntegerAttr>(use.get("operand"));
@@ -961,65 +1010,7 @@ bool mutateFoldRegionTask(mlir::ModuleOp module, llvm::StringRef mutation) {
       });
       if (!map)
         return false;
-      if (mutation == "boundary-source") {
-        mlir::shuttle::MapOp replacementMap;
-        unsigned replacementOperand = 0;
-        module.walk([&](mlir::shuttle::MapOp candidate) {
-          if (replacementMap || candidate == map ||
-              !llvm::is_contained(sources, candidate.getSource()))
-            return;
-          for (auto [candidateOperand, input] :
-               llvm::enumerate(candidate.getInputs())) {
-            auto candidateIndexing = mlir::cast<mlir::AffineMapAttr>(
-                candidate.getIndexingMaps()[candidateOperand]);
-            auto originalIndexing =
-                mlir::cast<mlir::AffineMapAttr>(use.get("indexing_map"));
-            if (input.getType() == map.getInputs()[operand.getInt()].getType() &&
-                candidateIndexing.getValue().getNumDims() ==
-                    originalIndexing.getValue().getNumDims() &&
-                candidateIndexing.getValue().getNumResults() ==
-                    originalIndexing.getValue().getNumResults()) {
-              replacementMap = candidate;
-              replacementOperand = candidateOperand;
-              return;
-            }
-          }
-        });
-        if (!replacementMap)
-          continue;
-        use = replaceField(use, "source", replacementMap.getSource());
-        use = replaceField(use, "operand",
-                           builder.getI64IntegerAttr(replacementOperand));
-        use = replaceField(
-            use, "indexing_map",
-            replacementMap.getIndexingMaps()[replacementOperand]);
-        int64_t expectedPhase = 0;
-        for (mlir::Attribute phaseAttribute : phases) {
-          auto phaseSource = mlir::cast<mlir::shuttle::SourceRefAttr>(
-              mlir::cast<mlir::DictionaryAttr>(phaseAttribute).get("source"));
-          if (sourcePrecedes(phaseSource, replacementMap.getSource()))
-            ++expectedPhase;
-        }
-        use = replaceField(
-            use, "phase",
-            builder.getI64IntegerAttr(
-                std::min<int64_t>(expectedPhase, phases.size() - 1)));
-      } else if (mutation == "boundary-operand") {
-        std::optional<unsigned> replacementOperand;
-        for (auto [candidateOperand, input] : llvm::enumerate(map.getInputs())) {
-          if (candidateOperand != static_cast<unsigned>(operand.getInt()) &&
-              input.getType() == map.getInputs()[operand.getInt()].getType()) {
-            replacementOperand = candidateOperand;
-            break;
-          }
-        }
-        if (!replacementOperand)
-          continue;
-        use = replaceField(use, "operand",
-                           builder.getI64IntegerAttr(*replacementOperand));
-        use = replaceField(use, "indexing_map",
-                           map.getIndexingMaps()[*replacementOperand]);
-      } else {
+      {
         auto original = mlir::cast<mlir::AffineMapAttr>(
             use.get("indexing_map")).getValue();
         if (original.getNumResults() == 0)
@@ -2149,13 +2140,19 @@ TEST(Abi22MapFusionContract,
                                                "missing-recomputation",
                                                "reordered-source"};
   for (llvm::StringRef mutation : mutations) {
-    SCOPED_TRACE(mutation.str());
-    std::unique_ptr<BuiltModule> built =
-        build(*source, mlir::shuttle::NumericalPolicy::SourceOrdered,
-              kFusionTuning, false, false);
-    ASSERT_TRUE(built);
-    ASSERT_TRUE(mutateFoldRegionTask(*built->module, mutation));
-    EXPECT_FALSE(verifyMaterializationPlan(*built->module));
+    for (mlir::shuttle::NumericalPolicy policy :
+         {mlir::shuttle::NumericalPolicy::SourceOrdered,
+          mlir::shuttle::NumericalPolicy::Fast}) {
+      SCOPED_TRACE(mutation.str());
+      SCOPED_TRACE(policy == mlir::shuttle::NumericalPolicy::SourceOrdered
+                       ? "source_ordered"
+                       : "fast");
+      std::unique_ptr<BuiltModule> built =
+          build(*source, policy, kFusionTuning, false, false);
+      ASSERT_TRUE(built);
+      ASSERT_TRUE(mutateFoldRegionTask(*built->module, mutation));
+      EXPECT_FALSE(verifyMaterializationPlan(*built->module));
+    }
   }
 }
 

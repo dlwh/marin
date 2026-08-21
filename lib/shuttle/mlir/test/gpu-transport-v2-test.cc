@@ -4136,8 +4136,14 @@ TEST(GpuTransportV2Test,
   std::vector<uint16_t> x(rows * features);
   std::vector<uint16_t> weight(features);
   std::vector<uint16_t> cotangent(rows * features);
-  for (size_t index = 0; index < x.size(); ++index)
-    x[index] = roundToBf16(-0.75f + 1.625f * index / (x.size() - 1));
+  for (size_t index = 0; index < x.size(); ++index) {
+    if (index < features) {
+      x[index] = roundToBf16(-0.001f + 0.002f * index / (features - 1));
+    } else {
+      x[index] =
+          roundToBf16(-0.75f + 1.625f * index / (x.size() - 1));
+    }
+  }
   for (size_t index = 0; index < weight.size(); ++index)
     weight[index] =
         roundToBf16(0.5f + 0.75f * index / (weight.size() - 1));
@@ -4145,12 +4151,20 @@ TEST(GpuTransportV2Test,
     cotangent[index] =
         roundToBf16(-0.5f + 1.125f * index / (cotangent.size() - 1));
 
-  constexpr llvm::StringLiteral options =
+  constexpr llvm::StringLiteral sourceOrderedOptions =
       R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+  constexpr llvm::StringLiteral fastOptions =
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
   constexpr llvm::StringLiteral tuning =
       R"json({"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json";
   for (bool backward : {false, true}) {
     SCOPED_TRACE(backward ? "VJP" : "forward");
+    for (mlir::shuttle::NumericalPolicy policy :
+         {mlir::shuttle::NumericalPolicy::SourceOrdered,
+          mlir::shuttle::NumericalPolicy::Fast}) {
+      SCOPED_TRACE(policy == mlir::shuttle::NumericalPolicy::SourceOrdered
+                       ? "source_ordered"
+                       : "fast");
     auto source = fixtureSource(
         backward
             ? "jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-"
@@ -4158,9 +4172,12 @@ TEST(GpuTransportV2Test,
             : "jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-"
               "forward.mlir");
     ASSERT_TRUE(source);
-    auto built = buildFixture(*source,
-                              mlir::shuttle::NumericalPolicy::SourceOrdered,
-                              options, tuning);
+    auto built = buildFixture(
+        *source, policy,
+        policy == mlir::shuttle::NumericalPolicy::SourceOrdered
+            ? sourceOrderedOptions
+            : fastOptions,
+        tuning);
     ASSERT_TRUE(built);
     auto transport =
         mlir::shuttle::serializeGpuExecutableBundle(*built->module);
@@ -4184,8 +4201,9 @@ TEST(GpuTransportV2Test,
     for (const auto &host : hostOperands) {
       auto device = (*executor)->AllocateArray<uint16_t>(host.size());
       ASSERT_TRUE(device);
-      ASSERT_TRUE(stream->get()
-                      ->Memcpy(&device, host.data(), host.size() * sizeof(uint16_t))
+      ASSERT_TRUE((*executor)
+                      ->SynchronousMemcpyH2D(
+                          host.data(), host.size() * sizeof(uint16_t), &device)
                       .ok());
       deviceOperands.push_back(device);
       operands.push_back(
@@ -4201,11 +4219,11 @@ TEST(GpuTransportV2Test,
     ASSERT_TRUE((*runner)->Execute(operands, results).ok());
     ASSERT_TRUE((*runner)->AwaitCompletion().ok());
     for (auto [index, host] : llvm::enumerate(hostResults))
-      ASSERT_TRUE(stream->get()
-                      ->Memcpy(host.data(), deviceResults[index],
-                               host.size() * sizeof(uint16_t))
+      ASSERT_TRUE((*executor)
+                      ->SynchronousMemcpyD2H(
+                          deviceResults[index], host.size() * sizeof(uint16_t),
+                          host.data())
                       .ok());
-    ASSERT_TRUE(stream->get()->BlockHostUntilDone().ok());
 
     std::vector<std::vector<uint16_t>> expected;
     if (backward) {
@@ -4231,6 +4249,7 @@ TEST(GpuTransportV2Test,
       (*executor)->Deallocate(&device);
     for (auto &device : deviceOperands)
       (*executor)->Deallocate(&device);
+    }
   }
 }
 

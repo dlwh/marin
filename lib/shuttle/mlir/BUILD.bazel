@@ -6,6 +6,7 @@ load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("@xla//xla:lit.bzl", "lit_test_suite")
+load("@xla//xla/tsl/platform/default:cuda_build_defs.bzl", "if_cuda_is_configured")
 
 package(
     default_visibility = ["//visibility:public"],
@@ -394,6 +395,20 @@ cc_test(
         "@xla//xla/stream_executor:platform_manager",
         "@xla//xla/stream_executor:stream_executor_address_allocator",
         "@bazel_tools//tools/cpp/runfiles",
+    ] + if_cuda_is_configured([
+        "@xla//xla/stream_executor/cuda:cuda_platform",
+    ]),
+)
+
+sh_test(
+    name = "gpu_transport_v2_h100_numerics_test",
+    srcs = ["test/run-h100-rmsnorm-numerics.sh"],
+    args = ["$(rootpath :gpu_transport_v2_test)"],
+    data = [":gpu_transport_v2_test"],
+    tags = [
+        "h100",
+        "manual",
+        "requires-gpu-nvidia",
     ],
 )
 
