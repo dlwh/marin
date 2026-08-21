@@ -1,16 +1,19 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
 import copy
 import hashlib
 import json
 import math
 import shutil
+import tempfile
+import unittest
+from collections.abc import Iterator
 from pathlib import Path
 
 import ml_dtypes
 import numpy as np
-import pytest
 from abi22_shuttle_rmsnorm_representative import (
     ACCEPTANCE_PATTERN,
     BINDING_CONTRACT,
@@ -242,6 +245,15 @@ EXPECTED_BINDINGS = {
 }
 
 
+@contextlib.contextmanager
+def _raises(error_type: type[Exception]) -> Iterator[None]:
+    try:
+        yield
+    except error_type:
+        return
+    raise AssertionError(f"expected {error_type.__name__}")
+
+
 def _sha(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
@@ -381,9 +393,8 @@ def _fake_runner(
     return 0
 
 
-@pytest.fixture(scope="module")
-def prepared_case_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    case_root = tmp_path_factory.mktemp("shuttle-representative-cases")
+def prepared_case_root(workspace: Path) -> Path:
+    case_root = workspace / "shuttle-representative-cases"
     prepared = prepare_representative_cases(case_root)
     assert prepared == {
         "input_digests": {role: SHA256[role] for role in ("x", "gamma", "dy")},
@@ -407,11 +418,10 @@ def prepared_case_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return case_root
 
 
-@pytest.fixture(scope="module")
 def executed_evidence(
-    tmp_path_factory: pytest.TempPathFactory, prepared_case_root: Path
+    workspace: Path, prepared_case_root: Path
 ) -> tuple[dict[str, object], Path, Path, list[list[str]]]:
-    workspace = tmp_path_factory.mktemp("shuttle-representative-execution")
+    workspace = workspace / "shuttle-representative-execution"
     raw_root = workspace / "raw"
     reports_root = workspace / "reports"
     calls: list[list[str]] = []
@@ -510,34 +520,33 @@ def test_executor_invokes_exact_matrix_and_assembles_file_backed_evidence(
             assert validate_output_artifact(artifact, raw_root=raw_root, case_root=prepared_case_root) == artifact
 
 
-@pytest.mark.parametrize(
-    "failure",
-    [
-        "nonzero",
-        "missing_cell",
-        "artifact_size",
-        "artifact_sha",
-        "backward_runner_index",
-        "composed_slot",
-        "operand_bytes",
-        "operand_type",
-        "operand_alignment",
-        "result_bytes",
-        "result_type",
-        "result_alignment",
-        "runner_api",
-        "resource",
-        "contract_transport",
-        "warmup_iterations",
-        "measured_iterations",
-        "host_clock",
-        "event_status",
-        "negative_host_sample",
-        "nan_host_sample",
-        "negative_event_sample",
-        "nan_event_sample",
-    ],
+FAILURE_MUTATIONS = (
+    "nonzero",
+    "missing_cell",
+    "artifact_size",
+    "artifact_sha",
+    "backward_runner_index",
+    "composed_slot",
+    "operand_bytes",
+    "operand_type",
+    "operand_alignment",
+    "result_bytes",
+    "result_type",
+    "result_alignment",
+    "runner_api",
+    "resource",
+    "contract_transport",
+    "warmup_iterations",
+    "measured_iterations",
+    "host_clock",
+    "event_status",
+    "negative_host_sample",
+    "nan_host_sample",
+    "negative_event_sample",
+    "nan_event_sample",
 )
+
+
 def test_executor_fails_closed_on_process_and_persisted_output_failures(
     tmp_path: Path, prepared_case_root: Path, failure: str
 ) -> None:
@@ -554,7 +563,7 @@ def test_executor_fails_closed_on_process_and_persisted_output_failures(
         kwargs["corrupt_artifact_sha"] = True
     else:
         kwargs["raw_mutation"] = failure
-    with pytest.raises(ValueError):
+    with _raises(ValueError):
         execute_representative(
             runner=tmp_path / "runner",
             case_root=prepared_case_root,
@@ -571,7 +580,7 @@ def test_executor_persists_raw_outputs_and_diagnostics_before_numerical_rejectio
 ) -> None:
     raw_root = tmp_path / "raw"
     reports_root = tmp_path / "reports"
-    with pytest.raises(ValueError):
+    with _raises(ValueError):
         execute_representative(
             runner=tmp_path / "runner",
             case_root=prepared_case_root,
@@ -653,9 +662,6 @@ def test_execution_plan_is_exact_fresh_process_matrix(tmp_path: Path) -> None:
         ]
 
 
-@pytest.mark.parametrize("provider", ["source_ordered", "fast"])
-@pytest.mark.parametrize("boundary", ["forward", "backward_recompute", "composed"])
-@pytest.mark.parametrize("repeat", [0, 1])
 def test_every_acceptance_cell_enforces_metrics_roles_and_resources(
     provider: str,
     boundary: str,
@@ -684,60 +690,59 @@ def test_every_acceptance_cell_enforces_metrics_roles_and_resources(
         for field, value in mutations.items():
             changed = copy.deepcopy(baseline)
             changed["cells"][index]["outputs"][role_index][field] = value
-            with pytest.raises(ValueError):
+            with _raises(ValueError):
                 _validate(changed, executed_evidence, prepared_case_root)
         changed = copy.deepcopy(baseline)
         changed["cells"][index]["outputs"][role_index]["max_absolute_error"] = math.nan
-        with pytest.raises(ValueError):
+        with _raises(ValueError):
             _validate(changed, executed_evidence, prepared_case_root)
         changed = copy.deepcopy(baseline)
         output = changed["cells"][index]["outputs"][role_index]
         output["below_floor_count"] += 1
         output["eligible_count"] -= 1
-        with pytest.raises(ValueError):
+        with _raises(ValueError):
             _validate(changed, executed_evidence, prepared_case_root)
         changed = copy.deepcopy(baseline)
         changed["cells"][index]["outputs"][role_index]["absolute_floor"] = limits["absolute_floor"] * 2
-        with pytest.raises(ValueError):
+        with _raises(ValueError):
             _validate(changed, executed_evidence, prepared_case_root)
         changed = copy.deepcopy(baseline)
         changed["cells"][index]["outputs"][role_index]["max_absolute_error"] = (
             limits["max_absolute_error_below_floor"] / 2
         )
-        with pytest.raises(ValueError):
+        with _raises(ValueError):
             _validate(changed, executed_evidence, prepared_case_root)
 
     for field in EXPECTED_RESOURCES[boundary]:
         changed = copy.deepcopy(baseline)
         changed["cells"][index]["resources"][field] += 1
-        with pytest.raises(ValueError):
+        with _raises(ValueError):
             _validate(changed, executed_evidence, prepared_case_root)
 
 
-@pytest.mark.parametrize(
-    "mutation",
-    [
-        "missing_cell",
-        "duplicate_cell",
-        "wrong_shape",
-        "wrong_epsilon",
-        "wrong_pattern",
-        "wrong_input",
-        "wrong_reference",
-        "wrong_role_order",
-        "wrong_public_index",
-        "wrong_runner_index",
-        "wrong_slot_ordinal",
-        "wrong_runner_api",
-        "repeat_drift",
-        "contract_fusion",
-        "wrong_warmup",
-        "short_host_samples",
-        "short_event_samples",
-        "wrong_external_result",
-        "wrong_external_raw",
-    ],
+STRUCTURAL_MUTATIONS = (
+    "missing_cell",
+    "duplicate_cell",
+    "wrong_shape",
+    "wrong_epsilon",
+    "wrong_pattern",
+    "wrong_input",
+    "wrong_reference",
+    "wrong_role_order",
+    "wrong_public_index",
+    "wrong_runner_index",
+    "wrong_slot_ordinal",
+    "wrong_runner_api",
+    "repeat_drift",
+    "contract_fusion",
+    "wrong_warmup",
+    "short_host_samples",
+    "short_event_samples",
+    "wrong_external_result",
+    "wrong_external_raw",
 )
+
+
 def test_structural_transport_repeat_and_external_evidence_mutations_reject(
     mutation: str,
     executed_evidence: tuple[dict[str, object], Path, Path, list[list[str]]],
@@ -821,7 +826,7 @@ def test_structural_transport_repeat_and_external_evidence_mutations_reject(
         changed["external_evidence"]["r12_policy_raw_sha256"] = "0" * 64
     else:
         raise AssertionError(mutation)
-    with pytest.raises(ValueError):
+    with _raises(ValueError):
         _validate(changed, executed_evidence, prepared_case_root)
 
 
@@ -845,13 +850,13 @@ def test_output_artifact_validation_rejects_case_alias_and_wrong_storage(tmp_pat
     output.hardlink_to(reference)
     aliased = copy.deepcopy(expected)
     aliased["sha256"] = hashlib.sha256(reference.read_bytes()).hexdigest()
-    with pytest.raises(ValueError):
+    with _raises(ValueError):
         validate_output_artifact(aliased, raw_root=raw_root, case_root=case_root)
 
     outside = copy.deepcopy(expected)
     outside["path"] = str(tmp_path / "outside.bf16")
     Path(outside["path"]).write_bytes(b"\x04\x03\x02\x01")
-    with pytest.raises(ValueError):
+    with _raises(ValueError):
         validate_output_artifact(outside, raw_root=raw_root, case_root=case_root)
 
 
@@ -866,7 +871,7 @@ def test_r12_external_evidence_is_revalidated_not_self_reported(
     changed_path.write_text(json.dumps(changed_result, sort_keys=True, separators=(",", ":")))
     document = copy.deepcopy(executed_evidence[0])
     document["external_evidence"]["r12_result_sha256"] = hashlib.sha256(changed_path.read_bytes()).hexdigest()
-    with pytest.raises(ValueError):
+    with _raises(ValueError):
         validate_shuttle_evidence(
             document,
             r12_result=changed_path,
@@ -874,3 +879,68 @@ def test_r12_external_evidence_is_revalidated_not_self_reported(
             raw_root=executed_evidence[1],
             case_root=prepared_case_root,
         )
+
+
+class RepresentativeRmsNormTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.temporary = tempfile.TemporaryDirectory()
+        cls.workspace = Path(cls.temporary.name)
+        cls.case_root = prepared_case_root(cls.workspace)
+        cls.executed = executed_evidence(cls.workspace, cls.case_root)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.temporary.cleanup()
+
+    def temporary_path(self, name: str) -> Path:
+        path = self.workspace / name
+        path.mkdir()
+        return path
+
+    def test_contract_and_file_backed_execution(self) -> None:
+        test_contract_freezes_r12_inputs_role_limits_resources_and_coordinates(self.executed, self.case_root)
+        test_executor_invokes_exact_matrix_and_assembles_file_backed_evidence(self.executed, self.case_root)
+        test_execution_plan_is_exact_fresh_process_matrix(self.temporary_path("plan"))
+
+    def test_process_and_raw_claim_failures(self) -> None:
+        for index, failure in enumerate(FAILURE_MUTATIONS):
+            with self.subTest(failure=failure):
+                test_executor_fails_closed_on_process_and_persisted_output_failures(
+                    self.temporary_path(f"failure-{index}"), self.case_root, failure
+                )
+
+    def test_prevalidation_durability(self) -> None:
+        test_executor_persists_raw_outputs_and_diagnostics_before_numerical_rejection(
+            self.temporary_path("durability"), self.case_root
+        )
+
+    def test_acceptance_metric_matrix(self) -> None:
+        for provider in POLICIES:
+            for boundary in BOUNDARIES:
+                for repeat in range(2):
+                    with self.subTest(provider=provider, boundary=boundary, repeat=repeat):
+                        test_every_acceptance_cell_enforces_metrics_roles_and_resources(
+                            provider,
+                            boundary,
+                            repeat,
+                            self.executed,
+                            self.case_root,
+                        )
+
+    def test_structural_mutation_matrix(self) -> None:
+        for mutation in STRUCTURAL_MUTATIONS:
+            with self.subTest(mutation=mutation):
+                test_structural_transport_repeat_and_external_evidence_mutations_reject(
+                    mutation, self.executed, self.case_root
+                )
+
+    def test_artifact_and_external_evidence_failures(self) -> None:
+        test_output_artifact_validation_rejects_case_alias_and_wrong_storage(self.temporary_path("artifact"))
+        test_r12_external_evidence_is_revalidated_not_self_reported(
+            self.temporary_path("r12"), self.executed, self.case_root
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
