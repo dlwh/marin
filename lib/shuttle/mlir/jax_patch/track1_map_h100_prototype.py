@@ -13,6 +13,7 @@ import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from rigging.redaction import REDACTED_VALUE, is_sensitive_key_name, redact_string
 from track1_map_h100_build import (
     JAX_COMMIT,
     JAX_PATCH_SHA256,
@@ -52,6 +53,11 @@ WORKER_MODES = ("disabled", "source_ordered", "fast")
 SOURCE_MANIFEST_RELATIVE = Path("scripts/shuttle/track1_map_h100_source_manifest.json")
 SOURCE_ROOTS = (Path("lib/shuttle/mlir"), Path("lib/shuttle/src/shuttle"))
 IGNORED_SOURCE_PARTS = frozenset({"__pycache__", ".pytest_cache"})
+AUTHORIZATION_LOG_VALUE = re.compile(r"(?im)\b((?:proxy[-_])?authorization\s*[:=]\s*)[^\r\n]*")
+SENSITIVE_LOG_VALUE = re.compile(
+    r"""(?i)(?<![A-Za-z0-9_-])(["']?([A-Za-z][A-Za-z0-9_-]{0,127})["']?\s*[:=]\s*)"""
+    r"""((?:bearer|basic)\s+\S+|"[^"\r\n]*"|'[^'\r\n]*'|\S+)"""
+)
 
 
 @dataclass(frozen=True)
@@ -462,29 +468,38 @@ def _sanitized_log_tail(log: Path) -> str:
         start = max(0, stream.tell() - LOG_TAIL_READ_BYTES)
         stream.seek(start)
         raw = stream.read()
+    truncated = start > 0
     if start:
-        _, _, raw = raw.partition(b"\n")
-    tail = raw.decode(errors="replace")
-    tail = re.sub(
-        (
-            r"(?i)\b((?:[A-Za-z0-9_]*(?:api[_-]?key|authorization|credential|password|passwd|secret|token)"
-            r"[A-Za-z0-9_]*)\s*[:=]\s*)\S+"
-        ),
-        r"\1[REDACTED]",
-        tail,
-    )
-    tail = re.sub(r"(?i)\b(bearer\s+)\S+", r"\1[REDACTED]", tail)
+        _, newline, suffix = raw.partition(b"\n")
+        if newline:
+            raw = suffix
+    tail = redact_string(raw.decode(errors="replace"))
+    tail = AUTHORIZATION_LOG_VALUE.sub(rf"\1{REDACTED_VALUE}", tail)
+
+    def redact_sensitive_value(match: re.Match[str]) -> str:
+        if is_sensitive_key_name(match.group(2)):
+            return f"{match.group(1)}{REDACTED_VALUE}"
+        return match.group(0)
+
+    tail = SENSITIVE_LOG_VALUE.sub(redact_sensitive_value, tail)
+    tail = re.sub(r"(?i)\b(bearer\s+)\S+", rf"\1{REDACTED_VALUE}", tail)
     tail = re.sub(r"(?i)(https?://)[^/@\s]+@", r"\1[REDACTED]@", tail)
     tail = re.sub(
         r"(?i)([?&](?:api[_-]?key|authorization|credential|password|secret|token)=)[^&\s]+",
         r"\1[REDACTED]",
         tail,
     )
-    tail = re.sub(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b", "[REDACTED]", tail)
     tail = "".join(character if character in "\n\t" or character.isprintable() else "�" for character in tail)
-    tail = "\n".join(tail.splitlines()[-LOG_TAIL_MAX_LINES:])
+    lines = tail.splitlines()
+    if len(lines) > LOG_TAIL_MAX_LINES:
+        truncated = True
+        lines = lines[-LOG_TAIL_MAX_LINES:]
+    tail = "\n".join(lines)
     if len(tail) > LOG_TAIL_MAX_CHARACTERS:
-        tail = "[tail truncated]\n" + tail[-LOG_TAIL_MAX_CHARACTERS:]
+        truncated = True
+        tail = tail[-LOG_TAIL_MAX_CHARACTERS:]
+    if truncated:
+        tail = "[tail truncated]\n" + tail
     return tail or "[no output]"
 
 

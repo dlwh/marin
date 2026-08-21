@@ -313,24 +313,30 @@ def test_source_bundle_manifest_rejects_missing_extra_symlink_and_hash_mutations
 
 
 @pytest.mark.parametrize(
-    ("observed_bazel_sha256", "mutate_during_hydration", "fail_hydration", "expected_error"),
+    ("observed_bazel_sha256", "mutate_during_hydration", "hydration_failure", "expected_error"),
     [
         (
             MISMATCHED_BAZEL_SHA256,
             False,
-            False,
+            None,
             f"expected {EXPECTED_BAZEL_SHA256}, observed {MISMATCHED_BAZEL_SHA256}",
         ),
         (
             EXPECTED_BAZEL_SHA256,
             True,
-            False,
+            None,
             "network hydration changed patched JAX or XLA source",
         ),
         (
             EXPECTED_BAZEL_SHA256,
             False,
-            True,
+            "secrets",
+            r"(?s)phase hydrate_bazel_repositories exited with status 23.*final useful failure",
+        ),
+        (
+            EXPECTED_BAZEL_SHA256,
+            False,
+            "long_line",
             r"(?s)phase hydrate_bazel_repositories exited with status 23.*final useful failure",
         ),
     ],
@@ -340,7 +346,7 @@ def test_execute_rejects_bazel_or_hydration_failure_before_offline_build(
     monkeypatch: pytest.MonkeyPatch,
     observed_bazel_sha256: str,
     mutate_during_hydration: bool,
-    fail_hydration: bool,
+    hydration_failure: str | None,
     expected_error: str,
 ) -> None:
     _, _, authorization = _authorization(tmp_path)
@@ -415,22 +421,24 @@ def test_execute_rejects_bazel_or_hydration_failure_before_offline_build(
         if "--bazel_options=--repository_disable_download" in command:
             offline_started = True
             return
-        if command[0].endswith("build/build.py") and fail_hydration:
+        if command[0].endswith("build/build.py") and hydration_failure:
+            failure_output = (
+                (
+                    "print('API_TOKEN=do-not-leak'); "
+                    "print('Authorization: Bearer bearer-secret'); "
+                    "print('AUTHORIZATION=Basic basic-secret'); "
+                    'print(\'{"client_secret":"json-secret"}\'); '
+                    "print('https://user:password@example.invalid/private'); "
+                    "print('final useful failure'); "
+                )
+                if hydration_failure == "secrets"
+                else "sys.stdout.write('z' * 70000 + ' final useful failure'); "
+            )
             real_run(
                 [
                     sys.executable,
                     "-c",
-                    (
-                        "import sys; "
-                        "print('x' * 20000); "
-                        "print('API_TOKEN=do-not-leak'); "
-                        "print('Authorization: Bearer bearer-secret'); "
-                        "print('AUTHORIZATION=Basic basic-secret'); "
-                        'print(\'{"client_secret":"json-secret"}\'); '
-                        "print('https://user:password@example.invalid/private'); "
-                        "sys.stdout.write('z' * 70000 + ' final useful failure'); "
-                        "sys.exit(23)"
-                    ),
+                    ("import sys; " "print('x' * 20000); " f"{failure_output}" "sys.exit(23)"),
                 ],
                 cwd=cwd,
                 log=log,
@@ -481,11 +489,12 @@ def test_execute_rejects_bazel_or_hydration_failure_before_offline_build(
         )
 
     assert not offline_started
-    if fail_hydration:
+    if hydration_failure == "secrets":
         assert "do-not-leak" not in str(raised.value)
         assert "bearer-secret" not in str(raised.value)
         assert "basic-secret" not in str(raised.value)
         assert "json-secret" not in str(raised.value)
         assert "user:password" not in str(raised.value)
         assert "[REDACTED]" in str(raised.value)
+    if hydration_failure:
         assert len(str(raised.value)) <= 9_000
