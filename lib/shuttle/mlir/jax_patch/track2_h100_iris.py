@@ -32,6 +32,7 @@ from track2_h100_batch import (
 )
 
 REQUEST_SCHEMA = "shuttle_track2_h100_iris_request_v1"
+REPRESENTATIVE_REQUEST_SCHEMA = "shuttle_track2_rmsnorm_representative_iris_request_v1"
 RUNNER_REPOSITORY = Path("/app")
 WORKSPACE = Path("/tmp/shuttle-track2-h100")
 SOURCE_MANIFEST_PATH = RUNNER_REPOSITORY / SOURCE_MANIFEST_NAME
@@ -50,6 +51,13 @@ def job_name(run: int) -> str:
     if type(run) is not int or run < 1 or run > MAX_RUN:
         raise ValueError(f"run must be a positive integer no greater than {MAX_RUN}")
     return JobName.root("dlwh", f"shuttle-track2-h100-r{run}").to_wire()
+
+
+def representative_job_name(run: int) -> str:
+    """Return the deterministic representative Shuttle job identity."""
+    if type(run) is not int or run < 1 or run > MAX_RUN:
+        raise ValueError(f"run must be a positive integer no greater than {MAX_RUN}")
+    return JobName.root("dlwh", f"shuttle-track2-rmsnorm-h100-r{run}").to_wire()
 
 
 def _git(repository: Path, *arguments: str) -> str:
@@ -94,11 +102,16 @@ def _source_paths(bundle_root: Path) -> list[Path]:
     if not relatives:
         raise RuntimeError("Track 2 source closure is empty")
     required = {
+        Path("lib/shuttle/mlir/artifacts/track2-te-rmsnorm-r12-success-20260821/policy-raw-v4.json"),
+        Path("lib/shuttle/mlir/artifacts/track2-te-rmsnorm-r12-success-20260821/result-v4.json"),
+        Path("lib/shuttle/mlir/jax_patch/abi22_shuttle_rmsnorm_representative.py"),
         Path("lib/shuttle/mlir/jax_patch/track2_h100_batch.py"),
         Path("lib/shuttle/mlir/jax_patch/abi22_h100_performance.py"),
         Path("lib/shuttle/mlir/jax_patch/abi22_h100_xla_baseline.py"),
         Path("lib/shuttle/mlir/jax_patch/track2_xla_workspace.patch"),
         Path("lib/shuttle/mlir/test/run-h100-performance.sh"),
+        Path("lib/shuttle/mlir/test/run-h100-shuttle-rmsnorm-representative-matrix.sh"),
+        Path("lib/shuttle/mlir/test/run-h100-shuttle-rmsnorm-representative.sh"),
         Path("lib/shuttle/mlir/test/run-h100-xla-baseline.sh"),
     }
     if not required.issubset(relatives):
@@ -169,6 +182,12 @@ def _entrypoint_command() -> list[str]:
     ]
 
 
+def _representative_entrypoint_command() -> list[str]:
+    command = _entrypoint_command()
+    command[-1] = "--execute-representative"
+    return command
+
+
 def build_launch_request(*, bundle_root: Path, run: int) -> controller_pb2.Controller.LaunchJobRequest:
     """Build the one-task, zero-retry request without opening a connection."""
     if bundle_root.is_symlink() or not bundle_root.is_dir():
@@ -199,6 +218,20 @@ def build_launch_request(*, bundle_root: Path, run: int) -> controller_pb2.Contr
     )
     request.timeout.CopyFrom(duration_to_proto(TIMEOUT))
     validate_launch_request(request, run=run)
+    return request
+
+
+def build_representative_launch_request(*, bundle_root: Path, run: int) -> controller_pb2.Controller.LaunchJobRequest:
+    """Build the reviewed representative Shuttle request."""
+    request = build_launch_request(bundle_root=bundle_root, run=run)
+    request.name = representative_job_name(run)
+    request.entrypoint.CopyFrom(
+        build_runtime_entrypoint(
+            Entrypoint.from_command(*_representative_entrypoint_command()),
+            job_pb2.EnvironmentConfig(setup_scripts=[]),
+        )
+    )
+    validate_representative_launch_request(request, run=run)
     return request
 
 
@@ -304,6 +337,28 @@ def validate_launch_request(request: controller_pb2.Controller.LaunchJobRequest,
         raise ValueError("LaunchJobRequest bundle content ID differs")
 
 
+def validate_representative_launch_request(request: controller_pb2.Controller.LaunchJobRequest, *, run: int) -> None:
+    """Validate the representative request by exact normalization to v1."""
+    if request.name != representative_job_name(run):
+        raise ValueError("representative LaunchJobRequest name differs")
+    expected = build_runtime_entrypoint(
+        Entrypoint.from_command(*_representative_entrypoint_command()),
+        job_pb2.EnvironmentConfig(setup_scripts=[]),
+    )
+    if request.entrypoint != expected:
+        raise ValueError("representative LaunchJobRequest entrypoint differs")
+    normalized = type(request)()
+    normalized.CopyFrom(request)
+    normalized.name = job_name(run)
+    normalized.entrypoint.CopyFrom(
+        build_runtime_entrypoint(
+            Entrypoint.from_command(*_entrypoint_command()),
+            job_pb2.EnvironmentConfig(setup_scripts=[]),
+        )
+    )
+    validate_launch_request(normalized, run=run)
+
+
 def decode_launch_request(raw: bytes, *, run: int) -> controller_pb2.Controller.LaunchJobRequest:
     """Decode canonical request bytes and revalidate their complete scope."""
     request = controller_pb2.Controller.LaunchJobRequest()
@@ -314,6 +369,19 @@ def decode_launch_request(raw: bytes, *, run: int) -> controller_pb2.Controller.
     if request.SerializeToString(deterministic=True) != raw:
         raise ValueError("LaunchJobRequest protobuf is not canonical")
     validate_launch_request(request, run=run)
+    return request
+
+
+def decode_representative_launch_request(raw: bytes, *, run: int) -> controller_pb2.Controller.LaunchJobRequest:
+    """Decode and revalidate canonical representative request bytes."""
+    request = controller_pb2.Controller.LaunchJobRequest()
+    try:
+        request.ParseFromString(raw)
+    except DecodeError as error:
+        raise ValueError("LaunchJobRequest protobuf is malformed") from error
+    if request.SerializeToString(deterministic=True) != raw:
+        raise ValueError("LaunchJobRequest protobuf is not canonical")
+    validate_representative_launch_request(request, run=run)
     return request
 
 
@@ -329,6 +397,23 @@ def _summary(raw: bytes, *, run: int) -> dict[str, object]:
         "request_size": len(raw),
         "run": run,
         "schema": REQUEST_SCHEMA,
+        "source_commit": manifest["commit"],
+        "source_tree": manifest["tree"],
+    }
+
+
+def _representative_summary(raw: bytes, *, run: int) -> dict[str, object]:
+    request = decode_representative_launch_request(raw, run=run)
+    manifest = _validated_bundle(request.bundle_blob)
+    return {
+        "bundle_sha256": request.bundle_id,
+        "bundle_size": len(request.bundle_blob),
+        "image": request.task_image,
+        "job_name": request.name,
+        "request_sha256": hashlib.sha256(raw).hexdigest(),
+        "request_size": len(raw),
+        "run": run,
+        "schema": REPRESENTATIVE_REQUEST_SCHEMA,
         "source_commit": manifest["commit"],
         "source_tree": manifest["tree"],
     }
@@ -373,22 +458,30 @@ def _submit(request: controller_pb2.Controller.LaunchJobRequest, *, config: Path
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="action", required=True)
-    render = subparsers.add_parser("render")
-    render.add_argument("--bundle-root", required=True, type=Path)
-    render.add_argument("--run", required=True, type=int)
-    render.add_argument("--output", required=True, type=Path)
-    submit = subparsers.add_parser("submit")
-    submit.add_argument("--request", required=True, type=Path)
-    submit.add_argument("--expected-request-sha256", required=True)
-    submit.add_argument("--run", required=True, type=int)
-    submit.add_argument("--config", required=True, type=Path)
-    submit.add_argument("--receipt", required=True, type=Path)
+    for name in ("render", "render-representative"):
+        render = subparsers.add_parser(name)
+        render.add_argument("--bundle-root", required=True, type=Path)
+        render.add_argument("--run", required=True, type=int)
+        render.add_argument("--output", required=True, type=Path)
+    for name in ("submit", "submit-representative"):
+        submit = subparsers.add_parser(name)
+        submit.add_argument("--request", required=True, type=Path)
+        submit.add_argument("--expected-request-sha256", required=True)
+        submit.add_argument("--run", required=True, type=int)
+        submit.add_argument("--config", required=True, type=Path)
+        submit.add_argument("--receipt", required=True, type=Path)
     arguments = parser.parse_args(argv)
-    if arguments.action == "render":
-        request = build_launch_request(bundle_root=arguments.bundle_root, run=arguments.run)
+    if arguments.action in ("render", "render-representative"):
+        representative = arguments.action == "render-representative"
+        request = (
+            build_representative_launch_request(bundle_root=arguments.bundle_root, run=arguments.run)
+            if representative
+            else build_launch_request(bundle_root=arguments.bundle_root, run=arguments.run)
+        )
         raw = request.SerializeToString(deterministic=True)
         _write_create_only(arguments.output, raw)
-        print(canonical_json(_summary(raw, run=arguments.run)).decode(), end="")
+        summary = _representative_summary(raw, run=arguments.run) if representative else _summary(raw, run=arguments.run)
+        print(canonical_json(summary).decode(), end="")
         return 0
 
     raw = arguments.request.read_bytes()
@@ -397,13 +490,24 @@ def main(argv: list[str] | None = None) -> int:
         arguments.expected_request_sha256
     ):
         raise ValueError("reviewed request SHA-256 differs")
-    request = decode_launch_request(raw, run=arguments.run)
-    request_summary = _summary(raw, run=arguments.run)
+    representative = arguments.action == "submit-representative"
+    request = (
+        decode_representative_launch_request(raw, run=arguments.run)
+        if representative
+        else decode_launch_request(raw, run=arguments.run)
+    )
+    request_summary = (
+        _representative_summary(raw, run=arguments.run) if representative else _summary(raw, run=arguments.run)
+    )
     receipt_descriptor = _reserve_create_only(arguments.receipt)
     pending = {
         "config": str(arguments.config),
         "request": request_summary,
-        "schema": "shuttle_track2_h100_submit_receipt_v1",
+        "schema": (
+            "shuttle_track2_rmsnorm_representative_submit_receipt_v1"
+            if representative
+            else "shuttle_track2_h100_submit_receipt_v1"
+        ),
         "status": "submission_pending",
     }
     _replace_reserved(receipt_descriptor, canonical_json(pending))
@@ -415,7 +519,11 @@ def main(argv: list[str] | None = None) -> int:
             "config": str(arguments.config),
             "job_id": submitted_job,
             "request": request_summary,
-            "schema": "shuttle_track2_h100_submit_receipt_v1",
+            "schema": (
+                "shuttle_track2_rmsnorm_representative_submit_receipt_v1"
+                if representative
+                else "shuttle_track2_h100_submit_receipt_v1"
+            ),
             "status": "submitted",
         }
         _replace_reserved(receipt_descriptor, canonical_json(receipt))
