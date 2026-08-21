@@ -79,10 +79,14 @@ SENSITIVE_LOG_WORDS = frozenset(
         "passphrase",
         "passwd",
         "password",
+        "passwords",
         "pwd",
         "secret",
+        "secrets",
         "session",
+        "sessions",
         "token",
+        "tokens",
     }
 )
 SENSITIVE_LOG_PHRASES = frozenset({("access", "key"), ("api", "key"), ("private", "key")})
@@ -535,7 +539,7 @@ def _redact_log_tokens(value: str) -> str:
 def _is_sensitive_log_key(name: str) -> bool:
     words = [word.lower() for word in LOG_KEY_WORD.findall(name)]
     hits = {word for word in words if word in SENSITIVE_LOG_WORDS}
-    if hits <= {"token"} and any(word in COUNT_LOG_WORDS for word in words):
+    if hits <= {"token", "tokens"} and any(word in COUNT_LOG_WORDS for word in words):
         hits = set()
     return bool(hits) or any(pair in SENSITIVE_LOG_PHRASES for pair in itertools.pairwise(words))
 
