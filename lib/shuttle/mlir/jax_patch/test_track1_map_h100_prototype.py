@@ -67,7 +67,14 @@ def _document() -> dict[str, object]:
                 "url": "https://github.com/bazelbuild/bazel/releases/download/7.7.0/bazel-7.7.0-linux-x86_64",
                 "version": "7.7.0",
             },
-            "cuda_root": "/usr/local/cuda-13.2",
+            "cuda": {
+                "build_distribution": "hermetic",
+                "build_version": "13.0.0",
+                "compute_capabilities": ["9.0"],
+                "hydration_downloads": True,
+                "offline_downloads": False,
+                "physical_tools_root": "/usr/local/cuda-13.2",
+            },
             "python": "3.12",
         },
     }
@@ -99,7 +106,12 @@ def _authorization(tmp_path: Path) -> tuple[Path, str, Authorization]:
         (("sources", "xla", "commit"), "e" * 40),
         (("sources", "xla", "patch_sha256"), list(reversed(XLA_PATCH_SHA256))),
         (("toolchain", "bazel", "sha256"), "f" * 64),
-        (("toolchain", "cuda_root"), "/usr/local/cuda"),
+        (("toolchain", "cuda", "build_distribution"), "local"),
+        (("toolchain", "cuda", "build_version"), "13.2.0"),
+        (("toolchain", "cuda", "compute_capabilities"), ["8.0"]),
+        (("toolchain", "cuda", "hydration_downloads"), False),
+        (("toolchain", "cuda", "offline_downloads"), True),
+        (("toolchain", "cuda", "physical_tools_root"), "/usr/local/cuda"),
         (("toolchain", "python"), "3.13"),
     ],
 )
@@ -186,6 +198,12 @@ def test_dry_run_renders_one_network_hydration_then_offline_build_and_two_worker
     ]
     hydration = phases[3]["argv"]
     offline = phases[4]["argv"]
+    assert "--cuda_version=13.0.0" in hydration
+    assert "--cuda_version=13.0.0" in offline
+    assert "--cuda_compute_capabilities=9.0" in hydration
+    assert "--cuda_compute_capabilities=9.0" in offline
+    assert all("LOCAL_CUDA_PATH" not in argument for argument in hydration)
+    assert all("LOCAL_CUDA_PATH" not in argument for argument in offline)
     assert "--bazel_options=--repository_disable_download" not in hydration
     assert "--bazel_options=--repository_disable_download" in offline
     assert "--disable-pip-version-check" in phases[6]["argv"]

@@ -250,7 +250,6 @@ def test_wheel_command_is_gpu_observable_and_download_disabled(tmp_path: Path) -
         marin_repository=tmp_path / "marin",
         bazel=tmp_path / "bazel",
         bazel_output_root=tmp_path / "bazel-output",
-        cuda_root=tmp_path / "cuda",
         wheel_output=tmp_path / "wheels",
         xla_repository=tmp_path / "xla",
     )
@@ -260,12 +259,13 @@ def test_wheel_command_is_gpu_observable_and_download_disabled(tmp_path: Path) -
         "build",
         "--wheels=jaxlib,jax-cuda-plugin,jax-cuda-pjrt",
     ]
+    assert "--cuda_version=13.0.0" in command
     assert "--cuda_compute_capabilities=9.0" in command
     assert "--python_version=3.12" in command
     assert "--disable_nccl" in command
     assert "--bazel_options=--define=SHUTTLE_TEST_OBSERVER=1" in command
     assert "--bazel_options=--repository_disable_download" in command
-    assert f"--bazel_options=--repo_env=LOCAL_CUDA_PATH={tmp_path / 'cuda'}" in command
+    assert all("LOCAL_CUDA_PATH" not in argument for argument in command)
     assert f"--bazel_options=--override_repository=xla={tmp_path / 'xla'}" in command
     assert f"--bazel_options=--override_repository=shuttle_mlir={tmp_path / 'marin/lib/shuttle/mlir'}" in command
     assert all("http://" not in argument and "https://" not in argument for argument in command)
