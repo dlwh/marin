@@ -51,6 +51,15 @@ XLA_OBSERVED_RUNTIME = {
     "jaxlib_version": "0.10.1",
     "platform_version": "CUDA 13.2.0",
 }
+RUNTIME_LIBRARY_IDENTITIES = {
+    role: {
+        "requested_path": str(path),
+        "resolved_path": str(path),
+        "sha256": hashlib.sha256(role.encode()).hexdigest(),
+        "soname": path.name,
+    }
+    for role, path in RUNTIME_LIBRARY_PATHS.items()
+}
 
 
 def _manifest(root: Path, relative: str, payload: bytes) -> Path:
@@ -484,6 +493,7 @@ def test_execute_batch_drives_validated_oracle_and_writes_closed_result(
                 "library_path": str(paths.te_library),
                 "library_sha256": hashlib.sha256(b"resolved-te-library").hexdigest(),
             },
+            "runtime_libraries": RUNTIME_LIBRARY_IDENTITIES,
         }
 
     monkeypatch.setattr("track2_te_h100_batch.platform.system", lambda: "Linux")
@@ -510,6 +520,7 @@ def test_execute_batch_drives_validated_oracle_and_writes_closed_result(
         "library_path": str(BatchPaths.under(workspace).te_library),
         "library_sha256": hashlib.sha256(b"resolved-te-library").hexdigest(),
     }
+    assert result["tools"]["runtime_libraries"] == RUNTIME_LIBRARY_IDENTITIES
     assert result["evidence"]["acceptance"]["accepted_shape"] == [2048, 4096]
     assert result["evidence"]["shuttle"] == {"status": "pending", "blocker": SHUTTLE_BLOCKER}
     assert len(calls) == 12
