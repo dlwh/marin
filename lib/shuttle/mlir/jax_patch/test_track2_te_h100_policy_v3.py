@@ -4,6 +4,7 @@
 """Worker-level durability contract for RMSNorm role policy v3."""
 
 import contextlib
+import copy
 import hashlib
 import io
 import json
@@ -134,9 +135,12 @@ class Track2TeH100PolicyV3Test(unittest.TestCase):
         plan = batch_plan_v3(workspace=Path("/tmp/v3"), runner_repository=Path("/app"))
         self.assertEqual(plan["schema"], "shuttle_track2_te_h100_batch_plan_v3")
         self.assertEqual(plan["qualification"], {**oracle.NUMERICAL_POLICY_V3, "run_count": 48})
-        self.assertEqual(
-            batch.batch_plan(workspace=Path("/tmp/v2"), runner_repository=Path("/app"))["qualification"]["run_count"], 36
-        )
+        v2_plan = batch.batch_plan(workspace=Path("/tmp/v3"), runner_repository=Path("/app"))
+        self.assertEqual(v2_plan["qualification"]["run_count"], 36)
+        normalized = copy.deepcopy(plan)
+        normalized["schema"] = v2_plan["schema"]
+        normalized["qualification"] = v2_plan["qualification"]
+        self.assertEqual(normalized, v2_plan)
 
         expected = {"schema": "v3-result"}
         stdout = io.StringIO()
