@@ -4051,6 +4051,12 @@ float expandBf16(uint16_t value) {
   return result;
 }
 
+int32_t orderedBf16(uint16_t value) {
+  if (value & UINT16_C(0x8000))
+    return INT32_C(0x8000) - static_cast<int32_t>(value & UINT16_C(0x7fff));
+  return INT32_C(0x8000) + static_cast<int32_t>(value);
+}
+
 std::vector<uint16_t> rmsNormForwardReference(
     llvm::ArrayRef<uint16_t> x, llvm::ArrayRef<uint16_t> weight,
     int64_t rows, int64_t features) {
@@ -4212,6 +4218,12 @@ TEST(GpuTransportV2Test,
     for (auto &host : hostResults) {
       auto device = (*executor)->AllocateArray<uint16_t>(host.size());
       ASSERT_TRUE(device);
+      std::vector<uint16_t> poison(host.size(), UINT16_C(0x7FC1));
+      ASSERT_TRUE((*executor)
+                      ->SynchronousMemcpyH2D(
+                          poison.data(), poison.size() * sizeof(uint16_t),
+                          &device)
+                      .ok());
       deviceResults.push_back(device);
       results.push_back(
           {device.opaque(), static_cast<int64_t>(device.size())});
@@ -4237,10 +4249,15 @@ TEST(GpuTransportV2Test,
     for (auto [resultIndex, actual] : llvm::enumerate(hostResults)) {
       ASSERT_EQ(actual.size(), expected[resultIndex].size());
       for (auto [element, actualBits] : llvm::enumerate(actual)) {
+        EXPECT_NE(actualBits, UINT16_C(0x7FC1));
         float actualValue = expandBf16(actualBits);
-        float expectedValue = expandBf16(expected[resultIndex][element]);
-        float tolerance = std::max(0.015625f, std::abs(expectedValue) * 0.02f);
-        EXPECT_NEAR(actualValue, expectedValue, tolerance)
+        EXPECT_TRUE(std::isfinite(actualValue));
+        uint16_t expectedBits = expected[resultIndex][element];
+        int32_t ulpDistance =
+            std::abs(orderedBf16(actualBits) - orderedBf16(expectedBits));
+        int32_t maximumUlps =
+            policy == mlir::shuttle::NumericalPolicy::SourceOrdered ? 1 : 4;
+        EXPECT_LE(ulpDistance, maximumUlps)
             << "result " << resultIndex << " element " << element;
       }
     }

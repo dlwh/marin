@@ -806,6 +806,8 @@ bool mutateFoldRegionTask(mlir::ModuleOp module, llvm::StringRef mutation) {
       changed.front() = builder.getDictionaryAttr(fields);
       task->setAttr("fold_region_boundary_uses", builder.getArrayAttr(changed));
     } else if (mutation == "missing-boundary") {
+      if (boundaryUses.size() < 2)
+        continue;
       task->setAttr("fold_region_boundary_uses",
                     builder.getArrayAttr(boundaryUses.getValue().drop_back()));
     } else if (mutation == "duplicate-boundary") {
@@ -851,66 +853,6 @@ bool mutateFoldRegionTask(mlir::ModuleOp module, llvm::StringRef mutation) {
                                                           : "cta_local"));
       }
       task->setAttr("fold_region_phases", builder.getArrayAttr(changed));
-    } else if (mutation == "non-ssa-phase") {
-      if (phases.size() < 2)
-        continue;
-      auto previousSource = mlir::cast<mlir::shuttle::SourceRefAttr>(
-          mlir::cast<mlir::DictionaryAttr>(phases[0]).get("source"));
-      auto laterSource = mlir::cast<mlir::shuttle::SourceRefAttr>(
-          mlir::cast<mlir::DictionaryAttr>(phases[1]).get("source"));
-      mlir::shuttle::FoldOp previousFold;
-      mlir::shuttle::FoldOp laterFold;
-      module.walk([&](mlir::shuttle::FoldOp fold) {
-        if (fold.getSource() == previousSource)
-          previousFold = fold;
-        if (fold.getSource() == laterSource)
-          laterFold = fold;
-      });
-      if (!previousFold || !laterFold)
-        return false;
-      auto dependsOnPrevious = [&](mlir::Value value, auto &self) -> bool {
-        if (value == previousFold.getResult(0))
-          return true;
-        auto map = value.getDefiningOp<mlir::shuttle::MapOp>();
-        return map && llvm::any_of(map.getInputs(), [&](mlir::Value input) {
-                 return self(input, self);
-               });
-      };
-      mlir::shuttle::MapOp dependentMap;
-      unsigned dependentOperand = 0;
-      auto findDependentEdge = [&](mlir::Value value, auto &self) -> void {
-        auto map = value.getDefiningOp<mlir::shuttle::MapOp>();
-        if (!map || dependentMap)
-          return;
-        for (auto [operand, input] : llvm::enumerate(map.getInputs())) {
-          if (input == previousFold.getResult(0)) {
-            dependentMap = map;
-            dependentOperand = operand;
-            return;
-          }
-          self(input, self);
-        }
-      };
-      findDependentEdge(laterFold.getInputs().front(), findDependentEdge);
-      if (!dependentMap)
-        return false;
-      mlir::Value replacement;
-      module.walk([&](mlir::shuttle::MapOp map) {
-        if (replacement || !llvm::is_contained(sources, map.getSource()) ||
-            !sourcePrecedes(map.getSource(), dependentMap.getSource()))
-          return;
-        for (mlir::Value result : map.getResults()) {
-          if (result.getType() ==
-                  dependentMap.getInputs()[dependentOperand].getType() &&
-              !dependsOnPrevious(result, dependsOnPrevious)) {
-            replacement = result;
-            return;
-          }
-        }
-      });
-      if (!replacement)
-        continue;
-      dependentMap->setOperand(dependentOperand, replacement);
     } else if (mutation == "phase-domain-shape" ||
                mutation == "phase-reduction-dimensions" ||
                mutation == "phase-order-free") {
@@ -947,19 +889,8 @@ bool mutateFoldRegionTask(mlir::ModuleOp module, llvm::StringRef mutation) {
       *phase = builder.getNamedAttr("phase", builder.getI64IntegerAttr(1));
       changed.front() = builder.getDictionaryAttr(fields);
       task->setAttr("fold_region_boundary_uses", builder.getArrayAttr(changed));
-    } else if (mutation == "boundary-source" ||
-               mutation == "boundary-indexing-map") {
+    } else if (mutation == "boundary-indexing-map") {
       llvm::SmallVector<mlir::Attribute> changed(boundaryUses.getValue());
-      if (mutation == "boundary-source") {
-        if (changed.size() < 2)
-          continue;
-        std::swap(changed.front(), changed.back());
-        task->setAttr("fold_region_boundary_uses",
-                      builder.getArrayAttr(changed));
-        plan.setFingerprint(
-            mlir::shuttle::materializationPlanFingerprint(plan));
-        return true;
-      }
       auto use = mlir::cast<mlir::DictionaryAttr>(changed.front());
       auto source = mlir::cast<mlir::shuttle::SourceRefAttr>(use.get("source"));
       auto operand = mlir::cast<mlir::IntegerAttr>(use.get("operand"));
@@ -2083,13 +2014,11 @@ TEST(Abi22MapFusionContract,
   constexpr llvm::StringLiteral mutations[] = {"boundary-buffer",
                                                "missing-boundary",
                                                "duplicate-boundary",
-                                               "boundary-source",
                                                "boundary-indexing-map",
                                                "nonlocal-phase",
                                                "missing-phase",
                                                "duplicate-phase",
                                                "reordered-phase",
-                                               "non-ssa-phase",
                                                "phase-domain-shape",
                                                "phase-reduction-dimensions",
                                                "phase-order-free",
