@@ -34,10 +34,17 @@ constexpr llvm::StringLiteral kRoundTripSourceOrderedOptions =
     R"json({"execution_mode":"stablehlo_round_trip","numerics":"source_ordered","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
 constexpr llvm::StringLiteral kRoundTripFastOptions =
     R"json({"execution_mode":"stablehlo_round_trip","numerics":"fast","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
-constexpr llvm::StringLiteral kGpuSourceOrderedOptions =
+constexpr llvm::StringLiteral kAbi21GpuSourceOrderedOptions =
     R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
-constexpr llvm::StringLiteral kGpuFastOptions =
+constexpr llvm::StringLiteral kAbi21GpuFastOptions =
     R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+constexpr llvm::StringLiteral kAbi22GpuSourceOrderedOptions =
+    R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+constexpr llvm::StringLiteral kAbi22GpuFastOptions =
+    R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+constexpr std::array<llvm::StringLiteral, 4> kGpuPolicies = {
+    kAbi21GpuSourceOrderedOptions, kAbi21GpuFastOptions,
+    kAbi22GpuSourceOrderedOptions, kAbi22GpuFastOptions};
 
 // Emitted by JAX 0.10.1 from:
 // jax.jit(lambda x: jnp.abs((-x.astype(jnp.float32)).astype(jnp.bfloat16)))
@@ -328,10 +335,8 @@ TEST(TrackOneMapWiringTest,
      BundlesJaxMapIslandsAndLeavesUnsupportedStablehloForXla) {
   constexpr std::array<llvm::StringLiteral, 2> programs = {
       kRankTwoMixedMapProgram, kRankThreeMixedMapProgram};
-  constexpr std::array<llvm::StringLiteral, 2> policies = {
-      kGpuSourceOrderedOptions, kGpuFastOptions};
   for (llvm::StringRef program : programs) {
-    for (llvm::StringRef policy : policies) {
+    for (llvm::StringRef policy : kGpuPolicies) {
       SCOPED_TRACE(policy.str());
       auto observer = std::make_shared<RecordingObserver>();
       auto subscription =
@@ -394,10 +399,8 @@ TEST(TrackOneMapWiringTest,
      BundlesBothValueAndGradientMapIslandsThroughRegisteredFfi) {
   constexpr std::array<llvm::StringLiteral, 2> programs = {
       kRankTwoValueAndGradientProgram, kRankThreeValueAndGradientProgram};
-  constexpr std::array<llvm::StringLiteral, 2> policies = {
-      kGpuSourceOrderedOptions, kGpuFastOptions};
   for (llvm::StringRef program : programs) {
-    for (llvm::StringRef policy : policies) {
+    for (llvm::StringRef policy : kGpuPolicies) {
       SCOPED_TRACE(policy.str());
       auto observer = std::make_shared<RecordingObserver>();
       auto subscription =
@@ -473,7 +476,7 @@ TEST(TrackOneMapWiringTest,
   std::string before = moduleText(*module);
 
   absl::Status status = mlir::shuttle::runShuttleXlaTransform(
-      *module, kGpuSourceOrderedOptions.str());
+      *module, kAbi21GpuSourceOrderedOptions.str());
 
   EXPECT_EQ(status.code(), absl::StatusCode::kInternal);
   EXPECT_EQ(moduleText(*module), before);
@@ -500,7 +503,7 @@ TEST(TrackOneMapWiringTest,
     std::string before = moduleText(*module);
 
     absl::Status status = mlir::shuttle::runShuttleXlaTransform(
-        *module, kGpuSourceOrderedOptions.str());
+        *module, kAbi21GpuSourceOrderedOptions.str());
 
     EXPECT_EQ(status.code(), absl::StatusCode::kInternal);
     EXPECT_EQ(moduleText(*module), before);

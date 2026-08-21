@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import hashlib
+import json
 from pathlib import Path
 
 import jax
@@ -113,6 +114,12 @@ def test_disabled_source_ordered_and_fast_use_three_distinct_compile_inputs() ->
     assert source_ordered["xla_shuttle_enable"] is True
     assert fast["xla_shuttle_enable"] is True
     assert source_ordered["xla_shuttle_options"] != fast["xla_shuttle_options"]
+    for options in (source_ordered, fast):
+        serialized = options["xla_shuttle_options"]
+        assert isinstance(serialized, str)
+        payload = json.loads(serialized)
+        assert payload["pipeline_abi_version"] == 22
+        assert payload["tuning"]["materialization"] == "automatic"
 
 
 def test_observer_contract_attributes_both_map_islands_and_final_erasure() -> None:

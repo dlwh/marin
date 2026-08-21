@@ -381,7 +381,7 @@ index 50111fd..f94b6f7 100644
 +  EXPECT_TRUE(debug_options.xla_shuttle_enable());
 +  EXPECT_EQ(debug_options.xla_shuttle_options(), "{\"numerics\":\"fast\"}");
    EXPECT_THAT(debug_options.xla_gpu_disable_async_collectives(),
-@@ -153,2 +157,42 @@ TEST(ExecuteOptionsTest, ApplyOptionsCanParseStringsAndEnums) {
+@@ -153,2 +157,84 @@ TEST(ExecuteOptionsTest, ApplyOptionsCanParseStringsAndEnums) {
 
 +TEST(CompileOptionsTest, ShuttleEnableAndPoliciesRemainDistinctWhenSerialized) {
 +  CompileOptions disabled;
@@ -415,12 +415,54 @@ index 50111fd..f94b6f7 100644
 +  TF_ASSERT_OK(fast.ApplyAllOptionOverrides());
 +  TF_ASSERT_OK_AND_ASSIGN(CompileOptionsProto fast_proto, fast.ToProto());
 +
++  CompileOptions abi22_source_ordered;
++  abi22_source_ordered.env_option_overrides = {
++      {"xla_shuttle_enable", true},
++      {"xla_shuttle_options",
++       std::string("{\"execution_mode\":\"gpu_executable_bundle\","
++                   "\"numerics\":\"source_ordered\","
++                   "\"pipeline_abi_version\":22,\"schema_version\":1,"
++                   "\"tuning\":{\"cluster_shape\":[],\"materialization\":"
++                   "\"automatic\",\"maximum_candidates\":1,"
++                   "\"pipeline_stages\":1,\"tile_sizes\":[]}}")}};
++  TF_ASSERT_OK(abi22_source_ordered.ApplyAllOptionOverrides());
++  TF_ASSERT_OK_AND_ASSIGN(CompileOptionsProto abi22_source_ordered_proto,
++                          abi22_source_ordered.ToProto());
++
++  CompileOptions abi22_fast;
++  abi22_fast.env_option_overrides = {
++      {"xla_shuttle_enable", true},
++      {"xla_shuttle_options",
++       std::string("{\"execution_mode\":\"gpu_executable_bundle\","
++                   "\"numerics\":\"fast\",\"pipeline_abi_version\":22,"
++                   "\"schema_version\":1,\"tuning\":{\"cluster_shape\":[],"
++                   "\"materialization\":\"automatic\","
++                   "\"maximum_candidates\":1,\"pipeline_stages\":1,"
++                   "\"tile_sizes\":[]}}")}};
++  TF_ASSERT_OK(abi22_fast.ApplyAllOptionOverrides());
++  TF_ASSERT_OK_AND_ASSIGN(CompileOptionsProto abi22_fast_proto,
++                          abi22_fast.ToProto());
++
 +  EXPECT_NE(disabled_proto.SerializeAsString(),
 +            source_ordered_proto.SerializeAsString());
 +  EXPECT_NE(disabled_proto.SerializeAsString(),
 +            fast_proto.SerializeAsString());
++  EXPECT_NE(disabled_proto.SerializeAsString(),
++            abi22_source_ordered_proto.SerializeAsString());
++  EXPECT_NE(disabled_proto.SerializeAsString(),
++            abi22_fast_proto.SerializeAsString());
 +  EXPECT_NE(source_ordered_proto.SerializeAsString(),
 +            fast_proto.SerializeAsString());
++  EXPECT_NE(abi22_source_ordered_proto.SerializeAsString(),
++            abi22_fast_proto.SerializeAsString());
++  EXPECT_NE(source_ordered_proto.SerializeAsString(),
++            abi22_source_ordered_proto.SerializeAsString());
++  EXPECT_NE(source_ordered_proto.SerializeAsString(),
++            abi22_fast_proto.SerializeAsString());
++  EXPECT_NE(fast_proto.SerializeAsString(),
++            abi22_source_ordered_proto.SerializeAsString());
++  EXPECT_NE(fast_proto.SerializeAsString(),
++            abi22_fast_proto.SerializeAsString());
 +}
 +
  TEST(CompiledMemoryStatsTest, Serialization) {
