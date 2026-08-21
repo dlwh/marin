@@ -143,17 +143,17 @@ def _expected_authorization(source_manifest_sha256: str) -> dict[str, object]:
     }
 
 
-def load_authorization(path: Path, expected_sha256: str) -> Authorization:
-    """Load the one exact canonical authorization accepted by this prototype."""
-    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
-        raise ValueError("authorization SHA-256 must use 64 lowercase hexadecimal characters")
+def load_authorization(path: Path, approved_sha256: str) -> Authorization:
+    """Load an authorization bound to a separately approved SHA-256."""
+    if not re.fullmatch(r"[0-9a-f]{64}", approved_sha256):
+        raise ValueError("approved authorization SHA-256 must use 64 lowercase hexadecimal characters")
     if path.is_symlink() or not path.is_file():
         raise ValueError("authorization must be one regular file")
     raw = path.read_bytes()
     if len(raw) > MAX_AUTHORIZATION_BYTES:
         raise ValueError("authorization exceeds the prototype size limit")
-    if _sha256_bytes(raw) != expected_sha256:
-        raise ValueError("authorization SHA-256 differs from the CLI binding")
+    if _sha256_bytes(raw) != approved_sha256:
+        raise ValueError("authorization SHA-256 differs from the external approval binding")
     try:
         document = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -168,7 +168,7 @@ def load_authorization(path: Path, expected_sha256: str) -> Authorization:
         raise ValueError("authorization source manifest SHA-256 is invalid")
     if document != _expected_authorization(source_manifest_sha256):
         raise ValueError("authorization differs from the closed prototype scope")
-    return Authorization(document=document, sha256=expected_sha256)
+    return Authorization(document=document, sha256=approved_sha256)
 
 
 def _build_commands(paths: PrototypePaths, runner_repository: Path) -> tuple[list[str], list[str]]:

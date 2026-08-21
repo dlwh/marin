@@ -44,15 +44,18 @@ through the plugin's real PJRT registration entry point using a fake extension;
 it does not load kernels or launch GPU work.
 
 The Track 1 single-job prototype is authorized by the canonical
-`scripts/shuttle/track1_map_h100_prototype_authorization.json` document. Compute
-its SHA-256 before launching. The launcher remains fail-closed without that file
-and its exact digest. Render the network hydration, offline build, isolated
-wheel install, and two worker commands without executing them:
+`scripts/shuttle/track1_map_h100_prototype_authorization.json` document. The
+reviewed Iris job authorization must supply that document's approved SHA-256 as
+an independent literal; the job must not compute it from the candidate file.
+This external binding avoids a circular trust chain because the authorization
+hashes the source manifest and the manifest hashes the launcher. The launcher
+remains fail-closed without both inputs. Render the network hydration, offline
+build, isolated wheel install, and two worker commands without executing them:
 
 ```bash
 python -B lib/shuttle/mlir/jax_patch/track1_map_h100_launcher.py \
   --authorization-file scripts/shuttle/track1_map_h100_prototype_authorization.json \
-  --authorization-sha256 SOURCE_AUTHORIZATION_SHA256 \
+  --approved-authorization-sha256 IRIS_JOB_APPROVED_AUTHORIZATION_SHA256 \
   --workspace /tmp/shuttle-track1-prototype \
   --runner-repository /app \
   --python /opt/h100-evidence-runtime/bin/python \

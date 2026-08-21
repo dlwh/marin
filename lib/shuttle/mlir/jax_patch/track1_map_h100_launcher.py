@@ -18,7 +18,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--require-launch-ready", action="store_true")
     parser.add_argument("--authorization-file", type=Path)
-    parser.add_argument("--authorization-sha256")
+    parser.add_argument("--approved-authorization-sha256")
     parser.add_argument("--workspace", type=Path)
     parser.add_argument("--runner-repository", type=Path)
     parser.add_argument("--python", type=Path)
@@ -31,7 +31,7 @@ def main(argv: list[str] | None = None) -> int:
     if arguments.require_launch_ready or arguments.authorization_file is None:
         require_launch_ready()
     required = {
-        "authorization SHA-256": arguments.authorization_sha256,
+        "approved authorization SHA-256": arguments.approved_authorization_sha256,
         "workspace": arguments.workspace,
         "runner repository": arguments.runner_repository,
         "Python": arguments.python,
@@ -42,7 +42,7 @@ def main(argv: list[str] | None = None) -> int:
     if missing or not (arguments.dry_run or arguments.execute):
         parser.error(f"authorization-bound launch is incomplete: {', '.join(missing)}")
 
-    authorization = load_authorization(arguments.authorization_file, arguments.authorization_sha256)
+    authorization = load_authorization(arguments.authorization_file, arguments.approved_authorization_sha256)
     keywords = {
         "workspace": arguments.workspace,
         "runner_repository": arguments.runner_repository,
