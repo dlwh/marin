@@ -4787,6 +4787,7 @@ TEST(Abi22MapFusionContract,
       std::optional<PlanSummary> planSummary = summary(*built->module);
       ASSERT_TRUE(planSummary);
       EXPECT_TRUE(planSummary->hasContractRegion);
+      EXPECT_EQ(planSummary->hasFoldRegion, boundary.columns == 257);
       EXPECT_TRUE(planSummary->exactSourceCoverage);
       EXPECT_EQ(planSummary->maps, 19);
       EXPECT_EQ(planSummary->folds, 1);
@@ -5077,8 +5078,14 @@ TEST(Abi22MapFusionContract,
           "contract_region_sources");
       ASSERT_TRUE(sources);
       llvm::SmallVector<int64_t> expectedPrimalSources;
-      for (int64_t ordinal = 0; ordinal <= 24; ++ordinal)
-        expectedPrimalSources.push_back(ordinal);
+      if (boundary.columns == 7) {
+        for (int64_t ordinal = 0; ordinal <= 24; ++ordinal)
+          expectedPrimalSources.push_back(ordinal);
+      } else {
+        expectedPrimalSources.push_back(0);
+        for (int64_t ordinal = 12; ordinal <= 24; ++ordinal)
+          expectedPrimalSources.push_back(ordinal);
+      }
       EXPECT_EQ(sourceOperationOrdinals(sources), expectedPrimalSources);
       auto foldSource =
           specializedTask->getAttrOfType<mlir::shuttle::SourceRefAttr>(
