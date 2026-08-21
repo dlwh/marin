@@ -5220,6 +5220,9 @@ FailureOr<DerivedPlan> deriveSharedStatFoldRegionPlan(RegionOp region) {
   for (auto *set : sourceSets)
     for (Operation *operation : *set)
       ++sourceOccurrences[operation];
+  for (auto [operation, occurrences] : sourceOccurrences)
+    if (occurrences > 1 && !isa<MapOp>(operation))
+      return failure();
   for (auto [taskOrdinal, sources] : llvm::enumerate(orderedSources)) {
     PlannedTask task;
     task.foldRegionSources = sources;
@@ -8419,6 +8422,11 @@ FailureOr<std::string> emitFoldRegionPtx(
                                           materializationTask.getContext()),
         coordinates);
   };
+  SmallVector<int64_t> phaseResultRegisters;
+  for (size_t phase = 0; phase < phases.size(); ++phase)
+    phaseResultRegisters.push_back(ptx.nextF32());
+  const int64_t phaseScratchBase = ptx.f32;
+  int64_t f32RegisterHighWater = ptx.f32;
   int64_t accumulator = ptx.nextF32();
   ptx.stream << "  mov.u32 %r0, %tid.x;\n"
                 "  mov.u32 %r1, %ctaid.x;\n"
@@ -8503,9 +8511,11 @@ FailureOr<std::string> emitFoldRegionPtx(
     }
     ptx.stream << "  bar.sync 0;\n";
   }
-  int64_t primaryValue = ptx.nextF32();
+  int64_t primaryValue = phaseResultRegisters.front();
   ptx.stream << "  ld.shared.f32 %f" << primaryValue << ", [%rd3];\n";
   context.foldValues[primary] = primaryValue;
+  f32RegisterHighWater = std::max(f32RegisterHighWater, ptx.f32);
+  ptx.f32 = phaseScratchBase;
 
   for (auto indexedFold :
        llvm::enumerate(ArrayRef<FoldOp>(phases).drop_front())) {
@@ -8609,9 +8619,11 @@ FailureOr<std::string> emitFoldRegionPtx(
         }
         ptx.stream << "  bar.sync 0;\n";
       }
-      int64_t phaseValue = ptx.nextF32();
+      int64_t phaseValue = phaseResultRegisters[phase];
       ptx.stream << "  ld.shared.f32 %f" << phaseValue << ", [%rd3];\n";
       context.foldValues[fold] = phaseValue;
+      f32RegisterHighWater = std::max(f32RegisterHighWater, ptx.f32);
+      ptx.f32 = phaseScratchBase;
       continue;
     }
     ptx.stream << "  cvt.u64.u32 %rd0, %r1;\n";
@@ -8627,12 +8639,18 @@ FailureOr<std::string> emitFoldRegionPtx(
     int64_t combined = ptx.nextF32();
     ptx.stream << "  mov.f32 %f" << initializer
                << ", 0f00000000;\n  add.rn.f32 %f" << combined << ", %f"
-               << initializer << ", %f" << *value << ";\n";
-    context.foldValues[fold] = combined;
+               << initializer << ", %f" << *value << ";\n  mov.f32 %f"
+               << phaseResultRegisters[phaseOrdinal + 1] << ", %f" << combined
+               << ";\n";
+    context.foldValues[fold] = phaseResultRegisters[phaseOrdinal + 1];
+    f32RegisterHighWater = std::max(f32RegisterHighWater, ptx.f32);
+    ptx.f32 = phaseScratchBase;
   }
 
+  const int64_t epilogueF32Base = phaseScratchBase;
   for (auto [outputOrdinal, outputOperation, outputBuffer] : llvm::enumerate(
            outputOperations, materializationTask.getOutputBuffers())) {
+    ptx.f32 = epilogueF32Base;
     if (outputBuffer < 0 || outputBuffer >= buffers.size())
       return failure();
     auto output = cast<RankedTensorType>(buffers[outputBuffer].getTensorType());
@@ -8658,6 +8676,7 @@ FailureOr<std::string> emitFoldRegionPtx(
                     "  st.global.f32 [%rd6], %f"
                  << value->second << ";\n$fold_region_output_" << outputOrdinal
                  << "_done:\n";
+      f32RegisterHighWater = std::max(f32RegisterHighWater, ptx.f32);
       continue;
     }
     auto outputMap = dyn_cast<MapOp>(outputOperation);
@@ -8705,10 +8724,10 @@ FailureOr<std::string> emitFoldRegionPtx(
                << ";\n  bra $fold_region_output_" << outputOrdinal
                << "_epilogue;\n$fold_region_output_" << outputOrdinal
                << "_done:\n";
+    f32RegisterHighWater = std::max(f32RegisterHighWater, ptx.f32);
   }
-  const int64_t maximumF32Registers =
-      outputOperations.size() > 1 ? 256 : 128;
-  if (ptx.f32 > maximumF32Registers || ptx.u64 > 128 || ptx.bf16 > 16)
+  ptx.f32 = f32RegisterHighWater;
+  if (ptx.f32 > 128 || ptx.u64 > 128 || ptx.bf16 > 16)
     return failure();
   ptx.finish();
   return ptx.text;

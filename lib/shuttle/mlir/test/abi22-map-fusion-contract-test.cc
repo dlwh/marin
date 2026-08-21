@@ -846,7 +846,8 @@ std::unique_ptr<BuiltModule> build(llvm::StringRef source,
 }
 
 std::unique_ptr<BuiltModule>
-buildAlgebra(llvm::StringRef source, mlir::shuttle::NumericalPolicy policy) {
+buildAlgebra(llvm::StringRef source, mlir::shuttle::NumericalPolicy policy,
+             bool executable = true) {
   mlir::DialectRegistry registry;
   registry.insert<mlir::arith::ArithDialect, mlir::func::FuncDialect,
                   mlir::math::MathDialect, mlir::shuttle::ShuttleDialect>();
@@ -861,10 +862,12 @@ buildAlgebra(llvm::StringRef source, mlir::shuttle::NumericalPolicy policy) {
   mlir::PassManager manager(result->context.get());
   manager.addPass(mlir::shuttle::createPlanRowFoldMaterializationPass());
   manager.addPass(mlir::shuttle::createVerifyMaterializationPlanPass());
-  manager.addPass(mlir::shuttle::createPlanSimt32RowFoldSchedulePass());
-  manager.addPass(mlir::shuttle::createVerifySimt32RowFoldSchedulePass());
-  manager.addPass(mlir::shuttle::createBuildGpuExecutableBundlePass());
-  manager.addPass(mlir::shuttle::createVerifyGpuExecutableBundlePass());
+  if (executable) {
+    manager.addPass(mlir::shuttle::createPlanSimt32RowFoldSchedulePass());
+    manager.addPass(mlir::shuttle::createVerifySimt32RowFoldSchedulePass());
+    manager.addPass(mlir::shuttle::createBuildGpuExecutableBundlePass());
+    manager.addPass(mlir::shuttle::createVerifyGpuExecutableBundlePass());
+  }
   if (mlir::failed(manager.run(*result->module)))
     return {};
   return result;
@@ -1953,6 +1956,46 @@ TEST(Abi22MapFusionContract,
   }
 }
 
+constexpr llvm::StringLiteral kFusedMapAlgebra = R"mlir(
+#matrix = affine_map<(d0, d1) -> (d0, d1)>
+#row = affine_map<(d0, d1) -> (d0)>
+#feature = affine_map<(d0, d1) -> (d1)>
+#scalar = affine_map<() -> ()>
+module attributes {
+  shuttle.coverage_manifest = {
+    canonical_tuning = "{\22cluster_shape\22:[],\22materialization\22:\22prefer_fusion\22,\22maximum_candidates\22:1,\22pipeline_stages\22:1,\22tile_sizes\22:[]}"
+  }
+} {
+  func.func @anonymous(%input: tensor<2x4xf32>, %row_input: tensor<2xf32>, %feature_input: tensor<4xf32>, %fold_input: tensor<2x4xf32>) -> (tensor<2x4xf32>, tensor<2xf32>) {
+    %result:2 = "shuttle.region"(%input, %row_input, %feature_input, %fold_input) ({
+    ^bb0(%region_input: tensor<2x4xf32>, %region_row: tensor<2xf32>, %region_feature: tensor<4xf32>, %region_fold_input: tensor<2x4xf32>):
+      %added = "shuttle.map"(%region_input, %region_row) ({
+      ^bb0(%element: f32, %row: f32):
+        %value = arith.addf %element, %row : f32
+        "shuttle.yield"(%value) : (f32) -> ()
+      }) {indexing_maps = [#matrix, #row, #matrix], source = #shuttle.source_ref<0, 0, 0, 0>} : (tensor<2x4xf32>, tensor<2xf32>) -> tensor<2x4xf32>
+      %multiplied = "shuttle.map"(%added, %region_feature) ({
+      ^bb0(%element: f32, %feature: f32):
+        %value = arith.mulf %element, %feature : f32
+        "shuttle.yield"(%value) : (f32) -> ()
+      }) {indexing_maps = [#matrix, #feature, #matrix], source = #shuttle.source_ref<0, 0, 0, 1>} : (tensor<2x4xf32>, tensor<4xf32>) -> tensor<2x4xf32>
+      %init = "shuttle.map"() ({
+      ^bb0:
+        %zero = arith.constant 0.000000e+00 : f32
+        "shuttle.yield"(%zero) : (f32) -> ()
+      }) {indexing_maps = [#scalar], source = #shuttle.source_ref<0, 0, 0, 2>} : () -> tensor<f32>
+      %folded = "shuttle.fold"(%region_fold_input, %init) ({
+      ^bb0(%element: f32, %accumulator: f32):
+        %sum = arith.addf %element, %accumulator : f32
+        "shuttle.yield"(%sum) : (f32) -> ()
+      }) {accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 3>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
+      "shuttle.yield"(%multiplied, %folded) : (tensor<2x4xf32>, tensor<2xf32>) -> ()
+    }) {policy = #shuttle.policy<source_ordered>, source_refs = [#shuttle.source_ref<0, 0, 0, 0>, #shuttle.source_ref<0, 0, 0, 1>, #shuttle.source_ref<0, 0, 0, 2>, #shuttle.source_ref<0, 0, 0, 3>]} : (tensor<2x4xf32>, tensor<2xf32>, tensor<4xf32>, tensor<2x4xf32>) -> (tensor<2x4xf32>, tensor<2xf32>)
+    return %result#0, %result#1 : tensor<2x4xf32>, tensor<2xf32>
+  }
+}
+)mlir";
+
 constexpr llvm::StringLiteral kFoldEpilogueAlgebra = R"mlir(
 #fold_input = affine_map<(d0, d1) -> (d0, d1)>
 #fold_result = affine_map<(d0, d1) -> (d0)>
@@ -1996,25 +2039,22 @@ module attributes {
 
 TEST(Abi22MapFusionContract,
      RejectsCorruptOrderedProvenanceAndComposedInputMaps) {
-  std::optional<std::string> mapSource =
-      fixtureSource("abi22-map-fusion-source-order.mlir");
-  ASSERT_TRUE(mapSource);
   constexpr llvm::StringLiteral mutations[] = {
       "duplicate-source", "reordered-source", "stale-source", "missing-map",
       "reordered-map"};
   for (llvm::StringRef mutation : mutations) {
     for (bool foldEpilogue : {false, true}) {
-      if (!foldEpilogue && mutation == "reordered-map")
-        continue;
       SCOPED_TRACE(
           (llvm::Twine(foldEpilogue ? "Fold epilogue " : "Map ") + mutation)
               .str());
       std::unique_ptr<BuiltModule> built =
           foldEpilogue
               ? buildAlgebra(kFoldEpilogueAlgebra,
-                             mlir::shuttle::NumericalPolicy::SourceOrdered)
-              : buildAlgebra(*mapSource,
-                             mlir::shuttle::NumericalPolicy::SourceOrdered);
+                             mlir::shuttle::NumericalPolicy::SourceOrdered,
+                             false)
+              : buildAlgebra(kFusedMapAlgebra,
+                             mlir::shuttle::NumericalPolicy::SourceOrdered,
+                             false);
       ASSERT_TRUE(built);
       ASSERT_TRUE(foldEpilogue
                       ? mutateFoldEpilogueTask(*built->module, mutation)
@@ -3614,11 +3654,26 @@ bool mutateGenericSharedStatPartition(mlir::ModuleOp module,
     std::swap(outputs[0], outputs[1]);
     tasks.back()->setAttr("output_buffers",
                           builder.getDenseI64ArrayAttr(outputs));
-  } else if (mutation == "duplicate-stat-producer") {
-    llvm::SmallVector<int64_t> outputs(tasks.back().getOutputBuffers());
-    outputs.push_back(2);
-    tasks.back()->setAttr("output_buffers",
-                          builder.getDenseI64ArrayAttr(outputs));
+  } else if (mutation == "stat-producer") {
+    buffers[2]->setAttr("producer", builder.getI64IntegerAttr(1));
+  } else if (mutation == "remove-output-source" ||
+             mutation == "duplicate-output-source" ||
+             mutation == "swap-output-sources") {
+    auto outputs = tasks.back()->getAttrOfType<mlir::ArrayAttr>(
+        "fold_region_output_sources");
+    llvm::SmallVector<mlir::Attribute> changed;
+    if (outputs)
+      llvm::append_range(changed, outputs.getValue());
+    if (changed.size() < 2)
+      return false;
+    if (mutation == "remove-output-source")
+      changed.pop_back();
+    else if (mutation == "duplicate-output-source")
+      changed[1] = changed[0];
+    else
+      std::swap(changed[0], changed[1]);
+    tasks.back()->setAttr("fold_region_output_sources",
+                          builder.getArrayAttr(changed));
   } else if (mutation == "stat-storage") {
     buffers[2]->setAttr("storage",
                         mlir::shuttle::MaterializationStorageAttr::get(
@@ -3629,6 +3684,61 @@ bool mutateGenericSharedStatPartition(mlir::ModuleOp module,
   }
   plan.setFingerprint(mlir::shuttle::materializationPlanFingerprint(plan));
   return true;
+}
+
+bool hasExactMultiOutputStoreDataflow(llvm::StringRef ptx,
+                                      int64_t inputCount,
+                                      llvm::ArrayRef<bool> outputBf16) {
+  PtxDataflow flow = ptxDataflow(ptx);
+  if (flow.stores.size() != outputBf16.size())
+    return false;
+  for (auto [outputOrdinal, store, bf16] :
+       llvm::enumerate(flow.stores, outputBf16)) {
+    std::set<std::string> pointer =
+        ptxDependencyClosure(flow, store.pointer);
+    const std::string parameter =
+        (llvm::Twine("p") + llvm::Twine(inputCount + outputOrdinal)).str();
+    if (store.bf16 != bf16 || !pointer.count(parameter) ||
+        !pointer.count("$op:mad.lo.u64"))
+      return false;
+    for (int64_t other = 0;
+         other < static_cast<int64_t>(outputBf16.size()); ++other) {
+      const std::string otherParameter =
+          (llvm::Twine("p") + llvm::Twine(inputCount + other)).str();
+      if (other != static_cast<int64_t>(outputOrdinal) &&
+          pointer.count(otherParameter))
+        return false;
+    }
+    std::set<std::string> value = ptxDependencyClosure(flow, store.value);
+    if (!value.count("$shared") && !value.count("$ld.global.f32") &&
+        !value.count("$ld.global.u16"))
+      return false;
+  }
+  return true;
+}
+
+std::string misrouteFirstPtxOutput(llvm::StringRef ptx, int64_t inputCount) {
+  std::string result = ptx.str();
+  const std::string correct =
+      (llvm::Twine("[p") + llvm::Twine(inputCount) + "]").str();
+  const std::string wrong =
+      (llvm::Twine("[p") + llvm::Twine(inputCount + 1) + "]").str();
+  size_t position = result.find(correct);
+  if (position != std::string::npos)
+    result.replace(position, correct.size(), wrong);
+  return result;
+}
+
+std::string zeroFirstPtxOutputValue(llvm::StringRef ptx) {
+  std::string result = ptx.str();
+  size_t store = result.find("st.global.");
+  size_t comma = store == std::string::npos ? std::string::npos
+                                            : result.find(", ", store);
+  size_t end = comma == std::string::npos ? std::string::npos
+                                          : result.find(';', comma);
+  if (end != std::string::npos)
+    result.replace(comma + 2, end - comma - 2, "0f00000000");
+  return result;
 }
 
 TEST(Abi22MapFusionContract,
@@ -3766,8 +3876,9 @@ module attributes {
 
       for (llvm::StringRef mutation :
            {"source-order", "drop-stat-input", "swap-stat-bindings",
-            "swap-public-outputs", "duplicate-stat-producer",
-            "stat-storage"}) {
+            "swap-public-outputs", "stat-producer", "stat-storage",
+            "remove-output-source", "duplicate-output-source",
+            "swap-output-sources"}) {
         SCOPED_TRACE(mutation.str());
         std::unique_ptr<BuiltModule> changed =
             buildAlgebra(shapeSource, policy);
@@ -3780,6 +3891,38 @@ module attributes {
       }
     }
   }
+
+  std::string sharedFoldSource = replaceAllText(
+      source.str(),
+      "      %independent = \"shuttle.fold\"(%region_dy, %independent_init)",
+      "      %shared_fold_input = \"shuttle.map\"(%region_dy, %mean_sum) "
+      "({\n"
+      "      ^bb0(%element: f32, %row_sum: f32):\n"
+      "        %value = arith.addf %element, %row_sum : f32\n"
+      "        \"shuttle.yield\"(%value) : (f32) -> ()\n"
+      "      }) {indexing_maps = [#matrix, #row, #matrix], source = "
+      "#shuttle.source_ref<0, 0, 16, 0>} : (tensor<2x4xf32>, "
+      "tensor<2xf32>) -> tensor<2x4xf32>\n"
+      "      %independent = \"shuttle.fold\"(%shared_fold_input, "
+      "%independent_init)");
+  sharedFoldSource = replaceAllText(
+      sharedFoldSource,
+      "reduction_dimensions = array<i64: 0>, source = "
+      "#shuttle.source_ref<0, 0, 16, 0>} : (tensor<2x4xf32>, "
+      "tensor<f32>) -> tensor<4xf32>\n      \"shuttle.yield\"",
+      "reduction_dimensions = array<i64: 0>, source = "
+      "#shuttle.source_ref<0, 0, 17, 0>} : (tensor<2x4xf32>, "
+      "tensor<f32>) -> tensor<4xf32>\n      \"shuttle.yield\"");
+  sharedFoldSource = replaceAllText(
+      sharedFoldSource,
+      "#shuttle.source_ref<0, 0, 15, 0>, #shuttle.source_ref<0, 0, 16, "
+      "0>]}",
+      "#shuttle.source_ref<0, 0, 15, 0>, #shuttle.source_ref<0, 0, 16, "
+      "0>, #shuttle.source_ref<0, 0, 17, 0>]}");
+  std::unique_ptr<BuiltModule> sharedFold = buildAlgebra(
+      sharedFoldSource, mlir::shuttle::NumericalPolicy::SourceOrdered, false);
+  ASSERT_TRUE(sharedFold);
+  EXPECT_FALSE(hasGenericSharedStatPartition(*sharedFold->module, 2, 4));
 }
 
 TEST(Abi22MapFusionContract,
@@ -3823,6 +3966,76 @@ TEST(Abi22MapFusionContract,
       ASSERT_TRUE(executable.ok()) << executable.status();
       EXPECT_EQ((*executable)->launches().size(), 2u);
       EXPECT_EQ((*executable)->slots().size(), fixture.composed ? 10u : 8u);
+      const int64_t inputCount = fixture.composed ? 4 : 3;
+      const int64_t matrixBytes = fixture.rows * fixture.features * 2;
+      const int64_t featureBytes = fixture.features * 2;
+      const llvm::SmallVector<int64_t> expectedBindingSlots =
+          fixture.composed
+              ? llvm::SmallVector<int64_t>{0, 1, 2, 3, 6, 7, 8, 9}
+              : llvm::SmallVector<int64_t>{0, 1, 2, 5, 6, 7};
+      const llvm::SmallVector<int64_t> expectedBindingBytes =
+          fixture.composed
+              ? llvm::SmallVector<int64_t>{matrixBytes, featureBytes,
+                                           featureBytes, matrixBytes,
+                                           matrixBytes, featureBytes,
+                                           featureBytes, matrixBytes}
+              : llvm::SmallVector<int64_t>{matrixBytes, featureBytes,
+                                           matrixBytes, featureBytes,
+                                           featureBytes, matrixBytes};
+      ASSERT_EQ((*executable)->externalBindings().size(),
+                expectedBindingSlots.size());
+      for (auto [ordinal, binding, slot, bytes] : llvm::enumerate(
+               (*executable)->externalBindings(), expectedBindingSlots,
+               expectedBindingBytes)) {
+        const bool operand =
+            static_cast<int64_t>(ordinal) < inputCount;
+        EXPECT_EQ(binding.kind,
+                  operand ? mlir::shuttle::ExecutableBindingKind::Operand
+                          : mlir::shuttle::ExecutableBindingKind::Result);
+        EXPECT_EQ(binding.index,
+                  operand ? static_cast<int64_t>(ordinal)
+                          : static_cast<int64_t>(ordinal) - inputCount);
+        EXPECT_EQ(binding.slotOrdinal, slot);
+        EXPECT_EQ(binding.requiredBytes, bytes);
+        EXPECT_EQ(binding.alignment, 2);
+        auto type = mlir::dyn_cast<mlir::RankedTensorType>(binding.tensorType);
+        ASSERT_TRUE(type);
+        EXPECT_TRUE(type.getElementType().isBF16());
+      }
+      const llvm::SmallVector<int64_t> expectedRowOutputs =
+          fixture.composed ? llvm::SmallVector<int64_t>{4, 5, 6, 9}
+                           : llvm::SmallVector<int64_t>{3, 4, 7};
+      const llvm::SmallVector<int64_t> expectedFeatureOutputs =
+          fixture.composed ? llvm::SmallVector<int64_t>{7, 8}
+                           : llvm::SmallVector<int64_t>{5, 6};
+      const auto &launches = (*executable)->launches();
+      ASSERT_EQ(launches.size(), 2u);
+      EXPECT_EQ(launches[0].outputSlots,
+                std::vector<int64_t>(expectedRowOutputs.begin(),
+                                     expectedRowOutputs.end()));
+      EXPECT_EQ(launches[1].outputSlots,
+                std::vector<int64_t>(expectedFeatureOutputs.begin(),
+                                     expectedFeatureOutputs.end()));
+      for (const mlir::shuttle::GpuLaunch &launch : launches) {
+        llvm::SmallVector<bool> outputBf16;
+        for (int64_t slot : launch.outputSlots) {
+          auto type = mlir::cast<mlir::RankedTensorType>(
+              (*executable)->slots()[slot].tensorType);
+          outputBf16.push_back(type.getElementType().isBF16());
+        }
+        llvm::StringRef ptx(
+            reinterpret_cast<const char *>(
+                (*executable)->codeBytes().data() + launch.codeOffset),
+            launch.codeLength);
+        ASSERT_TRUE(hasExactMultiOutputStoreDataflow(
+            ptx, launch.inputSlots.size(), outputBf16));
+        EXPECT_FALSE(hasExactMultiOutputStoreDataflow(
+            misrouteFirstPtxOutput(ptx, launch.inputSlots.size()),
+            launch.inputSlots.size(), outputBf16));
+        EXPECT_FALSE(hasExactMultiOutputStoreDataflow(
+            zeroFirstPtxOutputValue(ptx), launch.inputSlots.size(),
+            outputBf16));
+      }
       int64_t temporarySlots = 0;
       int64_t temporaryBytes = 0;
       for (const mlir::shuttle::GpuSlot &slot : (*executable)->slots()) {
