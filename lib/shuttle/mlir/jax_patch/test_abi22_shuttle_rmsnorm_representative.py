@@ -306,7 +306,7 @@ def _fake_runner(
         "resources": copy.deepcopy(EXPECTED_RESOURCES[boundary]),
         "transport": {
             "contract_operation_count": 0,
-            "code_bytes": 4096 + coordinate_number,
+            "code_bytes": 4096 + POLICIES.index(policy) * len(BOUNDARIES) + BOUNDARIES.index(boundary),
             "executable_digest": _sha(f"executable/{policy}/{boundary}"),
             "module_load_digest": _sha(f"module/{policy}/{boundary}"),
             "ptx_digests": [
