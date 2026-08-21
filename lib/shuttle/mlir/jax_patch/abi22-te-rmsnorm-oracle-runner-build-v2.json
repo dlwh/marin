@@ -1,0 +1,20 @@
+{
+  "schema": "shuttle_abi22_te_rmsnorm_runner_build_v2",
+  "runner": {
+    "path": "lib/shuttle/mlir/jax_patch/abi22_te_rmsnorm_oracle_runner_v2.cpp",
+    "sha256": "e22a1e774004ecefbbac55b6296bb0154c70cd65b9943e1e8a7fd93c1e7d01ad"
+  },
+  "provider": {
+    "distribution": "transformer_engine",
+    "version": "2.17.0"
+  },
+  "build": {
+    "language": "c++20",
+    "cuda_architecture": "sm_90a",
+    "libraries": [
+      "transformer_engine",
+      "cudart"
+    ]
+  },
+  "runtime_identity": "shuttle_abi22_te_rmsnorm_runtime_v2_required"
+}

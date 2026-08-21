@@ -6,7 +6,9 @@
 import copy
 import hashlib
 import statistics
+import tempfile
 import unittest
+from collections.abc import Mapping
 from pathlib import Path
 
 from abi22_te_rmsnorm_oracle_v2 import (
@@ -18,15 +20,36 @@ from abi22_te_rmsnorm_oracle_v2 import (
     NORM_CONTRACT_BLOCKER,
     REFERENCE_DIGESTS,
     REPRESENTATIVE_SHAPE,
+    ValidatedTeRuntimeIdentity,
     build_matched_acceptance,
+    epsilon_sensitivity,
     execute_plan,
     execution_plan,
+    prepare_cases,
     validate_build_manifest,
     validate_report,
+    validate_runtime_manifest,
 )
 
 TE_RUNNER = Path(__file__).with_name("abi22_te_rmsnorm_oracle_runner_v2.cpp")
 BUILD_MANIFEST = Path(__file__).with_name("abi22-te-rmsnorm-oracle-runner-build-v2.json")
+
+
+TE_IDENTITY: dict | None = None
+
+
+def _expected_te_identity() -> Mapping[str, str]:
+    if TE_IDENTITY is None:
+        raise AssertionError("test runtime identity was not prepared")
+    return TE_IDENTITY
+
+
+def _validate(report: dict, producer: str) -> dict:
+    return validate_report(
+        report,
+        expected_producer=producer,
+        expected_te_identity=_expected_te_identity() if producer == "transformer_engine_2_17" else None,
+    )
 
 
 def _cell(shape: tuple[int, int], boundary: str, *, provider: str) -> dict:
@@ -85,13 +108,7 @@ def _report(provider: str) -> dict:
             "epsilon": EPSILON,
         },
         "provider_identity": (
-            {
-                "distribution": "transformer_engine",
-                "version": "2.17.0",
-                "source_commit": "2e559f062497bef768dfbe9d7e45548fadeca80a",
-                "runner_sha256": "1" * 64,
-                "library_sha256": "2" * 64,
-            }
+            dict(_expected_te_identity())
             if provider == "transformer_engine_2_17"
             else {
                 "jax_version": "0.10.1",
@@ -118,6 +135,29 @@ def _report(provider: str) -> dict:
 
 
 class TeRmsnormOracleV2Test(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        global TE_IDENTITY
+        cls.runtime_directory = tempfile.TemporaryDirectory()
+        library = Path(cls.runtime_directory.name) / "libtransformer_engine.so"
+        library.write_bytes(b"sealed-transformer-engine-2.17-library")
+        runtime_manifest = {
+            "schema": "shuttle_abi22_te_rmsnorm_runtime_v2",
+            "runner_sha256": hashlib.sha256(TE_RUNNER.read_bytes()).hexdigest(),
+            "transformer_engine_library": {
+                "path": str(library),
+                "sha256": hashlib.sha256(library.read_bytes()).hexdigest(),
+            },
+        }
+        TE_IDENTITY = validate_runtime_manifest(runtime_manifest, TE_RUNNER)
+        cls.runtime_manifest = runtime_manifest
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        global TE_IDENTITY
+        TE_IDENTITY = None
+        cls.runtime_directory.cleanup()
+
     def test_canonical_bf16_inputs_and_independent_references_are_pinned(self) -> None:
         self.assertEqual(
             INPUT_DIGESTS,
@@ -151,10 +191,44 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
         )
 
     def test_plan_separates_architecture_from_representative_acceptance(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        case_root = Path(temporary.name) / "cases"
+        prepared = prepare_cases(case_root)
+        self.assertEqual(prepared["input_digests"], INPUT_DIGESTS)
+        self.assertEqual(prepared["reference_digests"], REFERENCE_DIGESTS)
+        for shape in (ARCHITECTURE_SHAPE, REPRESENTATIVE_SHAPE):
+            rows, features = shape
+            directory = case_root / f"{rows}x{features}"
+            expected = {
+                "x.bf16": (rows * features * 2, INPUT_DIGESTS[shape]["x"]),
+                "gamma.bf16": (features * 2, INPUT_DIGESTS[shape]["gamma"]),
+                "dy.bf16": (rows * features * 2, INPUT_DIGESTS[shape]["dy"]),
+                "reference_y.bf16": (rows * features * 2, REFERENCE_DIGESTS[shape]["y"]),
+                "reference_dx.bf16": (rows * features * 2, REFERENCE_DIGESTS[shape]["dx"]),
+                "reference_dgamma.bf16": (features * 2, REFERENCE_DIGESTS[shape]["dgamma"]),
+            }
+            for name, (size, digest) in expected.items():
+                path = directory / name
+                self.assertTrue(path.is_file())
+                self.assertEqual(path.stat().st_size, size)
+                self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), digest)
+
+        sensitivity = epsilon_sensitivity(case_root, REPRESENTATIVE_SHAPE)
+        self.assertEqual(
+            sensitivity,
+            {
+                "y": {"max_absolute_error": 1.36328125, "max_bfloat16_ulp": 231},
+                "dx": {"max_absolute_error": 189.0, "max_bfloat16_ulp": 34089},
+                "dgamma": {"max_absolute_error": 4.0, "max_bfloat16_ulp": 1},
+            },
+        )
+        self.assertGreater(sensitivity["y"]["max_absolute_error"], ACCEPTANCE_LIMITS["max_absolute_error"])
         plan = execution_plan(
             "./abi22_te_rmsnorm_oracle_runner_v2",
             "./abi22_xla_rmsnorm_oracle_v2.py",
             "./python",
+            case_root,
         )
 
         self.assertEqual(plan["schema"], "shuttle_abi22_te_xla_rmsnorm_plan_v2")
@@ -194,13 +268,32 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
                     "--epsilon",
                     "1e-06",
                     "--case-directory",
-                    f"cases/{rows}x{features}",
+                    str(case_root / f"{rows}x{features}"),
                     "--output",
                     f"raw/{run['producer']}-{rows}x{features}-{run['boundary']}.json",
                 ],
             )
         self.assertTrue(all("contract" not in run["boundary"] for run in plan["runs"]))
         self.assertEqual(plan["excluded_capability"], NORM_CONTRACT_BLOCKER)
+
+        (case_root / "2048x4096/x.bf16").write_bytes(b"tampered")
+        with self.assertRaisesRegex(ValueError, "case.*digest|case.*size"):
+            execution_plan(
+                "./abi22_te_rmsnorm_oracle_runner_v2",
+                "./abi22_xla_rmsnorm_oracle_v2.py",
+                "./python",
+                case_root,
+            )
+        prepare_cases(case_root)
+        (case_root / "7x13/gamma.bf16").unlink()
+        with self.assertRaisesRegex(ValueError, "case.*missing"):
+            execution_plan(
+                "./abi22_te_rmsnorm_oracle_runner_v2",
+                "./abi22_xla_rmsnorm_oracle_v2.py",
+                "./python",
+                case_root,
+            )
+        prepare_cases(case_root)
 
         invoked: list[list[str]] = []
 
@@ -211,12 +304,13 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
         execute_plan(plan, invoke)
         self.assertEqual(invoked, [run["argv"] for run in plan["runs"]])
 
-        with self.assertRaisesRegex(RuntimeError, "ordinary_jax_xla"):
-            execute_plan(plan, lambda argv: 7 if "ordinary_jax_xla" in argv[-1] else 0)
+        for producer in ("transformer_engine_2_17", "ordinary_jax_xla"):
+            with self.assertRaisesRegex(RuntimeError, producer):
+                execute_plan(plan, lambda argv, selected=producer: 7 if selected in argv[-1] else 0)
 
     def test_reports_require_the_closed_te_and_xla_matrix(self) -> None:
         for producer in ("transformer_engine_2_17", "ordinary_jax_xla"):
-            validated = validate_report(_report(producer), expected_producer=producer)
+            validated = _validate(_report(producer), producer)
             self.assertEqual(len(validated["cells"]), 6)
 
         for mutation, diagnostic in (
@@ -259,30 +353,52 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
             report = _report("transformer_engine_2_17")
             mutation(report)
             with self.assertRaisesRegex(ValueError, diagnostic):
-                validate_report(report, expected_producer="transformer_engine_2_17")
+                _validate(report, "transformer_engine_2_17")
 
-        for cell_index in (3, 4, 5):
-            for field, value in (
-                ("max_absolute_error", ACCEPTANCE_LIMITS["max_absolute_error"] + 0.01),
-                ("max_bfloat16_ulp", ACCEPTANCE_LIMITS["max_bfloat16_ulp"] + 1),
-                ("max_absolute_error", float("nan")),
-            ):
-                report = _report("transformer_engine_2_17")
-                report["cells"][cell_index]["outputs"][0][field] = value
-                with self.assertRaisesRegex(ValueError, field):
-                    validate_report(report, expected_producer="transformer_engine_2_17")
+        wrong_sequences = {
+            "forward": ["rmsnorm_backward"],
+            "backward_recompute": ["rmsnorm_backward", "rmsnorm_forward_to_private_rsigma"],
+            "composed": ["rmsnorm_backward", "rmsnorm_forward_to_public_y_and_private_rsigma"],
+        }
+        for producer in ("transformer_engine_2_17", "ordinary_jax_xla"):
+            for cell_index, cell in enumerate(_report(producer)["cells"]):
+                report = _report(producer)
+                report["cells"][cell_index]["execution"]["call_sequence"] = wrong_sequences[cell["boundary"]]
+                with self.assertRaisesRegex(ValueError, "call sequence"):
+                    _validate(report, producer)
+
+        self.assertEqual(ACCEPTANCE_LIMITS, {"max_absolute_error": 0.015625, "max_bfloat16_ulp": 8})
+        for producer in ("transformer_engine_2_17", "ordinary_jax_xla"):
+            for cell_index in (3, 4, 5):
+                for output_index in range(len(_report(producer)["cells"][cell_index]["outputs"])):
+                    for field, value in (
+                        ("max_absolute_error", 0.015626),
+                        ("max_bfloat16_ulp", 9),
+                        ("max_absolute_error", float("nan")),
+                    ):
+                        report = _report(producer)
+                        report["cells"][cell_index]["outputs"][output_index][field] = value
+                        with self.assertRaisesRegex(ValueError, field):
+                            _validate(report, producer)
+
+        for producer in ("transformer_engine_2_17", "ordinary_jax_xla"):
+            for boundary_index, output_index in ((3, 0), (4, 0), (4, 1), (5, 0), (5, 1), (5, 2)):
+                report = _report(producer)
+                report["cells"][boundary_index]["outputs"][output_index]["digest"] = "d" * 64
+                with self.assertRaisesRegex(ValueError, "composed output|output digest"):
+                    _validate(report, producer)
 
     def test_reports_pin_provider_identity_and_supplemental_cuda_events(self) -> None:
         for path, value, diagnostic in (
             (("version",), "2.16.0", "version"),
             (("source_commit",), "0" * 40, "source_commit"),
-            (("runner_sha256",), "missing", "runner_sha256"),
-            (("library_sha256",), "missing", "library_sha256"),
+            (("runner_sha256",), "3" * 64, "runner_sha256"),
+            (("library_sha256",), "4" * 64, "library_sha256"),
         ):
             report = _report("transformer_engine_2_17")
             report["provider_identity"][path[0]] = value
             with self.assertRaisesRegex(ValueError, diagnostic):
-                validate_report(report, expected_producer="transformer_engine_2_17")
+                _validate(report, "transformer_engine_2_17")
 
         for field, value in (
             ("jax_version", "0.10.0"),
@@ -292,24 +408,24 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
             report = _report("ordinary_jax_xla")
             report["provider_identity"][field] = value
             with self.assertRaisesRegex(ValueError, field):
-                validate_report(report, expected_producer="ordinary_jax_xla")
+                _validate(report, "ordinary_jax_xla")
 
         for samples in (None, [1] * 19, [1] * 19 + [0]):
             report = _report("transformer_engine_2_17")
             report["cells"][0]["timing"]["raw_cuda_event_ns"] = samples
             with self.assertRaisesRegex(ValueError, "CUDA-event"):
-                validate_report(report, expected_producer="transformer_engine_2_17")
+                _validate(report, "transformer_engine_2_17")
 
         report = _report("ordinary_jax_xla")
         report["cells"][0]["timing"]["raw_cuda_event_ns"] = [1] * 20
         with self.assertRaisesRegex(ValueError, "CUDA-event"):
-            validate_report(report, expected_producer="ordinary_jax_xla")
+            _validate(report, "ordinary_jax_xla")
 
     def test_acceptance_uses_only_complete_representative_cells_and_matched_host_clock(self) -> None:
         te = _report("transformer_engine_2_17")
         xla = _report("ordinary_jax_xla")
 
-        accepted = build_matched_acceptance(te, xla)
+        accepted = build_matched_acceptance(te, xla, expected_te_identity=_expected_te_identity())
 
         self.assertEqual(accepted["status"], "representative_numerics_accepted")
         self.assertEqual(accepted["accepted_shape"], [2048, 4096])
@@ -329,24 +445,35 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
         architecture_only_te["cells"] = architecture_only_te["cells"][:3]
         architecture_only_xla["cells"] = architecture_only_xla["cells"][:3]
         with self.assertRaisesRegex(ValueError, "representative"):
-            build_matched_acceptance(architecture_only_te, architecture_only_xla)
+            build_matched_acceptance(
+                architecture_only_te,
+                architecture_only_xla,
+                expected_te_identity=_expected_te_identity(),
+            )
 
         mismatched = copy.deepcopy(xla)
         mismatched["device"]["uuid"] = "GPU-other"
         with self.assertRaisesRegex(ValueError, "device"):
-            build_matched_acceptance(te, mismatched)
+            build_matched_acceptance(te, mismatched, expected_te_identity=_expected_te_identity())
 
         mismatched = copy.deepcopy(xla)
         mismatched["cells"][3]["input_digests"]["x"] = "f" * 64
         with self.assertRaisesRegex(ValueError, "input digest"):
-            build_matched_acceptance(te, mismatched)
+            build_matched_acceptance(te, mismatched, expected_te_identity=_expected_te_identity())
 
         changed_cuda = copy.deepcopy(te)
         changed_cuda["cells"][3]["timing"]["raw_cuda_event_ns"] = [1_000_000 + index for index in range(20)]
         self.assertEqual(
-            build_matched_acceptance(changed_cuda, xla)["performance"]["median_ratio_te_over_xla"],
+            build_matched_acceptance(changed_cuda, xla, expected_te_identity=_expected_te_identity())["performance"][
+                "median_ratio_te_over_xla"
+            ],
             {boundary: 0.5 for boundary in BOUNDARIES},
         )
+
+        corrupt_median = copy.deepcopy(te)
+        corrupt_median["cells"][3]["timing"]["median_host_blocking_ns"] += 1
+        with self.assertRaisesRegex(ValueError, "median_host_blocking_ns"):
+            build_matched_acceptance(corrupt_median, xla, expected_te_identity=_expected_te_identity())
 
     def test_runner_build_manifest_closes_the_external_te_binary(self) -> None:
         manifest = validate_build_manifest(BUILD_MANIFEST, TE_RUNNER)
@@ -363,6 +490,17 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
         mutated["runner"]["sha256"] = "0" * 64
         with self.assertRaisesRegex(ValueError, "runner.*digest"):
             validate_build_manifest(mutated, TE_RUNNER)
+
+        runtime = validate_runtime_manifest(self.runtime_manifest, TE_RUNNER)
+        self.assertEqual(runtime, _expected_te_identity())
+        with self.assertRaisesRegex(TypeError, "created only"):
+            ValidatedTeRuntimeIdentity(dict(runtime), object())
+        with self.assertRaisesRegex(TypeError, "immutable"):
+            runtime._values = {}  # type: ignore[misc]
+        mutated_runtime = copy.deepcopy(self.runtime_manifest)
+        mutated_runtime["transformer_engine_library"]["sha256"] = "4" * 64
+        with self.assertRaisesRegex(ValueError, "library.*digest"):
+            validate_runtime_manifest(mutated_runtime, TE_RUNNER)
 
     def test_runner_source_uses_exact_te_api_and_both_timing_observations(self) -> None:
         source = TE_RUNNER.read_text()
