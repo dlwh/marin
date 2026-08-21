@@ -194,7 +194,7 @@ r7 evidence also does not establish a rank-2-specific defect: rank 2 is simply
 the first enabled coordinate. With no semantic root cause proven, r8 is a
 diagnostic-only canary.
 
-## r8 primal all-zero failure
+## r8 primal zero-first failure
 
 r8 reproduced the enabled rank-2 `SOURCE_ORDERED` failure after build, runtime
 preflight, disabled execution, enabled GPU completion, and observer validation.
@@ -205,10 +205,14 @@ The new evidence identifies the primal, not the gradient:
 ```
 
 All six primal elements differ and the first actual BF16 value is zero. The
-disabled baseline is correct. Comparison stops at the primal, so r8 does not
-report the enabled gradient. This makes a small numerical-ordering discrepancy
-unlikely and prioritizes first-call output projection, dispatch, launch
-geometry, or store/completion behavior.
+digest is not the digest of six positive-zero BF16 elements, so this evidence
+does not establish that the remaining five actual values are zero. Under the
+subject's exact digest convention, six positive zeros hash to
+`66f3df06:9dda9f32:3d676a81:33792902:53b90c3d:4529e440:0f3af12e:4cf2d11b`,
+not the recorded `effc8e52:...` identity. The disabled baseline is correct.
+Comparison stops at the primal, so r8 does not report the enabled gradient. The
+full-result mismatch prioritizes first-call output projection, dispatch, launch
+geometry, or store/completion behavior over a single rounding discrepancy.
 
 ## r9 PTX lifetime root cause
 
@@ -221,8 +225,10 @@ the kernel. Destroying each local specification violated that contract and
 allowed the allocator to reuse one address for later, different PTX strings.
 Those launches could consequently resolve `shuttle_entry` from an earlier
 module. Reusing the BF16-to-f32 kernel for the f32 temporary reads its low 16
-bits, which are zero for these BF16-expanded values and explains the all-zero
-chain observed by r8.
+bits, which are zero for these BF16-expanded values; reusing it for the final
+launch also writes f32 values into a BF16 result. This can explain the zero
+first element and corrupted full result observed by r8, but the retained r8
+evidence does not decode the other five actual values.
 
 Initialize state now owns every PTX string for at least as long as its loaded
 kernel. It reserves both vectors before taking string views; member destruction
