@@ -4256,6 +4256,130 @@ int32_t orderedBf16(uint16_t value) {
   return INT32_C(0x8000) + static_cast<int32_t>(value);
 }
 
+struct LayerNormInputs {
+  std::vector<uint16_t> x;
+  std::vector<uint16_t> gamma;
+  std::vector<uint16_t> beta;
+};
+
+struct LayerNormForwardOracle {
+  std::vector<uint16_t> output;
+  std::vector<float> means;
+  std::vector<float> variances;
+};
+
+LayerNormInputs layerNormInputs(int64_t rows, int64_t features) {
+  LayerNormInputs inputs;
+  inputs.x.resize(rows * features);
+  inputs.gamma.resize(features);
+  inputs.beta.resize(features);
+  for (int64_t feature = 0; feature < features; ++feature) {
+    inputs.gamma[feature] = roundToBf16(
+        0.625f + static_cast<float>((feature * 11) % 23) * 0.03125f);
+    inputs.beta[feature] = roundToBf16(
+        -0.25f + static_cast<float>((feature * 7) % 19) * 0.0234375f);
+  }
+  for (int64_t row = 0; row < rows; ++row) {
+    const float rowOffset = -0.55f + static_cast<float>(row % 9) * 0.1375f;
+    const float rowScale = 0.35f + static_cast<float>(row % 7) * 0.0875f;
+    for (int64_t feature = 0; feature < features; ++feature) {
+      const int64_t featurePattern = (feature * 37) % 257 - 128;
+      const int64_t skewPattern = (feature * feature + row * 17) % 29 - 14;
+      const float value =
+          rowOffset + rowScale * static_cast<float>(featurePattern) / 128.0f +
+          static_cast<float>(skewPattern) * 0.0046875f;
+      inputs.x[row * features + feature] = roundToBf16(value);
+    }
+  }
+  return inputs;
+}
+
+LayerNormForwardOracle layerNormForwardReference(const LayerNormInputs &inputs,
+                                                 int64_t rows,
+                                                 int64_t features) {
+  assert(inputs.x.size() == static_cast<size_t>(rows * features));
+  assert(inputs.gamma.size() == static_cast<size_t>(features));
+  assert(inputs.beta.size() == static_cast<size_t>(features));
+  LayerNormForwardOracle oracle;
+  oracle.output.resize(inputs.x.size());
+  oracle.means.resize(rows);
+  oracle.variances.resize(rows);
+  for (int64_t row = 0; row < rows; ++row) {
+    float sum = 0.0f;
+    for (int64_t feature = 0; feature < features; ++feature)
+      sum += expandBf16(inputs.x[row * features + feature]);
+    const float mean = sum / static_cast<float>(features);
+    float squaredSum = 0.0f;
+    for (int64_t feature = 0; feature < features; ++feature) {
+      const float centered =
+          expandBf16(inputs.x[row * features + feature]) - mean;
+      squaredSum += centered * centered;
+    }
+    const float variance = squaredSum / static_cast<float>(features);
+    const float inverseStandardDeviation = 1.0f / std::sqrt(variance + 1.0e-5f);
+    oracle.means[row] = mean;
+    oracle.variances[row] = variance;
+    for (int64_t feature = 0; feature < features; ++feature) {
+      const float centered =
+          expandBf16(inputs.x[row * features + feature]) - mean;
+      oracle.output[row * features + feature] =
+          roundToBf16(centered * inverseStandardDeviation *
+                          expandBf16(inputs.gamma[feature]) +
+                      expandBf16(inputs.beta[feature]));
+    }
+  }
+  return oracle;
+}
+
+TEST(GpuTransportV2Test,
+     LayerNormForwardHostOracleRejectsMissingMeanVarianceAndFeatureIndexing) {
+  constexpr int64_t rows = 7;
+  constexpr int64_t features = 13;
+  LayerNormInputs inputs = layerNormInputs(rows, features);
+  LayerNormForwardOracle oracle =
+      layerNormForwardReference(inputs, rows, features);
+  int64_t missingMeanDifferences = 0;
+  int64_t missingVarianceDifferences = 0;
+  int64_t rotatedAffineDifferences = 0;
+  float minimumMean = std::numeric_limits<float>::infinity();
+  float maximumMean = -std::numeric_limits<float>::infinity();
+  float absoluteMeanSum = 0.0f;
+  for (int64_t row = 0; row < rows; ++row) {
+    minimumMean = std::min(minimumMean, oracle.means[row]);
+    maximumMean = std::max(maximumMean, oracle.means[row]);
+    absoluteMeanSum += std::abs(oracle.means[row]);
+    EXPECT_GT(oracle.variances[row], 0.01f);
+    EXPECT_LT(oracle.variances[row], 0.5f);
+    const float inverseStandardDeviation =
+        1.0f / std::sqrt(oracle.variances[row] + 1.0e-5f);
+    for (int64_t feature = 0; feature < features; ++feature) {
+      const int64_t element = row * features + feature;
+      const float value = expandBf16(inputs.x[element]);
+      const float gamma = expandBf16(inputs.gamma[feature]);
+      const float beta = expandBf16(inputs.beta[feature]);
+      const uint16_t missingMean =
+          roundToBf16(value * inverseStandardDeviation * gamma + beta);
+      const uint16_t missingVariance =
+          roundToBf16((value - oracle.means[row]) * gamma + beta);
+      const int64_t rotatedFeature = (feature + 1) % features;
+      const uint16_t rotatedAffine =
+          roundToBf16((value - oracle.means[row]) * inverseStandardDeviation *
+                          expandBf16(inputs.gamma[rotatedFeature]) +
+                      expandBf16(inputs.beta[rotatedFeature]));
+      missingMeanDifferences += missingMean != oracle.output[element];
+      missingVarianceDifferences += missingVariance != oracle.output[element];
+      rotatedAffineDifferences += rotatedAffine != oracle.output[element];
+    }
+  }
+  const int64_t majority = rows * features / 2;
+  EXPECT_LT(minimumMean, -0.25f);
+  EXPECT_GT(maximumMean, 0.1f);
+  EXPECT_GT(absoluteMeanSum, 1.0f);
+  EXPECT_GT(missingMeanDifferences, majority);
+  EXPECT_GT(missingVarianceDifferences, majority);
+  EXPECT_GT(rotatedAffineDifferences, majority);
+}
+
 TEST(GpuTransportV2Test, H100RunnerExecutesThreeMapBf16Chain) {
   if (std::getenv("SHUTTLE_RUN_H100_NUMERICS") == nullptr)
     GTEST_SKIP() << "set SHUTTLE_RUN_H100_NUMERICS=1 on an H100 worker";
@@ -4334,6 +4458,159 @@ module @three_map_bf16_chain {
   runner->reset();
   (*executor)->Deallocate(&deviceResult);
   (*executor)->Deallocate(&deviceInput);
+}
+
+TEST(GpuTransportV2Test, H100RunnerMatchesIndependentLayerNormForwardOracle) {
+  if (std::getenv("SHUTTLE_RUN_H100_NUMERICS") == nullptr)
+    GTEST_SKIP() << "set SHUTTLE_RUN_H100_NUMERICS=1 on an H100 worker";
+
+  auto platform = stream_executor::PlatformManager::PlatformWithName("CUDA");
+  ASSERT_TRUE(platform.ok()) << platform.status();
+  auto executor = (*platform)->ExecutorForDevice(0);
+  ASSERT_TRUE(executor.ok()) << executor.status();
+  ASSERT_NE((*executor)->GetDeviceDescription().name().find("H100"),
+            std::string::npos);
+  auto stream = (*executor)->CreateStream();
+  ASSERT_TRUE(stream.ok()) << stream.status();
+  stream_executor::StreamExecutorAddressAllocator allocator(*executor);
+  const auto &capability =
+      (*executor)->GetDeviceDescription().gpu_compute_capability();
+
+  constexpr llvm::StringLiteral sourceOrderedOptions =
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+  constexpr llvm::StringLiteral fastOptions =
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+  constexpr llvm::StringLiteral tuning =
+      R"json({"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json";
+  struct Boundary {
+    llvm::StringLiteral fixture;
+    int64_t rows;
+    int64_t features;
+  };
+  constexpr Boundary boundaries[] = {
+      {"jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-forward.mlir", 7, 13},
+      {"jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-forward.mlir", 2048, 4096},
+  };
+  for (const Boundary &boundary : boundaries) {
+    SCOPED_TRACE(boundary.fixture.str());
+    LayerNormInputs inputs = layerNormInputs(boundary.rows, boundary.features);
+    LayerNormForwardOracle oracle =
+        layerNormForwardReference(inputs, boundary.rows, boundary.features);
+    for (mlir::shuttle::NumericalPolicy policy :
+         {mlir::shuttle::NumericalPolicy::SourceOrdered,
+          mlir::shuttle::NumericalPolicy::Fast}) {
+      SCOPED_TRACE(policy == mlir::shuttle::NumericalPolicy::SourceOrdered
+                       ? "source_ordered"
+                       : "fast");
+      auto source = fixtureSource(boundary.fixture);
+      ASSERT_TRUE(source);
+      auto built =
+          buildFixture(*source, policy,
+                       policy == mlir::shuttle::NumericalPolicy::SourceOrdered
+                           ? sourceOrderedOptions
+                           : fastOptions,
+                       tuning);
+      ASSERT_TRUE(built);
+      auto transport =
+          mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+      ASSERT_TRUE(mlir::succeeded(transport));
+      auto executable = mlir::shuttle::GpuExecutable::Load(*transport);
+      ASSERT_TRUE(executable.ok()) << executable.status();
+      const auto &bindings = (*executable)->externalBindings();
+      ASSERT_EQ(bindings.size(), 4u);
+      constexpr mlir::shuttle::ExecutableBindingKind kinds[] = {
+          mlir::shuttle::ExecutableBindingKind::Operand,
+          mlir::shuttle::ExecutableBindingKind::Operand,
+          mlir::shuttle::ExecutableBindingKind::Operand,
+          mlir::shuttle::ExecutableBindingKind::Result,
+      };
+      const int64_t bindingBytes[] = {
+          static_cast<int64_t>(inputs.x.size() * sizeof(uint16_t)),
+          static_cast<int64_t>(inputs.gamma.size() * sizeof(uint16_t)),
+          static_cast<int64_t>(inputs.beta.size() * sizeof(uint16_t)),
+          static_cast<int64_t>(oracle.output.size() * sizeof(uint16_t)),
+      };
+      for (auto [ordinal, binding] : llvm::enumerate(bindings)) {
+        EXPECT_EQ(binding.kind, kinds[ordinal]);
+        EXPECT_EQ(binding.index, ordinal == 3 ? 0 : ordinal);
+        EXPECT_EQ(binding.requiredBytes, bindingBytes[ordinal]);
+      }
+
+      auto runner = mlir::shuttle::GpuRunner::Create(
+          *transport, &allocator, 0, stream->get(), &capability);
+      ASSERT_TRUE(runner.ok()) << runner.status();
+      const mlir::shuttle::GpuRunnerResources &resources =
+          (*runner)->resources();
+      EXPECT_EQ(resources.launchCount, 1);
+      EXPECT_EQ(resources.externalOperandCount, 3);
+      EXPECT_EQ(resources.externalResultCount, 1);
+      EXPECT_EQ(resources.temporaryAllocationCount, 0);
+      EXPECT_EQ(resources.temporaryBytes, 0);
+
+      const std::vector<const std::vector<uint16_t> *> hostOperands = {
+          &inputs.x, &inputs.gamma, &inputs.beta};
+      std::vector<stream_executor::DeviceAddressBase> deviceOperands;
+      llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> operands;
+      for (const std::vector<uint16_t> *host : hostOperands) {
+        auto device = (*executor)->AllocateArray<uint16_t>(host->size());
+        ASSERT_TRUE(device);
+        ASSERT_TRUE((*executor)
+                        ->SynchronousMemcpyH2D(host->data(),
+                                               host->size() * sizeof(uint16_t),
+                                               &device)
+                        .ok());
+        deviceOperands.push_back(device);
+        operands.push_back(
+            {device.opaque(), static_cast<int64_t>(device.size())});
+      }
+      std::vector<uint16_t> actual(oracle.output.size(), UINT16_C(0x7FC1));
+      auto deviceResult = (*executor)->AllocateArray<uint16_t>(actual.size());
+      ASSERT_TRUE(deviceResult);
+      ASSERT_TRUE((*executor)
+                      ->SynchronousMemcpyH2D(actual.data(),
+                                             actual.size() * sizeof(uint16_t),
+                                             &deviceResult)
+                      .ok());
+      llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> results{
+          {deviceResult.opaque(), static_cast<int64_t>(deviceResult.size())}};
+      absl::Status execution = (*runner)->Execute(operands, results);
+      ASSERT_TRUE(execution.ok()) << execution;
+      ASSERT_TRUE((*runner)->AwaitCompletion().ok());
+      ASSERT_TRUE((*executor)
+                      ->SynchronousMemcpyD2H(deviceResult,
+                                             actual.size() * sizeof(uint16_t),
+                                             actual.data())
+                      .ok());
+
+      int64_t poisoned = 0;
+      int64_t nonfinite = 0;
+      int32_t maximumUlpDistance = 0;
+      size_t maximumUlpElement = 0;
+      for (auto [element, actualBits] : llvm::enumerate(actual)) {
+        poisoned += actualBits == UINT16_C(0x7FC1);
+        nonfinite += !std::isfinite(expandBf16(actualBits));
+        int32_t ulpDistance = std::abs(orderedBf16(actualBits) -
+                                       orderedBf16(oracle.output[element]));
+        if (ulpDistance > maximumUlpDistance) {
+          maximumUlpDistance = ulpDistance;
+          maximumUlpElement = element;
+        }
+      }
+      EXPECT_EQ(poisoned, 0);
+      EXPECT_EQ(nonfinite, 0);
+      const int32_t allowedUlps =
+          policy == mlir::shuttle::NumericalPolicy::SourceOrdered ? 1 : 4;
+      EXPECT_LE(maximumUlpDistance, allowedUlps)
+          << "element " << maximumUlpElement << ", actual "
+          << expandBf16(actual[maximumUlpElement]) << ", expected "
+          << expandBf16(oracle.output[maximumUlpElement]);
+
+      runner->reset();
+      (*executor)->Deallocate(&deviceResult);
+      for (auto &device : deviceOperands)
+        (*executor)->Deallocate(&device);
+    }
+  }
 }
 
 std::vector<uint16_t> rmsNormForwardReference(
