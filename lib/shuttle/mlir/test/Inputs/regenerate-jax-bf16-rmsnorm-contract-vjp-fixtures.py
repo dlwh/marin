@@ -6,6 +6,7 @@
 import argparse
 import hashlib
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,16 +25,26 @@ STABLEHLO_VERSION = "1.17.0"
 
 @dataclass(frozen=True)
 class StructuralShape:
-    rows: int
-    reduction: int
+    activation: tuple[int, ...]
     columns: int
 
     @property
+    def rows(self) -> int:
+        return math.prod(self.activation[:-1])
+
+    @property
+    def reduction(self) -> int:
+        return self.activation[-1]
+
+    @property
     def shape_id(self) -> str:
-        return f"{self.rows}x{self.reduction}x{self.columns}"
+        return "x".join(str(dimension) for dimension in (*self.activation, self.columns))
 
 
-SHAPES = (StructuralShape(5, 19, 7), StructuralShape(5, 19, 257))
+SHAPES = (
+    StructuralShape((5, 19), 7),
+    StructuralShape((5, 19), 257),
+)
 
 
 def rmsnorm_contract(x, weight, projection):
@@ -50,17 +61,52 @@ def composed(x, weight, projection, cotangent):
     return (result, *pullback(cotangent))
 
 
-def audited_fixture(shape: StructuralShape) -> str:
-    arguments = (
-        jax.ShapeDtypeStruct((shape.rows, shape.reduction), jnp.bfloat16),
+def projection_vjp(x, weight, projection, cotangent):
+    result, pullback = jax.vjp(rmsnorm_contract, x, weight, projection)
+    return result, pullback(cotangent)[2]
+
+
+def boundary_consumer(x, weight, projection):
+    local = x.astype(jnp.float32)
+    mean_square = jnp.mean(local * local, axis=-1, keepdims=True)
+    inverse_root = lax.rsqrt(mean_square + jnp.float32(1e-6))
+    normalized = (local * inverse_root * weight.astype(jnp.float32)).astype(jnp.bfloat16)
+    result = jnp.matmul(normalized, projection, preferred_element_type=jnp.float32)
+    consumer = (-normalized.astype(jnp.float32)).astype(jnp.bfloat16)
+    return result.astype(jnp.bfloat16), consumer
+
+
+def audited_fixture(
+    shape: StructuralShape,
+    *,
+    boundary_only: bool = False,
+    projection_only: bool = False,
+) -> str:
+    arguments = [
+        jax.ShapeDtypeStruct(shape.activation, jnp.bfloat16),
         jax.ShapeDtypeStruct((shape.reduction,), jnp.bfloat16),
         jax.ShapeDtypeStruct((shape.reduction, shape.columns), jnp.bfloat16),
-        jax.ShapeDtypeStruct((shape.rows, shape.columns), jnp.bfloat16),
-    )
-    module = jax.jit(composed).lower(*arguments).compiler_ir(dialect="stablehlo")
+    ]
+    if not boundary_only:
+        arguments.append(jax.ShapeDtypeStruct((*shape.activation[:-1], shape.columns), jnp.bfloat16))
+    if boundary_only:
+        boundary = boundary_consumer
+        boundary_label = "composed normalized-boundary consumer"
+    elif not projection_only:
+        boundary = composed
+        boundary_label = "composed VJP"
+    else:
+        boundary = projection_vjp
+        boundary_label = "projection-only VJP"
+    module = jax.jit(boundary).lower(*arguments).compiler_ir(dialect="stablehlo")
     payload = f"{module}".rstrip() + "\n"
     fields = json.dumps(
-        {"columns": shape.columns, "reduction": shape.reduction, "rows": shape.rows},
+        {
+            "activation": shape.activation,
+            "columns": shape.columns,
+            "reduction": shape.reduction,
+            "rows": shape.rows,
+        },
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -74,7 +120,7 @@ def audited_fixture(shape: StructuralShape) -> str:
             "// Hardware evidence: none",
             f"// Generator: {Path(__file__).name}",
             f"// Generator source SHA-256: {hashlib.sha256(Path(__file__).read_bytes()).hexdigest().upper()}",
-            "// Source: jax.jit(ordinary JAX BF16 RMSNorm-to-Contract composed VJP)",
+            f"// Source: jax.jit(ordinary JAX BF16 RMSNorm-to-Contract {boundary_label})",
             '//   .lower(...).compiler_ir(dialect="stablehlo")',
             f"// Structural fields: {fields}",
             f"// JAX: {JAX_VERSION}; jaxlib: {JAXLIB_VERSION}; JAX revision: {JAX_REVISION}",
@@ -111,6 +157,22 @@ def main() -> int:
             path.write_text(expected)
         elif not path.exists() or path.read_text() != expected:
             mismatches.append(filename)
+    projection_shape = StructuralShape((5, 19), 257)
+    filename = f"jax-{JAX_VERSION}-bf16-rmsnorm_contract-" f"{projection_shape.shape_id}-projection-vjp.mlir"
+    path = arguments.output_dir / filename
+    expected = audited_fixture(projection_shape, projection_only=True)
+    if arguments.write:
+        path.write_text(expected)
+    elif not path.exists() or path.read_text() != expected:
+        mismatches.append(filename)
+    boundary_shape = StructuralShape((2, 5, 19), 7)
+    filename = f"jax-{JAX_VERSION}-bf16-rmsnorm_contract-" f"{boundary_shape.shape_id}-boundary-consumer.mlir"
+    path = arguments.output_dir / filename
+    expected = audited_fixture(boundary_shape, boundary_only=True)
+    if arguments.write:
+        path.write_text(expected)
+    elif not path.exists() or path.read_text() != expected:
+        mismatches.append(filename)
     if mismatches:
         parser.error("ordinary-JAX RMSNorm Contract VJP fixture drift: " + ", ".join(mismatches))
     return 0

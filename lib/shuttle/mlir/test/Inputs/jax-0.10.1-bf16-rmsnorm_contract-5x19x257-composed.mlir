@@ -5,10 +5,10 @@
 // Evaluation oracle status: hardware_gate_pending
 // Hardware evidence: none
 // Generator: regenerate-jax-bf16-rmsnorm-contract-vjp-fixtures.py
-// Generator source SHA-256: 34538526B2F526D652F34BE093E48A4B85A5FB11F134DC242CC9D68B97F5A7A9
+// Generator source SHA-256: 1BE378B0CECB4BACD8698FF05938ED1430EEC4FC7B3F4035329C377ABF499355
 // Source: jax.jit(ordinary JAX BF16 RMSNorm-to-Contract composed VJP)
 //   .lower(...).compiler_ir(dialect="stablehlo")
-// Structural fields: {"columns":257,"reduction":19,"rows":5}
+// Structural fields: {"activation":[5,19],"columns":257,"reduction":19,"rows":5}
 // JAX: 0.10.1; jaxlib: 0.10.1; JAX revision: 619764c15117fbefc4ba13ab941871cb514c23f6
 // XLA revision: 9b635916ecc6df6efee62d8e4b0c7ef87ef84d69; StableHLO current version: 1.17.0
 // Raw StableHLO SHA-256: 3754520E05AF91CA5B130C5A68563C49C6BF664246FACA957CD1BCEAC4CF387B
