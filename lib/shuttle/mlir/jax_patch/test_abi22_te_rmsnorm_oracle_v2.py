@@ -20,6 +20,7 @@ from abi22_te_rmsnorm_oracle_v2 import (
     ACCEPTANCE_REFERENCE_DIGESTS,
     ARCHITECTURE_SHAPE,
     BOUNDARIES,
+    ELIGIBLE_COUNTS,
     EPSILON,
     HELDOUT_INPUT_DIGESTS,
     HELDOUT_PATTERN,
@@ -188,6 +189,7 @@ def _qualification_evidence() -> dict:
                     for output in cell["outputs"]:
                         output["digest"] = reference_digests[output["role"]]
                         output["reference_digest"] = reference_digests[output["role"]]
+                        output["eligible_count"] = ELIGIBLE_COUNTS[pattern][output["role"]]
                     cells.append(cell)
     return validate_qualification_evidence({"schema": "shuttle_abi22_rmsnorm_policy_evidence_v2", "cells": cells})
 
@@ -419,6 +421,14 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
                 "dgamma": "209869785a9897bfd13ff39665e0ad781d2bb14b3b7c15067a1f6c752c4601fb",
             },
         )
+        self.assertEqual(
+            ELIGIBLE_COUNTS,
+            {
+                QUALIFICATION_PATTERN: {"y": 8_225_616, "dx": 6_523_647, "dgamma": 4_096},
+                HELDOUT_PATTERN: {"y": 8_388_455, "dx": 5_397_253, "dgamma": 4_096},
+                ACCEPTANCE_PATTERN: {"y": 8_305_853, "dx": 7_722_818, "dgamma": 4_091},
+            },
+        )
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         case_root = Path(temporary.name) / "cases"
@@ -579,6 +589,7 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
                         ACCEPTANCE_LIMITS[role]["max_bfloat16_ulp_above_absolute_floor"] + 1,
                     ),
                     ("eligible_count", 0),
+                    ("eligible_count", ELIGIBLE_COUNTS[ACCEPTANCE_PATTERN][role] + 1),
                     ("absolute_floor", ACCEPTANCE_LIMITS[role]["absolute_floor"] * 2),
                     ("all_finite", False),
                 ):
@@ -586,6 +597,13 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
                     evidence["cells"][index]["outputs"][output_index][field] = value
                     with self.assertRaisesRegex(ValueError, field):
                         validate_qualification_evidence(evidence)
+
+        for index, cell in enumerate(qualified["cells"]):
+            for output_index, _output in enumerate(cell["outputs"]):
+                evidence = copy.deepcopy(qualified)
+                evidence["cells"][index]["outputs"][output_index]["eligible_count"] += 1
+                with self.assertRaisesRegex(ValueError, "eligible_count"):
+                    validate_qualification_evidence(evidence)
 
         diagnostic = copy.deepcopy(qualified)
         reversed_dx = next(
