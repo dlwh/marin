@@ -31,6 +31,8 @@ from track1_rmsnorm_contract_numerical_policy import (
 
 from shuttle import ExecutionMode, Materialization, Numerics, Tuning, compiler_options
 
+MAX_CELL_REPORT_BYTES = 4096
+
 
 class Boundary(StrEnum):
     PRIMAL = "primal"
@@ -228,6 +230,121 @@ def _metrics_document(metrics: NumericalMetrics) -> dict[str, float | int]:
     }
 
 
+def _grouped_sha256(value: np.ndarray) -> str:
+    digest = array_sha256(value)
+    return ":".join(digest[offset : offset + 8] for offset in range(0, len(digest), 8))
+
+
+def _ordered_bf16(bits: np.ndarray) -> np.ndarray:
+    return np.where(
+        bits & np.uint16(0x8000),
+        bits ^ np.uint16(0xFFFF),
+        bits ^ np.uint16(0x8000),
+    ).astype(np.int32)
+
+
+def _index_document(flat_index: int, shape: tuple[int, ...]) -> list[int]:
+    return [int(index) for index in np.unravel_index(flat_index, shape)]
+
+
+def _scalar_diagnostic(
+    actual: np.ndarray,
+    analytic: np.ndarray,
+    rounded: np.ndarray,
+    *,
+    flat_index: int,
+) -> dict[str, float | int | str | list[int]]:
+    actual_flat = actual.reshape(-1)
+    analytic_flat = analytic.reshape(-1)
+    rounded_flat = rounded.reshape(-1)
+    actual_bits = int(actual_flat.view(np.uint16)[flat_index])
+    rounded_bits = int(rounded_flat.view(np.uint16)[flat_index])
+    actual_value = float(actual_flat[flat_index])
+    analytic_value = float(analytic_flat[flat_index])
+    rounded_value = float(rounded_flat[flat_index])
+    actual_ordered = int(_ordered_bf16(np.asarray([actual_bits], dtype=np.uint16))[0])
+    rounded_ordered = int(_ordered_bf16(np.asarray([rounded_bits], dtype=np.uint16))[0])
+    return {
+        "absolute_error": abs(actual_value - analytic_value),
+        "actual_bits": f"0x{actual_bits:04x}",
+        "actual_value": actual_value,
+        "analytic_rounded_bits": f"0x{rounded_bits:04x}",
+        "analytic_rounded_value": rounded_value,
+        "analytic_value": analytic_value,
+        "index": _index_document(flat_index, actual.shape),
+        "magnitude_masked_bf16_code_distance": abs((actual_bits & 0x7FFF) - (rounded_bits & 0x7FFF)),
+        "ordered_bf16_ulp_error": abs(actual_ordered - rounded_ordered),
+        "raw_bf16_code_distance": abs(actual_bits - rounded_bits),
+    }
+
+
+def _cell_report(
+    coordinate: Coordinate,
+    role: str,
+    actual: np.ndarray,
+    repeated: np.ndarray,
+    diagnostic: np.ndarray,
+    analytic: np.ndarray,
+    metrics: NumericalMetrics,
+) -> dict[str, object]:
+    rounded = analytic.astype(ml_dtypes.bfloat16)
+    actual_bits = actual.view(np.uint16)
+    rounded_bits = rounded.view(np.uint16)
+    raw_distance = np.abs(actual_bits.astype(np.int32) - rounded_bits.astype(np.int32))
+    magnitude_distance = np.abs(
+        (actual_bits & np.uint16(0x7FFF)).astype(np.int32) - (rounded_bits & np.uint16(0x7FFF)).astype(np.int32)
+    )
+    ordered_distance = np.abs(_ordered_bf16(actual_bits) - _ordered_bf16(rounded_bits))
+    absolute = np.abs(actual.astype(np.float64) - analytic.astype(np.float64))
+    mismatches = np.flatnonzero(actual_bits.reshape(-1) != rounded_bits.reshape(-1))
+    first_mismatch = None
+    if mismatches.size:
+        first_mismatch = _scalar_diagnostic(
+            actual,
+            analytic,
+            rounded,
+            flat_index=int(mismatches[0]),
+        )
+    observed = _metrics_document(metrics)
+    report = {
+        "boundary": coordinate.boundary.value,
+        "first_mismatch": first_mismatch,
+        "maximum_magnitude_masked_bf16_code_distance": int(np.max(magnitude_distance, initial=0)),
+        "maximum_raw_bf16_code_distance": int(np.max(raw_distance, initial=0)),
+        "metrics": observed,
+        "mode": coordinate.mode.value,
+        "output_digests": {
+            "actual": _grouped_sha256(actual),
+            "analytic_rounded": _grouped_sha256(rounded),
+            "disabled_jax": _grouped_sha256(diagnostic),
+            "repeat": _grouped_sha256(repeated),
+        },
+        "role": role,
+        "schema": "track1_rmsnorm_contract_h100_cell",
+        "schema_version": 1,
+        "shape": list(coordinate.shape),
+        "sign_crossing_count": int(np.count_nonzero(((actual_bits ^ rounded_bits) & np.uint16(0x8000)) != np.uint16(0))),
+        "threshold_exceeded": sorted(name for name, limit in LIMITS[role].items() if observed[name] > limit),
+        "thresholds": LIMITS[role],
+        "worst_absolute": _scalar_diagnostic(
+            actual,
+            analytic,
+            rounded,
+            flat_index=int(np.argmax(absolute)),
+        ),
+        "worst_bf16_ulp": _scalar_diagnostic(
+            actual,
+            analytic,
+            rounded,
+            flat_index=int(np.argmax(ordered_distance)),
+        ),
+    }
+    encoded = json.dumps(report, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    if len(encoded) >= MAX_CELL_REPORT_BYTES:
+        raise RuntimeError("RMSNorm Contract cell report exceeds its bounded diagnostic size")
+    return report
+
+
 def _array_bytes_equal(actual: np.ndarray, expected: np.ndarray) -> bool:
     return (
         actual.dtype == expected.dtype
@@ -253,6 +370,7 @@ def validate_coordinate(
     snapshot: tuple[tuple[object, ...], ...],
     *,
     disabled_jax: tuple[np.ndarray, ...] | None = None,
+    report_cell: Callable[[dict[str, object]], None] | None = None,
 ) -> CoordinateResult:
     """Validate one public result tuple and return its canonical evidence."""
     observer = validate_observer_snapshot(coordinate, snapshot)
@@ -276,6 +394,9 @@ def validate_coordinate(
             raise RuntimeError(f"disabled JAX {role} diagnostic type differs from the public boundary")
     analytic = binary64_oracle(coordinate.shape)
     role_metrics = {role: numerical_metrics(actual, analytic[role]) for role, actual in zip(roles, arrays, strict=True)}
+    if report_cell is not None:
+        for role, actual, repeated, reference in zip(roles, arrays, repeat_arrays, diagnostic, strict=True):
+            report_cell(_cell_report(coordinate, role, actual, repeated, reference, analytic[role], role_metrics[role]))
     for role, metrics in role_metrics.items():
         observed = _metrics_document(metrics)
         if any(observed[name] > limit for name, limit in LIMITS[role].items()):
@@ -330,7 +451,10 @@ def _execute(
     return arrays, repeat_arrays, snapshot
 
 
-def run_matrix() -> tuple[CoordinateResult, ...]:
+def run_matrix(
+    *,
+    report_cell: Callable[[dict[str, object]], None] | None = None,
+) -> tuple[CoordinateResult, ...]:
     """Execute all 12 coordinates on one H100."""
     require_h100()
     load_numerical_policy()
@@ -344,7 +468,16 @@ def run_matrix() -> tuple[CoordinateResult, ...]:
         baseline = disabled_results.get(key)
         if baseline is None:
             raise RuntimeError("enabled RMSNorm Contract coordinate ran before its disabled JAX diagnostic")
-        results.append(validate_coordinate(coordinate, arrays, repeated, snapshot, disabled_jax=baseline))
+        results.append(
+            validate_coordinate(
+                coordinate,
+                arrays,
+                repeated,
+                snapshot,
+                disabled_jax=baseline,
+                report_cell=report_cell,
+            )
+        )
     return tuple(results)
 
 

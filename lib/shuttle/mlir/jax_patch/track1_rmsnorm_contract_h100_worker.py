@@ -4,10 +4,22 @@
 """Fresh-process worker for the Track 1 RMSNorm-to-Contract H100 canary."""
 
 import argparse
+import sys
 from pathlib import Path
 
 from track1_map_h100_prototype import canonical_json, validate_rmsnorm_contract_result
-from track1_rmsnorm_contract_h100_subject import result_document, run_matrix
+from track1_rmsnorm_contract_h100_subject import MAX_CELL_REPORT_BYTES, result_document, run_matrix
+
+CELL_REPORT_PREFIX = "RMSNORM_CONTRACT_CELL "
+
+
+def emit_cell_report(document: dict[str, object]) -> None:
+    """Flush one bounded canonical diagnostic into the durable phase log."""
+    payload = canonical_json(document)
+    if len(payload) >= MAX_CELL_REPORT_BYTES:
+        raise RuntimeError("RMSNorm Contract cell report exceeds its bounded diagnostic size")
+    sys.stdout.write(CELL_REPORT_PREFIX + payload.decode())
+    sys.stdout.flush()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -16,7 +28,7 @@ def main(argv: list[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     if arguments.output.exists() or arguments.output.is_symlink():
         raise RuntimeError("RMSNorm Contract worker output path must not exist")
-    document = result_document(run_matrix())
+    document = result_document(run_matrix(report_cell=emit_cell_report))
     validate_rmsnorm_contract_result(document)
     arguments.output.write_bytes(canonical_json(document))
     return 0
