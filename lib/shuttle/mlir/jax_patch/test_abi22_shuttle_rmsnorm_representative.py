@@ -6,7 +6,9 @@ import copy
 import hashlib
 import json
 import math
+import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from collections.abc import Iterator
@@ -427,6 +429,7 @@ def executed_evidence(
     calls: list[list[str]] = []
     evidence = execute_representative(
         runner=workspace / "run-h100-shuttle-rmsnorm-representative.sh",
+        gpu_transport_test=workspace / "gpu_transport_v2_test",
         case_root=prepared_case_root,
         raw_root=raw_root,
         reports_root=reports_root,
@@ -478,7 +481,12 @@ def test_executor_invokes_exact_matrix_and_assembles_file_backed_evidence(
     executed_evidence: tuple[dict[str, object], Path, Path, list[list[str]]], prepared_case_root: Path
 ) -> None:
     evidence, raw_root, reports_root, calls = executed_evidence
-    expected_plan = execution_plan(runner=Path(calls[0][0]), case_root=prepared_case_root, raw_root=raw_root)
+    expected_plan = execution_plan(
+        runner=Path(calls[0][0]),
+        gpu_transport_test=Path(calls[0][1]),
+        case_root=prepared_case_root,
+        raw_root=raw_root,
+    )
     assert calls == [run["argv"] for run in expected_plan["runs"]]
     assert len(calls) == 12
     assert (
@@ -640,9 +648,15 @@ def test_executor_persists_raw_outputs_and_diagnostics_before_numerical_rejectio
 
 def test_execution_plan_is_exact_fresh_process_matrix(tmp_path: Path) -> None:
     runner = tmp_path / "run-h100-shuttle-rmsnorm-representative.sh"
+    gpu_transport_test = tmp_path / "gpu_transport_v2_test"
     case_root = tmp_path / "cases"
     raw_root = tmp_path / "raw"
-    plan = execution_plan(runner=runner, case_root=case_root, raw_root=raw_root)
+    plan = execution_plan(
+        runner=runner,
+        gpu_transport_test=gpu_transport_test,
+        case_root=case_root,
+        raw_root=raw_root,
+    )
     assert plan["schema"] == "shuttle_abi22_rmsnorm_representative_plan_v1"
     assert plan["fresh_process_per_coordinate"] is True
     assert len(plan["runs"]) == 12
@@ -656,6 +670,7 @@ def test_execution_plan_is_exact_fresh_process_matrix(tmp_path: Path) -> None:
     for run, (policy, boundary, repeat) in zip(plan["runs"], expected, strict=True):
         assert run["argv"] == [
             str(runner),
+            str(gpu_transport_test),
             "--case-root",
             str(case_root),
             "--raw-root",
@@ -667,6 +682,39 @@ def test_execution_plan_is_exact_fresh_process_matrix(tmp_path: Path) -> None:
             "--repeat",
             str(repeat),
         ]
+
+
+def test_execution_plan_invokes_shell_wrapper_with_explicit_gpu_test(tmp_path: Path) -> None:
+    runner = Path(__file__).parents[1] / "test" / "run-h100-shuttle-rmsnorm-representative.sh"
+    gpu_transport_test = tmp_path / "gpu_transport_v2_test"
+    capture = tmp_path / "capture.txt"
+    gpu_transport_test.write_text(
+        "#!/bin/sh\n"
+        'printf \'%s\\n\' "$SHUTTLE_REP_CASE_ROOT" "$SHUTTLE_REP_RAW_ROOT" '
+        '"$SHUTTLE_REP_POLICY" "$SHUTTLE_REP_BOUNDARY" "$SHUTTLE_REP_REPEAT" "$@" > "$CAPTURE"\n'
+    )
+    gpu_transport_test.chmod(0o755)
+    plan = execution_plan(
+        runner=runner,
+        gpu_transport_test=gpu_transport_test,
+        case_root=tmp_path / "cases",
+        raw_root=tmp_path / "raw",
+    )
+
+    environment = dict(os.environ)
+    environment["CAPTURE"] = str(capture)
+    result = subprocess.run(plan["runs"][0]["argv"], env=environment, check=False, capture_output=True, text=True)
+
+    assert result.returncode == 0, result.stderr
+    assert capture.read_text().splitlines() == [
+        str(tmp_path / "cases"),
+        str(tmp_path / "raw"),
+        "source_ordered",
+        "forward",
+        "0",
+        "--gtest_fail_if_no_test_selected",
+        "--gtest_filter=GpuTransportV2Test.H100RepresentativeRmsNormRunnerWritesOneAuthenticatedRawCell",
+    ]
 
 
 def test_every_acceptance_cell_enforces_metrics_roles_and_resources(

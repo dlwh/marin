@@ -613,6 +613,7 @@ py_test(
     data = [
         "artifacts/track2-te-rmsnorm-r12-success-20260821/policy-raw-v4.json",
         "artifacts/track2-te-rmsnorm-r12-success-20260821/result-v4.json",
+        "test/run-h100-shuttle-rmsnorm-representative.sh",
     ],
     deps = [
         "@pypi//ml_dtypes",
