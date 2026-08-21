@@ -200,6 +200,7 @@ struct PtxDataflow {
   struct Definition {
     std::string opcode;
     std::vector<std::string> operands;
+    bool predicated = false;
   };
   std::map<std::string, Definition> definitions;
   std::map<std::string, std::string> currentValues;
@@ -280,12 +281,17 @@ bool hasDisjointContiguousFoldLoop(llvm::StringRef ptx, int64_t outputExtent,
                 .str())
       continue;
     llvm::StringRef outputGuard = guardTokens[0];
-    if (lines[laneLine + 3] !=
-        (llvm::Twine("@") + outputGuard + " bra $done;").str())
+    const std::string guardPrefix =
+        (llvm::Twine("@") + outputGuard + " bra ").str();
+    if (!lines[laneLine + 3].starts_with(guardPrefix) ||
+        !lines[laneLine + 3].ends_with(";"))
       continue;
+    llvm::StringRef outputExit =
+        lines[laneLine + 3].drop_front(guardPrefix.size()).drop_back();
     for (size_t startLine = laneLine + 4; startLine < lines.size();
          ++startLine) {
-      if (lines[startLine].starts_with("bra ") || lines[startLine] == "ret;" ||
+      if (lines[startLine].starts_with("bra ") ||
+          lines[startLine].contains(" bra ") || lines[startLine] == "ret;" ||
           lines[startLine].contains(" ret;") || lines[startLine] == "exit;" ||
           lines[startLine].contains(" exit;") ||
           lines[startLine].ends_with(":"))
@@ -397,12 +403,21 @@ bool hasDisjointContiguousFoldLoop(llvm::StringRef ptx, int64_t outputExtent,
                 ptxDependencyClosure(bodyFlow, reachingLeaf->second);
             for (const auto &[loadValue, load] : bodyFlow.definitions) {
               if (!closure.count(loadValue) ||
-                  !llvm::StringRef(load.opcode).starts_with("ld.global."))
+                  !llvm::StringRef(load.opcode).starts_with("ld.global.") ||
+                  load.predicated)
                 continue;
               std::set<std::string> loadClosure =
                   ptxDependencyClosure(bodyFlow, loadValue);
-              accumulatedIndexedLeaf |= loadClosure.count(start.str()) &&
-                                        loadClosure.count("$op:cvt.u64.u32");
+              bool unpredicatedStartConversion = false;
+              for (const std::string &value : loadClosure) {
+                const PtxDataflow::Definition *definition =
+                    ptxDefinition(bodyFlow, value);
+                unpredicatedStartConversion |=
+                    definition && definition->opcode == "cvt.u64.u32" &&
+                    !definition->predicated &&
+                    ptxDependencyClosure(bodyFlow, value).count(start.str());
+              }
+              accumulatedIndexedLeaf |= unpredicatedStartConversion;
             }
           }
           ++line;
@@ -411,8 +426,10 @@ bool hasDisjointContiguousFoldLoop(llvm::StringRef ptx, int64_t outputExtent,
         if (defines(lines[line], accumulator))
           return false;
         if (lines[line] == increment)
-          return accumulatedIndexedLeaf && lines[line + 1] == backedge &&
-                 lines[line + 2] == exitLabel;
+          return accumulatedIndexedLeaf && outputExit != exit &&
+                 lines[line + 1] == backedge && lines[line + 2] == exitLabel &&
+                 llvm::is_contained(llvm::ArrayRef(lines).drop_front(line + 3),
+                                    (llvm::Twine(outputExit) + ":").str());
       }
       return false;
     }
@@ -470,7 +487,8 @@ PtxDataflow ptxDataflow(llvm::StringRef ptx) {
     const std::string destination = (llvm::Twine(tokens.front()) + "@" +
                                      llvm::Twine(generations[tokens.front()]++))
                                         .str();
-    result.definitions[destination] = {opcode.str(), std::move(dependencies)};
+    result.definitions[destination] = {opcode.str(), std::move(dependencies),
+                                       line.starts_with("@")};
     currentRegister[tokens.front()] = destination;
   }
   result.currentValues = std::move(currentRegister);
@@ -1820,7 +1838,7 @@ $done:
   mov.u32 %r31, %tid.x;
   mov.u32 %r29, %ctaid.x;
   setp.ge.u32 %p3, %r29, 3;
-  @%p3 bra $done;
+  @%p3 bra $all_done;
   mul.lo.u32 %r18, %r31, 2;
   add.u32 %r22, %r18, 2;
   min.u32 %r22, %r22, 330;
@@ -1835,7 +1853,7 @@ $again:
   add.u32 %r18, %r18, 1;
   bra $again;
 $finished:
-$done:
+$all_done:
 )ptx";
   EXPECT_TRUE(hasDisjointContiguousFoldLoop(correctFoldLoop, 3, 330, 2));
   EXPECT_TRUE(hasDisjointContiguousFoldLoop(renamedFoldLoop, 3, 330, 2));
@@ -1867,6 +1885,8 @@ $done:
            replace(correctFoldLoop, "mov.f32 %f0, 0f00000000;", "exit;"),
            replace(correctFoldLoop, "cvt.u64.u32 %rd0, %r4;",
                    "cvt.u64.u32 %rd0, %r7;"),
+           replace(correctFoldLoop, "cvt.u64.u32 %rd0, %r4;",
+                   "@%p1 cvt.u64.u32 %rd0, %r4;"),
            replace(correctFoldLoop, "mov.f32 %f0, 0f00000000;",
                    "mov.f32 %f0, 0f00000000;\n  mov.f32 %f0, 0f3F800000;"),
            replace(replace(correctFoldLoop, "cvt.u64.u32 %rd0, %r4;", "nop;"),
@@ -1884,6 +1904,8 @@ $done:
                    "setp.ge.u32 %p0, %r1, 3;", "setp.ge.u32 %p0, %r0, 3;"),
            replace(correctFoldLoop, "mul.lo.u32 %r4, %r0, 2;",
                    "bra $loaded;\n  mul.lo.u32 %r4, %r0, 2;"),
+           replace(correctFoldLoop, "mul.lo.u32 %r4, %r0, 2;",
+                   "@!%p0 bra $loaded;\n  mul.lo.u32 %r4, %r0, 2;"),
            replace(correctFoldLoop, "mul.lo.u32 %r4, %r0, 2;",
                    "ret;\n  mul.lo.u32 %r4, %r0, 2;"),
            replace(correctFoldLoop, "mul.lo.u32 %r4, %r0, 2;",
