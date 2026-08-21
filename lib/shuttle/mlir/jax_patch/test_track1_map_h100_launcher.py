@@ -22,6 +22,7 @@ def test_launcher_fails_before_importing_subject_or_jax(monkeypatch: pytest.Monk
         return original_import(name, *args, **kwargs)
 
     sys.modules.pop("track1_map_h100_launcher", None)
+    sys.modules.pop("track1_map_h100_prototype", None)
     monkeypatch.setattr(builtins, "__import__", record_import)
     launcher = importlib.import_module("track1_map_h100_launcher")
     with pytest.raises(RuntimeError, match="explicitly unsealed"):
@@ -44,6 +45,8 @@ def test_launcher_dry_run_emits_canonical_plan_without_importing_subject_or_jax(
         imported.append(name)
         return original_import(name, *args, **kwargs)
 
+    sys.modules.pop("track1_map_h100_prototype", None)
+    sys.modules.pop("track1_map_h100_launcher", None)
     monkeypatch.setattr(builtins, "__import__", record_import)
     launcher = importlib.import_module("track1_map_h100_launcher")
     assert (

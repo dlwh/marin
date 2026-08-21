@@ -43,6 +43,34 @@ Host adapter. The checked-in registration driver routes that returned bundle
 through the plugin's real PJRT registration entry point using a fake extension;
 it does not load kernels or launch GPU work.
 
+The Track 1 single-job prototype is authorized by the canonical
+`scripts/shuttle/track1_map_h100_prototype_authorization.json` document. Compute
+its SHA-256 before launching. The launcher remains fail-closed without that file
+and its exact digest. Render the network hydration, offline build, isolated
+wheel install, and two worker commands without executing them:
+
+```bash
+python -B lib/shuttle/mlir/jax_patch/track1_map_h100_launcher.py \
+  --authorization-file scripts/shuttle/track1_map_h100_prototype_authorization.json \
+  --authorization-sha256 SOURCE_AUTHORIZATION_SHA256 \
+  --workspace /tmp/shuttle-track1-prototype \
+  --runner-repository /app \
+  --python /opt/h100-evidence-runtime/bin/python \
+  --cuda-root /usr/local/cuda-13.2 \
+  --base-image ghcr.io/marin-community/iris-task-h100-evidence:5238c39e7a506b919fc803046de4a9dc2c29d02f@sha256:2efa83fbf8f2073a4175eef919a9f0c6c2db435d7c1ec9ed79017e1ea0d10cef \
+  --dry-run
+```
+
+Use `--execute` only inside the authorized one-attempt `H100x1` job. The
+workspace must not exist. Before network access, the executor validates the
+Iris-synced Shuttle and Track 1 source files against the authorization's
+canonical source manifest. It then fetches the pinned JAX, XLA, and Bazel
+inputs once, checks their identities and patch bytes, warms Bazel's
+repository state, and then repeats the three-wheel build with repository
+downloads disabled. Populate and reuse run as separate Python processes. Build
+logs and wheels remain under the ephemeral workspace; stdout contains one
+canonical result document.
+
 For the reviewed CPU acceptance wheel, first run the guarded source/query
 proof, then build a release-versioned jaxlib wheel:
 

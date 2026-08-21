@@ -17,17 +17,28 @@ from track1_map_h100_prototype import (
     canonical_json,
     load_authorization,
     prototype_plan,
+    require_source_bundle,
+    source_bundle_document,
     validate_result_pair,
     wheel_set,
 )
 
+MARIN_REPOSITORY = Path(__file__).parents[4]
+AUTHORIZATION_PATH = MARIN_REPOSITORY / "scripts/shuttle/track1_map_h100_prototype_authorization.json"
+SOURCE_MANIFEST_PATH = MARIN_REPOSITORY / "scripts/shuttle/track1_map_h100_source_manifest.json"
+
 
 def _document() -> dict[str, object]:
+    source_manifest_sha256 = hashlib.sha256(SOURCE_MANIFEST_PATH.read_bytes()).hexdigest()
     return {
         "attempts": 1,
         "base_image": BASE_IMAGE,
         "hardware": {"gpu_count": 1, "gpu_model": "H100"},
-        "integration": {"commit": INTEGRATION_COMMIT, "tree": INTEGRATION_TREE},
+        "integration": {
+            "commit": INTEGRATION_COMMIT,
+            "source_manifest_sha256": source_manifest_sha256,
+            "tree": INTEGRATION_TREE,
+        },
         "permissions": {"build": True, "network_hydration": True, "run": True},
         "schema": "track1_map_h100_prototype_authorization",
         "schema_version": 1,
@@ -116,6 +127,29 @@ def test_authorization_requires_exact_canonical_bytes_and_cli_digest(tmp_path: P
         load_authorization(path, digest)
 
 
+def test_checked_in_authorization_is_the_exact_canonical_prototype_scope() -> None:
+    raw = AUTHORIZATION_PATH.read_bytes()
+    loaded = load_authorization(AUTHORIZATION_PATH, hashlib.sha256(raw).hexdigest())
+
+    assert loaded.document == _document()
+
+
+def test_checked_in_source_manifest_matches_the_live_iris_bundle_closure(tmp_path: Path) -> None:
+    raw = AUTHORIZATION_PATH.read_bytes()
+    authorization = load_authorization(AUTHORIZATION_PATH, hashlib.sha256(raw).hexdigest())
+
+    assert require_source_bundle(MARIN_REPOSITORY, authorization) == source_bundle_document(MARIN_REPOSITORY)
+
+    changed_document = deepcopy(authorization.document)
+    changed_document["integration"]["source_manifest_sha256"] = "f" * 64  # type: ignore[index]
+    changed_raw = canonical_json(changed_document)
+    changed_path = tmp_path / "mutated-authorization.json"
+    changed_path.write_bytes(changed_raw)
+    changed = load_authorization(changed_path, hashlib.sha256(changed_raw).hexdigest())
+    with pytest.raises(RuntimeError, match="manifest SHA-256"):
+        require_source_bundle(MARIN_REPOSITORY, changed)
+
+
 def test_dry_run_renders_one_network_hydration_then_offline_build_and_two_workers(tmp_path: Path) -> None:
     _, _, authorization = _authorization(tmp_path)
     workspace = tmp_path / "fresh"
@@ -133,7 +167,6 @@ def test_dry_run_renders_one_network_hydration_then_offline_build_and_two_worker
     assert rendered["workspace"] == str(workspace)
     phases = rendered["phases"]
     assert [phase["name"] for phase in phases] == [
-        "clone_integration",
         "fetch_jax",
         "fetch_xla",
         "fetch_bazel",
@@ -144,12 +177,12 @@ def test_dry_run_renders_one_network_hydration_then_offline_build_and_two_worker
         "populate",
         "reuse",
     ]
-    hydration = phases[4]["argv"]
-    offline = phases[5]["argv"]
+    hydration = phases[3]["argv"]
+    offline = phases[4]["argv"]
     assert "--bazel_options=--repository_disable_download" not in hydration
     assert "--bazel_options=--repository_disable_download" in offline
-    assert phases[8]["argv"][phases[8]["argv"].index("--role") + 1] == "populate"
-    assert phases[9]["argv"][phases[9]["argv"].index("--role") + 1] == "reuse"
+    assert phases[7]["argv"][phases[7]["argv"].index("--role") + 1] == "populate"
+    assert phases[8]["argv"][phases[8]["argv"].index("--role") + 1] == "reuse"
     assert not workspace.exists()
 
     workspace.mkdir()
@@ -235,3 +268,37 @@ def test_wheel_set_requires_exact_regular_three_wheel_output(tmp_path: Path) -> 
     (tmp_path / names[0]).symlink_to(tmp_path / names[1])
     with pytest.raises(RuntimeError, match="regular"):
         wheel_set(tmp_path)
+
+
+def test_source_bundle_manifest_rejects_missing_extra_symlink_and_hash_mutations(tmp_path: Path) -> None:
+    for root in (tmp_path / "lib/shuttle/mlir", tmp_path / "lib/shuttle/src/shuttle"):
+        root.mkdir(parents=True)
+        root.joinpath("source.py").write_text(f"{root.name}\n")
+    document = source_bundle_document(tmp_path)
+    manifest = tmp_path / "scripts/shuttle/track1_map_h100_source_manifest.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_bytes(canonical_json(document))
+    authorization_document = _document()
+    authorization_document["integration"]["source_manifest_sha256"] = hashlib.sha256(manifest.read_bytes()).hexdigest()  # type: ignore[index]
+    authorization = Authorization(authorization_document, "a" * 64)
+
+    assert require_source_bundle(tmp_path, authorization) == document
+
+    for name in ("missing", "extra", "symlink"):
+        case = tmp_path / name
+        for root in (case / "lib/shuttle/mlir", case / "lib/shuttle/src/shuttle"):
+            root.mkdir(parents=True)
+            root.joinpath("source.py").write_text(f"{root.name}\n")
+        case_manifest = case / "scripts/shuttle/track1_map_h100_source_manifest.json"
+        case_manifest.parent.mkdir(parents=True)
+        case_manifest.write_bytes(canonical_json(source_bundle_document(case)))
+        case_document = _document()
+        case_document["integration"]["source_manifest_sha256"] = hashlib.sha256(case_manifest.read_bytes()).hexdigest()  # type: ignore[index]
+        if name == "missing":
+            (case / "lib/shuttle/mlir/source.py").unlink()
+        elif name == "extra":
+            (case / "lib/shuttle/mlir/extra.cc").write_text("extra\n")
+        else:
+            (case / "lib/shuttle/src/shuttle/link.py").symlink_to(case / "lib/shuttle/src/shuttle/source.py")
+        with pytest.raises(RuntimeError, match="source bundle"):
+            require_source_bundle(case, Authorization(case_document, "b" * 64))

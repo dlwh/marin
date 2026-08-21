@@ -221,6 +221,7 @@ def test_wheel_command_is_gpu_observable_and_download_disabled(tmp_path: Path) -
         "--wheels=jaxlib,jax-cuda-plugin,jax-cuda-pjrt",
     ]
     assert "--cuda_compute_capabilities=9.0" in command
+    assert "--python_version=3.12" in command
     assert "--disable_nccl" in command
     assert "--bazel_options=--define=SHUTTLE_TEST_OBSERVER=1" in command
     assert "--bazel_options=--repository_disable_download" in command

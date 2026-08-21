@@ -137,6 +137,7 @@ def offline_wheel_command(
         "--wheels=jaxlib,jax-cuda-plugin,jax-cuda-pjrt",
         f"--bazel_path={bazel}",
         f"--output_path={wheel_output}",
+        "--python_version=3.12",
         "--cuda_version=13.0.0",
         "--cuda_compute_capabilities=9.0",
         "--disable_nccl",
