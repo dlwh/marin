@@ -41,6 +41,30 @@ live-out, then following producer inputs, removes the displaced generic task
 and any other unreachable private storage. Producer, consumer, dependency, and
 recomputation declarations are rebuilt from the retained task order.
 
+Independent review then exposed two closure failures masked by the original
+rank-2, all-role fixture. First, the materialized normalized output schema
+flattened the activation prefix to `{rows, reduction}` even though the planner
+admits activation ranks 2 through 8. Second, recomputation declarations were
+rebuilt in one pass: a shared source was annotated only after an earlier task
+had made the repetition visible. A compact projection-only VJP, with no
+retained reverse activation task, consequently declared only the later
+Contract occurrence.
+
+The schema now derives the normalized output from the Contract domain prefix
+followed by the reduction extent and separately verifies that the checked
+prefix product equals the planned row count. Recomputation rebuilding first
+counts every retained task-source occurrence, then annotates every Fold or
+Contract region occurrence of a repeated source. Exact-source verification
+uses the same occurrence model and is independent of task order.
+
+The higher-rank regression uses a rank-3 normalized-boundary consumer rather
+than a full rank-3 VJP. The latter contains a reverse Contract with two
+reduction dimensions, which the current closed projected-Contract admission
+does not support. This change intentionally does not broaden Contract
+admission. It also recomputes the retained rank-N Fold property after pruning:
+a Fold fully absorbed by the special region does not block the hybrid, while a
+retained legacy rank-N Fold still does.
+
 ## Changes
 
 The standalone RMSNorm-to-Contract derivation now also accepts a closed yielded
@@ -68,10 +92,11 @@ count as the target architecture.
 
 ## Results
 
-The uncached combined native gate passes 63 targets: the ABI22 Map-fusion
+The final uncached combined native gate passes 63 targets: the ABI22 Map-fusion
 Contract suite, registered Track 1 wiring, XLA registration and adapter tests,
-the pipeline observer, and all 58 MLIR tests. The focused hybrid regression
-also passes independently after the final PTX assertion.
+the pipeline observer, and all 58 MLIR tests. It includes the rank-2 composed,
+rank-3 boundary, and compact projection-only regressions added for the review
+repairs.
 
 No GPU job ran for this change. The result establishes a generic compiler,
 schema, PTX, and transport plan boundary; it does not establish H100 numerical
