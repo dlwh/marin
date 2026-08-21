@@ -12,9 +12,9 @@ import pytest
 from iris.rpc import controller_pb2, job_pb2
 from track1_map_h100_iris import (
     CLIENT_REVISION_DATE,
-    JOB_NAME,
     build_launch_request,
     decode_launch_request,
+    job_name,
     main,
     validate_launch_request,
 )
@@ -29,11 +29,12 @@ def _approved_authorization_sha256() -> str:
     return hashlib.sha256(AUTHORIZATION_PATH.read_bytes()).hexdigest()
 
 
-def _request() -> controller_pb2.Controller.LaunchJobRequest:
+def _request(retry: int = 1) -> controller_pb2.Controller.LaunchJobRequest:
     return build_launch_request(
         bundle_root=MARIN_REPOSITORY,
         authorization_path=AUTHORIZATION_PATH,
         approved_authorization_sha256=_approved_authorization_sha256(),
+        retry=retry,
     )
 
 
@@ -53,6 +54,8 @@ def test_dry_run_emits_and_decodes_the_real_fail_closed_launch_request(
                 str(AUTHORIZATION_PATH),
                 "--approved-authorization-sha256",
                 approved,
+                "--retry",
+                "1",
                 "--request-output",
                 str(output),
             ]
@@ -63,16 +66,16 @@ def test_dry_run_emits_and_decodes_the_real_fail_closed_launch_request(
     raw = output.read_bytes()
     request = controller_pb2.Controller.LaunchJobRequest()
     request.ParseFromString(raw)
-    decoded = decode_launch_request(raw, approved_authorization_sha256=approved)
+    decoded = decode_launch_request(raw, approved_authorization_sha256=approved, retry=1)
     summary = json.loads(capsys.readouterr().out)
 
     assert request == decoded
     assert summary["request_sha256"] == hashlib.sha256(raw).hexdigest()
     assert summary["bundle_sha256"] == request.bundle_id
     assert summary["authorization_sha256"] == approved
-    assert summary["job_name"] == JOB_NAME
+    assert summary["job_name"] == job_name(1)
 
-    assert request.name == JOB_NAME
+    assert request.name == "/dlwh/shuttle-track1-map-h100-prototype-r1"
     assert request.client_revision_date == CLIENT_REVISION_DATE
     assert request.task_image == BASE_IMAGE
     assert request.bundle_init_image == ""
@@ -119,8 +122,12 @@ def test_request_bytes_are_deterministic_and_output_is_create_only(tmp_path: Pat
     first = _request().SerializeToString(deterministic=True)
     second = _request().SerializeToString(deterministic=True)
     assert first == second
+    assert _request(2).name == "/dlwh/shuttle-track1-map-h100-prototype-r2"
+    assert _request(2).SerializeToString(deterministic=True) != first
     with pytest.raises(ValueError, match="protobuf is malformed"):
-        decode_launch_request(b"\xff", approved_authorization_sha256=approved)
+        decode_launch_request(b"\xff", approved_authorization_sha256=approved, retry=1)
+    with pytest.raises(ValueError, match="positive integer"):
+        job_name(0)
 
     output = tmp_path / "launch.pb"
     output.write_bytes(b"do not replace")
@@ -134,6 +141,8 @@ def test_request_bytes_are_deterministic_and_output_is_create_only(tmp_path: Pat
                 str(AUTHORIZATION_PATH),
                 "--approved-authorization-sha256",
                 approved,
+                "--retry",
+                "1",
                 "--request-output",
                 str(output),
             ]
@@ -164,6 +173,7 @@ def test_default_is_unsealed_before_bundle_or_request_output(tmp_path: Path) -> 
         "gpu",
         "image",
         "memory",
+        "name",
         "priority",
         "replicas",
         "retry_failure",
@@ -209,6 +219,8 @@ def test_decoded_request_rejects_every_launch_scope_mutation(mutation: str) -> N
         changed.task_image = "ghcr.io/marin-community/iris-task-h100-evidence:latest"
     elif mutation == "memory":
         changed.resources.memory_bytes = 127 * 1024**3
+    elif mutation == "name":
+        changed.name = job_name(2)
     elif mutation == "priority":
         changed.priority_band = job_pb2.PRIORITY_BAND_INTERACTIVE
     elif mutation == "replicas":
@@ -225,4 +237,4 @@ def test_decoded_request_rejects_every_launch_scope_mutation(mutation: str) -> N
         changed.timeout.milliseconds += 1
 
     with pytest.raises(ValueError, match="LaunchJobRequest"):
-        validate_launch_request(changed, approved_authorization_sha256=approved)
+        validate_launch_request(changed, approved_authorization_sha256=approved, retry=1)

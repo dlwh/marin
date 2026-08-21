@@ -30,6 +30,8 @@ from track1_map_h100_prototype import (
 MARIN_REPOSITORY = Path(__file__).parents[4]
 AUTHORIZATION_PATH = MARIN_REPOSITORY / "scripts/shuttle/track1_map_h100_prototype_authorization.json"
 SOURCE_MANIFEST_PATH = MARIN_REPOSITORY / "scripts/shuttle/track1_map_h100_source_manifest.json"
+EXPECTED_BAZEL_SHA256 = "fe7e799cbc9140f986b063e06800a3d4c790525075c877d00a7112669824acbf"
+MISMATCHED_BAZEL_SHA256 = "f" * 64
 
 
 def _document() -> dict[str, object]:
@@ -310,8 +312,27 @@ def test_source_bundle_manifest_rejects_missing_extra_symlink_and_hash_mutations
             require_source_bundle(case, Authorization(case_document, "b" * 64))
 
 
-def test_execute_rejects_hydration_source_drift_before_offline_build(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("observed_bazel_sha256", "mutate_during_hydration", "expected_error"),
+    [
+        (
+            MISMATCHED_BAZEL_SHA256,
+            False,
+            f"expected {EXPECTED_BAZEL_SHA256}, observed {MISMATCHED_BAZEL_SHA256}",
+        ),
+        (
+            EXPECTED_BAZEL_SHA256,
+            True,
+            "network hydration changed patched JAX or XLA source",
+        ),
+    ],
+)
+def test_execute_rejects_bazel_or_hydration_drift_before_offline_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    observed_bazel_sha256: str,
+    mutate_during_hydration: bool,
+    expected_error: str,
 ) -> None:
     _, _, authorization = _authorization(tmp_path)
     workspace = tmp_path / "workspace"
@@ -383,7 +404,8 @@ def test_execute_rejects_hydration_source_drift_before_offline_build(
         if "--bazel_options=--repository_disable_download" in command:
             offline_started = True
             return
-        (workspace / "jax/source.cc").write_text("network hydration mutation\n")
+        if mutate_during_hydration:
+            (workspace / "jax/source.cc").write_text("network hydration mutation\n")
 
     original_is_file = Path.is_file
     original_access = os.access
@@ -406,7 +428,7 @@ def test_execute_rejects_hydration_source_drift_before_offline_build(
         prototype,
         "_sha256_file",
         lambda path: (
-            prototype.BAZEL_SHA256 if path.name.startswith("bazel-") else hashlib.sha256(path.name.encode()).hexdigest()
+            observed_bazel_sha256 if path.name.startswith("bazel-") else hashlib.sha256(path.name.encode()).hexdigest()
         ),
     )
     monkeypatch.setattr(Path, "is_file", lambda path: True if path in cuda_tools else original_is_file(path))
@@ -414,7 +436,7 @@ def test_execute_rejects_hydration_source_drift_before_offline_build(
         os, "access", lambda path, mode: True if Path(path) in cuda_tools else original_access(path, mode)
     )
 
-    with pytest.raises(RuntimeError, match="network hydration changed patched JAX or XLA source"):
+    with pytest.raises(RuntimeError, match=expected_error):
         prototype.execute_prototype(
             authorization,
             workspace=workspace,
