@@ -578,6 +578,7 @@ def test_executor_fails_closed_on_process_and_persisted_output_failures(
     with _raises(ValueError):
         execute_representative(
             runner=tmp_path / "runner",
+            gpu_transport_test=tmp_path / "gpu_transport_v2_test",
             case_root=prepared_case_root,
             raw_root=raw_root,
             reports_root=reports_root,
@@ -595,6 +596,7 @@ def test_executor_persists_raw_outputs_and_diagnostics_before_numerical_rejectio
     with _raises(ValueError):
         execute_representative(
             runner=tmp_path / "runner",
+            gpu_transport_test=tmp_path / "gpu_transport_v2_test",
             case_root=prepared_case_root,
             raw_root=raw_root,
             reports_root=reports_root,
