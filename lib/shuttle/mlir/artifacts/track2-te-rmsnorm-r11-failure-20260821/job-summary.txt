@@ -1,0 +1,20 @@
+warning: The `extra-build-dependencies` option is experimental and may change without warning. Pass `--preview-features extra-build-dependencies` to disable this warning.
+I20260821 10:23:06 8418467456 iris.cluster.config Loading config from lib/iris/config/cw-rno2a.yaml
+I20260821 10:23:06 8418467456 iris.cli.connect Establishing tunnel to controller...
+I20260821 10:23:07 8418467456 iris.cluster.platforms.k8s.service Tunnel ready: 127.0.0.1:10003 -> iris-controller-svc:10000
+Job: /dlwh/shuttle-track2-te-h100-r11 (/dlwh/shuttle-track2-te-h100-r11)
+State: failed  exit=0  failures=1  preemptions=0
+Tasks: 0/1 completed  failed=1
+Error: mix64_v2","max_absolute_error":0.0,"max_absolute_error_index":0,"max_absolute_error_repeat0":0.85546875,"max_absolute_error_repeat1":0.85546875,"max_bfloat16_ulp":0,"mismatch_count":0,"producer":"ordinary_jax_xla","raw_output_files":["/tmp/shuttle-track2-te-h100/raw/policy-ordinary_jax_xla-heldout_splitmix64_v2-composed-repeat0-outputs/dx.bf16","/tmp/shuttle-track2-te-h100/raw/policy-ordinary_jax_xla-heldout_splitmix64_v2-composed-repeat1-outputs/dx.bf16"],"repeat0_digest":"8065c9ffb21b828bc67acfc188d3f22d1f1ed845c02ce2a47a82ee700ed50284","repeat1_digest":"8065c9ffb21b828bc67acfc188d3f22d1f1ed845c02ce2a47a82ee700ed50284","role":"dx"},{"boundary":"composed","first_mismatch_index":0,"first_mismatch_repeat0":-48.5,"first_mismatch_repeat1":-48.5,"input_pattern":"heldout_splitmix64_v2","max_absolute_error":0.0,"max_absolute_error_index":0,"max_absolute_error_repeat0":-48.5,"max_absolute_error_repeat1":-48.5,"max_bfloat16_ulp":0,"mismatch_count":0,"producer":"ordinary_jax_xla","raw_output_files":["/tmp/shuttle-track2-te-h100/raw/policy-ordinary_jax_xla-heldout_splitmix64_v2-composed-repeat0-outputs/dgamma.bf16","/tmp/shuttle-track2-te-h100/raw/policy-ordinary_jax_xla-heldout_splitmix64_v2-composed-repeat1-outputs/dgamma.bf16"],"repeat0_digest":"4f6b8e22de67a1b0ccf5b8cd3946960c11b6117ff4d84ff2b39bbcbeef2657fd","repeat1_digest":"4f6b8e22de67a1b0ccf5b8cd3946960c11b6117ff4d84ff2b39bbcbeef2657fd","role":"dgamma"}],"schema":"shuttle_abi22_rmsnorm_repeat_diagnostics_v3"}
+
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/lib/shuttle/mlir/jax_patch/track2_te_h100_batch.py", line 941, in execute_oracle_v3
+    qualification = validate_policy_v3_evidence(raw_policy)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/lib/shuttle/mlir/jax_patch/abi22_te_rmsnorm_oracle_v2.py", line 1551, in validate_policy_v3_evidence
+    raise ValueError("qualification repeat output digest drifted")
+ValueError: qualification repeat output digest drifted
+
+
+  TASK  STATE      EXIT  DURATION                     PEAK MEM    CUR MEM    ERROR
+     0  failed        1  5 minutes and 18.68 seconds  -           -          mix64_v2","max_absolute_error":0.0,"max_absolute_e...

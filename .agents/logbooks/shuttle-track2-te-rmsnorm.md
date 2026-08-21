@@ -31,13 +31,27 @@ author: dlwh
   relative error was small.
 - A reviewed v2 proposal keeps whole-output absolute error and applies ULP only
   where `abs(reference) >= 2 * atol`. The untouched
-  `heldout_splitmix64_v1` bytes and digests are frozen but unexecuted.
+  `heldout_splitmix64_v1` bytes and digests were frozen before r10.
+- r10 rejected that SplitMix input: both providers produced `y` maximum
+  absolute error `0.015625` against the frozen `0.0078125` limit. Its complete
+  36-cell raw policy report is now durable qualification evidence.
+- r11 rejected the v3 run on exact repeatability. Ordinary-JAX/XLA composed
+  `dx` on the qualification linspace changed at three BF16 elements between
+  repeats. The untouched v3 acceptance pattern was repeatable and within its
+  numerical limits, but the required global qualification gate failed.
 
 ## Negative results index
 
 - `T2-TE-002`: r9 rejected the reversed held-out input and exposed missing raw
   artifact durability. Evidence:
   [`track2-te-rmsnorm-r9-failure-20260821`](../../lib/shuttle/mlir/artifacts/track2-te-rmsnorm-r9-failure-20260821/README.md).
+- `T2-TE-004`: r10 rejected the SplitMix v2 acceptance input and exposed
+  ordinary-JAX composed repeat nondeterminism in three role coordinates.
+  Evidence:
+  [`track2-te-rmsnorm-r10-failure-20260821`](../../lib/shuttle/mlir/artifacts/track2-te-rmsnorm-r10-failure-20260821/README.md).
+- `T2-TE-006`: r11 rejected the v3 matrix on one qualification repeat
+  coordinate. Evidence:
+  [`track2-te-rmsnorm-r11-failure-20260821`](../../lib/shuttle/mlir/artifacts/track2-te-rmsnorm-r11-failure-20260821/README.md).
 
 ## Entry log
 
@@ -113,3 +127,61 @@ author: dlwh
 - Next action: implement the v2 schema red-first, persist raw outputs before
   validation, review the exact request, then run one fresh batch-priority H100
   job. No hardware run is authorized by this entry.
+
+### 2026-08-21 09:14 - T2-TE-004 r10 SplitMix rejection
+
+- Hypothesis: the reviewed four-metric v2 policy would accept the untouched
+  `heldout_splitmix64_v1` input while preserving exact per-coordinate repeat
+  digests.
+- Commit Hash: source `721e1edca6d205c92df6101f542b93972525b4ac`, tree
+  `ebf6d299fdad77eef235bcbb5fbac53e4a2adf4c`.
+- Command: sealed Iris job `/dlwh/shuttle-track2-te-h100-r10`, request SHA-256
+  `c967d0905613c2527b71f0dffaeae727688ff9b9c3449b80f326ec71f62faa75`.
+- Config: one H100, batch priority, one replica, zero failure/preemption/task
+  retry budgets; exact TE 2.17 and ordinary-JAX/XLA providers; RMSNorm
+  `[2048,4096]`; epsilon `1e-6`; F/B/C; two repeats over three patterns.
+- Result: hypothesis rejected. Both providers measured `y`
+  `max_absolute_error=0.015625` against the frozen `0.0078125` limit in
+  forward and composed execution for both repeats. The task failed with exit
+  1, one task failure, and zero preemptions. All 36 raw cells were printed and
+  recovered.
+- Interpretation: above-floor ULP geometry cannot replace below-floor absolute
+  protection. Ordinary-JAX composed output digests also differed across
+  repeats for qualification-linspace `dx` and SplitMix `y` and `dx`, with
+  identical inputs, references, and call provenance. Element mismatch counts
+  and pairwise repeat errors are unrecoverable because XLA arrays were not
+  persisted. Repeatability remains a required gate.
+- Next action: retain r7, r9, and r10 as qualification-only evidence. Review a
+  scale-consistent v3 policy with a distinct low-tail gate and freeze a fourth
+  untouched input before any hardware execution.
+- Artifact:
+  [`track2-te-rmsnorm-r10-failure-20260821`](../../lib/shuttle/mlir/artifacts/track2-te-rmsnorm-r10-failure-20260821/README.md).
+
+### 2026-08-21 10:19 - T2-TE-006 r11 v3 repeatability rejection
+
+- Hypothesis: the reviewed piecewise v3 policy and untouched
+  `heldout_splitmix64_v2` input would pass all numerical and exact-repeat gates.
+- Commit Hash: source `e887fd2a726bb8ea46eaf93474d41485495d96af`, tree
+  `0ca4071807bf9ae607dfae8fda49e622691ddb4f`.
+- Command: sealed Iris job `/dlwh/shuttle-track2-te-h100-r11`, request SHA-256
+  `b616757fb0e3d4102f6b788d874341c4a8a09cf9f834c15afe650accc733c658`.
+- Config: one H100, batch priority, one replica, zero failure/preemption/task
+  retry budgets; exact TE 2.17 and ordinary-JAX/XLA providers; RMSNorm
+  `[2048,4096]`; epsilon `1e-6`; F/B/C; two repeats over four patterns.
+- Result: hypothesis rejected. Ordinary-JAX/XLA composed `dx` on
+  `qualification_linspace_v2` differed at three BF16 elements. The largest
+  repeat difference was one ULP (`2.384185791015625e-7`) at flat index
+  `4380678`. The task failed with exit 1, one task failure, and zero
+  preemptions. Complete raw policy and repeat diagnostics were recovered from
+  the pre-validation log records.
+- Interpretation: the two offending cells have identical input/reference
+  provenance and call sequence, so the failure is output nondeterminism rather
+  than input drift. All 12 repeat coordinates for the untouched SplitMix v2
+  acceptance pattern matched exactly and its individual numerical metrics were
+  within the frozen role limits. The global repeat requirement still rejects
+  r11, so neither numerical acceptance nor performance is promoted.
+- Next action: preserve r11 as qualification evidence. Do not widen the policy
+  or submit a replacement run without a separately reviewed change to the
+  repeatability hypothesis.
+- Artifact:
+  [`track2-te-rmsnorm-r11-failure-20260821`](../../lib/shuttle/mlir/artifacts/track2-te-rmsnorm-r11-failure-20260821/README.md).

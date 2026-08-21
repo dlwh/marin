@@ -1,0 +1,4797 @@
+{
+  "cells": [
+    {
+      "boundary": "forward",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "gamma": "e90137a7f830b75f00ee6dae7c89bbd7fba30dfb31ff7951fec129441c170821",
+        "x": "0f3b7cfa2054631d63038001deb298b086d0c2baffeaddd6082c4518df91e13c"
+      },
+      "input_pattern": "qualification_linspace_v2",
+      "outputs": [
+        {
+          "absolute_floor": 0.015625,
+          "all_finite": true,
+          "below_floor_count": 162992,
+          "digest": "75e99e9ddc07b64b025b04da0c2ac6eebb0c78e5ea22af107378867590ab0c8e",
+          "eligible_count": 8225616,
+          "max_absolute_error": 0.00390625,
+          "max_absolute_error_above_floor": 0.00390625,
+          "max_absolute_error_below_floor": 6.103515625e-05,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007299270015209913,
+          "mean_absolute_error": 2.3333996068686247e-08,
+          "raw_max_bfloat16_ulp_actual": -0.11181640625,
+          "raw_max_bfloat16_ulp_index": 292674,
+          "raw_max_bfloat16_ulp_reference": -0.1123046875,
+          "reference_digest": "85924a7a28e8edb0a21aff788016315a0b804465ae04cac79c69517ff7c71284",
+          "role": "y"
+        }
+      ],
+      "producer": "transformer_engine_2_17",
+      "repeat": 0,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 17033.0,
+        "raw_cuda_event_ns": [
+          18976,
+          14464,
+          14304,
+          16192,
+          14208,
+          14528,
+          14240,
+          15936,
+          14720,
+          14208,
+          15168,
+          14688,
+          13824,
+          14080,
+          14784,
+          14304,
+          14208,
+          16672,
+          14144,
+          14784
+        ],
+        "raw_host_blocking_ns": [
+          17939,
+          17092,
+          17456,
+          16811,
+          16763,
+          16854,
+          17014,
+          33420,
+          17258,
+          17009,
+          16480,
+          16931,
+          17017,
+          17073,
+          16889,
+          17356,
+          17164,
+          17049,
+          16602,
+          17504
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "forward",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "gamma": "e90137a7f830b75f00ee6dae7c89bbd7fba30dfb31ff7951fec129441c170821",
+        "x": "0f3b7cfa2054631d63038001deb298b086d0c2baffeaddd6082c4518df91e13c"
+      },
+      "input_pattern": "qualification_linspace_v2",
+      "outputs": [
+        {
+          "absolute_floor": 0.015625,
+          "all_finite": true,
+          "below_floor_count": 162992,
+          "digest": "75e99e9ddc07b64b025b04da0c2ac6eebb0c78e5ea22af107378867590ab0c8e",
+          "eligible_count": 8225616,
+          "max_absolute_error": 0.00390625,
+          "max_absolute_error_above_floor": 0.00390625,
+          "max_absolute_error_below_floor": 6.103515625e-05,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007299270015209913,
+          "mean_absolute_error": 2.3333996068686247e-08,
+          "raw_max_bfloat16_ulp_actual": -0.11181640625,
+          "raw_max_bfloat16_ulp_index": 292674,
+          "raw_max_bfloat16_ulp_reference": -0.1123046875,
+          "reference_digest": "85924a7a28e8edb0a21aff788016315a0b804465ae04cac79c69517ff7c71284",
+          "role": "y"
+        }
+      ],
+      "producer": "transformer_engine_2_17",
+      "repeat": 1,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 17798.5,
+        "raw_cuda_event_ns": [
+          20544,
+          15552,
+          15520,
+          14656,
+          14752,
+          15872,
+          14688,
+          15104,
+          15232,
+          15424,
+          14848,
+          15872,
+          14720,
+          14944,
+          15360,
+          14752,
+          14496,
+          15520,
+          15008,
+          14880
+        ],
+        "raw_host_blocking_ns": [
+          18140,
+          17142,
+          18066,
+          17320,
+          17508,
+          17551,
+          18020,
+          17152,
+          17859,
+          18076,
+          17893,
+          17140,
+          17877,
+          17603,
+          17811,
+          17734,
+          17516,
+          18160,
+          17786,
+          17955
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "backward_recompute",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward_to_private_rsigma",
+          "rmsnorm_backward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "dy": "275b6bb7bf115e9110a4403637863cd0a3f0fb2cbb7b18ac9de05560db5a154c",
+        "gamma": "e90137a7f830b75f00ee6dae7c89bbd7fba30dfb31ff7951fec129441c170821",
+        "x": "0f3b7cfa2054631d63038001deb298b086d0c2baffeaddd6082c4518df91e13c"
+      },
+      "input_pattern": "qualification_linspace_v2",
+      "outputs": [
+        {
+          "absolute_floor": 0.125,
+          "all_finite": true,
+          "below_floor_count": 1864961,
+          "digest": "0ab4011f4ddb9e0a86a469f18d50fa3e9285ec9df58bf9dda711a15638f54994",
+          "eligible_count": 6523647,
+          "max_absolute_error": 0.03125,
+          "max_absolute_error_above_floor": 0.03125,
+          "max_absolute_error_below_floor": 0.00048828125,
+          "max_bfloat16_ulp": 35,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007246376946568489,
+          "mean_absolute_error": 6.235485727756895e-08,
+          "raw_max_bfloat16_ulp_actual": 4.880130290985107e-07,
+          "raw_max_bfloat16_ulp_index": 7837695,
+          "raw_max_bfloat16_ulp_reference": 4.172325134277344e-07,
+          "reference_digest": "b832dffb3e31d5e5639c2e272bbd9e74cc5ec3a664298b02604448628c0fbdab",
+          "role": "dx"
+        },
+        {
+          "absolute_floor": 0.03125,
+          "all_finite": true,
+          "below_floor_count": 0,
+          "digest": "7e8e78fc4dad00d99b614018ae47cfe67162a859cc10bab79c2c2b0ca73746b3",
+          "eligible_count": 4096,
+          "max_absolute_error": 0.0,
+          "max_absolute_error_above_floor": 0.0,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 0,
+          "max_bfloat16_ulp_above_absolute_floor": 0,
+          "max_relative_error_above_absolute_floor": 0.0,
+          "mean_absolute_error": 0.0,
+          "raw_max_bfloat16_ulp_actual": 876.0,
+          "raw_max_bfloat16_ulp_index": 0,
+          "raw_max_bfloat16_ulp_reference": 876.0,
+          "reference_digest": "7e8e78fc4dad00d99b614018ae47cfe67162a859cc10bab79c2c2b0ca73746b3",
+          "role": "dgamma"
+        }
+      ],
+      "producer": "transformer_engine_2_17",
+      "repeat": 0,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 51044.5,
+        "raw_cuda_event_ns": [
+          55872,
+          47040,
+          47552,
+          48512,
+          46976,
+          45952,
+          46528,
+          47424,
+          48224,
+          47424,
+          48544,
+          46880,
+          48352,
+          47744,
+          46432,
+          48000,
+          48064,
+          47904,
+          47200,
+          47456
+        ],
+        "raw_host_blocking_ns": [
+          54178,
+          50788,
+          50379,
+          51117,
+          51610,
+          50531,
+          50698,
+          52099,
+          50494,
+          51455,
+          51546,
+          51269,
+          50315,
+          51399,
+          49969,
+          51020,
+          50175,
+          51069,
+          50016,
+          51697
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "backward_recompute",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward_to_private_rsigma",
+          "rmsnorm_backward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "dy": "275b6bb7bf115e9110a4403637863cd0a3f0fb2cbb7b18ac9de05560db5a154c",
+        "gamma": "e90137a7f830b75f00ee6dae7c89bbd7fba30dfb31ff7951fec129441c170821",
+        "x": "0f3b7cfa2054631d63038001deb298b086d0c2baffeaddd6082c4518df91e13c"
+      },
+      "input_pattern": "qualification_linspace_v2",
+      "outputs": [
+        {
+          "absolute_floor": 0.125,
+          "all_finite": true,
+          "below_floor_count": 1864961,
+          "digest": "0ab4011f4ddb9e0a86a469f18d50fa3e9285ec9df58bf9dda711a15638f54994",
+          "eligible_count": 6523647,
+          "max_absolute_error": 0.03125,
+          "max_absolute_error_above_floor": 0.03125,
+          "max_absolute_error_below_floor": 0.00048828125,
+          "max_bfloat16_ulp": 35,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007246376946568489,
+          "mean_absolute_error": 6.235485727756895e-08,
+          "raw_max_bfloat16_ulp_actual": 4.880130290985107e-07,
+          "raw_max_bfloat16_ulp_index": 7837695,
+          "raw_max_bfloat16_ulp_reference": 4.172325134277344e-07,
+          "reference_digest": "b832dffb3e31d5e5639c2e272bbd9e74cc5ec3a664298b02604448628c0fbdab",
+          "role": "dx"
+        },
+        {
+          "absolute_floor": 0.03125,
+          "all_finite": true,
+          "below_floor_count": 0,
+          "digest": "7e8e78fc4dad00d99b614018ae47cfe67162a859cc10bab79c2c2b0ca73746b3",
+          "eligible_count": 4096,
+          "max_absolute_error": 0.0,
+          "max_absolute_error_above_floor": 0.0,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 0,
+          "max_bfloat16_ulp_above_absolute_floor": 0,
+          "max_relative_error_above_absolute_floor": 0.0,
+          "mean_absolute_error": 0.0,
+          "raw_max_bfloat16_ulp_actual": 876.0,
+          "raw_max_bfloat16_ulp_index": 0,
+          "raw_max_bfloat16_ulp_reference": 876.0,
+          "reference_digest": "7e8e78fc4dad00d99b614018ae47cfe67162a859cc10bab79c2c2b0ca73746b3",
+          "role": "dgamma"
+        }
+      ],
+      "producer": "transformer_engine_2_17",
+      "repeat": 1,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 50537.5,
+        "raw_cuda_event_ns": [
+          54560,
+          47872,
+          48192,
+          46432,
+          47136,
+          46720,
+          45984,
+          46400,
+          46144,
+          47296,
+          82528,
+          46336,
+          48096,
+          46912,
+          46560,
+          46304,
+          47936,
+          46592,
+          48352,
+          47616
+        ],
+        "raw_host_blocking_ns": [
+          52024,
+          50139,
+          55085,
+          49647,
+          49102,
+          50365,
+          49588,
+          50405,
+          49790,
+          50622,
+          50490,
+          50742,
+          51601,
+          49251,
+          50876,
+          49975,
+          50594,
+          50628,
+          51066,
+          50585
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "composed",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward_to_public_y_and_private_rsigma",
+          "rmsnorm_backward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "dy": "275b6bb7bf115e9110a4403637863cd0a3f0fb2cbb7b18ac9de05560db5a154c",
+        "gamma": "e90137a7f830b75f00ee6dae7c89bbd7fba30dfb31ff7951fec129441c170821",
+        "x": "0f3b7cfa2054631d63038001deb298b086d0c2baffeaddd6082c4518df91e13c"
+      },
+      "input_pattern": "qualification_linspace_v2",
+      "outputs": [
+        {
+          "absolute_floor": 0.015625,
+          "all_finite": true,
+          "below_floor_count": 162992,
+          "digest": "75e99e9ddc07b64b025b04da0c2ac6eebb0c78e5ea22af107378867590ab0c8e",
+          "eligible_count": 8225616,
+          "max_absolute_error": 0.00390625,
+          "max_absolute_error_above_floor": 0.00390625,
+          "max_absolute_error_below_floor": 6.103515625e-05,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007299270015209913,
+          "mean_absolute_error": 2.3333996068686247e-08,
+          "raw_max_bfloat16_ulp_actual": -0.11181640625,
+          "raw_max_bfloat16_ulp_index": 292674,
+          "raw_max_bfloat16_ulp_reference": -0.1123046875,
+          "reference_digest": "85924a7a28e8edb0a21aff788016315a0b804465ae04cac79c69517ff7c71284",
+          "role": "y"
+        },
+        {
+          "absolute_floor": 0.125,
+          "all_finite": true,
+          "below_floor_count": 1864961,
+          "digest": "0ab4011f4ddb9e0a86a469f18d50fa3e9285ec9df58bf9dda711a15638f54994",
+          "eligible_count": 6523647,
+          "max_absolute_error": 0.03125,
+          "max_absolute_error_above_floor": 0.03125,
+          "max_absolute_error_below_floor": 0.00048828125,
+          "max_bfloat16_ulp": 35,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007246376946568489,
+          "mean_absolute_error": 6.235485727756895e-08,
+          "raw_max_bfloat16_ulp_actual": 4.880130290985107e-07,
+          "raw_max_bfloat16_ulp_index": 7837695,
+          "raw_max_bfloat16_ulp_reference": 4.172325134277344e-07,
+          "reference_digest": "b832dffb3e31d5e5639c2e272bbd9e74cc5ec3a664298b02604448628c0fbdab",
+          "role": "dx"
+        },
+        {
+          "absolute_floor": 0.03125,
+          "all_finite": true,
+          "below_floor_count": 0,
+          "digest": "7e8e78fc4dad00d99b614018ae47cfe67162a859cc10bab79c2c2b0ca73746b3",
+          "eligible_count": 4096,
+          "max_absolute_error": 0.0,
+          "max_absolute_error_above_floor": 0.0,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 0,
+          "max_bfloat16_ulp_above_absolute_floor": 0,
+          "max_relative_error_above_absolute_floor": 0.0,
+          "mean_absolute_error": 0.0,
+          "raw_max_bfloat16_ulp_actual": 876.0,
+          "raw_max_bfloat16_ulp_index": 0,
+          "raw_max_bfloat16_ulp_reference": 876.0,
+          "reference_digest": "7e8e78fc4dad00d99b614018ae47cfe67162a859cc10bab79c2c2b0ca73746b3",
+          "role": "dgamma"
+        }
+      ],
+      "producer": "transformer_engine_2_17",
+      "repeat": 0,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 49769.0,
+        "raw_cuda_event_ns": [
+          51840,
+          47008,
+          47232,
+          46208,
+          46688,
+          44384,
+          46912,
+          46784,
+          48352,
+          45600,
+          45824,
+          46656,
+          46848,
+          45120,
+          46144,
+          45824,
+          46464,
+          46784,
+          47104,
+          46752
+        ],
+        "raw_host_blocking_ns": [
+          49839,
+          48925,
+          48545,
+          49672,
+          49193,
+          48978,
+          50758,
+          50734,
+          50010,
+          50894,
+          49632,
+          49493,
+          49466,
+          49699,
+          51223,
+          49106,
+          50663,
+          57018,
+          51307,
+          50375
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "composed",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward_to_public_y_and_private_rsigma",
+          "rmsnorm_backward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "dy": "275b6bb7bf115e9110a4403637863cd0a3f0fb2cbb7b18ac9de05560db5a154c",
+        "gamma": "e90137a7f830b75f00ee6dae7c89bbd7fba30dfb31ff7951fec129441c170821",
+        "x": "0f3b7cfa2054631d63038001deb298b086d0c2baffeaddd6082c4518df91e13c"
+      },
+      "input_pattern": "qualification_linspace_v2",
+      "outputs": [
+        {
+          "absolute_floor": 0.015625,
+          "all_finite": true,
+          "below_floor_count": 162992,
+          "digest": "75e99e9ddc07b64b025b04da0c2ac6eebb0c78e5ea22af107378867590ab0c8e",
+          "eligible_count": 8225616,
+          "max_absolute_error": 0.00390625,
+          "max_absolute_error_above_floor": 0.00390625,
+          "max_absolute_error_below_floor": 6.103515625e-05,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007299270015209913,
+          "mean_absolute_error": 2.3333996068686247e-08,
+          "raw_max_bfloat16_ulp_actual": -0.11181640625,
+          "raw_max_bfloat16_ulp_index": 292674,
+          "raw_max_bfloat16_ulp_reference": -0.1123046875,
+          "reference_digest": "85924a7a28e8edb0a21aff788016315a0b804465ae04cac79c69517ff7c71284",
+          "role": "y"
+        },
+        {
+          "absolute_floor": 0.125,
+          "all_finite": true,
+          "below_floor_count": 1864961,
+          "digest": "0ab4011f4ddb9e0a86a469f18d50fa3e9285ec9df58bf9dda711a15638f54994",
+          "eligible_count": 6523647,
+          "max_absolute_error": 0.03125,
+          "max_absolute_error_above_floor": 0.03125,
+          "max_absolute_error_below_floor": 0.00048828125,
+          "max_bfloat16_ulp": 35,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007246376946568489,
+          "mean_absolute_error": 6.235485727756895e-08,
+          "raw_max_bfloat16_ulp_actual": 4.880130290985107e-07,
+          "raw_max_bfloat16_ulp_index": 7837695,
+          "raw_max_bfloat16_ulp_reference": 4.172325134277344e-07,
+          "reference_digest": "b832dffb3e31d5e5639c2e272bbd9e74cc5ec3a664298b02604448628c0fbdab",
+          "role": "dx"
+        },
+        {
+          "absolute_floor": 0.03125,
+          "all_finite": true,
+          "below_floor_count": 0,
+          "digest": "7e8e78fc4dad00d99b614018ae47cfe67162a859cc10bab79c2c2b0ca73746b3",
+          "eligible_count": 4096,
+          "max_absolute_error": 0.0,
+          "max_absolute_error_above_floor": 0.0,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 0,
+          "max_bfloat16_ulp_above_absolute_floor": 0,
+          "max_relative_error_above_absolute_floor": 0.0,
+          "mean_absolute_error": 0.0,
+          "raw_max_bfloat16_ulp_actual": 876.0,
+          "raw_max_bfloat16_ulp_index": 0,
+          "raw_max_bfloat16_ulp_reference": 876.0,
+          "reference_digest": "7e8e78fc4dad00d99b614018ae47cfe67162a859cc10bab79c2c2b0ca73746b3",
+          "role": "dgamma"
+        }
+      ],
+      "producer": "transformer_engine_2_17",
+      "repeat": 1,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 50686.5,
+        "raw_cuda_event_ns": [
+          54688,
+          47712,
+          49024,
+          47040,
+          47456,
+          45536,
+          47520,
+          46464,
+          48000,
+          46368,
+          46688,
+          46880,
+          46496,
+          46848,
+          47808,
+          46176,
+          48032,
+          48000,
+          48544,
+          47808
+        ],
+        "raw_host_blocking_ns": [
+          51098,
+          51059,
+          50616,
+          49622,
+          50356,
+          49817,
+          50332,
+          51066,
+          50974,
+          54320,
+          50690,
+          50683,
+          50660,
+          50628,
+          50627,
+          51679,
+          51113,
+          51280,
+          49552,
+          51475
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "forward",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "gamma": "bc3f6002b8b4c4718db1aeee0cf2b459c18ec80aa69958d2c8945be915a409d6",
+        "x": "595fc9c13633ba99278591d4288b9150b1d7c71eb17bd9c5f0d4720e1762ea8b"
+      },
+      "input_pattern": "heldout_reversed_linspace_v1",
+      "outputs": [
+        {
+          "absolute_floor": 0.015625,
+          "all_finite": true,
+          "below_floor_count": 153,
+          "digest": "c3076f63d0900c4dba2b35555d998ecfbcd61061f636908f2990b77c00ae8560",
+          "eligible_count": 8388455,
+          "max_absolute_error": 0.0078125,
+          "max_absolute_error_above_floor": 0.0078125,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.006369426846504211,
+          "mean_absolute_error": 3.655441105365753e-08,
+          "raw_max_bfloat16_ulp_actual": -1.234375,
+          "raw_max_bfloat16_ulp_index": 4702116,
+          "raw_max_bfloat16_ulp_reference": -1.2265625,
+          "reference_digest": "15a4e1660f2dc93b91841a0ac8c54c90372548a4b1269a09cc9c428cdc3e98f5",
+          "role": "y"
+        }
+      ],
+      "producer": "transformer_engine_2_17",
+      "repeat": 0,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 17278.0,
+        "raw_cuda_event_ns": [
+          18560,
+          14720,
+          14912,
+          14080,
+          14208,
+          15264,
+          15232,
+          15424,
+          14976,
+          14496,
+          14592,
+          15616,
+          15328,
+          14208,
+          15456,
+          13888,
+          14080,
+          15008,
+          14240,
+          14336
+        ],
+        "raw_host_blocking_ns": [
+          17928,
+          17506,
+          17306,
+          17137,
+          16971,
+          17002,
+          17523,
+          17421,
+          17735,
+          17854,
+          16483,
+          16712,
+          17413,
+          16686,
+          16618,
+          17250,
+          16928,
+          25215,
+          16737,
+          17397
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "forward",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "gamma": "bc3f6002b8b4c4718db1aeee0cf2b459c18ec80aa69958d2c8945be915a409d6",
+        "x": "595fc9c13633ba99278591d4288b9150b1d7c71eb17bd9c5f0d4720e1762ea8b"
+      },
+      "input_pattern": "heldout_reversed_linspace_v1",
+      "outputs": [
+        {
+          "absolute_floor": 0.015625,
+          "all_finite": true,
+          "below_floor_count": 153,
+          "digest": "c3076f63d0900c4dba2b35555d998ecfbcd61061f636908f2990b77c00ae8560",
+          "eligible_count": 8388455,
+          "max_absolute_error": 0.0078125,
+          "max_absolute_error_above_floor": 0.0078125,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.006369426846504211,
+          "mean_absolute_error": 3.655441105365753e-08,
+          "raw_max_bfloat16_ulp_actual": -1.234375,
+          "raw_max_bfloat16_ulp_index": 4702116,
+          "raw_max_bfloat16_ulp_reference": -1.2265625,
+          "reference_digest": "15a4e1660f2dc93b91841a0ac8c54c90372548a4b1269a09cc9c428cdc3e98f5",
+          "role": "y"
+        }
+      ],
+      "producer": "transformer_engine_2_17",
+      "repeat": 1,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 17551.5,
+        "raw_cuda_event_ns": [
+          18624,
+          15936,
+          15200,
+          14048,
+          14144,
+          17600,
+          15840,
+          15840,
+          14496,
+          14272,
+          14656,
+          15392,
+          14784,
+          14848,
+          24416,
+          14848,
+          14784,
+          15104,
+          14432,
+          14496
+        ],
+        "raw_host_blocking_ns": [
+          18610,
+          17446,
+          18008,
+          17388,
+          17498,
+          17805,
+          18093,
+          17225,
+          18146,
+          18207,
+          17035,
+          17559,
+          17544,
+          17001,
+          16864,
+          17826,
+          18324,
+          17445,
+          17472,
+          17820
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "backward_recompute",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward_to_private_rsigma",
+          "rmsnorm_backward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "dy": "237d26f9c6c048e5d3979da9e283aff46f062518d9a91ea5b74d2f8eaf80526d",
+        "gamma": "bc3f6002b8b4c4718db1aeee0cf2b459c18ec80aa69958d2c8945be915a409d6",
+        "x": "595fc9c13633ba99278591d4288b9150b1d7c71eb17bd9c5f0d4720e1762ea8b"
+      },
+      "input_pattern": "heldout_reversed_linspace_v1",
+      "outputs": [
+        {
+          "absolute_floor": 0.125,
+          "all_finite": true,
+          "below_floor_count": 2991355,
+          "digest": "5bf6740dc6f6f3ae389a9484805ae376dcf4e13af5ef2327c92911e09be36fdf",
+          "eligible_count": 5397253,
+          "max_absolute_error": 0.0078125,
+          "max_absolute_error_above_floor": 0.0078125,
+          "max_absolute_error_below_floor": 0.00048828125,
+          "max_bfloat16_ulp": 283,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.006849315017461777,
+          "mean_absolute_error": 9.758579722074501e-08,
+          "raw_max_bfloat16_ulp_actual": 6.472691893577576e-08,
+          "raw_max_bfloat16_ulp_index": 460791,
+          "raw_max_bfloat16_ulp_reference": 3.0919909477233887e-07,
+          "reference_digest": "d5e6be3d8cf52e4139235b9dde69a84db489a705580a376f08a613eb7beeab9a",
+          "role": "dx"
+        },
+        {
+          "absolute_floor": 0.03125,
+          "all_finite": true,
+          "below_floor_count": 0,
+          "digest": "06498bae527509f636aae0baa0b247e657e5f6dc1f7453cf3279e53db90664e0",
+          "eligible_count": 4096,
+          "max_absolute_error": 0.0,
+          "max_absolute_error_above_floor": 0.0,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 0,
+          "max_bfloat16_ulp_above_absolute_floor": 0,
+          "max_relative_error_above_absolute_floor": 0.0,
+          "mean_absolute_error": 0.0,
+          "raw_max_bfloat16_ulp_actual": -860.0,
+          "raw_max_bfloat16_ulp_index": 0,
+          "raw_max_bfloat16_ulp_reference": -860.0,
+          "reference_digest": "06498bae527509f636aae0baa0b247e657e5f6dc1f7453cf3279e53db90664e0",
+          "role": "dgamma"
+        }
+      ],
+      "producer": "transformer_engine_2_17",
+      "repeat": 0,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 50040.5,
+        "raw_cuda_event_ns": [
+          52896,
+          47968,
+          48288,
+          46368,
+          47072,
+          45888,
+          46592,
+          46272,
+          48608,
+          45792,
+          46496,
+          46752,
+          47328,
+          45792,
+          46112,
+          46272,
+          45856,
+          47712,
+          47520,
+          47616
+        ],
+        "raw_host_blocking_ns": [
+          50695,
+          49798,
+          50209,
+          48949,
+          50324,
+          49560,
+          50474,
+          49681,
+          61255,
+          50255,
+          49961,
+          49157,
+          48728,
+          50120,
+          49740,
+          51044,
+          50125,
+          49456,
+          48923,
+          50209
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "backward_recompute",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward_to_private_rsigma",
+          "rmsnorm_backward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "dy": "237d26f9c6c048e5d3979da9e283aff46f062518d9a91ea5b74d2f8eaf80526d",
+        "gamma": "bc3f6002b8b4c4718db1aeee0cf2b459c18ec80aa69958d2c8945be915a409d6",
+        "x": "595fc9c13633ba99278591d4288b9150b1d7c71eb17bd9c5f0d4720e1762ea8b"
+      },
+      "input_pattern": "heldout_reversed_linspace_v1",
+      "outputs": [
+        {
+          "absolute_floor": 0.125,
+          "all_finite": true,
+          "below_floor_count": 2991355,
+          "digest": "5bf6740dc6f6f3ae389a9484805ae376dcf4e13af5ef2327c92911e09be36fdf",
+          "eligible_count": 5397253,
+          "max_absolute_error": 0.0078125,
+          "max_absolute_error_above_floor": 0.0078125,
+          "max_absolute_error_below_floor": 0.00048828125,
+          "max_bfloat16_ulp": 283,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.006849315017461777,
+          "mean_absolute_error": 9.758579722074501e-08,
+          "raw_max_bfloat16_ulp_actual": 6.472691893577576e-08,
+          "raw_max_bfloat16_ulp_index": 460791,
+          "raw_max_bfloat16_ulp_reference": 3.0919909477233887e-07,
+          "reference_digest": "d5e6be3d8cf52e4139235b9dde69a84db489a705580a376f08a613eb7beeab9a",
+          "role": "dx"
+        },
+        {
+          "absolute_floor": 0.03125,
+          "all_finite": true,
+          "below_floor_count": 0,
+          "digest": "06498bae527509f636aae0baa0b247e657e5f6dc1f7453cf3279e53db90664e0",
+          "eligible_count": 4096,
+          "max_absolute_error": 0.0,
+          "max_absolute_error_above_floor": 0.0,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 0,
+          "max_bfloat16_ulp_above_absolute_floor": 0,
+          "max_relative_error_above_absolute_floor": 0.0,
+          "mean_absolute_error": 0.0,
+          "raw_max_bfloat16_ulp_actual": -860.0,
+          "raw_max_bfloat16_ulp_index": 0,
+          "raw_max_bfloat16_ulp_reference": -860.0,
+          "reference_digest": "06498bae527509f636aae0baa0b247e657e5f6dc1f7453cf3279e53db90664e0",
+          "role": "dgamma"
+        }
+      ],
+      "producer": "transformer_engine_2_17",
+      "repeat": 1,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 50145.0,
+        "raw_cuda_event_ns": [
+          53760,
+          48000,
+          46816,
+          47552,
+          46784,
+          46880,
+          46720,
+          45664,
+          48064,
+          45856,
+          48256,
+          46240,
+          47904,
+          46080,
+          46752,
+          46496,
+          45696,
+          48352,
+          47008,
+          46944
+        ],
+        "raw_host_blocking_ns": [
+          55504,
+          49321,
+          50138,
+          50027,
+          49129,
+          49693,
+          50297,
+          50475,
+          49686,
+          50187,
+          48585,
+          49811,
+          50031,
+          50382,
+          51298,
+          50233,
+          50152,
+          50425,
+          49481,
+          50261
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "composed",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward_to_public_y_and_private_rsigma",
+          "rmsnorm_backward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "dy": "237d26f9c6c048e5d3979da9e283aff46f062518d9a91ea5b74d2f8eaf80526d",
+        "gamma": "bc3f6002b8b4c4718db1aeee0cf2b459c18ec80aa69958d2c8945be915a409d6",
+        "x": "595fc9c13633ba99278591d4288b9150b1d7c71eb17bd9c5f0d4720e1762ea8b"
+      },
+      "input_pattern": "heldout_reversed_linspace_v1",
+      "outputs": [
+        {
+          "absolute_floor": 0.015625,
+          "all_finite": true,
+          "below_floor_count": 153,
+          "digest": "c3076f63d0900c4dba2b35555d998ecfbcd61061f636908f2990b77c00ae8560",
+          "eligible_count": 8388455,
+          "max_absolute_error": 0.0078125,
+          "max_absolute_error_above_floor": 0.0078125,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.006369426846504211,
+          "mean_absolute_error": 3.655441105365753e-08,
+          "raw_max_bfloat16_ulp_actual": -1.234375,
+          "raw_max_bfloat16_ulp_index": 4702116,
+          "raw_max_bfloat16_ulp_reference": -1.2265625,
+          "reference_digest": "15a4e1660f2dc93b91841a0ac8c54c90372548a4b1269a09cc9c428cdc3e98f5",
+          "role": "y"
+        },
+        {
+          "absolute_floor": 0.125,
+          "all_finite": true,
+          "below_floor_count": 2991355,
+          "digest": "5bf6740dc6f6f3ae389a9484805ae376dcf4e13af5ef2327c92911e09be36fdf",
+          "eligible_count": 5397253,
+          "max_absolute_error": 0.0078125,
+          "max_absolute_error_above_floor": 0.0078125,
+          "max_absolute_error_below_floor": 0.00048828125,
+          "max_bfloat16_ulp": 283,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.006849315017461777,
+          "mean_absolute_error": 9.758579722074501e-08,
+          "raw_max_bfloat16_ulp_actual": 6.472691893577576e-08,
+          "raw_max_bfloat16_ulp_index": 460791,
+          "raw_max_bfloat16_ulp_reference": 3.0919909477233887e-07,
+          "reference_digest": "d5e6be3d8cf52e4139235b9dde69a84db489a705580a376f08a613eb7beeab9a",
+          "role": "dx"
+        },
+        {
+          "absolute_floor": 0.03125,
+          "all_finite": true,
+          "below_floor_count": 0,
+          "digest": "06498bae527509f636aae0baa0b247e657e5f6dc1f7453cf3279e53db90664e0",
+          "eligible_count": 4096,
+          "max_absolute_error": 0.0,
+          "max_absolute_error_above_floor": 0.0,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 0,
+          "max_bfloat16_ulp_above_absolute_floor": 0,
+          "max_relative_error_above_absolute_floor": 0.0,
+          "mean_absolute_error": 0.0,
+          "raw_max_bfloat16_ulp_actual": -860.0,
+          "raw_max_bfloat16_ulp_index": 0,
+          "raw_max_bfloat16_ulp_reference": -860.0,
+          "reference_digest": "06498bae527509f636aae0baa0b247e657e5f6dc1f7453cf3279e53db90664e0",
+          "role": "dgamma"
+        }
+      ],
+      "producer": "transformer_engine_2_17",
+      "repeat": 0,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 50189.0,
+        "raw_cuda_event_ns": [
+          54816,
+          49600,
+          47616,
+          47744,
+          45984,
+          47936,
+          47136,
+          47392,
+          48640,
+          45440,
+          46912,
+          45984,
+          49056,
+          46880,
+          46240,
+          47328,
+          47936,
+          48224,
+          47104,
+          47456
+        ],
+        "raw_host_blocking_ns": [
+          56798,
+          50262,
+          50507,
+          50393,
+          50405,
+          49676,
+          51186,
+          50506,
+          49806,
+          51770,
+          50116,
+          50477,
+          49713,
+          49525,
+          49148,
+          49286,
+          50104,
+          50003,
+          49800,
+          51890
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "composed",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward_to_public_y_and_private_rsigma",
+          "rmsnorm_backward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "dy": "237d26f9c6c048e5d3979da9e283aff46f062518d9a91ea5b74d2f8eaf80526d",
+        "gamma": "bc3f6002b8b4c4718db1aeee0cf2b459c18ec80aa69958d2c8945be915a409d6",
+        "x": "595fc9c13633ba99278591d4288b9150b1d7c71eb17bd9c5f0d4720e1762ea8b"
+      },
+      "input_pattern": "heldout_reversed_linspace_v1",
+      "outputs": [
+        {
+          "absolute_floor": 0.015625,
+          "all_finite": true,
+          "below_floor_count": 153,
+          "digest": "c3076f63d0900c4dba2b35555d998ecfbcd61061f636908f2990b77c00ae8560",
+          "eligible_count": 8388455,
+          "max_absolute_error": 0.0078125,
+          "max_absolute_error_above_floor": 0.0078125,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.006369426846504211,
+          "mean_absolute_error": 3.655441105365753e-08,
+          "raw_max_bfloat16_ulp_actual": -1.234375,
+          "raw_max_bfloat16_ulp_index": 4702116,
+          "raw_max_bfloat16_ulp_reference": -1.2265625,
+          "reference_digest": "15a4e1660f2dc93b91841a0ac8c54c90372548a4b1269a09cc9c428cdc3e98f5",
+          "role": "y"
+        },
+        {
+          "absolute_floor": 0.125,
+          "all_finite": true,
+          "below_floor_count": 2991355,
+          "digest": "5bf6740dc6f6f3ae389a9484805ae376dcf4e13af5ef2327c92911e09be36fdf",
+          "eligible_count": 5397253,
+          "max_absolute_error": 0.0078125,
+          "max_absolute_error_above_floor": 0.0078125,
+          "max_absolute_error_below_floor": 0.00048828125,
+          "max_bfloat16_ulp": 283,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.006849315017461777,
+          "mean_absolute_error": 9.758579722074501e-08,
+          "raw_max_bfloat16_ulp_actual": 6.472691893577576e-08,
+          "raw_max_bfloat16_ulp_index": 460791,
+          "raw_max_bfloat16_ulp_reference": 3.0919909477233887e-07,
+          "reference_digest": "d5e6be3d8cf52e4139235b9dde69a84db489a705580a376f08a613eb7beeab9a",
+          "role": "dx"
+        },
+        {
+          "absolute_floor": 0.03125,
+          "all_finite": true,
+          "below_floor_count": 0,
+          "digest": "06498bae527509f636aae0baa0b247e657e5f6dc1f7453cf3279e53db90664e0",
+          "eligible_count": 4096,
+          "max_absolute_error": 0.0,
+          "max_absolute_error_above_floor": 0.0,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 0,
+          "max_bfloat16_ulp_above_absolute_floor": 0,
+          "max_relative_error_above_absolute_floor": 0.0,
+          "mean_absolute_error": 0.0,
+          "raw_max_bfloat16_ulp_actual": -860.0,
+          "raw_max_bfloat16_ulp_index": 0,
+          "raw_max_bfloat16_ulp_reference": -860.0,
+          "reference_digest": "06498bae527509f636aae0baa0b247e657e5f6dc1f7453cf3279e53db90664e0",
+          "role": "dgamma"
+        }
+      ],
+      "producer": "transformer_engine_2_17",
+      "repeat": 1,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 50404.5,
+        "raw_cuda_event_ns": [
+          56384,
+          48096,
+          49152,
+          48064,
+          46080,
+          46624,
+          45664,
+          48064,
+          46688,
+          47072,
+          46336,
+          47808,
+          46720,
+          47072,
+          47104,
+          47360,
+          48320,
+          47552,
+          47520,
+          45888
+        ],
+        "raw_host_blocking_ns": [
+          51987,
+          51529,
+          49933,
+          50622,
+          49779,
+          51335,
+          50355,
+          52329,
+          50668,
+          50133,
+          48682,
+          50454,
+          48704,
+          50752,
+          56312,
+          49585,
+          49416,
+          49382,
+          49161,
+          51116
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "forward",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "gamma": "7666bd787eded8f496d15ecaa0ff1a09e2785076f6f5e5db47737a95152b86ec",
+        "x": "d5306b1c52e907c4f4df004e6f3a9c488f354acd80221eb5077e6f20a1c3f34e"
+      },
+      "input_pattern": "heldout_splitmix64_v1",
+      "outputs": [
+        {
+          "absolute_floor": 0.015625,
+          "all_finite": true,
+          "below_floor_count": 82755,
+          "digest": "30ece49b722f6e5c657bf6e36a9bf99c5b6b731988e5e4cc0ed9bf097ad04979",
+          "eligible_count": 8305853,
+          "max_absolute_error": 0.015625,
+          "max_absolute_error_above_floor": 0.015625,
+          "max_absolute_error_below_floor": 6.103515625e-05,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007751937955617905,
+          "mean_absolute_error": 3.4313416108489037e-08,
+          "raw_max_bfloat16_ulp_actual": -1.0703125,
+          "raw_max_bfloat16_ulp_index": 294230,
+          "raw_max_bfloat16_ulp_reference": -1.078125,
+          "reference_digest": "dbf0c5cc4900ca5498099bd458edfdf31200a692fd2996e66960e8b98b77078e",
+          "role": "y"
+        }
+      ],
+      "producer": "transformer_engine_2_17",
+      "repeat": 0,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 16958.0,
+        "raw_cuda_event_ns": [
+          18720,
+          14560,
+          14752,
+          15360,
+          14112,
+          14848,
+          14144,
+          14048,
+          14048,
+          14144,
+          13600,
+          14432,
+          14592,
+          14016,
+          14528,
+          13728,
+          13536,
+          14496,
+          13856,
+          14240
+        ],
+        "raw_host_blocking_ns": [
+          17554,
+          16824,
+          17066,
+          16479,
+          17104,
+          16873,
+          17076,
+          16568,
+          17056,
+          16734,
+          16401,
+          16785,
+          17105,
+          16725,
+          16508,
+          17297,
+          17064,
+          16994,
+          17365,
+          16922
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "forward",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "gamma": "7666bd787eded8f496d15ecaa0ff1a09e2785076f6f5e5db47737a95152b86ec",
+        "x": "d5306b1c52e907c4f4df004e6f3a9c488f354acd80221eb5077e6f20a1c3f34e"
+      },
+      "input_pattern": "heldout_splitmix64_v1",
+      "outputs": [
+        {
+          "absolute_floor": 0.015625,
+          "all_finite": true,
+          "below_floor_count": 82755,
+          "digest": "30ece49b722f6e5c657bf6e36a9bf99c5b6b731988e5e4cc0ed9bf097ad04979",
+          "eligible_count": 8305853,
+          "max_absolute_error": 0.015625,
+          "max_absolute_error_above_floor": 0.015625,
+          "max_absolute_error_below_floor": 6.103515625e-05,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007751937955617905,
+          "mean_absolute_error": 3.4313416108489037e-08,
+          "raw_max_bfloat16_ulp_actual": -1.0703125,
+          "raw_max_bfloat16_ulp_index": 294230,
+          "raw_max_bfloat16_ulp_reference": -1.078125,
+          "reference_digest": "dbf0c5cc4900ca5498099bd458edfdf31200a692fd2996e66960e8b98b77078e",
+          "role": "y"
+        }
+      ],
+      "producer": "transformer_engine_2_17",
+      "repeat": 1,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 16696.0,
+        "raw_cuda_event_ns": [
+          17696,
+          13600,
+          14496,
+          13568,
+          14496,
+          14176,
+          13664,
+          13824,
+          13632,
+          13888,
+          15104,
+          14112,
+          14240,
+          13568,
+          14048,
+          13760,
+          13184,
+          14112,
+          14304,
+          14720
+        ],
+        "raw_host_blocking_ns": [
+          17301,
+          16695,
+          16751,
+          16512,
+          16493,
+          16589,
+          17411,
+          16205,
+          17104,
+          18002,
+          16987,
+          16373,
+          16756,
+          16469,
+          16697,
+          16937,
+          16528,
+          16433,
+          16538,
+          17186
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "backward_recompute",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward_to_private_rsigma",
+          "rmsnorm_backward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "dy": "2abeef4e00143b614ca27c6f310998493609de3490f4720538be507c4ddc4556",
+        "gamma": "7666bd787eded8f496d15ecaa0ff1a09e2785076f6f5e5db47737a95152b86ec",
+        "x": "d5306b1c52e907c4f4df004e6f3a9c488f354acd80221eb5077e6f20a1c3f34e"
+      },
+      "input_pattern": "heldout_splitmix64_v1",
+      "outputs": [
+        {
+          "absolute_floor": 0.125,
+          "all_finite": true,
+          "below_floor_count": 665790,
+          "digest": "b608a9c4124330188183c08c712e32507d41fd94bddd44697d04dcd9cb337865",
+          "eligible_count": 7722818,
+          "max_absolute_error": 0.015625,
+          "max_absolute_error_above_floor": 0.015625,
+          "max_absolute_error_below_floor": 0.00048828125,
+          "max_bfloat16_ulp": 4,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007751937955617905,
+          "mean_absolute_error": 3.635289047565493e-08,
+          "raw_max_bfloat16_ulp_actual": 1.6205012798309326e-07,
+          "raw_max_bfloat16_ulp_index": 7741279,
+          "raw_max_bfloat16_ulp_reference": 1.5832483768463135e-07,
+          "reference_digest": "938fe85ca5d7820ca1ae7dfb8acc970307ad88ec92d94b77bd024e904c2d8c55",
+          "role": "dx"
+        },
+        {
+          "absolute_floor": 0.03125,
+          "all_finite": true,
+          "below_floor_count": 5,
+          "digest": "209869785a9897bfd13ff39665e0ad781d2bb14b3b7c15067a1f6c752c4601fb",
+          "eligible_count": 4091,
+          "max_absolute_error": 0.0,
+          "max_absolute_error_above_floor": 0.0,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 0,
+          "max_bfloat16_ulp_above_absolute_floor": 0,
+          "max_relative_error_above_absolute_floor": 0.0,
+          "mean_absolute_error": 0.0,
+          "raw_max_bfloat16_ulp_actual": 27.5,
+          "raw_max_bfloat16_ulp_index": 0,
+          "raw_max_bfloat16_ulp_reference": 27.5,
+          "reference_digest": "209869785a9897bfd13ff39665e0ad781d2bb14b3b7c15067a1f6c752c4601fb",
+          "role": "dgamma"
+        }
+      ],
+      "producer": "transformer_engine_2_17",
+      "repeat": 0,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 49344.0,
+        "raw_cuda_event_ns": [
+          52352,
+          47072,
+          49536,
+          45280,
+          47168,
+          45888,
+          47104,
+          46272,
+          47840,
+          46656,
+          47456,
+          44992,
+          46336,
+          46624,
+          46976,
+          47136,
+          46240,
+          46368,
+          46144,
+          47264
+        ],
+        "raw_host_blocking_ns": [
+          51846,
+          49606,
+          48643,
+          50226,
+          49128,
+          49452,
+          49718,
+          49779,
+          49331,
+          49704,
+          48774,
+          49091,
+          49011,
+          49357,
+          49016,
+          48937,
+          49067,
+          48659,
+          49874,
+          50610
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "backward_recompute",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward_to_private_rsigma",
+          "rmsnorm_backward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "dy": "2abeef4e00143b614ca27c6f310998493609de3490f4720538be507c4ddc4556",
+        "gamma": "7666bd787eded8f496d15ecaa0ff1a09e2785076f6f5e5db47737a95152b86ec",
+        "x": "d5306b1c52e907c4f4df004e6f3a9c488f354acd80221eb5077e6f20a1c3f34e"
+      },
+      "input_pattern": "heldout_splitmix64_v1",
+      "outputs": [
+        {
+          "absolute_floor": 0.125,
+          "all_finite": true,
+          "below_floor_count": 665790,
+          "digest": "b608a9c4124330188183c08c712e32507d41fd94bddd44697d04dcd9cb337865",
+          "eligible_count": 7722818,
+          "max_absolute_error": 0.015625,
+          "max_absolute_error_above_floor": 0.015625,
+          "max_absolute_error_below_floor": 0.00048828125,
+          "max_bfloat16_ulp": 4,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007751937955617905,
+          "mean_absolute_error": 3.635289047565493e-08,
+          "raw_max_bfloat16_ulp_actual": 1.6205012798309326e-07,
+          "raw_max_bfloat16_ulp_index": 7741279,
+          "raw_max_bfloat16_ulp_reference": 1.5832483768463135e-07,
+          "reference_digest": "938fe85ca5d7820ca1ae7dfb8acc970307ad88ec92d94b77bd024e904c2d8c55",
+          "role": "dx"
+        },
+        {
+          "absolute_floor": 0.03125,
+          "all_finite": true,
+          "below_floor_count": 5,
+          "digest": "209869785a9897bfd13ff39665e0ad781d2bb14b3b7c15067a1f6c752c4601fb",
+          "eligible_count": 4091,
+          "max_absolute_error": 0.0,
+          "max_absolute_error_above_floor": 0.0,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 0,
+          "max_bfloat16_ulp_above_absolute_floor": 0,
+          "max_relative_error_above_absolute_floor": 0.0,
+          "mean_absolute_error": 0.0,
+          "raw_max_bfloat16_ulp_actual": 27.5,
+          "raw_max_bfloat16_ulp_index": 0,
+          "raw_max_bfloat16_ulp_reference": 27.5,
+          "reference_digest": "209869785a9897bfd13ff39665e0ad781d2bb14b3b7c15067a1f6c752c4601fb",
+          "role": "dgamma"
+        }
+      ],
+      "producer": "transformer_engine_2_17",
+      "repeat": 1,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 49581.5,
+        "raw_cuda_event_ns": [
+          52704,
+          47744,
+          46336,
+          46784,
+          46592,
+          46496,
+          46016,
+          46784,
+          46944,
+          45760,
+          45568,
+          45664,
+          47840,
+          45312,
+          48512,
+          45216,
+          47648,
+          45984,
+          46784,
+          47904
+        ],
+        "raw_host_blocking_ns": [
+          49999,
+          50235,
+          49501,
+          49431,
+          48864,
+          49239,
+          51166,
+          50067,
+          49655,
+          49365,
+          49716,
+          49508,
+          50092,
+          49894,
+          50520,
+          49313,
+          49299,
+          49135,
+          50331,
+          49118
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "composed",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward_to_public_y_and_private_rsigma",
+          "rmsnorm_backward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "dy": "2abeef4e00143b614ca27c6f310998493609de3490f4720538be507c4ddc4556",
+        "gamma": "7666bd787eded8f496d15ecaa0ff1a09e2785076f6f5e5db47737a95152b86ec",
+        "x": "d5306b1c52e907c4f4df004e6f3a9c488f354acd80221eb5077e6f20a1c3f34e"
+      },
+      "input_pattern": "heldout_splitmix64_v1",
+      "outputs": [
+        {
+          "absolute_floor": 0.015625,
+          "all_finite": true,
+          "below_floor_count": 82755,
+          "digest": "30ece49b722f6e5c657bf6e36a9bf99c5b6b731988e5e4cc0ed9bf097ad04979",
+          "eligible_count": 8305853,
+          "max_absolute_error": 0.015625,
+          "max_absolute_error_above_floor": 0.015625,
+          "max_absolute_error_below_floor": 6.103515625e-05,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007751937955617905,
+          "mean_absolute_error": 3.4313416108489037e-08,
+          "raw_max_bfloat16_ulp_actual": -1.0703125,
+          "raw_max_bfloat16_ulp_index": 294230,
+          "raw_max_bfloat16_ulp_reference": -1.078125,
+          "reference_digest": "dbf0c5cc4900ca5498099bd458edfdf31200a692fd2996e66960e8b98b77078e",
+          "role": "y"
+        },
+        {
+          "absolute_floor": 0.125,
+          "all_finite": true,
+          "below_floor_count": 665790,
+          "digest": "b608a9c4124330188183c08c712e32507d41fd94bddd44697d04dcd9cb337865",
+          "eligible_count": 7722818,
+          "max_absolute_error": 0.015625,
+          "max_absolute_error_above_floor": 0.015625,
+          "max_absolute_error_below_floor": 0.00048828125,
+          "max_bfloat16_ulp": 4,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007751937955617905,
+          "mean_absolute_error": 3.635289047565493e-08,
+          "raw_max_bfloat16_ulp_actual": 1.6205012798309326e-07,
+          "raw_max_bfloat16_ulp_index": 7741279,
+          "raw_max_bfloat16_ulp_reference": 1.5832483768463135e-07,
+          "reference_digest": "938fe85ca5d7820ca1ae7dfb8acc970307ad88ec92d94b77bd024e904c2d8c55",
+          "role": "dx"
+        },
+        {
+          "absolute_floor": 0.03125,
+          "all_finite": true,
+          "below_floor_count": 5,
+          "digest": "209869785a9897bfd13ff39665e0ad781d2bb14b3b7c15067a1f6c752c4601fb",
+          "eligible_count": 4091,
+          "max_absolute_error": 0.0,
+          "max_absolute_error_above_floor": 0.0,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 0,
+          "max_bfloat16_ulp_above_absolute_floor": 0,
+          "max_relative_error_above_absolute_floor": 0.0,
+          "mean_absolute_error": 0.0,
+          "raw_max_bfloat16_ulp_actual": 27.5,
+          "raw_max_bfloat16_ulp_index": 0,
+          "raw_max_bfloat16_ulp_reference": 27.5,
+          "reference_digest": "209869785a9897bfd13ff39665e0ad781d2bb14b3b7c15067a1f6c752c4601fb",
+          "role": "dgamma"
+        }
+      ],
+      "producer": "transformer_engine_2_17",
+      "repeat": 0,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 49387.5,
+        "raw_cuda_event_ns": [
+          52576,
+          46368,
+          45568,
+          48032,
+          46624,
+          45440,
+          45536,
+          45184,
+          47904,
+          46048,
+          46080,
+          45920,
+          46912,
+          46016,
+          47168,
+          45120,
+          45952,
+          46848,
+          47904,
+          47520
+        ],
+        "raw_host_blocking_ns": [
+          49672,
+          49383,
+          50829,
+          48846,
+          56924,
+          49039,
+          49261,
+          49651,
+          48845,
+          48366,
+          49454,
+          48972,
+          49389,
+          49534,
+          49296,
+          49439,
+          48838,
+          49386,
+          50219,
+          49843
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "composed",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward_to_public_y_and_private_rsigma",
+          "rmsnorm_backward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "dy": "2abeef4e00143b614ca27c6f310998493609de3490f4720538be507c4ddc4556",
+        "gamma": "7666bd787eded8f496d15ecaa0ff1a09e2785076f6f5e5db47737a95152b86ec",
+        "x": "d5306b1c52e907c4f4df004e6f3a9c488f354acd80221eb5077e6f20a1c3f34e"
+      },
+      "input_pattern": "heldout_splitmix64_v1",
+      "outputs": [
+        {
+          "absolute_floor": 0.015625,
+          "all_finite": true,
+          "below_floor_count": 82755,
+          "digest": "30ece49b722f6e5c657bf6e36a9bf99c5b6b731988e5e4cc0ed9bf097ad04979",
+          "eligible_count": 8305853,
+          "max_absolute_error": 0.015625,
+          "max_absolute_error_above_floor": 0.015625,
+          "max_absolute_error_below_floor": 6.103515625e-05,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007751937955617905,
+          "mean_absolute_error": 3.4313416108489037e-08,
+          "raw_max_bfloat16_ulp_actual": -1.0703125,
+          "raw_max_bfloat16_ulp_index": 294230,
+          "raw_max_bfloat16_ulp_reference": -1.078125,
+          "reference_digest": "dbf0c5cc4900ca5498099bd458edfdf31200a692fd2996e66960e8b98b77078e",
+          "role": "y"
+        },
+        {
+          "absolute_floor": 0.125,
+          "all_finite": true,
+          "below_floor_count": 665790,
+          "digest": "b608a9c4124330188183c08c712e32507d41fd94bddd44697d04dcd9cb337865",
+          "eligible_count": 7722818,
+          "max_absolute_error": 0.015625,
+          "max_absolute_error_above_floor": 0.015625,
+          "max_absolute_error_below_floor": 0.00048828125,
+          "max_bfloat16_ulp": 4,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007751937955617905,
+          "mean_absolute_error": 3.635289047565493e-08,
+          "raw_max_bfloat16_ulp_actual": 1.6205012798309326e-07,
+          "raw_max_bfloat16_ulp_index": 7741279,
+          "raw_max_bfloat16_ulp_reference": 1.5832483768463135e-07,
+          "reference_digest": "938fe85ca5d7820ca1ae7dfb8acc970307ad88ec92d94b77bd024e904c2d8c55",
+          "role": "dx"
+        },
+        {
+          "absolute_floor": 0.03125,
+          "all_finite": true,
+          "below_floor_count": 5,
+          "digest": "209869785a9897bfd13ff39665e0ad781d2bb14b3b7c15067a1f6c752c4601fb",
+          "eligible_count": 4091,
+          "max_absolute_error": 0.0,
+          "max_absolute_error_above_floor": 0.0,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 0,
+          "max_bfloat16_ulp_above_absolute_floor": 0,
+          "max_relative_error_above_absolute_floor": 0.0,
+          "mean_absolute_error": 0.0,
+          "raw_max_bfloat16_ulp_actual": 27.5,
+          "raw_max_bfloat16_ulp_index": 0,
+          "raw_max_bfloat16_ulp_reference": 27.5,
+          "reference_digest": "209869785a9897bfd13ff39665e0ad781d2bb14b3b7c15067a1f6c752c4601fb",
+          "role": "dgamma"
+        }
+      ],
+      "producer": "transformer_engine_2_17",
+      "repeat": 1,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 49751.5,
+        "raw_cuda_event_ns": [
+          52256,
+          45632,
+          46144,
+          46688,
+          47264,
+          45920,
+          46880,
+          46400,
+          45696,
+          44576,
+          46528,
+          45184,
+          46976,
+          45376,
+          46304,
+          45952,
+          47200,
+          46272,
+          46656,
+          44992
+        ],
+        "raw_host_blocking_ns": [
+          51317,
+          48906,
+          50057,
+          49227,
+          49718,
+          73497,
+          50299,
+          50012,
+          49156,
+          50631,
+          49141,
+          49892,
+          47899,
+          49400,
+          49784,
+          49567,
+          49719,
+          50369,
+          48259,
+          50512
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "forward",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "gamma": "a6798be78031f1e5ea51e24649b26a9b952f5b00543a8bf878a1fc68dae96c8e",
+        "x": "94149f756a9a5cbd8d4ef1fd5b72284666f790ec06da9c4fd34f91981de72b0d"
+      },
+      "input_pattern": "heldout_splitmix64_v2",
+      "outputs": [
+        {
+          "absolute_floor": 0.015625,
+          "all_finite": true,
+          "below_floor_count": 83481,
+          "digest": "9c8a4a98743e5312ad9696714f009bcd52eb83079850fa26e877beeb780c4f4d",
+          "eligible_count": 8305127,
+          "max_absolute_error": 0.015625,
+          "max_absolute_error_above_floor": 0.015625,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007692307699471712,
+          "mean_absolute_error": 3.7136487662792206e-08,
+          "raw_max_bfloat16_ulp_actual": 1.234375,
+          "raw_max_bfloat16_ulp_index": 98375,
+          "raw_max_bfloat16_ulp_reference": 1.2265625,
+          "reference_digest": "9adf2dbe23cbd85a4a2841e911a17fc769bad679764dc41a933fd29b3e2f5e7a",
+          "role": "y"
+        }
+      ],
+      "producer": "transformer_engine_2_17",
+      "repeat": 0,
+      "scope": "representative_policy_acceptance",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 16837.5,
+        "raw_cuda_event_ns": [
+          18176,
+          14624,
+          14560,
+          14848,
+          13824,
+          15200,
+          14464,
+          14304,
+          14528,
+          14272,
+          14560,
+          14784,
+          14496,
+          14240,
+          14592,
+          14016,
+          13408,
+          14784,
+          16192,
+          15520
+        ],
+        "raw_host_blocking_ns": [
+          17372,
+          16486,
+          17158,
+          16747,
+          16954,
+          16818,
+          17223,
+          16786,
+          16857,
+          20264,
+          16441,
+          16569,
+          17203,
+          16606,
+          16406,
+          16927,
+          17133,
+          16785,
+          16715,
+          17358
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "forward",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "gamma": "a6798be78031f1e5ea51e24649b26a9b952f5b00543a8bf878a1fc68dae96c8e",
+        "x": "94149f756a9a5cbd8d4ef1fd5b72284666f790ec06da9c4fd34f91981de72b0d"
+      },
+      "input_pattern": "heldout_splitmix64_v2",
+      "outputs": [
+        {
+          "absolute_floor": 0.015625,
+          "all_finite": true,
+          "below_floor_count": 83481,
+          "digest": "9c8a4a98743e5312ad9696714f009bcd52eb83079850fa26e877beeb780c4f4d",
+          "eligible_count": 8305127,
+          "max_absolute_error": 0.015625,
+          "max_absolute_error_above_floor": 0.015625,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007692307699471712,
+          "mean_absolute_error": 3.7136487662792206e-08,
+          "raw_max_bfloat16_ulp_actual": 1.234375,
+          "raw_max_bfloat16_ulp_index": 98375,
+          "raw_max_bfloat16_ulp_reference": 1.2265625,
+          "reference_digest": "9adf2dbe23cbd85a4a2841e911a17fc769bad679764dc41a933fd29b3e2f5e7a",
+          "role": "y"
+        }
+      ],
+      "producer": "transformer_engine_2_17",
+      "repeat": 1,
+      "scope": "representative_policy_acceptance",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 16800.0,
+        "raw_cuda_event_ns": [
+          19072,
+          15168,
+          14496,
+          13728,
+          14624,
+          14528,
+          14048,
+          13760,
+          14176,
+          14080,
+          14016,
+          14304,
+          14432,
+          14016,
+          14144,
+          13984,
+          13536,
+          14816,
+          13536,
+          14240
+        ],
+        "raw_host_blocking_ns": [
+          17080,
+          16653,
+          17115,
+          16486,
+          16621,
+          16562,
+          18328,
+          16471,
+          17342,
+          16917,
+          16760,
+          16953,
+          17407,
+          16288,
+          16505,
+          16829,
+          17237,
+          17224,
+          16623,
+          16771
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "backward_recompute",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward_to_private_rsigma",
+          "rmsnorm_backward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "dy": "16300ef5a34dbe3ae28fc07f6ade2e6f72f9ae63480bc34feb40581ee3bf3818",
+        "gamma": "a6798be78031f1e5ea51e24649b26a9b952f5b00543a8bf878a1fc68dae96c8e",
+        "x": "94149f756a9a5cbd8d4ef1fd5b72284666f790ec06da9c4fd34f91981de72b0d"
+      },
+      "input_pattern": "heldout_splitmix64_v2",
+      "outputs": [
+        {
+          "absolute_floor": 0.125,
+          "all_finite": true,
+          "below_floor_count": 662862,
+          "digest": "25a2f5b67aa7243865a183b08efba8d546c7f45f6720040585a762de56f5d86b",
+          "eligible_count": 7725746,
+          "max_absolute_error": 0.015625,
+          "max_absolute_error_above_floor": 0.015625,
+          "max_absolute_error_below_floor": 0.00048828125,
+          "max_bfloat16_ulp": 3,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.0078125,
+          "mean_absolute_error": 4.853264812254565e-08,
+          "raw_max_bfloat16_ulp_actual": -8.642673492431641e-07,
+          "raw_max_bfloat16_ulp_index": 4505961,
+          "raw_max_bfloat16_ulp_reference": -8.754432201385498e-07,
+          "reference_digest": "7c4e9301b933be7ba6a94d30bf3e00a1e6071e31982c25ea1cafe74ce439fad3",
+          "role": "dx"
+        },
+        {
+          "absolute_floor": 0.03125,
+          "all_finite": true,
+          "below_floor_count": 5,
+          "digest": "e7b1fefb572f5828c4f93366d995d36db93d129f852b94d52dcefb04b268789d",
+          "eligible_count": 4091,
+          "max_absolute_error": 7.62939453125e-06,
+          "max_absolute_error_above_floor": 0.0,
+          "max_absolute_error_below_floor": 7.62939453125e-06,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 0,
+          "max_relative_error_above_absolute_floor": 0.0,
+          "mean_absolute_error": 2.7939677238464355e-09,
+          "raw_max_bfloat16_ulp_actual": 0.000804901123046875,
+          "raw_max_bfloat16_ulp_index": 1529,
+          "raw_max_bfloat16_ulp_reference": 0.00080108642578125,
+          "reference_digest": "fc63fa70b69a390e51b5fc6a3a2f2c6e70373d1d4f9f79ff5c9f02681dc907e8",
+          "role": "dgamma"
+        }
+      ],
+      "producer": "transformer_engine_2_17",
+      "repeat": 0,
+      "scope": "representative_policy_acceptance",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 50871.0,
+        "raw_cuda_event_ns": [
+          54688,
+          53312,
+          48864,
+          46560,
+          47456,
+          47584,
+          47456,
+          46560,
+          47136,
+          48576,
+          45216,
+          47360,
+          48128,
+          46816,
+          46656,
+          46752,
+          49376,
+          47264,
+          48736,
+          47008
+        ],
+        "raw_host_blocking_ns": [
+          54320,
+          51495,
+          52248,
+          76110,
+          51190,
+          50060,
+          52426,
+          50255,
+          52418,
+          51675,
+          49635,
+          50053,
+          50342,
+          51032,
+          50458,
+          50710,
+          50079,
+          49942,
+          50139,
+          51440
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "backward_recompute",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward_to_private_rsigma",
+          "rmsnorm_backward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "dy": "16300ef5a34dbe3ae28fc07f6ade2e6f72f9ae63480bc34feb40581ee3bf3818",
+        "gamma": "a6798be78031f1e5ea51e24649b26a9b952f5b00543a8bf878a1fc68dae96c8e",
+        "x": "94149f756a9a5cbd8d4ef1fd5b72284666f790ec06da9c4fd34f91981de72b0d"
+      },
+      "input_pattern": "heldout_splitmix64_v2",
+      "outputs": [
+        {
+          "absolute_floor": 0.125,
+          "all_finite": true,
+          "below_floor_count": 662862,
+          "digest": "25a2f5b67aa7243865a183b08efba8d546c7f45f6720040585a762de56f5d86b",
+          "eligible_count": 7725746,
+          "max_absolute_error": 0.015625,
+          "max_absolute_error_above_floor": 0.015625,
+          "max_absolute_error_below_floor": 0.00048828125,
+          "max_bfloat16_ulp": 3,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.0078125,
+          "mean_absolute_error": 4.853264812254565e-08,
+          "raw_max_bfloat16_ulp_actual": -8.642673492431641e-07,
+          "raw_max_bfloat16_ulp_index": 4505961,
+          "raw_max_bfloat16_ulp_reference": -8.754432201385498e-07,
+          "reference_digest": "7c4e9301b933be7ba6a94d30bf3e00a1e6071e31982c25ea1cafe74ce439fad3",
+          "role": "dx"
+        },
+        {
+          "absolute_floor": 0.03125,
+          "all_finite": true,
+          "below_floor_count": 5,
+          "digest": "e7b1fefb572f5828c4f93366d995d36db93d129f852b94d52dcefb04b268789d",
+          "eligible_count": 4091,
+          "max_absolute_error": 7.62939453125e-06,
+          "max_absolute_error_above_floor": 0.0,
+          "max_absolute_error_below_floor": 7.62939453125e-06,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 0,
+          "max_relative_error_above_absolute_floor": 0.0,
+          "mean_absolute_error": 2.7939677238464355e-09,
+          "raw_max_bfloat16_ulp_actual": 0.000804901123046875,
+          "raw_max_bfloat16_ulp_index": 1529,
+          "raw_max_bfloat16_ulp_reference": 0.00080108642578125,
+          "reference_digest": "fc63fa70b69a390e51b5fc6a3a2f2c6e70373d1d4f9f79ff5c9f02681dc907e8",
+          "role": "dgamma"
+        }
+      ],
+      "producer": "transformer_engine_2_17",
+      "repeat": 1,
+      "scope": "representative_policy_acceptance",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 51548.0,
+        "raw_cuda_event_ns": [
+          54432,
+          49856,
+          47456,
+          48768,
+          48320,
+          47456,
+          48064,
+          46912,
+          49216,
+          47168,
+          47744,
+          54144,
+          47328,
+          46176,
+          47104,
+          48352,
+          48832,
+          57088,
+          47936,
+          47808
+        ],
+        "raw_host_blocking_ns": [
+          56958,
+          58794,
+          50986,
+          49885,
+          51763,
+          50476,
+          51333,
+          51890,
+          53246,
+          52035,
+          51268,
+          50115,
+          52207,
+          52668,
+          51956,
+          54252,
+          50655,
+          50795,
+          51226,
+          50246
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "composed",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward_to_public_y_and_private_rsigma",
+          "rmsnorm_backward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "dy": "16300ef5a34dbe3ae28fc07f6ade2e6f72f9ae63480bc34feb40581ee3bf3818",
+        "gamma": "a6798be78031f1e5ea51e24649b26a9b952f5b00543a8bf878a1fc68dae96c8e",
+        "x": "94149f756a9a5cbd8d4ef1fd5b72284666f790ec06da9c4fd34f91981de72b0d"
+      },
+      "input_pattern": "heldout_splitmix64_v2",
+      "outputs": [
+        {
+          "absolute_floor": 0.015625,
+          "all_finite": true,
+          "below_floor_count": 83481,
+          "digest": "9c8a4a98743e5312ad9696714f009bcd52eb83079850fa26e877beeb780c4f4d",
+          "eligible_count": 8305127,
+          "max_absolute_error": 0.015625,
+          "max_absolute_error_above_floor": 0.015625,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007692307699471712,
+          "mean_absolute_error": 3.7136487662792206e-08,
+          "raw_max_bfloat16_ulp_actual": 1.234375,
+          "raw_max_bfloat16_ulp_index": 98375,
+          "raw_max_bfloat16_ulp_reference": 1.2265625,
+          "reference_digest": "9adf2dbe23cbd85a4a2841e911a17fc769bad679764dc41a933fd29b3e2f5e7a",
+          "role": "y"
+        },
+        {
+          "absolute_floor": 0.125,
+          "all_finite": true,
+          "below_floor_count": 662862,
+          "digest": "25a2f5b67aa7243865a183b08efba8d546c7f45f6720040585a762de56f5d86b",
+          "eligible_count": 7725746,
+          "max_absolute_error": 0.015625,
+          "max_absolute_error_above_floor": 0.015625,
+          "max_absolute_error_below_floor": 0.00048828125,
+          "max_bfloat16_ulp": 3,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.0078125,
+          "mean_absolute_error": 4.853264812254565e-08,
+          "raw_max_bfloat16_ulp_actual": -8.642673492431641e-07,
+          "raw_max_bfloat16_ulp_index": 4505961,
+          "raw_max_bfloat16_ulp_reference": -8.754432201385498e-07,
+          "reference_digest": "7c4e9301b933be7ba6a94d30bf3e00a1e6071e31982c25ea1cafe74ce439fad3",
+          "role": "dx"
+        },
+        {
+          "absolute_floor": 0.03125,
+          "all_finite": true,
+          "below_floor_count": 5,
+          "digest": "e7b1fefb572f5828c4f93366d995d36db93d129f852b94d52dcefb04b268789d",
+          "eligible_count": 4091,
+          "max_absolute_error": 7.62939453125e-06,
+          "max_absolute_error_above_floor": 0.0,
+          "max_absolute_error_below_floor": 7.62939453125e-06,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 0,
+          "max_relative_error_above_absolute_floor": 0.0,
+          "mean_absolute_error": 2.7939677238464355e-09,
+          "raw_max_bfloat16_ulp_actual": 0.000804901123046875,
+          "raw_max_bfloat16_ulp_index": 1529,
+          "raw_max_bfloat16_ulp_reference": 0.00080108642578125,
+          "reference_digest": "fc63fa70b69a390e51b5fc6a3a2f2c6e70373d1d4f9f79ff5c9f02681dc907e8",
+          "role": "dgamma"
+        }
+      ],
+      "producer": "transformer_engine_2_17",
+      "repeat": 0,
+      "scope": "representative_policy_acceptance",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 49887.5,
+        "raw_cuda_event_ns": [
+          54784,
+          46976,
+          45056,
+          47072,
+          47552,
+          47136,
+          46208,
+          47328,
+          45984,
+          46944,
+          46240,
+          45952,
+          46848,
+          46080,
+          46720,
+          46272,
+          47328,
+          45696,
+          46208,
+          47008
+        ],
+        "raw_host_blocking_ns": [
+          52477,
+          50308,
+          50263,
+          49497,
+          49041,
+          49946,
+          49829,
+          50374,
+          50362,
+          50933,
+          50527,
+          48554,
+          50587,
+          49500,
+          50415,
+          48889,
+          49028,
+          49359,
+          49778,
+          49808
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "composed",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward_to_public_y_and_private_rsigma",
+          "rmsnorm_backward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "dy": "16300ef5a34dbe3ae28fc07f6ade2e6f72f9ae63480bc34feb40581ee3bf3818",
+        "gamma": "a6798be78031f1e5ea51e24649b26a9b952f5b00543a8bf878a1fc68dae96c8e",
+        "x": "94149f756a9a5cbd8d4ef1fd5b72284666f790ec06da9c4fd34f91981de72b0d"
+      },
+      "input_pattern": "heldout_splitmix64_v2",
+      "outputs": [
+        {
+          "absolute_floor": 0.015625,
+          "all_finite": true,
+          "below_floor_count": 83481,
+          "digest": "9c8a4a98743e5312ad9696714f009bcd52eb83079850fa26e877beeb780c4f4d",
+          "eligible_count": 8305127,
+          "max_absolute_error": 0.015625,
+          "max_absolute_error_above_floor": 0.015625,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007692307699471712,
+          "mean_absolute_error": 3.7136487662792206e-08,
+          "raw_max_bfloat16_ulp_actual": 1.234375,
+          "raw_max_bfloat16_ulp_index": 98375,
+          "raw_max_bfloat16_ulp_reference": 1.2265625,
+          "reference_digest": "9adf2dbe23cbd85a4a2841e911a17fc769bad679764dc41a933fd29b3e2f5e7a",
+          "role": "y"
+        },
+        {
+          "absolute_floor": 0.125,
+          "all_finite": true,
+          "below_floor_count": 662862,
+          "digest": "25a2f5b67aa7243865a183b08efba8d546c7f45f6720040585a762de56f5d86b",
+          "eligible_count": 7725746,
+          "max_absolute_error": 0.015625,
+          "max_absolute_error_above_floor": 0.015625,
+          "max_absolute_error_below_floor": 0.00048828125,
+          "max_bfloat16_ulp": 3,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.0078125,
+          "mean_absolute_error": 4.853264812254565e-08,
+          "raw_max_bfloat16_ulp_actual": -8.642673492431641e-07,
+          "raw_max_bfloat16_ulp_index": 4505961,
+          "raw_max_bfloat16_ulp_reference": -8.754432201385498e-07,
+          "reference_digest": "7c4e9301b933be7ba6a94d30bf3e00a1e6071e31982c25ea1cafe74ce439fad3",
+          "role": "dx"
+        },
+        {
+          "absolute_floor": 0.03125,
+          "all_finite": true,
+          "below_floor_count": 5,
+          "digest": "e7b1fefb572f5828c4f93366d995d36db93d129f852b94d52dcefb04b268789d",
+          "eligible_count": 4091,
+          "max_absolute_error": 7.62939453125e-06,
+          "max_absolute_error_above_floor": 0.0,
+          "max_absolute_error_below_floor": 7.62939453125e-06,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 0,
+          "max_relative_error_above_absolute_floor": 0.0,
+          "mean_absolute_error": 2.7939677238464355e-09,
+          "raw_max_bfloat16_ulp_actual": 0.000804901123046875,
+          "raw_max_bfloat16_ulp_index": 1529,
+          "raw_max_bfloat16_ulp_reference": 0.00080108642578125,
+          "reference_digest": "fc63fa70b69a390e51b5fc6a3a2f2c6e70373d1d4f9f79ff5c9f02681dc907e8",
+          "role": "dgamma"
+        }
+      ],
+      "producer": "transformer_engine_2_17",
+      "repeat": 1,
+      "scope": "representative_policy_acceptance",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 49350.0,
+        "raw_cuda_event_ns": [
+          54144,
+          46400,
+          47296,
+          45568,
+          45952,
+          44256,
+          47200,
+          46336,
+          47232,
+          44736,
+          45760,
+          45536,
+          45920,
+          47296,
+          45984,
+          46720,
+          45376,
+          46976,
+          46624,
+          47808
+        ],
+        "raw_host_blocking_ns": [
+          53919,
+          68288,
+          49217,
+          50209,
+          47630,
+          49332,
+          49100,
+          49368,
+          48628,
+          50180,
+          48059,
+          50415,
+          47410,
+          49251,
+          48446,
+          50609,
+          48950,
+          49934,
+          49763,
+          50188
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "forward",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "gamma": "e90137a7f830b75f00ee6dae7c89bbd7fba30dfb31ff7951fec129441c170821",
+        "x": "0f3b7cfa2054631d63038001deb298b086d0c2baffeaddd6082c4518df91e13c"
+      },
+      "input_pattern": "qualification_linspace_v2",
+      "outputs": [
+        {
+          "absolute_floor": 0.015625,
+          "all_finite": true,
+          "below_floor_count": 162992,
+          "digest": "cf9a4fe0b0b9adf7055e9c943f692d843dc5908e67dcec91b68961e013bbb8f1",
+          "eligible_count": 8225616,
+          "max_absolute_error": 0.00390625,
+          "max_absolute_error_above_floor": 0.00390625,
+          "max_absolute_error_below_floor": 6.103515625e-05,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007299270015209913,
+          "mean_absolute_error": 2.0074367057532072e-08,
+          "raw_max_bfloat16_ulp_actual": -0.11181640625,
+          "raw_max_bfloat16_ulp_index": 292674,
+          "raw_max_bfloat16_ulp_reference": -0.1123046875,
+          "reference_digest": "85924a7a28e8edb0a21aff788016315a0b804465ae04cac79c69517ff7c71284",
+          "role": "y"
+        }
+      ],
+      "producer": "ordinary_jax_xla",
+      "repeat": 0,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 206231.5,
+        "raw_cuda_event_ns": null,
+        "raw_host_blocking_ns": [
+          551905,
+          266410,
+          690532,
+          282445,
+          239506,
+          377482,
+          206276,
+          215649,
+          1066148,
+          294034,
+          206187,
+          163410,
+          153599,
+          182191,
+          144519,
+          146725,
+          146842,
+          148429,
+          147632,
+          162352
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "forward",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "gamma": "e90137a7f830b75f00ee6dae7c89bbd7fba30dfb31ff7951fec129441c170821",
+        "x": "0f3b7cfa2054631d63038001deb298b086d0c2baffeaddd6082c4518df91e13c"
+      },
+      "input_pattern": "qualification_linspace_v2",
+      "outputs": [
+        {
+          "absolute_floor": 0.015625,
+          "all_finite": true,
+          "below_floor_count": 162992,
+          "digest": "cf9a4fe0b0b9adf7055e9c943f692d843dc5908e67dcec91b68961e013bbb8f1",
+          "eligible_count": 8225616,
+          "max_absolute_error": 0.00390625,
+          "max_absolute_error_above_floor": 0.00390625,
+          "max_absolute_error_below_floor": 6.103515625e-05,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007299270015209913,
+          "mean_absolute_error": 2.0074367057532072e-08,
+          "raw_max_bfloat16_ulp_actual": -0.11181640625,
+          "raw_max_bfloat16_ulp_index": 292674,
+          "raw_max_bfloat16_ulp_reference": -0.1123046875,
+          "reference_digest": "85924a7a28e8edb0a21aff788016315a0b804465ae04cac79c69517ff7c71284",
+          "role": "y"
+        }
+      ],
+      "producer": "ordinary_jax_xla",
+      "repeat": 1,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 175626.5,
+        "raw_cuda_event_ns": null,
+        "raw_host_blocking_ns": [
+          170020,
+          194362,
+          175375,
+          245417,
+          193745,
+          160665,
+          182581,
+          180269,
+          191730,
+          187327,
+          174847,
+          155697,
+          177519,
+          175350,
+          170953,
+          170298,
+          175878,
+          207780,
+          173845,
+          168785
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "backward_recompute",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward_to_private_rsigma",
+          "rmsnorm_backward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "dy": "275b6bb7bf115e9110a4403637863cd0a3f0fb2cbb7b18ac9de05560db5a154c",
+        "gamma": "e90137a7f830b75f00ee6dae7c89bbd7fba30dfb31ff7951fec129441c170821",
+        "x": "0f3b7cfa2054631d63038001deb298b086d0c2baffeaddd6082c4518df91e13c"
+      },
+      "input_pattern": "qualification_linspace_v2",
+      "outputs": [
+        {
+          "absolute_floor": 0.125,
+          "all_finite": true,
+          "below_floor_count": 1864961,
+          "digest": "b09429e74cce38c20cc84b56a7d99aa51ded89a0e3d1a942e96eb43390965249",
+          "eligible_count": 6523647,
+          "max_absolute_error": 0.0078125,
+          "max_absolute_error_above_floor": 0.0078125,
+          "max_absolute_error_below_floor": 0.00048828125,
+          "max_bfloat16_ulp": 24,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007633587811142206,
+          "mean_absolute_error": 5.458664276147829e-08,
+          "raw_max_bfloat16_ulp_actual": 6.51925802230835e-09,
+          "raw_max_bfloat16_ulp_index": 2660366,
+          "raw_max_bfloat16_ulp_reference": 7.2177499532699585e-09,
+          "reference_digest": "b832dffb3e31d5e5639c2e272bbd9e74cc5ec3a664298b02604448628c0fbdab",
+          "role": "dx"
+        },
+        {
+          "absolute_floor": 0.03125,
+          "all_finite": true,
+          "below_floor_count": 0,
+          "digest": "7e8e78fc4dad00d99b614018ae47cfe67162a859cc10bab79c2c2b0ca73746b3",
+          "eligible_count": 4096,
+          "max_absolute_error": 0.0,
+          "max_absolute_error_above_floor": 0.0,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 0,
+          "max_bfloat16_ulp_above_absolute_floor": 0,
+          "max_relative_error_above_absolute_floor": 0.0,
+          "mean_absolute_error": 0.0,
+          "raw_max_bfloat16_ulp_actual": 876.0,
+          "raw_max_bfloat16_ulp_index": 0,
+          "raw_max_bfloat16_ulp_reference": 876.0,
+          "reference_digest": "7e8e78fc4dad00d99b614018ae47cfe67162a859cc10bab79c2c2b0ca73746b3",
+          "role": "dgamma"
+        }
+      ],
+      "producer": "ordinary_jax_xla",
+      "repeat": 0,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 341742.0,
+        "raw_cuda_event_ns": null,
+        "raw_host_blocking_ns": [
+          1134157,
+          299501,
+          269099,
+          387394,
+          2588099,
+          338683,
+          399685,
+          296198,
+          2837002,
+          566552,
+          4015546,
+          432255,
+          273640,
+          264436,
+          243817,
+          272269,
+          266668,
+          246649,
+          1126084,
+          344801
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "backward_recompute",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward_to_private_rsigma",
+          "rmsnorm_backward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "dy": "275b6bb7bf115e9110a4403637863cd0a3f0fb2cbb7b18ac9de05560db5a154c",
+        "gamma": "e90137a7f830b75f00ee6dae7c89bbd7fba30dfb31ff7951fec129441c170821",
+        "x": "0f3b7cfa2054631d63038001deb298b086d0c2baffeaddd6082c4518df91e13c"
+      },
+      "input_pattern": "qualification_linspace_v2",
+      "outputs": [
+        {
+          "absolute_floor": 0.125,
+          "all_finite": true,
+          "below_floor_count": 1864961,
+          "digest": "b09429e74cce38c20cc84b56a7d99aa51ded89a0e3d1a942e96eb43390965249",
+          "eligible_count": 6523647,
+          "max_absolute_error": 0.0078125,
+          "max_absolute_error_above_floor": 0.0078125,
+          "max_absolute_error_below_floor": 0.00048828125,
+          "max_bfloat16_ulp": 24,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007633587811142206,
+          "mean_absolute_error": 5.458664276147829e-08,
+          "raw_max_bfloat16_ulp_actual": 6.51925802230835e-09,
+          "raw_max_bfloat16_ulp_index": 2660366,
+          "raw_max_bfloat16_ulp_reference": 7.2177499532699585e-09,
+          "reference_digest": "b832dffb3e31d5e5639c2e272bbd9e74cc5ec3a664298b02604448628c0fbdab",
+          "role": "dx"
+        },
+        {
+          "absolute_floor": 0.03125,
+          "all_finite": true,
+          "below_floor_count": 0,
+          "digest": "7e8e78fc4dad00d99b614018ae47cfe67162a859cc10bab79c2c2b0ca73746b3",
+          "eligible_count": 4096,
+          "max_absolute_error": 0.0,
+          "max_absolute_error_above_floor": 0.0,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 0,
+          "max_bfloat16_ulp_above_absolute_floor": 0,
+          "max_relative_error_above_absolute_floor": 0.0,
+          "mean_absolute_error": 0.0,
+          "raw_max_bfloat16_ulp_actual": 876.0,
+          "raw_max_bfloat16_ulp_index": 0,
+          "raw_max_bfloat16_ulp_reference": 876.0,
+          "reference_digest": "7e8e78fc4dad00d99b614018ae47cfe67162a859cc10bab79c2c2b0ca73746b3",
+          "role": "dgamma"
+        }
+      ],
+      "producer": "ordinary_jax_xla",
+      "repeat": 1,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 203750.5,
+        "raw_cuda_event_ns": null,
+        "raw_host_blocking_ns": [
+          641198,
+          275889,
+          225837,
+          203194,
+          196286,
+          193571,
+          195665,
+          221498,
+          215315,
+          201412,
+          204307,
+          204578,
+          207571,
+          198875,
+          193185,
+          191468,
+          211500,
+          215010,
+          191606,
+          190442
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "composed",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward_to_public_y_and_private_rsigma",
+          "rmsnorm_backward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "dy": "275b6bb7bf115e9110a4403637863cd0a3f0fb2cbb7b18ac9de05560db5a154c",
+        "gamma": "e90137a7f830b75f00ee6dae7c89bbd7fba30dfb31ff7951fec129441c170821",
+        "x": "0f3b7cfa2054631d63038001deb298b086d0c2baffeaddd6082c4518df91e13c"
+      },
+      "input_pattern": "qualification_linspace_v2",
+      "outputs": [
+        {
+          "absolute_floor": 0.015625,
+          "all_finite": true,
+          "below_floor_count": 162992,
+          "digest": "cf9a4fe0b0b9adf7055e9c943f692d843dc5908e67dcec91b68961e013bbb8f1",
+          "eligible_count": 8225616,
+          "max_absolute_error": 0.00390625,
+          "max_absolute_error_above_floor": 0.00390625,
+          "max_absolute_error_below_floor": 6.103515625e-05,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007299270015209913,
+          "mean_absolute_error": 2.0074367057532072e-08,
+          "raw_max_bfloat16_ulp_actual": -0.11181640625,
+          "raw_max_bfloat16_ulp_index": 292674,
+          "raw_max_bfloat16_ulp_reference": -0.1123046875,
+          "reference_digest": "85924a7a28e8edb0a21aff788016315a0b804465ae04cac79c69517ff7c71284",
+          "role": "y"
+        },
+        {
+          "absolute_floor": 0.125,
+          "all_finite": true,
+          "below_floor_count": 1864961,
+          "digest": "b09429e74cce38c20cc84b56a7d99aa51ded89a0e3d1a942e96eb43390965249",
+          "eligible_count": 6523647,
+          "max_absolute_error": 0.0078125,
+          "max_absolute_error_above_floor": 0.0078125,
+          "max_absolute_error_below_floor": 0.00048828125,
+          "max_bfloat16_ulp": 24,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007633587811142206,
+          "mean_absolute_error": 5.458664276147829e-08,
+          "raw_max_bfloat16_ulp_actual": 6.51925802230835e-09,
+          "raw_max_bfloat16_ulp_index": 2660366,
+          "raw_max_bfloat16_ulp_reference": 7.2177499532699585e-09,
+          "reference_digest": "b832dffb3e31d5e5639c2e272bbd9e74cc5ec3a664298b02604448628c0fbdab",
+          "role": "dx"
+        },
+        {
+          "absolute_floor": 0.03125,
+          "all_finite": true,
+          "below_floor_count": 0,
+          "digest": "7e8e78fc4dad00d99b614018ae47cfe67162a859cc10bab79c2c2b0ca73746b3",
+          "eligible_count": 4096,
+          "max_absolute_error": 0.0,
+          "max_absolute_error_above_floor": 0.0,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 0,
+          "max_bfloat16_ulp_above_absolute_floor": 0,
+          "max_relative_error_above_absolute_floor": 0.0,
+          "mean_absolute_error": 0.0,
+          "raw_max_bfloat16_ulp_actual": 876.0,
+          "raw_max_bfloat16_ulp_index": 0,
+          "raw_max_bfloat16_ulp_reference": 876.0,
+          "reference_digest": "7e8e78fc4dad00d99b614018ae47cfe67162a859cc10bab79c2c2b0ca73746b3",
+          "role": "dgamma"
+        }
+      ],
+      "producer": "ordinary_jax_xla",
+      "repeat": 0,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 241727.5,
+        "raw_cuda_event_ns": null,
+        "raw_host_blocking_ns": [
+          221470,
+          317863,
+          242224,
+          235329,
+          242698,
+          238474,
+          244434,
+          234698,
+          274783,
+          240129,
+          242523,
+          237093,
+          254712,
+          235687,
+          235650,
+          267783,
+          259738,
+          250139,
+          236868,
+          241231
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "composed",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward_to_public_y_and_private_rsigma",
+          "rmsnorm_backward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "dy": "275b6bb7bf115e9110a4403637863cd0a3f0fb2cbb7b18ac9de05560db5a154c",
+        "gamma": "e90137a7f830b75f00ee6dae7c89bbd7fba30dfb31ff7951fec129441c170821",
+        "x": "0f3b7cfa2054631d63038001deb298b086d0c2baffeaddd6082c4518df91e13c"
+      },
+      "input_pattern": "qualification_linspace_v2",
+      "outputs": [
+        {
+          "absolute_floor": 0.015625,
+          "all_finite": true,
+          "below_floor_count": 162992,
+          "digest": "cf9a4fe0b0b9adf7055e9c943f692d843dc5908e67dcec91b68961e013bbb8f1",
+          "eligible_count": 8225616,
+          "max_absolute_error": 0.00390625,
+          "max_absolute_error_above_floor": 0.00390625,
+          "max_absolute_error_below_floor": 6.103515625e-05,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007299270015209913,
+          "mean_absolute_error": 2.0074367057532072e-08,
+          "raw_max_bfloat16_ulp_actual": -0.11181640625,
+          "raw_max_bfloat16_ulp_index": 292674,
+          "raw_max_bfloat16_ulp_reference": -0.1123046875,
+          "reference_digest": "85924a7a28e8edb0a21aff788016315a0b804465ae04cac79c69517ff7c71284",
+          "role": "y"
+        },
+        {
+          "absolute_floor": 0.125,
+          "all_finite": true,
+          "below_floor_count": 1864961,
+          "digest": "502041f57708e86411c5e2fafe675aba5208a89194cc82b3f8db43e0b5f6ace5",
+          "eligible_count": 6523647,
+          "max_absolute_error": 0.0078125,
+          "max_absolute_error_above_floor": 0.0078125,
+          "max_absolute_error_below_floor": 0.00048828125,
+          "max_bfloat16_ulp": 24,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007633587811142206,
+          "mean_absolute_error": 5.4586557496349997e-08,
+          "raw_max_bfloat16_ulp_actual": 6.51925802230835e-09,
+          "raw_max_bfloat16_ulp_index": 2660366,
+          "raw_max_bfloat16_ulp_reference": 7.2177499532699585e-09,
+          "reference_digest": "b832dffb3e31d5e5639c2e272bbd9e74cc5ec3a664298b02604448628c0fbdab",
+          "role": "dx"
+        },
+        {
+          "absolute_floor": 0.03125,
+          "all_finite": true,
+          "below_floor_count": 0,
+          "digest": "7e8e78fc4dad00d99b614018ae47cfe67162a859cc10bab79c2c2b0ca73746b3",
+          "eligible_count": 4096,
+          "max_absolute_error": 0.0,
+          "max_absolute_error_above_floor": 0.0,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 0,
+          "max_bfloat16_ulp_above_absolute_floor": 0,
+          "max_relative_error_above_absolute_floor": 0.0,
+          "mean_absolute_error": 0.0,
+          "raw_max_bfloat16_ulp_actual": 876.0,
+          "raw_max_bfloat16_ulp_index": 0,
+          "raw_max_bfloat16_ulp_reference": 876.0,
+          "reference_digest": "7e8e78fc4dad00d99b614018ae47cfe67162a859cc10bab79c2c2b0ca73746b3",
+          "role": "dgamma"
+        }
+      ],
+      "producer": "ordinary_jax_xla",
+      "repeat": 1,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 219066.0,
+        "raw_cuda_event_ns": null,
+        "raw_host_blocking_ns": [
+          199395,
+          317275,
+          224289,
+          231990,
+          230598,
+          238147,
+          218129,
+          217219,
+          209591,
+          212829,
+          230052,
+          218337,
+          215840,
+          212949,
+          252161,
+          225476,
+          219795,
+          214987,
+          211170,
+          225817
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "forward",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "gamma": "bc3f6002b8b4c4718db1aeee0cf2b459c18ec80aa69958d2c8945be915a409d6",
+        "x": "595fc9c13633ba99278591d4288b9150b1d7c71eb17bd9c5f0d4720e1762ea8b"
+      },
+      "input_pattern": "heldout_reversed_linspace_v1",
+      "outputs": [
+        {
+          "absolute_floor": 0.015625,
+          "all_finite": true,
+          "below_floor_count": 153,
+          "digest": "c3076f63d0900c4dba2b35555d998ecfbcd61061f636908f2990b77c00ae8560",
+          "eligible_count": 8388455,
+          "max_absolute_error": 0.0078125,
+          "max_absolute_error_above_floor": 0.0078125,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.006369426846504211,
+          "mean_absolute_error": 3.655441105365753e-08,
+          "raw_max_bfloat16_ulp_actual": -1.234375,
+          "raw_max_bfloat16_ulp_index": 4702116,
+          "raw_max_bfloat16_ulp_reference": -1.2265625,
+          "reference_digest": "15a4e1660f2dc93b91841a0ac8c54c90372548a4b1269a09cc9c428cdc3e98f5",
+          "role": "y"
+        }
+      ],
+      "producer": "ordinary_jax_xla",
+      "repeat": 0,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 144922.5,
+        "raw_cuda_event_ns": null,
+        "raw_host_blocking_ns": [
+          142897,
+          154833,
+          139544,
+          131637,
+          137905,
+          141744,
+          153656,
+          145121,
+          145424,
+          140240,
+          145737,
+          144724,
+          148036,
+          161478,
+          146334,
+          134559,
+          143479,
+          158176,
+          143606,
+          154266
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "forward",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "gamma": "bc3f6002b8b4c4718db1aeee0cf2b459c18ec80aa69958d2c8945be915a409d6",
+        "x": "595fc9c13633ba99278591d4288b9150b1d7c71eb17bd9c5f0d4720e1762ea8b"
+      },
+      "input_pattern": "heldout_reversed_linspace_v1",
+      "outputs": [
+        {
+          "absolute_floor": 0.015625,
+          "all_finite": true,
+          "below_floor_count": 153,
+          "digest": "c3076f63d0900c4dba2b35555d998ecfbcd61061f636908f2990b77c00ae8560",
+          "eligible_count": 8388455,
+          "max_absolute_error": 0.0078125,
+          "max_absolute_error_above_floor": 0.0078125,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.006369426846504211,
+          "mean_absolute_error": 3.655441105365753e-08,
+          "raw_max_bfloat16_ulp_actual": -1.234375,
+          "raw_max_bfloat16_ulp_index": 4702116,
+          "raw_max_bfloat16_ulp_reference": -1.2265625,
+          "reference_digest": "15a4e1660f2dc93b91841a0ac8c54c90372548a4b1269a09cc9c428cdc3e98f5",
+          "role": "y"
+        }
+      ],
+      "producer": "ordinary_jax_xla",
+      "repeat": 1,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 149648.0,
+        "raw_cuda_event_ns": null,
+        "raw_host_blocking_ns": [
+          329473,
+          154927,
+          222682,
+          183033,
+          158316,
+          146747,
+          140217,
+          139898,
+          148403,
+          143748,
+          121616,
+          140115,
+          142869,
+          137980,
+          159453,
+          142645,
+          150893,
+          168095,
+          152386,
+          151628
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "backward_recompute",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward_to_private_rsigma",
+          "rmsnorm_backward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "dy": "237d26f9c6c048e5d3979da9e283aff46f062518d9a91ea5b74d2f8eaf80526d",
+        "gamma": "bc3f6002b8b4c4718db1aeee0cf2b459c18ec80aa69958d2c8945be915a409d6",
+        "x": "595fc9c13633ba99278591d4288b9150b1d7c71eb17bd9c5f0d4720e1762ea8b"
+      },
+      "input_pattern": "heldout_reversed_linspace_v1",
+      "outputs": [
+        {
+          "absolute_floor": 0.125,
+          "all_finite": true,
+          "below_floor_count": 2991355,
+          "digest": "b8d0563c98763e75591d3aad21b690157da260ad95db7f76f0bd7683206f691e",
+          "eligible_count": 5397253,
+          "max_absolute_error": 0.0078125,
+          "max_absolute_error_above_floor": 0.0078125,
+          "max_absolute_error_below_floor": 0.00048828125,
+          "max_bfloat16_ulp": 37,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.006802720949053764,
+          "mean_absolute_error": 7.456419837126305e-08,
+          "raw_max_bfloat16_ulp_actual": 4.76837158203125e-07,
+          "raw_max_bfloat16_ulp_index": 985079,
+          "raw_max_bfloat16_ulp_reference": 4.079192876815796e-07,
+          "reference_digest": "d5e6be3d8cf52e4139235b9dde69a84db489a705580a376f08a613eb7beeab9a",
+          "role": "dx"
+        },
+        {
+          "absolute_floor": 0.03125,
+          "all_finite": true,
+          "below_floor_count": 0,
+          "digest": "06498bae527509f636aae0baa0b247e657e5f6dc1f7453cf3279e53db90664e0",
+          "eligible_count": 4096,
+          "max_absolute_error": 0.0,
+          "max_absolute_error_above_floor": 0.0,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 0,
+          "max_bfloat16_ulp_above_absolute_floor": 0,
+          "max_relative_error_above_absolute_floor": 0.0,
+          "mean_absolute_error": 0.0,
+          "raw_max_bfloat16_ulp_actual": -860.0,
+          "raw_max_bfloat16_ulp_index": 0,
+          "raw_max_bfloat16_ulp_reference": -860.0,
+          "reference_digest": "06498bae527509f636aae0baa0b247e657e5f6dc1f7453cf3279e53db90664e0",
+          "role": "dgamma"
+        }
+      ],
+      "producer": "ordinary_jax_xla",
+      "repeat": 0,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 204638.5,
+        "raw_cuda_event_ns": null,
+        "raw_host_blocking_ns": [
+          203968,
+          229726,
+          206487,
+          204526,
+          207252,
+          209699,
+          202981,
+          203801,
+          195408,
+          195894,
+          210301,
+          204751,
+          200885,
+          204521,
+          210486,
+          212006,
+          210728,
+          196771,
+          200315,
+          216212
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "backward_recompute",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward_to_private_rsigma",
+          "rmsnorm_backward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "dy": "237d26f9c6c048e5d3979da9e283aff46f062518d9a91ea5b74d2f8eaf80526d",
+        "gamma": "bc3f6002b8b4c4718db1aeee0cf2b459c18ec80aa69958d2c8945be915a409d6",
+        "x": "595fc9c13633ba99278591d4288b9150b1d7c71eb17bd9c5f0d4720e1762ea8b"
+      },
+      "input_pattern": "heldout_reversed_linspace_v1",
+      "outputs": [
+        {
+          "absolute_floor": 0.125,
+          "all_finite": true,
+          "below_floor_count": 2991355,
+          "digest": "b8d0563c98763e75591d3aad21b690157da260ad95db7f76f0bd7683206f691e",
+          "eligible_count": 5397253,
+          "max_absolute_error": 0.0078125,
+          "max_absolute_error_above_floor": 0.0078125,
+          "max_absolute_error_below_floor": 0.00048828125,
+          "max_bfloat16_ulp": 37,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.006802720949053764,
+          "mean_absolute_error": 7.456419837126305e-08,
+          "raw_max_bfloat16_ulp_actual": 4.76837158203125e-07,
+          "raw_max_bfloat16_ulp_index": 985079,
+          "raw_max_bfloat16_ulp_reference": 4.079192876815796e-07,
+          "reference_digest": "d5e6be3d8cf52e4139235b9dde69a84db489a705580a376f08a613eb7beeab9a",
+          "role": "dx"
+        },
+        {
+          "absolute_floor": 0.03125,
+          "all_finite": true,
+          "below_floor_count": 0,
+          "digest": "06498bae527509f636aae0baa0b247e657e5f6dc1f7453cf3279e53db90664e0",
+          "eligible_count": 4096,
+          "max_absolute_error": 0.0,
+          "max_absolute_error_above_floor": 0.0,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 0,
+          "max_bfloat16_ulp_above_absolute_floor": 0,
+          "max_relative_error_above_absolute_floor": 0.0,
+          "mean_absolute_error": 0.0,
+          "raw_max_bfloat16_ulp_actual": -860.0,
+          "raw_max_bfloat16_ulp_index": 0,
+          "raw_max_bfloat16_ulp_reference": -860.0,
+          "reference_digest": "06498bae527509f636aae0baa0b247e657e5f6dc1f7453cf3279e53db90664e0",
+          "role": "dgamma"
+        }
+      ],
+      "producer": "ordinary_jax_xla",
+      "repeat": 1,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 184568.5,
+        "raw_cuda_event_ns": null,
+        "raw_host_blocking_ns": [
+          389695,
+          4048335,
+          795310,
+          2158090,
+          343154,
+          511553,
+          235728,
+          197098,
+          184473,
+          171331,
+          180026,
+          180592,
+          177228,
+          175200,
+          172949,
+          171457,
+          178194,
+          184664,
+          192825,
+          184304
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "composed",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward_to_public_y_and_private_rsigma",
+          "rmsnorm_backward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "dy": "237d26f9c6c048e5d3979da9e283aff46f062518d9a91ea5b74d2f8eaf80526d",
+        "gamma": "bc3f6002b8b4c4718db1aeee0cf2b459c18ec80aa69958d2c8945be915a409d6",
+        "x": "595fc9c13633ba99278591d4288b9150b1d7c71eb17bd9c5f0d4720e1762ea8b"
+      },
+      "input_pattern": "heldout_reversed_linspace_v1",
+      "outputs": [
+        {
+          "absolute_floor": 0.015625,
+          "all_finite": true,
+          "below_floor_count": 153,
+          "digest": "c3076f63d0900c4dba2b35555d998ecfbcd61061f636908f2990b77c00ae8560",
+          "eligible_count": 8388455,
+          "max_absolute_error": 0.0078125,
+          "max_absolute_error_above_floor": 0.0078125,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.006369426846504211,
+          "mean_absolute_error": 3.655441105365753e-08,
+          "raw_max_bfloat16_ulp_actual": -1.234375,
+          "raw_max_bfloat16_ulp_index": 4702116,
+          "raw_max_bfloat16_ulp_reference": -1.2265625,
+          "reference_digest": "15a4e1660f2dc93b91841a0ac8c54c90372548a4b1269a09cc9c428cdc3e98f5",
+          "role": "y"
+        },
+        {
+          "absolute_floor": 0.125,
+          "all_finite": true,
+          "below_floor_count": 2991355,
+          "digest": "b8d0563c98763e75591d3aad21b690157da260ad95db7f76f0bd7683206f691e",
+          "eligible_count": 5397253,
+          "max_absolute_error": 0.0078125,
+          "max_absolute_error_above_floor": 0.0078125,
+          "max_absolute_error_below_floor": 0.00048828125,
+          "max_bfloat16_ulp": 37,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.006802720949053764,
+          "mean_absolute_error": 7.456419837126305e-08,
+          "raw_max_bfloat16_ulp_actual": 4.76837158203125e-07,
+          "raw_max_bfloat16_ulp_index": 985079,
+          "raw_max_bfloat16_ulp_reference": 4.079192876815796e-07,
+          "reference_digest": "d5e6be3d8cf52e4139235b9dde69a84db489a705580a376f08a613eb7beeab9a",
+          "role": "dx"
+        },
+        {
+          "absolute_floor": 0.03125,
+          "all_finite": true,
+          "below_floor_count": 0,
+          "digest": "06498bae527509f636aae0baa0b247e657e5f6dc1f7453cf3279e53db90664e0",
+          "eligible_count": 4096,
+          "max_absolute_error": 0.0,
+          "max_absolute_error_above_floor": 0.0,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 0,
+          "max_bfloat16_ulp_above_absolute_floor": 0,
+          "max_relative_error_above_absolute_floor": 0.0,
+          "mean_absolute_error": 0.0,
+          "raw_max_bfloat16_ulp_actual": -860.0,
+          "raw_max_bfloat16_ulp_index": 0,
+          "raw_max_bfloat16_ulp_reference": -860.0,
+          "reference_digest": "06498bae527509f636aae0baa0b247e657e5f6dc1f7453cf3279e53db90664e0",
+          "role": "dgamma"
+        }
+      ],
+      "producer": "ordinary_jax_xla",
+      "repeat": 0,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 291406.5,
+        "raw_cuda_event_ns": null,
+        "raw_host_blocking_ns": [
+          247952,
+          391748,
+          338608,
+          324720,
+          285153,
+          316119,
+          291435,
+          283743,
+          275061,
+          318783,
+          297241,
+          296504,
+          300142,
+          281978,
+          278766,
+          284654,
+          294176,
+          291378,
+          280153,
+          283586
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "composed",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward_to_public_y_and_private_rsigma",
+          "rmsnorm_backward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "dy": "237d26f9c6c048e5d3979da9e283aff46f062518d9a91ea5b74d2f8eaf80526d",
+        "gamma": "bc3f6002b8b4c4718db1aeee0cf2b459c18ec80aa69958d2c8945be915a409d6",
+        "x": "595fc9c13633ba99278591d4288b9150b1d7c71eb17bd9c5f0d4720e1762ea8b"
+      },
+      "input_pattern": "heldout_reversed_linspace_v1",
+      "outputs": [
+        {
+          "absolute_floor": 0.015625,
+          "all_finite": true,
+          "below_floor_count": 153,
+          "digest": "c3076f63d0900c4dba2b35555d998ecfbcd61061f636908f2990b77c00ae8560",
+          "eligible_count": 8388455,
+          "max_absolute_error": 0.0078125,
+          "max_absolute_error_above_floor": 0.0078125,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.006369426846504211,
+          "mean_absolute_error": 3.655441105365753e-08,
+          "raw_max_bfloat16_ulp_actual": -1.234375,
+          "raw_max_bfloat16_ulp_index": 4702116,
+          "raw_max_bfloat16_ulp_reference": -1.2265625,
+          "reference_digest": "15a4e1660f2dc93b91841a0ac8c54c90372548a4b1269a09cc9c428cdc3e98f5",
+          "role": "y"
+        },
+        {
+          "absolute_floor": 0.125,
+          "all_finite": true,
+          "below_floor_count": 2991355,
+          "digest": "b8d0563c98763e75591d3aad21b690157da260ad95db7f76f0bd7683206f691e",
+          "eligible_count": 5397253,
+          "max_absolute_error": 0.0078125,
+          "max_absolute_error_above_floor": 0.0078125,
+          "max_absolute_error_below_floor": 0.00048828125,
+          "max_bfloat16_ulp": 37,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.006802720949053764,
+          "mean_absolute_error": 7.456419837126305e-08,
+          "raw_max_bfloat16_ulp_actual": 4.76837158203125e-07,
+          "raw_max_bfloat16_ulp_index": 985079,
+          "raw_max_bfloat16_ulp_reference": 4.079192876815796e-07,
+          "reference_digest": "d5e6be3d8cf52e4139235b9dde69a84db489a705580a376f08a613eb7beeab9a",
+          "role": "dx"
+        },
+        {
+          "absolute_floor": 0.03125,
+          "all_finite": true,
+          "below_floor_count": 0,
+          "digest": "06498bae527509f636aae0baa0b247e657e5f6dc1f7453cf3279e53db90664e0",
+          "eligible_count": 4096,
+          "max_absolute_error": 0.0,
+          "max_absolute_error_above_floor": 0.0,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 0,
+          "max_bfloat16_ulp_above_absolute_floor": 0,
+          "max_relative_error_above_absolute_floor": 0.0,
+          "mean_absolute_error": 0.0,
+          "raw_max_bfloat16_ulp_actual": -860.0,
+          "raw_max_bfloat16_ulp_index": 0,
+          "raw_max_bfloat16_ulp_reference": -860.0,
+          "reference_digest": "06498bae527509f636aae0baa0b247e657e5f6dc1f7453cf3279e53db90664e0",
+          "role": "dgamma"
+        }
+      ],
+      "producer": "ordinary_jax_xla",
+      "repeat": 1,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 259707.5,
+        "raw_cuda_event_ns": null,
+        "raw_host_blocking_ns": [
+          234957,
+          308899,
+          1046512,
+          985132,
+          3700321,
+          394084,
+          281305,
+          275653,
+          259535,
+          259880,
+          246365,
+          263100,
+          263537,
+          258768,
+          253598,
+          259030,
+          251264,
+          243995,
+          256850,
+          256625
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "forward",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "gamma": "7666bd787eded8f496d15ecaa0ff1a09e2785076f6f5e5db47737a95152b86ec",
+        "x": "d5306b1c52e907c4f4df004e6f3a9c488f354acd80221eb5077e6f20a1c3f34e"
+      },
+      "input_pattern": "heldout_splitmix64_v1",
+      "outputs": [
+        {
+          "absolute_floor": 0.015625,
+          "all_finite": true,
+          "below_floor_count": 82755,
+          "digest": "b7215b7eee5b09b5e0c23c78af786e9a2b07762f1ed8e9da6afd480a88c6a53a",
+          "eligible_count": 8305853,
+          "max_absolute_error": 0.015625,
+          "max_absolute_error_above_floor": 0.015625,
+          "max_absolute_error_below_floor": 6.103515625e-05,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007751937955617905,
+          "mean_absolute_error": 3.0930095817893744e-08,
+          "raw_max_bfloat16_ulp_actual": 0.62109375,
+          "raw_max_bfloat16_ulp_index": 491597,
+          "raw_max_bfloat16_ulp_reference": 0.6171875,
+          "reference_digest": "dbf0c5cc4900ca5498099bd458edfdf31200a692fd2996e66960e8b98b77078e",
+          "role": "y"
+        }
+      ],
+      "producer": "ordinary_jax_xla",
+      "repeat": 0,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 167676.0,
+        "raw_cuda_event_ns": null,
+        "raw_host_blocking_ns": [
+          142311,
+          164914,
+          148065,
+          148688,
+          148564,
+          170438,
+          147343,
+          145799,
+          146044,
+          278681,
+          198169,
+          1268690,
+          3640070,
+          289304,
+          234334,
+          2568569,
+          287874,
+          141357,
+          187253,
+          143399
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "forward",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "gamma": "7666bd787eded8f496d15ecaa0ff1a09e2785076f6f5e5db47737a95152b86ec",
+        "x": "d5306b1c52e907c4f4df004e6f3a9c488f354acd80221eb5077e6f20a1c3f34e"
+      },
+      "input_pattern": "heldout_splitmix64_v1",
+      "outputs": [
+        {
+          "absolute_floor": 0.015625,
+          "all_finite": true,
+          "below_floor_count": 82755,
+          "digest": "b7215b7eee5b09b5e0c23c78af786e9a2b07762f1ed8e9da6afd480a88c6a53a",
+          "eligible_count": 8305853,
+          "max_absolute_error": 0.015625,
+          "max_absolute_error_above_floor": 0.015625,
+          "max_absolute_error_below_floor": 6.103515625e-05,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007751937955617905,
+          "mean_absolute_error": 3.0930095817893744e-08,
+          "raw_max_bfloat16_ulp_actual": 0.62109375,
+          "raw_max_bfloat16_ulp_index": 491597,
+          "raw_max_bfloat16_ulp_reference": 0.6171875,
+          "reference_digest": "dbf0c5cc4900ca5498099bd458edfdf31200a692fd2996e66960e8b98b77078e",
+          "role": "y"
+        }
+      ],
+      "producer": "ordinary_jax_xla",
+      "repeat": 1,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 203595.0,
+        "raw_cuda_event_ns": null,
+        "raw_host_blocking_ns": [
+          199568,
+          193305,
+          175724,
+          203368,
+          228178,
+          256240,
+          220402,
+          214727,
+          209095,
+          233698,
+          213279,
+          196122,
+          185790,
+          206948,
+          225893,
+          203822,
+          200439,
+          193259,
+          200401,
+          197744
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "backward_recompute",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward_to_private_rsigma",
+          "rmsnorm_backward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "dy": "2abeef4e00143b614ca27c6f310998493609de3490f4720538be507c4ddc4556",
+        "gamma": "7666bd787eded8f496d15ecaa0ff1a09e2785076f6f5e5db47737a95152b86ec",
+        "x": "d5306b1c52e907c4f4df004e6f3a9c488f354acd80221eb5077e6f20a1c3f34e"
+      },
+      "input_pattern": "heldout_splitmix64_v1",
+      "outputs": [
+        {
+          "absolute_floor": 0.125,
+          "all_finite": true,
+          "below_floor_count": 665790,
+          "digest": "70f3e84152897a9a8c1b205544197381f144a5ff8187fd09fc52f6be43a58f58",
+          "eligible_count": 7722818,
+          "max_absolute_error": 0.015625,
+          "max_absolute_error_above_floor": 0.015625,
+          "max_absolute_error_below_floor": 0.00048828125,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007751937955617905,
+          "mean_absolute_error": 3.537907389272732e-08,
+          "raw_max_bfloat16_ulp_actual": -0.451171875,
+          "raw_max_bfloat16_ulp_index": 230839,
+          "raw_max_bfloat16_ulp_reference": -0.453125,
+          "reference_digest": "938fe85ca5d7820ca1ae7dfb8acc970307ad88ec92d94b77bd024e904c2d8c55",
+          "role": "dx"
+        },
+        {
+          "absolute_floor": 0.03125,
+          "all_finite": true,
+          "below_floor_count": 5,
+          "digest": "209869785a9897bfd13ff39665e0ad781d2bb14b3b7c15067a1f6c752c4601fb",
+          "eligible_count": 4091,
+          "max_absolute_error": 0.0,
+          "max_absolute_error_above_floor": 0.0,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 0,
+          "max_bfloat16_ulp_above_absolute_floor": 0,
+          "max_relative_error_above_absolute_floor": 0.0,
+          "mean_absolute_error": 0.0,
+          "raw_max_bfloat16_ulp_actual": 27.5,
+          "raw_max_bfloat16_ulp_index": 0,
+          "raw_max_bfloat16_ulp_reference": 27.5,
+          "reference_digest": "209869785a9897bfd13ff39665e0ad781d2bb14b3b7c15067a1f6c752c4601fb",
+          "role": "dgamma"
+        }
+      ],
+      "producer": "ordinary_jax_xla",
+      "repeat": 0,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 238362.5,
+        "raw_cuda_event_ns": null,
+        "raw_host_blocking_ns": [
+          217099,
+          233011,
+          239851,
+          254794,
+          232861,
+          231204,
+          226582,
+          243126,
+          242016,
+          224345,
+          205640,
+          241084,
+          253850,
+          257307,
+          237997,
+          244206,
+          243444,
+          238728,
+          234891,
+          212175
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "backward_recompute",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward_to_private_rsigma",
+          "rmsnorm_backward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "dy": "2abeef4e00143b614ca27c6f310998493609de3490f4720538be507c4ddc4556",
+        "gamma": "7666bd787eded8f496d15ecaa0ff1a09e2785076f6f5e5db47737a95152b86ec",
+        "x": "d5306b1c52e907c4f4df004e6f3a9c488f354acd80221eb5077e6f20a1c3f34e"
+      },
+      "input_pattern": "heldout_splitmix64_v1",
+      "outputs": [
+        {
+          "absolute_floor": 0.125,
+          "all_finite": true,
+          "below_floor_count": 665790,
+          "digest": "70f3e84152897a9a8c1b205544197381f144a5ff8187fd09fc52f6be43a58f58",
+          "eligible_count": 7722818,
+          "max_absolute_error": 0.015625,
+          "max_absolute_error_above_floor": 0.015625,
+          "max_absolute_error_below_floor": 0.00048828125,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007751937955617905,
+          "mean_absolute_error": 3.537907389272732e-08,
+          "raw_max_bfloat16_ulp_actual": -0.451171875,
+          "raw_max_bfloat16_ulp_index": 230839,
+          "raw_max_bfloat16_ulp_reference": -0.453125,
+          "reference_digest": "938fe85ca5d7820ca1ae7dfb8acc970307ad88ec92d94b77bd024e904c2d8c55",
+          "role": "dx"
+        },
+        {
+          "absolute_floor": 0.03125,
+          "all_finite": true,
+          "below_floor_count": 5,
+          "digest": "209869785a9897bfd13ff39665e0ad781d2bb14b3b7c15067a1f6c752c4601fb",
+          "eligible_count": 4091,
+          "max_absolute_error": 0.0,
+          "max_absolute_error_above_floor": 0.0,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 0,
+          "max_bfloat16_ulp_above_absolute_floor": 0,
+          "max_relative_error_above_absolute_floor": 0.0,
+          "mean_absolute_error": 0.0,
+          "raw_max_bfloat16_ulp_actual": 27.5,
+          "raw_max_bfloat16_ulp_index": 0,
+          "raw_max_bfloat16_ulp_reference": 27.5,
+          "reference_digest": "209869785a9897bfd13ff39665e0ad781d2bb14b3b7c15067a1f6c752c4601fb",
+          "role": "dgamma"
+        }
+      ],
+      "producer": "ordinary_jax_xla",
+      "repeat": 1,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 264746.5,
+        "raw_cuda_event_ns": null,
+        "raw_host_blocking_ns": [
+          246962,
+          270075,
+          260336,
+          249133,
+          260123,
+          254369,
+          281848,
+          258320,
+          255943,
+          256795,
+          281500,
+          268116,
+          265950,
+          303792,
+          657999,
+          351547,
+          289690,
+          258227,
+          263543,
+          270105
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "composed",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward_to_public_y_and_private_rsigma",
+          "rmsnorm_backward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "dy": "2abeef4e00143b614ca27c6f310998493609de3490f4720538be507c4ddc4556",
+        "gamma": "7666bd787eded8f496d15ecaa0ff1a09e2785076f6f5e5db47737a95152b86ec",
+        "x": "d5306b1c52e907c4f4df004e6f3a9c488f354acd80221eb5077e6f20a1c3f34e"
+      },
+      "input_pattern": "heldout_splitmix64_v1",
+      "outputs": [
+        {
+          "absolute_floor": 0.015625,
+          "all_finite": true,
+          "below_floor_count": 82755,
+          "digest": "b7215b7eee5b09b5e0c23c78af786e9a2b07762f1ed8e9da6afd480a88c6a53a",
+          "eligible_count": 8305853,
+          "max_absolute_error": 0.015625,
+          "max_absolute_error_above_floor": 0.015625,
+          "max_absolute_error_below_floor": 6.103515625e-05,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007751937955617905,
+          "mean_absolute_error": 3.0930095817893744e-08,
+          "raw_max_bfloat16_ulp_actual": 0.62109375,
+          "raw_max_bfloat16_ulp_index": 491597,
+          "raw_max_bfloat16_ulp_reference": 0.6171875,
+          "reference_digest": "dbf0c5cc4900ca5498099bd458edfdf31200a692fd2996e66960e8b98b77078e",
+          "role": "y"
+        },
+        {
+          "absolute_floor": 0.125,
+          "all_finite": true,
+          "below_floor_count": 665790,
+          "digest": "9e7ecab1632755e5eb43e76606ef30369628bd9ee9738916c1b78c0e5b28738f",
+          "eligible_count": 7722818,
+          "max_absolute_error": 0.015625,
+          "max_absolute_error_above_floor": 0.015625,
+          "max_absolute_error_below_floor": 0.00048828125,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007751937955617905,
+          "mean_absolute_error": 3.89515832921461e-08,
+          "raw_max_bfloat16_ulp_actual": -0.255859375,
+          "raw_max_bfloat16_ulp_index": 49975,
+          "raw_max_bfloat16_ulp_reference": -0.2578125,
+          "reference_digest": "938fe85ca5d7820ca1ae7dfb8acc970307ad88ec92d94b77bd024e904c2d8c55",
+          "role": "dx"
+        },
+        {
+          "absolute_floor": 0.03125,
+          "all_finite": true,
+          "below_floor_count": 5,
+          "digest": "209869785a9897bfd13ff39665e0ad781d2bb14b3b7c15067a1f6c752c4601fb",
+          "eligible_count": 4091,
+          "max_absolute_error": 0.0,
+          "max_absolute_error_above_floor": 0.0,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 0,
+          "max_bfloat16_ulp_above_absolute_floor": 0,
+          "max_relative_error_above_absolute_floor": 0.0,
+          "mean_absolute_error": 0.0,
+          "raw_max_bfloat16_ulp_actual": 27.5,
+          "raw_max_bfloat16_ulp_index": 0,
+          "raw_max_bfloat16_ulp_reference": 27.5,
+          "reference_digest": "209869785a9897bfd13ff39665e0ad781d2bb14b3b7c15067a1f6c752c4601fb",
+          "role": "dgamma"
+        }
+      ],
+      "producer": "ordinary_jax_xla",
+      "repeat": 0,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 263363.5,
+        "raw_cuda_event_ns": null,
+        "raw_host_blocking_ns": [
+          255810,
+          414120,
+          292899,
+          289993,
+          268315,
+          256318,
+          1937884,
+          360196,
+          338004,
+          265003,
+          243027,
+          250685,
+          257064,
+          252635,
+          2673887,
+          408910,
+          261724,
+          260697,
+          235971,
+          238136
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "composed",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward_to_public_y_and_private_rsigma",
+          "rmsnorm_backward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "dy": "2abeef4e00143b614ca27c6f310998493609de3490f4720538be507c4ddc4556",
+        "gamma": "7666bd787eded8f496d15ecaa0ff1a09e2785076f6f5e5db47737a95152b86ec",
+        "x": "d5306b1c52e907c4f4df004e6f3a9c488f354acd80221eb5077e6f20a1c3f34e"
+      },
+      "input_pattern": "heldout_splitmix64_v1",
+      "outputs": [
+        {
+          "absolute_floor": 0.015625,
+          "all_finite": true,
+          "below_floor_count": 82755,
+          "digest": "b7215b7eee5b09b5e0c23c78af786e9a2b07762f1ed8e9da6afd480a88c6a53a",
+          "eligible_count": 8305853,
+          "max_absolute_error": 0.015625,
+          "max_absolute_error_above_floor": 0.015625,
+          "max_absolute_error_below_floor": 6.103515625e-05,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007751937955617905,
+          "mean_absolute_error": 3.0930095817893744e-08,
+          "raw_max_bfloat16_ulp_actual": 0.62109375,
+          "raw_max_bfloat16_ulp_index": 491597,
+          "raw_max_bfloat16_ulp_reference": 0.6171875,
+          "reference_digest": "dbf0c5cc4900ca5498099bd458edfdf31200a692fd2996e66960e8b98b77078e",
+          "role": "y"
+        },
+        {
+          "absolute_floor": 0.125,
+          "all_finite": true,
+          "below_floor_count": 665790,
+          "digest": "9e7ecab1632755e5eb43e76606ef30369628bd9ee9738916c1b78c0e5b28738f",
+          "eligible_count": 7722818,
+          "max_absolute_error": 0.015625,
+          "max_absolute_error_above_floor": 0.015625,
+          "max_absolute_error_below_floor": 0.00048828125,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007751937955617905,
+          "mean_absolute_error": 3.89515832921461e-08,
+          "raw_max_bfloat16_ulp_actual": -0.255859375,
+          "raw_max_bfloat16_ulp_index": 49975,
+          "raw_max_bfloat16_ulp_reference": -0.2578125,
+          "reference_digest": "938fe85ca5d7820ca1ae7dfb8acc970307ad88ec92d94b77bd024e904c2d8c55",
+          "role": "dx"
+        },
+        {
+          "absolute_floor": 0.03125,
+          "all_finite": true,
+          "below_floor_count": 5,
+          "digest": "209869785a9897bfd13ff39665e0ad781d2bb14b3b7c15067a1f6c752c4601fb",
+          "eligible_count": 4091,
+          "max_absolute_error": 0.0,
+          "max_absolute_error_above_floor": 0.0,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 0,
+          "max_bfloat16_ulp_above_absolute_floor": 0,
+          "max_relative_error_above_absolute_floor": 0.0,
+          "mean_absolute_error": 0.0,
+          "raw_max_bfloat16_ulp_actual": 27.5,
+          "raw_max_bfloat16_ulp_index": 0,
+          "raw_max_bfloat16_ulp_reference": 27.5,
+          "reference_digest": "209869785a9897bfd13ff39665e0ad781d2bb14b3b7c15067a1f6c752c4601fb",
+          "role": "dgamma"
+        }
+      ],
+      "producer": "ordinary_jax_xla",
+      "repeat": 1,
+      "scope": "representative_policy_qualification",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 316856.5,
+        "raw_cuda_event_ns": null,
+        "raw_host_blocking_ns": [
+          270041,
+          381303,
+          331313,
+          325521,
+          316415,
+          310554,
+          315912,
+          317298,
+          323784,
+          324848,
+          314076,
+          310952,
+          294525,
+          292332,
+          280916,
+          319996,
+          339310,
+          319916,
+          307050,
+          351602
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "forward",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "gamma": "a6798be78031f1e5ea51e24649b26a9b952f5b00543a8bf878a1fc68dae96c8e",
+        "x": "94149f756a9a5cbd8d4ef1fd5b72284666f790ec06da9c4fd34f91981de72b0d"
+      },
+      "input_pattern": "heldout_splitmix64_v2",
+      "outputs": [
+        {
+          "absolute_floor": 0.015625,
+          "all_finite": true,
+          "below_floor_count": 83481,
+          "digest": "9a1a7971d53ee45f3267867fbe8f099eb3c73e1e61b465fe2c8ebf67baf50b97",
+          "eligible_count": 8305127,
+          "max_absolute_error": 0.015625,
+          "max_absolute_error_above_floor": 0.015625,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007692307699471712,
+          "mean_absolute_error": 2.61643435806036e-08,
+          "raw_max_bfloat16_ulp_actual": 1.234375,
+          "raw_max_bfloat16_ulp_index": 98375,
+          "raw_max_bfloat16_ulp_reference": 1.2265625,
+          "reference_digest": "9adf2dbe23cbd85a4a2841e911a17fc769bad679764dc41a933fd29b3e2f5e7a",
+          "role": "y"
+        }
+      ],
+      "producer": "ordinary_jax_xla",
+      "repeat": 0,
+      "scope": "representative_policy_acceptance",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 155995.0,
+        "raw_cuda_event_ns": null,
+        "raw_host_blocking_ns": [
+          203177,
+          191859,
+          166831,
+          150617,
+          148452,
+          150308,
+          186839,
+          164427,
+          156209,
+          155731,
+          165899,
+          152426,
+          173324,
+          155724,
+          155781,
+          157227,
+          151939,
+          144849,
+          143000,
+          168437
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "forward",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "gamma": "a6798be78031f1e5ea51e24649b26a9b952f5b00543a8bf878a1fc68dae96c8e",
+        "x": "94149f756a9a5cbd8d4ef1fd5b72284666f790ec06da9c4fd34f91981de72b0d"
+      },
+      "input_pattern": "heldout_splitmix64_v2",
+      "outputs": [
+        {
+          "absolute_floor": 0.015625,
+          "all_finite": true,
+          "below_floor_count": 83481,
+          "digest": "9a1a7971d53ee45f3267867fbe8f099eb3c73e1e61b465fe2c8ebf67baf50b97",
+          "eligible_count": 8305127,
+          "max_absolute_error": 0.015625,
+          "max_absolute_error_above_floor": 0.015625,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007692307699471712,
+          "mean_absolute_error": 2.61643435806036e-08,
+          "raw_max_bfloat16_ulp_actual": 1.234375,
+          "raw_max_bfloat16_ulp_index": 98375,
+          "raw_max_bfloat16_ulp_reference": 1.2265625,
+          "reference_digest": "9adf2dbe23cbd85a4a2841e911a17fc769bad679764dc41a933fd29b3e2f5e7a",
+          "role": "y"
+        }
+      ],
+      "producer": "ordinary_jax_xla",
+      "repeat": 1,
+      "scope": "representative_policy_acceptance",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 138014.0,
+        "raw_cuda_event_ns": null,
+        "raw_host_blocking_ns": [
+          3373203,
+          342875,
+          160196,
+          119809,
+          107477,
+          107681,
+          102265,
+          106635,
+          92260,
+          130403,
+          130461,
+          140562,
+          139504,
+          140981,
+          159293,
+          141434,
+          131804,
+          136524,
+          142396,
+          146758
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "backward_recompute",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward_to_private_rsigma",
+          "rmsnorm_backward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "dy": "16300ef5a34dbe3ae28fc07f6ade2e6f72f9ae63480bc34feb40581ee3bf3818",
+        "gamma": "a6798be78031f1e5ea51e24649b26a9b952f5b00543a8bf878a1fc68dae96c8e",
+        "x": "94149f756a9a5cbd8d4ef1fd5b72284666f790ec06da9c4fd34f91981de72b0d"
+      },
+      "input_pattern": "heldout_splitmix64_v2",
+      "outputs": [
+        {
+          "absolute_floor": 0.125,
+          "all_finite": true,
+          "below_floor_count": 662862,
+          "digest": "8065c9ffb21b828bc67acfc188d3f22d1f1ed845c02ce2a47a82ee700ed50284",
+          "eligible_count": 7725746,
+          "max_absolute_error": 0.015625,
+          "max_absolute_error_above_floor": 0.015625,
+          "max_absolute_error_below_floor": 0.00048828125,
+          "max_bfloat16_ulp": 3,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.0078125,
+          "mean_absolute_error": 6.481543124436939e-08,
+          "raw_max_bfloat16_ulp_actual": 1.3597309589385986e-07,
+          "raw_max_bfloat16_ulp_index": 1462744,
+          "raw_max_bfloat16_ulp_reference": 1.387670636177063e-07,
+          "reference_digest": "7c4e9301b933be7ba6a94d30bf3e00a1e6071e31982c25ea1cafe74ce439fad3",
+          "role": "dx"
+        },
+        {
+          "absolute_floor": 0.03125,
+          "all_finite": true,
+          "below_floor_count": 5,
+          "digest": "4f6b8e22de67a1b0ccf5b8cd3946960c11b6117ff4d84ff2b39bbcbeef2657fd",
+          "eligible_count": 4091,
+          "max_absolute_error": 3.814697265625e-06,
+          "max_absolute_error_above_floor": 0.0,
+          "max_absolute_error_below_floor": 3.814697265625e-06,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 0,
+          "max_relative_error_above_absolute_floor": 0.0,
+          "mean_absolute_error": 9.313225746154785e-10,
+          "raw_max_bfloat16_ulp_actual": 0.000797271728515625,
+          "raw_max_bfloat16_ulp_index": 1529,
+          "raw_max_bfloat16_ulp_reference": 0.00080108642578125,
+          "reference_digest": "fc63fa70b69a390e51b5fc6a3a2f2c6e70373d1d4f9f79ff5c9f02681dc907e8",
+          "role": "dgamma"
+        }
+      ],
+      "producer": "ordinary_jax_xla",
+      "repeat": 0,
+      "scope": "representative_policy_acceptance",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 242581.0,
+        "raw_cuda_event_ns": null,
+        "raw_host_blocking_ns": [
+          350698,
+          252079,
+          270791,
+          1689662,
+          3991571,
+          444489,
+          267770,
+          248946,
+          239446,
+          235001,
+          222819,
+          238705,
+          228197,
+          245716,
+          235508,
+          227629,
+          249613,
+          235231,
+          235352,
+          224912
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "backward_recompute",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward_to_private_rsigma",
+          "rmsnorm_backward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "dy": "16300ef5a34dbe3ae28fc07f6ade2e6f72f9ae63480bc34feb40581ee3bf3818",
+        "gamma": "a6798be78031f1e5ea51e24649b26a9b952f5b00543a8bf878a1fc68dae96c8e",
+        "x": "94149f756a9a5cbd8d4ef1fd5b72284666f790ec06da9c4fd34f91981de72b0d"
+      },
+      "input_pattern": "heldout_splitmix64_v2",
+      "outputs": [
+        {
+          "absolute_floor": 0.125,
+          "all_finite": true,
+          "below_floor_count": 662862,
+          "digest": "8065c9ffb21b828bc67acfc188d3f22d1f1ed845c02ce2a47a82ee700ed50284",
+          "eligible_count": 7725746,
+          "max_absolute_error": 0.015625,
+          "max_absolute_error_above_floor": 0.015625,
+          "max_absolute_error_below_floor": 0.00048828125,
+          "max_bfloat16_ulp": 3,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.0078125,
+          "mean_absolute_error": 6.481543124436939e-08,
+          "raw_max_bfloat16_ulp_actual": 1.3597309589385986e-07,
+          "raw_max_bfloat16_ulp_index": 1462744,
+          "raw_max_bfloat16_ulp_reference": 1.387670636177063e-07,
+          "reference_digest": "7c4e9301b933be7ba6a94d30bf3e00a1e6071e31982c25ea1cafe74ce439fad3",
+          "role": "dx"
+        },
+        {
+          "absolute_floor": 0.03125,
+          "all_finite": true,
+          "below_floor_count": 5,
+          "digest": "4f6b8e22de67a1b0ccf5b8cd3946960c11b6117ff4d84ff2b39bbcbeef2657fd",
+          "eligible_count": 4091,
+          "max_absolute_error": 3.814697265625e-06,
+          "max_absolute_error_above_floor": 0.0,
+          "max_absolute_error_below_floor": 3.814697265625e-06,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 0,
+          "max_relative_error_above_absolute_floor": 0.0,
+          "mean_absolute_error": 9.313225746154785e-10,
+          "raw_max_bfloat16_ulp_actual": 0.000797271728515625,
+          "raw_max_bfloat16_ulp_index": 1529,
+          "raw_max_bfloat16_ulp_reference": 0.00080108642578125,
+          "reference_digest": "fc63fa70b69a390e51b5fc6a3a2f2c6e70373d1d4f9f79ff5c9f02681dc907e8",
+          "role": "dgamma"
+        }
+      ],
+      "producer": "ordinary_jax_xla",
+      "repeat": 1,
+      "scope": "representative_policy_acceptance",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 220942.0,
+        "raw_cuda_event_ns": null,
+        "raw_host_blocking_ns": [
+          218248,
+          227350,
+          227394,
+          225722,
+          213571,
+          211937,
+          223108,
+          219273,
+          234111,
+          222611,
+          210248,
+          209031,
+          224429,
+          260564,
+          214759,
+          206494,
+          252483,
+          244427,
+          187177,
+          179936
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "composed",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward_to_public_y_and_private_rsigma",
+          "rmsnorm_backward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "dy": "16300ef5a34dbe3ae28fc07f6ade2e6f72f9ae63480bc34feb40581ee3bf3818",
+        "gamma": "a6798be78031f1e5ea51e24649b26a9b952f5b00543a8bf878a1fc68dae96c8e",
+        "x": "94149f756a9a5cbd8d4ef1fd5b72284666f790ec06da9c4fd34f91981de72b0d"
+      },
+      "input_pattern": "heldout_splitmix64_v2",
+      "outputs": [
+        {
+          "absolute_floor": 0.015625,
+          "all_finite": true,
+          "below_floor_count": 83481,
+          "digest": "7a178f9ed5acbd63c576b36a5881b48a176ae6d6b61aed88ac3c93cfa5f0f8e2",
+          "eligible_count": 8305127,
+          "max_absolute_error": 0.015625,
+          "max_absolute_error_above_floor": 0.015625,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007692307699471712,
+          "mean_absolute_error": 2.5203917175531387e-08,
+          "raw_max_bfloat16_ulp_actual": 1.234375,
+          "raw_max_bfloat16_ulp_index": 98375,
+          "raw_max_bfloat16_ulp_reference": 1.2265625,
+          "reference_digest": "9adf2dbe23cbd85a4a2841e911a17fc769bad679764dc41a933fd29b3e2f5e7a",
+          "role": "y"
+        },
+        {
+          "absolute_floor": 0.125,
+          "all_finite": true,
+          "below_floor_count": 662862,
+          "digest": "8065c9ffb21b828bc67acfc188d3f22d1f1ed845c02ce2a47a82ee700ed50284",
+          "eligible_count": 7725746,
+          "max_absolute_error": 0.015625,
+          "max_absolute_error_above_floor": 0.015625,
+          "max_absolute_error_below_floor": 0.00048828125,
+          "max_bfloat16_ulp": 3,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.0078125,
+          "mean_absolute_error": 6.481543124436939e-08,
+          "raw_max_bfloat16_ulp_actual": 1.3597309589385986e-07,
+          "raw_max_bfloat16_ulp_index": 1462744,
+          "raw_max_bfloat16_ulp_reference": 1.387670636177063e-07,
+          "reference_digest": "7c4e9301b933be7ba6a94d30bf3e00a1e6071e31982c25ea1cafe74ce439fad3",
+          "role": "dx"
+        },
+        {
+          "absolute_floor": 0.03125,
+          "all_finite": true,
+          "below_floor_count": 5,
+          "digest": "4f6b8e22de67a1b0ccf5b8cd3946960c11b6117ff4d84ff2b39bbcbeef2657fd",
+          "eligible_count": 4091,
+          "max_absolute_error": 3.814697265625e-06,
+          "max_absolute_error_above_floor": 0.0,
+          "max_absolute_error_below_floor": 3.814697265625e-06,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 0,
+          "max_relative_error_above_absolute_floor": 0.0,
+          "mean_absolute_error": 9.313225746154785e-10,
+          "raw_max_bfloat16_ulp_actual": 0.000797271728515625,
+          "raw_max_bfloat16_ulp_index": 1529,
+          "raw_max_bfloat16_ulp_reference": 0.00080108642578125,
+          "reference_digest": "fc63fa70b69a390e51b5fc6a3a2f2c6e70373d1d4f9f79ff5c9f02681dc907e8",
+          "role": "dgamma"
+        }
+      ],
+      "producer": "ordinary_jax_xla",
+      "repeat": 0,
+      "scope": "representative_policy_acceptance",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 258812.0,
+        "raw_cuda_event_ns": null,
+        "raw_host_blocking_ns": [
+          194188,
+          270378,
+          231280,
+          242776,
+          228490,
+          250251,
+          233562,
+          262428,
+          307682,
+          255196,
+          309624,
+          244093,
+          302810,
+          324640,
+          454271,
+          283090,
+          281981,
+          263770,
+          234786,
+          227209
+        ],
+        "warmup_invocations": 10
+      }
+    },
+    {
+      "boundary": "composed",
+      "execution": {
+        "call_sequence": [
+          "rmsnorm_forward_to_public_y_and_private_rsigma",
+          "rmsnorm_backward"
+        ],
+        "rsigma_state": "invocation_local_not_public"
+      },
+      "input_digests": {
+        "dy": "16300ef5a34dbe3ae28fc07f6ade2e6f72f9ae63480bc34feb40581ee3bf3818",
+        "gamma": "a6798be78031f1e5ea51e24649b26a9b952f5b00543a8bf878a1fc68dae96c8e",
+        "x": "94149f756a9a5cbd8d4ef1fd5b72284666f790ec06da9c4fd34f91981de72b0d"
+      },
+      "input_pattern": "heldout_splitmix64_v2",
+      "outputs": [
+        {
+          "absolute_floor": 0.015625,
+          "all_finite": true,
+          "below_floor_count": 83481,
+          "digest": "7a178f9ed5acbd63c576b36a5881b48a176ae6d6b61aed88ac3c93cfa5f0f8e2",
+          "eligible_count": 8305127,
+          "max_absolute_error": 0.015625,
+          "max_absolute_error_above_floor": 0.015625,
+          "max_absolute_error_below_floor": 0.0,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.007692307699471712,
+          "mean_absolute_error": 2.5203917175531387e-08,
+          "raw_max_bfloat16_ulp_actual": 1.234375,
+          "raw_max_bfloat16_ulp_index": 98375,
+          "raw_max_bfloat16_ulp_reference": 1.2265625,
+          "reference_digest": "9adf2dbe23cbd85a4a2841e911a17fc769bad679764dc41a933fd29b3e2f5e7a",
+          "role": "y"
+        },
+        {
+          "absolute_floor": 0.125,
+          "all_finite": true,
+          "below_floor_count": 662862,
+          "digest": "8065c9ffb21b828bc67acfc188d3f22d1f1ed845c02ce2a47a82ee700ed50284",
+          "eligible_count": 7725746,
+          "max_absolute_error": 0.015625,
+          "max_absolute_error_above_floor": 0.015625,
+          "max_absolute_error_below_floor": 0.00048828125,
+          "max_bfloat16_ulp": 3,
+          "max_bfloat16_ulp_above_absolute_floor": 1,
+          "max_relative_error_above_absolute_floor": 0.0078125,
+          "mean_absolute_error": 6.481543124436939e-08,
+          "raw_max_bfloat16_ulp_actual": 1.3597309589385986e-07,
+          "raw_max_bfloat16_ulp_index": 1462744,
+          "raw_max_bfloat16_ulp_reference": 1.387670636177063e-07,
+          "reference_digest": "7c4e9301b933be7ba6a94d30bf3e00a1e6071e31982c25ea1cafe74ce439fad3",
+          "role": "dx"
+        },
+        {
+          "absolute_floor": 0.03125,
+          "all_finite": true,
+          "below_floor_count": 5,
+          "digest": "4f6b8e22de67a1b0ccf5b8cd3946960c11b6117ff4d84ff2b39bbcbeef2657fd",
+          "eligible_count": 4091,
+          "max_absolute_error": 3.814697265625e-06,
+          "max_absolute_error_above_floor": 0.0,
+          "max_absolute_error_below_floor": 3.814697265625e-06,
+          "max_bfloat16_ulp": 1,
+          "max_bfloat16_ulp_above_absolute_floor": 0,
+          "max_relative_error_above_absolute_floor": 0.0,
+          "mean_absolute_error": 9.313225746154785e-10,
+          "raw_max_bfloat16_ulp_actual": 0.000797271728515625,
+          "raw_max_bfloat16_ulp_index": 1529,
+          "raw_max_bfloat16_ulp_reference": 0.00080108642578125,
+          "reference_digest": "fc63fa70b69a390e51b5fc6a3a2f2c6e70373d1d4f9f79ff5c9f02681dc907e8",
+          "role": "dgamma"
+        }
+      ],
+      "producer": "ordinary_jax_xla",
+      "repeat": 1,
+      "scope": "representative_policy_acceptance",
+      "shape": [
+        2048,
+        4096
+      ],
+      "timing": {
+        "median_host_blocking_ns": 261797.5,
+        "raw_cuda_event_ns": null,
+        "raw_host_blocking_ns": [
+          234534,
+          329562,
+          278328,
+          287553,
+          265187,
+          259227,
+          273685,
+          271213,
+          272670,
+          259570,
+          274430,
+          254483,
+          261972,
+          260337,
+          261333,
+          261623,
+          252838,
+          254409,
+          267762,
+          257618
+        ],
+        "warmup_invocations": 10
+      }
+    }
+  ],
+  "schema": "shuttle_abi22_rmsnorm_policy_evidence_v3"
+}

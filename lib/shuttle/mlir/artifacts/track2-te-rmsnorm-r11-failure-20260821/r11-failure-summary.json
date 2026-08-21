@@ -1,0 +1,83 @@
+{
+  "schema": "shuttle_track2_te_rmsnorm_v3_failure_summary_v1",
+  "job": {
+    "id": "/dlwh/shuttle-track2-te-h100-r11",
+    "config": "/Users/dlwh/src/marin/lib/iris/config/cw-rno2a.yaml",
+    "state": "failed",
+    "task_exit": 1,
+    "failures": 1,
+    "preemptions": 0,
+    "duration_seconds": 318.68
+  },
+  "source": {
+    "commit": "e887fd2a726bb8ea46eaf93474d41485495d96af",
+    "tree": "0ca4071807bf9ae607dfae8fda49e622691ddb4f"
+  },
+  "request": {
+    "path": "/private/tmp/shuttle-track2-te-request-r11.13CRYM/request.pb",
+    "sha256": "b616757fb0e3d4102f6b788d874341c4a8a09cf9f834c15afe650accc733c658",
+    "size": 6907354,
+    "bundle_sha256": "29617b3e11f7a0f52f6050e064b3721d3faf9a861150ae116be4bc2c7f78ae28",
+    "bundle_size": 6906585
+  },
+  "receipt": {
+    "sha256": "e8a9bdd29acd6cac0207669291635ef68927f3abc6a86cf0daa9eaf1287ba8a1",
+    "size": 776
+  },
+  "evidence": {
+    "controller_log_archive": {
+      "sha256": "9d45c56836a0eeaa8fe46fa9826e3c31a4d9a9445a64e1923675dae01fb219b2",
+      "size": 14711,
+      "uncompressed_sha256": "1387978daebdfbebb0add5e2d574545636ab2b868f00fe745eec245993274692",
+      "uncompressed_size": 146749
+    },
+    "job_summary": {
+      "sha256": "f3921ab8574ba7222c9f83c20288a11c794639b1e0f8d798f1be8aa19654fc52",
+      "size": 2903
+    },
+    "raw_policy": {
+      "sha256": "2709a8d61005db69fe05e07c2e7961e1d6ddcffd36245a872b1510e69dc9f6a0",
+      "size": 154452,
+      "cell_count": 48
+    },
+    "repeat_diagnostics": {
+      "sha256": "a65d2898dd5f6d602529cb25ca2a15714c1a6c60e4470f0c2f6c8753e8325cc1",
+      "size": 46653,
+      "coordinate_count": 48
+    }
+  },
+  "failure": {
+    "validator_error": "qualification repeat output digest drifted",
+    "mismatch_coordinate_count": 1,
+    "matching_coordinate_count": 47,
+    "coordinate": {
+      "producer": "ordinary_jax_xla",
+      "input_pattern": "qualification_linspace_v2",
+      "boundary": "composed",
+      "role": "dx"
+    },
+    "provenance_equal_across_repeats": {
+      "input_digests": true,
+      "reference_digest": true,
+      "shape": true,
+      "scope": true,
+      "call_sequence": true
+    },
+    "repeat0_digest": "b09429e74cce38c20cc84b56a7d99aa51ded89a0e3d1a942e96eb43390965249",
+    "repeat1_digest": "502041f57708e86411c5e2fafe675aba5208a89194cc82b3f8db43e0b5f6ace5",
+    "mismatch_count": 3,
+    "max_pairwise_absolute_error": 2.384185791015625e-7,
+    "max_pairwise_bfloat16_ulp": 1,
+    "first_and_max_mismatch_index": 4380678,
+    "repeat0_value": 5.3882598876953125e-5,
+    "repeat1_value": 5.412101745605469e-5
+  },
+  "acceptance_pattern_observation": {
+    "input_pattern": "heldout_splitmix64_v2",
+    "repeat_coordinate_count": 12,
+    "exact_repeat_coordinate_count": 12,
+    "individual_numerical_metrics_within_frozen_limits": true,
+    "acceptance_status": "rejected_by_global_qualification_repeat_gate"
+  },
+  "decision": "qualification_failure_no_policy_widening_no_resubmission_no_acceptance_claim"
+}
