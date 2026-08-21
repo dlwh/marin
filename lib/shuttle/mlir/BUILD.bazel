@@ -366,6 +366,9 @@ cc_test(
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-forward.mlir",
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-backward.mlir",
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-composed.mlir",
+        "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2048x4096-backward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2048x4096-composed.mlir",
+        "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2048x4096-forward.mlir",
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-3x2x5x11x263-forward.mlir",
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-3x2x5x11x263-backward.mlir",
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-3x2x5x11x263-composed.mlir",
@@ -569,6 +572,24 @@ py_test(
 )
 
 py_test(
+    name = "abi22_shuttle_rmsnorm_representative_test",
+    srcs = [
+        "jax_patch/abi22_shuttle_rmsnorm_representative.py",
+        "jax_patch/test_abi22_shuttle_rmsnorm_representative.py",
+    ],
+    data = [
+        "artifacts/track2-te-rmsnorm-r12-success-20260821/policy-raw-v4.json",
+        "artifacts/track2-te-rmsnorm-r12-success-20260821/result-v4.json",
+    ],
+    deps = [
+        "@pypi//ml_dtypes",
+        "@pypi//numpy",
+    ],
+    imports = ["jax_patch"],
+    main = "jax_patch/test_abi22_shuttle_rmsnorm_representative.py",
+)
+
+py_test(
     name = "track2_te_h100_policy_v4_test",
     srcs = [
         "jax_patch/abi15_h100_numerics.py",
@@ -625,6 +646,9 @@ cc_test(
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-backward.mlir",
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-composed.mlir",
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-forward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2048x4096-backward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2048x4096-composed.mlir",
+        "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2048x4096-forward.mlir",
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-3x2x5x11x263-backward.mlir",
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-3x2x5x11x263-composed.mlir",
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-3x2x5x11x263-forward.mlir",
