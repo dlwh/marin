@@ -36,7 +36,7 @@ def _run_git(repository: Path, *arguments: str) -> None:
 
 
 def _git_repository(repository: Path, files: dict[str, str]) -> None:
-    repository.mkdir()
+    repository.mkdir(exist_ok=True)
     for relative_path, content in files.items():
         path = repository / relative_path
         path.parent.mkdir(parents=True, exist_ok=True)

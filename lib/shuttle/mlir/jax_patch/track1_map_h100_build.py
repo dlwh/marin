@@ -6,6 +6,7 @@
 import hashlib
 import os
 import platform
+import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -61,6 +62,20 @@ class BuildInputs:
     xla_patch_sha256: tuple[str, ...]
     xla_repository: Path
     xla_status: str
+
+
+@dataclass(frozen=True)
+class SourceCheckoutsIdentity:
+    jax_commit: str
+    jax_diff_sha256: str
+    jax_status_sha256: str
+    jax_tree: str
+    jax_untracked_sha256: str
+    xla_commit: str
+    xla_diff_sha256: str
+    xla_status_sha256: str
+    xla_tree: str
+    xla_untracked_sha256: str
 
 
 def _regular(path: Path, name: str, *, executable: bool = False) -> None:
@@ -188,6 +203,70 @@ def _git(repository: Path, *arguments: str) -> str:
         capture_output=True,
         text=True,
     ).stdout.strip()
+
+
+def _git_bytes(repository: Path, *arguments: str) -> bytes:
+    return subprocess.run(
+        ["git", *arguments],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+    ).stdout
+
+
+def _untracked_sha256(repository: Path) -> str:
+    digest = hashlib.sha256()
+    raw_paths = _git_bytes(repository, "ls-files", "--others", "--exclude-standard", "-z")
+    for raw_path in sorted(path for path in raw_paths.split(b"\0") if path):
+        relative = Path(os.fsdecode(raw_path))
+        path = repository / relative
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError(f"hydrated source contains a non-regular untracked file: {relative}")
+        digest.update(len(raw_path).to_bytes(8, "little"))
+        digest.update(raw_path)
+        digest.update(stat.S_IMODE(metadata.st_mode).to_bytes(4, "little"))
+        digest.update(metadata.st_size.to_bytes(8, "little"))
+        with path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
+def source_checkouts_identity(*, jax_repository: Path, xla_repository: Path) -> SourceCheckoutsIdentity:
+    """Snapshot all live tracked and non-ignored untracked JAX/XLA source state."""
+    return SourceCheckoutsIdentity(
+        jax_commit=_git(jax_repository, "rev-parse", "HEAD"),
+        jax_diff_sha256=hashlib.sha256(
+            _git_bytes(jax_repository, "diff", "--binary", "--no-ext-diff", "HEAD", "--")
+        ).hexdigest(),
+        jax_status_sha256=hashlib.sha256(
+            _git_bytes(jax_repository, "status", "--porcelain=v1", "--untracked-files=all")
+        ).hexdigest(),
+        jax_tree=_git(jax_repository, "rev-parse", "HEAD^{tree}"),
+        jax_untracked_sha256=_untracked_sha256(jax_repository),
+        xla_commit=_git(xla_repository, "rev-parse", "HEAD"),
+        xla_diff_sha256=hashlib.sha256(
+            _git_bytes(xla_repository, "diff", "--binary", "--no-ext-diff", "HEAD", "--")
+        ).hexdigest(),
+        xla_status_sha256=hashlib.sha256(
+            _git_bytes(xla_repository, "status", "--porcelain=v1", "--untracked-files=all")
+        ).hexdigest(),
+        xla_tree=_git(xla_repository, "rev-parse", "HEAD^{tree}"),
+        xla_untracked_sha256=_untracked_sha256(xla_repository),
+    )
+
+
+def require_source_checkouts_unchanged(
+    expected: SourceCheckoutsIdentity,
+    *,
+    jax_repository: Path,
+    xla_repository: Path,
+) -> None:
+    """Reject source drift between the approved patch application and offline build."""
+    observed = source_checkouts_identity(jax_repository=jax_repository, xla_repository=xla_repository)
+    if observed != expected:
+        raise RuntimeError("network hydration changed patched JAX or XLA source")
 
 
 def _require_live_source_snapshot(inputs: BuildInputs) -> None:

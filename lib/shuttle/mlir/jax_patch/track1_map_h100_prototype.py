@@ -10,7 +10,7 @@ import platform
 import re
 import stat
 import subprocess
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from track1_map_h100_build import (
@@ -21,10 +21,13 @@ from track1_map_h100_build import (
     XLA_PATCH_SHA256,
     BuildInputs,
     BuildToolDigests,
+    SourceCheckoutsIdentity,
     apply_source_patches,
     inspect_build_inputs,
     offline_wheel_command,
     require_offline_build_inputs,
+    require_source_checkouts_unchanged,
+    source_checkouts_identity,
 )
 
 INTEGRATION_COMMIT = "41502f2079385df29fccbf1137bce553aa090297"
@@ -477,6 +480,7 @@ def _hydration_identity(
     paths: PrototypePaths,
     cuda_root: Path,
     inspected: BuildInputs,
+    source_identity: SourceCheckoutsIdentity,
     source_manifest_sha256: str,
 ) -> dict[str, object]:
     return {
@@ -490,9 +494,7 @@ def _hydration_identity(
             "integration_commit": INTEGRATION_COMMIT,
             "integration_source_manifest_sha256": source_manifest_sha256,
             "integration_tree": INTEGRATION_TREE,
-            "jax_commit": inspected.jax_commit,
-            "jax_tree": inspected.jax_tree,
-            "xla_commit": inspected.xla_commit,
+            "patched_checkouts": asdict(source_identity),
         },
         "tools": {
             "bazel": {"identity": _identity([str(paths.bazel), "--version"]), "sha256": _sha256_file(paths.bazel)},
@@ -603,13 +605,24 @@ def execute_prototype(
         ptxas=_sha256_file(cuda_root / "bin/ptxas"),
     )
     require_offline_build_inputs(inspected, expected_tool_sha256=tools)
-    hydration_identity = _hydration_identity(paths, cuda_root, inspected, source_manifest_sha256)
-    paths.hydration_identity.write_bytes(canonical_json(hydration_identity))
     apply_source_patches(inspected)
+    patched_sources = source_checkouts_identity(jax_repository=paths.jax, xla_repository=paths.xla)
+    hydration_identity = _hydration_identity(paths, cuda_root, inspected, patched_sources, source_manifest_sha256)
+    paths.hydration_identity.write_bytes(canonical_json(hydration_identity))
     hydrate, offline = _build_commands(paths, runner_repository)
     _run(hydrate, cwd=paths.jax, log=paths.logs / "hydrate-build.log")
-    if _hydration_identity(paths, cuda_root, inspected, source_manifest_sha256) != hydration_identity:
+    require_source_checkouts_unchanged(
+        patched_sources,
+        jax_repository=paths.jax,
+        xla_repository=paths.xla,
+    )
+    if _hydration_identity(paths, cuda_root, inspected, patched_sources, source_manifest_sha256) != hydration_identity:
         raise RuntimeError("hydrated tool identities changed before the offline build")
+    require_source_checkouts_unchanged(
+        patched_sources,
+        jax_repository=paths.jax,
+        xla_repository=paths.xla,
+    )
     _run(offline, cwd=paths.jax, log=paths.logs / "offline-build.log")
     wheels = wheel_set(paths.wheels)
 
