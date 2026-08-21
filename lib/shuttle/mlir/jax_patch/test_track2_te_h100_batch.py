@@ -25,6 +25,7 @@ from track2_te_h100_batch import (
     TE_WHEEL_SHA256,
     TE_WHEEL_URL,
     BatchPaths,
+    _invoke_oracle,
     batch_plan,
     canonical_json,
     execute_batch,
@@ -309,7 +310,14 @@ def test_execute_batch_drives_validated_oracle_and_writes_closed_result(
         return {
             "device": {"model": "NVIDIA H100 80GB HBM3", "uuid": "GPU-test", "compute_capability": "9.0"},
             "driver": "580.00",
-            "transformer_engine": {"source_commit": TE_SOURCE_COMMIT, "source_tree": TE_SOURCE_TREE},
+            "transformer_engine": {
+                "source_commit": TE_SOURCE_COMMIT,
+                "source_tree": TE_SOURCE_TREE,
+                "version": "2.17.0",
+                "wheel_sha256": TE_WHEEL_SHA256,
+                "library_path": str(paths.te_library),
+                "library_sha256": hashlib.sha256(b"resolved-te-library").hexdigest(),
+            },
         }
 
     monkeypatch.setattr("track2_te_h100_batch.platform.system", lambda: "Linux")
@@ -328,12 +336,44 @@ def test_execute_batch_drives_validated_oracle_and_writes_closed_result(
 
     assert result["schema"] == "shuttle_track2_te_h100_batch_result_v1"
     assert result["source"]["commit"] == "1" * 40
-    assert result["tools"]["transformer_engine"]["source_commit"] == TE_SOURCE_COMMIT
+    assert result["tools"]["transformer_engine"] == {
+        "source_commit": TE_SOURCE_COMMIT,
+        "source_tree": TE_SOURCE_TREE,
+        "version": "2.17.0",
+        "wheel_sha256": TE_WHEEL_SHA256,
+        "library_path": str(BatchPaths.under(workspace).te_library),
+        "library_sha256": hashlib.sha256(b"resolved-te-library").hexdigest(),
+    }
     assert result["evidence"]["acceptance"]["accepted_shape"] == [2048, 4096]
     assert result["evidence"]["shuttle"] == {"status": "pending", "blocker": SHUTTLE_BLOCKER}
     assert len(calls) == 12
     assert json.loads(BatchPaths.under(workspace).result.read_bytes()) == result
     assert not any("shuttle" in path.name for path in BatchPaths.under(workspace).reports.iterdir())
+
+
+def test_oracle_subprocess_uses_resolved_te_library_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    paths = BatchPaths.under(tmp_path)
+    paths.workspace.mkdir()
+    paths.te_library.parent.mkdir(parents=True)
+    paths.te_library.write_bytes(b"resolved-te-library")
+    observed: dict[str, object] = {}
+
+    class Result:
+        returncode = 0
+
+    def fake_run(argv: list[str], **kwargs: object) -> Result:
+        observed["argv"] = argv
+        observed.update(kwargs)
+        return Result()
+
+    monkeypatch.setattr("track2_te_h100_batch.subprocess.run", fake_run)
+
+    assert _invoke_oracle(paths, [str(paths.te_runner), "--probe", "1"]) == 0
+    assert observed["argv"] == [str(paths.te_runner), "--probe", "1"]
+    assert observed["cwd"] == paths.workspace
+    environment = observed["env"]
+    assert isinstance(environment, dict)
+    assert environment["LD_LIBRARY_PATH"].split(":")[0] == str(paths.te_library.parent)
 
 
 def test_execute_batch_rejects_zero_exit_with_missing_oracle_artifact(
