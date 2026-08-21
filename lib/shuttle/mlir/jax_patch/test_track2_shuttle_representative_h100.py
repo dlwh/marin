@@ -56,11 +56,13 @@ class ShuttleRepresentativeBatchTest(unittest.TestCase):
         self.assertEqual(build[2], "build")
         self.assertEqual(build[-1], "@shuttle_mlir//:run_h100_shuttle_rmsnorm_representative_matrix")
         self.assertIn("--config=cuda", build)
+        execute = phases[10]["argv"]
+        self.assertEqual(execute[2], "run")
+        self.assertIn("@shuttle_mlir//:run_h100_shuttle_rmsnorm_representative_matrix", execute)
+        separator = execute.index("--")
         self.assertEqual(
-            phases[10]["argv"],
+            execute[separator + 1 :],
             [
-                "/tmp/shuttle-track2-rmsnorm/xla/bazel-bin/external/shuttle_mlir/"
-                "run_h100_shuttle_rmsnorm_representative_matrix",
                 "--python",
                 "/opt/h100-evidence-runtime/bin/python",
                 "--case-root",
