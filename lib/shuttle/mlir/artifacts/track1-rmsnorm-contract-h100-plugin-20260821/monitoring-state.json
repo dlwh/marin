@@ -1,0 +1,21 @@
+{
+  "authorization_sha256": "d0c03b7f72dbe3e7164308b853b0f43a1550979e920afac4f2da96292156c9ff",
+  "bundle_sha256": "ed22190110c1f94ba0f2cc461cbc2fce05bdb0841734c30578e19ae59c7ba2ca",
+  "cluster": "cw-rno2a",
+  "config": "lib/iris/config/cw-rno2a.yaml",
+  "failure_count": 0,
+  "job_id": "/dlwh/shuttle-track1-rmsnorm-contract-h100-canary-r3",
+  "last_check_at": "2026-08-21T19:27:34Z",
+  "last_signal": "task 0 succeeded after 16 minutes 2.2 seconds runtime; canonical result preserved and validated",
+  "preemption_count": 0,
+  "request_path": "/private/tmp/shuttle-rmsnorm-contract-r3-request-d7f5534.ZmIZzl/launch.pb",
+  "request_sha256": "ddb2933b25446b0f7cbf26ae87cfe7dbbfa0a7d9c1511f359954209708e86626",
+  "restart_count": 0,
+  "result_sha256": "32af1df017f5790c52b3515c72d8843763852d19d492d3e55baad03ea227a9a5",
+  "result_size": 58841,
+  "resubmit_command": "none; any successor requires a reviewed request",
+  "status": "SUCCEEDED",
+  "submitted_at": "2026-08-21T18:09:14.707Z",
+  "task_exit_code": 0,
+  "terminal_observed_at": "2026-08-21T19:27:29Z"
+}

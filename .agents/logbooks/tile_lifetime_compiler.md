@@ -16,16 +16,21 @@ author: dlwh
 
 ## Current TL;DR
 
-- Three deliberately bounded H100 milestones are now complete. The ordinary-JAX
+- Six deliberately bounded H100 milestones are now complete. The ordinary-JAX
   plugin path is replicated for generic Map islands while unsupported
   `stablehlo.abs` remains XLA-owned. Standalone ABI22 Fold and norm-to-Contract
   bundles are bit-exact against an independent host oracle and have exploratory
   same-GPU timing. The ordinary-JAX RMSNorm plugin also passes the declared
   forward, backward, and composed rank-3/rank-5 H100 matrix against its
-  independent numerical contract. Representative RMSNorm shapes, a matched
-  strong CUDA-event oracle, performance, and the remaining target matrix are
-  open. Evidence: entries `TLTC-MLIR-037`, `TLTC-ABI22-001`, and
-  `TLTC-ABI22-002`. The
+  independent numerical contract. The ordinary-JAX RMSNorm-to-Contract plugin
+  passes its prospectively declared small-shape primal and composed matrix;
+  the 42-launch composed path remains diagnostic and is not the target
+  architecture. LayerNorm forward and the generic two-task backward/composed
+  partition also pass their prospectively declared H100 contracts. A matched
+  strong CUDA-event oracle, performance, RMSNorm-to-Contract composed-path
+  optimization, and the remaining target matrix are open. Evidence: entries
+  `TLTC-MLIR-037`, `TLTC-ABI22-001`, `TLTC-ABI22-002`, `TLTC-ABI22-003`,
+  `TLTC-ABI22-004`, and `TLTC-ABI22-005`. The
   [target/oracle matrix](../projects/tile_lifetime_compiler/oracle_target_matrix_20260821.md)
   records the matched semantic and performance controls for the remaining
   targets.
@@ -77,6 +82,16 @@ author: dlwh
 
 ### Promoted
 
+- `TLTC-ABI22-005`: the registered ordinary-JAX RMSNorm-to-Contract plugin
+  passes its declared small-shape primal and composed H100 matrix with exact
+  observer attribution, repeat determinism, and independent per-role numerical
+  acceptance. The composed 42-launch/38-temporary path remains diagnostic and
+  non-performant.
+- `TLTC-ABI22-004`: the generic two-task LayerNorm backward/composed partition
+  passes its prospective H100 contract across both shapes and tuning policies
+  with exact public result projection, resource topology, and repeatability.
+- `TLTC-ABI22-003`: the generic dependent-Fold LayerNorm forward region passes
+  its prospective H100 contract across both shapes and tuning policies.
 - `TLTC-MLIR-038`: the ordinary-JAX RMSNorm plugin passes the declared
   forward, backward, and composed rank-3/rank-5 H100 matrix in SOURCE_ORDERED
   and FAST with exact observer attribution, repeat determinism, and independent
@@ -5777,3 +5792,72 @@ author: dlwh
 - Next action: define a separately reviewed CUDA-event performance protocol
   against ordinary JAX/XLA and an available strong oracle before another
   hardware run.
+
+### 2026-08-21 - TLTC-ABI22-005 ordinary-JAX RMSNorm-to-Contract on H100
+
+- Hypothesis: the registered ABI22 plugin can execute ordinary-JAX RMSNorm
+  followed by Contract at epsilon `1e-6`, preserve the public primal and VJP
+  result order, repeat deterministically, and satisfy a prospectively declared
+  independent binary64 numerical contract at small structural shapes.
+- Executed source: reviewed clean commit
+  `d7f55340f4f08a84c3d7304e88129755bdb890ae`; source-manifest SHA-256
+  `3a8a331db045798aa73ccecb41ac247f44d5e440c3d4b19639c4592ca0bf9415`;
+  authorization SHA-256
+  `d0c03b7f72dbe3e7164308b853b0f43a1550979e920afac4f2da96292156c9ff`;
+  numerical-policy SHA-256
+  `9fd9e00c6ef90b40d12916f671eeb5b73b385875d8e1ee485e0d029ab272996a`.
+  The reviewed 24-commit subject, policy, diagnostic, and checkpoint lineage
+  was replayed without conflict onto integration base
+  `bc9e782b25e58b1b44f4ade55bc76e3f6650eebb`; artifact commit
+  `4fea5c39e879452b5791644516290941b1740763` records the old-to-new mapping.
+  Merge `99618df4e4fd5dcc7c9f451f18213cdcd36938f4` then joins that evidence
+  history with current integration `481a91743f8122b7c0996822e94e3dfcf0d3bced`.
+- Config: `/dlwh/shuttle-track1-rmsnorm-contract-h100-canary-r3` ran on one
+  batch-priority H100 in `cw-rno2a`, with 32 CPU, 128 GiB memory, 500 GiB disk,
+  one replica, a four-hour timeout, and all retry/failure budgets zero. The
+  6,758,570-byte request has SHA-256
+  `ddb2933b25446b0f7cbf26ae87cfe7dbbfa0a7d9c1511f359954209708e86626`;
+  its 6,757,562-byte source bundle has SHA-256
+  `ed22190110c1f94ba0f2cc461cbc2fce05bdb0841734c30578e19ae59c7ba2ca`.
+  Iris reports one successful task, exit code zero, no failure or preemption,
+  and 16 minutes 2.2 seconds runtime.
+- Identity result: all 12 coordinates formed by shapes `[5,19,7]` and
+  `[5,19,257]`, primal and composed boundaries, and disabled JAX,
+  SOURCE_ORDERED, and FAST completed. Every coordinate repeated byte-for-byte.
+  Enabled observer invocation IDs were exactly 1 through 8. The normative
+  primal topology was one launch/no temporary for output extent 7 and two
+  launches/one 20-byte temporary for extent 257. Both enabled composed shapes
+  used 42 launches and 38 temporaries; this is retained as
+  `diagnostic_non_performant`, not as the target architecture or a performance
+  acceptance.
+- Numerical result: enabled `result` and `projection_cotangent` were exact
+  against the independent binary64 oracle. Worst `input_cotangent` maximum
+  absolute, mean absolute, and relative Linf errors were
+  `0.23216684002008492`, `0.0662817995777676`, and
+  `0.0023686916414149177`. Worst `weight_cotangent` values were
+  `0.40334577692291873`, `0.14983168789504084`, and
+  `0.0031414334546365657`. Maximum masked BF16 ULP error was zero for every
+  enabled role. SOURCE_ORDERED and FAST matched the predeclared rounded-oracle
+  digests.
+- Diagnostic: enabled composed `input_cotangent`, `weight_cotangent`, and
+  `projection_cotangent` differed bitwise from disabled JAX at both shapes and
+  in both policies; primal `result` matched. Disabled JAX is labeled diagnostic
+  and is not the acceptance oracle. This entry makes no bitwise-JAX,
+  Transformer Engine, representative-shape, or performance claim.
+- Wheel identities: `jaxlib` SHA-256
+  `e46fc550ab532e0c4cdf3c9e86099f7afc508c5fbe7bf9ef46df61c0adee1b4e`;
+  CUDA plugin
+  `de02d4b39691a7344b841e15724a893b5e82d3772c0c30213ecc72a0b1150bab`;
+  PJRT plugin
+  `7283f736e20fa9f6d5d1570787895efc987e700343860507e8889754df6958a4`.
+- Artifacts:
+  `lib/shuttle/mlir/artifacts/track1-rmsnorm-contract-h100-plugin-20260821/`
+  preserves the exact 58,841-byte canonical result (SHA-256
+  `32af1df017f5790c52b3515c72d8843763852d19d492d3e55baad03ea227a9a5`),
+  terminal summary, receipt, monitoring metadata, exact run authorization and
+  source manifest, policy, request identity, replay lineage, and file
+  checksums. The request bytes remain external. Verification command:
+  `(cd lib/shuttle/mlir/artifacts/track1-rmsnorm-contract-h100-plugin-20260821 && shasum -a 256 -c SHA256SUMS)`.
+- Next action: materialize the normalized BF16 boundary once for composed VJP,
+  reuse the specialized primal task, and leave remaining Contract/Fold
+  consumers to the generic planner before considering another H100 run.

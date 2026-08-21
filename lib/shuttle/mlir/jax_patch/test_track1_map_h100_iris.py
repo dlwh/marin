@@ -134,6 +134,7 @@ def test_request_bytes_are_deterministic_and_output_is_create_only(tmp_path: Pat
     assert first == second
     assert _request(4).name == "/dlwh/shuttle-track1-rmsnorm-h100-canary-r4"
     assert _request(4).SerializeToString(deterministic=True) != first
+    assert job_name(Campaign.RMSNORM_CONTRACT_CANARY, 1) == "/dlwh/shuttle-track1-rmsnorm-contract-h100-canary-r1"
     with pytest.raises(ValueError, match="protobuf is malformed"):
         decode_launch_request(b"\xff", approved_authorization_sha256=approved, campaign=Campaign.RMSNORM_CANARY, retry=1)
     with pytest.raises(ValueError, match="positive integer"):

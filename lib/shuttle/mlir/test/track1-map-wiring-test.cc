@@ -596,6 +596,128 @@ TEST(TrackOneMapWiringTest,
   }
 }
 
+TEST(TrackOneMapWiringTest,
+     BundlesAbi22RmsNormContractPrimalAndComposedVjpThroughRegisteredFfi) {
+  struct Boundary {
+    const char *filename;
+    int64_t inputs;
+    int64_t outputs;
+    std::optional<int64_t> launches;
+    std::optional<int64_t> temporaries;
+    std::optional<int64_t> temporaryBytes;
+  };
+  constexpr Boundary boundaries[] = {
+      {"jax-0.10.1-bf16-rmsnorm_contract-5x19x7-forward.mlir", 3, 1, 1,
+       0, 0},
+      {"jax-0.10.1-bf16-rmsnorm_contract-5x19x257-forward.mlir", 3, 1,
+       2, 1, 20},
+      {"jax-0.10.1-bf16-rmsnorm_contract-5x19x7-composed.mlir", 4, 4,
+       std::nullopt, std::nullopt, std::nullopt},
+      {"jax-0.10.1-bf16-rmsnorm_contract-5x19x257-composed.mlir", 4, 4,
+       std::nullopt, std::nullopt, std::nullopt},
+  };
+  for (const Boundary &boundary : boundaries) {
+    SCOPED_TRACE(boundary.filename);
+    std::optional<std::string> source = fixtureSource(boundary.filename);
+    ASSERT_TRUE(source);
+    for (llvm::StringRef policy : kAbi22FoldRegionPolicies) {
+      SCOPED_TRACE(policy.str());
+      auto observer = std::make_shared<RecordingObserver>();
+      auto subscription =
+          mlir::shuttle::subscribeShuttlePipelineObserver(observer);
+      mlir::MLIRContext context;
+      mlir::OwningOpRef<mlir::ModuleOp> module =
+          parseModule(context, *source);
+      ASSERT_TRUE(module);
+      absl::Status status = runRegisteredShuttleTransform(*module, policy);
+      ASSERT_TRUE(status.ok()) << status;
+
+      llvm::SmallVector<mlir::Operation *> customCalls;
+      mlir::func::ReturnOp functionReturn;
+      module->walk([&](mlir::Operation *operation) {
+        if (operation->getName().getStringRef() == "stablehlo.custom_call")
+          customCalls.push_back(operation);
+        if (auto returned = mlir::dyn_cast<mlir::func::ReturnOp>(operation))
+          functionReturn = returned;
+      });
+      ASSERT_EQ(customCalls.size(), 1);
+      mlir::Operation *customCall = customCalls.front();
+      ASSERT_TRUE(functionReturn);
+      EXPECT_EQ(customCall->getNumOperands(), boundary.inputs);
+      EXPECT_EQ(customCall->getNumResults(), boundary.outputs);
+      ASSERT_EQ(functionReturn.getNumOperands(), boundary.outputs);
+      auto main = module->lookupSymbol<mlir::func::FuncOp>("main");
+      ASSERT_TRUE(main);
+      ASSERT_EQ(main.getNumResults(), boundary.outputs);
+      for (auto [ordinal, value] :
+           llvm::enumerate(functionReturn.getOperands())) {
+        auto result = mlir::dyn_cast<mlir::OpResult>(value);
+        ASSERT_TRUE(result);
+        EXPECT_EQ(result.getOwner(), customCall);
+        EXPECT_EQ(value.getType(), main.getResultTypes()[ordinal]);
+      }
+
+      auto backendConfig =
+          customCall->getAttrOfType<mlir::DictionaryAttr>("backend_config");
+      ASSERT_TRUE(backendConfig);
+      expectFfiInstantiationAccepts(backendConfig);
+      auto bundleBytes =
+          backendConfig.getAs<mlir::StringAttr>("bundle_bytes");
+      ASSERT_TRUE(bundleBytes);
+      llvm::StringRef serialized = bundleBytes.getValue();
+      auto loaded = mlir::shuttle::GpuExecutable::Load(
+          llvm::ArrayRef<uint8_t>(
+              reinterpret_cast<const uint8_t *>(serialized.data()),
+              serialized.size()));
+      ASSERT_TRUE(loaded.ok()) << loaded.status();
+      int64_t temporaryCount = 0;
+      int64_t temporaryBytes = 0;
+      for (const auto &slot : (*loaded)->slots()) {
+        if (slot.storage !=
+            mlir::shuttle::MaterializationStorage::Temporary)
+          continue;
+        ++temporaryCount;
+        temporaryBytes += slot.requiredBytes;
+      }
+      if (boundary.launches) {
+        EXPECT_EQ((*loaded)->launches().size(), *boundary.launches);
+        EXPECT_EQ(temporaryCount, *boundary.temporaries);
+        EXPECT_EQ(temporaryBytes, *boundary.temporaryBytes);
+      } else {
+        EXPECT_GT((*loaded)->launches().size(), 2);
+        EXPECT_LE((*loaded)->launches().size(), 128);
+        EXPECT_GT(temporaryCount, 0);
+        EXPECT_LE(temporaryCount, 128);
+      }
+
+      std::string transformed = moduleText(*module);
+      EXPECT_EQ(transformed.find("shuttle.region"), std::string::npos);
+      EXPECT_EQ(transformed.find("stablehlo.dot_general"),
+                std::string::npos);
+      auto events = observer->snapshot();
+      ASSERT_EQ(events.size(), 3);
+      EXPECT_EQ(events[0].phase(),
+                mlir::shuttle::ShuttlePipelinePhase::AlgebraCoverage);
+      EXPECT_EQ(events[1].phase(),
+                mlir::shuttle::ShuttlePipelinePhase::GeneratedBundle);
+      EXPECT_EQ(events[2].phase(),
+                mlir::shuttle::ShuttlePipelinePhase::FinalErasure);
+      EXPECT_GT(events[0].invocationId(), 0);
+      EXPECT_EQ(events[0].invocationId(), events[1].invocationId());
+      EXPECT_EQ(events[0].invocationId(), events[2].invocationId());
+      EXPECT_EQ(events[0].regionMembership(), events[1].regionMembership());
+      EXPECT_FALSE(events[0].regionMembership().empty());
+      EXPECT_EQ(events[0].coverageManifest().find("unsupported_operation"),
+                std::string::npos);
+      EXPECT_EQ(events[1].bundleLaunchCount(),
+                (*loaded)->launches().size());
+      EXPECT_EQ(events[1].bundleTemporaryCount(), temporaryCount);
+      EXPECT_TRUE(events[2].noShuttleSemantics());
+      EXPECT_TRUE(events[2].regionMembership().empty());
+    }
+  }
+}
+
 TEST(TrackOneMapWiringTest, LateMapCodegenFailureLeavesTheJaxGraphUnchanged) {
   auto observer = std::make_shared<RecordingObserver>();
   auto subscription = mlir::shuttle::subscribeShuttlePipelineObserver(observer);

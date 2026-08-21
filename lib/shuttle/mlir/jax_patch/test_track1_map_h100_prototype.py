@@ -24,8 +24,21 @@ from track1_map_h100_prototype import (
     require_source_bundle,
     source_bundle_document,
     validate_result_pair,
+    validate_rmsnorm_contract_result,
     validate_rmsnorm_result,
     wheel_set,
+)
+from track1_rmsnorm_contract_numerical_policy import (
+    POLICY_FILENAME as CONTRACT_POLICY_FILENAME,
+)
+from track1_rmsnorm_contract_numerical_policy import (
+    POLICY_SHA256 as CONTRACT_POLICY_SHA256,
+)
+from track1_rmsnorm_contract_numerical_policy import (
+    SHAPES as CONTRACT_SHAPES,
+)
+from track1_rmsnorm_contract_numerical_policy import (
+    load_numerical_policy as load_contract_numerical_policy,
 )
 from track1_rmsnorm_numerical_policy import POLICY_FILENAME, POLICY_SHA256, load_numerical_policy
 
@@ -71,6 +84,27 @@ def _document() -> dict[str, object]:
                 "numerical_policy": {"path": f"lib/shuttle/mlir/jax_patch/{POLICY_FILENAME}", "sha256": POLICY_SHA256},
                 "repeat_bitwise_required": True,
                 "shapes": [[2, 7, 19], [3, 2, 5, 11, 263]],
+            },
+            "rmsnorm_contract": {
+                "boundaries": ["primal", "composed"],
+                "composed_topology": "diagnostic_non_performant_not_architecture_target",
+                "coordinate_order": "all_primal_before_any_composed",
+                "disabled_jax_reference": True,
+                "disabled_jax_role": "diagnostic_only_never_threshold_gated",
+                "host_oracle": "independent_binary64_rmsnorm_contract_vjp",
+                "masked_bf16_ulp": "role_floor_then_ordered_finite_distance",
+                "modes": ["disabled", "source_ordered", "fast"],
+                "numerical_policy": {
+                    "path": f"lib/shuttle/mlir/jax_patch/{CONTRACT_POLICY_FILENAME}",
+                    "sha256": CONTRACT_POLICY_SHA256,
+                },
+                "primal_bundle_shapes": {
+                    "5x19x257": {"launches": 2, "temporary_bytes": 20, "temporaries": 1},
+                    "5x19x7": {"launches": 1, "temporary_bytes": 0, "temporaries": 0},
+                },
+                "raw_full_range_bf16_ulp": "diagnostic_only",
+                "repeat_bitwise_required": True,
+                "shapes": [list(shape) for shape in CONTRACT_SHAPES],
             },
         },
         "sources": {
@@ -216,7 +250,7 @@ def test_checked_in_source_manifest_matches_the_live_iris_bundle_closure(tmp_pat
         load_authorization(changed_path, approved_sha256)
 
 
-def test_dry_run_renders_one_network_hydration_then_offline_build_and_three_workers(tmp_path: Path) -> None:
+def test_dry_run_renders_one_network_hydration_then_offline_build_and_four_workers(tmp_path: Path) -> None:
     _, _, authorization = _authorization(tmp_path)
     workspace = tmp_path / "fresh"
 
@@ -245,6 +279,7 @@ def test_dry_run_renders_one_network_hydration_then_offline_build_and_three_work
         "populate",
         "reuse",
         "rmsnorm",
+        "rmsnorm_contract",
     ]
     hydration = phases[3]["argv"]
     offline = phases[4]["argv"]
@@ -271,6 +306,12 @@ def test_dry_run_renders_one_network_hydration_then_offline_build_and_three_work
     assert phases[9]["argv"][phases[9]["argv"].index("--role") + 1] == "populate"
     assert phases[10]["argv"][phases[10]["argv"].index("--role") + 1] == "reuse"
     assert phases[11]["argv"][-2:] == ["--output", str(workspace / "rmsnorm.json")]
+    assert phases[12]["argv"][-4:] == [
+        "--output",
+        str(workspace / "rmsnorm-contract.json"),
+        "--primal-checkpoint",
+        str(workspace / "rmsnorm-contract-primal.json"),
+    ]
     assert not workspace.exists()
 
     workspace.mkdir()
@@ -362,6 +403,160 @@ def _rmsnorm_document() -> dict[str, object]:
         "schema": "track1_rmsnorm_h100_result",
         "schema_version": 2,
     }
+
+
+def _rmsnorm_contract_document() -> dict[str, object]:
+    policy = load_contract_numerical_policy()
+    coordinates = []
+    invocation_id = 0
+    for boundary, roles in (
+        ("primal", ("result",)),
+        ("composed", ("result", "input_cotangent", "weight_cotangent", "projection_cotangent")),
+    ):
+        for shape in CONTRACT_SHAPES:
+            shape_key = "x".join(map(str, shape))
+            shape_policy = policy["shapes"][shape_key]
+            baseline = {role: shape_policy["binary64_rounded_outputs"][role] for role in roles}
+            for mode in ("disabled", "source_ordered", "fast"):
+                results = dict(baseline)
+                if boundary == "primal" and mode != "disabled":
+                    results["result"] = shape_policy["primal_emitted_outputs"][mode]
+                observer = None
+                if mode != "disabled":
+                    invocation_id += 1
+                    launches, temporaries, status = (
+                        ({7: (1, 0), 257: (2, 1)}[shape[-1]] + ("normative_primal",))
+                        if boundary == "primal"
+                        else (42, 38, "diagnostic_non_performant")
+                    )
+                    observer = {
+                        "final_module_sha256": "1" * 64,
+                        "generated_bundle_sha256": "2" * 64,
+                        "invocation_id": invocation_id,
+                        "launch_count": launches,
+                        "temporary_count": temporaries,
+                        "topology_status": status,
+                    }
+                coordinates.append(
+                    {
+                        "analytic_oracle": baseline,
+                        "boundary": boundary,
+                        "disabled_jax_equal": {role: results[role] == baseline[role] for role in roles},
+                        "disabled_jax_results": baseline,
+                        "mode": mode,
+                        "numerics": {
+                            role: {
+                                "maximum_absolute_error": 0.0,
+                                "maximum_bf16_ulp_error": 0,
+                                "maximum_masked_bf16_ulp_error": 0,
+                                "mean_absolute_error": 0.0,
+                                "relative_linf_error": 0.0,
+                            }
+                            for role in roles
+                        },
+                        "observer": observer,
+                        "repeat_results": results,
+                        "results": results,
+                        "shape": list(shape),
+                    }
+                )
+    return {
+        "coordinates": coordinates,
+        "numerical_policy_sha256": CONTRACT_POLICY_SHA256,
+        "pid": 404,
+        "schema": "track1_rmsnorm_contract_h100_result",
+        "schema_version": 2,
+    }
+
+
+def test_rmsnorm_contract_result_requires_oracle_roles_repeatability_and_topology() -> None:
+    document = _rmsnorm_contract_document()
+    assert validate_rmsnorm_contract_result(document) == document
+
+    for mutation in ("role", "repeat", "threshold", "observer", "primal_topology", "diagnostic_topology"):
+        changed = deepcopy(document)
+        if mutation == "role":
+            changed["coordinates"][6]["results"].pop("projection_cotangent")
+        elif mutation == "repeat":
+            changed["coordinates"][1]["repeat_results"]["result"] = "3" * 64
+        elif mutation == "threshold":
+            changed["coordinates"][7]["numerics"]["input_cotangent"]["maximum_absolute_error"] = 1.0
+        elif mutation == "observer":
+            changed["coordinates"][1]["observer"] = None
+        elif mutation == "primal_topology":
+            changed["coordinates"][1]["observer"]["launch_count"] = 2
+        else:
+            changed["coordinates"][7]["observer"]["topology_status"] = "normative_primal"
+        with pytest.raises(ValueError, match="RMSNorm Contract"):
+            validate_rmsnorm_contract_result(changed)
+
+
+def test_rmsnorm_contract_result_survives_the_worker_canonical_json_boundary() -> None:
+    document = _rmsnorm_contract_document()
+    reloaded = json.loads(canonical_json(document))
+
+    assert validate_rmsnorm_contract_result(reloaded) == reloaded
+
+
+def test_rmsnorm_contract_result_keeps_disabled_and_raw_ulp_metrics_diagnostic() -> None:
+    document = _rmsnorm_contract_document()
+    disabled = document["coordinates"][6]["numerics"]["input_cotangent"]
+    disabled["maximum_absolute_error"] = 1024.0
+    disabled["maximum_masked_bf16_ulp_error"] = 1024
+    for coordinate in document["coordinates"]:
+        for metrics in coordinate["numerics"].values():
+            metrics["maximum_bf16_ulp_error"] = 65535
+
+    assert validate_rmsnorm_contract_result(document) == document
+
+    document["coordinates"][7]["numerics"]["input_cotangent"]["maximum_masked_bf16_ulp_error"] = 9
+    with pytest.raises(ValueError, match="independent binary64 threshold"):
+        validate_rmsnorm_contract_result(document)
+
+
+def test_failed_rmsnorm_contract_phase_surfaces_the_complete_primal_checkpoint_last(tmp_path: Path) -> None:
+    full = _rmsnorm_contract_document()
+    checkpoint = {
+        "coordinates": [
+            {
+                "analytic_oracle": item["analytic_oracle"]["result"],
+                "disabled_jax_equal": item["disabled_jax_equal"]["result"],
+                "mode": item["mode"],
+                "numerics": item["numerics"]["result"],
+                "observer": item["observer"],
+                "repeat_bitwise_equal": True,
+                "result": item["results"]["result"],
+                "shape": item["shape"],
+            }
+            for item in full["coordinates"][:6]
+        ],
+        "numerical_policy_sha256": CONTRACT_POLICY_SHA256,
+        "schema": "track1_rmsnorm_contract_h100_primal_checkpoint",
+        "schema_version": 1,
+    }
+    checkpoint_path = tmp_path / "primal.json"
+    checkpoint_path.write_bytes(canonical_json(checkpoint))
+
+    with pytest.raises(RuntimeError, match="primal checkpoint follows phase tail") as raised:
+        prototype._run(
+            [sys.executable, "-c", "import sys; print('late composed failure ' * 2000); sys.exit(19)"],
+            cwd=None,
+            log=tmp_path / "phase.log",
+            phase="rmsnorm_contract",
+            failure_evidence=checkpoint_path,
+        )
+
+    surfaced = str(raised.value)
+    marker = "canonical RMSNorm Contract primal checkpoint:\n"
+    assert surfaced.endswith(marker + canonical_json(checkpoint).decode().rstrip("\n"))
+    recovered = json.loads(surfaced.rsplit(marker, 1)[1])
+    assert prototype.validate_rmsnorm_contract_primal_checkpoint(recovered) == recovered
+    assert len(recovered["coordinates"]) == 6
+
+    changed = deepcopy(recovered)
+    changed["coordinates"][1]["disabled_jax_equal"] = not changed["coordinates"][1]["disabled_jax_equal"]
+    with pytest.raises(ValueError, match="disabled diagnostic differs"):
+        prototype.validate_rmsnorm_contract_primal_checkpoint(changed)
 
 
 def test_rmsnorm_result_requires_exact_coordinate_output_and_observer_closure() -> None:

@@ -1,0 +1,42 @@
+{
+  "authorization_sha256": "d0c03b7f72dbe3e7164308b853b0f43a1550979e920afac4f2da96292156c9ff",
+  "bundle_sha256": "ed22190110c1f94ba0f2cc461cbc2fce05bdb0841734c30578e19ae59c7ba2ca",
+  "bundle_size": 6757562,
+  "cluster": "cw-rno2a",
+  "coordinates": 12,
+  "duration_seconds": 962.2,
+  "failures": 0,
+  "job_id": "/dlwh/shuttle-track1-rmsnorm-contract-h100-canary-r3",
+  "numerical_policy_sha256": "9fd9e00c6ef90b40d12916f671eeb5b73b385875d8e1ee485e0d029ab272996a",
+  "preemptions": 0,
+  "request_bytes_preserved": false,
+  "request_sha256": "ddb2933b25446b0f7cbf26ae87cfe7dbbfa0a7d9c1511f359954209708e86626",
+  "request_size": 6758570,
+  "result_payload_sha256_without_newline": "9aa9a227cef8dc1d6d3716846f15fd19b242550a2e60707ae4472e6c534df624",
+  "result_sha256": "32af1df017f5790c52b3515c72d8843763852d19d492d3e55baad03ea227a9a5",
+  "result_size": 58841,
+  "reviewed_source_commit": "d7f55340f4f08a84c3d7304e88129755bdb890ae",
+  "schema": "track1_rmsnorm_contract_h100_evidence_receipt",
+  "schema_version": 1,
+  "source_manifest_sha256": "3a8a331db045798aa73ccecb41ac247f44d5e440c3d4b19639c4592ca0bf9415",
+  "state": "succeeded",
+  "submitted_at": "2026-08-21T18:09:14.707Z",
+  "task_exit_code": 0,
+  "wheels": [
+    {
+      "name": "jaxlib-0.10.1-cp312-cp312-manylinux_2_27_x86_64.whl",
+      "sha256": "e46fc550ab532e0c4cdf3c9e86099f7afc508c5fbe7bf9ef46df61c0adee1b4e",
+      "size": 86338493
+    },
+    {
+      "name": "jax_cuda13_plugin-0.10.1-cp312-cp312-manylinux_2_27_x86_64.whl",
+      "sha256": "de02d4b39691a7344b841e15724a893b5e82d3772c0c30213ecc72a0b1150bab",
+      "size": 7425253
+    },
+    {
+      "name": "jax_cuda13_pjrt-0.10.1-py3-none-manylinux_2_27_x86_64.whl",
+      "sha256": "7283f736e20fa9f6d5d1570787895efc987e700343860507e8889754df6958a4",
+      "size": 99041338
+    }
+  ]
+}
