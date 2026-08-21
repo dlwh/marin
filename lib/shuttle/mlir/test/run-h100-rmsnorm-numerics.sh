@@ -11,7 +11,7 @@ fi
 
 SHUTTLE_RUN_H100_NUMERICS=1 "$1" \
   --gtest_fail_if_no_test_selected \
-  --gtest_filter=GpuTransportV2Test.H100RunnerMatchesIndependentRmsNormForwardAndVjpOracle
+  --gtest_filter=GpuTransportV2Test.H100RunnerExecutesThreeMapBf16Chain:GpuTransportV2Test.H100RunnerMatchesIndependentRmsNormForwardAndVjpOracle
 
 SHUTTLE_RUN_H100_NUMERICS=1 exec "$1" \
   --gtest_fail_if_no_test_selected \
