@@ -35,7 +35,8 @@ AUTHORIZATION_RELATIVE = Path("scripts/shuttle/track1_map_h100_prototype_authori
 REQUEST_SCHEMA = "track1_map_h100_iris_launch_request"
 WORKSPACE = Path("/tmp/shuttle-track1-map-h100-prototype")
 RUNNER_REPOSITORY = Path("/app")
-PYTHON = Path("/opt/h100-evidence-runtime/bin/python")
+LAUNCHER_PYTHON = Path("/app/.venv/bin/python")
+SUBJECT_PYTHON = Path("/opt/h100-evidence-runtime/bin/python")
 CUDA_ROOT = Path("/usr/local/cuda-13.2")
 TIMEOUT = Duration.from_hours(4)
 CLIENT_REVISION_DATE = client_revision_date()
@@ -54,7 +55,7 @@ def job_name(retry: int) -> str:
 
 def _entrypoint_command(approved_authorization_sha256: str) -> list[str]:
     return [
-        str(PYTHON),
+        str(LAUNCHER_PYTHON),
         str(RUNNER_REPOSITORY / "lib/shuttle/mlir/jax_patch/track1_map_h100_launcher.py"),
         "--authorization-file",
         str(RUNNER_REPOSITORY / AUTHORIZATION_RELATIVE),
@@ -65,7 +66,7 @@ def _entrypoint_command(approved_authorization_sha256: str) -> list[str]:
         "--runner-repository",
         str(RUNNER_REPOSITORY),
         "--python",
-        str(PYTHON),
+        str(SUBJECT_PYTHON),
         "--cuda-root",
         str(CUDA_ROOT),
         "--base-image",
