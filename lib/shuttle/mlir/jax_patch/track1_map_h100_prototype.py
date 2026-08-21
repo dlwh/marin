@@ -34,6 +34,13 @@ from track1_map_h100_build import (
     require_source_checkouts_unchanged,
     source_checkouts_identity,
 )
+from track1_rmsnorm_contract_h100_topology import (
+    COMPOSED_BUNDLE_SHAPES,
+    COMPOSED_TOPOLOGY_STATUS,
+    PRIMAL_BUNDLE_SHAPES,
+    PRIMAL_TOPOLOGY_STATUS,
+    authorization_bundle_shapes,
+)
 from track1_rmsnorm_numerical_policy import POLICY_FILENAME, POLICY_SHA256, load_numerical_policy
 
 INTEGRATION_COMMIT = "41502f2079385df29fccbf1137bce553aa090297"
@@ -230,7 +237,8 @@ def _expected_authorization(source_manifest_sha256: str) -> dict[str, object]:
             },
             "rmsnorm_contract": {
                 "boundaries": ["primal", "composed"],
-                "composed_topology": "diagnostic_non_performant_not_architecture_target",
+                "composed_bundle_shapes": authorization_bundle_shapes(COMPOSED_BUNDLE_SHAPES),
+                "composed_topology": "reviewed_hybrid_exact_nonperformance_contract",
                 "coordinate_order": "all_primal_before_any_composed",
                 "disabled_jax_reference": True,
                 "disabled_jax_role": "diagnostic_only_never_threshold_gated",
@@ -241,10 +249,7 @@ def _expected_authorization(source_manifest_sha256: str) -> dict[str, object]:
                     "path": f"lib/shuttle/mlir/jax_patch/{contract_policy.POLICY_FILENAME}",
                     "sha256": contract_policy.POLICY_SHA256,
                 },
-                "primal_bundle_shapes": {
-                    "5x19x257": {"launches": 2, "temporary_bytes": 20, "temporaries": 1},
-                    "5x19x7": {"launches": 1, "temporary_bytes": 0, "temporaries": 0},
-                },
+                "primal_bundle_shapes": authorization_bundle_shapes(PRIMAL_BUNDLE_SHAPES),
                 "raw_full_range_bf16_ulp": "diagnostic_only",
                 "repeat_bitwise_required": True,
                 "shapes": [list(shape) for shape in contract_policy.SHAPES],
@@ -883,19 +888,15 @@ def validate_rmsnorm_contract_result(document: object) -> dict[str, object]:
         _sha(observer["generated_bundle_sha256"], "RMSNorm Contract generated bundle")
         topology = (observer["launch_count"], observer["temporary_count"])
         if boundary == "primal":
-            expected_topology = (1, 0) if shape[-1] == 7 else (2, 1)
-            if topology != expected_topology or observer["topology_status"] != "normative_primal":
+            resources = PRIMAL_BUNDLE_SHAPES[shape]
+            expected_topology = (resources["launches"], resources["temporaries"])
+            if topology != expected_topology or observer["topology_status"] != PRIMAL_TOPOLOGY_STATUS:
                 raise ValueError("RMSNorm Contract primal bundle topology differs")
-        elif (
-            type(topology[0]) is not int
-            or type(topology[1]) is not int
-            or topology[0] <= 0
-            or topology[0] > 128
-            or topology[1] <= 0
-            or topology[1] > 128
-            or observer["topology_status"] != "diagnostic_non_performant"
-        ):
-            raise ValueError("RMSNorm Contract composed diagnostic topology differs")
+        else:
+            resources = COMPOSED_BUNDLE_SHAPES[shape]
+            expected_topology = (resources["launches"], resources["temporaries"])
+            if topology != expected_topology or observer["topology_status"] != COMPOSED_TOPOLOGY_STATUS:
+                raise ValueError("RMSNorm Contract composed bundle topology differs")
     if len(invocation_ids) != 8:
         raise ValueError("RMSNorm Contract observer invocation coverage differs")
     return document

@@ -16,6 +16,12 @@ import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 from jaxlib import _jax
+from track1_rmsnorm_contract_h100_topology import (
+    COMPOSED_BUNDLE_SHAPES,
+    COMPOSED_TOPOLOGY_STATUS,
+    PRIMAL_BUNDLE_SHAPES,
+    PRIMAL_TOPOLOGY_STATUS,
+)
 from track1_rmsnorm_contract_numerical_policy import (
     LIMITS,
     MASKED_ULP_ABSOLUTE_FLOORS,
@@ -205,14 +211,17 @@ def validate_observer_snapshot(
     launches, temporaries = snapshot[1][11:13]
     if type(launches) is not int or type(temporaries) is not int:
         raise ValueError("RMSNorm Contract observer topology must use integers")
-    topology_status = "diagnostic_non_performant"
     if coordinate.boundary is Boundary.PRIMAL:
-        expected = (1, 0) if coordinate.shape[-1] == 7 else (2, 1)
-        if (launches, temporaries) != expected:
-            raise ValueError("RMSNorm Contract primal bundle topology differs")
-        topology_status = "normative_primal"
-    elif launches <= 0 or temporaries <= 0 or launches > 128 or temporaries > 128:
-        raise ValueError("RMSNorm Contract composed bundle lacks bounded positive topology")
+        resources = PRIMAL_BUNDLE_SHAPES[coordinate.shape]
+        topology_status = PRIMAL_TOPOLOGY_STATUS
+        error = "RMSNorm Contract primal bundle topology differs"
+    else:
+        resources = COMPOSED_BUNDLE_SHAPES[coordinate.shape]
+        topology_status = COMPOSED_TOPOLOGY_STATUS
+        error = "RMSNorm Contract composed bundle topology differs"
+    expected = (resources["launches"], resources["temporaries"])
+    if (launches, temporaries) != expected:
+        raise ValueError(error)
     return ObserverEvidence(
         invocation_id=snapshot[0][0],
         generated_bundle_sha256=_sha(snapshot[1][8], "generated bundle fingerprint"),
