@@ -15,10 +15,12 @@ The request used one H100, batch priority, one replica, fail-if-exists, and
 zero failure, preemption, and task-failure budgets. Iris recorded task exit 1,
 one task failure, and zero preemptions.
 
-This artifact contains the exact reviewed request, submission receipt, terminal
-job records, and compressed controller log. The log proves the build completed
-and the first coordinate failed during argument parsing. r1 provides no GPU
-numerical, kernel-resource, or performance evidence.
+This artifact contains the losslessly compressed exact reviewed request,
+submission receipt, terminal job records, and compressed controller log.
+Decompressing `request.pb.gz` reproduces the reviewed request SHA-256 above.
+The log proves the build completed and the first coordinate failed during
+argument parsing. r1 provides no GPU numerical, kernel-resource, or performance
+evidence.
 
 The reproduction is fixed by explicitly passing the GPU transport executable
 in every per-coordinate argv. Referencing a Bazel `sh_binary` executable from
