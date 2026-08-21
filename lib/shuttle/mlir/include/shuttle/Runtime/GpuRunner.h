@@ -58,6 +58,10 @@ public:
   // remain alive until AwaitCompletion succeeds.
   absl::Status Execute(llvm::ArrayRef<GpuRunnerBuffer> operands,
                        llvm::ArrayRef<GpuRunnerBuffer> results);
+  // Measures only the stream interval containing the sealed launch graph.
+  absl::StatusOr<int64_t>
+  ExecuteTimed(llvm::ArrayRef<GpuRunnerBuffer> operands,
+               llvm::ArrayRef<GpuRunnerBuffer> results);
   // Retries a failed Execute completion fence without enqueueing new work.
   absl::Status AwaitCompletion();
   const GpuRunnerResources &resources() const;

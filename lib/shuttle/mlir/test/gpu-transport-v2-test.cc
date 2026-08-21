@@ -49,6 +49,8 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/JSON.h"
 #include "llvm/Support/SHA256.h"
 #include "gtest/gtest.h"
 
@@ -4462,6 +4464,351 @@ TEST(GpuTransportV2Test,
       for (auto &device : deviceOperands)
         (*executor)->Deallocate(&device);
     }
+  }
+}
+
+TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
+  if (std::getenv("SHUTTLE_RUN_H100_PERFORMANCE") == nullptr)
+    GTEST_SKIP() << "set SHUTTLE_RUN_H100_PERFORMANCE=1 on an H100 worker";
+  const char *reportPath = std::getenv("SHUTTLE_H100_PERF_REPORT");
+  const char *compilerIdentity = std::getenv("SHUTTLE_COMPILER_IDENTITY");
+  ASSERT_NE(reportPath, nullptr);
+  ASSERT_NE(compilerIdentity, nullptr);
+  ASSERT_FALSE(llvm::StringRef(compilerIdentity).empty());
+
+  auto platform = stream_executor::PlatformManager::PlatformWithName("CUDA");
+  ASSERT_TRUE(platform.ok()) << platform.status();
+  auto executor = (*platform)->ExecutorForDevice(0);
+  ASSERT_TRUE(executor.ok()) << executor.status();
+  const std::string deviceName = (*executor)->GetDeviceDescription().name();
+  ASSERT_NE(deviceName.find("H100"), std::string::npos);
+  auto stream = (*executor)->CreateStream();
+  ASSERT_TRUE(stream.ok()) << stream.status();
+  stream_executor::StreamExecutorAddressAllocator allocator(*executor);
+  const auto &capability =
+      (*executor)->GetDeviceDescription().gpu_compute_capability();
+
+  constexpr llvm::StringLiteral sourceOrderedOptions =
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+  constexpr llvm::StringLiteral fastOptions =
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+  constexpr llvm::StringLiteral tuning =
+      R"json({"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json";
+  constexpr int64_t warmupIterations = 3;
+  constexpr int64_t measuredIterations = 20;
+  constexpr int64_t normRows = 14;
+  constexpr int64_t normFeatures = 19;
+
+  struct PerformanceSpec {
+    const char *caseName;
+    const char *fixture;
+    std::vector<int64_t> shape;
+    bool backward;
+    int64_t columns;
+    uint64_t launches;
+    uint64_t slots;
+    uint64_t operands;
+    uint64_t results;
+    uint64_t temporaryAllocations;
+    uint64_t temporaryBytes;
+  };
+  const PerformanceSpec specs[] = {
+      {"rmsnorm_forward",
+       "jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-forward.mlir",
+       {2, 7, 19}, false, 0, 1, 3, 2, 1, 0, 0},
+      {"rmsnorm_backward",
+       "jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-backward.mlir",
+       {2, 7, 19}, true, 0, 3, 6, 3, 2, 1, 56},
+      {"rmsnorm_contract_inline",
+       "jax-0.10.1-bf16-rmsnorm_contract-5x19x7-forward.mlir",
+       {5, 19, 7}, false, 7, 1, 4, 3, 1, 0, 0},
+      {"rmsnorm_contract_compact",
+       "jax-0.10.1-bf16-rmsnorm_contract-5x19x257-forward.mlir",
+       {5, 19, 257}, false, 257, 2, 5, 3, 1, 1, 20},
+  };
+
+  struct PerformanceCell {
+    const PerformanceSpec *spec;
+    mlir::shuttle::NumericalPolicy policy;
+    std::string fixture;
+    std::vector<uint8_t> transport;
+    std::shared_ptr<const mlir::shuttle::GpuExecutable> executable;
+    std::unique_ptr<mlir::shuttle::GpuRunner> runner;
+    mlir::shuttle::GpuRunnerResources resources{};
+    std::vector<std::vector<uint16_t>> hostOperands;
+    std::vector<std::vector<uint16_t>> expected;
+    std::vector<std::vector<uint16_t>> actual;
+    std::vector<stream_executor::DeviceAddressBase> deviceOperands;
+    std::vector<stream_executor::DeviceAddressBase> deviceResults;
+    llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> operandBindings;
+    llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> resultBindings;
+    std::vector<int64_t> samples;
+  };
+  std::vector<PerformanceCell> cells;
+
+  std::vector<uint16_t> normX(normRows * normFeatures);
+  std::vector<uint16_t> normWeight(normFeatures);
+  std::vector<uint16_t> normCotangent(normRows * normFeatures);
+  for (size_t index = 0; index < normX.size(); ++index) {
+    normX[index] = index < normFeatures
+                       ? roundToBf16(-0.001f +
+                                     0.002f * index / (normFeatures - 1))
+                       : roundToBf16(-0.75f +
+                                     1.625f * index / (normX.size() - 1));
+    normCotangent[index] =
+        roundToBf16(-0.5f + 1.125f * index / (normX.size() - 1));
+  }
+  for (size_t index = 0; index < normWeight.size(); ++index)
+    normWeight[index] =
+        roundToBf16(0.5f + 0.75f * index / (normWeight.size() - 1));
+
+  for (const PerformanceSpec &spec : specs) {
+    for (mlir::shuttle::NumericalPolicy policy :
+         {mlir::shuttle::NumericalPolicy::SourceOrdered,
+          mlir::shuttle::NumericalPolicy::Fast}) {
+      PerformanceCell cell;
+      cell.spec = &spec;
+      cell.policy = policy;
+      auto source = fixtureSource(spec.fixture);
+      ASSERT_TRUE(source);
+      cell.fixture = *source;
+      auto built = buildFixture(
+          *source, policy,
+          policy == mlir::shuttle::NumericalPolicy::SourceOrdered
+              ? sourceOrderedOptions
+              : fastOptions,
+          tuning);
+      ASSERT_TRUE(built);
+      auto serialized =
+          mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+      ASSERT_TRUE(mlir::succeeded(serialized));
+      cell.transport.assign(serialized->begin(), serialized->end());
+      auto executable = mlir::shuttle::GpuExecutable::Load(cell.transport);
+      ASSERT_TRUE(executable.ok()) << executable.status();
+      cell.executable = *executable;
+      auto runner = mlir::shuttle::GpuRunner::Create(
+          cell.transport, &allocator, 0, stream->get(), &capability);
+      ASSERT_TRUE(runner.ok()) << runner.status();
+      cell.runner = std::move(*runner);
+      cell.resources = cell.runner->resources();
+      EXPECT_EQ(cell.resources.launchCount, spec.launches);
+      EXPECT_EQ(cell.resources.slotCount, spec.slots);
+      EXPECT_EQ(cell.resources.externalOperandCount, spec.operands);
+      EXPECT_EQ(cell.resources.externalResultCount, spec.results);
+      EXPECT_EQ(cell.resources.temporaryAllocationCount,
+                spec.temporaryAllocations);
+      EXPECT_EQ(cell.resources.temporaryBytes, spec.temporaryBytes);
+
+      if (spec.columns == 0) {
+        cell.hostOperands = {normX, normWeight};
+        if (spec.backward) {
+          cell.hostOperands.push_back(normCotangent);
+          auto [dx, dw] = rmsNormBackwardReference(
+              normX, normWeight, normCotangent, normRows, normFeatures);
+          cell.expected = {std::move(dx), std::move(dw)};
+        } else {
+          cell.expected = {rmsNormForwardReference(normX, normWeight, normRows,
+                                                   normFeatures)};
+        }
+      } else {
+        constexpr int64_t rows = 5;
+        constexpr int64_t reduction = 19;
+        std::vector<uint16_t> x(rows * reduction);
+        std::vector<uint16_t> weight(reduction);
+        std::vector<uint16_t> projection(reduction * spec.columns);
+        for (size_t index = 0; index < x.size(); ++index)
+          x[index] = index < reduction
+                         ? roundToBf16(-0.001f +
+                                       0.002f * index / (reduction - 1))
+                         : roundToBf16(-0.75f +
+                                       1.625f * index / (x.size() - 1));
+        for (size_t index = 0; index < weight.size(); ++index)
+          weight[index] =
+              roundToBf16(0.5f + 0.75f * index / (weight.size() - 1));
+        for (size_t index = 0; index < projection.size(); ++index)
+          projection[index] = roundToBf16(
+              -0.25f + 0.625f * index / (projection.size() - 1));
+        cell.hostOperands = {x, weight, projection};
+        cell.expected = {rmsNormContractReference(
+            x, weight, projection, rows, reduction, spec.columns,
+            policy == mlir::shuttle::NumericalPolicy::Fast)};
+      }
+      for (const auto &expected : cell.expected)
+        cell.actual.emplace_back(expected.size());
+      for (const auto &host : cell.hostOperands) {
+        auto device = (*executor)->AllocateArray<uint16_t>(host.size());
+        ASSERT_TRUE(device);
+        ASSERT_TRUE((*executor)
+                        ->SynchronousMemcpyH2D(
+                            host.data(), host.size() * sizeof(uint16_t),
+                            &device)
+                        .ok());
+        cell.operandBindings.push_back(
+            {device.opaque(), static_cast<int64_t>(device.size())});
+        cell.deviceOperands.push_back(device);
+      }
+      for (auto &actual : cell.actual) {
+        auto device = (*executor)->AllocateArray<uint16_t>(actual.size());
+        ASSERT_TRUE(device);
+        std::vector<uint16_t> poison(actual.size(), UINT16_C(0x7FC1));
+        ASSERT_TRUE((*executor)
+                        ->SynchronousMemcpyH2D(
+                            poison.data(), poison.size() * sizeof(uint16_t),
+                            &device)
+                        .ok());
+        cell.resultBindings.push_back(
+            {device.opaque(), static_cast<int64_t>(device.size())});
+        cell.deviceResults.push_back(device);
+      }
+      cells.push_back(std::move(cell));
+    }
+  }
+  ASSERT_EQ(cells.size(), 8u);
+
+  for (PerformanceCell &cell : cells)
+    for (int64_t iteration = 0; iteration < warmupIterations; ++iteration)
+      ASSERT_TRUE(cell.runner
+                      ->Execute(cell.operandBindings, cell.resultBindings)
+                      .ok());
+  for (int64_t round = 0; round < measuredIterations; ++round) {
+    for (size_t position = 0; position < cells.size(); ++position) {
+      size_t cellIndex = round % 2 == 0 ? position : cells.size() - 1 - position;
+      PerformanceCell &cell = cells[cellIndex];
+      auto elapsed =
+          cell.runner->ExecuteTimed(cell.operandBindings, cell.resultBindings);
+      ASSERT_TRUE(elapsed.ok()) << elapsed.status();
+      cell.samples.push_back(*elapsed);
+    }
+  }
+
+  llvm::json::Array reportCells;
+  for (auto [cellIndex, cell] : llvm::enumerate(cells)) {
+    float maximumAbsoluteError = 0.0f;
+    int32_t maximumUlp = 0;
+    llvm::json::Array outputDigests;
+    for (auto [resultIndex, actual] : llvm::enumerate(cell.actual)) {
+      ASSERT_TRUE((*executor)
+                      ->SynchronousMemcpyD2H(
+                          cell.deviceResults[resultIndex],
+                          actual.size() * sizeof(uint16_t), actual.data())
+                      .ok());
+      ASSERT_EQ(actual.size(), cell.expected[resultIndex].size());
+      for (auto [element, actualBits] : llvm::enumerate(actual)) {
+        EXPECT_NE(actualBits, UINT16_C(0x7FC1));
+        float actualValue = expandBf16(actualBits);
+        float expectedValue = expandBf16(cell.expected[resultIndex][element]);
+        EXPECT_TRUE(std::isfinite(actualValue));
+        maximumAbsoluteError =
+            std::max(maximumAbsoluteError,
+                     std::abs(actualValue - expectedValue));
+        maximumUlp =
+            std::max(maximumUlp,
+                     std::abs(orderedBf16(actualBits) -
+                              orderedBf16(cell.expected[resultIndex][element])));
+      }
+      auto bytes = llvm::ArrayRef<uint8_t>(
+          reinterpret_cast<const uint8_t *>(actual.data()),
+          actual.size() * sizeof(uint16_t));
+      outputDigests.push_back(sha256(bytes));
+    }
+    EXPECT_LE(maximumUlp,
+              cell.policy == mlir::shuttle::NumericalPolicy::SourceOrdered
+                  ? 1
+                  : 4);
+
+    llvm::json::Array samples;
+    llvm::json::Array rounds;
+    llvm::json::Array positions;
+    ASSERT_EQ(cell.samples.size(), measuredIterations);
+    for (int64_t round = 0; round < measuredIterations; ++round) {
+      samples.push_back(cell.samples[round]);
+      rounds.push_back(round);
+      positions.push_back(round % 2 == 0
+                              ? static_cast<int64_t>(cellIndex)
+                              : static_cast<int64_t>(cells.size() - 1 -
+                                                     cellIndex));
+    }
+    llvm::json::Array shape;
+    for (int64_t extent : cell.spec->shape)
+      shape.push_back(extent);
+    llvm::json::Array ptxDigests;
+    for (const mlir::shuttle::GpuLaunch &launch : cell.executable->launches())
+      ptxDigests.push_back(launch.codeDigest);
+    llvm::json::Object resources{
+        {"code_bytes", cell.resources.codeBytes},
+        {"launch_count", cell.resources.launchCount},
+        {"slot_count", cell.resources.slotCount},
+        {"external_operand_count", cell.resources.externalOperandCount},
+        {"external_result_count", cell.resources.externalResultCount},
+        {"temporary_allocation_count",
+         cell.resources.temporaryAllocationCount},
+        {"temporary_bytes", cell.resources.temporaryBytes},
+    };
+    llvm::json::Object output{
+        {"digests", std::move(outputDigests)},
+        {"max_abs_error", maximumAbsoluteError},
+        {"max_bf16_ulp", maximumUlp},
+    };
+    llvm::json::Object identity{
+        {"fixture_digest", sha256(llvm::ArrayRef<uint8_t>(
+                               reinterpret_cast<const uint8_t *>(
+                                   cell.fixture.data()),
+                               cell.fixture.size()))},
+        {"executable_digest",
+         mlir::shuttle::gpuExecutableBundleDigest(cell.transport)},
+        {"ptx_digests", std::move(ptxDigests)},
+        {"module_load_digest", sha256(cell.executable->codeBytes())},
+    };
+    reportCells.push_back(llvm::json::Object{
+        {"case", cell.spec->caseName},
+        {"policy",
+         cell.policy == mlir::shuttle::NumericalPolicy::SourceOrdered
+             ? "source_ordered"
+             : "fast"},
+        {"shape", std::move(shape)},
+        {"samples_ns", std::move(samples)},
+        {"sample_rounds", std::move(rounds)},
+        {"sample_positions", std::move(positions)},
+        {"resources", std::move(resources)},
+        {"output", std::move(output)},
+        {"identity", std::move(identity)},
+    });
+  }
+
+  std::string options(sourceOrderedOptions);
+  options.append(fastOptions);
+  options.append(tuning);
+  llvm::json::Object root{
+      {"schema", "shuttle_h100_performance_v1"},
+      {"producer", "shuttle"},
+      {"device", llvm::json::Object{{"model", deviceName}, {"ordinal", 0}}},
+      {"compiler",
+       llvm::json::Object{
+           {"identity", compilerIdentity},
+           {"options_digest",
+            sha256(llvm::ArrayRef<uint8_t>(
+                reinterpret_cast<const uint8_t *>(options.data()),
+                options.size()))}}},
+      {"protocol",
+       llvm::json::Object{
+           {"clock", "cuda_event"},
+           {"counterbalance", "forward_reverse_alternating"},
+           {"warmup_iterations", warmupIterations},
+           {"measured_iterations", measuredIterations}}},
+      {"cells", std::move(reportCells)},
+  };
+  std::ofstream report(reportPath, std::ios::binary | std::ios::trunc);
+  ASSERT_TRUE(report.good());
+  report << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(root))).str();
+  report.close();
+  ASSERT_TRUE(report.good());
+
+  for (PerformanceCell &cell : cells) {
+    cell.runner.reset();
+    for (auto &device : cell.deviceResults)
+      (*executor)->Deallocate(&device);
+    for (auto &device : cell.deviceOperands)
+      (*executor)->Deallocate(&device);
   }
 }
 

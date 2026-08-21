@@ -129,6 +129,7 @@ cc_library(
         ":ShuttleDialect",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/time",
         "@llvm-project//llvm:Support",
         "@llvm-project//mlir:IR",
         "@llvm-project//mlir:Support",
@@ -173,6 +174,7 @@ cc_library(
         "@xla//xla/ffi:invoke",
         "@xla//xla/stream_executor:device_address_allocator",
         "@xla//xla/stream_executor:device_description",
+        "@xla//xla/stream_executor:event_based_timer",
         "@xla//xla/stream_executor:stream",
     ],
 )
@@ -407,6 +409,24 @@ sh_test(
     srcs = ["test/run-h100-rmsnorm-numerics.sh"],
     args = ["$(rootpath :gpu_transport_v2_test)"],
     data = [":gpu_transport_v2_test"],
+    tags = [
+        "h100",
+        "manual",
+        "requires-gpu-nvidia",
+    ],
+)
+
+sh_test(
+    name = "gpu_transport_v2_h100_performance_test",
+    srcs = ["test/run-h100-performance.sh"],
+    args = [
+        "$(rootpath :gpu_transport_v2_test)",
+        "$(rootpath jax_patch/abi22_h100_performance.py)",
+    ],
+    data = [
+        ":gpu_transport_v2_test",
+        "jax_patch/abi22_h100_performance.py",
+    ],
     tags = [
         "h100",
         "manual",

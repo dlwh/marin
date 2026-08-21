@@ -14,6 +14,7 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/time/time.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "shuttle/Runtime/GpuExecutable.h"
 #include "shuttle/Runtime/GpuFfi.h"
@@ -24,6 +25,7 @@
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/device_address_allocator.h"
 #include "xla/stream_executor/device_description.h"
+#include "xla/stream_executor/event_based_timer.h"
 #include "xla/stream_executor/stream.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
@@ -322,6 +324,42 @@ absl::Status GpuRunner::Execute(llvm::ArrayRef<GpuRunnerBuffer> operands,
                   *frame, context, XLA_FFI_ExecutionStage_EXECUTE);
   absl::Status completion = implementation->synchronize();
   return completion.ok() ? execute : completion;
+}
+
+absl::StatusOr<int64_t>
+GpuRunner::ExecuteTimed(llvm::ArrayRef<GpuRunnerBuffer> operands,
+                        llvm::ArrayRef<GpuRunnerBuffer> results) {
+  std::lock_guard lock(implementation->executeMutex);
+  if (implementation->pending)
+    return absl::FailedPreconditionError(
+        "GPU runner completion is pending; call AwaitCompletion");
+  absl::StatusOr<ffi::CallFrame> frame =
+      buildCallFrame(implementation->transport, implementation->projection,
+                     operands, results);
+  if (!frame.ok())
+    return frame.status();
+  absl::StatusOr<std::unique_ptr<se::EventBasedTimer>> timer =
+      implementation->stream->CreateEventBasedTimer(
+          /*use_delay_kernel=*/false);
+  if (!timer.ok())
+    return timer.status();
+  ffi::InvokeContext context = implementation->context();
+  implementation->pending = true;
+  absl::Status execute =
+      ffi::Invoke(ffi::GetXlaFfiApi(), implementation->handlers.execute,
+                  *frame, context, XLA_FFI_ExecutionStage_EXECUTE);
+  absl::StatusOr<absl::Duration> duration = (*timer)->GetElapsedDuration();
+  absl::Status completion = implementation->synchronize();
+  if (!completion.ok())
+    return completion;
+  if (!execute.ok())
+    return execute;
+  if (!duration.ok())
+    return duration.status();
+  int64_t nanoseconds = absl::ToInt64Nanoseconds(*duration);
+  if (nanoseconds <= 0)
+    return absl::InternalError("GPU event timer returned no elapsed time");
+  return nanoseconds;
 }
 
 absl::Status GpuRunner::AwaitCompletion() {
