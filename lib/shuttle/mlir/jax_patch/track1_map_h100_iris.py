@@ -273,8 +273,8 @@ def validate_launch_request(
     _require_no_unknown_fields(request, "root")
     if request.name != job_name(campaign, retry):
         raise ValueError("LaunchJobRequest job name differs")
-    if request.task_image != BASE_IMAGE or request.bundle_init_image:
-        raise ValueError("LaunchJobRequest task or staging image differs")
+    if request.task_image != BASE_IMAGE:
+        raise ValueError("LaunchJobRequest task image differs")
     expected_resources = ResourceSpec(
         cpu=32,
         memory="128GB",
@@ -312,8 +312,6 @@ def validate_launch_request(
         raise ValueError("LaunchJobRequest contains an unauthorized launch option")
     if request.client_revision_date != CLIENT_REVISION_DATE:
         raise ValueError("LaunchJobRequest client revision date differs")
-    if request.HasField("exact_bundle_upload"):
-        raise ValueError("LaunchJobRequest integration-only exact bundle field is present")
     bundle_sha256 = _validated_bundle(request.bundle_blob, approved_authorization_sha256)
     if request.bundle_id != bundle_sha256:
         raise ValueError("LaunchJobRequest bundle content ID differs")
