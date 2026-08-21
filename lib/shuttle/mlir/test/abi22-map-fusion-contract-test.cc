@@ -206,6 +206,10 @@ struct PtxDataflow {
   std::vector<std::string> sharedStores;
 };
 
+PtxDataflow ptxDataflow(llvm::StringRef ptx);
+std::set<std::string> ptxDependencyClosure(const PtxDataflow &flow,
+                                           llvm::StringRef root);
+
 std::vector<std::string> ptxTokens(llvm::StringRef text) {
   std::vector<std::string> tokens;
   for (size_t index = 0; index < text.size();) {
@@ -290,10 +294,20 @@ bool hasDisjointContiguousFoldLoop(llvm::StringRef ptx,
         ++loopLine;
       if (loopLine + 2 >= lines.size())
         return false;
+      std::string accumulator;
       for (size_t line = startLine + 3; line < loopLine; ++line) {
-        if (defines(lines[line], start) || defines(lines[line], end))
+        if (defines(lines[line], start) || defines(lines[line], end) ||
+            lines[line].starts_with("bra ") || lines[line].contains(" bra ") ||
+            lines[line] == "ret;" || lines[line].contains(" ret;") ||
+            lines[line] == "exit;" || lines[line].contains(" exit;"))
           return false;
+        std::vector<std::string> tokens = ptxTokens(lines[line]);
+        if (lines[line].starts_with("mov.f32 ") &&
+            lines[line].ends_with(", 0f00000000;") && tokens.size() == 2)
+          accumulator = tokens[0];
       }
+      if (accumulator.empty())
+        return false;
       llvm::StringRef loop = lines[loopLine].drop_back();
       std::vector<std::string> predicateTokens =
           ptxTokens(lines[loopLine + 1]);
@@ -314,23 +328,58 @@ bool hasDisjointContiguousFoldLoop(llvm::StringRef ptx,
           (llvm::Twine("add.u32 ") + start + ", " + start + ", 1;").str();
       const std::string backedge = (llvm::Twine("bra ") + loop + ";").str();
       const std::string exitLabel = (llvm::Twine(exit) + ":").str();
+      PtxDataflow flow = ptxDataflow(ptx);
+      std::set<std::string> indexedLeafLoads;
+      for (const auto &[indexValue, definition] : flow.definitions) {
+        if (definition.opcode != "cvt.u64.u32" || definition.operands.empty() ||
+            !llvm::StringRef(definition.operands.front())
+                 .starts_with((llvm::Twine(start) + "@").str()))
+          continue;
+        for (const auto &[loadValue, load] : flow.definitions) {
+          if (llvm::StringRef(load.opcode).starts_with("ld.global.") &&
+              ptxDependencyClosure(flow, loadValue).count(indexValue))
+            indexedLeafLoads.insert(loadValue);
+        }
+      }
       bool sawLeafLoad = false;
-      bool sawAccumulatorAdd = false;
+      bool accumulatedIndexedLeaf = false;
       for (size_t line = loopLine + 3; line + 2 < lines.size(); ++line) {
-        if (lines[line] == exitLabel ||
-            lines[line].starts_with("bra ") ||
-            lines[line].contains(" bra ") ||
-            lines[line] == "ret;" || lines[line].contains(" ret;") ||
-            lines[line].ends_with(":") ||
+        if (lines[line] == exitLabel || lines[line].starts_with("bra ") ||
+            lines[line].contains(" bra ") || lines[line] == "ret;" ||
+            lines[line].contains(" ret;") || lines[line] == "exit;" ||
+            lines[line].contains(" exit;") || lines[line].ends_with(":") ||
             defines(lines[line], end) ||
             (defines(lines[line], start) && lines[line] != increment))
           return false;
         sawLeafLoad |= lines[line].starts_with("ld.global.");
-        sawAccumulatorAdd |= lines[line].starts_with("add.rn.f32 ");
+        std::vector<std::string> tokens = ptxTokens(lines[line]);
+        if (lines[line].starts_with("add.rn.f32 ") && tokens.size() == 3 &&
+            (tokens[1] == accumulator || tokens[2] == accumulator)) {
+          llvm::StringRef leaf =
+              tokens[1] == accumulator ? tokens[2] : tokens[1];
+          const std::string update =
+              (llvm::Twine("mov.f32 ") + accumulator + ", " + tokens[0] + ";")
+                  .str();
+          if (lines[line + 1] != update)
+            return false;
+          for (const auto &[value, definition] : flow.definitions) {
+            if (!llvm::StringRef(value).starts_with(
+                    (llvm::Twine(leaf) + "@").str()))
+              continue;
+            std::set<std::string> closure = ptxDependencyClosure(flow, value);
+            accumulatedIndexedLeaf |=
+                llvm::any_of(indexedLeafLoads, [&](const std::string &load) {
+                  return closure.count(load);
+                });
+          }
+          ++line;
+          continue;
+        }
+        if (defines(lines[line], accumulator))
+          return false;
         if (lines[line] == increment)
-          return sawLeafLoad && sawAccumulatorAdd &&
-                 lines[line + 1] == backedge &&
-                 lines[line + 2] == exitLabel;
+          return sawLeafLoad && accumulatedIndexedLeaf &&
+                 lines[line + 1] == backedge && lines[line + 2] == exitLabel;
       }
       return false;
     }
@@ -1721,8 +1770,10 @@ TEST(Abi22MapFusionContract,
 $load:
   setp.ge.u32 %p1, %r4, %r7;
   @%p1 bra $loaded;
+  cvt.u64.u32 %rd0, %r4;
   ld.global.f32 %f1, [%rd0];
   add.rn.f32 %f2, %f0, %f1;
+  mov.f32 %f0, %f2;
   add.u32 %r4, %r4, 1;
   bra $load;
 $loaded:
@@ -1736,8 +1787,10 @@ $loaded:
 $again:
   setp.ge.u32 %p7, %r18, %r22;
   @%p7 bra $finished;
+  cvt.u64.u32 %rd6, %r18;
   ld.global.f32 %f12, [%rd6];
   add.rn.f32 %f13, %f9, %f12;
+  mov.f32 %f9, %f13;
   add.u32 %r18, %r18, 1;
   bra $again;
 $finished:
@@ -1753,26 +1806,25 @@ $finished:
                    "mov.u32 %r0, %ctaid.x;"),
            replace(correctFoldLoop, "mov.u32 %r0, %tid.x;",
                    "mov.u32 %r0, %tid.y;"),
-           replace(
-               replace(
-                   replace(correctFoldLoop, "add.u32 %r7, %r4, 2;",
-                           "add.u32 %r4, %r4, 2;"),
-                   "min.u32 %r7, %r7, 330;",
-                   "min.u32 %r4, %r4, 330;"),
-               "setp.ge.u32 %p1, %r4, %r7;",
-               "setp.ge.u32 %p1, %r4, %r4;"),
+           replace(replace(replace(correctFoldLoop, "add.u32 %r7, %r4, 2;",
+                                   "add.u32 %r4, %r4, 2;"),
+                           "min.u32 %r7, %r7, 330;", "min.u32 %r4, %r4, 330;"),
+                   "setp.ge.u32 %p1, %r4, %r7;", "setp.ge.u32 %p1, %r4, %r4;"),
            replace(correctFoldLoop, "ld.global.f32 %f1, [%rd0];",
                    "bra $loaded;\n  ld.global.f32 %f1, [%rd0];"),
-           replace(correctFoldLoop, "$load:",
-                   "mov.u32 %r7, 0;\n$load:"),
+           replace(correctFoldLoop, "$load:", "mov.u32 %r7, 0;\n$load:"),
            replace(correctFoldLoop, "ld.global.f32 %f1, [%rd0];",
                    "@%p2 mov.u32 %r7, 0;\n  ld.global.f32 %f1, [%rd0];"),
            replace(correctFoldLoop, "ld.global.f32 %f1, [%rd0];",
                    "ret;\n  ld.global.f32 %f1, [%rd0];"),
-           replace(correctFoldLoop, "ld.global.f32 %f1, [%rd0];",
-                   "nop;"),
-           replace(correctFoldLoop, "add.rn.f32 %f2, %f0, %f1;",
-                   "nop;"),
+           replace(correctFoldLoop, "ld.global.f32 %f1, [%rd0];", "nop;"),
+           replace(correctFoldLoop, "add.rn.f32 %f2, %f0, %f1;", "nop;"),
+           replace(correctFoldLoop, "mov.f32 %f0, 0f00000000;", "ret;"),
+           replace(correctFoldLoop, "mov.f32 %f0, 0f00000000;", "@%p2 ret;"),
+           replace(correctFoldLoop, "mov.f32 %f0, 0f00000000;", "bra $loaded;"),
+           replace(correctFoldLoop, "mov.f32 %f0, 0f00000000;", "exit;"),
+           replace(correctFoldLoop, "cvt.u64.u32 %rd0, %r4;",
+                   "cvt.u64.u32 %rd0, %r7;"),
        })
     EXPECT_FALSE(hasDisjointContiguousFoldLoop(mutation, 330, 2));
 }
