@@ -53,6 +53,16 @@ SHUTTLE_BLOCKER = (
 RUNTIME_PYTHON = Path("/opt/h100-evidence-runtime/bin/python")
 RUNTIME_SITE_PACKAGES = Path("/opt/h100-evidence-runtime/lib/python3.12/site-packages")
 CUDA_ROOT = Path("/usr/local/cuda-13.2")
+NVIDIA_SITE_PACKAGES = RUNTIME_SITE_PACKAGES / "nvidia"
+RUNTIME_LIBRARY_PATHS = {
+    "cublas": NVIDIA_SITE_PACKAGES / "cublas/lib/libcublas.so.13",
+    "cublas_lt": NVIDIA_SITE_PACKAGES / "cublas/lib/libcublasLt.so.13",
+    "cudnn": NVIDIA_SITE_PACKAGES / "cudnn/lib/libcudnn.so.9",
+    "nccl": NVIDIA_SITE_PACKAGES / "nccl/lib/libnccl.so.2",
+    "cudart": CUDA_ROOT / "lib64/libcudart.so.13",
+    "nvrtc": CUDA_ROOT / "lib64/libnvrtc.so.13",
+    "curand": CUDA_ROOT / "lib64/libcurand.so.10",
+}
 RUNNER_SOURCE = Path("lib/shuttle/mlir/jax_patch/abi22_te_rmsnorm_oracle_runner_v2.cpp")
 XLA_RUNNER = Path("lib/shuttle/mlir/jax_patch/abi22_xla_rmsnorm_oracle_v2.py")
 BUILD_MANIFEST = Path("lib/shuttle/mlir/jax_patch/abi22-te-rmsnorm-oracle-runner-build-v2.json")
@@ -191,6 +201,9 @@ def batch_plan(*, workspace: Path, runner_repository: Path) -> dict[str, Any]:
         f"-L{CUDA_ROOT / 'lib64'}",
         f"-Wl,-rpath,{CUDA_ROOT / 'lib64'}",
         "-lcudart",
+        "-Wl,--no-as-needed",
+        *map(str, RUNTIME_LIBRARY_PATHS.values()),
+        "-Wl,--as-needed",
         "-Wl,--allow-shlib-undefined",
         "-o",
         str(paths.te_runner),
@@ -310,7 +323,7 @@ def validate_te_hydration(paths: BatchPaths) -> dict[str, str]:
 
 def runtime_environment(paths: BatchPaths) -> dict[str, str]:
     """Return the runner environment with the reviewed TE library first."""
-    search = [paths.te_library.parent, CUDA_ROOT / "lib64"]
+    search = [paths.te_library.parent, *(path.parent for path in RUNTIME_LIBRARY_PATHS.values())]
     nvidia = RUNTIME_SITE_PACKAGES / "nvidia"
     if nvidia.is_dir():
         search.extend(sorted(path for path in nvidia.glob("*/lib") if path.is_dir()))
@@ -320,15 +333,62 @@ def runtime_environment(paths: BatchPaths) -> dict[str, str]:
     unique = list(dict.fromkeys(str(path) for path in search))
     environment = dict(os.environ)
     environment.pop("LD_PRELOAD", None)
+    environment.pop("LD_BIND_NOW", None)
     environment["LD_LIBRARY_PATH"] = ":".join(unique)
     return environment
 
 
-def _validate_link_closure(log: Path) -> None:
+def _elf_soname(path: Path) -> str:
+    result = subprocess.run(["readelf", "-d", path], check=True, capture_output=True, text=True)
+    matches = re.findall(r"\(SONAME\).*Shared library: \[([^]]+)\]", result.stdout)
+    if len(matches) != 1:
+        raise RuntimeError(f"runtime library has no unique ELF SONAME: {path}")
+    return matches[0]
+
+
+def _validated_runtime_libraries(
+    library_paths: Mapping[str, Path],
+    *,
+    approved_roots: tuple[Path, ...],
+    soname_reader: Callable[[Path], str],
+) -> dict[str, dict[str, str]]:
+    identities = {}
+    resolved_roots = tuple(root.resolve(strict=True) for root in approved_roots)
+    for role, requested in library_paths.items():
+        try:
+            resolved = requested.resolve(strict=True)
+        except FileNotFoundError as error:
+            raise RuntimeError(f"runtime library is missing: {role}") from error
+        if not resolved.is_file() or resolved.is_symlink():
+            raise RuntimeError(f"runtime library is not one regular file: {role}")
+        if not any(resolved.is_relative_to(root) for root in resolved_roots):
+            raise RuntimeError(f"runtime library is outside an approved runtime root: {role}")
+        soname = soname_reader(resolved)
+        if not soname or "/" in soname:
+            raise RuntimeError(f"runtime library SONAME is invalid: {role}")
+        identities[role] = {
+            "requested_path": str(requested),
+            "resolved_path": str(resolved),
+            "sha256": _file_sha256(resolved),
+            "soname": soname,
+        }
+    return identities
+
+
+def _validate_link_closure(log: Path, libraries: Mapping[str, Mapping[str, str]]) -> None:
     output = log.read_text()
-    required = ("libtransformer_engine.so", "libcublasLt.so.13", "libcudnn.so.9", "libnccl.so", "libnvrtc.so")
-    if "not found" in output or any(library not in output for library in required):
-        raise RuntimeError("Transformer Engine runtime dependency closure is incomplete")
+    failed = "not found" in output or "libtransformer_engine.so" not in output
+    for identity in libraries.values():
+        soname = identity["soname"]
+        matches = re.findall(rf"^\s*{re.escape(soname)}\s+=>\s+(\S+)\s+\(", output, flags=re.MULTILINE)
+        if len(matches) != 1:
+            failed = True
+            continue
+        loaded = Path(matches[0]).resolve()
+        if str(loaded) != identity["resolved_path"] or _file_sha256(loaded) != identity["sha256"]:
+            failed = True
+    if failed:
+        raise RuntimeError(f"Transformer Engine runtime dependency closure is incomplete\n{output[-32 * 1024 :]}")
 
 
 def _invoke_oracle(paths: BatchPaths, argv: list[str]) -> int:
@@ -368,6 +428,11 @@ def _execute_hydration(paths: BatchPaths, plan: dict[str, Any]) -> dict[str, Any
     _run(phases[6]["argv"], cwd=None, log=paths.logs / "te_wheel_extract.log", phase="te_wheel_extract")
     runner_repository = Path(plan["runner_repository"])
     validate_build_manifest(runner_repository / BUILD_MANIFEST, runner_repository / RUNNER_SOURCE)
+    runtime_libraries = _validated_runtime_libraries(
+        RUNTIME_LIBRARY_PATHS,
+        approved_roots=(CUDA_ROOT, NVIDIA_SITE_PACKAGES),
+        soname_reader=_elf_soname,
+    )
     _run(phases[7]["argv"], cwd=None, log=paths.logs / "te_runner_build.log", phase="te_runner_build")
     link_log = paths.logs / "te_runner_link_check.log"
     _run(
@@ -377,8 +442,9 @@ def _execute_hydration(paths: BatchPaths, plan: dict[str, Any]) -> dict[str, Any
         phase="te_runner_link_check",
         environment=runtime_environment(paths),
     )
-    _validate_link_closure(link_log)
+    _validate_link_closure(link_log, runtime_libraries)
     observed["transformer_engine"] = validate_te_hydration(paths)
+    observed["runtime_libraries"] = runtime_libraries
     return observed
 
 
@@ -536,6 +602,7 @@ def execute_batch(
         "tools": {
             "logs": logs,
             "runner_binary_sha256": _file_sha256(paths.te_runner),
+            "runtime_libraries": hydration["runtime_libraries"],
             "transformer_engine": hydration["transformer_engine"],
         },
     }
