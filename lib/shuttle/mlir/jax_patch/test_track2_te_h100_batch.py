@@ -201,15 +201,16 @@ def test_link_closure_rejects_any_unresolved_runtime_dependency(tmp_path: Path) 
     log = tmp_path / "ldd.log"
     log.write_text(
         "libtransformer_engine.so => /tmp/runtime/libtransformer_engine.so\n"
-        "libcublasLt.so.13 => /opt/cublas/libcublasLt.so.13\n"
-        "libcudnn.so.9 => /opt/cudnn/libcudnn.so.9\n"
-        "libnccl.so.2 => /opt/nccl/libnccl.so.2\n"
-        "libnvrtc.so.13 => /opt/nvrtc/libnvrtc.so.13\n"
+        "libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6\n"
     )
 
     _validate_link_closure(log)
 
     log.write_text("libnccl.so.2 => not found\n")
+    with pytest.raises(RuntimeError, match="runtime dependency closure"):
+        _validate_link_closure(log)
+
+    log.write_text("libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6\n")
     with pytest.raises(RuntimeError, match="runtime dependency closure"):
         _validate_link_closure(log)
 
