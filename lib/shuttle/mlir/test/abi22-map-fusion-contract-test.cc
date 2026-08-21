@@ -4370,36 +4370,47 @@ TEST(Abi22MapFusionContract,
       const int64_t inputCount = fixture.composed ? 4 : 3;
       const int64_t matrixBytes = fixture.rows * fixture.features * 2;
       const int64_t featureBytes = fixture.features * 2;
+      // External result indices are the public function result order, not the
+      // materialization-buffer or task-output order.
       const llvm::SmallVector<int64_t> expectedBindingSlots =
           fixture.composed
-              ? llvm::SmallVector<int64_t>{0, 1, 2, 3, 6, 7, 8, 9}
-              : llvm::SmallVector<int64_t>{0, 1, 2, 5, 6, 7};
+              ? llvm::SmallVector<int64_t>{0, 1, 2, 3, 6, 9, 8, 7}
+              : llvm::SmallVector<int64_t>{0, 1, 2, 7, 6, 5};
       const llvm::SmallVector<int64_t> expectedBindingBytes =
           fixture.composed
               ? llvm::SmallVector<int64_t>{matrixBytes, featureBytes,
                                            featureBytes, matrixBytes,
-                                           matrixBytes, featureBytes,
-                                           featureBytes, matrixBytes}
+                                           matrixBytes, matrixBytes,
+                                           featureBytes, featureBytes}
               : llvm::SmallVector<int64_t>{matrixBytes, featureBytes,
-                                           matrixBytes, featureBytes,
-                                           featureBytes, matrixBytes};
+                                           matrixBytes, matrixBytes,
+                                           featureBytes, featureBytes};
       ASSERT_EQ((*executable)->externalBindings().size(),
                 expectedBindingSlots.size());
-      for (auto [ordinal, binding, slot, bytes] : llvm::enumerate(
-               (*executable)->externalBindings(), expectedBindingSlots,
-               expectedBindingBytes)) {
-        const bool operand =
-            static_cast<int64_t>(ordinal) < inputCount;
-        EXPECT_EQ(binding.kind,
+      for (auto [ordinal, slot, bytes] : llvm::enumerate(
+               expectedBindingSlots, expectedBindingBytes)) {
+        const bool operand = static_cast<int64_t>(ordinal) < inputCount;
+        const int64_t index = operand ? static_cast<int64_t>(ordinal)
+                                      : static_cast<int64_t>(ordinal) -
+                                            inputCount;
+        auto binding = llvm::find_if(
+            (*executable)->externalBindings(), [&](const auto &candidate) {
+              return candidate.kind ==
+                         (operand
+                              ? mlir::shuttle::ExecutableBindingKind::Operand
+                              : mlir::shuttle::ExecutableBindingKind::Result) &&
+                     candidate.index == index;
+            });
+        ASSERT_NE(binding, (*executable)->externalBindings().end());
+        EXPECT_EQ(binding->kind,
                   operand ? mlir::shuttle::ExecutableBindingKind::Operand
                           : mlir::shuttle::ExecutableBindingKind::Result);
-        EXPECT_EQ(binding.index,
-                  operand ? static_cast<int64_t>(ordinal)
-                          : static_cast<int64_t>(ordinal) - inputCount);
-        EXPECT_EQ(binding.slotOrdinal, slot);
-        EXPECT_EQ(binding.requiredBytes, bytes);
-        EXPECT_EQ(binding.alignment, 2);
-        auto type = mlir::dyn_cast<mlir::RankedTensorType>(binding.tensorType);
+        EXPECT_EQ(binding->index, index);
+        EXPECT_EQ(binding->slotOrdinal, slot);
+        EXPECT_EQ(binding->requiredBytes, bytes);
+        EXPECT_EQ(binding->alignment, 2);
+        auto type =
+            mlir::dyn_cast<mlir::RankedTensorType>(binding->tensorType);
         ASSERT_TRUE(type);
         EXPECT_TRUE(type.getElementType().isBF16());
       }
