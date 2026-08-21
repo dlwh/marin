@@ -62,6 +62,26 @@ The complete canonical four-cell record is retained outside the repository at
 `f8118e26165f2f701b8bdc2154e2ec3c277d393b2a89790370c592e32ed4b81d`,
 7,853 bytes).
 
+## Prospective v2 campaign
+
+The v1 result qualifies only the geometry of a later metric: a full-range BF16
+ULP maximum is unstable near zero even when whole-array absolute and relative
+errors are small. It does not qualify new thresholds, inputs, or outputs.
+
+The v2 policy uses a new deterministic input, weight, projection, and cotangent
+set that has not run on hardware. Each role retains whole-array maximum
+absolute, mean absolute, and relative L-infinity limits. Ordered finite BF16
+ULP is an acceptance metric only where the binary64 reference magnitude meets
+a predeclared role-specific absolute floor; the full-range ULP remains a
+diagnostic. Type, shape, public role order, finiteness, and repeat bytes remain
+mandatory.
+
+Disabled JAX is diagnostic-only and cannot reject the v2 campaign. The matrix
+runs all six primal coordinates before any composed coordinate, so the
+normative 1-launch and 2-launch special plans emit durable per-cell evidence
+even if a later composed coordinate fails. The compiler, planner, emitter, and
+runtime are unchanged.
+
 ## Future work
 
 - [ ] Decide whether a later campaign should gate disabled JAX against the independent oracle or retain it as diagnostic-only, without retroactively changing r2.
