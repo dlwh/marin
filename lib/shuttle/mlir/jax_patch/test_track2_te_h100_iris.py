@@ -100,13 +100,15 @@ def test_render_emits_one_exact_batch_priority_zero_retry_h100_request(
 
 def test_v3_request_selects_only_the_versioned_batch_entrypoint() -> None:
     request = build_launch_request_v3(bundle_root=MARIN_REPOSITORY, run=11)
+    v1_request = build_launch_request(bundle_root=MARIN_REPOSITORY, run=11)
     raw = request.SerializeToString(deterministic=True)
     self_checked = decode_launch_request_v3(raw, run=11)
     assert self_checked.name == "/dlwh/shuttle-track2-te-h100-r11"
     assert list(self_checked.entrypoint.run_command.argv)[-1] == "--execute-v3"
-    assert (
-        list(build_launch_request(bundle_root=MARIN_REPOSITORY, run=11).entrypoint.run_command.argv)[-1] == "--execute"
-    )
+    assert list(v1_request.entrypoint.run_command.argv)[-1] == "--execute"
+    normalized = deepcopy(self_checked)
+    normalized.entrypoint.CopyFrom(v1_request.entrypoint)
+    assert normalized.SerializeToString(deterministic=True) == v1_request.SerializeToString(deterministic=True)
     with pytest.raises(ValueError, match="entrypoint"):
         decode_launch_request(raw, run=11)
 

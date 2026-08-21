@@ -168,6 +168,49 @@ class Track2TeH100PolicyV3Test(unittest.TestCase):
         )
         self.assertEqual(json.loads(stdout.getvalue().split("=", 1)[1]), expected)
 
+    def test_execute_batch_v3_returns_only_v3_evidence(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        workspace = root / "workspace"
+        repository = root / "repository"
+        repository.mkdir()
+        manifest = root / "source.json"
+        expected_evidence = {"acceptance": {"schema": "shuttle_abi22_te_xla_rmsnorm_acceptance_v3"}}
+        observed_plan = {}
+
+        def hydrate(paths: BatchPaths, plan: dict[str, object]) -> dict[str, object]:
+            observed_plan.update(plan)
+            paths.te_runner.write_bytes(b"runner-binary")
+            return {
+                "device": DEVICE,
+                "driver": "driver",
+                "cuda_runtime_headers": {},
+                "runtime_libraries": {},
+                "transformer_engine": {},
+            }
+
+        with (
+            patch.object(batch.platform, "system", return_value="Linux"),
+            patch.object(batch, "validate_source_manifest", return_value={"commit": "c", "tree": "t"}),
+            patch.object(batch, "_execute_hydration", side_effect=hydrate),
+            patch.object(batch, "execute_oracle", side_effect=AssertionError("legacy v2 worker called")),
+            patch.object(batch, "execute_oracle_v3", return_value=expected_evidence) as execute_v3,
+        ):
+            result = batch.execute_batch_v3(
+                workspace=workspace,
+                runner_repository=repository,
+                manifest_path=manifest,
+                observed_base_image=batch.BASE_IMAGE,
+            )
+
+        self.assertEqual(result["schema"], "shuttle_track2_te_h100_batch_result_v3")
+        self.assertEqual(result["evidence"], expected_evidence)
+        self.assertEqual(observed_plan["schema"], "shuttle_track2_te_h100_batch_plan_v3")
+        self.assertEqual(observed_plan["qualification"], {**oracle.NUMERICAL_POLICY_V3, "run_count": 48})
+        execute_v3.assert_called_once()
+        self.assertEqual(json.loads(BatchPaths.under(workspace).result.read_text()), result)
+
     def test_worker_persists_raw_outputs_and_repeat_diagnostics_before_rejection(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
