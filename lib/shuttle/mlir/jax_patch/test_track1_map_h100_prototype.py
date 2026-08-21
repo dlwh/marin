@@ -428,6 +428,8 @@ def test_execute_rejects_bazel_or_hydration_failure_before_offline_build(
                     "print('Authorization: Bearer bearer-secret'); "
                     "print('AUTHORIZATION=Basic basic-secret'); "
                     'print(\'{"client_secret":"json-secret"}\'); '
+                    "print('API_TOKENS=plural-token-secret'); "
+                    'print(\'{"passwords":"plural-password-secret"}\'); '
                     "print('ghp_' + 'A' * 36); "
                     "print('eyJheader.eyJpayload.signature'); "
                     "print('-----BEGIN PRIVATE KEY-----\\n"
@@ -499,6 +501,8 @@ def test_execute_rejects_bazel_or_hydration_failure_before_offline_build(
         assert "bearer-secret" not in str(raised.value)
         assert "basic-secret" not in str(raised.value)
         assert "json-secret" not in str(raised.value)
+        assert "plural-token-secret" not in str(raised.value)
+        assert "plural-password-secret" not in str(raised.value)
         assert "ghp_" not in str(raised.value)
         assert "eyJheader" not in str(raised.value)
         assert "BEGIN PRIVATE KEY" not in str(raised.value)
