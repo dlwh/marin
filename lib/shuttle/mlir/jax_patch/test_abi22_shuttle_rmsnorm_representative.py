@@ -259,6 +259,7 @@ def _fake_runner(
     corrupt_output: bool = False,
     corrupt_artifact_size: bool = False,
     corrupt_artifact_sha: bool = False,
+    raw_mutation: str | None = None,
 ) -> int:
     calls.append(argv)
     arguments = _arguments(argv)
@@ -291,6 +292,7 @@ def _fake_runner(
         if corrupt_artifact_sha and coordinate == ("source_ordered", "forward", 0) and role == "y":
             artifact["sha256"] = "0" * 64
         external_bindings.append({"kind": "result", **binding, "artifact": artifact})
+    coordinate_number = POLICIES.index(policy) * len(BOUNDARIES) * 2 + BOUNDARIES.index(boundary) * 2 + repeat
     cell = {
         "schema": "shuttle_abi22_rmsnorm_representative_raw_cell_v1",
         "policy": policy,
@@ -304,7 +306,7 @@ def _fake_runner(
         "resources": copy.deepcopy(EXPECTED_RESOURCES[boundary]),
         "transport": {
             "contract_operation_count": 0,
-            "code_bytes": 4096,
+            "code_bytes": 4096 + coordinate_number,
             "executable_digest": _sha(f"executable/{policy}/{boundary}"),
             "module_load_digest": _sha(f"module/{policy}/{boundary}"),
             "ptx_digests": [
@@ -316,11 +318,55 @@ def _fake_runner(
             "warmup_iterations": 10,
             "measured_iterations": 20,
             "host_clock": "steady_clock_execute_block_host_until_done_ns",
-            "host_samples_ns": list(range(1000, 1020)),
+            "host_samples_ns": list(range(1000 + coordinate_number * 100, 1020 + coordinate_number * 100)),
             "cuda_event_status": "supplemental_not_acceptance",
-            "cuda_event_samples_ns": list(range(500, 520)),
+            "cuda_event_samples_ns": list(range(500 + coordinate_number * 100, 520 + coordinate_number * 100)),
         },
     }
+    first_coordinate = coordinate == ("source_ordered", "forward", 0)
+    if raw_mutation == "backward_runner_index" and coordinate == ("source_ordered", "backward_recompute", 0):
+        next(binding for binding in external_bindings if binding["kind"] == "result")["runner_index"] = 1
+    elif raw_mutation == "composed_slot" and coordinate == ("source_ordered", "composed", 0):
+        next(binding for binding in external_bindings if binding["kind"] == "result")["slot_ordinal"] = 3
+    elif first_coordinate and raw_mutation not in (None, "backward_runner_index", "composed_slot"):
+        operand = next(binding for binding in external_bindings if binding["kind"] == "operand")
+        result = next(binding for binding in external_bindings if binding["kind"] == "result")
+        if raw_mutation == "operand_bytes":
+            operand["required_bytes"] += 2
+        elif raw_mutation == "operand_type":
+            operand["tensor_type"] = "bf16[4096,2048]"
+        elif raw_mutation == "operand_alignment":
+            operand["alignment"] = 4
+        elif raw_mutation == "result_bytes":
+            result["required_bytes"] += 2
+        elif raw_mutation == "result_type":
+            result["tensor_type"] = "bf16[4096,2048]"
+        elif raw_mutation == "result_alignment":
+            result["alignment"] = 4
+        elif raw_mutation == "runner_api":
+            cell["runner_api"]["host"] = "wall_clock_without_stream_fence"
+        elif raw_mutation == "resource":
+            cell["resources"]["launch_count"] += 1
+        elif raw_mutation == "contract_transport":
+            cell["transport"]["contract_operation_count"] = 1
+        elif raw_mutation == "warmup_iterations":
+            cell["timing"]["warmup_iterations"] = 9
+        elif raw_mutation == "measured_iterations":
+            cell["timing"]["measured_iterations"] = 19
+        elif raw_mutation == "host_clock":
+            cell["timing"]["host_clock"] = "wall_clock_ns"
+        elif raw_mutation == "event_status":
+            cell["timing"]["cuda_event_status"] = "acceptance_clock"
+        elif raw_mutation == "negative_host_sample":
+            cell["timing"]["host_samples_ns"][0] = -1
+        elif raw_mutation == "nan_host_sample":
+            cell["timing"]["host_samples_ns"][0] = math.nan
+        elif raw_mutation == "negative_event_sample":
+            cell["timing"]["cuda_event_samples_ns"][0] = -1
+        elif raw_mutation == "nan_event_sample":
+            cell["timing"]["cuda_event_samples_ns"][0] = math.nan
+        else:
+            raise AssertionError(raw_mutation)
     (directory / "cell.json").write_text(json.dumps(cell, sort_keys=True, separators=(",", ":")))
     return 0
 
@@ -427,6 +473,13 @@ def test_executor_invokes_exact_matrix_and_assembles_file_backed_evidence(
     )
     assert json.loads((reports_root / "shuttle-policy-raw-v1.json").read_text()) == evidence
     for cell in evidence["cells"]:
+        raw_cell = json.loads(
+            (raw_root / cell["policy"] / cell["boundary"] / f"repeat-{cell['repeat']}" / "cell.json").read_text()
+        )
+        assert cell["runner_api"] == raw_cell["runner_api"]
+        assert cell["resources"] == raw_cell["resources"]
+        assert cell["transport"] == raw_cell["transport"]
+        assert cell["timing"] == raw_cell["timing"]
         contract = EXPECTED_BINDINGS[cell["boundary"]]["results"]
         assert [
             (output["role"], output["public_result_index"], output["runner_result_index"], output["slot_ordinal"])
@@ -435,12 +488,46 @@ def test_executor_invokes_exact_matrix_and_assembles_file_backed_evidence(
             (binding["role"], binding["public_result_index"], binding["runner_index"], binding["slot_ordinal"])
             for binding in contract
         ]
+        expected_external_bindings = [
+            {"kind": "operand", **binding} for binding in EXPECTED_BINDINGS[cell["boundary"]]["operands"]
+        ] + [
+            {"kind": "result", **binding, "artifact": output["artifact"]}
+            for binding, output in zip(contract, cell["outputs"], strict=True)
+        ]
+        assert raw_cell["external_bindings"] == expected_external_bindings
         for output in cell["outputs"]:
             artifact = output["artifact"]
             assert validate_output_artifact(artifact, raw_root=raw_root, case_root=prepared_case_root) == artifact
 
 
-@pytest.mark.parametrize("failure", ["nonzero", "missing_cell", "artifact_size", "artifact_sha"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "nonzero",
+        "missing_cell",
+        "artifact_size",
+        "artifact_sha",
+        "backward_runner_index",
+        "composed_slot",
+        "operand_bytes",
+        "operand_type",
+        "operand_alignment",
+        "result_bytes",
+        "result_type",
+        "result_alignment",
+        "runner_api",
+        "resource",
+        "contract_transport",
+        "warmup_iterations",
+        "measured_iterations",
+        "host_clock",
+        "event_status",
+        "negative_host_sample",
+        "nan_host_sample",
+        "negative_event_sample",
+        "nan_event_sample",
+    ],
+)
 def test_executor_fails_closed_on_process_and_persisted_output_failures(
     tmp_path: Path, prepared_case_root: Path, failure: str
 ) -> None:
@@ -453,8 +540,10 @@ def test_executor_fails_closed_on_process_and_persisted_output_failures(
         kwargs["omit_cell"] = True
     elif failure == "artifact_size":
         kwargs["corrupt_artifact_size"] = True
-    else:
+    elif failure == "artifact_sha":
         kwargs["corrupt_artifact_sha"] = True
+    else:
+        kwargs["raw_mutation"] = failure
     with pytest.raises(ValueError):
         execute_representative(
             runner=tmp_path / "runner",
