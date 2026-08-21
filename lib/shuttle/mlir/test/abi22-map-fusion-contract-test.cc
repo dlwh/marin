@@ -3690,10 +3690,91 @@ bool mutateGenericSharedStatPartition(mlir::ModuleOp module,
 std::string ptxFingerprintDigest(const PtxDataflow &flow,
                                  llvm::StringRef value);
 
+std::string ptxOutputControlDigest(llvm::StringRef ptx,
+                                   int64_t outputOrdinal) {
+  const std::string epilogueLabel =
+      (llvm::Twine("$fold_region_output_") + llvm::Twine(outputOrdinal) +
+       "_epilogue:")
+          .str();
+  const std::string doneLabel =
+      (llvm::Twine("$fold_region_output_") + llvm::Twine(outputOrdinal) +
+       "_done:")
+          .str();
+  size_t done = ptx.find(doneLabel);
+  if (done == llvm::StringRef::npos)
+    return {};
+  size_t epilogue = ptx.take_front(done).rfind(epilogueLabel);
+  size_t control = epilogue;
+  if (control == llvm::StringRef::npos) {
+    const std::string branch =
+        (llvm::Twine("bra $fold_region_output_") +
+         llvm::Twine(outputOrdinal) + "_done;")
+            .str();
+    control = ptx.take_front(done).rfind(branch);
+  }
+  if (control == llvm::StringRef::npos)
+    return {};
+  size_t start = ptx.take_front(control).rfind('\n');
+  if (start == llvm::StringRef::npos)
+    return {};
+  start = ptx.take_front(start).rfind('\n');
+  start = start == llvm::StringRef::npos ? 0 : start + 1;
+  llvm::StringRef slice = ptx.slice(start, done + doneLabel.size());
+
+  std::map<std::string, std::string> registers;
+  int64_t nextPredicate = 0;
+  int64_t nextU32 = 0;
+  int64_t nextU64 = 0;
+  int64_t nextF32 = 0;
+  int64_t nextBf16 = 0;
+  auto canonicalRegister = [&](llvm::StringRef token) -> std::string {
+    auto found = registers.find(token.str());
+    if (found != registers.end())
+      return found->second;
+    llvm::StringRef prefix;
+    int64_t *next = nullptr;
+    if (token.starts_with("%p")) {
+      prefix = "$p";
+      next = &nextPredicate;
+    } else if (token.starts_with("%rd")) {
+      prefix = "$rd";
+      next = &nextU64;
+    } else if (token.starts_with("%f")) {
+      prefix = "$f";
+      next = &nextF32;
+    } else if (token.starts_with("%h")) {
+      prefix = "$h";
+      next = &nextBf16;
+    } else {
+      prefix = "$r";
+      next = &nextU32;
+    }
+    std::string canonical =
+        (llvm::Twine(prefix) + llvm::Twine((*next)++)).str();
+    registers.try_emplace(token.str(), canonical);
+    return canonical;
+  };
+  std::string skeleton;
+  size_t cursor = 0;
+  for (llvm::StringRef token : ptxTokens(slice)) {
+    size_t position = slice.find(token, cursor);
+    if (position == llvm::StringRef::npos)
+      return {};
+    skeleton += slice.slice(cursor, position).str();
+    skeleton += token.starts_with("%") ? canonicalRegister(token) : token.str();
+    cursor = position + token.size();
+  }
+  skeleton += slice.drop_front(cursor).str();
+  llvm::SHA256 digest;
+  digest.update(skeleton);
+  return llvm::toHex(digest.final(), true);
+}
+
 struct ExpectedPtxOutput {
   bool bf16;
   llvm::StringRef pointerDigest;
   llvm::StringRef valueDigest;
+  llvm::StringRef controlDigest;
   llvm::StringRef inputParameters;
 };
 
@@ -3711,7 +3792,8 @@ bool hasExactMultiOutputStoreDataflow(
     if (store.bf16 != expected.bf16 || !pointer.count(parameter) ||
         !pointer.count("$op:mad.lo.u64") ||
         ptxFingerprintDigest(flow, store.pointer) != expected.pointerDigest ||
-        ptxFingerprintDigest(flow, store.value) != expected.valueDigest)
+        ptxFingerprintDigest(flow, store.value) != expected.valueDigest ||
+        ptxOutputControlDigest(ptx, outputOrdinal) != expected.controlDigest)
       return false;
     for (int64_t other = 0;
          other < static_cast<int64_t>(expectedOutputs.size()); ++other) {
@@ -3850,6 +3932,23 @@ std::string changeFirstPtxOutputByteScale(llvm::StringRef ptx) {
     if (scale != std::string::npos && scale < addressEnd)
       result.replace(scale, 4, ", 4,");
   }
+  return result;
+}
+
+std::string flipFirstPtxOutputGuardPolarity(llvm::StringRef ptx) {
+  std::string result = ptx.str();
+  size_t branch = result.find("@%p3 bra $fold_region_output_0_");
+  if (branch != std::string::npos)
+    result.insert(branch + 1, "!");
+  return result;
+}
+
+std::string redirectFirstPtxOutputGuard(llvm::StringRef ptx) {
+  std::string result = ptx.str();
+  const std::string branch = "bra $fold_region_output_0_done;";
+  size_t position = result.find(branch);
+  if (position != std::string::npos)
+    result.replace(position, branch.size(), "bra $done;");
   return result;
 }
 
@@ -4096,6 +4195,7 @@ TEST(Abi22MapFusionContract,
     int64_t rowOutputCount;
     std::array<const char *, 6> pointerDigests;
     std::array<const char *, 6> valueDigests;
+    std::array<const char *, 6> controlDigests;
     std::array<const char *, 6> inputParameters;
   };
   // These digests seal register-insensitive reaching-definition trees. They
@@ -4116,6 +4216,12 @@ TEST(Abi22MapFusionContract,
         "948ec3995104fbff504ef2af2bdef2d5c5b84d72c26c36a1b4f321a8763ffcbd",
         "4ea4548e103b339bd5d55854a32d9ed632ce44a3fac32d39385cfafd84677835",
         "ba762e537b95bdc44ff9ea14e83475661a6ade0179251a656a85b8dd7204a783", ""},
+       {"97fdcf5a0fc69518bdcff4e7aee2868ffb5301a3c559ba87ca3407c74182fc06",
+        "5a25f3f711d286de78fb8266fe0aa343bbb144096d7b26df83cc2fc12b257a4c",
+        "7d251567f750a86380a918d6e771fa986541e5226da4a7434ff83022bae14197",
+        "f5a7ba8c9ecfc240cd1350358d6b497be1cd3a912e69d2fcac316c9c40fbf566",
+        "ae4ed1493af4beb3dc60a8fd8e0d2b4a28d193d53af1c3b9e3e0bcdaf60e0961",
+        ""},
        {"p0", "p0", "p0,p1,p2", "p1", "p0,p1,p2,p3", ""}},
       {"jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-composed.mlir",
        7,
@@ -4134,6 +4240,12 @@ TEST(Abi22MapFusionContract,
         "e982e5187665143b7060ee99f8df8c6ecba60aa816514bccd8a0e631c4489dca",
         "4ea4548e103b339bd5d55854a32d9ed632ce44a3fac32d39385cfafd84677835",
         "ba762e537b95bdc44ff9ea14e83475661a6ade0179251a656a85b8dd7204a783"},
+       {"b9a41d0609c5b9b5caf55c09a914acbacbe68c13b5bedc20349f3c1219b7c25c",
+        "bc92c9e300241bc1b369a3bbdf16e95f041f8df2de08be33697828743fb378da",
+        "5000b8ed594ef13757b41fedc06602fdfaab812216fb897cf3715bc6ff4fe9bd",
+        "08fd53780e238d5029776df9043ad2a37f97a3093883fcebf18e65caba841585",
+        "f5a7ba8c9ecfc240cd1350358d6b497be1cd3a912e69d2fcac316c9c40fbf566",
+        "ae4ed1493af4beb3dc60a8fd8e0d2b4a28d193d53af1c3b9e3e0bcdaf60e0961"},
        {"p0", "p0", "p0,p1,p2", "p0,p1,p3", "p1", "p0,p1,p2,p3"}},
       {"jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-backward.mlir",
        2048,
@@ -4150,6 +4262,12 @@ TEST(Abi22MapFusionContract,
         "f287dceb40d1523dd06b1bce7d4d7502c62ca0c7782dd6b1ca4688704d611de8",
         "4764abf32a66ed2208781e798b792197df47b5ba9af9d7d759ad9af5f3dac018",
         "cd2b45f73b977d0258420899923c80e038a52a1792f4a076a40367529b6711ec", ""},
+       {"4f77ad4d56a7f2ca413c7c5a442d26831eac28b5e81c77b5e384a02a77888de6",
+        "d6a7fe52bf220794c8132f6d0305949d511968149ad9d1c360f345d627ccfd1e",
+        "a074d17bb65eb862d4f80c336fdd24df6368fa502c25400bf65aeb88fedb9492",
+        "f4b4e412ee05a363c0d98420d01ffc199348f8cce084f489a6802768336aa50f",
+        "211ac33ef1ce83db74a9f60165d39130e01c35113151ca24bae80c2be00622bb",
+        ""},
        {"p0", "p0", "p0,p1,p2", "p1", "p0,p1,p2,p3", ""}},
       {"jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-composed.mlir",
        2048,
@@ -4168,6 +4286,12 @@ TEST(Abi22MapFusionContract,
         "b43694d152c34ab031548b757d6c6a48cb72390c768ab10b0bfbb1f493f9003d",
         "4764abf32a66ed2208781e798b792197df47b5ba9af9d7d759ad9af5f3dac018",
         "cd2b45f73b977d0258420899923c80e038a52a1792f4a076a40367529b6711ec"},
+       {"d4c50ab5ee5a10dfb5dafbde8decf511cda81dae7b3c06d643d51499fca1fda0",
+        "10fddc433dcc231b17a904cddd2e486ee10c01d014699de2efec3b191d93f60e",
+        "c5962176df663f6619bf18bdf9f9ecca4959e53c6ea550494943a132bc2a594f",
+        "6ab35b5df1d0a16b2414005154106b61167293828b910652f3f20b40389412cd",
+        "f4b4e412ee05a363c0d98420d01ffc199348f8cce084f489a6802768336aa50f",
+        "211ac33ef1ce83db74a9f60165d39130e01c35113151ca24bae80c2be00622bb"},
        {"p0", "p0", "p0,p1,p2", "p0,p1,p3", "p1", "p0,p1,p2,p3"}},
   }};
   for (const Fixture &fixture : fixtures) {
@@ -4255,6 +4379,7 @@ TEST(Abi22MapFusionContract,
               {type.getElementType().isBF16(),
                fixture.pointerDigests[expectedOrdinal],
                fixture.valueDigests[expectedOrdinal],
+               fixture.controlDigests[expectedOrdinal],
                fixture.inputParameters[expectedOrdinal]});
         }
         llvm::StringRef ptx(
@@ -4277,6 +4402,12 @@ TEST(Abi22MapFusionContract,
             expectedPtxOutputs));
         EXPECT_FALSE(hasExactMultiOutputStoreDataflow(
             changeFirstPtxOutputByteScale(ptx), launch.inputSlots.size(),
+            expectedPtxOutputs));
+        EXPECT_FALSE(hasExactMultiOutputStoreDataflow(
+            flipFirstPtxOutputGuardPolarity(ptx), launch.inputSlots.size(),
+            expectedPtxOutputs));
+        EXPECT_FALSE(hasExactMultiOutputStoreDataflow(
+            redirectFirstPtxOutputGuard(ptx), launch.inputSlots.size(),
             expectedPtxOutputs));
       }
       int64_t temporarySlots = 0;
