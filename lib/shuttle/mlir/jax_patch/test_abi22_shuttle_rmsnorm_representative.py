@@ -274,6 +274,7 @@ def _fake_runner(
     corrupt_artifact_size: bool = False,
     corrupt_artifact_sha: bool = False,
     raw_mutation: str | None = None,
+    topology_variant: str | None = None,
 ) -> int:
     calls.append(argv)
     arguments = _arguments(argv)
@@ -337,6 +338,22 @@ def _fake_runner(
             "cuda_event_samples_ns": list(range(500 + coordinate_number * 100, 520 + coordinate_number * 100)),
         },
     }
+    if topology_variant == "renumbered_slots":
+        slot_count = cell["resources"]["slot_count"]
+        for binding in external_bindings:
+            binding["slot_ordinal"] = slot_count - 1 - binding["slot_ordinal"]
+    elif topology_variant == "split_forward" and boundary == "forward":
+        cell["resources"].update(
+            {
+                "launch_count": 2,
+                "slot_count": 4,
+                "temporary_allocation_count": 1,
+                "temporary_bytes": 2048 * 4,
+            }
+        )
+        cell["transport"]["ptx_digests"].append(_sha(f"ptx/{policy}/{boundary}/split"))
+    elif topology_variant is not None and topology_variant != "split_forward":
+        raise AssertionError(topology_variant)
     first_coordinate = coordinate == ("source_ordered", "forward", 0)
     if raw_mutation == "backward_runner_index" and coordinate == ("source_ordered", "backward_recompute", 0):
         results = [binding for binding in external_bindings if binding["kind"] == "result"]
@@ -530,6 +547,27 @@ def test_executor_invokes_exact_matrix_and_assembles_file_backed_evidence(
         for output in cell["outputs"]:
             artifact = output["artifact"]
             assert validate_output_artifact(artifact, raw_root=raw_root, case_root=prepared_case_root) == artifact
+
+
+def test_executor_accepts_semantically_equivalent_resource_topologies(
+    workspace: Path, prepared_case_root: Path, topology_variant: str
+) -> None:
+    raw_root = workspace / "raw"
+    reports_root = workspace / "reports"
+    calls: list[list[str]] = []
+    evidence = execute_representative(
+        runner=workspace / "runner",
+        gpu_transport_test=workspace / "gpu_transport_v2_test",
+        case_root=prepared_case_root,
+        raw_root=raw_root,
+        reports_root=reports_root,
+        r12_result=R12_RESULT,
+        r12_policy_raw=R12_RAW,
+        invoke=lambda argv: _fake_runner(calls, argv, topology_variant=topology_variant),
+    )
+
+    assert len(evidence["cells"]) == 12
+    assert {cell["status"] for cell in evidence["cells"] if "status" in cell} == set()
 
 
 FAILURE_MUTATIONS = (
@@ -1116,6 +1154,11 @@ class RepresentativeRmsNormTest(unittest.TestCase):
         test_shell_wrapper_rejects_missing_or_ambiguous_derived_runfiles_root(
             self.temporary_path("wrapper-runfiles-invalid")
         )
+        for topology_variant in ("renumbered_slots", "split_forward"):
+            with self.subTest(topology_variant=topology_variant):
+                test_executor_accepts_semantically_equivalent_resource_topologies(
+                    self.temporary_path(f"topology-{topology_variant}"), self.case_root, topology_variant
+                )
 
     def test_process_and_raw_claim_failures(self) -> None:
         for index, failure in enumerate(FAILURE_MUTATIONS):
