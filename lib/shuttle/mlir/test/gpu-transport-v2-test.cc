@@ -6269,7 +6269,16 @@ TEST(GpuTransportV2Test,
           : "jax-0.10.1-bf16-projected_parameter_broadcast-2048x4096-"
             "composed.mlir";
   auto source = fixtureSource(fixture);
-  ASSERT_TRUE(source);
+  ASSERT_TRUE(source)
+      << "representative fixture unavailable: " << fixture
+      << " RUNFILES_DIR="
+      << (std::getenv("RUNFILES_DIR") == nullptr
+              ? "<unset>"
+              : std::getenv("RUNFILES_DIR"))
+      << " TEST_SRCDIR="
+      << (std::getenv("TEST_SRCDIR") == nullptr
+              ? "<unset>"
+              : std::getenv("TEST_SRCDIR"));
   constexpr llvm::StringLiteral sourceOrderedOptions =
       R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
   constexpr llvm::StringLiteral fastOptions =

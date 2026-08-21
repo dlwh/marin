@@ -719,6 +719,45 @@ def test_execution_plan_invokes_shell_wrapper_with_explicit_gpu_test(tmp_path: P
     ]
 
 
+def test_shell_wrapper_bridges_bazel_runfiles_directory_for_fixture_lookup(tmp_path: Path) -> None:
+    runner = Path(__file__).parents[1] / "test" / "run-h100-shuttle-rmsnorm-representative.sh"
+    fixture = (
+        tmp_path
+        / "runfiles"
+        / "shuttle_mlir"
+        / "test"
+        / "Inputs"
+        / "jax-0.10.1-bf16-projected_parameter_broadcast-2048x4096-forward.mlir"
+    )
+    fixture.parent.mkdir(parents=True)
+    fixture.write_text("module {}\n")
+    gpu_transport_test = tmp_path / "gpu_transport_v2_test"
+    capture = tmp_path / "test-srcdir.txt"
+    gpu_transport_test.write_text(
+        "#!/bin/sh\n"
+        'test -r "$TEST_SRCDIR/shuttle_mlir/test/Inputs/'
+        'jax-0.10.1-bf16-projected_parameter_broadcast-2048x4096-forward.mlir" || exit 23\n'
+        'printf \'%s\\n\' "$TEST_SRCDIR" > "$CAPTURE"\n'
+    )
+    gpu_transport_test.chmod(0o755)
+    plan = execution_plan(
+        runner=runner,
+        gpu_transport_test=gpu_transport_test,
+        case_root=tmp_path / "cases",
+        raw_root=tmp_path / "raw",
+    )
+
+    environment = dict(os.environ)
+    environment.pop("TEST_SRCDIR", None)
+    environment.pop("RUNFILES_MANIFEST_FILE", None)
+    environment["RUNFILES_DIR"] = str(tmp_path / "runfiles")
+    environment["CAPTURE"] = str(capture)
+    result = subprocess.run(plan["runs"][0]["argv"], env=environment, check=False, capture_output=True, text=True)
+
+    assert result.returncode == 0, result.stderr
+    assert capture.read_text().strip() == str(tmp_path / "runfiles")
+
+
 def test_every_acceptance_cell_enforces_metrics_roles_and_resources(
     provider: str,
     boundary: str,
