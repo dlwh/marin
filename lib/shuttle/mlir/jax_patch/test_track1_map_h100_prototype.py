@@ -428,7 +428,7 @@ def test_execute_rejects_bazel_or_hydration_failure_before_offline_build(
                         "print('AUTHORIZATION=Basic basic-secret'); "
                         'print(\'{"client_secret":"json-secret"}\'); '
                         "print('https://user:password@example.invalid/private'); "
-                        "print('final useful failure'); "
+                        "sys.stdout.write('z' * 70000 + ' final useful failure'); "
                         "sys.exit(23)"
                     ),
                 ],
