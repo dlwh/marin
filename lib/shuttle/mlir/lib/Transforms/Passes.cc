@@ -4788,16 +4788,28 @@ FailureOr<DerivedPlan> deriveFoldRegionPlan(RegionOp region) {
       return failure();
   }
   sourceSets.front().insert(primary);
+  SmallVector<SmallVector<Value>> publicOutputs(1);
   for (Value yielded : regionYield.getValues()) {
     llvm::SmallDenseSet<Operation *> branch;
     if (failed(collectSources(yielded, branch, true, collectSources)))
       return failure();
+    if (regionYield.getValues().size() == 1) {
+      sourceSets.front().insert(branch.begin(), branch.end());
+      publicOutputs.front().push_back(yielded);
+      continue;
+    }
+    if (llvm::none_of(branch,
+                      [](Operation *operation) {
+                        return isa<FoldOp>(operation);
+                      })) {
+      llvm::SmallDenseSet<Operation *> complete = sourceSets.front();
+      complete.insert(branch.begin(), branch.end());
+      sourceSets.push_back(std::move(complete));
+      publicOutputs.push_back({yielded});
+      continue;
+    }
     sourceSets.push_back(std::move(branch));
-  }
-  if (regionYield.getValues().size() == 1) {
-    sourceSets.front().insert(sourceSets.back().begin(),
-                              sourceSets.back().end());
-    sourceSets.pop_back();
+    publicOutputs.push_back({yielded});
   }
 
   llvm::SmallDenseSet<Operation *> covered;
@@ -4840,7 +4852,13 @@ FailureOr<DerivedPlan> deriveFoldRegionPlan(RegionOp region) {
       for (int64_t axis : reduction)
         cardinality *= input.getDimSize(axis);
       FoldOp previous = phases[phaseOrdinal - 1];
-      if (cardinality != 1 ||
+      auto previousInput =
+          cast<RankedTensorType>(previous.getInputs().front().getType());
+      const bool degenerateTransition = cardinality == 1;
+      const bool sameDomainTransition =
+          input == previousInput &&
+          fold.getReductionDimensions() == previous.getReductionDimensions();
+      if ((!degenerateTransition && !sameDomainTransition) ||
           fold.getResult(0).getType() != previous.getResult(0).getType() ||
           !valueDependsOnOperation(fold.getInputs().front(), previous))
         return failure();
@@ -4869,11 +4887,12 @@ FailureOr<DerivedPlan> deriveFoldRegionPlan(RegionOp region) {
     bufferForValue.try_emplace(primary.getResult(0), result.buffers.size());
     result.buffers.push_back({primary.getResult(0), int64_t{0}, {}, false});
   }
-  for (auto [outputOrdinal, yielded] :
-       llvm::enumerate(regionYield.getValues())) {
-    int64_t producer = sourceSets.size() == 1 ? 0 : outputOrdinal + 1;
-    bufferForValue.try_emplace(yielded, result.buffers.size());
-    result.buffers.push_back({yielded, producer, {}, true});
+  for (auto [taskOrdinal, outputs] : llvm::enumerate(publicOutputs)) {
+    for (Value output : outputs) {
+      bufferForValue.try_emplace(output, result.buffers.size());
+      result.buffers.push_back(
+          {output, static_cast<int64_t>(taskOrdinal), {}, true});
+    }
   }
 
   llvm::SmallDenseMap<Operation *, int64_t> sourceOccurrences;
@@ -4882,7 +4901,7 @@ FailureOr<DerivedPlan> deriveFoldRegionPlan(RegionOp region) {
       ++sourceOccurrences[operation];
   }
   if (llvm::any_of(sourceOccurrences, [](const auto &occurrence) {
-        return occurrence.second > 1 && !isa<MapOp>(occurrence.first);
+        return occurrence.second > 1 && !isa<MapOp, FoldOp>(occurrence.first);
       }))
     return failure();
   for (auto [taskOrdinal, sources] : llvm::enumerate(orderedSources)) {
@@ -4948,15 +4967,16 @@ FailureOr<DerivedPlan> deriveFoldRegionPlan(RegionOp region) {
     }
     if (task.foldRegionBoundaryUses.empty())
       return failure();
-    if (sourceSets.size() == 1) {
-      task.outputs.push_back(bufferForValue.lookup(regionYield.getValues()[0]));
-    } else if (taskOrdinal == 0) {
+    if (taskOrdinal == 0 && sourceSets.size() > 1)
       task.outputs.push_back(bufferForValue.lookup(primary.getResult(0)));
-    } else {
-      task.outputs.push_back(
-          bufferForValue.lookup(regionYield.getValues()[taskOrdinal - 1]));
-      task.dependencies.push_back(0);
+    for (Value output : publicOutputs[taskOrdinal])
+      task.outputs.push_back(bufferForValue.lookup(output));
+    for (int64_t input : task.inputs) {
+      if (std::optional<int64_t> producer = result.buffers[input].producer;
+          producer && !llvm::is_contained(task.dependencies, *producer))
+        task.dependencies.push_back(*producer);
     }
+    llvm::sort(task.dependencies);
     result.tasks.push_back(std::move(task));
   }
   for (auto [taskOrdinal, task] : llvm::enumerate(result.tasks)) {
@@ -5697,8 +5717,12 @@ public:
               "fold_region_boundary_uses", builder.getArrayAttr(boundaryUses)));
           if (!task.foldRegionRecomputedSources.empty()) {
             SmallVector<Attribute> recomputed;
-            for (Operation *operation : task.foldRegionRecomputedSources)
-              recomputed.push_back(cast<MapOp>(operation).getSource());
+            for (Operation *operation : task.foldRegionRecomputedSources) {
+              if (auto map = dyn_cast<MapOp>(operation))
+                recomputed.push_back(map.getSource());
+              else
+                recomputed.push_back(cast<FoldOp>(operation).getSource());
+            }
             attrs.push_back(
                 builder.getNamedAttr("fold_region_recomputed_sources",
                                      builder.getArrayAttr(recomputed)));
@@ -5886,10 +5910,10 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
               "fold_region_recomputed_sources")) {
         for (Attribute source : recomputed) {
           Operation *operation = sourceOperations.lookup(source);
-          if (!operation || !isa<MapOp>(operation) ||
+          if (!operation || !isa<MapOp, FoldOp>(operation) ||
               !llvm::is_contained(operations, operation)) {
             task.emitOpError(
-                "Fold-region recomputation must bind a task-local Map");
+                "Fold-region recomputation must bind task-local algebra");
             return failure();
           }
           ++recomputationDeclarations[operation];
@@ -6079,11 +6103,10 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
   if (sawFoldRegion) {
     for (auto [operation, occurrences] : foldRegionOccurrences) {
       const int64_t declarations = recomputationDeclarations.lookup(operation);
-      if ((occurrences > 1 &&
-           (!isa<MapOp>(operation) || declarations != occurrences)) ||
+      if ((occurrences > 1 && declarations != occurrences) ||
           (occurrences == 1 && declarations != 0)) {
         plan.emitOpError(
-            "Fold-region recomputation must exactly declare repeated Maps");
+            "Fold-region recomputation must exactly declare repeated sources");
         return failure();
       }
     }
@@ -6227,8 +6250,12 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
       auto actualRecomputed =
           actual->getAttrOfType<ArrayAttr>("fold_region_recomputed_sources");
       SmallVector<Attribute> expectedRecomputed;
-      for (Operation *operation : expectedTask.foldRegionRecomputedSources)
-        expectedRecomputed.push_back(cast<MapOp>(operation).getSource());
+      for (Operation *operation : expectedTask.foldRegionRecomputedSources) {
+        if (auto map = dyn_cast<MapOp>(operation))
+          expectedRecomputed.push_back(map.getSource());
+        else
+          expectedRecomputed.push_back(cast<FoldOp>(operation).getSource());
+      }
       bool matches =
           actualFoldRegionSources && actualPhases && actualBoundaryUses &&
           actualFoldRegionSources.getValue() ==
@@ -8012,8 +8039,113 @@ FailureOr<std::string> emitFoldRegionPtx(
   ptx.stream << "  ld.shared.f32 %f" << primaryValue << ", [%rd3];\n";
   context.foldValues[primary] = primaryValue;
 
-  for (FoldOp fold : ArrayRef<FoldOp>(phases).drop_front()) {
+  for (auto indexedFold :
+       llvm::enumerate(ArrayRef<FoldOp>(phases).drop_front())) {
+    const size_t phaseOrdinal = indexedFold.index();
+    FoldOp fold = indexedFold.value();
     auto input = cast<RankedTensorType>(fold.getInputs().front().getType());
+    int64_t cardinality = 1;
+    for (int64_t axis : fold.getReductionDimensions())
+      cardinality *= input.getDimSize(axis);
+    if (cardinality != 1) {
+      if (input != domain ||
+          fold.getReductionDimensions() != primary.getReductionDimensions())
+        return failure();
+      const int64_t phase = phaseOrdinal + 1;
+      int64_t phaseAccumulator = ptx.nextF32();
+      ptx.stream << "  bar.sync 0;\n  mul.lo.u32 %r4, %r0, "
+                 << task.getSerialTiles() << ";\n  add.u32 %r7, %r4, "
+                 << task.getSerialTiles() << ";\n  min.u32 %r7, %r7, "
+                 << *reductionExtent << ";\n  mov.f32 %f" << phaseAccumulator
+                 << ", 0f00000000;\n$fold_region_phase_" << phase
+                 << "_load:\n"
+                    "  setp.ge.u32 %p1, %r4, %r7;\n"
+                    "  @%p1 bra $fold_region_phase_"
+                 << phase
+                 << "_loaded;\n"
+                    "  cvt.u64.u32 %rd0, %r4;\n"
+                    "  cvt.u64.u32 %rd1, %r1;\n";
+      if (fullPrefix)
+        ptx.stream << "  mad.lo.u64 %rd0, %rd0, " << *outputExtent
+                   << ", %rd1;\n";
+      else
+        ptx.stream << "  mad.lo.u64 %rd0, %rd1, " << *reductionExtent
+                   << ", %rd0;\n";
+      FailureOr<SmallVector<int64_t>> phaseCoordinates =
+          emitOutputCoordinates(ptx, input);
+      if (failed(phaseCoordinates))
+        return failure();
+      FailureOr<int64_t> phaseLeaf = emitFoldRegionValue(
+          context, fold.getInputs().front(), *phaseCoordinates);
+      if (failed(phaseLeaf))
+        return failure();
+      int64_t phaseCombined = ptx.nextF32();
+      ptx.stream << "  add.rn.f32 %f" << phaseCombined << ", %f"
+                 << phaseAccumulator << ", %f" << *phaseLeaf
+                 << ";\n  mov.f32 %f" << phaseAccumulator << ", %f"
+                 << phaseCombined
+                 << ";\n  add.u32 %r4, %r4, 1;\n"
+                    "  bra $fold_region_phase_"
+                 << phase << "_load;\n$fold_region_phase_" << phase
+                 << "_loaded:\n"
+                    "  cvt.u64.u32 %rd2, %r0;\n"
+                    "  mul.lo.u64 %rd2, %rd2, 4;\n"
+                    "  add.u64 %rd2, %rd3, %rd2;\n"
+                    "  st.shared.f32 [%rd2], %f"
+                 << phaseAccumulator << ";\n  bar.sync 0;\n";
+      for (int64_t active = task.getWorkgroupThreads(); active > 1;
+           active = (active + 1) / 2) {
+        int64_t pairs = active / 2;
+        int64_t left = ptx.nextF32();
+        int64_t right = ptx.nextF32();
+        int64_t sum = ptx.nextF32();
+        ptx.stream << "  setp.ge.u32 %p2, %r0, " << pairs
+                   << ";\n  @%p2 bra $fold_region_phase_" << phase
+                   << "_skip_pair_read" << active
+                   << ";\n  mul.lo.u32 %r5, %r0, 2;\n"
+                      "  cvt.u64.u32 %rd4, %r5;\n"
+                      "  mul.lo.u64 %rd4, %rd4, 4;\n"
+                      "  add.u64 %rd4, %rd3, %rd4;\n"
+                      "  ld.shared.f32 %f"
+                   << left << ", [%rd4];\n  ld.shared.f32 %f" << right
+                   << ", [%rd4+4];\n  add.rn.f32 %f" << sum << ", %f" << left
+                   << ", %f" << right << ";\n$fold_region_phase_" << phase
+                   << "_skip_pair_read" << active << ":\n";
+        std::optional<int64_t> carry;
+        if (active % 2 != 0) {
+          carry = ptx.nextF32();
+          ptx.stream << "  setp.ne.u32 %p3, %r0, " << pairs
+                     << ";\n  @%p3 bra $fold_region_phase_" << phase
+                     << "_skip_carry_read" << active << ";\n  ld.shared.f32 %f"
+                     << *carry << ", [%rd3+"
+                     << (active - 1) * static_cast<int64_t>(sizeof(float))
+                     << "];\n$fold_region_phase_" << phase << "_skip_carry_read"
+                     << active << ":\n";
+        }
+        ptx.stream << "  bar.sync 0;\n"
+                      "  @%p2 bra $fold_region_phase_"
+                   << phase << "_skip_pair_write" << active
+                   << ";\n  cvt.u64.u32 %rd5, %r0;\n"
+                      "  mul.lo.u64 %rd5, %rd5, 4;\n"
+                      "  add.u64 %rd5, %rd3, %rd5;\n"
+                      "  st.shared.f32 [%rd5], %f"
+                   << sum << ";\n$fold_region_phase_" << phase
+                   << "_skip_pair_write" << active << ":\n";
+        if (carry) {
+          ptx.stream << "  @%p3 bra $fold_region_phase_" << phase
+                     << "_skip_carry_write" << active
+                     << ";\n  st.shared.f32 [%rd3+"
+                     << pairs * static_cast<int64_t>(sizeof(float)) << "], %f"
+                     << *carry << ";\n$fold_region_phase_" << phase
+                     << "_skip_carry_write" << active << ":\n";
+        }
+        ptx.stream << "  bar.sync 0;\n";
+      }
+      int64_t phaseValue = ptx.nextF32();
+      ptx.stream << "  ld.shared.f32 %f" << phaseValue << ", [%rd3];\n";
+      context.foldValues[fold] = phaseValue;
+      continue;
+    }
     ptx.stream << "  cvt.u64.u32 %rd0, %r1;\n";
     FailureOr<SmallVector<int64_t>> coordinates =
         emitOutputCoordinates(ptx, input);

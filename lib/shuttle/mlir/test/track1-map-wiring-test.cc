@@ -3,8 +3,11 @@
 
 #include <algorithm>
 #include <array>
+#include <fstream>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -18,6 +21,7 @@
 #include "shuttle/Transforms/Observer.h"
 #include "shuttle/Transforms/XlaRegistration.h"
 #include "stablehlo/dialect/Register.h"
+#include "tools/cpp/runfiles/runfiles.h"
 #include "xla/ffi/call_frame.h"
 #include "xla/ffi/execution_state.h"
 #include "xla/ffi/ffi.h"
@@ -25,6 +29,7 @@
 #include "xla/pjrt/stablehlo_module_transform.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/Twine.h"
 #include "llvm/Support/raw_ostream.h"
 #include "gtest/gtest.h"
 
@@ -45,6 +50,12 @@ constexpr llvm::StringLiteral kAbi22GpuFastOptions =
 constexpr std::array<llvm::StringLiteral, 4> kGpuPolicies = {
     kAbi21GpuSourceOrderedOptions, kAbi21GpuFastOptions,
     kAbi22GpuSourceOrderedOptions, kAbi22GpuFastOptions};
+constexpr llvm::StringLiteral kAbi22FoldRegionSourceOrderedOptions =
+    R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+constexpr llvm::StringLiteral kAbi22FoldRegionFastOptions =
+    R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+constexpr std::array<llvm::StringLiteral, 2> kAbi22FoldRegionPolicies = {
+    kAbi22FoldRegionSourceOrderedOptions, kAbi22FoldRegionFastOptions};
 
 // Emitted by JAX 0.10.1 from:
 // jax.jit(lambda x: jnp.abs((-x.astype(jnp.float32)).astype(jnp.bfloat16)))
@@ -173,6 +184,20 @@ std::string moduleText(mlir::ModuleOp module) {
   module.print(output);
   output.flush();
   return result;
+}
+
+std::optional<std::string> fixtureSource(llvm::StringRef filename) {
+  std::string error;
+  auto runfiles = bazel::tools::cpp::runfiles::Runfiles::CreateForTest(&error);
+  if (!runfiles)
+    return std::nullopt;
+  std::ifstream input(runfiles->Rlocation(
+      (llvm::Twine("shuttle_mlir/test/Inputs/") + filename).str()));
+  std::ostringstream source;
+  source << input.rdbuf();
+  if (!input)
+    return std::nullopt;
+  return source.str();
 }
 
 absl::Status runRegisteredShuttleTransform(mlir::ModuleOp module,
@@ -463,6 +488,104 @@ TEST(TrackOneMapWiringTest,
                        std::to_string(operation) + ", 0>")),
                   std::string::npos);
       }
+    }
+  }
+}
+
+TEST(TrackOneMapWiringTest,
+     BundlesAbi22RmsNormFoldRegionsThroughRegisteredFfi) {
+  struct Boundary {
+    const char *filename;
+    int64_t inputs;
+    int64_t outputs;
+    int64_t launches;
+    int64_t temporaries;
+  };
+  constexpr Boundary boundaries[] = {
+      {"jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-forward.mlir",
+       2, 1, 1, 0},
+      {"jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-backward.mlir",
+       3, 2, 3, 1},
+      {"jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-composed.mlir",
+       3, 3, 4, 1},
+      {"jax-0.10.1-bf16-projected_parameter_broadcast-"
+       "3x2x5x11x263-forward.mlir",
+       2, 1, 1, 0},
+      {"jax-0.10.1-bf16-projected_parameter_broadcast-"
+       "3x2x5x11x263-backward.mlir",
+       3, 2, 3, 1},
+      {"jax-0.10.1-bf16-projected_parameter_broadcast-"
+       "3x2x5x11x263-composed.mlir",
+       3, 3, 4, 1},
+  };
+  for (const Boundary &boundary : boundaries) {
+    SCOPED_TRACE(boundary.filename);
+    std::optional<std::string> source = fixtureSource(boundary.filename);
+    ASSERT_TRUE(source);
+    for (llvm::StringRef policy : kAbi22FoldRegionPolicies) {
+      SCOPED_TRACE(policy.str());
+      auto observer = std::make_shared<RecordingObserver>();
+      auto subscription =
+          mlir::shuttle::subscribeShuttlePipelineObserver(observer);
+      mlir::MLIRContext context;
+      mlir::OwningOpRef<mlir::ModuleOp> module =
+          parseModule(context, *source);
+      ASSERT_TRUE(module);
+      absl::Status status = runRegisteredShuttleTransform(*module, policy);
+      ASSERT_TRUE(status.ok()) << status;
+
+      llvm::SmallVector<mlir::Operation *> customCalls;
+      module->walk([&](mlir::Operation *operation) {
+        if (operation->getName().getStringRef() == "stablehlo.custom_call")
+          customCalls.push_back(operation);
+      });
+      ASSERT_EQ(customCalls.size(), 1);
+      mlir::Operation *customCall = customCalls.front();
+      EXPECT_EQ(customCall->getNumOperands(), boundary.inputs);
+      EXPECT_EQ(customCall->getNumResults(), boundary.outputs);
+      auto backendConfig =
+          customCall->getAttrOfType<mlir::DictionaryAttr>("backend_config");
+      ASSERT_TRUE(backendConfig);
+      expectFfiInstantiationAccepts(backendConfig);
+      auto bundleBytes =
+          backendConfig.getAs<mlir::StringAttr>("bundle_bytes");
+      ASSERT_TRUE(bundleBytes);
+      llvm::StringRef serialized = bundleBytes.getValue();
+      auto loaded = mlir::shuttle::GpuExecutable::Load(llvm::ArrayRef<uint8_t>(
+          reinterpret_cast<const uint8_t *>(serialized.data()),
+          serialized.size()));
+      ASSERT_TRUE(loaded.ok()) << loaded.status();
+      EXPECT_EQ((*loaded)->launches().size(), boundary.launches);
+      EXPECT_EQ((*loaded)->externalBindings().size(),
+                boundary.inputs + boundary.outputs);
+      EXPECT_EQ(std::count_if(
+                    (*loaded)->slots().begin(), (*loaded)->slots().end(),
+                    [](const auto &slot) {
+                      return slot.storage ==
+                             mlir::shuttle::MaterializationStorage::Temporary;
+                    }),
+                boundary.temporaries);
+
+      std::string transformed = moduleText(*module);
+      EXPECT_EQ(transformed.find("shuttle.region"), std::string::npos);
+      EXPECT_EQ(transformed.find("stablehlo.reduce"), std::string::npos);
+      auto events = observer->snapshot();
+      ASSERT_EQ(events.size(), 3);
+      EXPECT_EQ(events[0].phase(),
+                mlir::shuttle::ShuttlePipelinePhase::AlgebraCoverage);
+      EXPECT_EQ(events[1].phase(),
+                mlir::shuttle::ShuttlePipelinePhase::GeneratedBundle);
+      EXPECT_EQ(events[2].phase(),
+                mlir::shuttle::ShuttlePipelinePhase::FinalErasure);
+      EXPECT_GT(events[0].invocationId(), 0);
+      EXPECT_EQ(events[0].invocationId(), events[1].invocationId());
+      EXPECT_EQ(events[0].invocationId(), events[2].invocationId());
+      EXPECT_FALSE(events[0].regionMembership().empty());
+      EXPECT_EQ(events[0].regionMembership(), events[1].regionMembership());
+      EXPECT_FALSE(events[0].noShuttleSemantics());
+      EXPECT_FALSE(events[1].noShuttleSemantics());
+      EXPECT_TRUE(events[2].noShuttleSemantics());
+      EXPECT_TRUE(events[2].regionMembership().empty());
     }
   }
 }

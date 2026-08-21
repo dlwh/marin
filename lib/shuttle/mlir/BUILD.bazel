@@ -595,6 +595,14 @@ cc_test(
 cc_test(
     name = "track1_map_wiring_test",
     srcs = ["test/track1-map-wiring-test.cc"],
+    data = [
+        "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-backward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-composed.mlir",
+        "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-forward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-3x2x5x11x263-backward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-3x2x5x11x263-composed.mlir",
+        "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-3x2x5x11x263-forward.mlir",
+    ],
     deps = [
         ":ShuttleGpuExecutable",
         ":ShuttleGpuFfi",
@@ -607,6 +615,7 @@ cc_test(
         "@llvm-project//mlir:IR",
         "@llvm-project//mlir:Parser",
         "@stablehlo//:register",
+        "@bazel_tools//tools/cpp/runfiles",
         "@xla//xla/ffi",
         "@xla//xla/ffi:ffi_api",
         "@xla//xla/ffi:invoke",

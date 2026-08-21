@@ -1345,6 +1345,14 @@ void expectCounts(const PlanSummary &actual, const FixtureExpectation &expected,
       EXPECT_EQ(actual.tasks, 3);
       EXPECT_EQ(actual.buffers, 6);
       EXPECT_EQ(actual.foldTasks, 3);
+    } else if (expected.maps == 46 && expected.folds == 5) {
+      EXPECT_EQ(actual.tasks, 4);
+      EXPECT_EQ(actual.buffers, 7);
+      EXPECT_EQ(actual.foldTasks, 4);
+    } else if (expected.maps == 29 && expected.folds == 2) {
+      EXPECT_EQ(actual.tasks, 1);
+      EXPECT_EQ(actual.buffers, 4);
+      EXPECT_EQ(actual.foldTasks, 1);
     } else {
       ADD_FAILURE() << "unexpected fixture admitted as a Fold region";
     }
@@ -1440,6 +1448,37 @@ TEST(Abi22MapFusionContract,
       }
     }
   }
+}
+
+TEST(Abi22MapFusionContract, DependentRowFoldsShareOneGenericFoldRegion) {
+  std::optional<std::string> source =
+      fixtureSource("jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-forward.mlir");
+  ASSERT_TRUE(source);
+  std::unique_ptr<BuiltModule> built =
+      build(*source, mlir::shuttle::NumericalPolicy::SourceOrdered,
+            kFusionTuning, false, true);
+  ASSERT_TRUE(built);
+  std::optional<PlanSummary> plan = summary(*built->module);
+  ASSERT_TRUE(plan);
+
+  EXPECT_TRUE(plan->hasFoldRegion);
+  EXPECT_EQ(plan->tasks, 1);
+  EXPECT_EQ(plan->buffers, 4);
+  EXPECT_EQ(plan->foldTasks, 1);
+  EXPECT_EQ(plan->mapTasks, 0);
+  EXPECT_TRUE(plan->exactSourceCoverage);
+
+  auto device = *built->module->getOps<mlir::shuttle::DeviceModuleOp>().begin();
+  auto entries = llvm::to_vector(
+      device.getBody().front().getOps<mlir::shuttle::DeviceEntryOp>());
+  ASSERT_EQ(entries.size(), 1u);
+  ASSERT_TRUE(entries.front().getBlock());
+  EXPECT_EQ(*entries.front().getBlock(), llvm::ArrayRef<int64_t>({256, 1, 1}));
+  llvm::StringRef ptx(
+      reinterpret_cast<const char *>(device.getCode().data() +
+                                     entries.front().getCodeOffset()),
+      entries.front().getCodeLength());
+  EXPECT_EQ(ptx.count(", [%rd3];\n  bar.sync 0;\n"), 1u);
 }
 
 TEST(Abi22MapFusionContract,
@@ -1635,8 +1674,8 @@ TEST(Abi22MapFusionContract,
 
 TEST(Abi22MapFusionContract,
      RejectsCorruptOrderedProvenanceAndComposedInputMaps) {
-  std::optional<std::string> source = fixtureSource(kFixtures[2].filename);
-  std::optional<std::string> foldSource = fixtureSource(kFixtures[2].filename);
+  std::optional<std::string> source = fixtureSource(kFixtures[8].filename);
+  std::optional<std::string> foldSource = fixtureSource(kFixtures[8].filename);
   ASSERT_TRUE(source);
   ASSERT_TRUE(foldSource);
   constexpr llvm::StringLiteral mutations[] = {
@@ -2530,6 +2569,46 @@ TEST(Abi22MapFusionContract,
       EXPECT_EQ(plan.getFingerprint(), renamedPlan.getFingerprint());
     }
   }
+}
+
+TEST(Abi22MapFusionContract,
+     ComposedFoldRegionRequiresExactRepeatedFoldProvenance) {
+  std::optional<std::string> source = fixtureSource(kFixtures[2].filename);
+  ASSERT_TRUE(source);
+  std::unique_ptr<BuiltModule> built =
+      build(*source, mlir::shuttle::NumericalPolicy::SourceOrdered,
+            kFusionTuning, false, false);
+  ASSERT_TRUE(built);
+
+  llvm::SmallDenseSet<mlir::Attribute> foldSources;
+  built->module->walk([&](mlir::shuttle::FoldOp fold) {
+    foldSources.insert(fold.getSource());
+  });
+  auto plan =
+      *built->module->getOps<mlir::shuttle::MaterializationPlanOp>().begin();
+  bool removedRepeatedFold = false;
+  for (auto task : plan.getBody().front().getOps<
+           mlir::shuttle::MaterializationTaskOp>()) {
+    auto recomputed = task->getAttrOfType<mlir::ArrayAttr>(
+        "fold_region_recomputed_sources");
+    if (!recomputed)
+      continue;
+    auto repeatedFold = llvm::find_if(recomputed, [&](mlir::Attribute source) {
+      return foldSources.contains(source);
+    });
+    if (repeatedFold == recomputed.end())
+      continue;
+    llvm::SmallVector<mlir::Attribute> changed(recomputed.getValue());
+    changed.erase(changed.begin() + std::distance(recomputed.begin(),
+                                                 repeatedFold));
+    task->setAttr("fold_region_recomputed_sources",
+                  mlir::ArrayAttr::get(built->context.get(), changed));
+    removedRepeatedFold = true;
+    break;
+  }
+  ASSERT_TRUE(removedRepeatedFold);
+  plan.setFingerprint(mlir::shuttle::materializationPlanFingerprint(plan));
+  EXPECT_FALSE(verifyMaterializationPlan(*built->module));
 }
 
 TEST(Abi22MapFusionContract,
