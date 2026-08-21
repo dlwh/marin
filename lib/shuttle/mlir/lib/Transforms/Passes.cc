@@ -7602,7 +7602,8 @@ FailureOr<std::string> emitFoldMapPtx(
   }
   ptx.stream << "  cvt.u64.u32 %rd3, %r0;\n"
                 "  mul.lo.u64 %rd3, %rd3, 4;\n"
-                "  cvta.to.shared.u64 %rd4, shuttle_smem;\n"
+                "  mov.u64 %rd4, shuttle_smem;\n"
+                "  cvta.to.shared.u64 %rd4, %rd4;\n"
                 "  add.u64 %rd3, %rd4, %rd3;\n"
                 "  st.shared.f32 [%rd3], %f0;\n"
                 "  bar.sync 0;\n";
@@ -7959,7 +7960,8 @@ FailureOr<std::string> emitFoldRegionPtx(
 
   ptx.stream << "  cvt.u64.u32 %rd2, %r0;\n"
                 "  mul.lo.u64 %rd2, %rd2, 4;\n"
-                "  cvta.to.shared.u64 %rd3, shuttle_smem;\n"
+                "  mov.u64 %rd3, shuttle_smem;\n"
+                "  cvta.to.shared.u64 %rd3, %rd3;\n"
                 "  add.u64 %rd2, %rd3, %rd2;\n"
                 "  st.shared.f32 [%rd2], %f"
              << accumulator << ";\n  bar.sync 0;\n";
@@ -8207,7 +8209,8 @@ FailureOr<std::string> emitContractRegionPtx(
   ptx.stream << "  mov.u32 %r0, %tid.x;\n"
                 "  mov.u32 %r1, %ctaid.x;\n"
                 "  mov.u32 %r2, %ctaid.y;\n"
-                "  cvta.to.shared.u64 %rd3, shuttle_smem;\n";
+                "  mov.u64 %rd3, shuttle_smem;\n"
+                "  cvta.to.shared.u64 %rd3, %rd3;\n";
   if (inlineFold) {
     const int64_t paddedReduction = scheduleThreads(reduction);
     if (task.getScratchBytes() != paddedReduction * 4)
