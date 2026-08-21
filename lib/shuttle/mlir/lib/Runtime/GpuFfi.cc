@@ -29,6 +29,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLExtras.h"
 
 namespace mlir::shuttle {
 namespace {
@@ -70,9 +71,8 @@ absl::Status projectBindings(ArrayRef<GpuExternalBinding> bindings,
       projection = &results;
     else
       return invalid("GPU executable has an invalid external projection");
-    if (binding.index < 0 ||
-        static_cast<size_t>(binding.index) != projection->size())
-      return invalid("GPU executable external projection is not contiguous");
+    if (binding.index < 0)
+      return invalid("GPU executable external projection index is invalid");
     auto type = dyn_cast<RankedTensorType>(binding.tensorType);
     int64_t elements = 1;
     if (!type || !type.getElementType().isBF16() || !type.hasStaticShape() ||
@@ -90,6 +90,18 @@ absl::Status projectBindings(ArrayRef<GpuExternalBinding> bindings,
       return invalid("GPU executable external projection bytes are invalid");
     projection->push_back(binding);
   }
+  auto orderBindings = [](std::vector<GpuExternalBinding> &projection) {
+    llvm::sort(projection, [](const GpuExternalBinding &left,
+                              const GpuExternalBinding &right) {
+      return left.index < right.index;
+    });
+    for (auto [index, binding] : llvm::enumerate(projection))
+      if (binding.index != static_cast<int64_t>(index))
+        return false;
+    return true;
+  };
+  if (!orderBindings(operands) || !orderBindings(results))
+    return invalid("GPU executable external projection is not contiguous");
   if (operands.empty() || results.empty() ||
       bindings.size() > kMaximumGpuExecutableRecords)
     return invalid("GPU executable projection count is invalid");

@@ -4481,6 +4481,29 @@ TEST(Abi22MapFusionContract,
       }
       EXPECT_EQ(temporarySlots, 2);
       EXPECT_EQ(temporaryBytes, fixture.rows * 2 * 4);
+
+      mlir::PassManager replace(built->context.get());
+      replace.addPass(
+          mlir::shuttle::createReplaceWithGpuExecutableBundlePass());
+      ASSERT_TRUE(mlir::succeeded(replace.run(*built->module)));
+      llvm::SmallVector<mlir::Operation *> calls;
+      built->module->walk([&](mlir::Operation *operation) {
+        if (operation->getName().getStringRef() == "stablehlo.custom_call")
+          calls.push_back(operation);
+      });
+      ASSERT_EQ(calls.size(), 1u);
+      mlir::func::FuncOp function =
+          *built->module->getOps<mlir::func::FuncOp>().begin();
+      auto returnOp =
+          mlir::cast<mlir::func::ReturnOp>(function.getBody().front().back());
+      ASSERT_EQ(calls.front()->getNumResults(), returnOp.getNumOperands());
+      for (auto [publicResult, returned] :
+           llvm::enumerate(returnOp.getOperands())) {
+        auto result = mlir::dyn_cast<mlir::OpResult>(returned);
+        ASSERT_TRUE(result);
+        EXPECT_EQ(result.getOwner(), calls.front());
+        EXPECT_EQ(result.getResultNumber(), publicResult);
+      }
     }
   }
 }

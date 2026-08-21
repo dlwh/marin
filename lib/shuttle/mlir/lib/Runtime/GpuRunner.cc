@@ -58,11 +58,23 @@ projectExternalBindings(const GpuExecutable &executable) {
       bindings = &projection.results;
     else
       return invalid("GPU runner external binding kind is invalid");
-    if (binding.index < 0 ||
-        static_cast<size_t>(binding.index) != bindings->size())
-      return invalid("GPU runner external bindings are not contiguous");
+    if (binding.index < 0)
+      return invalid("GPU runner external binding index is invalid");
     bindings->push_back(binding);
   }
+  auto orderBindings = [](std::vector<GpuExternalBinding> &bindings) {
+    llvm::sort(bindings, [](const GpuExternalBinding &left,
+                            const GpuExternalBinding &right) {
+      return left.index < right.index;
+    });
+    for (auto [index, binding] : llvm::enumerate(bindings))
+      if (binding.index != static_cast<int64_t>(index))
+        return false;
+    return true;
+  };
+  if (!orderBindings(projection.operands) ||
+      !orderBindings(projection.results))
+    return invalid("GPU runner external bindings are not contiguous");
   if (projection.operands.empty() || projection.results.empty())
     return invalid("GPU runner requires operands and results");
   return projection;

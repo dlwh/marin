@@ -2084,8 +2084,8 @@ LogicalResult InvocationAbiOp::verifyRegions() {
   }
   int64_t ordinal = 0;
   llvm::SmallDenseSet<int64_t> aliasGroups;
-  int64_t operandBinding = 0;
-  int64_t resultBinding = 0;
+  llvm::SmallDenseSet<int64_t> operandBindings;
+  llvm::SmallDenseSet<int64_t> resultBindings;
   for (Operation &operation : body.front().without_terminator()) {
     auto slot = dyn_cast<InvocationSlotOp>(operation);
     if (!slot) {
@@ -2153,22 +2153,34 @@ LogicalResult InvocationAbiOp::verifyRegions() {
       return slot.emitOpError("temporary slots must be read-write");
     }
     ExecutableBindingKind expectedBinding = ExecutableBindingKind::None;
-    std::optional<int64_t> expectedIndex;
+    llvm::SmallDenseSet<int64_t> *bindingIndices = nullptr;
     if (slot.getStorage() == MaterializationStorage::External &&
         slot.getAccess() == ExecutableAccess::Read) {
       expectedBinding = ExecutableBindingKind::Operand;
-      expectedIndex = operandBinding++;
+      bindingIndices = &operandBindings;
     } else if (slot.getStorage() == MaterializationStorage::External &&
                slot.getAccess() == ExecutableAccess::Write) {
       expectedBinding = ExecutableBindingKind::Result;
-      expectedIndex = resultBinding++;
+      bindingIndices = &resultBindings;
     }
+    std::optional<int64_t> bindingIndex = slot.getBindingIndex();
     if (slot.getBinding() != expectedBinding ||
-        slot.getBindingIndex() != expectedIndex) {
+        ((expectedBinding == ExecutableBindingKind::None) != !bindingIndex) ||
+        (bindingIndex &&
+         (*bindingIndex < 0 || !bindingIndices->insert(*bindingIndex).second))) {
       return slot.emitOpError(
-          "binding kind and index must be the structural external ABI order");
+          "binding kind and index must uniquely identify the external ABI");
     }
   }
+  auto isContiguous = [](const llvm::SmallDenseSet<int64_t> &indices) {
+    for (int64_t index = 0; index < static_cast<int64_t>(indices.size());
+         ++index)
+      if (!indices.contains(index))
+        return false;
+    return true;
+  };
+  if (!isContiguous(operandBindings) || !isContiguous(resultBindings))
+    return emitOpError("external binding indices must be contiguous");
   if (ordinal == 0) {
     return emitOpError("requires at least one invocation slot");
   }

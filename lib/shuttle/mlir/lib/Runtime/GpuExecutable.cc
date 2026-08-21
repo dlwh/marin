@@ -500,8 +500,8 @@ absl::StatusOr<Parsed> parse(ArrayRef<uint8_t> bytes) {
       finalUse[slot] = std::max(finalUse[slot], launch.taskOrdinal);
     }
   }
-  int64_t operandIndex = 0;
-  int64_t resultIndex = 0;
+  llvm::SmallDenseSet<int64_t> operandIndices;
+  llvm::SmallDenseSet<int64_t> resultIndices;
   llvm::SmallDenseSet<int64_t> externalReuseGroups;
   for (const GpuSlot &slot : parsed.slots) {
     if (slot.storage == MaterializationStorage::Temporary) {
@@ -516,11 +516,14 @@ absl::StatusOr<Parsed> parse(ArrayRef<uint8_t> bytes) {
     if (!tensor || !tensor.getElementType().isBF16())
       return invalidTransport("external type");
     if (slot.bindingKind == ExecutableBindingKind::Operand) {
-      if (slot.bindingIndex != operandIndex++ || producer[slot.ordinal] != -1 ||
-          finalUse[slot.ordinal] < 0)
+      if (slot.bindingIndex < 0 ||
+          !operandIndices.insert(slot.bindingIndex).second ||
+          producer[slot.ordinal] != -1 || finalUse[slot.ordinal] < 0)
         return invalidTransport("operand projection");
     } else if (slot.bindingKind == ExecutableBindingKind::Result) {
-      if (slot.bindingIndex != resultIndex++ || producer[slot.ordinal] < 0 ||
+      if (slot.bindingIndex < 0 ||
+          !resultIndices.insert(slot.bindingIndex).second ||
+          producer[slot.ordinal] < 0 ||
           (firstUse[slot.ordinal] != -1 &&
            firstUse[slot.ordinal] <= producer[slot.ordinal]))
         return invalidTransport("result projection");
@@ -528,8 +531,16 @@ absl::StatusOr<Parsed> parse(ArrayRef<uint8_t> bytes) {
       return invalidTransport("external binding kind");
     }
   }
-  if (operandIndex == 0 || resultIndex == 0 ||
-      parsed.bindings.size() != static_cast<size_t>(operandIndex + resultIndex))
+  auto isContiguous = [](const llvm::SmallDenseSet<int64_t> &indices) {
+    for (int64_t index = 0; index < static_cast<int64_t>(indices.size());
+         ++index)
+      if (!indices.contains(index))
+        return false;
+    return true;
+  };
+  if (operandIndices.empty() || resultIndices.empty() ||
+      !isContiguous(operandIndices) || !isContiguous(resultIndices) ||
+      parsed.bindings.size() != operandIndices.size() + resultIndices.size())
     return invalidTransport("binding count");
   for (size_t left = 0; left < parsed.slots.size(); ++left) {
     const GpuSlot &first = parsed.slots[left];
@@ -560,6 +571,13 @@ absl::StatusOr<Parsed> parse(ArrayRef<uint8_t> bytes) {
       *bundleRoot != digest(bytes.take_front(bundleRootOffset)) ||
       !reader.done())
     return invalidTransport("bundle closure");
+  llvm::sort(parsed.bindings,
+             [](const GpuExternalBinding &left,
+                const GpuExternalBinding &right) {
+               if (left.kind != right.kind)
+                 return left.kind == ExecutableBindingKind::Operand;
+               return left.index < right.index;
+             });
   return parsed;
 }
 

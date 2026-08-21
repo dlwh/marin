@@ -48,6 +48,7 @@
 #include "xla/stream_executor/stream_executor_address_allocator.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/Twine.h"
@@ -57,6 +58,17 @@
 #include "gtest/gtest.h"
 
 namespace {
+
+std::vector<mlir::shuttle::GpuExternalBinding>
+externalBindingsBySlot(const mlir::shuttle::GpuExecutable &executable) {
+  std::vector<mlir::shuttle::GpuExternalBinding> bindings(
+      executable.externalBindings().begin(),
+      executable.externalBindings().end());
+  llvm::sort(bindings, [](const auto &left, const auto &right) {
+    return left.slotOrdinal < right.slotOrdinal;
+  });
+  return bindings;
+}
 
 class Reader {
 public:
@@ -685,8 +697,8 @@ decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes,
       finalUses[slot] = std::max(finalUses[slot], launch.taskOrdinal);
     }
   }
-  int64_t operandIndex = 0;
-  int64_t resultIndex = 0;
+  llvm::SmallDenseSet<int64_t> operandIndices;
+  llvm::SmallDenseSet<int64_t> resultIndices;
   for (int64_t ordinal = 0; ordinal < static_cast<int64_t>(slotCount);
        ++ordinal) {
     if (slotStorage[ordinal] == 1) {
@@ -696,11 +708,13 @@ decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes,
       continue;
     }
     if (slotBinding[ordinal] == 1) {
-      if (slotBindingIndex[ordinal] != operandIndex++ ||
+      if (slotBindingIndex[ordinal] < 0 ||
+          !operandIndices.insert(slotBindingIndex[ordinal]).second ||
           producers[ordinal] != -1 || finalUses[ordinal] < 0)
         return std::nullopt;
     } else if (slotBinding[ordinal] == 2) {
-      if (slotBindingIndex[ordinal] != resultIndex++ ||
+      if (slotBindingIndex[ordinal] < 0 ||
+          !resultIndices.insert(slotBindingIndex[ordinal]).second ||
           producers[ordinal] < 0 ||
           (firstUses[ordinal] != -1 &&
            firstUses[ordinal] <= producers[ordinal]))
@@ -709,7 +723,15 @@ decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes,
       return std::nullopt;
     }
   }
-  if (operandIndex == 0 || resultIndex == 0)
+  auto isContiguous = [](const llvm::SmallDenseSet<int64_t> &indices) {
+    for (int64_t index = 0; index < static_cast<int64_t>(indices.size());
+         ++index)
+      if (!indices.contains(index))
+        return false;
+    return true;
+  };
+  if (operandIndices.empty() || resultIndices.empty() ||
+      !isContiguous(operandIndices) || !isContiguous(resultIndices))
     return std::nullopt;
   for (int64_t left = 0; left < static_cast<int64_t>(slotCount); ++left) {
     if (slotStorage[left] != 1)
@@ -2235,8 +2257,12 @@ TEST(GpuTransportV2Test,
                             : mlir::shuttle::ExecutableBindingKind::Result);
         EXPECT_EQ(binding.index,
                   isOperand ? ordinal : ordinal - boundary.operandCount);
-        EXPECT_EQ(binding.requiredBytes, boundary.externalBytes[ordinal]);
       }
+      std::vector<mlir::shuttle::GpuExternalBinding> structuralBindings =
+          externalBindingsBySlot(**loaded);
+      for (auto [binding, expectedBytes] : llvm::zip_equal(
+               structuralBindings, boundary.externalBytes))
+        EXPECT_EQ(binding.requiredBytes, expectedBytes);
     }
 
     for (const Contract &contract : boundary.contracts) {
@@ -3093,8 +3119,10 @@ TEST(GpuTransportV2Test,
                                        shape.fullPublicBytes};
         ASSERT_EQ((*loaded)->externalBindings().size(),
                   expectedBindingBytes.size());
+        std::vector<mlir::shuttle::GpuExternalBinding> structuralBindings =
+            externalBindingsBySlot(**loaded);
         for (auto [binding, expectedBytes] : llvm::zip_equal(
-                 (*loaded)->externalBindings(), expectedBindingBytes))
+                 structuralBindings, expectedBindingBytes))
           EXPECT_EQ(binding.requiredBytes, expectedBytes);
 
         int64_t prefixFolds = 0;
@@ -3391,8 +3419,10 @@ TEST(GpuTransportV2Test,
     EXPECT_EQ(decoded->launches.size(), expectedLaunches[index]);
     EXPECT_EQ(decoded->slots, expectedSlots[index]);
     ASSERT_EQ((*loaded)->externalBindings().size(), expectedBindings[index]);
+    std::vector<mlir::shuttle::GpuExternalBinding> structuralBindings =
+        externalBindingsBySlot(**loaded);
     for (auto [binding, expectedBytes] :
-         llvm::zip_equal((*loaded)->externalBindings(),
+         llvm::zip_equal(structuralBindings,
                          llvm::ArrayRef<int64_t>(expectedBytes[index])
                              .take_front(expectedBindings[index]))) {
       EXPECT_EQ(binding.requiredBytes, expectedBytes);

@@ -7279,7 +7279,29 @@ struct GpuExecutableSpec {
   std::vector<GpuEntrySpec> entries;
   SmallVector<ExecutableSlotSpec> slots;
   SmallVector<int64_t> reuseGroups;
+  SmallVector<std::optional<int64_t>> bindingIndices;
 };
+
+SmallVector<int64_t> publicRegionResultBindings(RegionOp region) {
+  SmallVector<int64_t> bindings(region.getNumResults(), -1);
+  int64_t nextBinding = 0;
+  if (auto function = region->getParentOfType<func::FuncOp>()) {
+    if (auto returnOp =
+            dyn_cast<func::ReturnOp>(function.getBody().front().back())) {
+      for (Value value : returnOp.getOperands()) {
+        auto result = dyn_cast<OpResult>(value);
+        if (!result || result.getOwner() != region ||
+            bindings[result.getResultNumber()] >= 0)
+          continue;
+        bindings[result.getResultNumber()] = nextBinding++;
+      }
+    }
+  }
+  for (int64_t &binding : bindings)
+    if (binding < 0)
+      binding = nextBinding++;
+  return bindings;
+}
 
 FailureOr<int64_t> staticElementCount(RankedTensorType type) {
   int64_t elements = 1;
@@ -9071,6 +9093,38 @@ deriveGpuExecutable(RegionOp region, MaterializationPlanOp materialization,
   if (failed(reuseGroups))
     return failure();
   spec.reuseGroups = std::move(*reuseGroups);
+  auto manifest = region->getParentOfType<ModuleOp>()->getAttrOfType<DictionaryAttr>(
+      kCoverageManifestAttribute);
+  auto tuning = manifest ? manifest.getAs<StringAttr>("canonical_tuning")
+                         : StringAttr{};
+  FailureOr<DerivedPlan> derived =
+      deriveGpuPlan(region,
+                    tuning && tuning.getValue() == kFusionCanonicalTuning);
+  auto regionYield = cast<YieldOp>(region.getBody().front().getTerminator());
+  SmallVector<int64_t> resultBindings = publicRegionResultBindings(region);
+  if (failed(derived) || derived->buffers.size() != spec.slots.size())
+    return failure();
+  spec.bindingIndices.resize(spec.slots.size());
+  for (auto [ordinal, buffer, slot] :
+       llvm::enumerate(derived->buffers, spec.slots)) {
+    if (slot.storage != MaterializationStorage::External)
+      continue;
+    if (!buffer.producer) {
+      auto argument = dyn_cast<BlockArgument>(buffer.value);
+      if (!argument || argument.getOwner() != &region.getBody().front())
+        return failure();
+      spec.bindingIndices[ordinal] = argument.getArgNumber();
+      continue;
+    }
+    if (!buffer.liveOut)
+      return failure();
+    auto yielded = llvm::find(regionYield.getValues(), buffer.value);
+    if (yielded == regionYield.getValues().end())
+      return failure();
+    int64_t resultIndex =
+        std::distance(regionYield.getValues().begin(), yielded);
+    spec.bindingIndices[ordinal] = resultBindings[resultIndex];
+  }
   for (auto [ordinal, materializationTask, task] :
        llvm::enumerate(materializationTasks, tasks)) {
     Operation *operation =
@@ -9409,20 +9463,20 @@ public:
       auto abi = cast<InvocationAbiOp>(builder.create(abiState));
       abi.getBody().push_back(new Block());
       builder.setInsertionPointToEnd(&abi.getBody().front());
-      int64_t operandBinding = 0;
-      int64_t resultBinding = 0;
       for (auto [ordinal, slot] : llvm::enumerate(spec.slots)) {
         ExecutableBindingKind binding = ExecutableBindingKind::None;
         std::optional<int64_t> bindingIndex;
         if (slot.storage == MaterializationStorage::External &&
             slot.access == ExecutableAccess::Read) {
           binding = ExecutableBindingKind::Operand;
-          bindingIndex = operandBinding++;
+          bindingIndex = spec.bindingIndices[ordinal];
         } else if (slot.storage == MaterializationStorage::External &&
                    slot.access == ExecutableAccess::Write) {
           binding = ExecutableBindingKind::Result;
-          bindingIndex = resultBinding++;
+          bindingIndex = spec.bindingIndices[ordinal];
         }
+        if ((binding == ExecutableBindingKind::None) != !bindingIndex)
+          return signalPassFailure();
         SmallVector<NamedAttribute> attributes{
             builder.getNamedAttr("ordinal", builder.getI64IntegerAttr(ordinal)),
             builder.getNamedAttr("source_buffer",
@@ -9552,19 +9606,17 @@ LogicalResult verifyGpuExecutableUnit(ModuleOp module, RegionOp region,
         actual.getCodeDigest() != spec.codeDigest)
       return failure();
   }
-  int64_t operandBinding = 0;
-  int64_t resultBinding = 0;
   for (auto [ordinal, actual, spec] : llvm::enumerate(slots, expected->slots)) {
     ExecutableBindingKind binding = ExecutableBindingKind::None;
     std::optional<int64_t> bindingIndex;
     if (spec.storage == MaterializationStorage::External &&
         spec.access == ExecutableAccess::Read) {
       binding = ExecutableBindingKind::Operand;
-      bindingIndex = operandBinding++;
+      bindingIndex = expected->bindingIndices[ordinal];
     } else if (spec.storage == MaterializationStorage::External &&
                spec.access == ExecutableAccess::Write) {
       binding = ExecutableBindingKind::Result;
-      bindingIndex = resultBinding++;
+      bindingIndex = expected->bindingIndices[ordinal];
     }
     if (actual.getTensorType() != spec.tensorType ||
         actual.getRequiredBytes() != spec.requiredBytes ||
@@ -9685,7 +9737,9 @@ struct PreparedGpuCall {
   SmallVector<uint8_t> bundleBytes;
   std::string digest;
   SmallVector<Attribute> operandLayouts;
+  SmallVector<Type> resultTypes;
   SmallVector<Attribute> resultLayouts;
+  SmallVector<int64_t> regionResultBindings;
 };
 
 FailureOr<PreparedGpuCall> prepareGpuCall(ModuleOp module, RegionOp region,
@@ -9725,8 +9779,13 @@ FailureOr<PreparedGpuCall> prepareGpuCall(ModuleOp module, RegionOp region,
     if (!slot || slot.getTensorType() != region.getInputs()[index].getType())
       return failure();
   }
-  for (auto [index, slot] : llvm::enumerate(resultSlots)) {
-    if (!slot || slot.getTensorType() != region.getResults()[index].getType())
+  SmallVector<int64_t> regionResultBindings =
+      publicRegionResultBindings(region);
+  for (auto [regionIndex, bindingIndex] :
+       llvm::enumerate(regionResultBindings)) {
+    InvocationSlotOp slot = resultSlots[bindingIndex];
+    if (!slot ||
+        slot.getTensorType() != region.getResults()[regionIndex].getType())
       return failure();
   }
   OpBuilder builder(module.getContext());
@@ -9744,14 +9803,23 @@ FailureOr<PreparedGpuCall> prepareGpuCall(ModuleOp module, RegionOp region,
                            std::move(*bundleBytes),
                            {},
                            {},
+                           {},
+                           {},
                            {}};
   prepared.digest = gpuExecutableBundleDigest(prepared.bundleBytes);
   for (Value input : region.getInputs())
     prepared.operandLayouts.push_back(
         rowMajorLayout(cast<RankedTensorType>(input.getType())));
-  for (Value result : region.getResults())
-    prepared.resultLayouts.push_back(
-        rowMajorLayout(cast<RankedTensorType>(result.getType())));
+  prepared.resultTypes.resize(region.getNumResults());
+  prepared.resultLayouts.resize(region.getNumResults());
+  prepared.regionResultBindings = std::move(regionResultBindings);
+  for (auto [regionIndex, bindingIndex] :
+       llvm::enumerate(prepared.regionResultBindings)) {
+    Type type = region.getResults()[regionIndex].getType();
+    prepared.resultTypes[bindingIndex] = type;
+    prepared.resultLayouts[bindingIndex] =
+        rowMajorLayout(cast<RankedTensorType>(type));
+  }
   return prepared;
 }
 
@@ -9772,7 +9840,7 @@ public:
     SmallVector<InvocationAbiOp> abis(module.getOps<InvocationAbiOp>());
     SmallVector<ExecutableBundleOp> bundles(
         module.getOps<ExecutableBundleOp>());
-    SmallVector<PreparedGpuCall> preparedCalls;
+    SmallVector<PreparedGpuCall, 1> preparedCalls;
     uint64_t aggregateTransportBytes = 0;
     for (MaterializationPlanOp materialization : materializations) {
       RegionOp region;
@@ -9841,7 +9909,7 @@ public:
       builder.setInsertionPoint(region);
       OperationState callState(region.getLoc(), "stablehlo.custom_call");
       callState.addOperands(region.getInputs());
-      callState.addTypes(region.getResultTypes());
+      callState.addTypes(prepared.resultTypes);
       callState.addAttribute(
           "call_target_name",
           builder.getStringAttr(kGpuExecutableBundleFfiTarget));
@@ -9856,7 +9924,10 @@ public:
       callState.addAttribute("result_layouts",
                              builder.getArrayAttr(prepared.resultLayouts));
       Operation *call = builder.create(callState);
-      region.getResults().replaceAllUsesWith(call->getResults());
+      for (auto [regionIndex, bindingIndex] :
+           llvm::enumerate(prepared.regionResultBindings))
+        region.getResults()[regionIndex].replaceAllUsesWith(
+            call->getResult(bindingIndex));
       region.erase();
     }
     for (Operation &operation :
