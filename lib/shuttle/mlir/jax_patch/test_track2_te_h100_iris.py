@@ -144,11 +144,11 @@ def test_request_rejects_execution_scope_mutations(mutation: str) -> None:
     elif mutation == "gpu_variant":
         request.resources.device.gpu.variant = "B200"
     elif mutation == "cpu":
-        request.resources.cpu = 64
+        request.resources.cpu_millicores = 64_000
     elif mutation == "memory":
-        request.resources.memory = "256GB"
+        request.resources.memory_bytes = 256 * 1024**3
     elif mutation == "disk":
-        request.resources.disk = "1TB"
+        request.resources.disk_bytes = 1024**4
     elif mutation == "image":
         request.task_image = "ghcr.io/marin-community/iris-task-h100-evidence:latest"
     elif mutation == "bundle_init_image":
@@ -156,7 +156,7 @@ def test_request_rejects_execution_scope_mutations(mutation: str) -> None:
     elif mutation == "replicas":
         request.replicas = 2
     elif mutation == "timeout":
-        request.timeout.seconds += 1
+        request.timeout.milliseconds += 1_000
     elif mutation == "preemption":
         request.max_retries_preemption = 1
     elif mutation == "failure":
@@ -180,7 +180,7 @@ def test_request_rejects_execution_scope_mutations(mutation: str) -> None:
     elif mutation == "constraints":
         request.constraints.add().SetInParent()
     elif mutation == "scheduling_timeout":
-        request.scheduling_timeout.seconds = 1
+        request.scheduling_timeout.milliseconds = 1_000
     elif mutation == "coscheduling":
         request.coscheduling.SetInParent()
     elif mutation == "preemption_policy":
