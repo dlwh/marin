@@ -983,6 +983,7 @@ void expectCounts(const PlanSummary &actual, const FixtureExpectation &expected,
   EXPECT_EQ(actual.folds, expected.folds);
   EXPECT_EQ(actual.contracts, 0);
   if (actual.hasFoldRegion) {
+    EXPECT_TRUE(fused);
     if (expected.maps == 18 && expected.folds == 1) {
       EXPECT_EQ(actual.tasks, 1);
       EXPECT_EQ(actual.buffers, 3);
