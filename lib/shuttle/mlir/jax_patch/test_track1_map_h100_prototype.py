@@ -49,6 +49,25 @@ def _document() -> dict[str, object]:
         "permissions": {"build": True, "network_hydration": True, "run": True},
         "schema": "track1_map_h100_prototype_authorization",
         "schema_version": 1,
+        "subjects": {
+            "map": {
+                "boundaries": ["mixed_value_gradient"],
+                "modes": ["disabled", "source_ordered", "fast"],
+                "ranks": [2, 3],
+            },
+            "rmsnorm": {
+                "boundaries": ["forward", "backward", "composed"],
+                "bundle_shapes": {
+                    "backward": {"launches": 3, "temporaries": 1},
+                    "composed": {"launches": 4, "temporaries": 1},
+                    "forward": {"launches": 1, "temporaries": 0},
+                },
+                "disabled_jax_reference": True,
+                "host_oracle": "independent_float32_rmsnorm_vjp",
+                "modes": ["disabled", "source_ordered", "fast"],
+                "shapes": [[2, 7, 19], [3, 2, 5, 11, 263]],
+            },
+        },
         "sources": {
             "jax": {
                 "commit": JAX_COMMIT,
@@ -117,6 +136,7 @@ def _authorization(tmp_path: Path) -> tuple[Path, str, Authorization]:
         (("sources", "jax", "patch_sha256"), list(reversed(JAX_PATCH_SHA256))),
         (("sources", "xla", "commit"), "e" * 40),
         (("sources", "xla", "patch_sha256"), list(reversed(XLA_PATCH_SHA256))),
+        (("subjects", "rmsnorm", "host_oracle"), "disabled_jax_only"),
         (("toolchain", "bazel", "sha256"), "f" * 64),
         (("toolchain", "cuda", "build_distribution"), "local"),
         (("toolchain", "cuda", "build_version"), "13.2.0"),
