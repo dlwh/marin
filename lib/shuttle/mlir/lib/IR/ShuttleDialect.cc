@@ -1297,7 +1297,18 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
         const int64_t reductionAxis = domain.size() - 1;
         auto outputType = cast<RankedTensorType>(
             buffers[outputBuffers.back()].getTensorType());
-        if (domain.size() < 3 || domain.size() > 9 ||
+        int64_t domainRows = 1;
+        if (domain.size() >= 3) {
+          for (int64_t dimension : domain.drop_back(2)) {
+            if (dimension <= 0 ||
+                domainRows > std::numeric_limits<int64_t>::max() / dimension) {
+              domainRows = -1;
+              break;
+            }
+            domainRows *= dimension;
+          }
+        }
+        if (domain.size() < 3 || domain.size() > 9 || domainRows != rows ||
             task.getReductionDimensions() !=
                 ArrayRef<int64_t>({reductionAxis}) ||
             outputType.getShape() != domain.drop_back() ||
@@ -1309,10 +1320,11 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
           MaterializationBufferOp normalized = buffers[outputBuffers.front()];
           auto normalizedType =
               cast<RankedTensorType>(normalized.getTensorType());
+          SmallVector<int64_t> normalizedShape(domain.drop_back(2));
+          normalizedShape.push_back(reduction);
           if (normalized.getLiveOut() ||
               normalized.getStorage() != MaterializationStorage::Temporary ||
-              normalizedType.getShape() !=
-                  ArrayRef<int64_t>({rows, reduction}) ||
+              normalizedType.getShape() != ArrayRef<int64_t>(normalizedShape) ||
               !normalizedType.getElementType().isBF16()) {
             return task.emitOpError(
                 "Contract-region normalized output must be one private BF16 "

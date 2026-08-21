@@ -5762,7 +5762,7 @@ FailureOr<DerivedPlan> deriveHybridNormContractPlan(RegionOp region,
   SmallVector<int64_t> liveBufferMapping(hybrid.buffers.size(), -1);
   DerivedPlan live;
   live.hasContract = hybrid.hasContract;
-  live.hasRankNFold = hybrid.hasRankNFold;
+  live.hasRankNFold = false;
   live.hasContractRegion = hybrid.hasContractRegion;
   live.hasFoldRegion = hybrid.hasFoldRegion;
   for (auto [ordinal, buffer] : llvm::enumerate(hybrid.buffers)) {
@@ -5778,11 +5778,18 @@ FailureOr<DerivedPlan> deriveHybridNormContractPlan(RegionOp region,
         failed(remap(task.outputs, liveBufferMapping)))
       return failure();
     task.dependencies.clear();
+    if (task.kind == MaterializationTaskKind::Fold &&
+        task.foldRegionSources.empty() && task.domain.size() > 2)
+      live.hasRankNFold = true;
     live.tasks.push_back(std::move(task));
   }
   hybrid = std::move(live);
 
-  llvm::SmallDenseSet<Operation *> seenSources;
+  llvm::SmallDenseMap<Operation *, int64_t> sourceOccurrences;
+  for (PlannedTask &task : hybrid.tasks) {
+    for (Operation *operation : taskSources(task))
+      ++sourceOccurrences[operation];
+  }
   for (PlannedTask &task : hybrid.tasks) {
     const bool regionTask =
         !task.foldRegionSources.empty() || !task.contractRegionSources.empty();
@@ -5790,16 +5797,15 @@ FailureOr<DerivedPlan> deriveHybridNormContractPlan(RegionOp region,
     task.contractRegionRecomputedSources.clear();
     SmallVector<Operation *> sources = taskSources(task);
     for (Operation *operation : sources) {
-      if (!seenSources.contains(operation))
+      if (sourceOccurrences.lookup(operation) == 1 || !regionTask)
         continue;
-      if (!regionTask || !isa<MapOp, FoldOp>(operation))
+      if (!isa<MapOp, FoldOp>(operation))
         return failure();
       if (!task.foldRegionSources.empty())
         task.foldRegionRecomputedSources.push_back(operation);
       else
         task.contractRegionRecomputedSources.push_back(operation);
     }
-    seenSources.insert(sources.begin(), sources.end());
   }
 
   for (auto [ordinal, task] : llvm::enumerate(hybrid.tasks)) {
@@ -6457,9 +6463,8 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
     }
   }
   llvm::SmallDenseSet<Operation *> bound;
-  llvm::SmallDenseSet<Operation *> legacyBound;
-  llvm::SmallDenseMap<Operation *, int64_t> foldRegionOccurrences;
-  llvm::SmallDenseMap<Operation *, int64_t> legacyRecomputationOccurrences;
+  llvm::SmallDenseMap<Operation *, int64_t> sourceOccurrences;
+  llvm::SmallDenseMap<Operation *, int64_t> regionOccurrences;
   llvm::SmallDenseMap<Operation *, int64_t> recomputationDeclarations;
   bool sawFoldRegion = false;
   bool sawContractRegion = false;
@@ -6496,12 +6501,9 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
           return failure();
         }
         operations.push_back(found->second);
-        if (legacyBound.contains(found->second)) {
-          ++foldRegionOccurrences[found->second];
-          ++legacyRecomputationOccurrences[found->second];
-        }
         bound.insert(found->second);
-        ++foldRegionOccurrences[found->second];
+        ++sourceOccurrences[found->second];
+        ++regionOccurrences[found->second];
       }
       if (task.getSemanticFingerprint() !=
           contractRegionFingerprint(operations)) {
@@ -6563,12 +6565,9 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
           return failure();
         }
         operations.push_back(found->second);
-        if (legacyBound.contains(found->second)) {
-          ++foldRegionOccurrences[found->second];
-          ++legacyRecomputationOccurrences[found->second];
-        }
         bound.insert(found->second);
-        ++foldRegionOccurrences[found->second];
+        ++sourceOccurrences[found->second];
+        ++regionOccurrences[found->second];
       }
       if (task.getSemanticFingerprint() != foldRegionFingerprint(operations)) {
         task.emitOpError("does not fingerprint every Fold-region source");
@@ -6791,18 +6790,21 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
       task.emitOpError("domain does not match bound algebra indexing");
       return failure();
     }
-    legacyBound.insert(source);
-    legacyBound.insert(fusedOperations.begin(), fusedOperations.end());
+    if (fusedSources) {
+      for (Operation *operation : fusedOperations)
+        ++sourceOccurrences[operation];
+    } else {
+      ++sourceOccurrences[source];
+      for (Operation *operation : fusedOperations)
+        ++sourceOccurrences[operation];
+    }
   }
   if (sawFoldRegion || sawContractRegion) {
-    for (auto [operation, occurrences] : foldRegionOccurrences) {
+    for (auto [operation, occurrences] : regionOccurrences) {
       const int64_t declarations = recomputationDeclarations.lookup(operation);
       const int64_t expectedDeclarations =
-          occurrences > 1
-              ? occurrences - legacyRecomputationOccurrences.lookup(operation)
-              : 0;
-      if ((occurrences > 1 && declarations != expectedDeclarations) ||
-          (occurrences == 1 && declarations != 0)) {
+          sourceOccurrences.lookup(operation) > 1 ? occurrences : 0;
+      if (declarations != expectedDeclarations) {
         plan.emitOpError(
             "Fold-region recomputation must exactly declare repeated sources");
         return failure();
