@@ -314,15 +314,22 @@ bool hasDisjointContiguousFoldLoop(llvm::StringRef ptx,
           (llvm::Twine("add.u32 ") + start + ", " + start + ", 1;").str();
       const std::string backedge = (llvm::Twine("bra ") + loop + ";").str();
       const std::string exitLabel = (llvm::Twine(exit) + ":").str();
+      bool sawLeafLoad = false;
+      bool sawAccumulatorAdd = false;
       for (size_t line = loopLine + 3; line + 2 < lines.size(); ++line) {
         if (lines[line] == exitLabel ||
             lines[line].starts_with("bra ") ||
             lines[line].contains(" bra ") ||
+            lines[line] == "ret;" || lines[line].contains(" ret;") ||
+            lines[line].ends_with(":") ||
             defines(lines[line], end) ||
             (defines(lines[line], start) && lines[line] != increment))
           return false;
+        sawLeafLoad |= lines[line].starts_with("ld.global.");
+        sawAccumulatorAdd |= lines[line].starts_with("add.rn.f32 ");
         if (lines[line] == increment)
-          return lines[line + 1] == backedge &&
+          return sawLeafLoad && sawAccumulatorAdd &&
+                 lines[line + 1] == backedge &&
                  lines[line + 2] == exitLabel;
       }
       return false;
@@ -1715,6 +1722,7 @@ $load:
   setp.ge.u32 %p1, %r4, %r7;
   @%p1 bra $loaded;
   ld.global.f32 %f1, [%rd0];
+  add.rn.f32 %f2, %f0, %f1;
   add.u32 %r4, %r4, 1;
   bra $load;
 $loaded:
@@ -1729,6 +1737,7 @@ $again:
   setp.ge.u32 %p7, %r18, %r22;
   @%p7 bra $finished;
   ld.global.f32 %f12, [%rd6];
+  add.rn.f32 %f13, %f9, %f12;
   add.u32 %r18, %r18, 1;
   bra $again;
 $finished:
@@ -1758,6 +1767,12 @@ $finished:
                    "mov.u32 %r7, 0;\n$load:"),
            replace(correctFoldLoop, "ld.global.f32 %f1, [%rd0];",
                    "@%p2 mov.u32 %r7, 0;\n  ld.global.f32 %f1, [%rd0];"),
+           replace(correctFoldLoop, "ld.global.f32 %f1, [%rd0];",
+                   "ret;\n  ld.global.f32 %f1, [%rd0];"),
+           replace(correctFoldLoop, "ld.global.f32 %f1, [%rd0];",
+                   "nop;"),
+           replace(correctFoldLoop, "add.rn.f32 %f2, %f0, %f1;",
+                   "nop;"),
        })
     EXPECT_FALSE(hasDisjointContiguousFoldLoop(mutation, 330, 2));
 }
