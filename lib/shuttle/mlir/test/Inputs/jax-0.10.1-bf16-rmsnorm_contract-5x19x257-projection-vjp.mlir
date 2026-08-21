@@ -5,7 +5,7 @@
 // Evaluation oracle status: hardware_gate_pending
 // Hardware evidence: none
 // Generator: regenerate-jax-bf16-rmsnorm-contract-vjp-fixtures.py
-// Generator source SHA-256: 714D9165315130A99E299C243370383E55306BBBFCE3EB66784D9ABEA83FAA64
+// Generator source SHA-256: 1BE378B0CECB4BACD8698FF05938ED1430EEC4FC7B3F4035329C377ABF499355
 // Source: jax.jit(ordinary JAX BF16 RMSNorm-to-Contract projection-only VJP)
 //   .lower(...).compiler_ir(dialect="stablehlo")
 // Structural fields: {"activation":[5,19],"columns":257,"reduction":19,"rows":5}
