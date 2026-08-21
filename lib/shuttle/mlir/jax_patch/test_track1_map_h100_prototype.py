@@ -121,6 +121,7 @@ def _authorization(tmp_path: Path) -> tuple[Path, str, Authorization]:
         (("toolchain", "cuda", "offline_downloads"), True),
         (("toolchain", "cuda", "physical_tools_root"), "/usr/local/cuda"),
         (("toolchain", "python_package", "dependency_resolution"), True),
+        (("toolchain", "python_package", "distribution"), "jax-nightly"),
         (("toolchain", "python_package", "expected_base_version"), "0.10.0"),
         (("toolchain", "python_package", "install_method"), "registry-wheel"),
         (("toolchain", "python_package", "network"), True),
