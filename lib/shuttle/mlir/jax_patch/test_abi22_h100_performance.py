@@ -28,11 +28,11 @@ def _resources(case: str) -> dict[str, int]:
         "rmsnorm_backward": {
             "code_bytes": 4096,
             "launch_count": 3,
-            "slot_count": 9,
+            "slot_count": 6,
             "external_operand_count": 3,
             "external_result_count": 2,
-            "temporary_allocation_count": 4,
-            "temporary_bytes": 2240,
+            "temporary_allocation_count": 1,
+            "temporary_bytes": 56,
         },
         "rmsnorm_contract_inline": {
             "code_bytes": 2048,
