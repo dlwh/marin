@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <optional>
@@ -1210,6 +1211,117 @@ bool mutateFoldRegionTask(mlir::ModuleOp module, llvm::StringRef mutation) {
     return true;
   }
   return false;
+}
+
+bool mutateContractRegionTask(mlir::ModuleOp module,
+                              llvm::StringRef mutation) {
+  auto plan = *module.getOps<mlir::shuttle::MaterializationPlanOp>().begin();
+  mlir::shuttle::MaterializationTaskOp contractTask;
+  for (auto task : plan.getBody().front().getOps<
+           mlir::shuttle::MaterializationTaskOp>()) {
+    if (task->getAttr("contract_region_sources")) {
+      contractTask = task;
+      break;
+    }
+  }
+  if (!contractTask)
+    return false;
+  mlir::Builder builder(module.getContext());
+  if (mutation == "strategy") {
+    auto strategy = contractTask->getAttrOfType<mlir::StringAttr>(
+        "contract_region_strategy");
+    if (!strategy)
+      return false;
+    contractTask->setAttr(
+        "contract_region_strategy",
+        builder.getStringAttr(strategy.getValue() == "inline_fold"
+                                  ? "compact_stat"
+                                  : "inline_fold"));
+  } else if (mutation == "cost") {
+    auto cost = contractTask->getAttrOfType<mlir::DictionaryAttr>(
+        "contract_region_cost");
+    if (!cost)
+      return false;
+    llvm::SmallVector<mlir::NamedAttribute> fields(cost.begin(), cost.end());
+    auto rows = llvm::find_if(fields, [](mlir::NamedAttribute field) {
+      return field.getName() == "rows";
+    });
+    if (rows == fields.end())
+      return false;
+    int64_t value = mlir::cast<mlir::IntegerAttr>(rows->getValue()).getInt();
+    *rows = builder.getNamedAttr("rows", builder.getI64IntegerAttr(value + 1));
+    contractTask->setAttr("contract_region_cost",
+                          builder.getDictionaryAttr(fields));
+  } else if (mutation == "sources") {
+    auto sources = contractTask->getAttrOfType<mlir::ArrayAttr>(
+        "contract_region_sources");
+    if (!sources || sources.size() < 2)
+      return false;
+    contractTask->setAttr(
+        "contract_region_sources",
+        builder.getArrayAttr(sources.getValue().drop_back()));
+  } else if (mutation == "fold-source" || mutation == "contract-source" ||
+             mutation == "boundary-source") {
+    auto foldSource =
+        contractTask->getAttrOfType<mlir::shuttle::SourceRefAttr>(
+            "contract_region_fold_source");
+    auto contractSource =
+        contractTask->getAttrOfType<mlir::shuttle::SourceRefAttr>(
+            "contract_region_contract_source");
+    auto epilogue = contractTask->getAttrOfType<mlir::ArrayAttr>(
+        "contract_region_epilogue_sources");
+    if (!foldSource || !contractSource || !epilogue || epilogue.empty())
+      return false;
+    contractTask->setAttr(
+        mutation == "fold-source"
+            ? "contract_region_fold_source"
+            : mutation == "contract-source"
+                  ? "contract_region_contract_source"
+                  : "contract_region_bf16_boundary_source",
+        mutation == "fold-source" ? mlir::Attribute(contractSource)
+                                   : mutation == "contract-source"
+                                         ? mlir::Attribute(foldSource)
+                                         : epilogue.getValue().front());
+  } else if (mutation == "normalized-operand") {
+    contractTask->setAttr("contract_region_normalized_operand",
+                          builder.getI64IntegerAttr(1));
+  } else if (mutation == "epilogue") {
+    contractTask->setAttr("contract_region_epilogue_sources",
+                          builder.getArrayAttr({}));
+  } else if (mutation == "recomputation") {
+    auto recomputed = contractTask->getAttrOfType<mlir::ArrayAttr>(
+        "contract_region_recomputed_sources");
+    if (!recomputed || recomputed.empty())
+      return false;
+    contractTask->setAttr(
+        "contract_region_recomputed_sources",
+        builder.getArrayAttr(recomputed.getValue().drop_back()));
+  } else if (mutation == "buffers") {
+    llvm::SmallVector<int64_t> inputs(contractTask.getInputBuffers());
+    if (inputs.size() < 2)
+      return false;
+    std::swap(inputs[0], inputs[1]);
+    contractTask->setAttr("input_buffers",
+                          builder.getDenseI64ArrayAttr(inputs));
+  } else if (mutation == "ssa-edge") {
+    mlir::shuttle::MapOp replacement;
+    mlir::shuttle::MapOp target;
+    module.walk([&](mlir::shuttle::MapOp map) {
+      if (map.getSource().getOperationOrdinal() == 1)
+        replacement = map;
+      if (map.getSource().getOperationOrdinal() == 13)
+        target = map;
+    });
+    if (!replacement || !target || target.getInputs().empty() ||
+        replacement.getNumResults() != 1 ||
+        replacement.getResult(0).getType() != target.getInputs()[0].getType())
+      return false;
+    target->setOperand(0, replacement.getResult(0));
+  } else {
+    return false;
+  }
+  plan.setFingerprint(mlir::shuttle::materializationPlanFingerprint(plan));
+  return true;
 }
 
 bool verifyMaterializationPlan(mlir::ModuleOp module) {
@@ -2629,6 +2741,48 @@ int64_t materializationBytes(mlir::shuttle::MaterializationBufferOp buffer) {
   return -1;
 }
 
+bool hasSourceOrderedContractRecurrence(llvm::StringRef ptx,
+                                        int64_t reduction) {
+  llvm::SmallVector<llvm::StringRef> lines;
+  ptx.split(lines, '\n');
+  auto tokens = [](llvm::StringRef line) {
+    llvm::SmallVector<llvm::StringRef> result;
+    line.split(result, " ,;\t", -1, false);
+    return result;
+  };
+  auto loop = llvm::find(lines, "$contract_region_source_ordered_loop:");
+  if (loop == lines.end())
+    return false;
+  std::optional<llvm::StringRef> coordinate;
+  std::optional<llvm::StringRef> accumulator;
+  bool increment = false;
+  for (auto line = std::next(loop); line != lines.end(); ++line) {
+    llvm::SmallVector<llvm::StringRef> instruction = tokens(*line);
+    if (instruction.empty())
+      continue;
+    if (instruction.front() == "setp.ge.u64") {
+      int64_t bound = 0;
+      if (instruction.size() != 4 ||
+          instruction.back().getAsInteger(10, bound) || bound != reduction)
+        return false;
+      coordinate = instruction[2];
+    } else if (instruction.front() == "fma.rn.f32") {
+      if (!coordinate || instruction.size() != 5 ||
+          instruction[1] != instruction[4])
+        return false;
+      accumulator = instruction[1];
+    } else if (instruction.front() == "add.u64" && coordinate) {
+      if (instruction.size() == 4 && instruction[1] == *coordinate &&
+          instruction[2] == *coordinate && instruction[3] == "1")
+        increment = true;
+    } else if (instruction.front() == "bra" && instruction.size() == 2 &&
+               instruction[1] == "$contract_region_source_ordered_loop") {
+      return accumulator.has_value() && increment;
+    }
+  }
+  return false;
+}
+
 TEST(Abi22MapFusionContract,
      NormContractCandidatesBindCostTopologyTransportAndPolicy) {
   struct Boundary {
@@ -2639,6 +2793,9 @@ TEST(Abi22MapFusionContract,
   };
   constexpr Boundary boundaries[] = {
       {"jax-0.10.1-bf16-rmsnorm_contract-5x19x7-forward.mlir", 5, 19, 7},
+      {"jax-0.10.1-bf16-rmsnorm_contract-5x19x9-forward.mlir", 5, 19, 9},
+      {"jax-0.10.1-bf16-rmsnorm_contract-5x19x257-forward.mlir", 5, 19,
+       257},
       {"jax-0.10.1-bf16-rmsnorm_contract-3x2x5x11x263x521-forward.mlir",
        330, 263, 521},
   };
@@ -2816,9 +2973,11 @@ TEST(Abi22MapFusionContract,
         ASSERT_TRUE(entries.front().getBlock());
         EXPECT_EQ(*entries.front().getGrid(),
                   llvm::ArrayRef<int64_t>({boundary.rows, 1, 1}));
+        const int64_t foldThreads =
+            ((std::min<int64_t>(boundary.reduction, 256) + 31) / 32) * 32;
         EXPECT_EQ(*entries.front().getBlock(),
-                  llvm::ArrayRef<int64_t>({256, 1, 1}));
-        EXPECT_EQ(*entries.front().getDynamicSharedBytes(), 1024);
+                  llvm::ArrayRef<int64_t>({foldThreads, 1, 1}));
+        EXPECT_EQ(*entries.front().getDynamicSharedBytes(), foldThreads * 4);
       }
 
       llvm::StringRef contractPtx(
@@ -2828,10 +2987,16 @@ TEST(Abi22MapFusionContract,
       EXPECT_NE(contractPtx.find("cvt.rn.bf16.f32"), llvm::StringRef::npos);
       EXPECT_NE(contractPtx.find("cvt.f32.bf16"), llvm::StringRef::npos);
       EXPECT_NE(contractPtx.find("fma.rn.f32"), llvm::StringRef::npos);
-      EXPECT_NE(contractPtx.find(policy == mlir::shuttle::NumericalPolicy::Fast
-                                     ? "shfl.sync.down.b32"
-                                     : "add.u64"),
-                llvm::StringRef::npos);
+      if (policy == mlir::shuttle::NumericalPolicy::SourceOrdered) {
+        EXPECT_TRUE(
+            hasSourceOrderedContractRecurrence(contractPtx, boundary.reduction));
+        EXPECT_EQ(contractPtx.find("shfl.sync.down.b32"), llvm::StringRef::npos);
+      } else {
+        EXPECT_NE(contractPtx.find("shfl.sync.down.b32"),
+                  llvm::StringRef::npos);
+        EXPECT_EQ(contractPtx.find("$contract_region_source_ordered_loop:"),
+                  llvm::StringRef::npos);
+      }
       EXPECT_EQ(contractPtx.count("st.global.u16"), 1u);
 
       mlir::FailureOr<llvm::SmallVector<uint8_t>> transport =
@@ -2863,6 +3028,47 @@ TEST(Abi22MapFusionContract,
         EXPECT_NE(*sourceOrderedFingerprint, plan.getFingerprint());
       else
         sourceOrderedFingerprint = plan.getFingerprint().str();
+    }
+  }
+}
+
+TEST(Abi22MapFusionContract,
+     RejectsCorruptNormContractSchemaBuffersAndInternalSsaEdges) {
+  struct Mutation {
+    const char *name;
+    const char *filename;
+  };
+  constexpr Mutation mutations[] = {
+      {"strategy", "jax-0.10.1-bf16-rmsnorm_contract-5x19x7-forward.mlir"},
+      {"cost", "jax-0.10.1-bf16-rmsnorm_contract-5x19x7-forward.mlir"},
+      {"sources", "jax-0.10.1-bf16-rmsnorm_contract-5x19x7-forward.mlir"},
+      {"fold-source", "jax-0.10.1-bf16-rmsnorm_contract-5x19x7-forward.mlir"},
+      {"contract-source",
+       "jax-0.10.1-bf16-rmsnorm_contract-5x19x7-forward.mlir"},
+      {"boundary-source",
+       "jax-0.10.1-bf16-rmsnorm_contract-5x19x7-forward.mlir"},
+      {"normalized-operand",
+       "jax-0.10.1-bf16-rmsnorm_contract-5x19x7-forward.mlir"},
+      {"epilogue", "jax-0.10.1-bf16-rmsnorm_contract-5x19x7-forward.mlir"},
+      {"buffers", "jax-0.10.1-bf16-rmsnorm_contract-5x19x7-forward.mlir"},
+      {"ssa-edge", "jax-0.10.1-bf16-rmsnorm_contract-5x19x7-forward.mlir"},
+      {"recomputation",
+       "jax-0.10.1-bf16-rmsnorm_contract-5x19x257-forward.mlir"},
+  };
+  for (const Mutation &mutation : mutations) {
+    SCOPED_TRACE(mutation.name);
+    std::optional<std::string> source = fixtureSource(mutation.filename);
+    ASSERT_TRUE(source);
+    for (mlir::shuttle::NumericalPolicy policy :
+         {mlir::shuttle::NumericalPolicy::SourceOrdered,
+          mlir::shuttle::NumericalPolicy::Fast}) {
+      SCOPED_TRACE(policy == mlir::shuttle::NumericalPolicy::Fast ? "fast"
+                                                                  : "source");
+      std::unique_ptr<BuiltModule> built =
+          build(*source, policy, kFusionTuning, false, false);
+      ASSERT_TRUE(built);
+      ASSERT_TRUE(mutateContractRegionTask(*built->module, mutation.name));
+      EXPECT_FALSE(verifyMaterializationPlan(*built->module));
     }
   }
 }
@@ -2942,7 +3148,6 @@ TEST(Abi22MapFusionContract,
       "%16 = stablehlo.dot_general %14, %arg2, contracting_dims = [1] x [0], "
       "precision = [DEFAULT, DEFAULT] : (tensor<5x19xf32>, "
       "tensor<19x7xf32>) -> tensor<5x7xf32>");
-  mutations.push_back(std::move(noBf16Boundary));
 
   for (const std::string &mutation : mutations) {
     for (mlir::shuttle::NumericalPolicy policy :
@@ -2952,8 +3157,7 @@ TEST(Abi22MapFusionContract,
                                                                   : "source");
       std::unique_ptr<BuiltModule> built =
           build(mutation, policy, kFusionTuning, false, false);
-      if (!built)
-        continue;
+      ASSERT_TRUE(built);
       auto plan = *built->module->getOps<mlir::shuttle::MaterializationPlanOp>()
                        .begin();
       for (auto task : plan.getBody().front().getOps<
@@ -2961,6 +3165,10 @@ TEST(Abi22MapFusionContract,
         EXPECT_FALSE(task->getAttr("contract_region_sources"));
     }
   }
+  for (mlir::shuttle::NumericalPolicy policy :
+       {mlir::shuttle::NumericalPolicy::SourceOrdered,
+        mlir::shuttle::NumericalPolicy::Fast})
+    EXPECT_FALSE(build(noBf16Boundary, policy, kFusionTuning, false, false));
 }
 
 } // namespace

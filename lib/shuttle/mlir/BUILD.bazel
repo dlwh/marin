@@ -370,6 +370,7 @@ cc_test(
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-3x2x5x11x263-backward.mlir",
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-3x2x5x11x263-composed.mlir",
         "test/Inputs/jax-0.10.1-bf16-rmsnorm_contract-5x19x7-forward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-rmsnorm_contract-5x19x257-forward.mlir",
         "test/Inputs/jax-0.10.1-bf16-row_fold_scale_44d152ecc3e9ff18-forward.mlir",
     ],
     deps = [
@@ -451,7 +452,9 @@ cc_test(
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-3x2x5x11x263-composed.mlir",
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-3x2x5x11x263-forward.mlir",
         "test/Inputs/jax-0.10.1-bf16-rmsnorm_contract-3x2x5x11x263x521-forward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-rmsnorm_contract-5x19x257-forward.mlir",
         "test/Inputs/jax-0.10.1-bf16-rmsnorm_contract-5x19x7-forward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-rmsnorm_contract-5x19x9-forward.mlir",
     ],
     deps = [
         ":ShuttleDialect",
