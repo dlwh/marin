@@ -17,8 +17,10 @@ from abi22_te_rmsnorm_oracle_v2 import (
     ACCEPTANCE_PATTERN,
     BOUNDARIES,
     CALL_SEQUENCES,
+    ELIGIBLE_COUNTS,
     INPUT_DIGESTS,
     OUTPUT_ROLES,
+    QUALIFICATION_PATTERN,
     REFERENCE_DIGESTS,
     SHAPES,
 )
@@ -514,7 +516,12 @@ def _fake_oracle_invoke(paths: BatchPaths, calls: list[list[str]], argv: list[st
         }
         for role, result in zip(OUTPUT_ROLES[boundary], cell["outputs"], strict=True):
             digest = hashlib.sha256((case / f"reference_{role}.bf16").read_bytes()).hexdigest()
-            result.update(digest=digest, reference_digest=digest)
+            pattern = QUALIFICATION_PATTERN if case.name == f"{shape[0]}x{shape[1]}" else case.name
+            result.update(
+                digest=digest,
+                reference_digest=digest,
+                eligible_count=ELIGIBLE_COUNTS[pattern][role],
+            )
         output.write_text(json.dumps(cell, sort_keys=True))
     return 0
 
