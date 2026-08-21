@@ -153,6 +153,48 @@ across all three phases. It fails on the first transform at the old tip and
 covers the same multi-custom-call value-and-gradient fixture used by the H100
 subject without relaxing subject attribution.
 
+## r7 numerical failure
+
+r7 built the patched wheels, passed runtime preflight, and completed the
+disabled rank-2 coordinate. The rank-2 `SOURCE_ORDERED` coordinate then
+compiled and blocked on both the primal and analytic-gradient GPU results. Its
+three observer records passed the repaired positive-invocation and attribution
+checks, proving that the selected two-Map module reached enabled GPU execution.
+
+The next check failed with:
+
+```text
+RuntimeError: enabled output or gradient differs from disabled JAX
+```
+
+This check compared both results under one diagnostic. The retained log cannot
+identify whether the primal, gradient, or both differed, and it contains no
+element-level evidence. It therefore does not prove a compiler or runtime root
+cause. r8 keeps the exact-byte criterion and adds bounded, role-specific
+evidence before considering a semantic change.
+
+## r8 numerical evidence
+
+The subject now compares dtype, shape, and contiguous result bytes. A mismatch
+reports the result role, coordinate, dtype and shape, grouped SHA-256 identities,
+the number and first index of differing elements, exact element bits, finite
+values, and maximum absolute difference. The canonical one-line report is
+bounded below 1 KiB. Digest groups are reconstructable but short enough to
+avoid being mistaken for bearer-token-like build-log content by the prototype
+sanitizer.
+
+The exact static dataflow audit found no operand or result permutation to
+repair. The two regions are `[x] -> negate, convert` and
+`[abs(value), x] -> convert, convert, divide, convert`; region construction,
+Map scalar arguments, ABI binding indices, FFI projections, and launch
+parameters preserve those orders. PTX emits the numerator before the divisor,
+uses exact BF16-to-f32 loads and round-to-nearest-even BF16 stores, covers every
+element with a bounds check, and does not alias overlapping temporaries. The
+r7 evidence also does not establish a rank-2-specific defect: rank 2 is simply
+the first enabled coordinate. With no semantic root cause proven, r8 is a
+diagnostic-only canary.
+
 ## Future work
 
-- [ ] Record final wheel/DSO evidence from r7 or a later authorized H100 run.
+- [ ] Use r8 evidence to distinguish a primal, gradient, or shared Map dataflow
+      defect before changing lowering semantics.

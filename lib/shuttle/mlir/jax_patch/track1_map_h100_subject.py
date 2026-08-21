@@ -139,6 +139,82 @@ def _sha_array(value: np.ndarray) -> str:
     return digest.hexdigest()
 
 
+def _grouped_sha_array(value: np.ndarray) -> str:
+    digest = _sha_array(value)
+    return ":".join(digest[index : index + 8] for index in range(0, len(digest), 8))
+
+
+def _array_bytes_equal(actual: np.ndarray, expected: np.ndarray) -> bool:
+    return (
+        actual.dtype == expected.dtype
+        and actual.shape == expected.shape
+        and actual.tobytes(order="C") == expected.tobytes(order="C")
+    )
+
+
+def _finite_value(value: np.generic) -> float | str:
+    converted = float(value)
+    if np.isfinite(converted):
+        return converted
+    if np.isnan(converted):
+        return "nan"
+    return "positive_infinity" if converted > 0 else "negative_infinity"
+
+
+def _element_bits(value: np.ndarray, index: tuple[int, ...]) -> str:
+    raw = np.asarray(value[index]).tobytes(order="C")
+    return f"0x{int.from_bytes(raw, byteorder='little'):0{len(raw) * 2}x}"
+
+
+def _numerical_mismatch(
+    coordinate: Coordinate,
+    role: str,
+    actual: np.ndarray,
+    expected: np.ndarray,
+) -> RuntimeError:
+    if actual.dtype != expected.dtype or actual.shape != expected.shape:
+        evidence: dict[str, object] = {
+            "actual_dtype": str(actual.dtype),
+            "actual_sha256": _grouped_sha_array(actual),
+            "actual_shape": list(actual.shape),
+            "coordinate": coordinate.label,
+            "expected_dtype": str(expected.dtype),
+            "expected_sha256": _grouped_sha_array(expected),
+            "expected_shape": list(expected.shape),
+            "role": role,
+            "schema_version": 1,
+        }
+    else:
+        actual_bytes = np.ascontiguousarray(actual).view(np.uint8).reshape(actual.size, actual.dtype.itemsize)
+        expected_bytes = np.ascontiguousarray(expected).view(np.uint8).reshape(expected.size, expected.dtype.itemsize)
+        mismatches = np.any(actual_bytes != expected_bytes, axis=1)
+        flat_index = int(np.flatnonzero(mismatches)[0])
+        index = tuple(int(part) for part in np.unravel_index(flat_index, actual.shape))
+        maximum = np.max(np.abs(actual.astype(np.float64) - expected.astype(np.float64)))
+        evidence = {
+            "actual_bits": _element_bits(actual, index),
+            "actual_dtype": str(actual.dtype),
+            "actual_sha256": _grouped_sha_array(actual),
+            "actual_shape": list(actual.shape),
+            "actual_value": _finite_value(actual[index]),
+            "coordinate": coordinate.label,
+            "expected_bits": _element_bits(expected, index),
+            "expected_dtype": str(expected.dtype),
+            "expected_sha256": _grouped_sha_array(expected),
+            "expected_shape": list(expected.shape),
+            "expected_value": _finite_value(expected[index]),
+            "first_index": list(index),
+            "max_abs": _finite_value(maximum),
+            "mismatch_count": int(np.count_nonzero(mismatches)),
+            "role": role,
+            "schema_version": 1,
+        }
+    payload = json.dumps(evidence, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    if len(payload) >= 960:
+        raise RuntimeError("Track 1 numerical mismatch evidence exceeds its bound")
+    return RuntimeError(f"Track 1 numerical mismatch: {payload}")
+
+
 def _sha(value: object, name: str) -> str:
     if type(value) is not str or len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
         raise ValueError(f"observer {name} must be a lowercase SHA-256")
@@ -294,9 +370,9 @@ def run_matrix(
         if coordinate.mode is Mode.DISABLED:
             baselines[coordinate.rank] = arrays
         else:
-            for actual, expected in zip(arrays, baselines[coordinate.rank], strict=True):
-                if not np.array_equal(actual, expected):
-                    raise RuntimeError("enabled output or gradient differs from disabled JAX")
+            for role, actual, expected in zip(("primal", "gradient"), arrays, baselines[coordinate.rank], strict=True):
+                if not _array_bytes_equal(actual, expected):
+                    raise _numerical_mismatch(coordinate, role, actual, expected)
         after = cache_snapshot(cache_directory)
         if reuse:
             if after != before:
