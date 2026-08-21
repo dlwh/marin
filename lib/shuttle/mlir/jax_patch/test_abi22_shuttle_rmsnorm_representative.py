@@ -26,7 +26,7 @@ from abi22_shuttle_rmsnorm_representative import (
     validate_output_artifact,
     validate_shuttle_evidence,
 )
-from abi22_te_rmsnorm_oracle_v2 import error_metrics_v4
+from abi22_te_rmsnorm_oracle_v2 import error_metrics_v4, repeat_output_diagnostics_v4
 
 MLIR_ROOT = Path(__file__).resolve().parents[1]
 R12_ROOT = MLIR_ROOT / "artifacts/track2-te-rmsnorm-r12-success-20260821"
@@ -487,9 +487,40 @@ def test_executor_persists_raw_outputs_and_diagnostics_before_numerical_rejectio
     assert raw_path.is_file()
     assert diagnostics_path.is_file()
     raw = json.loads(raw_path.read_text())
+    diagnostics = json.loads(diagnostics_path.read_text())
     failed = raw["cells"][0]["outputs"][0]
     assert failed["max_absolute_error"] > EXPECTED_LIMITS["y"]["max_absolute_error_below_floor"]
     assert Path(failed["artifact"]["path"]).is_file()
+    expected_coordinates = []
+    cells = {(cell["policy"], cell["boundary"], cell["repeat"]): cell for cell in raw["cells"]}
+    for policy in POLICIES:
+        for boundary in BOUNDARIES:
+            for role_index, role in enumerate(RESULT_ROLES[boundary]):
+                repeat0 = cells[(policy, boundary, 0)]["outputs"][role_index]
+                repeat1 = cells[(policy, boundary, 1)]["outputs"][role_index]
+                shape = REPRESENTATIVE_SHAPE if role != "dgamma" else (REPRESENTATIVE_SHAPE[1],)
+                first = np.fromfile(repeat0["artifact"]["path"], dtype=np.uint16).view(ml_dtypes.bfloat16).reshape(shape)
+                second = (
+                    np.fromfile(repeat1["artifact"]["path"], dtype=np.uint16).view(ml_dtypes.bfloat16).reshape(shape)
+                )
+                expected_coordinates.append(
+                    {
+                        "policy": policy,
+                        "boundary": boundary,
+                        "role": role,
+                        "repeat0_artifact_sha256": repeat0["artifact"]["sha256"],
+                        "repeat1_artifact_sha256": repeat1["artifact"]["sha256"],
+                        **repeat_output_diagnostics_v4(first, second),
+                    }
+                )
+    assert diagnostics == {
+        "schema": "shuttle_abi22_rmsnorm_representative_repeat_diagnostics_v1",
+        "coordinates": expected_coordinates,
+    }
+    failed_repeat = diagnostics["coordinates"][0]
+    assert failed_repeat["mismatch_count"] > 0
+    assert failed_repeat["max_absolute_error"] > 0
+    assert failed_repeat["max_bfloat16_ulp"] > 0
 
 
 def test_execution_plan_is_exact_fresh_process_matrix(tmp_path: Path) -> None:
