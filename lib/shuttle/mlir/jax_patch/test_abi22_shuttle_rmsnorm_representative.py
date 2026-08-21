@@ -688,6 +688,16 @@ def test_execution_plan_is_exact_fresh_process_matrix(tmp_path: Path) -> None:
 
 def test_execution_plan_invokes_shell_wrapper_with_explicit_gpu_test(tmp_path: Path) -> None:
     runner = Path(__file__).parents[1] / "test" / "run-h100-shuttle-rmsnorm-representative.sh"
+    test_srcdir = tmp_path / "test-srcdir"
+    fixture = (
+        test_srcdir
+        / "shuttle_mlir"
+        / "test"
+        / "Inputs"
+        / "jax-0.10.1-bf16-projected_parameter_broadcast-2048x4096-forward.mlir"
+    )
+    fixture.parent.mkdir(parents=True)
+    fixture.write_text("module {}\n")
     gpu_transport_test = tmp_path / "gpu_transport_v2_test"
     capture = tmp_path / "capture.txt"
     gpu_transport_test.write_text(
@@ -705,6 +715,7 @@ def test_execution_plan_invokes_shell_wrapper_with_explicit_gpu_test(tmp_path: P
 
     environment = dict(os.environ)
     environment["CAPTURE"] = str(capture)
+    environment["TEST_SRCDIR"] = str(test_srcdir)
     result = subprocess.run(plan["runs"][0]["argv"], env=environment, check=False, capture_output=True, text=True)
 
     assert result.returncode == 0, result.stderr
@@ -755,7 +766,7 @@ def test_shell_wrapper_bridges_bazel_runfiles_directory_for_fixture_lookup(tmp_p
     result = subprocess.run(plan["runs"][0]["argv"], env=environment, check=False, capture_output=True, text=True)
 
     assert result.returncode == 0, result.stderr
-    assert capture.read_text().strip() == str(tmp_path / "runfiles")
+    assert capture.read_text().strip() == str((tmp_path / "runfiles").resolve())
 
 
 def test_shell_wrapper_derives_runfiles_root_when_bazel_omits_environment(tmp_path: Path) -> None:
@@ -804,7 +815,7 @@ def test_shell_wrapper_derives_runfiles_root_when_bazel_omits_environment(tmp_pa
     )
 
     assert result.returncode == 0, result.stderr
-    assert capture.read_text().strip() == str(runfiles_root)
+    assert capture.read_text().strip() == str(runfiles_root.resolve())
 
 
 def test_shell_wrapper_rejects_missing_or_ambiguous_derived_runfiles_root(tmp_path: Path) -> None:
