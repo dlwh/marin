@@ -14,6 +14,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+from google.protobuf.message import DecodeError
 from iris.cluster.bundle import MAX_BUNDLE_SIZE_BYTES, content_id
 from iris.cluster.runtime.entrypoint import build_runtime_entrypoint
 from iris.cluster.types import Entrypoint, JobName, ResourceSpec, gpu_device
@@ -38,6 +39,7 @@ RUNNER_REPOSITORY = Path("/app")
 PYTHON = Path("/opt/h100-evidence-runtime/bin/python")
 CUDA_ROOT = Path("/usr/local/cuda-13.2")
 TIMEOUT = Duration.from_hours(4)
+CLIENT_REVISION_DATE = client_revision_date()
 FILE_MODE = 0o644
 ZIP_DATE = (1980, 1, 1, 0, 0, 0)
 SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -90,20 +92,24 @@ def _bundle_members(
     return members
 
 
-def _exact_bundle(
-    bundle_root: Path,
-    authorization_path: Path,
-    authorization: Authorization,
-) -> bytes:
+def _zip_bytes(members: list[tuple[str, bytes]]) -> bytes:
     stream = io.BytesIO()
     with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_STORED) as archive:
-        for name, payload in _bundle_members(bundle_root, authorization_path, authorization):
+        for name, payload in sorted(members):
             info = zipfile.ZipInfo(name, date_time=ZIP_DATE)
             info.create_system = 3
             info.compress_type = zipfile.ZIP_STORED
             info.external_attr = (stat.S_IFREG | FILE_MODE) << 16
             archive.writestr(info, payload)
-    blob = stream.getvalue()
+    return stream.getvalue()
+
+
+def _exact_bundle(
+    bundle_root: Path,
+    authorization_path: Path,
+    authorization: Authorization,
+) -> bytes:
+    blob = _zip_bytes(_bundle_members(bundle_root, authorization_path, authorization))
     if len(blob) > MAX_BUNDLE_SIZE_BYTES:
         raise RuntimeError("exact Iris bundle exceeds the controller size limit")
     return blob
@@ -144,7 +150,7 @@ def build_launch_request(
         existing_job_policy=job_pb2.EXISTING_JOB_POLICY_ERROR,
         priority_band=job_pb2.PRIORITY_BAND_BATCH,
         task_image=BASE_IMAGE,
-        client_revision_date=client_revision_date(),
+        client_revision_date=CLIENT_REVISION_DATE,
     )
     request.timeout.CopyFrom(duration_to_proto(TIMEOUT))
     request.exact_bundle_upload.bundle_id = content_id(blob)
@@ -223,6 +229,8 @@ def _validated_bundle(blob: bytes, approved_authorization_sha256: str) -> str:
         expected_paths.add(path)
     if set(payloads) != expected_paths:
         raise ValueError("LaunchJobRequest bundle contains an unauthorized member")
+    if blob != _zip_bytes(list(payloads.items())):
+        raise ValueError("LaunchJobRequest bundle ZIP bytes are not canonical")
     return hashlib.sha256(blob).hexdigest()
 
 
@@ -276,8 +284,8 @@ def validate_launch_request(
         or request.HasField("federation")
     ):
         raise ValueError("LaunchJobRequest contains an unauthorized launch option")
-    if re.fullmatch(r"20[0-9]{2}-[0-9]{2}-[0-9]{2}", request.client_revision_date) is None:
-        raise ValueError("LaunchJobRequest client revision date is invalid")
+    if request.client_revision_date != CLIENT_REVISION_DATE:
+        raise ValueError("LaunchJobRequest client revision date differs")
     if not request.HasField("exact_bundle_upload"):
         raise ValueError("LaunchJobRequest exact bundle is missing")
     _require_no_unknown_fields(request.exact_bundle_upload, "exact bundle")
@@ -295,7 +303,7 @@ def decode_launch_request(
     request = controller_pb2.Controller.LaunchJobRequest()
     try:
         request.ParseFromString(raw)
-    except ValueError as error:
+    except DecodeError as error:
         raise ValueError("LaunchJobRequest protobuf is malformed") from error
     if request.SerializeToString(deterministic=True) != raw:
         raise ValueError("LaunchJobRequest protobuf is not canonical")

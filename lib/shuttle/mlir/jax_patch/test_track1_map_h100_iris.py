@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from iris.rpc import controller_pb2, job_pb2
 from track1_map_h100_iris import (
+    CLIENT_REVISION_DATE,
     JOB_NAME,
     build_launch_request,
     decode_launch_request,
@@ -72,6 +73,7 @@ def test_dry_run_emits_and_decodes_the_real_fail_closed_launch_request(
     assert summary["job_name"] == JOB_NAME
 
     assert request.name == JOB_NAME
+    assert request.client_revision_date == CLIENT_REVISION_DATE
     assert request.task_image == BASE_IMAGE
     assert request.bundle_init_image == ""
     assert request.resources.cpu_millicores == 32_000
@@ -117,6 +119,8 @@ def test_request_bytes_are_deterministic_and_output_is_create_only(tmp_path: Pat
     first = _request().SerializeToString(deterministic=True)
     second = _request().SerializeToString(deterministic=True)
     assert first == second
+    with pytest.raises(ValueError, match="protobuf is malformed"):
+        decode_launch_request(b"\xff", approved_authorization_sha256=approved)
 
     output = tmp_path / "launch.pb"
     output.write_bytes(b"do not replace")
@@ -150,6 +154,8 @@ def test_default_is_unsealed_before_bundle_or_request_output(tmp_path: Path) -> 
         "authorization",
         "bundle_hash",
         "bundle_image",
+        "bundle_zip",
+        "client_revision",
         "cpu",
         "disk",
         "environment",
@@ -177,6 +183,14 @@ def test_decoded_request_rejects_every_launch_scope_mutation(mutation: str) -> N
         changed.exact_bundle_upload.bundle_id = "f" * 64
     elif mutation == "bundle_image":
         changed.bundle_init_image = BASE_IMAGE
+    elif mutation == "bundle_zip":
+        stream = io.BytesIO(changed.exact_bundle_upload.blob)
+        with zipfile.ZipFile(stream, "a") as archive:
+            archive.comment = b"alternate ZIP bytes"
+        changed.exact_bundle_upload.blob = stream.getvalue()
+        changed.exact_bundle_upload.bundle_id = hashlib.sha256(stream.getvalue()).hexdigest()
+    elif mutation == "client_revision":
+        changed.client_revision_date = "2099-12-31"
     elif mutation == "cpu":
         changed.resources.cpu_millicores = 31_000
     elif mutation == "disk":
