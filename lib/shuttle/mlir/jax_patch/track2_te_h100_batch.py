@@ -56,12 +56,14 @@ CUDA_ROOT = Path("/usr/local/cuda-13.2")
 NVIDIA_SITE_PACKAGES = RUNTIME_SITE_PACKAGES / "nvidia"
 NVIDIA_CU13_ROOT = NVIDIA_SITE_PACKAGES / "cu13"
 NVIDIA_CU13_LIB = NVIDIA_CU13_ROOT / "lib"
+NVIDIA_CUDNN_ROOT = NVIDIA_SITE_PACKAGES / "cudnn"
+NVIDIA_NCCL_ROOT = NVIDIA_SITE_PACKAGES / "nccl"
 NVTE_CUDA_INCLUDE_DIR = NVIDIA_CU13_ROOT / "include"
 RUNTIME_LIBRARY_PATHS = {
     "cublas": NVIDIA_CU13_LIB / "libcublas.so.13",
     "cublas_lt": NVIDIA_CU13_LIB / "libcublasLt.so.13",
-    "cudnn": NVIDIA_CU13_LIB / "libcudnn.so.9",
-    "nccl": NVIDIA_CU13_LIB / "libnccl.so.2",
+    "cudnn": NVIDIA_CUDNN_ROOT / "lib/libcudnn.so.9",
+    "nccl": NVIDIA_NCCL_ROOT / "lib/libnccl.so.2",
     "cudart": NVIDIA_CU13_LIB / "libcudart.so.13",
     "nvrtc": NVIDIA_CU13_LIB / "libnvrtc.so.13",
 }
@@ -452,7 +454,7 @@ def _execute_hydration(paths: BatchPaths, plan: dict[str, Any]) -> dict[str, Any
     cuda_runtime_headers = _validated_cuda_include(NVTE_CUDA_INCLUDE_DIR, approved_root=NVIDIA_CU13_ROOT)
     runtime_libraries = _validated_runtime_libraries(
         RUNTIME_LIBRARY_PATHS,
-        approved_roots=(NVIDIA_CU13_ROOT,),
+        approved_roots=(NVIDIA_CU13_ROOT, NVIDIA_CUDNN_ROOT, NVIDIA_NCCL_ROOT),
         soname_reader=_elf_soname,
     )
     _run(phases[7]["argv"], cwd=None, log=paths.logs / "te_runner_build.log", phase="te_runner_build")
