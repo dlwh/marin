@@ -380,7 +380,7 @@ def execution_plan(
     runs = []
     for shape in SHAPES:
         rows, features = shape
-        scope = "architecture_fixture" if shape == ARCHITECTURE_SHAPE else "representative_acceptance"
+        scope = "architecture_fixture" if shape == ARCHITECTURE_SHAPE else "representative_performance_qualification"
         for boundary in BOUNDARIES:
             for producer in PRODUCERS:
                 prefix = [te_runner] if producer == "transformer_engine_2_17" else [python, xla_runner]
@@ -727,7 +727,7 @@ def load_te_raw_cell(
         raise ValueError("raw TE workspace metadata drifted")
     return {
         "shape": list(shape),
-        "scope": "architecture_fixture" if shape == ARCHITECTURE_SHAPE else "representative_acceptance",
+        "scope": "architecture_fixture" if shape == ARCHITECTURE_SHAPE else "representative_performance_qualification",
         "boundary": boundary,
         "input_digests": (
             _expected_inputs(shape, boundary)
@@ -887,7 +887,7 @@ def validate_report(
             raise ValueError("cell matrix contains a non-object")
         if tuple(cell.get("shape", ())) != shape or cell.get("boundary") != boundary:
             raise ValueError("cell matrix coordinate drifted")
-        scope = "architecture_fixture" if shape == ARCHITECTURE_SHAPE else "representative_acceptance"
+        scope = "architecture_fixture" if shape == ARCHITECTURE_SHAPE else "representative_performance_qualification"
         if cell.get("scope") != scope:
             raise ValueError("cell scope drifted")
         if cell.get("input_digests") != _expected_inputs(shape, boundary):
@@ -1126,6 +1126,7 @@ def build_matched_acceptance(
         "performance": {
             "status": "reported_without_threshold",
             "clock": "host_blocking_ns",
+            "input_pattern": QUALIFICATION_PATTERN,
             "median_ratio_te_over_xla": ratios,
         },
         "norm_contract": {"status": "unavailable", "blocker": NORM_CONTRACT_BLOCKER},

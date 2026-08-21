@@ -139,7 +139,7 @@ def run_cell(boundary: str, shape: tuple[int, int], case_directory: Path) -> dic
         )
     return {
         "shape": list(shape),
-        "scope": "architecture_fixture" if shape == SHAPES[0] else "representative_acceptance",
+        "scope": "architecture_fixture" if shape == SHAPES[0] else "representative_performance_qualification",
         "boundary": boundary,
         "input_digests": input_digests,
         "execution": {
