@@ -144,7 +144,6 @@ def build_launch_request(
         existing_job_policy=job_pb2.EXISTING_JOB_POLICY_ERROR,
         priority_band=job_pb2.PRIORITY_BAND_BATCH,
         task_image=BASE_IMAGE,
-        bundle_init_image=BASE_IMAGE,
         client_revision_date=client_revision_date(),
     )
     request.timeout.CopyFrom(duration_to_proto(TIMEOUT))
@@ -238,8 +237,8 @@ def validate_launch_request(
     _require_no_unknown_fields(request, "root")
     if request.name != JOB_NAME:
         raise ValueError("LaunchJobRequest job name differs")
-    if request.task_image != BASE_IMAGE or request.bundle_init_image != BASE_IMAGE:
-        raise ValueError("LaunchJobRequest image differs")
+    if request.task_image != BASE_IMAGE or request.bundle_init_image:
+        raise ValueError("LaunchJobRequest task or staging image differs")
     expected_resources = ResourceSpec(
         cpu=32,
         memory="128GB",

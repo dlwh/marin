@@ -73,7 +73,7 @@ def test_dry_run_emits_and_decodes_the_real_fail_closed_launch_request(
 
     assert request.name == JOB_NAME
     assert request.task_image == BASE_IMAGE
-    assert request.bundle_init_image == BASE_IMAGE
+    assert request.bundle_init_image == ""
     assert request.resources.cpu_millicores == 32_000
     assert request.resources.memory_bytes == 128 * 1024**3
     assert request.resources.disk_bytes == 500 * 1024**3
@@ -149,6 +149,7 @@ def test_default_is_unsealed_before_bundle_or_request_output(tmp_path: Path) -> 
     [
         "authorization",
         "bundle_hash",
+        "bundle_image",
         "cpu",
         "disk",
         "environment",
@@ -174,6 +175,8 @@ def test_decoded_request_rejects_every_launch_scope_mutation(mutation: str) -> N
         command[list(command).index(approved)] = "f" * 64
     elif mutation == "bundle_hash":
         changed.exact_bundle_upload.bundle_id = "f" * 64
+    elif mutation == "bundle_image":
+        changed.bundle_init_image = BASE_IMAGE
     elif mutation == "cpu":
         changed.resources.cpu_millicores = 31_000
     elif mutation == "disk":
