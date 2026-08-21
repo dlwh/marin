@@ -243,7 +243,7 @@ def prepare_representative_cases(case_root: Path) -> dict[str, dict[str, str]]:
     return expected
 
 
-def execution_plan(*, runner: Path, case_root: Path, raw_root: Path) -> dict[str, object]:
+def execution_plan(*, runner: Path, gpu_transport_test: Path, case_root: Path, raw_root: Path) -> dict[str, object]:
     """Return the exact fresh-process SO/FAST F/B/C execution matrix."""
     runs = []
     for policy in POLICIES:
@@ -256,6 +256,7 @@ def execution_plan(*, runner: Path, case_root: Path, raw_root: Path) -> dict[str
                         "repeat": repeat,
                         "argv": [
                             str(runner),
+                            str(gpu_transport_test),
                             "--case-root",
                             str(case_root),
                             "--raw-root",
@@ -724,6 +725,7 @@ def validate_shuttle_evidence(
 def execute_representative(
     *,
     runner: Path,
+    gpu_transport_test: Path,
     case_root: Path,
     raw_root: Path,
     reports_root: Path,
@@ -735,7 +737,12 @@ def execute_representative(
     prepare_representative_cases(case_root)
     raw_root.mkdir(parents=True, exist_ok=True)
     reports_root.mkdir(parents=True, exist_ok=True)
-    plan = execution_plan(runner=runner, case_root=case_root, raw_root=raw_root)
+    plan = execution_plan(
+        runner=runner,
+        gpu_transport_test=gpu_transport_test,
+        case_root=case_root,
+        raw_root=raw_root,
+    )
     cells = []
     for run in plan["runs"]:
         status = invoke(run["argv"])
@@ -782,6 +789,7 @@ def main() -> int:
     """Run the sealed representative matrix and write accepted evidence."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--runner", type=Path, required=True)
+    parser.add_argument("--gpu-transport-test", type=Path, required=True)
     parser.add_argument("--case-root", type=Path, required=True)
     parser.add_argument("--raw-root", type=Path, required=True)
     parser.add_argument("--reports-root", type=Path, required=True)
@@ -795,6 +803,7 @@ def main() -> int:
 
     evidence = execute_representative(
         runner=arguments.runner,
+        gpu_transport_test=arguments.gpu_transport_test,
         case_root=arguments.case_root,
         raw_root=arguments.raw_root,
         reports_root=arguments.reports_root,

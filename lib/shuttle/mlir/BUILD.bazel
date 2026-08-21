@@ -461,10 +461,12 @@ sh_binary(
     args = [
         "$(rootpath jax_patch/abi22_shuttle_rmsnorm_representative.py)",
         "$(rootpath :run_h100_shuttle_rmsnorm_representative)",
+        "$(rootpath :gpu_transport_v2_test)",
         "$(rootpath artifacts/track2-te-rmsnorm-r12-success-20260821/result-v4.json)",
         "$(rootpath artifacts/track2-te-rmsnorm-r12-success-20260821/policy-raw-v4.json)",
     ],
     data = [
+        ":gpu_transport_v2_test",
         ":run_h100_shuttle_rmsnorm_representative",
         "artifacts/track2-te-rmsnorm-r12-success-20260821/policy-raw-v4.json",
         "artifacts/track2-te-rmsnorm-r12-success-20260821/result-v4.json",
