@@ -4421,6 +4421,35 @@ FailureOr<DerivedPlan> deriveNormContractPlan(RegionOp region) {
       !contractResult.getElementType().isF32() ||
       !result.getElementType().isBF16())
     return failure();
+  const unsigned activationRank = activation.getRank();
+  const unsigned contractRank = activationRank + 1;
+  MLIRContext *context = region.getContext();
+  SmallVector<AffineExpr> lhsExpressions;
+  for (unsigned dimension = 0; dimension + 1 < activationRank; ++dimension)
+    lhsExpressions.push_back(getAffineDimExpr(dimension, context));
+  lhsExpressions.push_back(getAffineDimExpr(contractRank - 1, context));
+  AffineMap expectedLhs =
+      AffineMap::get(contractRank, 0, lhsExpressions, context);
+  AffineMap expectedRhs =
+      AffineMap::get(contractRank, 0,
+                     {getAffineDimExpr(contractRank - 1, context),
+                      getAffineDimExpr(contractRank - 2, context)},
+                     context);
+  SmallVector<AffineExpr> resultExpressions;
+  for (unsigned dimension = 0; dimension + 1 < contractRank; ++dimension)
+    resultExpressions.push_back(getAffineDimExpr(dimension, context));
+  AffineMap expectedResult =
+      AffineMap::get(contractRank, 0, resultExpressions, context);
+  auto epilogueInputMap =
+      dyn_cast<AffineMapAttr>(epilogue.getIndexingMaps()[0]);
+  if (cast<AffineMapAttr>(contract.getIndexingMaps()[0]).getValue() !=
+          expectedLhs ||
+      cast<AffineMapAttr>(contract.getIndexingMaps()[1]).getValue() !=
+          expectedRhs ||
+      cast<AffineMapAttr>(contract.getIndexingMaps()[2]).getValue() !=
+          expectedResult ||
+      !epilogueInputMap || !isIdentityMap(epilogueInputMap.getValue()))
+    return failure();
 
   auto collect = [&](Value value, Operation *stop,
                      llvm::SmallDenseSet<Operation *> &operations,
@@ -4645,9 +4674,21 @@ FailureOr<DerivedPlan> deriveNormContractPlan(RegionOp region) {
       inlineFold ? ArrayRef<Operation *>(algebra)
                  : ArrayRef<Operation *>(orderedContractSources);
   fillContractMetadata(contractTask, contractTaskSources);
-  for (Value value :
-       boundaryValues(contractTaskSources,
-                      inlineFold ? nullptr : reciprocal.getOperation())) {
+  SmallVector<Value> actualContractBoundaries = boundaryValues(
+      contractTaskSources, inlineFold ? nullptr : reciprocal.getOperation());
+  SmallVector<Value> canonicalContractBoundaries{activationValue};
+  if (!inlineFold)
+    canonicalContractBoundaries.push_back(reciprocal.getResult(0));
+  canonicalContractBoundaries.push_back(weightValue);
+  canonicalContractBoundaries.push_back(projectionValue);
+  llvm::SmallDenseSet<Value> actualContractBoundarySet(
+      actualContractBoundaries.begin(), actualContractBoundaries.end());
+  if (actualContractBoundarySet.size() != canonicalContractBoundaries.size() ||
+      llvm::any_of(canonicalContractBoundaries, [&](Value value) {
+        return !actualContractBoundarySet.contains(value);
+      }))
+    return failure();
+  for (Value value : canonicalContractBoundaries) {
     auto found = bufferForValue.find(value);
     if (found == bufferForValue.end())
       return failure();
@@ -8142,6 +8183,7 @@ FailureOr<std::string> emitContractRegionPtx(
     const int64_t paddedReduction = scheduleThreads(reduction);
     if (task.getScratchBytes() != paddedReduction * 4)
       return failure();
+    int64_t foldIndex = ptx.nextU64();
     ptx.stream << "  mov.u32 %r4, %r0;\n"
                   "$contract_region_fold_fill:\n"
                   "  setp.ge.u32 %p0, %r4, "
@@ -8151,8 +8193,9 @@ FailureOr<std::string> emitContractRegionPtx(
                << reduction
                << ";\n  @%p1 bra $contract_region_fold_zero;\n"
                   "  cvt.u64.u32 %rd0, %r1;\n"
-                  "  mad.lo.u64 %rd0, %rd0, "
-               << reduction << ", %r4;\n";
+                  "  cvt.u64.u32 %rd"
+               << foldIndex << ", %r4;\n  mad.lo.u64 %rd0, %rd0, " << reduction
+               << ", %rd" << foldIndex << ";\n";
     FailureOr<SmallVector<int64_t>> leafCoordinates = emitOutputCoordinates(
         ptx, cast<RankedTensorType>(fold.getInputs().front().getType()));
     if (failed(leafCoordinates))
@@ -8239,9 +8282,11 @@ FailureOr<std::string> emitContractRegionPtx(
     column = 5;
   }
   int64_t outputLinear = ptx.nextU64();
+  int64_t columnIndex = ptx.nextU64();
   ptx.stream << "  cvt.u64.u32 %rd" << outputLinear
-             << ", %r1;\n  mad.lo.u64 %rd" << outputLinear << ", %rd"
-             << outputLinear << ", " << columns << ", %r" << column
+             << ", %r1;\n  cvt.u64.u32 %rd" << columnIndex << ", %r" << column
+             << ";\n  mad.lo.u64 %rd" << outputLinear << ", %rd"
+             << outputLinear << ", " << columns << ", %rd" << columnIndex
              << ";\n  mov.u64 %rd0, %rd" << outputLinear << ";\n";
   FailureOr<SmallVector<int64_t>> outputCoordinates =
       emitOutputCoordinates(ptx, resultType);
