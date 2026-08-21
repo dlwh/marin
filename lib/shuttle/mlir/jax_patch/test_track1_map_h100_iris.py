@@ -86,6 +86,7 @@ def test_dry_run_emits_and_decodes_the_real_fail_closed_launch_request(
     assert request.max_task_failures == 0
     assert request.fail_if_exists
     assert request.existing_job_policy == job_pb2.EXISTING_JOB_POLICY_ERROR
+    assert request.priority_band == job_pb2.PRIORITY_BAND_BATCH
     assert list(request.environment.setup_scripts) == []
     assert dict(request.environment.env_vars) == {}
     assert list(request.entrypoint.setup_commands) == []
@@ -155,6 +156,7 @@ def test_default_is_unsealed_before_bundle_or_request_output(tmp_path: Path) -> 
         "gpu",
         "image",
         "memory",
+        "priority",
         "replicas",
         "retry_failure",
         "retry_preemption",
@@ -169,7 +171,7 @@ def test_decoded_request_rejects_every_launch_scope_mutation(mutation: str) -> N
     changed = deepcopy(request)
     command = changed.entrypoint.run_command.argv
     if mutation == "authorization":
-        command[command.index(approved)] = "f" * 64
+        command[list(command).index(approved)] = "f" * 64
     elif mutation == "bundle_hash":
         changed.exact_bundle_upload.bundle_id = "f" * 64
     elif mutation == "cpu":
@@ -186,6 +188,8 @@ def test_decoded_request_rejects_every_launch_scope_mutation(mutation: str) -> N
         changed.task_image = "ghcr.io/marin-community/iris-task-h100-evidence:latest"
     elif mutation == "memory":
         changed.resources.memory_bytes = 127 * 1024**3
+    elif mutation == "priority":
+        changed.priority_band = job_pb2.PRIORITY_BAND_INTERACTIVE
     elif mutation == "replicas":
         changed.replicas = 2
     elif mutation == "retry_failure":
