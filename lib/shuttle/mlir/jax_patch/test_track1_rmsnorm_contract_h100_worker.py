@@ -25,7 +25,7 @@ def test_worker_flushes_canonical_cell_evidence_before_subject_failure(monkeypat
         "boundary": "composed",
         "mode": "disabled",
         "role": "input_cotangent",
-        "schema": "track1_rmsnorm_contract_h100_cell",
+        "schema": "rmsnorm_contract_cell_v1",
         "schema_version": 1,
         "shape": [5, 19, 7],
     }

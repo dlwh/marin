@@ -172,7 +172,7 @@ def test_threshold_failure_reports_every_role_before_rejecting_the_coordinate() 
 
     assert [report["role"] for report in reports] == list(roles)
     failing = reports[1]
-    assert failing["schema"] == "track1_rmsnorm_contract_h100_cell"
+    assert failing["schema"] == "rmsnorm_contract_cell_v1"
     assert failing["schema_version"] == 1
     assert failing["shape"] == [5, 19, 7]
     assert failing["boundary"] == "composed"
@@ -183,7 +183,7 @@ def test_threshold_failure_reports_every_role_before_rejecting_the_coordinate() 
     assert failing["worst_absolute"]["index"] == [0, 3]
     assert failing["worst_bf16_ulp"]["index"] == [0, 3]
     assert failing["maximum_raw_bf16_code_distance"] >= 0
-    assert failing["maximum_magnitude_masked_bf16_code_distance"] >= 0
+    assert failing["max_bf16_masked_code_distance"] >= 0
     assert failing["metrics"]["maximum_absolute_error"] > 0.0625
     assert set(failing["output_digests"]) == {
         "actual",

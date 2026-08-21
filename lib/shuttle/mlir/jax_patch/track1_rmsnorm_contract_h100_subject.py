@@ -272,7 +272,7 @@ def _scalar_diagnostic(
         "analytic_rounded_value": rounded_value,
         "analytic_value": analytic_value,
         "index": _index_document(flat_index, actual.shape),
-        "magnitude_masked_bf16_code_distance": abs((actual_bits & 0x7FFF) - (rounded_bits & 0x7FFF)),
+        "masked_bf16_code_distance": abs((actual_bits & 0x7FFF) - (rounded_bits & 0x7FFF)),
         "ordered_bf16_ulp_error": abs(actual_ordered - rounded_ordered),
         "raw_bf16_code_distance": abs(actual_bits - rounded_bits),
     }
@@ -309,7 +309,7 @@ def _cell_report(
     report = {
         "boundary": coordinate.boundary.value,
         "first_mismatch": first_mismatch,
-        "maximum_magnitude_masked_bf16_code_distance": int(np.max(magnitude_distance, initial=0)),
+        "max_bf16_masked_code_distance": int(np.max(magnitude_distance, initial=0)),
         "maximum_raw_bf16_code_distance": int(np.max(raw_distance, initial=0)),
         "metrics": observed,
         "mode": coordinate.mode.value,
@@ -320,7 +320,7 @@ def _cell_report(
             "repeat": _grouped_sha256(repeated),
         },
         "role": role,
-        "schema": "track1_rmsnorm_contract_h100_cell",
+        "schema": "rmsnorm_contract_cell_v1",
         "schema_version": 1,
         "shape": list(coordinate.shape),
         "sign_crossing_count": int(np.count_nonzero(((actual_bits ^ rounded_bits) & np.uint16(0x8000)) != np.uint16(0))),
