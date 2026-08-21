@@ -124,6 +124,12 @@ def test_batch_plan_pins_te_wheel_source_build_and_exact_v2_matrix(tmp_path: Pat
     compile_argv = phases[7]["argv"]
     assert compile_argv[:4] == ["/usr/bin/g++", "-std=c++20", "-O3", "-Wall"]
     assert "-Werror" in compile_argv
+    te_include = str(BatchPaths.under(workspace).te_source / "transformer_engine/common/include")
+    assert compile_argv[compile_argv.index("-isystem") : compile_argv.index("-isystem") + 2] == [
+        "-isystem",
+        te_include,
+    ]
+    assert f"-I{te_include}" not in compile_argv
     assert f"-L{BatchPaths.under(workspace).te_library.parent}" in compile_argv
     assert f"-Wl,-rpath,{BatchPaths.under(workspace).te_library.parent}" in compile_argv
     assert "-ltransformer_engine" in compile_argv
