@@ -77,6 +77,8 @@ def _document() -> dict[str, object]:
             },
             "python_package": {
                 "dependency_resolution": False,
+                "dependency_site_packages": "/opt/h100-evidence-runtime/lib/python3.12/site-packages",
+                "dependency_source": "immutable_base_image_runtime",
                 "distribution": "jax",
                 "expected_base_version": "0.10.1",
                 "install_method": "site-packages-pth",
@@ -121,6 +123,8 @@ def _authorization(tmp_path: Path) -> tuple[Path, str, Authorization]:
         (("toolchain", "cuda", "offline_downloads"), True),
         (("toolchain", "cuda", "physical_tools_root"), "/usr/local/cuda"),
         (("toolchain", "python_package", "dependency_resolution"), True),
+        (("toolchain", "python_package", "dependency_site_packages"), "/usr/local/lib/python3.12/site-packages"),
+        (("toolchain", "python_package", "dependency_source"), "system"),
         (("toolchain", "python_package", "distribution"), "jax-nightly"),
         (("toolchain", "python_package", "expected_base_version"), "0.10.0"),
         (("toolchain", "python_package", "install_method"), "registry-wheel"),
@@ -225,7 +229,12 @@ def test_dry_run_renders_one_network_hydration_then_offline_build_and_two_worker
     assert "--disable-pip-version-check" in phases[6]["argv"]
     assert "--no-deps" in phases[6]["argv"]
     assert "--no-index" in phases[6]["argv"]
-    assert phases[7]["argv"][-2:] == ["install", str(workspace / "jax")]
+    assert phases[7]["argv"][-4:] == [
+        "install",
+        str(workspace / "jax"),
+        "--dependency-site-packages",
+        "/opt/h100-evidence-runtime/lib/python3.12/site-packages",
+    ]
     assert phases[8]["argv"][-2:] == ["verify", str(workspace / "jax")]
     assert all("pip" not in argument and "http" not in argument for argument in phases[7]["argv"])
     assert phases[9]["argv"][phases[9]["argv"].index("--role") + 1] == "populate"
