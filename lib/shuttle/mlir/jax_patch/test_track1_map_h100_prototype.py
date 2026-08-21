@@ -3,10 +3,14 @@
 
 import hashlib
 import json
+import os
+import subprocess
+import sys
 from copy import deepcopy
 from pathlib import Path
 
 import pytest
+import track1_map_h100_prototype as prototype
 from track1_map_h100_build import JAX_COMMIT, JAX_PATCH_SHA256, JAX_TREE, XLA_COMMIT, XLA_PATCH_SHA256
 from track1_map_h100_prototype import (
     BASE_IMAGE,
@@ -304,3 +308,120 @@ def test_source_bundle_manifest_rejects_missing_extra_symlink_and_hash_mutations
             (case / "lib/shuttle/src/shuttle/link.py").symlink_to(case / "lib/shuttle/src/shuttle/source.py")
         with pytest.raises(RuntimeError, match="source bundle"):
             require_source_bundle(case, Authorization(case_document, "b" * 64))
+
+
+def test_execute_rejects_hydration_source_drift_before_offline_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, authorization = _authorization(tmp_path)
+    workspace = tmp_path / "workspace"
+    offline_started = False
+
+    def initialize_repository(path: Path, url: str, commit: str, log: Path) -> None:
+        del url, commit, log
+        path.mkdir()
+        (path / "source.cc").write_text(f"{path.name}\n")
+        if path.name == "jax":
+            (path / "build").mkdir()
+            (path / "build/build.py").write_text("#!/usr/bin/env python3\n")
+            (path / "build/build.py").chmod(0o755)
+        subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+        subprocess.run(["git", "add", "."], cwd=path, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Track One",
+                "-c",
+                "user.email=track1@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+            cwd=path,
+            check=True,
+        )
+
+    def inspect_inputs(**arguments: Path) -> prototype.BuildInputs:
+        return prototype.BuildInputs(
+            bazel=arguments["bazel"],
+            bazel_sha256=prototype.BAZEL_SHA256,
+            cuda_root=arguments["cuda_root"],
+            image_archive=arguments["image_archive"],
+            image_sha256="1" * 64,
+            jax_commit=prototype.JAX_COMMIT,
+            jax_patch_sha256=prototype.JAX_PATCH_SHA256,
+            jax_repository=arguments["jax_repository"],
+            jax_status="",
+            jax_tree=prototype.JAX_TREE,
+            marin_repository=arguments["marin_repository"],
+            nvcc_sha256="2" * 64,
+            platform="linux",
+            ptxas_sha256="3" * 64,
+            xla_commit=prototype.XLA_COMMIT,
+            xla_patch_sha256=prototype.XLA_PATCH_SHA256,
+            xla_repository=arguments["xla_repository"],
+            xla_status="",
+        )
+
+    def apply_patches(inputs: prototype.BuildInputs) -> None:
+        (inputs.jax_repository / "source.cc").write_text("approved JAX patch\n")
+        (inputs.xla_repository / "source.cc").write_text("approved XLA patch\n")
+
+    def run(
+        command: list[str],
+        *,
+        cwd: Path | None,
+        log: Path,
+        environment: dict[str, str] | None = None,
+    ) -> None:
+        del cwd, log, environment
+        nonlocal offline_started
+        if command[0] == "curl":
+            Path(command[command.index("--output") + 1]).write_bytes(b"bazel")
+            return
+        if "--bazel_options=--repository_disable_download" in command:
+            offline_started = True
+            return
+        (workspace / "jax/source.cc").write_text("network hydration mutation\n")
+
+    original_is_file = Path.is_file
+    original_access = os.access
+    cuda_tools = {
+        Path("/usr/local/cuda-13.2/bin/nvcc"),
+        Path("/usr/local/cuda-13.2/bin/ptxas"),
+    }
+    monkeypatch.setattr(prototype.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(prototype, "require_source_bundle", lambda root, value: {"schema_version": 1})
+    monkeypatch.setattr(prototype, "_initialize_repository", initialize_repository)
+    monkeypatch.setattr(prototype, "_require_source", lambda *args, **kwargs: None)
+    monkeypatch.setattr(prototype, "inspect_build_inputs", inspect_inputs)
+    monkeypatch.setattr(prototype, "require_offline_build_inputs", lambda *args, **kwargs: None)
+    monkeypatch.setattr(prototype, "apply_source_patches", apply_patches)
+    monkeypatch.setattr(prototype, "_run", run)
+    monkeypatch.setattr(
+        prototype, "_identity", lambda command: "Python 3.12.11" if command[0] == sys.executable else "tool"
+    )
+    monkeypatch.setattr(
+        prototype,
+        "_sha256_file",
+        lambda path: (
+            prototype.BAZEL_SHA256 if path.name.startswith("bazel-") else hashlib.sha256(path.name.encode()).hexdigest()
+        ),
+    )
+    monkeypatch.setattr(Path, "is_file", lambda path: True if path in cuda_tools else original_is_file(path))
+    monkeypatch.setattr(
+        os, "access", lambda path, mode: True if Path(path) in cuda_tools else original_access(path, mode)
+    )
+
+    with pytest.raises(RuntimeError, match="network hydration changed patched JAX or XLA source"):
+        prototype.execute_prototype(
+            authorization,
+            workspace=workspace,
+            runner_repository=MARIN_REPOSITORY,
+            python=Path(sys.executable),
+            cuda_root=Path("/usr/local/cuda-13.2"),
+            observed_base_image=BASE_IMAGE,
+        )
+
+    assert not offline_started
