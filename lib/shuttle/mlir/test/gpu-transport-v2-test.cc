@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -165,6 +166,14 @@ std::string performanceWorkloadDigest(
     }
   }
   return llvm::toHex(sha.final(), true);
+}
+
+TEST(GpuTransportV2Test,
+     PerformanceWorkloadDigestMatchesProducerIndependentProtocol) {
+  std::vector<int64_t> shape{2, 2};
+  std::vector<std::vector<uint16_t>> operands{{1, 2, 3, 4}, {5, 6}};
+  EXPECT_EQ(performanceWorkloadDigest("probe", "fast", shape, operands),
+            "1a39c50a5f3ab75d02bad51a11a33175b8910c8292d7570ccc64d76f932ee1c2");
 }
 
 class PacketWriter {
@@ -4580,6 +4589,7 @@ TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
     llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> operandBindings;
     llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> resultBindings;
     std::vector<int64_t> samples;
+    std::vector<int64_t> hostSamples;
   };
   std::vector<PerformanceCell> cells;
 
@@ -4717,6 +4727,26 @@ TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
       cell.samples.push_back(*elapsed);
     }
   }
+  for (PerformanceCell &cell : cells)
+    for (int64_t iteration = 0; iteration < warmupIterations; ++iteration)
+      ASSERT_TRUE(cell.runner
+                      ->Execute(cell.operandBindings, cell.resultBindings)
+                      .ok());
+  for (int64_t round = 0; round < measuredIterations; ++round) {
+    for (size_t position = 0; position < cells.size(); ++position) {
+      size_t cellIndex = round % 2 == 0 ? position : cells.size() - 1 - position;
+      PerformanceCell &cell = cells[cellIndex];
+      auto start = std::chrono::steady_clock::now();
+      ASSERT_TRUE(cell.runner
+                      ->Execute(cell.operandBindings, cell.resultBindings)
+                      .ok());
+      auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count();
+      ASSERT_GT(elapsed, 0);
+      cell.hostSamples.push_back(elapsed);
+    }
+  }
 
   llvm::json::Array reportCells;
   for (auto [cellIndex, cell] : llvm::enumerate(cells)) {
@@ -4758,16 +4788,26 @@ TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
                   : 4);
 
     llvm::json::Array samples;
+    llvm::json::Array hostSamples;
     llvm::json::Array rounds;
     llvm::json::Array positions;
+    llvm::json::Array hostRounds;
+    llvm::json::Array hostPositions;
     ASSERT_EQ(cell.samples.size(), measuredIterations);
+    ASSERT_EQ(cell.hostSamples.size(), measuredIterations);
     for (int64_t round = 0; round < measuredIterations; ++round) {
       samples.push_back(cell.samples[round]);
+      hostSamples.push_back(cell.hostSamples[round]);
       rounds.push_back(round);
+      hostRounds.push_back(round);
       positions.push_back(round % 2 == 0
                               ? static_cast<int64_t>(cellIndex)
                               : static_cast<int64_t>(cells.size() - 1 -
                                                      cellIndex));
+      hostPositions.push_back(round % 2 == 0
+                                  ? static_cast<int64_t>(cellIndex)
+                                  : static_cast<int64_t>(cells.size() - 1 -
+                                                         cellIndex));
     }
     llvm::json::Array shape;
     for (int64_t extent : cell.spec->shape)
@@ -4808,8 +4848,11 @@ TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
         {"policy", policyName},
         {"shape", std::move(shape)},
         {"samples_ns", std::move(samples)},
+        {"host_samples_ns", std::move(hostSamples)},
         {"sample_rounds", std::move(rounds)},
         {"sample_positions", std::move(positions)},
+        {"host_sample_rounds", std::move(hostRounds)},
+        {"host_sample_positions", std::move(hostPositions)},
         {"resources", std::move(resources)},
         {"output", std::move(output)},
         {"identity", std::move(identity)},
@@ -4833,6 +4876,13 @@ TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
       {"protocol",
        llvm::json::Object{
            {"clock", "cuda_event"},
+           {"counterbalance", "forward_reverse_alternating"},
+           {"warmup_iterations", warmupIterations},
+           {"measured_iterations", measuredIterations}}},
+      {"host_protocol",
+       llvm::json::Object{
+           {"mode", "exploratory_host_v1"},
+           {"clock", "host_block_until_ready"},
            {"counterbalance", "forward_reverse_alternating"},
            {"warmup_iterations", warmupIterations},
            {"measured_iterations", measuredIterations}}},

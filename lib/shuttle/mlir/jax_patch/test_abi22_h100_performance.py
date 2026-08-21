@@ -124,6 +124,11 @@ def _shuttle_host_report(base_ns: int) -> dict[str, object]:
         cell["host_samples_ns"] = [
             base_ns + 1_000 + cell_index * 10 + round_index for round_index in range(MEASURED_ITERATIONS)
         ]
+        cell["host_sample_rounds"] = list(range(MEASURED_ITERATIONS))
+        cell["host_sample_positions"] = [
+            cell_index if round_index % 2 == 0 else len(CELL_KEYS) - 1 - cell_index
+            for round_index in range(MEASURED_ITERATIONS)
+        ]
     return report
 
 
@@ -168,7 +173,7 @@ def _te_unavailable() -> dict[str, object]:
         "producer": "te",
         "protocol_mode": "exploratory_host_v1",
         "status": "unavailable",
-        "blocker": "te_2_17_runner_lacks_norm_contract_cells",
+        "blocker": "te_2_17_runner_lacks_required_shapes_epsilon_and_norm_contract",
     }
 
 

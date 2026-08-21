@@ -6,9 +6,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import statistics
+import struct
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +56,10 @@ _RESOURCE_FIELDS = (
     "temporary_bytes",
 )
 
+EXPLORATORY_MODE = "exploratory_host_v1"
+HOST_CLOCK = "host_block_until_ready"
+TE_UNAVAILABLE_BLOCKER = "te_2_17_runner_lacks_required_shapes_epsilon_and_norm_contract"
+
 
 def _mapping(value: object, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
@@ -83,6 +90,35 @@ def _digest(value: object, label: str) -> str:
     if not isinstance(value, str) or len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
         raise ValueError(f"{label} must be a lowercase SHA-256 digest")
     return value
+
+
+def workload_digest(case: str, policy: str, shape: Sequence[int], operands: Sequence[bytes]) -> str:
+    """Hash a producer-independent benchmark coordinate and its BF16 inputs."""
+    digest = hashlib.sha256()
+
+    def update_integer(value: int) -> None:
+        digest.update(struct.pack("<Q", value))
+
+    def update_text(value: str) -> None:
+        encoded = value.encode()
+        update_integer(len(encoded))
+        digest.update(encoded)
+
+    update_text("shuttle-h100-performance-workload-v1")
+    update_text(case)
+    update_text(policy)
+    update_integer(len(shape))
+    for extent in shape:
+        if isinstance(extent, bool) or not isinstance(extent, int) or extent <= 0:
+            raise ValueError("workload shape must contain positive integers")
+        update_integer(extent)
+    update_integer(len(operands))
+    for operand in operands:
+        if not isinstance(operand, bytes) or len(operand) % 2 != 0:
+            raise ValueError("workload operands must be serialized BF16 bytes")
+        update_integer(len(operand) // 2)
+        digest.update(operand)
+    return digest.hexdigest()
 
 
 def _validate_resources(value: object, case: str, producer: str) -> dict[str, Any]:
@@ -221,6 +257,225 @@ def validate_report(report: object, *, expected_producer: str | None = None) -> 
     }
 
 
+def _validate_host_protocol(value: object) -> dict[str, Any]:
+    protocol = _mapping(value, "protocol")
+    if protocol.get("mode") != EXPLORATORY_MODE:
+        raise ValueError(f"protocol.mode must be {EXPLORATORY_MODE}")
+    if protocol.get("clock") != HOST_CLOCK:
+        raise ValueError(f"protocol.clock must be {HOST_CLOCK}")
+    if protocol.get("counterbalance") != "forward_reverse_alternating":
+        raise ValueError("protocol.counterbalance must be forward_reverse_alternating")
+    warmups = _integer(protocol.get("warmup_iterations"), "protocol.warmup_iterations", positive=True)
+    measured = _integer(protocol.get("measured_iterations"), "protocol.measured_iterations", positive=True)
+    if measured < 2 or measured % 2 != 0:
+        raise ValueError("protocol.measured_iterations must be positive and even to counterbalance both orders")
+    return {
+        "mode": EXPLORATORY_MODE,
+        "clock": HOST_CLOCK,
+        "counterbalance": "forward_reverse_alternating",
+        "warmup_iterations": warmups,
+        "measured_iterations": measured,
+    }
+
+
+def _validate_host_samples(
+    cell: dict[str, Any],
+    cell_index: int,
+    measured_iterations: int,
+    *,
+    field: str,
+) -> list[int]:
+    case, _ = CELL_KEYS[cell_index]
+    samples = _list(cell.get(field), f"{case}.{field}")
+    if len(samples) != measured_iterations:
+        raise ValueError(f"{case}.{field} must equal measured_iterations")
+    for sample in samples:
+        if isinstance(sample, bool) or not isinstance(sample, int) or sample <= 0:
+            raise ValueError(f"{case}.{field} must contain positive integer nanoseconds")
+    return list(samples)
+
+
+def _shuttle_exploratory_report(report: object) -> dict[str, Any]:
+    root = _mapping(report, "Shuttle report")
+    accepted = validate_report(root, expected_producer="shuttle")
+    protocol = _validate_host_protocol(root.get("host_protocol"))
+    if protocol["warmup_iterations"] != accepted["protocol"]["warmup_iterations"]:
+        raise ValueError("Shuttle host and CUDA-event warmup counts must match")
+    if protocol["measured_iterations"] != accepted["protocol"]["measured_iterations"]:
+        raise ValueError("Shuttle host and CUDA-event measured counts must match")
+    raw_cells = _list(root.get("cells"), "cells")
+    cells = []
+    for index, cell in enumerate(accepted["cells"]):
+        raw_cell = _mapping(raw_cells[index], f"cells[{index}]")
+        rounds = _list(raw_cell.get("host_sample_rounds"), f"{cell['case']}.host_sample_rounds")
+        positions = _list(raw_cell.get("host_sample_positions"), f"{cell['case']}.host_sample_positions")
+        if len(rounds) != protocol["measured_iterations"] or len(positions) != protocol["measured_iterations"]:
+            raise ValueError(f"{cell['case']} host counterbalance arrays must equal measured_iterations")
+        for round_index in range(protocol["measured_iterations"]):
+            expected_position = index if round_index % 2 == 0 else len(CELL_KEYS) - 1 - index
+            if rounds[round_index] != round_index or positions[round_index] != expected_position:
+                raise ValueError(f"{cell['case']} host counterbalanced position is invalid")
+        cells.append(
+            {
+                "case": cell["case"],
+                "policy": cell["policy"],
+                "shape": cell["shape"],
+                "samples_ns": _validate_host_samples(
+                    raw_cell,
+                    index,
+                    protocol["measured_iterations"],
+                    field="host_samples_ns",
+                ),
+                "sample_rounds": list(rounds),
+                "sample_positions": list(positions),
+                "output": cell["output"],
+                "identity": {
+                    "workload_digest": cell["identity"]["workload_digest"],
+                    "executable_digest": cell["identity"]["executable_digest"],
+                },
+            }
+        )
+    return {
+        "schema": "shuttle_h100_exploratory_host_v1",
+        "producer": "shuttle",
+        "device": accepted["device"],
+        "compiler": accepted["compiler"],
+        "protocol": protocol,
+        "cells": cells,
+    }
+
+
+def validate_exploratory_report(report: object, *, expected_producer: str) -> dict[str, Any]:
+    """Validate one complete host-blocking exploratory timing report."""
+    root = _mapping(report, "exploratory report")
+    if root.get("schema") != "shuttle_h100_exploratory_host_v1":
+        raise ValueError("exploratory report schema is not shuttle_h100_exploratory_host_v1")
+    if expected_producer not in {"shuttle", "xla"} or root.get("producer") != expected_producer:
+        raise ValueError(f"exploratory report producer must be {expected_producer}")
+    device = _mapping(root.get("device"), "device")
+    if not isinstance(device.get("model"), str) or "H100" not in device["model"]:
+        raise ValueError("device.model must identify an H100")
+    ordinal = _integer(device.get("ordinal"), "device.ordinal")
+    compiler = _mapping(root.get("compiler"), "compiler")
+    if not isinstance(compiler.get("identity"), str) or not compiler["identity"]:
+        raise ValueError("compiler.identity must be nonempty")
+    options_digest = _digest(compiler.get("options_digest"), "compiler.options_digest")
+    protocol = _validate_host_protocol(root.get("protocol"))
+    cells = _list(root.get("cells"), "cells")
+    if len(cells) != len(CELL_KEYS):
+        raise ValueError(f"{expected_producer} exploratory report must contain the complete case/policy matrix")
+    validated_cells = []
+    for index, value in enumerate(cells):
+        cell = _mapping(value, f"cells[{index}]")
+        case, policy = CELL_KEYS[index]
+        if (cell.get("case"), cell.get("policy")) != (case, policy):
+            raise ValueError("exploratory report must contain the complete case/policy matrix in canonical order")
+        if cell.get("shape") != _SHAPES[case]:
+            raise ValueError(f"{case} shape does not match the benchmark protocol")
+        samples = _validate_host_samples(cell, index, protocol["measured_iterations"], field="samples_ns")
+        rounds = _list(cell.get("sample_rounds"), f"{case}.sample_rounds")
+        positions = _list(cell.get("sample_positions"), f"{case}.sample_positions")
+        if len(rounds) != protocol["measured_iterations"] or len(positions) != protocol["measured_iterations"]:
+            raise ValueError(f"{case} counterbalance arrays must equal measured_iterations")
+        for round_index in range(protocol["measured_iterations"]):
+            expected_position = index if round_index % 2 == 0 else len(CELL_KEYS) - 1 - index
+            if rounds[round_index] != round_index or positions[round_index] != expected_position:
+                raise ValueError(f"{case} counterbalanced position is invalid")
+        output = _mapping(cell.get("output"), f"{case}.output")
+        digests = _list(output.get("digests"), f"{case}.output.digests")
+        if len(digests) != _RESULT_COUNTS[case]:
+            raise ValueError(f"{case} output digest count is invalid")
+        for result_index, digest in enumerate(digests):
+            _digest(digest, f"{case}.output.digests[{result_index}]")
+        maximum_absolute_error = _finite(output.get("max_abs_error"), f"{case}.output.max_abs_error")
+        maximum_ulp = _integer(output.get("max_bf16_ulp"), f"{case}.output.max_bf16_ulp")
+        identity = _mapping(cell.get("identity"), f"{case}.identity")
+        workload = _digest(identity.get("workload_digest"), f"{case}.identity.workload_digest")
+        executable = _digest(identity.get("executable_digest"), f"{case}.identity.executable_digest")
+        validated_cells.append(
+            {
+                "case": case,
+                "policy": policy,
+                "shape": list(_SHAPES[case]),
+                "samples_ns": samples,
+                "sample_rounds": list(rounds),
+                "sample_positions": list(positions),
+                "output": {
+                    "digests": list(digests),
+                    "max_abs_error": maximum_absolute_error,
+                    "max_bf16_ulp": maximum_ulp,
+                },
+                "identity": {"workload_digest": workload, "executable_digest": executable},
+            }
+        )
+    return {
+        "schema": "shuttle_h100_exploratory_host_v1",
+        "producer": expected_producer,
+        "device": {"model": device["model"], "ordinal": ordinal},
+        "compiler": {"identity": compiler["identity"], "options_digest": options_digest},
+        "protocol": protocol,
+        "cells": validated_cells,
+    }
+
+
+def _validate_te_unavailable(value: object) -> dict[str, str]:
+    blocker = _mapping(value, "TE exploratory blocker")
+    expected = {
+        "schema": "shuttle_h100_exploratory_unavailable_v1",
+        "producer": "te",
+        "protocol_mode": EXPLORATORY_MODE,
+        "status": "unavailable",
+        "blocker": TE_UNAVAILABLE_BLOCKER,
+    }
+    if blocker != expected:
+        raise ValueError("TE exploratory blocker does not match the audited TE 2.17 limitation")
+    return expected
+
+
+def build_exploratory(shuttle: object, xla: object | None, te_status: object | None) -> dict[str, Any]:
+    """Compare matched Shuttle and XLA host-blocking reports."""
+    if xla is None:
+        raise ValueError("xla exploratory report is required")
+    if te_status is None:
+        raise ValueError("TE exploratory blocker is required")
+    reports = {
+        "shuttle": validate_exploratory_report(_shuttle_exploratory_report(shuttle), expected_producer="shuttle"),
+        "xla": validate_exploratory_report(xla, expected_producer="xla"),
+    }
+    te = _validate_te_unavailable(te_status)
+    reference = reports["shuttle"]
+    candidate = reports["xla"]
+    if candidate["device"] != reference["device"]:
+        raise ValueError("xla exploratory device does not match Shuttle")
+    if candidate["protocol"] != reference["protocol"]:
+        raise ValueError("xla exploratory timing protocol does not match Shuttle")
+    comparisons = []
+    for index, (case, policy) in enumerate(CELL_KEYS):
+        shuttle_cell = reference["cells"][index]
+        xla_cell = candidate["cells"][index]
+        if xla_cell["identity"]["workload_digest"] != shuttle_cell["identity"]["workload_digest"]:
+            raise ValueError(f"xla {case} {policy} workload does not match Shuttle")
+        shuttle_median = statistics.median(shuttle_cell["samples_ns"])
+        xla_median = statistics.median(xla_cell["samples_ns"])
+        comparisons.append(
+            {
+                "case": case,
+                "policy": policy,
+                "shuttle_median_ns": shuttle_median,
+                "xla_median_ns": xla_median,
+                "speedup_vs_xla": xla_median / shuttle_median,
+            }
+        )
+    return {
+        "schema": "shuttle_h100_exploratory_comparison_v1",
+        "device": reference["device"],
+        "protocol": reference["protocol"],
+        "compiler_identities": {producer: report["compiler"] for producer, report in reports.items()},
+        "te": te,
+        "comparisons": comparisons,
+    }
+
+
 def build_acceptance(
     shuttle: object,
     xla: object | None,
@@ -285,15 +540,25 @@ def main() -> int:
     parser.add_argument("--shuttle", type=Path, required=True)
     parser.add_argument("--xla", type=Path)
     parser.add_argument("--te", type=Path)
+    parser.add_argument("--te-status", type=Path)
     parser.add_argument("--acceptance", action="store_true")
+    parser.add_argument("--exploratory", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
     shuttle = _load(arguments.shuttle)
+    if arguments.acceptance and arguments.exploratory:
+        parser.error("--acceptance and --exploratory are mutually exclusive")
     if arguments.acceptance:
         result = build_acceptance(
             shuttle,
             _load(arguments.xla) if arguments.xla else None,
             _load(arguments.te) if arguments.te else None,
+        )
+    elif arguments.exploratory:
+        result = build_exploratory(
+            shuttle,
+            _load(arguments.xla) if arguments.xla else None,
+            _load(arguments.te_status) if arguments.te_status else None,
         )
     else:
         result = validate_report(shuttle, expected_producer="shuttle")

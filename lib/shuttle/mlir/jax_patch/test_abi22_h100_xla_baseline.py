@@ -48,5 +48,5 @@ def test_te_status_names_the_missing_norm_contract_coverage() -> None:
         "producer": "te",
         "protocol_mode": "exploratory_host_v1",
         "status": "unavailable",
-        "blocker": "te_2_17_runner_lacks_norm_contract_cells",
+        "blocker": "te_2_17_runner_lacks_required_shapes_epsilon_and_norm_contract",
     }
