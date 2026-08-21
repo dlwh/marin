@@ -25,6 +25,7 @@ WARMUP_INVOCATIONS = 10
 NORM_CONTRACT_BLOCKER = "te_2_17_rmsnorm_oracle_v2_does_not_cover_norm_contract"
 ACCEPTANCE_LIMITS = {"max_absolute_error": 0.015625, "max_bfloat16_ulp": 8}
 TE_SOURCE_COMMIT = "2e559f062497bef768dfbe9d7e45548fadeca80a"
+JAX_REVISION = "619764c15117fbefc4ba13ab941871cb514c23f6"
 XLA_REVISION = "9b635916ecc6df6efee62d8e4b0c7ef87ef84d69"
 PRODUCERS = ("transformer_engine_2_17", "ordinary_jax_xla")
 OUTPUT_ROLES = {
@@ -245,7 +246,7 @@ def execution_plan(
                             "--case-directory",
                             str(case_root / f"{rows}x{features}"),
                             "--output",
-                            f"raw/{producer}-{rows}x{features}-{boundary}.json",
+                            str(case_root.parent / "raw" / f"{producer}-{rows}x{features}-{boundary}.json"),
                         ],
                     }
                 )

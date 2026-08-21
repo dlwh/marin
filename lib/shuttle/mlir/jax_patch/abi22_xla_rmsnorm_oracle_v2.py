@@ -13,6 +13,7 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import jaxlib
 import ml_dtypes
 import numpy as np
 from abi22_te_rmsnorm_oracle_v2 import (
@@ -20,11 +21,36 @@ from abi22_te_rmsnorm_oracle_v2 import (
     CALL_SEQUENCES,
     EPSILON,
     INPUT_DIGESTS,
+    JAX_REVISION,
     MEASURED_INVOCATIONS,
     OUTPUT_ROLES,
     SHAPES,
     WARMUP_INVOCATIONS,
 )
+from jaxlib import version as jaxlib_version
+
+
+def _observed_runtime() -> dict[str, Any]:
+    if jax.default_backend() != "gpu":
+        raise RuntimeError("ordinary-JAX RMSNorm evidence requires the GPU backend")
+    devices = jax.devices("gpu")
+    if len(devices) != 1 or "H100" not in devices[0].device_kind.upper():
+        raise RuntimeError("ordinary-JAX RMSNorm evidence requires one visible H100")
+    if jax.__version__ != "0.10.1" or jaxlib.__version__ != "0.10.1":
+        raise RuntimeError("ordinary-JAX RMSNorm evidence requires JAX and jaxlib 0.10.1")
+    if jaxlib_version._git_hash != JAX_REVISION:
+        raise RuntimeError("ordinary-JAX RMSNorm evidence JAX revision differs")
+    device = devices[0]
+    return {
+        "backend": "gpu",
+        "device_count": 1,
+        "device_id": device.id,
+        "device_kind": device.device_kind,
+        "jax_git_commit": jaxlib_version._git_hash,
+        "jax_version": jax.__version__,
+        "jaxlib_version": jaxlib.__version__,
+        "platform_version": device.client.platform_version,
+    }
 
 
 def _read_bf16(path: Path, shape: tuple[int, ...]) -> np.ndarray:
@@ -91,6 +117,7 @@ def run_cell(boundary: str, shape: tuple[int, int], case_directory: Path) -> dic
     """Run one XLA cell with host-blocking samples and BF16 output evidence."""
     if boundary not in BOUNDARIES or shape not in SHAPES:
         raise ValueError("cell is outside the RMSNorm v2 matrix")
+    observed_runtime = _observed_runtime()
     _, features = shape
     operands = [
         _read_bf16(case_directory / "x.bf16", shape),
@@ -135,6 +162,7 @@ def run_cell(boundary: str, shape: tuple[int, int], case_directory: Path) -> dic
             "rsigma_state": "invocation_local_not_public",
         },
         "outputs": outputs,
+        "observed_runtime": observed_runtime,
         "timing": {
             "warmup_invocations": WARMUP_INVOCATIONS,
             "raw_host_blocking_ns": samples,

@@ -19,7 +19,9 @@ from typing import Any
 
 from abi22_te_rmsnorm_oracle_v2 import (
     BOUNDARIES,
+    JAX_REVISION,
     SHAPES,
+    XLA_REVISION,
     assemble_report,
     build_matched_acceptance,
     execute_plan,
@@ -368,6 +370,43 @@ def _artifact_identities(paths: BatchPaths) -> dict[str, dict[str, int | str]]:
     }
 
 
+def _validated_xla_raw_cell(
+    raw: dict[str, Any], *, expected_device: Mapping[str, str]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    cell = dict(raw)
+    runtime = cell.pop("observed_runtime", None)
+    fields = {
+        "backend",
+        "device_count",
+        "device_id",
+        "device_kind",
+        "jax_git_commit",
+        "jax_version",
+        "jaxlib_version",
+        "platform_version",
+    }
+    if not isinstance(runtime, Mapping) or set(runtime) != fields:
+        raise ValueError("ordinary-JAX observed runtime fields drifted")
+    if (
+        runtime["backend"] != "gpu"
+        or runtime["device_count"] != 1
+        or runtime["device_id"] != 0
+        or not isinstance(runtime["device_kind"], str)
+        or "H100" not in runtime["device_kind"].upper()
+        or "H100" not in expected_device.get("model", "").upper()
+    ):
+        raise ValueError("ordinary-JAX observed runtime is not the one visible H100")
+    if (
+        runtime["jax_version"] != "0.10.1"
+        or runtime["jaxlib_version"] != "0.10.1"
+        or runtime["jax_git_commit"] != JAX_REVISION
+        or not isinstance(runtime["platform_version"], str)
+        or not runtime["platform_version"]
+    ):
+        raise ValueError("ordinary-JAX observed runtime identity drifted")
+    return cell, dict(runtime)
+
+
 def execute_oracle(
     *,
     paths: BatchPaths,
@@ -398,6 +437,7 @@ def execute_oracle(
     execute_plan(plan, runner)
     te_cells = []
     xla_cells = []
+    observed_xla_runtime = None
     for shape in SHAPES:
         rows, features = shape
         case = paths.cases / f"{rows}x{features}"
@@ -405,12 +445,21 @@ def execute_oracle(
             te_raw = paths.raw / f"transformer_engine_2_17-{rows}x{features}-{boundary}.json"
             xla_raw = paths.raw / f"ordinary_jax_xla-{rows}x{features}-{boundary}.json"
             te_cells.append(load_te_raw_cell(te_raw, case))
-            xla_cells.append(_read_json(xla_raw, "ordinary-JAX/XLA raw cell"))
+            xla_cell, runtime = _validated_xla_raw_cell(
+                _read_json(xla_raw, "ordinary-JAX/XLA raw cell"), expected_device=device
+            )
+            if observed_xla_runtime is None:
+                observed_xla_runtime = runtime
+            elif observed_xla_runtime != runtime:
+                raise ValueError("ordinary-JAX observed runtime differs across cells")
+            xla_cells.append(xla_cell)
+    if observed_xla_runtime is None:
+        raise AssertionError("ordinary-JAX matrix was empty")
     te_report = assemble_report("transformer_engine_2_17", te_cells, runtime_identity, device)
     xla_identity = {
-        "jax_version": "0.10.1",
-        "jaxlib_version": "0.10.1",
-        "xla_revision": "9b635916ecc6df6efee62d8e4b0c7ef87ef84d69",
+        "jax_version": observed_xla_runtime["jax_version"],
+        "jaxlib_version": observed_xla_runtime["jaxlib_version"],
+        "xla_revision": XLA_REVISION,
     }
     xla_report = assemble_report("ordinary_jax_xla", xla_cells, xla_identity, device)
     acceptance = build_matched_acceptance(te_report, xla_report, expected_te_identity=runtime_identity)
@@ -421,6 +470,7 @@ def execute_oracle(
         "acceptance": acceptance,
         "artifacts": _artifact_identities(paths),
         "oracle_plan": dict(plan),
+        "observed_xla_runtime": observed_xla_runtime,
         "reports": {
             "transformer_engine_2_17": te_report,
             "ordinary_jax_xla": xla_report,
