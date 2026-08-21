@@ -146,8 +146,13 @@ def test_batch_plan_pins_te_wheel_source_build_and_exact_v2_matrix(tmp_path: Pat
     assert "-Werror" in compile_argv
     assert "-Wl,--allow-shlib-undefined" in compile_argv
     assert set(RUNTIME_LIBRARY_PATHS) == {"cublas", "cublas_lt", "cudnn", "nccl", "cudart", "nvrtc"}
-    assert {path.parent for path in RUNTIME_LIBRARY_PATHS.values()} == {
-        Path("/opt/h100-evidence-runtime/lib/python3.12/site-packages/nvidia/cu13/lib")
+    assert {role: path.parent for role, path in RUNTIME_LIBRARY_PATHS.items()} == {
+        "cublas": Path("/opt/h100-evidence-runtime/lib/python3.12/site-packages/nvidia/cu13/lib"),
+        "cublas_lt": Path("/opt/h100-evidence-runtime/lib/python3.12/site-packages/nvidia/cu13/lib"),
+        "cudnn": Path("/opt/h100-evidence-runtime/lib/python3.12/site-packages/nvidia/cudnn/lib"),
+        "nccl": Path("/opt/h100-evidence-runtime/lib/python3.12/site-packages/nvidia/nccl/lib"),
+        "cudart": Path("/opt/h100-evidence-runtime/lib/python3.12/site-packages/nvidia/cu13/lib"),
+        "nvrtc": Path("/opt/h100-evidence-runtime/lib/python3.12/site-packages/nvidia/cu13/lib"),
     }
     assert RUNTIME_LIBRARY_PATHS["nvrtc"] == (
         Path("/opt/h100-evidence-runtime/lib/python3.12/site-packages/nvidia/cu13/lib/libnvrtc.so.13")
