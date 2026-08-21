@@ -472,6 +472,17 @@ py_test(
     main = "jax_patch/test_abi22_h100_performance.py",
 )
 
+py_test(
+    name = "abi22_te_rmsnorm_oracle_v2_test",
+    srcs = [
+        "jax_patch/abi22_te_rmsnorm_oracle_v2.py",
+        "jax_patch/test_abi22_te_rmsnorm_oracle_v2.py",
+    ],
+    data = ["jax_patch/abi22_te_rmsnorm_oracle_runner_v2.cpp"],
+    imports = ["jax_patch"],
+    main = "jax_patch/test_abi22_te_rmsnorm_oracle_v2.py",
+)
+
 cc_test(
     name = "abi19_libdevice_contract_test",
     srcs = ["test/abi19-libdevice-contract-test.cc"],
