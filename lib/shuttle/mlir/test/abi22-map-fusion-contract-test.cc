@@ -1490,6 +1490,45 @@ bool mutateContractRegionTask(mlir::ModuleOp module,
   return true;
 }
 
+bool mutateHybridNormalizedOutput(mlir::ModuleOp module,
+                                  llvm::StringRef mutation) {
+  auto plan = *module.getOps<mlir::shuttle::MaterializationPlanOp>().begin();
+  llvm::SmallVector<mlir::shuttle::MaterializationBufferOp> buffers(
+      plan.getBody().front().getOps<
+          mlir::shuttle::MaterializationBufferOp>());
+  for (auto task : plan.getBody().front().getOps<
+           mlir::shuttle::MaterializationTaskOp>()) {
+    if (!task->getAttr("contract_region_sources") ||
+        task.getOutputBuffers().size() != 2)
+      continue;
+    mlir::Builder builder(module.getContext());
+    llvm::SmallVector<int64_t> outputs(task.getOutputBuffers());
+    if (mutation == "output-order") {
+      std::swap(outputs[0], outputs[1]);
+      task->setAttr("output_buffers", builder.getDenseI64ArrayAttr(outputs));
+    } else {
+      auto normalized = llvm::find_if(buffers, [&](auto buffer) {
+        return buffer.getOrdinal() == outputs.front();
+      });
+      if (normalized == buffers.end())
+        return false;
+      if (mutation == "live-out") {
+        (*normalized)->setAttr("live_out", builder.getBoolAttr(true));
+      } else if (mutation == "storage") {
+        (*normalized)->setAttr(
+            "storage", mlir::shuttle::MaterializationStorageAttr::get(
+                           module.getContext(),
+                           mlir::shuttle::MaterializationStorage::External));
+      } else {
+        return false;
+      }
+    }
+    plan.setFingerprint(mlir::shuttle::materializationPlanFingerprint(plan));
+    return true;
+  }
+  return false;
+}
+
 bool verifyMaterializationPlan(mlir::ModuleOp module) {
   mlir::PassManager manager(module.getContext());
   manager.addPass(mlir::shuttle::createVerifyMaterializationPlanPass());
@@ -4787,7 +4826,6 @@ TEST(Abi22MapFusionContract,
       std::optional<PlanSummary> planSummary = summary(*built->module);
       ASSERT_TRUE(planSummary);
       EXPECT_TRUE(planSummary->hasContractRegion);
-      EXPECT_EQ(planSummary->hasFoldRegion, boundary.columns == 257);
       EXPECT_TRUE(planSummary->exactSourceCoverage);
       EXPECT_EQ(planSummary->maps, 19);
       EXPECT_EQ(planSummary->folds, 1);
@@ -5043,11 +5081,12 @@ TEST(Abi22MapFusionContract,
           mlir::shuttle::NumericalPolicy::Fast}) {
       SCOPED_TRACE(mlir::shuttle::stringifyNumericalPolicy(policy).str());
       std::unique_ptr<BuiltModule> built =
-          build(*source, policy, kFusionTuning, false, false);
+          build(*source, policy, kFusionTuning, false, true);
       ASSERT_TRUE(built);
       std::optional<PlanSummary> planSummary = summary(*built->module);
       ASSERT_TRUE(planSummary);
       EXPECT_TRUE(planSummary->hasContractRegion);
+      EXPECT_EQ(planSummary->hasFoldRegion, boundary.columns == 257);
       EXPECT_TRUE(planSummary->exactSourceCoverage);
 
       auto plan = *built->module->getOps<mlir::shuttle::MaterializationPlanOp>()
@@ -5060,6 +5099,7 @@ TEST(Abi22MapFusionContract,
           plan.getBody()
               .front()
               .getOps<mlir::shuttle::MaterializationBufferOp>());
+      EXPECT_LT(tasks.size(), 42u);
       auto specialized = llvm::find_if(tasks, [](auto task) {
         return static_cast<bool>(task->template getAttrOfType<mlir::ArrayAttr>(
             "contract_region_sources"));
@@ -5079,11 +5119,13 @@ TEST(Abi22MapFusionContract,
       ASSERT_TRUE(sources);
       llvm::SmallVector<int64_t> expectedPrimalSources;
       if (boundary.columns == 7) {
-        for (int64_t ordinal = 0; ordinal <= 24; ++ordinal)
+        for (int64_t ordinal = 0; ordinal <= 11; ++ordinal)
+          expectedPrimalSources.push_back(ordinal);
+        for (int64_t ordinal = 16; ordinal <= 24; ++ordinal)
           expectedPrimalSources.push_back(ordinal);
       } else {
         expectedPrimalSources.push_back(0);
-        for (int64_t ordinal = 12; ordinal <= 24; ++ordinal)
+        for (int64_t ordinal = 16; ordinal <= 24; ++ordinal)
           expectedPrimalSources.push_back(ordinal);
       }
       EXPECT_EQ(sourceOperationOrdinals(sources), expectedPrimalSources);
@@ -5137,14 +5179,61 @@ TEST(Abi22MapFusionContract,
                 mlir::shuttle::MaterializationStorage::Temporary);
       ASSERT_TRUE(normalized->getProducer());
       EXPECT_EQ(*normalized->getProducer(), specializedTask.getOrdinal());
-      EXPECT_FALSE(normalized->getConsumers().empty());
+      ASSERT_EQ(normalized->getConsumers().size(), 1u);
+      const int64_t conversionOrdinal = normalized->getConsumers().front();
+      ASSERT_GE(conversionOrdinal, 0);
+      ASSERT_LT(conversionOrdinal, static_cast<int64_t>(tasks.size()));
+      auto conversion = tasks[conversionOrdinal];
+      EXPECT_EQ(conversion.getKind(),
+                mlir::shuttle::MaterializationTaskKind::Map);
+      ASSERT_EQ(conversion.getOutputBuffers().size(), 1u);
+      auto converted = llvm::find_if(buffers, [&](auto buffer) {
+        return buffer.getOrdinal() == conversion.getOutputBuffers().front();
+      });
+      ASSERT_NE(converted, buffers.end());
       EXPECT_EQ(llvm::count_if(tasks, [&](auto task) {
                   return task.getKind() ==
                              mlir::shuttle::MaterializationTaskKind::Contract &&
                          llvm::is_contained(task.getInputBuffers(),
-                                            normalized->getOrdinal());
+                                            converted->getOrdinal());
                 }),
                 1);
+
+      mlir::FailureOr<llvm::SmallVector<uint8_t>> transport =
+          mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+      ASSERT_TRUE(mlir::succeeded(transport));
+      auto executable = mlir::shuttle::GpuExecutable::Load(*transport);
+      ASSERT_TRUE(executable.ok()) << executable.status();
+      ASSERT_EQ((*executable)->launches().size(), tasks.size());
+      const auto &specializedLaunch =
+          (*executable)->launches()[specializedTask.getOrdinal()];
+      EXPECT_EQ(specializedLaunch.outputSlots.size(), 2u);
+      EXPECT_EQ(specializedLaunch.outputSlots.front(),
+                normalized->getOrdinal());
+      EXPECT_EQ(specializedLaunch.outputSlots.back(),
+                primalResult->getOrdinal());
+    }
+  }
+}
+
+TEST(Abi22MapFusionContract,
+     HybridNormalizedBoundaryRejectsOrderLifetimeAndStorageCorruption) {
+  constexpr const char *fixtures[] = {
+      "jax-0.10.1-bf16-rmsnorm_contract-5x19x7-composed.mlir",
+      "jax-0.10.1-bf16-rmsnorm_contract-5x19x257-composed.mlir",
+  };
+  for (const char *fixture : fixtures) {
+    SCOPED_TRACE(fixture);
+    std::optional<std::string> source = fixtureSource(fixture);
+    ASSERT_TRUE(source);
+    for (llvm::StringRef mutation : {"output-order", "live-out", "storage"}) {
+      SCOPED_TRACE(mutation.str());
+      std::unique_ptr<BuiltModule> built = build(
+          *source, mlir::shuttle::NumericalPolicy::SourceOrdered,
+          kFusionTuning, false, false);
+      ASSERT_TRUE(built);
+      ASSERT_TRUE(mutateHybridNormalizedOutput(*built->module, mutation));
+      EXPECT_FALSE(verifyMaterializationPlan(*built->module));
     }
   }
 }
