@@ -525,7 +525,10 @@ std::optional<PlanSummary> summary(mlir::ModuleOp module) {
         task->getAttrOfType<mlir::ArrayAttr>("fold_epilogue_sources");
     auto foldRegionSources =
         task->getAttrOfType<mlir::ArrayAttr>("fold_region_sources");
-    if (fusedSources && foldEpilogueSources)
+    if (static_cast<int>(static_cast<bool>(fusedSources)) +
+            static_cast<int>(static_cast<bool>(foldEpilogueSources)) +
+            static_cast<int>(static_cast<bool>(foldRegionSources)) >
+        1)
       return std::nullopt;
     if (foldRegionSources) {
       result.hasFoldRegion = true;
