@@ -535,6 +535,9 @@ py_test(
 py_test(
     name = "track2_te_h100_policy_v3_test",
     srcs = [
+        "jax_patch/abi15_h100_numerics.py",
+        "jax_patch/abi21_rmsnorm_numerics.py",
+        "jax_patch/abi21_rmsnorm_prehardware_contract.py",
         "jax_patch/abi22_te_rmsnorm_oracle_v2.py",
         "jax_patch/test_track2_te_h100_policy_v3.py",
         "jax_patch/track1_map_h100_build.py",

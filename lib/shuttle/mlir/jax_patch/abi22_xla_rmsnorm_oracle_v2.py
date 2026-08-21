@@ -26,6 +26,7 @@ from abi22_te_rmsnorm_oracle_v2 import (
     SHAPES,
     WARMUP_INVOCATIONS,
     error_metrics,
+    error_metrics_v3,
 )
 from jaxlib import version as jaxlib_version
 
@@ -99,7 +100,12 @@ def _arrays(value: Any) -> tuple[np.ndarray, ...]:
     return tuple(np.asarray(leaf) for leaf in jax.tree.leaves(value))
 
 
-def run_cell(boundary: str, shape: tuple[int, int], case_directory: Path) -> dict[str, Any]:
+def run_cell(
+    boundary: str,
+    shape: tuple[int, int],
+    case_directory: Path,
+    output_files_directory: Path | None = None,
+) -> dict[str, Any]:
     """Run one XLA cell with host-blocking samples and BF16 output evidence."""
     if boundary not in BOUNDARIES or shape not in SHAPES:
         raise ValueError("cell is outside the RMSNorm v2 matrix")
@@ -126,18 +132,29 @@ def run_cell(boundary: str, shape: tuple[int, int], case_directory: Path) -> dic
     if result is None:
         raise AssertionError("measurement loop did not execute")
     outputs = []
+    output_files = {}
+    if output_files_directory is not None:
+        output_files_directory.mkdir(parents=True, exist_ok=True)
     for role, actual in zip(OUTPUT_ROLES[boundary], _arrays(result), strict=True):
         reference_shape = shape if role != "dgamma" else (features,)
         reference = _read_bf16(case_directory / f"reference_{role}.bf16", reference_shape)
+        if output_files_directory is not None:
+            output_path = output_files_directory / f"{role}.bf16"
+            output_path.write_bytes(actual.view(np.uint16).tobytes(order="C"))
+            output_files[role] = str(output_path)
         outputs.append(
             {
                 "role": role,
                 "digest": _digest(actual),
                 "reference_digest": _digest(reference),
-                **error_metrics(actual, reference, role=role),
+                **(
+                    error_metrics_v3(actual, reference, role=role)
+                    if output_files_directory is not None
+                    else error_metrics(actual, reference, role=role)
+                ),
             }
         )
-    return {
+    document = {
         "shape": list(shape),
         "scope": "architecture_fixture" if shape == SHAPES[0] else "representative_performance_qualification",
         "boundary": boundary,
@@ -155,6 +172,9 @@ def run_cell(boundary: str, shape: tuple[int, int], case_directory: Path) -> dic
             "raw_cuda_event_ns": None,
         },
     }
+    if output_files_directory is not None:
+        document["output_files"] = output_files
+    return document
 
 
 def main() -> None:
@@ -165,10 +185,16 @@ def main() -> None:
     parser.add_argument("--epsilon", type=float, required=True)
     parser.add_argument("--case-directory", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--output-files-directory", type=Path)
     arguments = parser.parse_args()
     if arguments.epsilon != EPSILON:
         parser.error("epsilon must be exactly 1e-6")
-    document = run_cell(arguments.boundary, (arguments.rows, arguments.features), arguments.case_directory)
+    document = run_cell(
+        arguments.boundary,
+        (arguments.rows, arguments.features),
+        arguments.case_directory,
+        arguments.output_files_directory,
+    )
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
     arguments.output.write_text(json.dumps(document, sort_keys=True) + "\n")
 

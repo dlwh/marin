@@ -26,21 +26,35 @@ from abi22_te_rmsnorm_oracle_v2 import (
     INPUT_DIGESTS,
     JAX_REVISION,
     NUMERICAL_POLICY,
+    OUTPUT_ROLES,
+    POLICY_V3_ACCEPTANCE_INPUT_DIGESTS,
+    POLICY_V3_ACCEPTANCE_PATTERN,
+    POLICY_V3_QUALIFICATION_PATTERNS,
     PRODUCERS,
     QUALIFICATION_PATTERN,
     REPRESENTATIVE_SHAPE,
     SHAPES,
     XLA_REVISION,
+    _bf16_bytes,
+    _read_bf16_file,
     assemble_report,
     build_matched_acceptance,
+    build_matched_acceptance_v3,
+    error_metrics_v3,
     execute_plan,
     execute_qualification_plan,
+    execute_qualification_plan_v3,
     execution_plan,
     load_te_raw_cell,
+    load_te_raw_cell_v3,
     prepare_cases,
     prepare_policy_cases,
+    prepare_policy_v3_cases,
     qualification_plan,
+    qualification_plan_v3,
+    repeat_output_diagnostics_v3,
     validate_build_manifest,
+    validate_policy_v3_evidence,
     validate_qualification_evidence,
     validate_runtime_manifest,
 )
@@ -487,15 +501,17 @@ def _execute_hydration(paths: BatchPaths, plan: dict[str, Any]) -> dict[str, Any
     return observed
 
 
-def _artifact_identities(paths: BatchPaths) -> dict[str, dict[str, int | str]]:
+def _artifact_identities(paths: BatchPaths, *, policy_version: str = "v2") -> dict[str, dict[str, int | str]]:
     files = [
         paths.te_report,
         paths.xla_report,
         paths.acceptance,
         paths.runtime_manifest,
-        paths.reports / "policy-raw-v2.json",
+        paths.reports / f"policy-raw-{policy_version}.json",
     ]
-    files.extend(sorted(path for path in paths.raw.iterdir() if path.is_file() and not path.is_symlink()))
+    if policy_version == "v3":
+        files.append(paths.reports / "policy-repeat-diagnostics-v3.json")
+    files.extend(sorted(path for path in paths.raw.rglob("*") if path.is_file() and not path.is_symlink()))
     return {
         str(path.relative_to(paths.workspace)): {"sha256": _file_sha256(path), "size": path.stat().st_size}
         for path in files
@@ -537,6 +553,106 @@ def _validated_xla_raw_cell(
     ):
         raise ValueError("ordinary-JAX observed runtime identity drifted")
     return cell, dict(runtime)
+
+
+def _policy_v3_case(paths: BatchPaths, pattern: str) -> tuple[Path, Mapping[str, str], str | None]:
+    rows, features = REPRESENTATIVE_SHAPE
+    if pattern == QUALIFICATION_PATTERN:
+        return paths.cases / f"{rows}x{features}", INPUT_DIGESTS[REPRESENTATIVE_SHAPE], None
+    if pattern == HELDOUT_PATTERN:
+        return paths.cases / pattern, HELDOUT_INPUT_DIGESTS, pattern
+    if pattern == ACCEPTANCE_PATTERN:
+        return paths.cases / pattern, ACCEPTANCE_INPUT_DIGESTS, pattern
+    if pattern == POLICY_V3_ACCEPTANCE_PATTERN:
+        return paths.cases / pattern, POLICY_V3_ACCEPTANCE_INPUT_DIGESTS, pattern
+    raise ValueError("policy v3 input pattern drifted")
+
+
+def _raw_output_files(raw: Mapping[str, Any], *, boundary: str, name: str) -> dict[str, Path]:
+    output_files = raw.get("output_files")
+    roles = tuple(OUTPUT_ROLES[boundary])
+    if not isinstance(output_files, Mapping) or tuple(sorted(output_files)) != tuple(sorted(roles)):
+        raise ValueError(f"{name} output file roles drifted")
+    result = {}
+    for role in roles:
+        value = output_files[role]
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{name} output file path drifted")
+        path = Path(value)
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"{name} output file is not one regular file")
+        result[role] = path
+    return result
+
+
+def _load_xla_policy_cell_v3(
+    path: Path,
+    case_directory: Path,
+    *,
+    expected_device: Mapping[str, str],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Path]]:
+    raw = _read_json(path, "ordinary-JAX/XLA policy cell")
+    boundary = raw.get("boundary")
+    if boundary not in BOUNDARIES:
+        raise ValueError("ordinary-JAX/XLA policy boundary drifted")
+    output_files = _raw_output_files(raw, boundary=boundary, name="ordinary-JAX/XLA policy")
+    cell_document = dict(raw)
+    del cell_document["output_files"]
+    cell, runtime = _validated_xla_raw_cell(cell_document, expected_device=expected_device)
+    shape = tuple(cell.get("shape", ()))
+    if shape != REPRESENTATIVE_SHAPE:
+        raise ValueError("ordinary-JAX/XLA policy shape drifted")
+    outputs = []
+    for role in OUTPUT_ROLES[boundary]:
+        output_shape = shape if role != "dgamma" else (shape[1],)
+        actual = _read_bf16_file(output_files[role], output_shape)
+        reference = _read_bf16_file(case_directory / f"reference_{role}.bf16", output_shape)
+        outputs.append(
+            {
+                "role": role,
+                "digest": hashlib.sha256(_bf16_bytes(actual)).hexdigest(),
+                "reference_digest": hashlib.sha256(_bf16_bytes(reference)).hexdigest(),
+                **error_metrics_v3(actual, reference, role=role),
+            }
+        )
+    cell["outputs"] = outputs
+    return cell, runtime, output_files
+
+
+def _repeat_diagnostics_v3(
+    policy_cells: Mapping[tuple[str, str, str, int], Mapping[str, Any]],
+    output_files: Mapping[tuple[str, str, str, int, str], Path],
+) -> dict[str, Any]:
+    coordinates = []
+    patterns = (*POLICY_V3_QUALIFICATION_PATTERNS, POLICY_V3_ACCEPTANCE_PATTERN)
+    for producer in PRODUCERS:
+        for pattern in patterns:
+            for boundary in BOUNDARIES:
+                for role in OUTPUT_ROLES[boundary]:
+                    shape = REPRESENTATIVE_SHAPE if role != "dgamma" else (REPRESENTATIVE_SHAPE[1],)
+                    paths = [output_files[(producer, pattern, boundary, repeat, role)] for repeat in range(2)]
+                    values = [_read_bf16_file(path, shape) for path in paths]
+                    cells = [policy_cells[(producer, pattern, boundary, repeat)] for repeat in range(2)]
+                    digests = []
+                    for cell, path in zip(cells, paths, strict=True):
+                        output = next(output for output in cell["outputs"] if output["role"] == role)
+                        digest = _file_sha256(path)
+                        if output["digest"] != digest:
+                            raise ValueError("policy output digest differs from its persisted raw file")
+                        digests.append(digest)
+                    coordinates.append(
+                        {
+                            "producer": producer,
+                            "input_pattern": pattern,
+                            "boundary": boundary,
+                            "role": role,
+                            "repeat0_digest": digests[0],
+                            "repeat1_digest": digests[1],
+                            **repeat_output_diagnostics_v3(*values),
+                            "raw_output_files": [str(path) for path in paths],
+                        }
+                    )
+    return {"schema": "shuttle_abi22_rmsnorm_repeat_diagnostics_v3", "coordinates": coordinates}
 
 
 def execute_oracle(
@@ -684,6 +800,167 @@ def execute_oracle(
         "artifacts": _artifact_identities(paths),
         "oracle_plan": {"base": dict(plan), "qualification": dict(policy_plan)},
         "observed_xla_runtime": observed_xla_runtime,
+        "reports": {
+            "transformer_engine_2_17": te_report,
+            "ordinary_jax_xla": xla_report,
+        },
+        "runtime_identity": dict(runtime_identity),
+        "shuttle": {"status": "pending", "blocker": SHUTTLE_BLOCKER},
+    }
+
+
+def execute_oracle_v3(
+    *,
+    paths: BatchPaths,
+    device: Mapping[str, str],
+    invoke: Callable[[list[str]], int] | None = None,
+    runner_repository: Path | None = None,
+) -> dict[str, Any]:
+    """Execute v2 base cells and the versioned v3 policy matrix."""
+    prepare_cases(paths.cases)
+    prepare_policy_v3_cases(paths.cases)
+    runtime_manifest = {
+        "schema": "shuttle_abi22_te_rmsnorm_runtime_v2",
+        "runner_sha256": _file_sha256(paths.te_runner),
+        "transformer_engine_library": {
+            "path": str(paths.te_library),
+            "sha256": _file_sha256(paths.te_library),
+        },
+    }
+    paths.runtime_manifest.write_bytes(canonical_json(runtime_manifest))
+    runtime_identity = validate_runtime_manifest(runtime_manifest, paths.te_runner)
+    source_root = paths.workspace.parent if runner_repository is None else runner_repository
+    plan = execution_plan(
+        str(paths.te_runner),
+        str(source_root / XLA_RUNNER),
+        str(RUNTIME_PYTHON),
+        paths.cases,
+    )
+    runner = invoke if invoke is not None else lambda argv: _invoke_oracle(paths, argv)
+    execute_plan(plan, runner)
+    policy_plan = qualification_plan_v3(
+        str(paths.te_runner),
+        str(source_root / XLA_RUNNER),
+        str(RUNTIME_PYTHON),
+        paths.cases,
+    )
+    execute_qualification_plan_v3(policy_plan, runner)
+
+    te_cells = []
+    xla_cells = []
+    observed_xla_runtime = None
+    for shape in SHAPES:
+        rows, features = shape
+        case = paths.cases / f"{rows}x{features}"
+        for boundary in BOUNDARIES:
+            te_raw = paths.raw / f"transformer_engine_2_17-{rows}x{features}-{boundary}.json"
+            xla_raw = paths.raw / f"ordinary_jax_xla-{rows}x{features}-{boundary}.json"
+            te_cells.append(load_te_raw_cell(te_raw, case))
+            xla_cell, runtime = _validated_xla_raw_cell(
+                _read_json(xla_raw, "ordinary-JAX/XLA raw cell"), expected_device=device
+            )
+            if observed_xla_runtime is None:
+                observed_xla_runtime = runtime
+            elif observed_xla_runtime != runtime:
+                raise ValueError("ordinary-JAX observed runtime differs across cells")
+            xla_cells.append(xla_cell)
+    if observed_xla_runtime is None:
+        raise AssertionError("ordinary-JAX matrix was empty")
+
+    policy_cells: dict[tuple[str, str, str, int], dict[str, Any]] = {}
+    output_files: dict[tuple[str, str, str, int, str], Path] = {}
+    for run in policy_plan["runs"]:
+        producer = run["producer"]
+        pattern = run["input_pattern"]
+        boundary = run["boundary"]
+        repeat = run["repeat"]
+        case, input_digests, expected_pattern = _policy_v3_case(paths, pattern)
+        raw_path = paths.raw / f"policy-{producer}-{pattern}-{boundary}-repeat{repeat}.json"
+        if producer == "transformer_engine_2_17":
+            raw_document = _read_json(raw_path, "Transformer Engine policy cell")
+            files = _raw_output_files(raw_document, boundary=boundary, name="Transformer Engine policy")
+            cell = load_te_raw_cell_v3(
+                raw_path,
+                case,
+                expected_input_digests=input_digests,
+                expected_pattern=expected_pattern,
+            )
+        else:
+            cell, runtime, files = _load_xla_policy_cell_v3(
+                raw_path,
+                case,
+                expected_device=device,
+            )
+            if observed_xla_runtime != runtime:
+                raise ValueError("ordinary-JAX observed runtime differs in policy qualification")
+        input_roles = ("x", "gamma") if boundary == "forward" else ("x", "gamma", "dy")
+        if cell["input_digests"] != {role: input_digests[role] for role in input_roles}:
+            raise ValueError("policy input bytes differ from the predeclared pattern")
+        cell.update(
+            producer=producer,
+            input_pattern=pattern,
+            repeat=repeat,
+            scope=(
+                "representative_policy_acceptance"
+                if pattern == POLICY_V3_ACCEPTANCE_PATTERN
+                else "representative_policy_qualification"
+            ),
+        )
+        policy_cells[(producer, pattern, boundary, repeat)] = cell
+        for role, path in files.items():
+            output_files[(producer, pattern, boundary, repeat, role)] = path
+
+    patterns = (*POLICY_V3_QUALIFICATION_PATTERNS, POLICY_V3_ACCEPTANCE_PATTERN)
+    raw_policy = {
+        "schema": "shuttle_abi22_rmsnorm_policy_evidence_v3",
+        "cells": [
+            policy_cells[(producer, pattern, boundary, repeat)]
+            for producer in PRODUCERS
+            for pattern in patterns
+            for boundary in BOUNDARIES
+            for repeat in range(2)
+        ],
+    }
+    raw_policy_bytes = canonical_json(raw_policy)
+    (paths.reports / "policy-raw-v3.json").write_bytes(raw_policy_bytes)
+    print(f"TRACK2_TE_POLICY_RAW_V3={raw_policy_bytes.decode()}", flush=True)
+    repeat_diagnostics = _repeat_diagnostics_v3(policy_cells, output_files)
+    repeat_bytes = canonical_json(repeat_diagnostics)
+    (paths.reports / "policy-repeat-diagnostics-v3.json").write_bytes(repeat_bytes)
+    print(f"TRACK2_TE_REPEAT_DIAGNOSTICS_V3={repeat_bytes.decode()}", flush=True)
+    qualification = validate_policy_v3_evidence(raw_policy)
+    print(f"TRACK2_TE_POLICY_DIAGNOSTICS_V3={canonical_json(qualification).decode()}", flush=True)
+
+    diagnostics = {
+        producer: [{"shape": cell["shape"], "boundary": cell["boundary"], "outputs": cell["outputs"]} for cell in cells]
+        for producer, cells in (
+            ("transformer_engine_2_17", te_cells),
+            ("ordinary_jax_xla", xla_cells),
+        )
+    }
+    print(f"TRACK2_TE_NUMERICAL_DIAGNOSTICS={canonical_json(diagnostics).decode()}")
+    te_report = assemble_report("transformer_engine_2_17", te_cells, runtime_identity, device)
+    xla_identity = {
+        "jax_version": observed_xla_runtime["jax_version"],
+        "jaxlib_version": observed_xla_runtime["jaxlib_version"],
+        "xla_revision": XLA_REVISION,
+    }
+    xla_report = assemble_report("ordinary_jax_xla", xla_cells, xla_identity, device)
+    acceptance = build_matched_acceptance_v3(
+        te_report,
+        xla_report,
+        qualification=qualification,
+        expected_te_identity=runtime_identity,
+    )
+    paths.te_report.write_bytes(canonical_json(te_report))
+    paths.xla_report.write_bytes(canonical_json(xla_report))
+    paths.acceptance.write_bytes(canonical_json(acceptance))
+    return {
+        "acceptance": acceptance,
+        "artifacts": _artifact_identities(paths, policy_version="v3"),
+        "oracle_plan": {"base": dict(plan), "qualification": dict(policy_plan)},
+        "observed_xla_runtime": observed_xla_runtime,
+        "repeat_diagnostics": repeat_diagnostics,
         "reports": {
             "transformer_engine_2_17": te_report,
             "ordinary_jax_xla": xla_report,
