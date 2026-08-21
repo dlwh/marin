@@ -4103,6 +4103,86 @@ int32_t orderedBf16(uint16_t value) {
   return INT32_C(0x8000) + static_cast<int32_t>(value);
 }
 
+TEST(GpuTransportV2Test, H100RunnerExecutesThreeMapBf16Chain) {
+  if (std::getenv("SHUTTLE_RUN_H100_NUMERICS") == nullptr)
+    GTEST_SKIP() << "set SHUTTLE_RUN_H100_NUMERICS=1 on an H100 worker";
+
+  constexpr llvm::StringLiteral source = R"mlir(
+module @three_map_bf16_chain {
+  func.func public @main(%arg0: tensor<2x3xbf16>) -> tensor<2x3xbf16> {
+    %0 = stablehlo.convert %arg0 : (tensor<2x3xbf16>) -> tensor<2x3xf32>
+    %1 = stablehlo.negate %0 : tensor<2x3xf32>
+    %2 = stablehlo.convert %1 : (tensor<2x3xf32>) -> tensor<2x3xbf16>
+    return %2 : tensor<2x3xbf16>
+  }
+}
+)mlir";
+  constexpr llvm::StringLiteral options =
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+  constexpr llvm::StringLiteral tuning =
+      R"json({"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json";
+  auto built = buildFixture(source, mlir::shuttle::NumericalPolicy::SourceOrdered,
+                            options, tuning);
+  ASSERT_TRUE(built);
+  auto transport = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+  ASSERT_TRUE(mlir::succeeded(transport));
+
+  auto platform = stream_executor::PlatformManager::PlatformWithName("CUDA");
+  ASSERT_TRUE(platform.ok()) << platform.status();
+  auto executor = (*platform)->ExecutorForDevice(0);
+  ASSERT_TRUE(executor.ok()) << executor.status();
+  ASSERT_NE((*executor)->GetDeviceDescription().name().find("H100"),
+            std::string::npos);
+  auto stream = (*executor)->CreateStream();
+  ASSERT_TRUE(stream.ok()) << stream.status();
+  stream_executor::StreamExecutorAddressAllocator allocator(*executor);
+  const auto &capability =
+      (*executor)->GetDeviceDescription().gpu_compute_capability();
+  auto runner = mlir::shuttle::GpuRunner::Create(
+      *transport, &allocator, 0, stream->get(), &capability);
+  ASSERT_TRUE(runner.ok()) << runner.status();
+  ASSERT_EQ((*runner)->resources().launchCount, 3);
+
+  std::vector<uint16_t> input = {
+      roundToBf16(-3.0f), roundToBf16(-1.5f), roundToBf16(-0.5f),
+      roundToBf16(0.5f),  roundToBf16(1.5f),  roundToBf16(3.0f),
+  };
+  std::vector<uint16_t> actual(input.size(), UINT16_C(0x7FC1));
+  auto deviceInput = (*executor)->AllocateArray<uint16_t>(input.size());
+  auto deviceResult = (*executor)->AllocateArray<uint16_t>(actual.size());
+  ASSERT_TRUE(deviceInput);
+  ASSERT_TRUE(deviceResult);
+  ASSERT_TRUE((*executor)
+                  ->SynchronousMemcpyH2D(input.data(),
+                                         input.size() * sizeof(uint16_t),
+                                         &deviceInput)
+                  .ok());
+  ASSERT_TRUE((*executor)
+                  ->SynchronousMemcpyH2D(actual.data(),
+                                         actual.size() * sizeof(uint16_t),
+                                         &deviceResult)
+                  .ok());
+  llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> operands{{
+      deviceInput.opaque(), static_cast<int64_t>(deviceInput.size())}};
+  llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> results{{
+      deviceResult.opaque(), static_cast<int64_t>(deviceResult.size())}};
+
+  ASSERT_TRUE((*runner)->Execute(operands, results).ok());
+  ASSERT_TRUE((*runner)->AwaitCompletion().ok());
+  ASSERT_TRUE((*executor)
+                  ->SynchronousMemcpyD2H(deviceResult,
+                                         actual.size() * sizeof(uint16_t),
+                                         actual.data())
+                  .ok());
+  for (auto [index, actualBits] : llvm::enumerate(actual))
+    EXPECT_EQ(actualBits, roundToBf16(-expandBf16(input[index])))
+        << "element " << index;
+
+  runner->reset();
+  (*executor)->Deallocate(&deviceResult);
+  (*executor)->Deallocate(&deviceInput);
+}
+
 std::vector<uint16_t> rmsNormForwardReference(
     llvm::ArrayRef<uint16_t> x, llvm::ArrayRef<uint16_t> weight,
     int64_t rows, int64_t features) {
