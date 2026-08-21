@@ -5540,8 +5540,8 @@ author: dlwh
   `f3342153b37f12dbed2f81eb39d7648898975b89`, tree
   `abb539d85b53ba38b3e297b7756a95327574ae3d`, source-manifest SHA-256
   `c2571612301c6346cd9bef34635b29fc8eec81a5d8e6635ebe6db0f03e1b74ea`,
-  through XLA's `override_repository`. The gate was based on production commit
-  `43b52d73d2eb13b28c765bda2bfd5ad28af9ceab`; its diff changes the fixture,
+  through Bazel's `--override_repository`. The gate was based on production
+  commit `43b52d73d2eb13b28c765bda2bfd5ad28af9ceab`; its diff changes the fixture,
   request builder, test, and build plumbing without changing the production
   implementation libraries.
 - Config: `/dlwh/shuttle-gb200-portability-r4` on batch-priority GB200x1 in
@@ -5577,7 +5577,8 @@ author: dlwh
   canonical result, terminal summary, submission receipt, sanitized result
   log, reconstructable gate-source patch, request SHA-256 and size, and file
   checksum manifest. The 6,363,268-byte request protobuf is omitted. The
-  compressed 47,430-byte full-index patch reconstructs gate tree
+  12,795-byte compressed full-index patch expands to 47,430 bytes and
+  reconstructs gate tree
   `abb539d85b53ba38b3e297b7756a95327574ae3d` from the reachable production
   commit and has SHA-256
   `366a15e1cb201225b475a896e517b560e30aff3884a6917a2f3c51e1c84dad21`.

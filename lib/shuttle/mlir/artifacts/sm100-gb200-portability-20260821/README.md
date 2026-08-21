@@ -7,8 +7,8 @@ NVIDIA GB200 with exit 0, zero failures, and zero preemptions. The task ran for
 
 The job compiled gate commit
 `f3342153b37f12dbed2f81eb39d7648898975b89`, tree
-`abb539d85b53ba38b3e297b7756a95327574ae3d`, through XLA's
-`override_repository`. The gate was based on production commit
+`abb539d85b53ba38b3e297b7756a95327574ae3d`, through Bazel's
+`--override_repository`. The gate was based on production commit
 `43b52d73d2eb13b28c765bda2bfd5ad28af9ceab`; its patch changes the reviewed
 fixture, request builder, test, and build plumbing without changing the
 production implementation libraries. The source manifest SHA-256 was
