@@ -567,6 +567,14 @@ def execute_oracle(
             xla_cells.append(xla_cell)
     if observed_xla_runtime is None:
         raise AssertionError("ordinary-JAX matrix was empty")
+    diagnostics = {
+        producer: [{"shape": cell["shape"], "boundary": cell["boundary"], "outputs": cell["outputs"]} for cell in cells]
+        for producer, cells in (
+            ("transformer_engine_2_17", te_cells),
+            ("ordinary_jax_xla", xla_cells),
+        )
+    }
+    print(f"TRACK2_TE_NUMERICAL_DIAGNOSTICS={canonical_json(diagnostics).decode()}")
     te_report = assemble_report("transformer_engine_2_17", te_cells, runtime_identity, device)
     xla_identity = {
         "jax_version": observed_xla_runtime["jax_version"],
