@@ -4380,6 +4380,336 @@ TEST(GpuTransportV2Test,
   EXPECT_GT(rotatedAffineDifferences, majority);
 }
 
+enum class ProspectiveLayerNormCase { Balanced, PositiveOffset };
+
+struct ProspectiveLayerNormCell {
+  ProspectiveLayerNormCase testCase;
+  int64_t rows;
+  int64_t features;
+  llvm::StringLiteral xDigest;
+  llvm::StringLiteral gammaDigest;
+  llvm::StringLiteral betaDigest;
+  llvm::StringLiteral binary64Digest;
+  llvm::StringLiteral scheduleDigest;
+  double scheduleMaxAbsoluteError;
+  double scheduleMeanAbsoluteError;
+  double scheduleRelativeLinfError;
+  int32_t scheduleMaxBf16UlpError;
+};
+
+constexpr ProspectiveLayerNormCell prospectiveLayerNormCells[] = {
+    {ProspectiveLayerNormCase::Balanced, 7, 13,
+     "2e43a818f671624fccb9795c962c5ebcafc27ea1e9e8de51f99a9037aabae0f2",
+     "34effe46fe6716c40d0ae04f50309d60e9743b32c86d890a64b1181378f54ef9",
+     "fcc835f6d26f1dddc481c20f646176ad694e6174115a5599fdd165668c8f5de8",
+     "9852b2a458e0a2c04a02eeaf23665c4fddafa0dc5e27c078f432e2c5f6cdce87",
+     "9852b2a458e0a2c04a02eeaf23665c4fddafa0dc5e27c078f432e2c5f6cdce87", 0.0,
+     0.0, 0.0, 0},
+    {ProspectiveLayerNormCase::Balanced, 2048, 4096,
+     "15e4956b1c4d383ba6fddf1b125c9bb9cb7c2ff98b209b4d1c6d1a0dfa918a81",
+     "872b4391b6ea27f0ad4741ecd49609658ad243341f6d8f99ae76b04164f6c94e",
+     "a9da8f908c0517f02b32fa19b2150614f27bb165dc90b96a28c1c9782006dec5",
+     "958b574bed7b59b3e772d3bfe75e3dd60f57bd61e3ca21ad38045c0ed705f27c",
+     "9126627880838eb8205d217555045de1c9c5621e10f5bd74623b9d5801f558ac",
+     0.015625, 3.1493970653606596e-08, 0.004975124378109453, 9},
+    {ProspectiveLayerNormCase::PositiveOffset, 7, 13,
+     "2e43a818f671624fccb9795c962c5ebcafc27ea1e9e8de51f99a9037aabae0f2",
+     "34effe46fe6716c40d0ae04f50309d60e9743b32c86d890a64b1181378f54ef9",
+     "91f2179937df9a6204846408a95194b24fbf38d49300696ddb1a6fd5c5087985",
+     "b33fad9beb38cf7af1bd937665bdbf508171e4f458759886f981a12d039219e8",
+     "b33fad9beb38cf7af1bd937665bdbf508171e4f458759886f981a12d039219e8", 0.0,
+     0.0, 0.0, 0},
+    {ProspectiveLayerNormCase::PositiveOffset, 2048, 4096,
+     "15e4956b1c4d383ba6fddf1b125c9bb9cb7c2ff98b209b4d1c6d1a0dfa918a81",
+     "872b4391b6ea27f0ad4741ecd49609658ad243341f6d8f99ae76b04164f6c94e",
+     "73eb4840bac211062417bea20b7633dd51e525f744a20d87b91a3f0283e5ba2a",
+     "878c03fd5b00d131debc718b80a9d208bb23096f80db5c67e44ef6f88f08e97c",
+     "8410a8e6435fdd1dd953cc0056770b8ccc909149a705172344411a8d753d2068", 0.0625,
+     3.725290298461914e-08, 0.005376344086021506, 1},
+};
+
+uint32_t prospectiveLayerNormMix32(uint32_t index, uint32_t stream) {
+  uint32_t value = index + UINT32_C(0x6A09E667) + stream * UINT32_C(0x9E3779B9);
+  value ^= value >> 16;
+  value *= UINT32_C(0x7FEB352D);
+  value ^= value >> 15;
+  value *= UINT32_C(0x846CA68B);
+  value ^= value >> 16;
+  return value;
+}
+
+LayerNormInputs
+prospectiveLayerNormInputs(const ProspectiveLayerNormCell &cell) {
+  LayerNormInputs inputs;
+  inputs.x.resize(cell.rows * cell.features);
+  inputs.gamma.resize(cell.features);
+  inputs.beta.resize(cell.features);
+  for (size_t index = 0; index < inputs.x.size(); ++index) {
+    int32_t quantized =
+        static_cast<int32_t>(prospectiveLayerNormMix32(index, 1) %
+                             UINT32_C(513)) -
+        256;
+    inputs.x[index] = roundToBf16(static_cast<float>(quantized) / 128.0f);
+  }
+  const int32_t betaOrigin =
+      cell.testCase == ProspectiveLayerNormCase::Balanced ? -64 : 1024;
+  for (int64_t feature = 0; feature < cell.features; ++feature) {
+    int32_t gammaQuantized =
+        64 + static_cast<int32_t>(prospectiveLayerNormMix32(feature, 2) %
+                                  UINT32_C(129));
+    int32_t betaQuantized =
+        betaOrigin + static_cast<int32_t>(
+                         prospectiveLayerNormMix32(feature, 3) % UINT32_C(129));
+    inputs.gamma[feature] =
+        roundToBf16(static_cast<float>(gammaQuantized) / 128.0f);
+    inputs.beta[feature] =
+        roundToBf16(static_cast<float>(betaQuantized) / 128.0f);
+  }
+  return inputs;
+}
+
+std::string prospectiveBf16Digest(llvm::ArrayRef<uint16_t> values,
+                                  llvm::ArrayRef<int64_t> shape) {
+  std::string shapeText = "(";
+  for (auto [ordinal, extent] : llvm::enumerate(shape)) {
+    if (ordinal != 0)
+      shapeText += ", ";
+    shapeText += std::to_string(extent);
+  }
+  if (shape.size() == 1)
+    shapeText += ",";
+  shapeText += ")";
+  llvm::SHA256 digest;
+  constexpr llvm::StringLiteral dtype = "bfloat16";
+  digest.update(llvm::ArrayRef<uint8_t>(
+      reinterpret_cast<const uint8_t *>(dtype.data()), dtype.size()));
+  digest.update(llvm::ArrayRef<uint8_t>(
+      reinterpret_cast<const uint8_t *>(shapeText.data()), shapeText.size()));
+  for (uint16_t value : values) {
+    std::array<uint8_t, 2> bytes{static_cast<uint8_t>(value),
+                                 static_cast<uint8_t>(value >> 8)};
+    digest.update(bytes);
+  }
+  return llvm::toHex(digest.final(), true);
+}
+
+float prospectiveAdd(float left, float right) {
+  volatile float result = left + right;
+  return result;
+}
+
+float prospectiveSubtract(float left, float right) {
+  volatile float result = left - right;
+  return result;
+}
+
+float prospectiveMultiply(float left, float right) {
+  volatile float result = left * right;
+  return result;
+}
+
+float prospectiveDivide(float numerator, float denominator) {
+  volatile float result = numerator / denominator;
+  return result;
+}
+
+float prospectiveSqrt(float value) {
+  volatile float result = std::sqrt(value);
+  return result;
+}
+
+std::vector<float> prospectiveScheduledFold(llvm::ArrayRef<float> values,
+                                            int64_t rows, int64_t features) {
+  assert(values.size() == static_cast<size_t>(rows * features));
+  const int64_t tile = std::min<int64_t>(features, 256);
+  const int64_t threads = (tile + 31) / 32 * 32;
+  const int64_t serialTiles = (features + tile - 1) / tile;
+  std::vector<float> result(rows);
+  std::vector<float> partials(threads);
+  for (int64_t row = 0; row < rows; ++row) {
+    std::fill(partials.begin(), partials.end(), 0.0f);
+    for (int64_t thread = 0; thread < threads; ++thread) {
+      for (int64_t leaf = 0; leaf < serialTiles; ++leaf) {
+        const int64_t feature = thread * serialTiles + leaf;
+        if (feature < features) {
+          partials[thread] = prospectiveAdd(partials[thread],
+                                            values[row * features + feature]);
+        }
+      }
+    }
+    int64_t active = threads;
+    while (active > 1) {
+      const int64_t pairs = active / 2;
+      for (int64_t pair = 0; pair < pairs; ++pair) {
+        partials[pair] =
+            prospectiveAdd(partials[pair * 2], partials[pair * 2 + 1]);
+      }
+      if (active % 2 != 0)
+        partials[pairs] = partials[active - 1];
+      active = (active + 1) / 2;
+    }
+    result[row] = partials[0];
+  }
+  return result;
+}
+
+std::vector<uint16_t>
+prospectiveScheduledLayerNorm(const LayerNormInputs &inputs, int64_t rows,
+                              int64_t features) {
+  std::vector<float> values(inputs.x.size());
+  for (auto [index, bits] : llvm::enumerate(inputs.x))
+    values[index] = expandBf16(bits);
+  std::vector<float> sums = prospectiveScheduledFold(values, rows, features);
+  std::vector<float> means(rows);
+  std::vector<float> centered(values.size());
+  std::vector<float> squared(values.size());
+  for (int64_t row = 0; row < rows; ++row) {
+    means[row] = prospectiveDivide(sums[row], static_cast<float>(features));
+    for (int64_t feature = 0; feature < features; ++feature) {
+      const int64_t element = row * features + feature;
+      centered[element] = prospectiveSubtract(values[element], means[row]);
+      squared[element] =
+          prospectiveMultiply(centered[element], centered[element]);
+    }
+  }
+  std::vector<float> squaredSums =
+      prospectiveScheduledFold(squared, rows, features);
+  std::vector<uint16_t> output(values.size());
+  for (int64_t row = 0; row < rows; ++row) {
+    float variance =
+        prospectiveDivide(squaredSums[row], static_cast<float>(features));
+    float root = prospectiveSqrt(prospectiveAdd(variance, 1.0e-5f));
+    float inverse = prospectiveDivide(1.0f, root);
+    for (int64_t feature = 0; feature < features; ++feature) {
+      const int64_t element = row * features + feature;
+      float value = prospectiveMultiply(centered[element], inverse);
+      value = prospectiveMultiply(value, expandBf16(inputs.gamma[feature]));
+      value = prospectiveAdd(value, expandBf16(inputs.beta[feature]));
+      output[element] = roundToBf16(value);
+    }
+  }
+  return output;
+}
+
+std::vector<uint16_t>
+prospectiveBinary64LayerNorm(const LayerNormInputs &inputs, int64_t rows,
+                             int64_t features) {
+  std::vector<uint16_t> output(inputs.x.size());
+  for (int64_t row = 0; row < rows; ++row) {
+    double sum = 0.0;
+    for (int64_t feature = 0; feature < features; ++feature)
+      sum += expandBf16(inputs.x[row * features + feature]);
+    double mean = sum / static_cast<double>(features);
+    double squaredSum = 0.0;
+    for (int64_t feature = 0; feature < features; ++feature) {
+      double centered =
+          static_cast<double>(expandBf16(inputs.x[row * features + feature])) -
+          mean;
+      squaredSum += centered * centered;
+    }
+    double inverse =
+        1.0 / std::sqrt(squaredSum / static_cast<double>(features) + 1.0e-5);
+    for (int64_t feature = 0; feature < features; ++feature) {
+      const int64_t element = row * features + feature;
+      double centered =
+          static_cast<double>(expandBf16(inputs.x[element])) - mean;
+      double value =
+          centered * inverse *
+              static_cast<double>(expandBf16(inputs.gamma[feature])) +
+          static_cast<double>(expandBf16(inputs.beta[feature]));
+      output[element] = roundToBf16(static_cast<float>(value));
+    }
+  }
+  return output;
+}
+
+struct ProspectiveLayerNormMetrics {
+  double maxAbsoluteError = 0.0;
+  double meanAbsoluteError = 0.0;
+  double relativeLinfError = 0.0;
+  int32_t maxBf16UlpError = 0;
+  size_t maxAbsoluteElement = 0;
+  size_t maxUlpElement = 0;
+};
+
+std::optional<ProspectiveLayerNormMetrics>
+prospectiveLayerNormMetrics(llvm::ArrayRef<uint16_t> actual,
+                            llvm::ArrayRef<uint16_t> reference) {
+  if (actual.size() != reference.size() || actual.empty())
+    return std::nullopt;
+  ProspectiveLayerNormMetrics metrics;
+  double absoluteSum = 0.0;
+  double referenceScale = 1.0 / 128.0;
+  for (size_t element = 0; element < actual.size(); ++element) {
+    double actualValue = expandBf16(actual[element]);
+    double referenceValue = expandBf16(reference[element]);
+    if (!std::isfinite(actualValue) || !std::isfinite(referenceValue))
+      return std::nullopt;
+    double absolute = std::abs(actualValue - referenceValue);
+    absoluteSum += absolute;
+    referenceScale = std::max(referenceScale, std::abs(referenceValue));
+    if (absolute > metrics.maxAbsoluteError) {
+      metrics.maxAbsoluteError = absolute;
+      metrics.maxAbsoluteElement = element;
+    }
+    int32_t ulp = std::abs(orderedBf16(actual[element]) -
+                           orderedBf16(reference[element]));
+    if (ulp > metrics.maxBf16UlpError) {
+      metrics.maxBf16UlpError = ulp;
+      metrics.maxUlpElement = element;
+    }
+  }
+  metrics.meanAbsoluteError = absoluteSum / actual.size();
+  metrics.relativeLinfError = metrics.maxAbsoluteError / referenceScale;
+  return metrics;
+}
+
+void expectProspectiveLayerNormMetrics(
+    const ProspectiveLayerNormMetrics &metrics,
+    const ProspectiveLayerNormCell &cell) {
+  const bool balanced = cell.testCase == ProspectiveLayerNormCase::Balanced;
+  EXPECT_LE(metrics.maxAbsoluteError, balanced ? 0.015625 : 0.0625)
+      << "element " << metrics.maxAbsoluteElement;
+  EXPECT_LE(metrics.meanAbsoluteError, 1.0e-6);
+  EXPECT_LE(metrics.relativeLinfError, 0.0078125);
+  EXPECT_LE(metrics.maxBf16UlpError, balanced ? 16 : 1)
+      << "element " << metrics.maxUlpElement;
+}
+
+TEST(GpuTransportV2Test,
+     ProspectiveLayerNormForwardContractMatchesSealedHostModels) {
+  for (const ProspectiveLayerNormCell &cell : prospectiveLayerNormCells) {
+    SCOPED_TRACE(
+        llvm::formatv("{0}x{1} {2}", cell.rows, cell.features,
+                      cell.testCase == ProspectiveLayerNormCase::Balanced
+                          ? "balanced"
+                          : "positive_offset")
+            .str());
+    LayerNormInputs inputs = prospectiveLayerNormInputs(cell);
+    EXPECT_EQ(prospectiveBf16Digest(inputs.x, {cell.rows, cell.features}),
+              cell.xDigest);
+    EXPECT_EQ(prospectiveBf16Digest(inputs.gamma, {cell.features}),
+              cell.gammaDigest);
+    EXPECT_EQ(prospectiveBf16Digest(inputs.beta, {cell.features}),
+              cell.betaDigest);
+    std::vector<uint16_t> binary64 =
+        prospectiveBinary64LayerNorm(inputs, cell.rows, cell.features);
+    std::vector<uint16_t> scheduled =
+        prospectiveScheduledLayerNorm(inputs, cell.rows, cell.features);
+    EXPECT_EQ(prospectiveBf16Digest(binary64, {cell.rows, cell.features}),
+              cell.binary64Digest);
+    EXPECT_EQ(prospectiveBf16Digest(scheduled, {cell.rows, cell.features}),
+              cell.scheduleDigest);
+    auto metrics = prospectiveLayerNormMetrics(scheduled, binary64);
+    ASSERT_TRUE(metrics);
+    EXPECT_EQ(metrics->maxAbsoluteError, cell.scheduleMaxAbsoluteError);
+    EXPECT_EQ(metrics->meanAbsoluteError, cell.scheduleMeanAbsoluteError);
+    EXPECT_EQ(metrics->relativeLinfError, cell.scheduleRelativeLinfError);
+    EXPECT_EQ(metrics->maxBf16UlpError, cell.scheduleMaxBf16UlpError);
+    expectProspectiveLayerNormMetrics(*metrics, cell);
+  }
+}
+
 TEST(GpuTransportV2Test, H100RunnerExecutesThreeMapBf16Chain) {
   if (std::getenv("SHUTTLE_RUN_H100_NUMERICS") == nullptr)
     GTEST_SKIP() << "set SHUTTLE_RUN_H100_NUMERICS=1 on an H100 worker";
@@ -4609,6 +4939,207 @@ TEST(GpuTransportV2Test, H100RunnerMatchesIndependentLayerNormForwardOracle) {
       (*executor)->Deallocate(&deviceResult);
       for (auto &device : deviceOperands)
         (*executor)->Deallocate(&device);
+    }
+  }
+}
+
+TEST(GpuTransportV2Test,
+     H100RunnerMatchesProspectiveLayerNormForwardContractV1) {
+  if (std::getenv("SHUTTLE_RUN_H100_NUMERICS") == nullptr)
+    GTEST_SKIP() << "set SHUTTLE_RUN_H100_NUMERICS=1 on an H100 worker";
+
+  auto platform = stream_executor::PlatformManager::PlatformWithName("CUDA");
+  ASSERT_TRUE(platform.ok()) << platform.status();
+  auto executor = (*platform)->ExecutorForDevice(0);
+  ASSERT_TRUE(executor.ok()) << executor.status();
+  ASSERT_NE((*executor)->GetDeviceDescription().name().find("H100"),
+            std::string::npos);
+  auto stream = (*executor)->CreateStream();
+  ASSERT_TRUE(stream.ok()) << stream.status();
+  stream_executor::StreamExecutorAddressAllocator allocator(*executor);
+  const auto &capability =
+      (*executor)->GetDeviceDescription().gpu_compute_capability();
+
+  constexpr llvm::StringLiteral sourceOrderedOptions =
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+  constexpr llvm::StringLiteral fastOptions =
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+  constexpr llvm::StringLiteral tuning =
+      R"json({"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json";
+  struct Boundary {
+    llvm::StringLiteral fixture;
+    int64_t rows;
+    int64_t features;
+  };
+  constexpr Boundary boundaries[] = {
+      {"jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-forward.mlir", 7, 13},
+      {"jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-forward.mlir", 2048, 4096},
+  };
+  for (const Boundary &boundary : boundaries) {
+    SCOPED_TRACE(boundary.fixture.str());
+    for (mlir::shuttle::NumericalPolicy policy :
+         {mlir::shuttle::NumericalPolicy::SourceOrdered,
+          mlir::shuttle::NumericalPolicy::Fast}) {
+      const llvm::StringRef policyName =
+          policy == mlir::shuttle::NumericalPolicy::SourceOrdered
+              ? "source_ordered"
+              : "fast";
+      SCOPED_TRACE(policyName.str());
+      auto source = fixtureSource(boundary.fixture);
+      ASSERT_TRUE(source);
+      auto built =
+          buildFixture(*source, policy,
+                       policy == mlir::shuttle::NumericalPolicy::SourceOrdered
+                           ? sourceOrderedOptions
+                           : fastOptions,
+                       tuning);
+      ASSERT_TRUE(built);
+      auto transport =
+          mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+      ASSERT_TRUE(mlir::succeeded(transport));
+      auto executable = mlir::shuttle::GpuExecutable::Load(*transport);
+      ASSERT_TRUE(executable.ok()) << executable.status();
+      const auto &bindings = (*executable)->externalBindings();
+      ASSERT_EQ(bindings.size(), 4u);
+      constexpr mlir::shuttle::ExecutableBindingKind kinds[] = {
+          mlir::shuttle::ExecutableBindingKind::Operand,
+          mlir::shuttle::ExecutableBindingKind::Operand,
+          mlir::shuttle::ExecutableBindingKind::Operand,
+          mlir::shuttle::ExecutableBindingKind::Result,
+      };
+      const int64_t bindingBytes[] = {
+          boundary.rows * boundary.features *
+              static_cast<int64_t>(sizeof(uint16_t)),
+          boundary.features * static_cast<int64_t>(sizeof(uint16_t)),
+          boundary.features * static_cast<int64_t>(sizeof(uint16_t)),
+          boundary.rows * boundary.features *
+              static_cast<int64_t>(sizeof(uint16_t)),
+      };
+      for (auto [ordinal, binding] : llvm::enumerate(bindings)) {
+        EXPECT_EQ(binding.kind, kinds[ordinal]);
+        EXPECT_EQ(binding.index, ordinal == 3 ? 0 : ordinal);
+        EXPECT_EQ(binding.requiredBytes, bindingBytes[ordinal]);
+      }
+
+      auto runner = mlir::shuttle::GpuRunner::Create(
+          *transport, &allocator, 0, stream->get(), &capability);
+      ASSERT_TRUE(runner.ok()) << runner.status();
+      const mlir::shuttle::GpuRunnerResources &resources =
+          (*runner)->resources();
+      EXPECT_EQ(resources.launchCount, 1);
+      EXPECT_EQ(resources.externalOperandCount, 3);
+      EXPECT_EQ(resources.externalResultCount, 1);
+      EXPECT_EQ(resources.temporaryAllocationCount, 0);
+      EXPECT_EQ(resources.temporaryBytes, 0);
+
+      for (const ProspectiveLayerNormCell &cell : prospectiveLayerNormCells) {
+        if (cell.rows != boundary.rows || cell.features != boundary.features)
+          continue;
+        const llvm::StringRef caseName =
+            cell.testCase == ProspectiveLayerNormCase::Balanced
+                ? "balanced"
+                : "positive_offset";
+        SCOPED_TRACE(caseName.str());
+        LayerNormInputs inputs = prospectiveLayerNormInputs(cell);
+        std::vector<uint16_t> scheduled =
+            prospectiveScheduledLayerNorm(inputs, cell.rows, cell.features);
+        std::vector<uint16_t> binary64 =
+            prospectiveBinary64LayerNorm(inputs, cell.rows, cell.features);
+        ASSERT_EQ(prospectiveBf16Digest(inputs.x, {cell.rows, cell.features}),
+                  cell.xDigest);
+        ASSERT_EQ(prospectiveBf16Digest(inputs.gamma, {cell.features}),
+                  cell.gammaDigest);
+        ASSERT_EQ(prospectiveBf16Digest(inputs.beta, {cell.features}),
+                  cell.betaDigest);
+        ASSERT_EQ(prospectiveBf16Digest(binary64, {cell.rows, cell.features}),
+                  cell.binary64Digest);
+        ASSERT_EQ(prospectiveBf16Digest(scheduled, {cell.rows, cell.features}),
+                  cell.scheduleDigest);
+
+        const std::vector<const std::vector<uint16_t> *> hostOperands = {
+            &inputs.x, &inputs.gamma, &inputs.beta};
+        std::vector<stream_executor::DeviceAddressBase> deviceOperands;
+        llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> operands;
+        for (const std::vector<uint16_t> *host : hostOperands) {
+          auto device = (*executor)->AllocateArray<uint16_t>(host->size());
+          ASSERT_TRUE(device);
+          ASSERT_TRUE(
+              (*executor)
+                  ->SynchronousMemcpyH2D(
+                      host->data(), host->size() * sizeof(uint16_t), &device)
+                  .ok());
+          deviceOperands.push_back(device);
+          operands.push_back(
+              {device.opaque(), static_cast<int64_t>(device.size())});
+        }
+        std::vector<std::vector<uint16_t>> actualRuns(
+            2, std::vector<uint16_t>(scheduled.size()));
+        auto deviceResult =
+            (*executor)->AllocateArray<uint16_t>(scheduled.size());
+        ASSERT_TRUE(deviceResult);
+        llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> results{
+            {deviceResult.opaque(), static_cast<int64_t>(deviceResult.size())}};
+        for (std::vector<uint16_t> &actual : actualRuns) {
+          std::fill(actual.begin(), actual.end(), UINT16_C(0x7FC1));
+          ASSERT_TRUE((*executor)
+                          ->SynchronousMemcpyH2D(
+                              actual.data(), actual.size() * sizeof(uint16_t),
+                              &deviceResult)
+                          .ok());
+          absl::Status execution = (*runner)->Execute(operands, results);
+          ASSERT_TRUE(execution.ok()) << execution;
+          ASSERT_TRUE((*runner)->AwaitCompletion().ok());
+          ASSERT_TRUE((*executor)
+                          ->SynchronousMemcpyD2H(
+                              deviceResult, actual.size() * sizeof(uint16_t),
+                              actual.data())
+                          .ok());
+        }
+
+        int64_t repeatabilityDifferences = 0;
+        size_t firstRepeatabilityDifference = 0;
+        int64_t scheduleDifferences = 0;
+        size_t firstScheduleDifference = 0;
+        for (size_t element = 0; element < scheduled.size(); ++element) {
+          if (actualRuns[0][element] != actualRuns[1][element]) {
+            if (repeatabilityDifferences == 0)
+              firstRepeatabilityDifference = element;
+            ++repeatabilityDifferences;
+          }
+          if (actualRuns[0][element] != scheduled[element]) {
+            if (scheduleDifferences == 0)
+              firstScheduleDifference = element;
+            ++scheduleDifferences;
+          }
+        }
+        EXPECT_EQ(repeatabilityDifferences, 0)
+            << "first element " << firstRepeatabilityDifference;
+        EXPECT_EQ(scheduleDifferences, 0)
+            << "first element " << firstScheduleDifference << ", actual "
+            << expandBf16(actualRuns[0][firstScheduleDifference])
+            << ", scheduled " << expandBf16(scheduled[firstScheduleDifference]);
+        auto metrics = prospectiveLayerNormMetrics(actualRuns[0], binary64);
+        ASSERT_TRUE(metrics)
+            << "all actual and reference outputs must be finite";
+        expectProspectiveLayerNormMetrics(*metrics, cell);
+        RecordProperty(
+            llvm::formatv("metrics_{0}x{1}_{2}_{3}", cell.rows, cell.features,
+                          caseName, policyName)
+                .str(),
+            llvm::formatv(
+                "max_absolute={0},mean_absolute={1},relative_linf={2},"
+                "max_bf16_ulp={3},schedule_differences={4},"
+                "repeatability_differences={5}",
+                metrics->maxAbsoluteError, metrics->meanAbsoluteError,
+                metrics->relativeLinfError, metrics->maxBf16UlpError,
+                scheduleDifferences, repeatabilityDifferences)
+                .str());
+
+        (*executor)->Deallocate(&deviceResult);
+        for (auto &device : deviceOperands)
+          (*executor)->Deallocate(&device);
+      }
+      runner->reset();
     }
   }
 }

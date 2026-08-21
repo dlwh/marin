@@ -1,0 +1,124 @@
+{
+  "cells": [
+    {
+      "binary64_output_digest": "9852b2a458e0a2c04a02eeaf23665c4fddafa0dc5e27c078f432e2c5f6cdce87",
+      "case": "balanced",
+      "input_digests": {
+        "beta": "fcc835f6d26f1dddc481c20f646176ad694e6174115a5599fdd165668c8f5de8",
+        "gamma": "34effe46fe6716c40d0ae04f50309d60e9743b32c86d890a64b1181378f54ef9",
+        "x": "2e43a818f671624fccb9795c962c5ebcafc27ea1e9e8de51f99a9037aabae0f2"
+      },
+      "limits": {
+        "max_absolute_error": 0.015625,
+        "max_bfloat16_ulp_error": 16,
+        "mean_absolute_error": 1e-06,
+        "relative_linf_error": 0.0078125
+      },
+      "policies": ["source_ordered", "fast"],
+      "repeatability_runs": 2,
+      "schedule_metrics": {
+        "max_absolute_error": 0.0,
+        "max_bfloat16_ulp_error": 0,
+        "mean_absolute_error": 0.0,
+        "relative_linf_error": 0.0
+      },
+      "schedule_output_digest": "9852b2a458e0a2c04a02eeaf23665c4fddafa0dc5e27c078f432e2c5f6cdce87",
+      "shape": [7, 13]
+    },
+    {
+      "binary64_output_digest": "958b574bed7b59b3e772d3bfe75e3dd60f57bd61e3ca21ad38045c0ed705f27c",
+      "case": "balanced",
+      "input_digests": {
+        "beta": "a9da8f908c0517f02b32fa19b2150614f27bb165dc90b96a28c1c9782006dec5",
+        "gamma": "872b4391b6ea27f0ad4741ecd49609658ad243341f6d8f99ae76b04164f6c94e",
+        "x": "15e4956b1c4d383ba6fddf1b125c9bb9cb7c2ff98b209b4d1c6d1a0dfa918a81"
+      },
+      "limits": {
+        "max_absolute_error": 0.015625,
+        "max_bfloat16_ulp_error": 16,
+        "mean_absolute_error": 1e-06,
+        "relative_linf_error": 0.0078125
+      },
+      "policies": ["source_ordered", "fast"],
+      "repeatability_runs": 2,
+      "schedule_metrics": {
+        "max_absolute_error": 0.015625,
+        "max_bfloat16_ulp_error": 9,
+        "mean_absolute_error": 3.1493970653606596e-08,
+        "relative_linf_error": 0.004975124378109453
+      },
+      "schedule_output_digest": "9126627880838eb8205d217555045de1c9c5621e10f5bd74623b9d5801f558ac",
+      "shape": [2048, 4096]
+    },
+    {
+      "binary64_output_digest": "b33fad9beb38cf7af1bd937665bdbf508171e4f458759886f981a12d039219e8",
+      "case": "positive_offset",
+      "input_digests": {
+        "beta": "91f2179937df9a6204846408a95194b24fbf38d49300696ddb1a6fd5c5087985",
+        "gamma": "34effe46fe6716c40d0ae04f50309d60e9743b32c86d890a64b1181378f54ef9",
+        "x": "2e43a818f671624fccb9795c962c5ebcafc27ea1e9e8de51f99a9037aabae0f2"
+      },
+      "limits": {
+        "max_absolute_error": 0.0625,
+        "max_bfloat16_ulp_error": 1,
+        "mean_absolute_error": 1e-06,
+        "relative_linf_error": 0.0078125
+      },
+      "policies": ["source_ordered", "fast"],
+      "repeatability_runs": 2,
+      "schedule_metrics": {
+        "max_absolute_error": 0.0,
+        "max_bfloat16_ulp_error": 0,
+        "mean_absolute_error": 0.0,
+        "relative_linf_error": 0.0
+      },
+      "schedule_output_digest": "b33fad9beb38cf7af1bd937665bdbf508171e4f458759886f981a12d039219e8",
+      "shape": [7, 13]
+    },
+    {
+      "binary64_output_digest": "878c03fd5b00d131debc718b80a9d208bb23096f80db5c67e44ef6f88f08e97c",
+      "case": "positive_offset",
+      "input_digests": {
+        "beta": "73eb4840bac211062417bea20b7633dd51e525f744a20d87b91a3f0283e5ba2a",
+        "gamma": "872b4391b6ea27f0ad4741ecd49609658ad243341f6d8f99ae76b04164f6c94e",
+        "x": "15e4956b1c4d383ba6fddf1b125c9bb9cb7c2ff98b209b4d1c6d1a0dfa918a81"
+      },
+      "limits": {
+        "max_absolute_error": 0.0625,
+        "max_bfloat16_ulp_error": 1,
+        "mean_absolute_error": 1e-06,
+        "relative_linf_error": 0.0078125
+      },
+      "policies": ["source_ordered", "fast"],
+      "repeatability_runs": 2,
+      "schedule_metrics": {
+        "max_absolute_error": 0.0625,
+        "max_bfloat16_ulp_error": 1,
+        "mean_absolute_error": 3.725290298461914e-08,
+        "relative_linf_error": 0.005376344086021506
+      },
+      "schedule_output_digest": "8410a8e6435fdd1dd953cc0056770b8ccc909149a705172344411a8d753d2068",
+      "shape": [2048, 4096]
+    }
+  ],
+  "contract_id": "abi22_layernorm_forward_h100_v1",
+  "generator": {
+    "algorithm": "mix32_power_of_two_bf16_v1",
+    "seed": 1779033703,
+    "streams": {"beta": 3, "gamma": 2, "x": 1}
+  },
+  "model": {
+    "epilogue": "sub_mul_mul_add_rn_f32_then_cvt_rn_bf16",
+    "fold_schedule": "simt32_contiguous_leaf_then_adjacent_pair_tree_v1",
+    "near_zero": "none",
+    "rsqrt": "sqrt.rn.f32_then_div.rn.f32_from_one",
+    "ulp": "raw_ordered_finite_bf16_all_elements"
+  },
+  "qualification_only": {
+    "job": "/dlwh/shuttle-layernorm-forward-h100-r3",
+    "promotion_allowed": false,
+    "purpose": "candidate_model_and_limit_design_only",
+    "request_sha256": "9534f59f22cdd4f4dd28112de1185ffe40d72618a8933bb6ba5f3edbae73271b"
+  },
+  "schema": "shuttle_abi22_layernorm_forward_numerical_contract_v1"
+}
