@@ -807,6 +807,56 @@ def test_shell_wrapper_derives_runfiles_root_when_bazel_omits_environment(tmp_pa
     assert capture.read_text().strip() == str(runfiles_root)
 
 
+def test_shell_wrapper_rejects_missing_or_ambiguous_derived_runfiles_root(tmp_path: Path) -> None:
+    runner = Path(__file__).parents[1] / "test" / "run-h100-shuttle-rmsnorm-representative.sh"
+    runfiles_root = tmp_path / "matrix.runfiles"
+    invocation_root = runfiles_root / "xla"
+    relative_gpu_test = Path("external/shuttle_mlir/gpu_transport_v2_test")
+    gpu_transport_test = invocation_root / relative_gpu_test
+    gpu_transport_test.parent.mkdir(parents=True)
+    gpu_transport_test.write_text("#!/bin/sh\nexit 0\n")
+    gpu_transport_test.chmod(0o755)
+    plan = execution_plan(
+        runner=runner,
+        gpu_transport_test=relative_gpu_test,
+        case_root=tmp_path / "cases",
+        raw_root=tmp_path / "raw",
+    )
+    environment = dict(os.environ)
+    environment.pop("TEST_SRCDIR", None)
+    environment.pop("RUNFILES_DIR", None)
+    environment.pop("RUNFILES_MANIFEST_FILE", None)
+
+    missing = subprocess.run(
+        plan["runs"][0]["argv"],
+        cwd=invocation_root,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert missing.returncode == 2
+    assert "representative runfiles root" in missing.stderr
+
+    fixture_suffix = Path(
+        "shuttle_mlir/test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2048x4096-forward.mlir"
+    )
+    for candidate in (runfiles_root, invocation_root):
+        fixture = candidate / fixture_suffix
+        fixture.parent.mkdir(parents=True, exist_ok=True)
+        fixture.write_text("module {}\n")
+    ambiguous = subprocess.run(
+        plan["runs"][0]["argv"],
+        cwd=invocation_root,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert ambiguous.returncode == 2
+    assert "ambiguous representative runfiles roots" in ambiguous.stderr
+
+
 def test_every_acceptance_cell_enforces_metrics_roles_and_resources(
     provider: str,
     boundary: str,
@@ -1051,6 +1101,9 @@ class RepresentativeRmsNormTest(unittest.TestCase):
         test_shell_wrapper_bridges_bazel_runfiles_directory_for_fixture_lookup(self.temporary_path("wrapper-runfiles"))
         test_shell_wrapper_derives_runfiles_root_when_bazel_omits_environment(
             self.temporary_path("wrapper-runfiles-derived")
+        )
+        test_shell_wrapper_rejects_missing_or_ambiguous_derived_runfiles_root(
+            self.temporary_path("wrapper-runfiles-invalid")
         )
 
     def test_process_and_raw_claim_failures(self) -> None:
