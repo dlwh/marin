@@ -469,7 +469,9 @@ def _fake_oracle_invoke(paths: BatchPaths, calls: list[list[str]], argv: list[st
     return 0
 
 
-def test_execute_oracle_runs_exact_matrix_and_builds_matched_acceptance(tmp_path: Path) -> None:
+def test_execute_oracle_runs_exact_matrix_and_builds_matched_acceptance(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     paths = BatchPaths.under(tmp_path / "workspace")
     paths.workspace.mkdir()
     paths.reports.mkdir()
@@ -485,6 +487,22 @@ def test_execute_oracle_runs_exact_matrix_and_builds_matched_acceptance(tmp_path
         device=device,
         invoke=lambda argv: _fake_oracle_invoke(paths, calls, argv),
     )
+
+    diagnostic_lines = [
+        line for line in capsys.readouterr().out.splitlines() if line.startswith("TRACK2_TE_NUMERICAL_DIAGNOSTICS=")
+    ]
+    assert len(diagnostic_lines) == 1
+    diagnostics = json.loads(diagnostic_lines[0].split("=", 1)[1])
+    assert set(diagnostics) == {"ordinary_jax_xla", "transformer_engine_2_17"}
+    for cells in diagnostics.values():
+        assert [(cell["shape"], cell["boundary"]) for cell in cells] == [
+            (list(shape), boundary) for shape in SHAPES for boundary in BOUNDARIES
+        ]
+        assert all(
+            output["max_absolute_error"] == 0.0 and output["max_bfloat16_ulp"] == 0
+            for cell in cells
+            for output in cell["outputs"]
+        )
 
     assert len(calls) == 12
     assert [
