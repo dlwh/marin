@@ -1,0 +1,11 @@
+{
+  "bundle_sha256": "38e887bc11d41cb9a6ba8f3c5cda21f35561133782e704ccf55e1564cfe9b9f2",
+  "bundle_size": 7515895,
+  "external_request_bytes_preserved": false,
+  "job_id": "/dlwh/shuttle-track1-rmsnorm-contract-h100-canary-r5",
+  "request_path_at_submission": "/private/tmp/shuttle-rmsnorm-contract-hybrid-east-request.lbKwaw/launch.pb",
+  "request_sha256": "d56f626fc3b30588940a7b7bd28f1b927f6b1b5e28944505d5529902db25fbdd",
+  "request_size": 7516903,
+  "schema": "track1_rmsnorm_contract_hybrid_h100_request_identity",
+  "schema_version": 1
+}

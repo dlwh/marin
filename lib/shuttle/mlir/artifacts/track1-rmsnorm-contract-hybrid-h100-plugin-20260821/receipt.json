@@ -1,0 +1,44 @@
+{
+  "authorization_sha256": "d9c603e5419a03e046c10907987c79e89ad7e4435e1bcbeec944580bb2cbb62f",
+  "bundle_sha256": "38e887bc11d41cb9a6ba8f3c5cda21f35561133782e704ccf55e1564cfe9b9f2",
+  "bundle_size": 7515895,
+  "cluster": "cw-us-east-02a",
+  "coordinates": 12,
+  "duration_seconds": 1002.15,
+  "failures": 0,
+  "finished_at": "2026-08-21T22:43:45.445Z",
+  "integration_implementation_commit": "406287b97305f6229ea1b7f97a6f51f3ae31c5b6",
+  "job_id": "/dlwh/shuttle-track1-rmsnorm-contract-h100-canary-r5",
+  "numerical_policy_sha256": "9fd9e00c6ef90b40d12916f671eeb5b73b385875d8e1ee485e0d029ab272996a",
+  "preemptions": 0,
+  "request_bytes_preserved": false,
+  "request_sha256": "d56f626fc3b30588940a7b7bd28f1b927f6b1b5e28944505d5529902db25fbdd",
+  "request_size": 7516903,
+  "result_payload_sha256_without_newline": "ea890d129d9e175b1553af1d73f383711f09fdce5cd27471a89600102eacba8b",
+  "result_sha256": "e02da4a840ac1032a2d959a3687178932c93610d1b6d37c6a27f6a7ffbda50c5",
+  "result_size": 58825,
+  "reviewed_source_commit": "ae1db7865780ccf046c2e8ee49681afb054fa4bd",
+  "schema": "track1_rmsnorm_contract_hybrid_h100_evidence_receipt",
+  "schema_version": 1,
+  "source_manifest_sha256": "c3dbb267be48d93d4c16debc52cb86cb05e89669af97f671f8c1771f3498d47a",
+  "state": "succeeded",
+  "submitted_at": "2026-08-21T22:26:53.755Z",
+  "task_exit_code": 0,
+  "wheels": [
+    {
+      "name": "jaxlib-0.10.1-cp312-cp312-manylinux_2_27_x86_64.whl",
+      "sha256": "a7133844b1fef2f7a1a0e9cdec5f9cdda82d51ca4840110e3039a8fdf4e272e0",
+      "size": 86360028
+    },
+    {
+      "name": "jax_cuda13_plugin-0.10.1-cp312-cp312-manylinux_2_27_x86_64.whl",
+      "sha256": "b163e5bd3865b4509b1961224dbfe5868d62ae8c79c789533f80e45885b39276",
+      "size": 7427633
+    },
+    {
+      "name": "jax_cuda13_pjrt-0.10.1-py3-none-manylinux_2_27_x86_64.whl",
+      "sha256": "b70ecacb8eab324d095de1568cd5d4a8b8706ce6f5fec9ced29cd337297ef2d1",
+      "size": 99042108
+    }
+  ]
+}

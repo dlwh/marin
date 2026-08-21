@@ -1,0 +1,6 @@
+Job: /dlwh/shuttle-track1-rmsnorm-contract-h100-canary-r5 (/dlwh/shuttle-track1-rmsnorm-contract-h100-canary-r5)
+State: succeeded  exit=0  failures=0  preemptions=0
+Tasks: 1/1 completed  succeeded=1
+
+  TASK  STATE        EXIT  DURATION                      PEAK MEM    CUR MEM    ERROR
+     0  succeeded       0  16 minutes and 42.15 seconds  -           -

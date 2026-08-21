@@ -1,0 +1,16 @@
+{
+  "integration_implementation_commit": "406287b97305f6229ea1b7f97a6f51f3ae31c5b6",
+  "integration_implementation_tree": "5942eb7d4439677d612294c2b604016db4602280",
+  "reviewed_run_tip": "ae1db7865780ccf046c2e8ee49681afb054fa4bd",
+  "reviewed_run_tree": "c44a353811a467073020b0cde5244c5fac07d82e",
+  "schema": "track1_rmsnorm_contract_hybrid_source_lineage",
+  "schema_version": 1,
+  "commits": [
+    ["33f28f031584cf92c109e591f86ecd8a67574882", "Freeze hybrid canary topology"],
+    ["34f56211d042d0a317f8f549c1d9c7da8ddbfefd", "Bind the hybrid canary plan"],
+    ["7105ca187abb15093e60abdc526c9d38da215ce9", "Seal the hybrid H100 canary"],
+    ["f032b26736445fa843f8e30a6bb7315f0159a174", "Reject nonintegral canary topology"],
+    ["726eac5d6d56dc0ec8ffc3dfba4a6d5d475763f6", "Validate canary topology types"],
+    ["ae1db7865780ccf046c2e8ee49681afb054fa4bd", "Reseal the hybrid H100 canary"]
+  ]
+}

@@ -5861,3 +5861,64 @@ author: dlwh
 - Next action: materialize the normalized BF16 boundary once for composed VJP,
   reuse the specialized primal task, and leave remaining Contract/Fold
   consumers to the generic planner before considering another H100 run.
+
+### 2026-08-21 - TLTC-ABI22-006 ordinary-JAX hybrid RMSNorm-to-Contract on H100
+
+- Hypothesis: materializing the normalized BF16 boundary once lets the generic
+  ABI22 plugin reuse the specialized RMSNorm-to-Contract primal task inside a
+  composed VJP while preserving public results, observer attribution, and the
+  prospectively sealed numerical contract.
+- Executed source: reviewed clean commit
+  `ae1db7865780ccf046c2e8ee49681afb054fa4bd`, tree
+  `c44a353811a467073020b0cde5244c5fac07d82e`, source-manifest SHA-256
+  `c3dbb267be48d93d4c16debc52cb86cb05e89669af97f671f8c1771f3498d47a`,
+  and authorization SHA-256
+  `d9c603e5419a03e046c10907987c79e89ad7e4435e1bcbeec944580bb2cbb62f`.
+  The run source is a direct six-commit descendant of integration implementation
+  `406287b97305f6229ea1b7f97a6f51f3ae31c5b6`. Numerical policy
+  `9fd9e00c6ef90b40d12916f671eeb5b73b385875d8e1ee485e0d029ab272996a`
+  is unchanged from TLTC-ABI22-005.
+- Config: `/dlwh/shuttle-track1-rmsnorm-contract-h100-canary-r5` ran on one
+  batch-priority H100 in `cw-us-east-02a`, with 32 CPU, 128 GiB memory,
+  500 GiB disk, one replica, a four-hour timeout, and all retry/failure budgets
+  zero. The 7,516,903-byte request has SHA-256
+  `d56f626fc3b30588940a7b7bd28f1b927f6b1b5e28944505d5529902db25fbdd`;
+  its 7,515,895-byte bundle has SHA-256
+  `38e887bc11d41cb9a6ba8f3c5cda21f35561133782e704ccf55e1564cfe9b9f2`.
+  The preceding `r4` request was killed on `cw-rno2a` before allocation after a
+  capacity-only wait; it had no worker, attempt, or task log.
+- Result: Iris reports one successful task, exit code zero, no failure or
+  preemption, and 16 minutes 42.15 seconds runtime. All 12 primal/composed,
+  shape-7/shape-257, and disabled/SOURCE_ORDERED/FAST coordinates completed and
+  repeated byte-for-byte. Enabled observer invocation IDs were exactly 1
+  through 8, with distinct generated-bundle and final-module digests.
+- Topology: the normative primal cells retained 1 launch/0 temporaries/0 bytes
+  at `[5,19,7]` and 2/1/20 bytes at `[5,19,257]`. The reviewed hybrid composed
+  cells used 39 launches/36 temporaries/6,996 bytes at `[5,19,7]` and
+  40/37/79,016 bytes at `[5,19,257]` for both SOURCE_ORDERED and FAST. Runtime
+  observers checked launch and temporary counts; the native serialized-bundle
+  contract checked temporary bytes.
+- Numerical result: enabled `result` and `projection_cotangent` were exact
+  against the independent binary64 oracle. Worst `input_cotangent` maximum
+  absolute, mean absolute, and relative Linf errors were
+  `0.23216684002008492`, `0.0662817995777676`, and
+  `0.0023686916414149177`. Worst `weight_cotangent` values were
+  `0.40334577692291873`, `0.14983168789504084`, and
+  `0.0031414334546365657`. Raw and masked BF16 ULP errors were zero for every
+  enabled role. Both policies matched the predeclared rounded-oracle digests.
+- Diagnostic: enabled composed input, weight, and projection cotangents differ
+  bitwise from disabled JAX at both shapes; the result matches. Disabled JAX is
+  diagnostic and is not the acceptance oracle. This entry makes no
+  representative-shape, performance, Transformer Engine, or bitwise-JAX claim.
+- Artifacts:
+  `lib/shuttle/mlir/artifacts/track1-rmsnorm-contract-hybrid-h100-plugin-20260821/`
+  preserves the exact 58,825-byte canonical result (SHA-256
+  `e02da4a840ac1032a2d959a3687178932c93610d1b6d37c6a27f6a7ffbda50c5`),
+  receipt, terminal summary, monitoring metadata, run authorization and source
+  manifest, numerical policy, source lineage, bounded facts, request identity,
+  and checksums. The request bytes remain external. Verification command:
+  `(cd lib/shuttle/mlir/artifacts/track1-rmsnorm-contract-hybrid-h100-plugin-20260821 && shasum -a 256 -c SHA256SUMS)`.
+- Next action: keep this small-shape functional result separate from
+  representative-shape and performance qualification. The composed path still
+  has 36 or 37 temporaries and needs a separately reviewed optimization target
+  before a performance claim.
