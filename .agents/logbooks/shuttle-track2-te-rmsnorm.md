@@ -264,3 +264,31 @@ author: dlwh
   behavior regression, and require full code and request review before r3.
 - Artifact:
   [`track2-shuttle-rmsnorm-r2-failure-20260821`](../../lib/shuttle/mlir/artifacts/track2-shuttle-rmsnorm-r2-failure-20260821/README.md).
+
+### 2026-08-21 15:31 - T2-SHUTTLE-003 r3 migration and r4 runfiles rejection
+
+- Hypothesis: the reviewed runfiles bridge would let the standalone GpuRunner
+  matrix execute the exact r12 held-out RMSNorm input.
+- Commit Hash: source `0a212699e8bf080a2c6f5b6f508294435c3d792e`, tree
+  `cf71f6366eddc99c5b760db5d2d1a36227a60e81`.
+- Command: r3 request SHA-256
+  `1623978fc9cef2da94617b3bf98ab98be6170efa277b4255da59517b3fbaf303`
+  on `cw-rno2a`; r4 request SHA-256
+  `77eea45a62132b4452b11800fb7feb497749c51345b112eba31b88da272a6a26`
+  on `cw-us-east-02a`.
+- Config: one H100, batch priority, one replica, zero failure, preemption, and
+  task-failure budgets; Shuttle RMSNorm `[2048,4096]`; epsilon `1e-6`; F/B/C;
+  SOURCE_ORDERED and FAST; two repeats.
+- Result: r3 remained unallocated on Reno for 43 minutes and was explicitly
+  killed before the reviewed east migration; it had no task duration, memory,
+  logs, failure, or preemption. r4 allocated immediately, completed hydration
+  and build, then failed the first filtered gtest in 0 ms because both
+  `RUNFILES_DIR` and `TEST_SRCDIR` were unset.
+- Interpretation: r4 proves the prior bridge was insufficient on the Linux
+  nested `bazel run` boundary. Neither r3 nor r4 contains compiler, kernel,
+  numerical, resource, or performance evidence.
+- Next action: derive one validated runfiles root from the explicit GPU-test
+  path or invocation directory, reject missing or ambiguous roots, and require
+  full local and independent review before another request.
+- Artifact:
+  [`track2-shuttle-rmsnorm-r4-failure-20260821`](../../lib/shuttle/mlir/artifacts/track2-shuttle-rmsnorm-r4-failure-20260821/README.md).

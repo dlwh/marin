@@ -66,3 +66,25 @@ build compiles the matrix target, and a direct `bazel run` resolves the module,
 coordinate wrapper, GPU test, and sealed r12 report paths from runfiles before
 printing the representative producer help. No compiler admission, schedule,
 or numerical tolerance changed.
+
+## Hypothesis 3
+
+The r2 repair assumed nested `bazel run` would expose `RUNFILES_DIR`. The east
+r4 diagnostic disproved that assumption: the filtered Linux gtest saw both
+`RUNFILES_DIR` and `TEST_SRCDIR` unset. Its explicit GPU-test path and current
+working directory still identify the surrounding matrix runfiles tree.
+
+## Changes to make
+
+When `TEST_SRCDIR` is absent, enumerate only the existing `RUNFILES_DIR`, the
+invocation directory, its parent, and the lexical GPU-test path ancestry.
+Accept exactly one physical directory containing the boundary's exact fixture;
+reject no match or multiple distinct matches.
+
+## Results
+
+The new behavior tests reproduce the Linux environment with both variables
+unset through the real wrapper, plus missing-root and ambiguous-root failures.
+The implementation derives one physical root only after finding the exact
+boundary fixture. Existing `TEST_SRCDIR` remains authoritative. No compiler,
+admission, schedule, PTX, numerical tolerance, or timing behavior changed.
