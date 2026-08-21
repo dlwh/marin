@@ -145,13 +145,13 @@ subject's intentional positive-ID contract rejected the snapshot.
 
 ## r7 observer repair
 
-Observer IDs now begin at one. A wrapped counter returns zero only after the
-entire positive 64-bit space has been consumed; that state terminates with a
-stable exhaustion diagnostic rather than reusing an ID. The public registered
-transform regression now requires a positive ID and equality across all three
-phases. It fails on the first transform at the old tip and covers the same
-multi-custom-call value-and-gradient fixture used by the H100 subject without
-relaxing subject attribution.
+Observer IDs now begin at one. A non-wrapping atomic allocation loop reserves
+the maximum value as an exhaustion sentinel and terminates with a stable
+diagnostic rather than exposing zero or a reused ID to another thread. The
+public registered transform regression now requires a positive ID and equality
+across all three phases. It fails on the first transform at the old tip and
+covers the same multi-custom-call value-and-gradient fixture used by the H100
+subject without relaxing subject attribution.
 
 ## Future work
 

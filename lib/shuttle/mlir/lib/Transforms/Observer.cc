@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cassert>
 #include <condition_variable>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <utility>
@@ -198,11 +199,17 @@ ObserverRegistry &observerRegistry() {
 std::atomic<uint64_t> nextInvocationId{1};
 
 uint64_t takeNextInvocationId() {
-  uint64_t invocationId =
-      nextInvocationId.fetch_add(1, std::memory_order_relaxed);
-  if (invocationId == 0)
-    llvm::report_fatal_error("Shuttle observer invocation ID space exhausted");
-  return invocationId;
+  uint64_t invocationId = nextInvocationId.load(std::memory_order_relaxed);
+  while (true) {
+    if (invocationId == 0 ||
+        invocationId == std::numeric_limits<uint64_t>::max())
+      llvm::report_fatal_error(
+          "Shuttle observer invocation ID space exhausted");
+    if (nextInvocationId.compare_exchange_weak(
+            invocationId, invocationId + 1, std::memory_order_relaxed,
+            std::memory_order_relaxed))
+      return invocationId;
+  }
 }
 
 } // namespace
