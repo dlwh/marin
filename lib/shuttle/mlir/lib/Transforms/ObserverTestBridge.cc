@@ -40,7 +40,8 @@ public:
         identity.policyDigest, identity.tuningDigest, event.regionMembership(),
         event.coverageManifest(), event.unsupportedFingerprint(),
         event.normalizedModuleFingerprint(), event.noShuttleSemantics(),
-        event.failurePass()});
+        event.failurePass(), event.bundleLaunchCount(),
+        event.bundleTemporaryCount()});
     if (blockNextCallback) {
       blockNextCallback = false;
       callbackBlocked = true;

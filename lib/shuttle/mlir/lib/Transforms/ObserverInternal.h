@@ -18,7 +18,8 @@ public:
   void emit(ShuttlePipelinePhase phase, std::string regionMembership,
             std::string coverageManifest, std::string unsupportedFingerprint,
             std::string normalizedModuleFingerprint, bool noShuttleSemantics,
-            std::string failurePass = {}) const;
+            std::string failurePass = {}, uint64_t bundleLaunchCount = 0,
+            uint64_t bundleTemporaryCount = 0) const;
 
 private:
   class Impl;

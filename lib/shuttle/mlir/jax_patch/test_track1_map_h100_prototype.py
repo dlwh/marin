@@ -297,6 +297,10 @@ def _rmsnorm_document() -> dict[str, object]:
                 coordinates.append(
                     {
                         "boundary": boundary,
+                        "host_oracle": {
+                            role: hashlib.sha256(f"host:{shape}:{boundary}:{role}".encode()).hexdigest()
+                            for role in roles
+                        },
                         "mode": mode,
                         "observer": (
                             None
@@ -305,6 +309,8 @@ def _rmsnorm_document() -> dict[str, object]:
                                 "final_module_sha256": "1" * 64,
                                 "generated_bundle_sha256": "2" * 64,
                                 "invocation_id": len(coordinates) + 1,
+                                "launch_count": {"forward": 1, "backward": 3, "composed": 4}[boundary],
+                                "temporary_count": 0 if boundary == "forward" else 1,
                             }
                         ),
                         "results": {

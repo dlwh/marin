@@ -109,14 +109,10 @@ def test_run_matrix_rejects_enabled_result_drift_through_public_boundary(monkeyp
 
     def execute(coordinate: Coordinate):
         roles = subject.result_roles(coordinate.boundary)
-        arrays = []
-        for ordinal, role in enumerate(roles):
-            shape = (coordinate.shape[-1],) if role == "weight_cotangent" else coordinate.shape
-            value = np.full(shape, ordinal + 1, dtype=ml_dtypes.bfloat16)
+        arrays = [value.copy() for value in subject.host_oracle(coordinate.shape, coordinate.boundary)]
+        for index, role in enumerate(roles):
             if coordinate == Coordinate((2, 7, 19), Boundary.COMPOSED, Mode.FAST) and role == "input_cotangent":
-                value = value.copy()
-                value.flat[0] = ml_dtypes.bfloat16(-0.0)
-            arrays.append(value)
+                arrays[index].flat[0] = ml_dtypes.bfloat16(-0.0)
         snapshot = () if coordinate.mode is Mode.DISABLED else _observer_snapshot(coordinate)
         return tuple(arrays), snapshot
 
@@ -156,10 +152,7 @@ def test_result_document_binds_all_output_hashes_and_observer_invocations(monkey
     monkeypatch.setattr(subject, "require_h100", lambda: None)
 
     def execute(coordinate: Coordinate):
-        arrays = []
-        for ordinal, role in enumerate(subject.result_roles(coordinate.boundary)):
-            shape = (coordinate.shape[-1],) if role == "weight_cotangent" else coordinate.shape
-            arrays.append(np.full(shape, ordinal + 1, dtype=ml_dtypes.bfloat16))
+        arrays = subject.host_oracle(coordinate.shape, coordinate.boundary)
         return tuple(arrays), (() if coordinate.mode is Mode.DISABLED else _observer_snapshot(coordinate))
 
     monkeypatch.setattr(subject, "_execute", execute)
@@ -170,6 +163,7 @@ def test_result_document_binds_all_output_hashes_and_observer_invocations(monkey
     assert sum(item["observer"] is not None for item in document["coordinates"]) == 12
     for item in document["coordinates"]:
         assert list(item["results"]) == list(subject.result_roles(Boundary(item["boundary"])))
+        assert list(item["host_oracle"]) == list(subject.result_roles(Boundary(item["boundary"])))
         assert all(len(digest) == 64 for digest in item["results"].values())
         if item["observer"] is not None:
             assert item["observer"]["invocation_id"] == 31

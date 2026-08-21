@@ -241,7 +241,8 @@ ShuttlePipelineEvent::ShuttlePipelineEvent(
     ShuttlePipelineIdentity identity, std::string regionMembership,
     std::string coverageManifest, std::string unsupportedFingerprint,
     std::string normalizedModuleFingerprint, bool noShuttleSemantics,
-    std::string failurePass)
+    std::string failurePass, uint64_t bundleLaunchCount,
+    uint64_t bundleTemporaryCount)
     : invocationIdValue(invocationId), phaseValue(phase),
       identityValue(std::move(identity)),
       regionMembershipValue(std::move(regionMembership)),
@@ -249,7 +250,9 @@ ShuttlePipelineEvent::ShuttlePipelineEvent(
       unsupportedFingerprintValue(std::move(unsupportedFingerprint)),
       normalizedModuleFingerprintValue(std::move(normalizedModuleFingerprint)),
       noShuttleSemanticsValue(noShuttleSemantics),
-      failurePassValue(std::move(failurePass)) {}
+      failurePassValue(std::move(failurePass)),
+      bundleLaunchCountValue(bundleLaunchCount),
+      bundleTemporaryCountValue(bundleTemporaryCount) {}
 
 class ShuttleObserverSubscription::Impl {
 public:
@@ -322,12 +325,15 @@ void ShuttleObserverInvocation::emit(ShuttlePipelinePhase phase,
                                      std::string unsupportedFingerprint,
                                      std::string normalizedModuleFingerprint,
                                      bool noShuttleSemantics,
-                                     std::string failurePass) const {
+                                     std::string failurePass,
+                                     uint64_t bundleLaunchCount,
+                                     uint64_t bundleTemporaryCount) const {
   ShuttlePipelineEvent event(
       implementation->invocationId, phase, implementation->identity,
       std::move(regionMembership), std::move(coverageManifest),
       std::move(unsupportedFingerprint), std::move(normalizedModuleFingerprint),
-      noShuttleSemantics, std::move(failurePass));
+      noShuttleSemantics, std::move(failurePass), bundleLaunchCount,
+      bundleTemporaryCount);
   ScopedCapturedSubscriptions captured(implementation->subscriptions);
   for (const auto &subscription : implementation->subscriptions) {
     subscription.second->observe(event);

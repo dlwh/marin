@@ -60,12 +60,15 @@ class ObserverEvidence:
     invocation_id: int
     generated_bundle_sha256: str
     final_module_sha256: str
+    launch_count: int
+    temporary_count: int
 
 
 @dataclass(frozen=True)
 class CoordinateResult:
     coordinate: Coordinate
     results: dict[str, str]
+    host_oracle: dict[str, str]
     observer: ObserverEvidence | None
 
 
@@ -133,6 +136,14 @@ def result_roles(boundary: Boundary) -> tuple[str, ...]:
     return ("result", "input_cotangent", "weight_cotangent")
 
 
+def expected_bundle_shape(boundary: Boundary) -> tuple[int, int]:
+    return {
+        Boundary.FORWARD: (1, 0),
+        Boundary.BACKWARD: (3, 1),
+        Boundary.COMPOSED: (4, 1),
+    }[boundary]
+
+
 def boundary_function(boundary: Boundary) -> Callable[[jax.Array, jax.Array, jax.Array], tuple[jax.Array, ...]]:
     def subject(x: jax.Array, weight: jax.Array, cotangent: jax.Array) -> tuple[jax.Array, ...]:
         result, pullback = jax.vjp(rms_norm_forward, x, weight)
@@ -144,6 +155,33 @@ def boundary_function(boundary: Boundary) -> Callable[[jax.Array, jax.Array, jax
         return (result, *gradients)
 
     return subject
+
+
+def host_oracle(shape: tuple[int, ...], boundary: Boundary) -> tuple[np.ndarray, ...]:
+    """Evaluate an independently derived float32 RMSNorm/VJP oracle on the host."""
+    x_bf16, weight_bf16, cotangent_bf16 = deterministic_inputs(shape)
+    x = x_bf16.astype(np.float32)
+    weight = weight_bf16.astype(np.float32)
+    cotangent = cotangent_bf16.astype(np.float32)
+    mean_square = np.mean(x * x, axis=-1, keepdims=True, dtype=np.float32)
+    inverse_root = np.float32(1.0) / np.sqrt(mean_square + np.float32(1e-6))
+    result = (x * inverse_root * weight).astype(ml_dtypes.bfloat16)
+    weighted_cotangent = cotangent * weight
+    projection = np.mean(weighted_cotangent * x, axis=-1, keepdims=True, dtype=np.float32)
+    input_cotangent = np.asarray(
+        weighted_cotangent * inverse_root - x * inverse_root * inverse_root * inverse_root * projection,
+        dtype=ml_dtypes.bfloat16,
+    )
+    prefix_axes = tuple(range(len(shape) - 1))
+    weight_cotangent = np.asarray(
+        np.sum(cotangent * x * inverse_root, axis=prefix_axes, dtype=np.float32),
+        dtype=ml_dtypes.bfloat16,
+    )
+    if boundary is Boundary.FORWARD:
+        return (result,)
+    if boundary is Boundary.BACKWARD:
+        return input_cotangent, weight_cotangent
+    return result, input_cotangent, weight_cotangent
 
 
 def _sha_array(value: np.ndarray) -> str:
@@ -205,7 +243,7 @@ def validate_observer_snapshot(
         if snapshot:
             raise ValueError("disabled RMSNorm compilation emitted Shuttle observer events")
         return None
-    if len(snapshot) != 3 or any(type(event) is not tuple or len(event) != 11 for event in snapshot):
+    if len(snapshot) != 3 or any(type(event) is not tuple or len(event) != 13 for event in snapshot):
         raise ValueError("enabled RMSNorm compilation must emit three closed observer records")
     if tuple(event[1] for event in snapshot) != ("algebra_coverage", "generated_bundle", "final_erasure"):
         raise ValueError("enabled RMSNorm compilation emitted the wrong observer phases")
@@ -233,10 +271,17 @@ def validate_observer_snapshot(
         raise ValueError("RMSNorm observer erased Shuttle semantics before the final phase")
     if snapshot[2][5:8] != ("", "", "") or snapshot[2][9] is not True:
         raise ValueError("RMSNorm observer final phase did not erase Shuttle semantics")
+    expected_launches, expected_temporaries = expected_bundle_shape(coordinate.boundary)
+    if snapshot[0][11:13] != (0, 0) or snapshot[2][11:13] != (0, 0):
+        raise ValueError("RMSNorm observer reported bundle shape outside bundle generation")
+    if snapshot[1][11:13] != (expected_launches, expected_temporaries):
+        raise ValueError("RMSNorm generated bundle launch or temporary count differs")
     return ObserverEvidence(
         invocation_id=snapshot[0][0],
         generated_bundle_sha256=_sha(snapshot[1][8], "generated bundle fingerprint"),
         final_module_sha256=_sha(snapshot[2][8], "final module fingerprint"),
+        launch_count=expected_launches,
+        temporary_count=expected_temporaries,
     )
 
 
@@ -263,7 +308,7 @@ def _execute(coordinate: Coordinate) -> tuple[tuple[np.ndarray, ...], tuple[tupl
     with _bridge().subscribe() as capture:
         outputs = compiled(x, weight, cotangent)
         arrays = tuple(np.asarray(output.block_until_ready()) for output in outputs)
-        snapshot = tuple(capture.snapshot())
+        snapshot = tuple(capture.snapshot_with_bundle_shape())
     return arrays, snapshot
 
 
@@ -275,21 +320,38 @@ def run_matrix() -> tuple[CoordinateResult, ...]:
     for coordinate in Coordinate.all():
         arrays, snapshot = _execute(coordinate)
         observer = validate_observer_snapshot(coordinate, snapshot)
+        roles = result_roles(coordinate.boundary)
+        expected_shapes = tuple(
+            (coordinate.shape[-1],) if role == "weight_cotangent" else coordinate.shape for role in roles
+        )
+        if len(arrays) != len(roles):
+            raise RuntimeError("Track 1 RMSNorm result count differs from its public boundary")
+        for role, array, expected_shape in zip(roles, arrays, expected_shapes, strict=True):
+            if array.shape != expected_shape or array.dtype != np.dtype(ml_dtypes.bfloat16):
+                raise RuntimeError(f"Track 1 RMSNorm {role} result type differs from its public boundary")
+        oracle = host_oracle(coordinate.shape, coordinate.boundary)
         key = (coordinate.shape, coordinate.boundary)
         if coordinate.mode is Mode.DISABLED:
+            for role, actual, expected in zip(roles, arrays, oracle, strict=True):
+                if not np.allclose(
+                    actual.astype(np.float32),
+                    expected.astype(np.float32),
+                    rtol=0.02,
+                    atol=0.02,
+                    equal_nan=False,
+                ):
+                    raise RuntimeError(f"Track 1 RMSNorm {role} differs from the independent host oracle")
             baselines[key] = arrays
         else:
             expected_arrays = baselines[key]
-            for role, actual, expected in zip(result_roles(coordinate.boundary), arrays, expected_arrays, strict=True):
+            for role, actual, expected in zip(roles, arrays, expected_arrays, strict=True):
                 if not _array_bytes_equal(actual, expected):
                     raise _numerical_mismatch(coordinate, role, actual, expected)
         results.append(
             CoordinateResult(
                 coordinate=coordinate,
-                results={
-                    role: _sha_array(array)
-                    for role, array in zip(result_roles(coordinate.boundary), arrays, strict=True)
-                },
+                results={role: _sha_array(array) for role, array in zip(roles, arrays, strict=True)},
+                host_oracle={role: _sha_array(array) for role, array in zip(roles, oracle, strict=True)},
                 observer=observer,
             )
         )
@@ -301,6 +363,7 @@ def result_document(results: tuple[CoordinateResult, ...]) -> dict[str, object]:
         "coordinates": [
             {
                 "boundary": result.coordinate.boundary.value,
+                "host_oracle": result.host_oracle,
                 "mode": result.coordinate.mode.value,
                 "observer": (
                     None
@@ -309,6 +372,8 @@ def result_document(results: tuple[CoordinateResult, ...]) -> dict[str, object]:
                         "final_module_sha256": result.observer.final_module_sha256,
                         "generated_bundle_sha256": result.observer.generated_bundle_sha256,
                         "invocation_id": result.observer.invocation_id,
+                        "launch_count": result.observer.launch_count,
+                        "temporary_count": result.observer.temporary_count,
                     }
                 ),
                 "results": result.results,

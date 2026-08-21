@@ -14,7 +14,8 @@ namespace nb = nanobind;
 namespace mlir::shuttle::testing {
 namespace {
 
-nb::tuple pythonRecord(const ShuttleObserverTestEvent &event) {
+nb::tuple pythonRecord(const ShuttleObserverTestEvent &event,
+                       bool includeBundleShape) {
   nb::list record;
   record.append(nb::int_(event.invocationId));
   record.append(nb::str(event.phase.c_str()));
@@ -27,15 +28,20 @@ nb::tuple pythonRecord(const ShuttleObserverTestEvent &event) {
   record.append(nb::str(event.normalizedModuleFingerprint.c_str()));
   record.append(nb::bool_(event.noShuttleSemantics));
   record.append(nb::str(event.failurePass.c_str()));
+  if (includeBundleShape) {
+    record.append(nb::int_(event.bundleLaunchCount));
+    record.append(nb::int_(event.bundleTemporaryCount));
+  }
   return nb::tuple(record);
 }
 
-nb::tuple pythonEvents(const ShuttleObserverTestCapture &capture) {
+nb::tuple pythonEvents(const ShuttleObserverTestCapture &capture,
+                       bool includeBundleShape) {
   // snapshot() releases the native mutex before Python objects are allocated.
   std::vector<ShuttleObserverTestEvent> events = capture.snapshot();
   nb::list records;
   for (const ShuttleObserverTestEvent &event : events) {
-    records.append(pythonRecord(event));
+    records.append(pythonRecord(event, includeBundleShape));
   }
   return nb::tuple(records);
 }
@@ -47,7 +53,14 @@ void registerShuttleObserverTestBindings(nb::module_ &module) {
       "_shuttle_test_observer",
       "Test-only native Shuttle observer bridge; absent from normal builds.");
   nb::class_<ShuttleObserverTestCapture>(bridge, "Capture")
-      .def("snapshot", &pythonEvents)
+      .def("snapshot",
+           [](const ShuttleObserverTestCapture &capture) {
+             return pythonEvents(capture, false);
+           })
+      .def("snapshot_with_bundle_shape",
+           [](const ShuttleObserverTestCapture &capture) {
+             return pythonEvents(capture, true);
+           })
       .def("close", &ShuttleObserverTestCapture::close,
            nb::call_guard<nb::gil_scoped_release>())
       .def("__enter__",

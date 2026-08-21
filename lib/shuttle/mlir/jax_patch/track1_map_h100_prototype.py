@@ -581,8 +581,16 @@ def validate_rmsnorm_result(document: object) -> dict[str, object]:
         (shape, boundary, roles, mode) for shape in shapes for boundary, roles in boundaries for mode in WORKER_MODES
     ]
     baselines: dict[tuple[tuple[int, ...], str], dict[str, str]] = {}
+    oracle_baselines: dict[tuple[tuple[int, ...], str], dict[str, str]] = {}
     for item, (shape, boundary, roles, mode) in zip(coordinates, expected, strict=True):
-        if type(item) is not dict or set(item) != {"boundary", "mode", "observer", "results", "shape"}:
+        if type(item) is not dict or set(item) != {
+            "boundary",
+            "host_oracle",
+            "mode",
+            "observer",
+            "results",
+            "shape",
+        }:
             raise ValueError("RMSNorm result coordinate has the wrong schema")
         if item["shape"] != list(shape) or item["boundary"] != boundary or item["mode"] != mode:
             raise ValueError("RMSNorm result coordinate order differs")
@@ -591,18 +599,34 @@ def validate_rmsnorm_result(document: object) -> dict[str, object]:
             raise ValueError("RMSNorm result output roles differ")
         for role in roles:
             _sha(results[role], f"RMSNorm {role}")
+        host_oracle = item["host_oracle"]
+        if type(host_oracle) is not dict or tuple(host_oracle) != roles:
+            raise ValueError("RMSNorm host oracle output roles differ")
+        for role in roles:
+            _sha(host_oracle[role], f"RMSNorm host oracle {role}")
         key = (shape, boundary)
         if mode == "disabled":
             baselines[key] = results
         elif results != baselines[key]:
             raise ValueError("RMSNorm enabled result differs from its disabled baseline")
+        if mode == "disabled":
+            oracle_baselines[key] = host_oracle
+        elif host_oracle != oracle_baselines[key]:
+            raise ValueError("RMSNorm host oracle differs across modes")
         observer = item["observer"]
         if mode == "disabled":
             if observer is not None:
                 raise ValueError("RMSNorm disabled result has an observer")
         elif (
             type(observer) is not dict
-            or set(observer) != {"final_module_sha256", "generated_bundle_sha256", "invocation_id"}
+            or set(observer)
+            != {
+                "final_module_sha256",
+                "generated_bundle_sha256",
+                "invocation_id",
+                "launch_count",
+                "temporary_count",
+            }
             or type(observer["invocation_id"]) is not int
             or observer["invocation_id"] <= 0
         ):
@@ -610,6 +634,13 @@ def validate_rmsnorm_result(document: object) -> dict[str, object]:
         else:
             _sha(observer["final_module_sha256"], "RMSNorm final module")
             _sha(observer["generated_bundle_sha256"], "RMSNorm generated bundle")
+            expected_bundle = {
+                "forward": (1, 0),
+                "backward": (3, 1),
+                "composed": (4, 1),
+            }[boundary]
+            if (observer["launch_count"], observer["temporary_count"]) != expected_bundle:
+                raise ValueError("RMSNorm generated bundle shape differs")
     return document
 
 

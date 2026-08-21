@@ -9424,6 +9424,8 @@ void emitObserverSnapshot(
   std::string regionMembership;
   std::string coverageManifest;
   std::string unsupportedFingerprint;
+  uint64_t bundleLaunchCount = 0;
+  uint64_t bundleTemporaryCount = 0;
   if (auto manifest =
           module->getAttrOfType<DictionaryAttr>(kCoverageManifestAttribute)) {
     coverageManifest = attributeText(manifest);
@@ -9435,6 +9437,19 @@ void emitObserverSnapshot(
       unsupportedFingerprint = sha256(attributeText(excluded));
     }
   }
+  if (phase == ShuttlePipelinePhase::GeneratedBundle) {
+    for (DeviceModuleOp device : module.getOps<DeviceModuleOp>())
+      bundleLaunchCount += static_cast<uint64_t>(
+          llvm::range_size(device.getBody().front().getOps<DeviceEntryOp>()));
+    for (MaterializationPlanOp plan :
+         module.getOps<MaterializationPlanOp>()) {
+      for (MaterializationBufferOp buffer :
+           plan.getBody().front().getOps<MaterializationBufferOp>()) {
+        if (buffer.getStorage() == MaterializationStorage::Temporary)
+          ++bundleTemporaryCount;
+      }
+    }
+  }
   invocation->emit(
       phase, std::move(regionMembership), std::move(coverageManifest),
       std::move(unsupportedFingerprint),
@@ -9443,7 +9458,8 @@ void emitObserverSnapshot(
       : phase == ShuttlePipelinePhase::FinalErasure
           ? normalizedModuleFingerprintImpl(module)
           : std::string{},
-      phase == ShuttlePipelinePhase::FinalErasure, failurePass.str());
+      phase == ShuttlePipelinePhase::FinalErasure, failurePass.str(),
+      bundleLaunchCount, bundleTemporaryCount);
 }
 
 class EmitObserverPass

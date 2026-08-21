@@ -79,6 +79,8 @@ public:
   }
   bool noShuttleSemantics() const { return noShuttleSemanticsValue; }
   const std::string &failurePass() const { return failurePassValue; }
+  uint64_t bundleLaunchCount() const { return bundleLaunchCountValue; }
+  uint64_t bundleTemporaryCount() const { return bundleTemporaryCountValue; }
 
 private:
   friend class detail::ShuttleObserverInvocation;
@@ -89,7 +91,9 @@ private:
                        std::string coverageManifest,
                        std::string unsupportedFingerprint,
                        std::string normalizedModuleFingerprint,
-                       bool noShuttleSemantics, std::string failurePass);
+                       bool noShuttleSemantics, std::string failurePass,
+                       uint64_t bundleLaunchCount,
+                       uint64_t bundleTemporaryCount);
 
   uint64_t invocationIdValue;
   ShuttlePipelinePhase phaseValue;
@@ -100,6 +104,8 @@ private:
   std::string normalizedModuleFingerprintValue;
   bool noShuttleSemanticsValue;
   std::string failurePassValue;
+  uint64_t bundleLaunchCountValue;
+  uint64_t bundleTemporaryCountValue;
 };
 
 class ShuttlePipelineObserver {

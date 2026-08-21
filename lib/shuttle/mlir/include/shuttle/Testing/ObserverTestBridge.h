@@ -25,6 +25,8 @@ struct ShuttleObserverTestEvent {
   std::string normalizedModuleFingerprint;
   bool noShuttleSemantics;
   std::string failurePass;
+  uint64_t bundleLaunchCount;
+  uint64_t bundleTemporaryCount;
 };
 
 // A test-only scoped capture. Its subscription is separate from pipeline
