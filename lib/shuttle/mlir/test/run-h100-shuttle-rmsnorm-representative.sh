@@ -55,12 +55,46 @@ case "$repeat" in
   *) echo "unsupported repeat: $repeat" >&2; exit 2 ;;
 esac
 
-if [ -z "${TEST_SRCDIR:-}" ] && [ -n "${RUNFILES_DIR:-}" ]; then
-  if [ ! -d "$RUNFILES_DIR" ]; then
-    echo "RUNFILES_DIR is not a directory: $RUNFILES_DIR" >&2
+case "$boundary" in
+  forward) representative_fixture=jax-0.10.1-bf16-projected_parameter_broadcast-2048x4096-forward.mlir ;;
+  backward_recompute) representative_fixture=jax-0.10.1-bf16-projected_parameter_broadcast-2048x4096-backward.mlir ;;
+  composed) representative_fixture=jax-0.10.1-bf16-projected_parameter_broadcast-2048x4096-composed.mlir ;;
+esac
+
+runfiles_root=
+consider_runfiles_root() {
+  candidate=$1
+  if [ ! -d "$candidate" ]; then
+    return
+  fi
+  candidate=$(CDPATH= cd "$candidate" 2>/dev/null && pwd -P) || return
+  if [ ! -r "$candidate/shuttle_mlir/test/Inputs/$representative_fixture" ]; then
+    return
+  fi
+  if [ -n "$runfiles_root" ] && [ "$runfiles_root" != "$candidate" ]; then
+    echo "ambiguous representative runfiles roots: $runfiles_root and $candidate" >&2
     exit 2
   fi
-  TEST_SRCDIR=$RUNFILES_DIR
+  runfiles_root=$candidate
+}
+
+if [ -z "${TEST_SRCDIR:-}" ]; then
+  if [ -n "${RUNFILES_DIR:-}" ]; then
+    if [ ! -d "$RUNFILES_DIR" ]; then
+      echo "RUNFILES_DIR is not a directory: $RUNFILES_DIR" >&2
+      exit 2
+    fi
+    consider_runfiles_root "$RUNFILES_DIR"
+  fi
+  consider_runfiles_root "$PWD"
+  consider_runfiles_root "$PWD/.."
+  gpu_transport_dir=$(dirname "$gpu_transport_test")
+  consider_runfiles_root "$gpu_transport_dir/../../.."
+  if [ -z "$runfiles_root" ]; then
+    echo "unable to derive representative runfiles root for $representative_fixture" >&2
+    exit 2
+  fi
+  TEST_SRCDIR=$runfiles_root
   export TEST_SRCDIR
 fi
 
