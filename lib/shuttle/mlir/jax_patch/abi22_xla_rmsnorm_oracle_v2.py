@@ -20,7 +20,6 @@ from abi22_te_rmsnorm_oracle_v2 import (
     BOUNDARIES,
     CALL_SEQUENCES,
     EPSILON,
-    INPUT_DIGESTS,
     JAX_REVISION,
     MEASURED_INVOCATIONS,
     OUTPUT_ROLES,
@@ -125,6 +124,8 @@ def run_cell(boundary: str, shape: tuple[int, int], case_directory: Path) -> dic
     ]
     if boundary != "forward":
         operands.append(_read_bf16(case_directory / "dy.bf16", shape))
+    input_roles = ("x", "gamma") if boundary == "forward" else ("x", "gamma", "dy")
+    input_digests = {role: _digest(operand) for role, operand in zip(input_roles, operands, strict=True)}
     device_operands = tuple(jax.device_put(operand) for operand in operands)
     compiled = jax.jit(_function(boundary)).lower(*device_operands).compile()
     for _ in range(WARMUP_INVOCATIONS):
@@ -153,10 +154,7 @@ def run_cell(boundary: str, shape: tuple[int, int], case_directory: Path) -> dic
         "shape": list(shape),
         "scope": "architecture_fixture" if shape == SHAPES[0] else "representative_acceptance",
         "boundary": boundary,
-        "input_digests": {
-            role: INPUT_DIGESTS[shape][role]
-            for role in (("x", "gamma") if boundary == "forward" else ("x", "gamma", "dy"))
-        },
+        "input_digests": input_digests,
         "execution": {
             "call_sequence": list(CALL_SEQUENCES[boundary]),
             "rsigma_state": "invocation_local_not_public",

@@ -23,7 +23,19 @@ EPSILON = 1.0e-6
 MEASURED_INVOCATIONS = 20
 WARMUP_INVOCATIONS = 10
 NORM_CONTRACT_BLOCKER = "te_2_17_rmsnorm_oracle_v2_does_not_cover_norm_contract"
-ACCEPTANCE_LIMITS = {"max_absolute_error": 0.015625, "max_bfloat16_ulp": 8}
+QUALIFICATION_PATTERN = "qualification_linspace_v2"
+HELDOUT_PATTERN = "heldout_reversed_linspace_v1"
+ACCEPTANCE_LIMITS = {
+    "y": {"max_absolute_error": 0.0078125, "max_bfloat16_ulp": 2},
+    "dx": {"max_absolute_error": 0.0625, "max_bfloat16_ulp": 64},
+    "dgamma": {"max_absolute_error": 0.015625, "max_bfloat16_ulp": 8},
+}
+NUMERICAL_POLICY = {
+    "schema": "shuttle_abi22_rmsnorm_role_policy_v1",
+    "patterns": [QUALIFICATION_PATTERN, HELDOUT_PATTERN],
+    "repeat_count": 2,
+    "limits_by_role": ACCEPTANCE_LIMITS,
+}
 TE_SOURCE_COMMIT = "2e559f062497bef768dfbe9d7e45548fadeca80a"
 JAX_REVISION = "619764c15117fbefc4ba13ab941871cb514c23f6"
 XLA_REVISION = "9b635916ecc6df6efee62d8e4b0c7ef87ef84d69"
@@ -62,6 +74,16 @@ REFERENCE_DIGESTS = {
         "dgamma": "7e8e78fc4dad00d99b614018ae47cfe67162a859cc10bab79c2c2b0ca73746b3",
     },
 }
+HELDOUT_INPUT_DIGESTS = {
+    "x": "595fc9c13633ba99278591d4288b9150b1d7c71eb17bd9c5f0d4720e1762ea8b",
+    "gamma": "bc3f6002b8b4c4718db1aeee0cf2b459c18ec80aa69958d2c8945be915a409d6",
+    "dy": "237d26f9c6c048e5d3979da9e283aff46f062518d9a91ea5b74d2f8eaf80526d",
+}
+HELDOUT_REFERENCE_DIGESTS = {
+    "y": "15a4e1660f2dc93b91841a0ac8c54c90372548a4b1269a09cc9c428cdc3e98f5",
+    "dx": "d5e6be3d8cf52e4139235b9dde69a84db489a705580a376f08a613eb7beeab9a",
+    "dgamma": "06498bae527509f636aae0baa0b247e657e5f6dc1f7453cf3279e53db90664e0",
+}
 INPUT_RANGES = ((-0.75, 0.875), (-0.625, 1.0), (-0.5, 1.125))
 
 
@@ -97,6 +119,10 @@ class ValidatedTeRuntimeIdentity(Mapping[str, str]):
 
 class ValidatedExecutionPlan(dict[str, Any]):
     """Exact command matrix returned by the canonical plan derivation."""
+
+
+class ValidatedQualificationPlan(dict[str, Any]):
+    """Exact repeated qualification matrix for the frozen role policy."""
 
 
 def _sha256_bytes(payload: bytes) -> str:
@@ -185,6 +211,62 @@ def prepare_cases(case_root: Path) -> dict[str, Any]:
             (directory / name).write_bytes(_bf16_bytes(value))
     _verify_case_directory(case_root)
     return {"input_digests": INPUT_DIGESTS, "reference_digests": REFERENCE_DIGESTS}
+
+
+def _heldout_inputs() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    rows, features = REPRESENTATIVE_SHAPE
+    specifications = (
+        (-1.125, 0.5, (rows, features)),
+        (0.375, 1.25, (features,)),
+        (1.0, -0.75, (rows, features)),
+    )
+    return tuple(
+        np.linspace(start, stop, math.prod(shape), dtype=np.float32).reshape(shape).astype(ml_dtypes.bfloat16)
+        for start, stop, shape in specifications
+    )  # type: ignore[return-value]
+
+
+def _heldout_case_files() -> dict[str, tuple[int, str]]:
+    rows, features = REPRESENTATIVE_SHAPE
+    return {
+        "x.bf16": (rows * features * 2, HELDOUT_INPUT_DIGESTS["x"]),
+        "gamma.bf16": (features * 2, HELDOUT_INPUT_DIGESTS["gamma"]),
+        "dy.bf16": (rows * features * 2, HELDOUT_INPUT_DIGESTS["dy"]),
+        "reference_y.bf16": (rows * features * 2, HELDOUT_REFERENCE_DIGESTS["y"]),
+        "reference_dx.bf16": (rows * features * 2, HELDOUT_REFERENCE_DIGESTS["dx"]),
+        "reference_dgamma.bf16": (features * 2, HELDOUT_REFERENCE_DIGESTS["dgamma"]),
+    }
+
+
+def _verify_heldout_case(case_root: Path) -> None:
+    for name, (size, digest) in _heldout_case_files().items():
+        path = case_root / HELDOUT_PATTERN / name
+        if not path.is_file():
+            raise ValueError(f"case file missing: {path}")
+        payload = path.read_bytes()
+        if len(payload) != size:
+            raise ValueError(f"case file size drifted: {path}")
+        if _sha256_bytes(payload) != digest:
+            raise ValueError(f"case file digest drifted: {path}")
+
+
+def prepare_heldout_case(case_root: Path) -> dict[str, dict[str, str]]:
+    """Write the predeclared representative input that was not used to tune the role limits."""
+    directory = case_root / HELDOUT_PATTERN
+    directory.mkdir(parents=True, exist_ok=True)
+    x, gamma, dy = _heldout_inputs()
+    y, dx, dgamma = _reference(x, gamma, dy, EPSILON)
+    for name, value in {
+        "x.bf16": x,
+        "gamma.bf16": gamma,
+        "dy.bf16": dy,
+        "reference_y.bf16": y,
+        "reference_dx.bf16": dx,
+        "reference_dgamma.bf16": dgamma,
+    }.items():
+        (directory / name).write_bytes(_bf16_bytes(value))
+    _verify_heldout_case(case_root)
+    return {"input_digests": HELDOUT_INPUT_DIGESTS, "reference_digests": HELDOUT_REFERENCE_DIGESTS}
 
 
 def _ordered_bf16(value: np.ndarray) -> np.ndarray:
@@ -280,6 +362,82 @@ def execute_plan(plan: Mapping[str, Any], invoke: Callable[[list[str]], int]) ->
         status = invoke(list(run["argv"]))
         if status != 0:
             raise RuntimeError(f"{run['producer']} producer exited with status {status}")
+
+
+def qualification_plan(
+    te_runner: str,
+    xla_runner: str,
+    python: str,
+    case_root: Path,
+) -> ValidatedQualificationPlan:
+    """Return the repeated qualification and held-out matrix for the role policy."""
+    _verify_case_directory(case_root)
+    _verify_heldout_case(case_root)
+    rows, features = REPRESENTATIVE_SHAPE
+    runs = []
+    for pattern in (QUALIFICATION_PATTERN, HELDOUT_PATTERN):
+        directory = case_root / (f"{rows}x{features}" if pattern == QUALIFICATION_PATTERN else HELDOUT_PATTERN)
+        for boundary in BOUNDARIES:
+            for producer in PRODUCERS:
+                prefix = [te_runner] if producer == "transformer_engine_2_17" else [python, xla_runner]
+                for repeat in range(NUMERICAL_POLICY["repeat_count"]):
+                    runs.append(
+                        {
+                            "shape": [rows, features],
+                            "scope": "representative_policy_qualification",
+                            "input_pattern": pattern,
+                            "boundary": boundary,
+                            "producer": producer,
+                            "repeat": repeat,
+                            "argv": [
+                                *prefix,
+                                "--boundary",
+                                boundary,
+                                "--rows",
+                                str(rows),
+                                "--features",
+                                str(features),
+                                "--epsilon",
+                                "1e-06",
+                                "--case-directory",
+                                str(directory),
+                                "--output",
+                                str(
+                                    case_root.parent
+                                    / "raw"
+                                    / f"policy-{producer}-{pattern}-{boundary}-repeat{repeat}.json"
+                                ),
+                            ],
+                        }
+                    )
+    return ValidatedQualificationPlan(
+        schema="shuttle_abi22_rmsnorm_policy_plan_v1",
+        policy=NUMERICAL_POLICY,
+        case_root=str(case_root),
+        executables={"te": te_runner, "xla": xla_runner, "python": python},
+        runs=runs,
+    )
+
+
+def execute_qualification_plan(plan: Mapping[str, Any], invoke: Callable[[list[str]], int]) -> None:
+    """Execute only the exact canonical repeated qualification plan."""
+    if not isinstance(plan, ValidatedQualificationPlan):
+        raise ValueError("qualification plan was not returned by canonical derivation")
+    executables = plan.get("executables")
+    if not isinstance(executables, Mapping) or set(executables) != {"te", "xla", "python"}:
+        raise ValueError("qualification plan executable identities drifted")
+    expected = qualification_plan(
+        _string(executables["te"], "TE executable"),
+        _string(executables["xla"], "XLA executable"),
+        _string(executables["python"], "Python executable"),
+        Path(_string(plan.get("case_root"), "case_root")),
+    )
+    if plan != expected:
+        raise ValueError("qualification plan differs from canonical repeated derivation")
+    for run in plan["runs"]:
+        status = invoke(list(run["argv"]))
+        if status != 0:
+            raise RuntimeError(f"{run['producer']} qualification producer exited with status {status}")
 
 
 def _string(value: object, name: str) -> str:
@@ -388,7 +546,12 @@ def _error_metrics(actual: np.ndarray, reference: np.ndarray) -> dict[str, float
     }
 
 
-def load_te_raw_cell(path: Path, case_directory: Path) -> dict[str, Any]:
+def load_te_raw_cell(
+    path: Path,
+    case_directory: Path,
+    *,
+    expected_input_digests: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
     """Convert one TE runner observation into a validated-report cell."""
     raw = json.loads(path.read_text())
     required = {
@@ -410,7 +573,8 @@ def load_te_raw_cell(path: Path, case_directory: Path) -> dict[str, Any]:
     boundary = raw["boundary"]
     if shape not in SHAPES or boundary not in BOUNDARIES:
         raise ValueError("raw TE coordinate is outside the matrix")
-    if case_directory.name != f"{shape[0]}x{shape[1]}":
+    expected_directory = f"{shape[0]}x{shape[1]}" if expected_input_digests is None else HELDOUT_PATTERN
+    if case_directory.name != expected_directory:
         raise ValueError("raw TE case directory does not match its shape")
     _verify_case_directory(case_directory.parent)
     roles = OUTPUT_ROLES[boundary]
@@ -446,7 +610,14 @@ def load_te_raw_cell(path: Path, case_directory: Path) -> dict[str, Any]:
         "shape": list(shape),
         "scope": "architecture_fixture" if shape == ARCHITECTURE_SHAPE else "representative_acceptance",
         "boundary": boundary,
-        "input_digests": _expected_inputs(shape, boundary),
+        "input_digests": (
+            _expected_inputs(shape, boundary)
+            if expected_input_digests is None
+            else {
+                role: expected_input_digests[role]
+                for role in (("x", "gamma") if boundary == "forward" else ("x", "gamma", "dy"))
+            }
+        ),
         "execution": _expected_execution(boundary),
         "outputs": outputs,
         "timing": {
@@ -618,11 +789,12 @@ def validate_report(
             ulp = output.get("max_bfloat16_ulp")
             if type(absolute) not in (int, float) or not math.isfinite(float(absolute)) or absolute < 0:
                 raise ValueError("max_absolute_error must be nonnegative and finite")
-            if shape == REPRESENTATIVE_SHAPE and float(absolute) > ACCEPTANCE_LIMITS["max_absolute_error"]:
+            limits = ACCEPTANCE_LIMITS[role]
+            if shape == REPRESENTATIVE_SHAPE and float(absolute) > limits["max_absolute_error"]:
                 raise ValueError("max_absolute_error exceeds acceptance limit")
             if type(ulp) is not int or ulp < 0:
                 raise ValueError("max_bfloat16_ulp must be a nonnegative integer")
-            if shape == REPRESENTATIVE_SHAPE and ulp > ACCEPTANCE_LIMITS["max_bfloat16_ulp"]:
+            if shape == REPRESENTATIVE_SHAPE and ulp > limits["max_bfloat16_ulp"]:
                 raise ValueError("max_bfloat16_ulp exceeds acceptance limit")
             actual_digests[(shape, boundary, role)] = digest
         timing = cell.get("timing")
@@ -653,10 +825,117 @@ def validate_report(
     return dict(document)
 
 
+def validate_qualification_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate both repeated representative patterns against the frozen role policy."""
+    document = dict(value)
+    if set(document) not in ({"schema", "cells"}, {"schema", "policy", "cells"}):
+        raise ValueError("qualification evidence fields drifted")
+    if document.get("schema") != "shuttle_abi22_rmsnorm_policy_evidence_v1":
+        raise ValueError("qualification evidence schema drifted")
+    if "policy" in document and document["policy"] != NUMERICAL_POLICY:
+        raise ValueError("qualification numerical policy drifted")
+    cells = document.get("cells")
+    expected_coordinates = [
+        (producer, pattern, boundary, repeat)
+        for producer in PRODUCERS
+        for pattern in (QUALIFICATION_PATTERN, HELDOUT_PATTERN)
+        for boundary in BOUNDARIES
+        for repeat in range(NUMERICAL_POLICY["repeat_count"])
+    ]
+    if not isinstance(cells, list) or len(cells) != len(expected_coordinates):
+        raise ValueError("qualification cell matrix drifted")
+    digests: dict[tuple[str, str, str, int, str], str] = {}
+    for cell, (producer, pattern, boundary, repeat) in zip(cells, expected_coordinates, strict=True):
+        if not isinstance(cell, Mapping):
+            raise ValueError("qualification cell is not an object")
+        if (
+            cell.get("producer") != producer
+            or cell.get("input_pattern") != pattern
+            or cell.get("boundary") != boundary
+            or cell.get("repeat") != repeat
+            or tuple(cell.get("shape", ())) != REPRESENTATIVE_SHAPE
+            or cell.get("scope") != "representative_policy_qualification"
+        ):
+            raise ValueError("qualification coordinate drifted")
+        if pattern == QUALIFICATION_PATTERN:
+            input_digests = INPUT_DIGESTS[REPRESENTATIVE_SHAPE]
+            reference_digests = REFERENCE_DIGESTS[REPRESENTATIVE_SHAPE]
+        else:
+            input_digests = HELDOUT_INPUT_DIGESTS
+            reference_digests = HELDOUT_REFERENCE_DIGESTS
+        if cell.get("input_digests") != {
+            role: input_digests[role] for role in (("x", "gamma") if boundary == "forward" else ("x", "gamma", "dy"))
+        }:
+            raise ValueError("qualification input provenance drifted")
+        if cell.get("execution") != _expected_execution(boundary):
+            raise ValueError("qualification call sequence drifted")
+        outputs = cell.get("outputs")
+        roles = OUTPUT_ROLES[boundary]
+        if not isinstance(outputs, list) or [output.get("role") for output in outputs] != list(roles):
+            raise ValueError("qualification output role drifted")
+        for output, role in zip(outputs, roles, strict=True):
+            digest = _sha(output.get("digest"), "qualification output digest")
+            if _sha(output.get("reference_digest"), "qualification reference digest") != reference_digests[role]:
+                raise ValueError("qualification reference digest drifted")
+            absolute = output.get("max_absolute_error")
+            ulp = output.get("max_bfloat16_ulp")
+            if type(absolute) not in (int, float) or not math.isfinite(float(absolute)) or absolute < 0:
+                raise ValueError("qualification max_absolute_error must be finite and nonnegative")
+            if type(ulp) is not int or ulp < 0:
+                raise ValueError("qualification max_bfloat16_ulp must be nonnegative")
+            limits = ACCEPTANCE_LIMITS[role]
+            if float(absolute) > limits["max_absolute_error"]:
+                raise ValueError("qualification max_absolute_error exceeds role limit")
+            if ulp > limits["max_bfloat16_ulp"]:
+                raise ValueError("qualification max_bfloat16_ulp exceeds role limit")
+            digests[(producer, pattern, boundary, repeat, role)] = digest
+        timing = cell.get("timing")
+        if not isinstance(timing, Mapping) or timing.get("warmup_invocations") != WARMUP_INVOCATIONS:
+            raise ValueError("qualification timing drifted")
+        host = _positive_samples(timing.get("raw_host_blocking_ns"), "qualification host", permitted_none=False)
+        assert host is not None
+        if timing.get("median_host_blocking_ns") != statistics.median(host):
+            raise ValueError("qualification host median drifted")
+        cuda = _positive_samples(
+            timing.get("raw_cuda_event_ns"),
+            "qualification CUDA-event",
+            permitted_none=producer == "ordinary_jax_xla",
+        )
+        if (producer == "transformer_engine_2_17") != (cuda is not None):
+            raise ValueError("qualification CUDA-event provider contract drifted")
+    for producer in PRODUCERS:
+        for pattern in (QUALIFICATION_PATTERN, HELDOUT_PATTERN):
+            for boundary in BOUNDARIES:
+                for role in OUTPUT_ROLES[boundary]:
+                    if (
+                        digests[(producer, pattern, boundary, 0, role)]
+                        != digests[(producer, pattern, boundary, 1, role)]
+                    ):
+                        raise ValueError("qualification repeat output digest drifted")
+            for repeat in range(NUMERICAL_POLICY["repeat_count"]):
+                if (
+                    digests[(producer, pattern, "forward", repeat, "y")]
+                    != digests[(producer, pattern, "composed", repeat, "y")]
+                ):
+                    raise ValueError("qualification composed forward digest drifted")
+                for role in ("dx", "dgamma"):
+                    if (
+                        digests[(producer, pattern, "backward_recompute", repeat, role)]
+                        != digests[(producer, pattern, "composed", repeat, role)]
+                    ):
+                        raise ValueError("qualification composed backward digest drifted")
+    return {
+        "schema": "shuttle_abi22_rmsnorm_policy_evidence_v1",
+        "policy": NUMERICAL_POLICY,
+        "cells": [dict(cell) for cell in cells],
+    }
+
+
 def build_matched_acceptance(
     te_report: Mapping[str, Any],
     xla_report: Mapping[str, Any],
     *,
+    qualification: Mapping[str, Any],
     expected_te_identity: ValidatedTeRuntimeIdentity,
 ) -> dict[str, Any]:
     """Build the representative numerical acceptance and clock-matched timing summary."""
@@ -670,6 +949,7 @@ def build_matched_acceptance(
         expected_te_identity=expected_te_identity,
     )
     xla = validate_report(xla_report, expected_producer="ordinary_jax_xla")
+    qualified = validate_qualification_evidence(qualification)
     if te["device"] != xla["device"]:
         raise ValueError("producer device identities differ")
     ratios = {}
@@ -691,6 +971,8 @@ def build_matched_acceptance(
         "accepted_shape": list(REPRESENTATIVE_SHAPE),
         "accepted_boundaries": list(BOUNDARIES),
         "excluded_architecture_fixture_shape": list(ARCHITECTURE_SHAPE),
+        "numerical_policy": NUMERICAL_POLICY,
+        "qualification": qualified,
         "performance": {
             "status": "reported_without_threshold",
             "clock": "host_blocking_ns",
