@@ -69,8 +69,10 @@ workspace must not exist. Before network access, the executor validates the
 Iris-synced Shuttle and Track 1 source files against the authorization's
 canonical source manifest. It then fetches the pinned JAX, XLA, and Bazel
 inputs once, checks their identities and patch bytes, warms Bazel's
-repository state, and then repeats the three-wheel build with repository
-downloads disabled. Populate and reuse run as separate Python processes. Build
+repository state—including the pinned hermetic CUDA 13.0.0 packages—and then
+repeats the three-wheel build with repository downloads disabled. The physical
+CUDA 13.2 compiler tools are identity evidence only; neither build phase sets
+`LOCAL_CUDA_PATH`. Populate and reuse run as separate Python processes. Build
 logs and wheels remain under the ephemeral workspace; stdout contains one
 canonical result document.
 

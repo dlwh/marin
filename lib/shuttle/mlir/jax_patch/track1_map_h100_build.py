@@ -32,6 +32,8 @@ XLA_PATCH_SHA256 = (
     "8e50020606758a431f7e96b80e2720ef5ca40986746449cc6a20ab6ae9c7bb1e",
     "e4f3121f3123d7e2ee781cc5ee92f1ddeb0df662b6702d37615bcae821ecbc99",
 )
+HERMETIC_CUDA_VERSION = "13.0.0"
+HERMETIC_CUDA_COMPUTE_CAPABILITIES = ("9.0",)
 
 
 @dataclass(frozen=True)
@@ -141,7 +143,6 @@ def offline_wheel_command(
     marin_repository: Path,
     bazel: Path,
     bazel_output_root: Path,
-    cuda_root: Path,
     wheel_output: Path,
     xla_repository: Path,
 ) -> list[str]:
@@ -153,8 +154,8 @@ def offline_wheel_command(
         f"--bazel_path={bazel}",
         f"--output_path={wheel_output}",
         "--python_version=3.12",
-        "--cuda_version=13.0.0",
-        "--cuda_compute_capabilities=9.0",
+        f"--cuda_version={HERMETIC_CUDA_VERSION}",
+        f"--cuda_compute_capabilities={','.join(HERMETIC_CUDA_COMPUTE_CAPABILITIES)}",
         "--disable_nccl",
         "--bazel_options=--repo_env=ML_WHEEL_TYPE=release",
         "--bazel_options=--define=SHUTTLE_TEST_OBSERVER=1",
@@ -162,7 +163,6 @@ def offline_wheel_command(
         f"--bazel_startup_options=--output_user_root={bazel_output_root}",
         f"--bazel_options=--override_repository=xla={xla_repository}",
         f"--bazel_options=--override_repository=shuttle_mlir={marin_repository / 'lib/shuttle/mlir'}",
-        f"--bazel_options=--repo_env=LOCAL_CUDA_PATH={cuda_root}",
     ]
 
 

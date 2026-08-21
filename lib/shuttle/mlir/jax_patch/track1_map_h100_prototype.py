@@ -16,6 +16,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from track1_map_h100_build import (
+    HERMETIC_CUDA_COMPUTE_CAPABILITIES,
+    HERMETIC_CUDA_VERSION,
     JAX_COMMIT,
     JAX_PATCH_SHA256,
     JAX_TREE,
@@ -44,6 +46,7 @@ BAZEL_SHA256 = "fe7e799cbc9140f986b063e06800a3d4c790525075c877d00a7112669824acbf
 BAZEL_URL = f"https://github.com/bazelbuild/bazel/releases/download/{BAZEL_VERSION}/bazel-{BAZEL_VERSION}-linux-x86_64"
 JAX_URL = "https://github.com/jax-ml/jax.git"
 XLA_URL = "https://github.com/openxla/xla.git"
+PHYSICAL_CUDA_TOOLS_ROOT = Path("/usr/local/cuda-13.2")
 AUTHORIZATION_SCHEMA = "track1_map_h100_prototype_authorization"
 MAX_AUTHORIZATION_BYTES = 32 * 1024
 LOG_TAIL_READ_BYTES = 64 * 1024
@@ -205,7 +208,14 @@ def _expected_authorization(source_manifest_sha256: str) -> dict[str, object]:
         },
         "toolchain": {
             "bazel": {"sha256": BAZEL_SHA256, "url": BAZEL_URL, "version": BAZEL_VERSION},
-            "cuda_root": "/usr/local/cuda-13.2",
+            "cuda": {
+                "build_distribution": "hermetic",
+                "build_version": HERMETIC_CUDA_VERSION,
+                "compute_capabilities": list(HERMETIC_CUDA_COMPUTE_CAPABILITIES),
+                "hydration_downloads": True,
+                "offline_downloads": False,
+                "physical_tools_root": str(PHYSICAL_CUDA_TOOLS_ROOT),
+            },
             "python": "3.12",
         },
     }
@@ -245,7 +255,6 @@ def _build_commands(paths: PrototypePaths, runner_repository: Path) -> tuple[lis
         marin_repository=runner_repository,
         bazel=paths.bazel,
         bazel_output_root=paths.bazel_output,
-        cuda_root=Path("/usr/local/cuda-13.2"),
         wheel_output=paths.wheels,
         xla_repository=paths.xla,
     )
@@ -284,7 +293,7 @@ def prototype_plan(
         raise RuntimeError("prototype requires a fresh workspace path")
     if observed_base_image != BASE_IMAGE:
         raise RuntimeError("observed base image differs from authorization")
-    if cuda_root != Path("/usr/local/cuda-13.2"):
+    if cuda_root != PHYSICAL_CUDA_TOOLS_ROOT:
         raise RuntimeError("CUDA root differs from authorization")
     paths = PrototypePaths.under(workspace)
     hydrate, offline = _build_commands(paths, runner_repository)
