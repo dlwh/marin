@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import hashlib
+import json
+import shutil
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -25,6 +27,7 @@ from track1_map_h100_build import (
 )
 
 MARIN_REPOSITORY = Path(__file__).parents[4]
+PATCH_SOURCE_CAPSULES = MARIN_REPOSITORY / "lib/shuttle/mlir/jax_patch/testdata"
 
 
 def _run_git(repository: Path, *arguments: str) -> None:
@@ -92,6 +95,47 @@ def _tool_digests(inputs: BuildInputs) -> BuildToolDigests:
         nvcc=inputs.nvcc_sha256,
         ptxas=inputs.ptxas_sha256,
     )
+
+
+def _patch_source_repository(tmp_path: Path, capsule_name: str) -> Path:
+    capsule = PATCH_SOURCE_CAPSULES / capsule_name
+    raw_manifest = capsule.joinpath("source.json").read_bytes()
+    manifest = json.loads(raw_manifest)
+    assert raw_manifest == json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    repository = tmp_path / capsule_name
+    repository.mkdir()
+    for entry in manifest["entries"]:
+        source = capsule / entry["path"]
+        assert source.stat().st_size == entry["size"]
+        assert hashlib.sha256(source.read_bytes()).hexdigest() == entry["sha256"]
+        assert (
+            subprocess.run(["git", "hash-object", source], check=True, capture_output=True, text=True).stdout.strip()
+            == entry["blob"]
+        )
+        destination = repository / entry["path"]
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+    _run_git(repository, "init", "-q")
+    _run_git(repository, "add", ".")
+    _run_git(repository, "commit", "-qm", f"exact {manifest['commit']} patch source capsule")
+    return repository
+
+
+def test_exact_pinned_source_capsules_accept_both_complete_ordered_patch_stacks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    jax_repository = _patch_source_repository(tmp_path, "jax_619764c1")
+    xla_repository = _patch_source_repository(tmp_path, "xla_9b6359")
+    inputs = replace(_inputs(tmp_path), jax_repository=jax_repository, xla_repository=xla_repository)
+    monkeypatch.setattr("track1_map_h100_build._require_live_source_snapshot", lambda value: None)
+
+    apply_source_patches(inputs)
+
+    jax_module = jax_repository.joinpath("jaxlib/jax.cc").read_text()
+    assert '#include "shuttle/Transforms/XlaRegistration.h"' in jax_module
+    assert "registerShuttleXlaTransform()" in jax_module
+    xla_client = xla_repository.joinpath("xla/pjrt/c_api_client/pjrt_c_api_client.cc").read_text()
+    assert "ApplyStablehloModuleTransform" in xla_client
 
 
 def test_offline_build_preflight_is_closed_over_source_tools_and_image(
