@@ -156,8 +156,14 @@ def _test_env(name: str, value: object) -> str:
     return f"--test_env={name}={value}"
 
 
-def batch_plan(*, workspace: Path, runner_repository: Path) -> dict[str, object]:
+def _compiler_identity(source: dict[str, str]) -> str:
+    return f"shuttle-abi22:{source['commit']}:{source['tree']}:{source['manifest_sha256']}"
+
+
+def batch_plan(*, workspace: Path, runner_repository: Path, compiler_identity: str) -> dict[str, object]:
     """Return the exact same-device phase plan without executing it."""
+    if not compiler_identity.startswith("shuttle-abi22:") or not compiler_identity.strip():
+        raise ValueError("compiler identity is invalid")
     paths = BatchPaths.under(workspace)
     common = _common_bazel(paths, runner_repository)
     xla = [
@@ -178,16 +184,38 @@ def batch_plan(*, workspace: Path, runner_repository: Path) -> dict[str, object]
         _test_env("SHUTTLE_H100_XLA_HOST_REPORT", paths.xla_report),
         _test_env("SHUTTLE_H100_TE_STATUS", paths.te_status),
         _test_env("SHUTTLE_H100_PERF_EXPLORATORY_REPORT", paths.exploratory_comparison),
+        _test_env("SHUTTLE_COMPILER_IDENTITY", compiler_identity),
     ]
     return {
         "base_image": BASE_IMAGE,
         "hardware": {"gpu_count": 1, "gpu_model": "H100"},
         "phases": [
             {
-                "name": "fetch_xla",
-                "argv": ["git", "fetch", "--depth=1", "https://github.com/openxla/xla.git", XLA_COMMIT],
+                "name": "device",
+                "argv": ["nvidia-smi", "--query-gpu=name,uuid,driver_version", "--format=csv,noheader"],
             },
-            {"name": "fetch_bazel", "argv": ["curl", "--output", str(paths.bazel), BAZEL_URL]},
+            {"name": "xla_init", "argv": ["git", "init", "--quiet"]},
+            {
+                "name": "xla_remote",
+                "argv": ["git", "remote", "add", "origin", "https://github.com/openxla/xla.git"],
+            },
+            {"name": "xla_fetch", "argv": ["git", "fetch", "--depth=1", "origin", XLA_COMMIT]},
+            {"name": "xla_checkout", "argv": ["git", "checkout", "--detach", "FETCH_HEAD"]},
+            {
+                "name": "bazel_fetch",
+                "argv": [
+                    "curl",
+                    "--fail",
+                    "--location",
+                    "--proto",
+                    "=https",
+                    "--proto-redir",
+                    "=https",
+                    "--output",
+                    str(paths.bazel),
+                    BAZEL_URL,
+                ],
+            },
             {"name": "xla", "argv": xla},
             {"name": "shuttle", "argv": shuttle},
         ],
@@ -206,16 +234,11 @@ def _run(argv: list[str], *, cwd: Path | None, log: Path, phase: str) -> None:
     raise RuntimeError(f"phase {phase} failed with exit {result.returncode}\n{tail}")
 
 
-def _fetch_xla(paths: BatchPaths) -> None:
+def _fetch_xla(paths: BatchPaths, phases: list[dict[str, object]]) -> None:
     paths.xla.mkdir()
-    commands = (
-        ["git", "init", "--quiet"],
-        ["git", "remote", "add", "origin", "https://github.com/openxla/xla.git"],
-        ["git", "fetch", "--depth=1", "origin", XLA_COMMIT],
-        ["git", "checkout", "--detach", "FETCH_HEAD"],
-    )
-    for index, command in enumerate(commands):
-        _run(command, cwd=paths.xla, log=paths.logs / f"xla-{index}.log", phase=f"fetch_xla_{index}")
+    for phase in phases:
+        name = str(phase["name"])
+        _run(phase["argv"], cwd=paths.xla, log=paths.logs / f"{name}.log", phase=name)
     observed = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=paths.xla, check=True, capture_output=True, text=True
     ).stdout.strip()
@@ -223,14 +246,9 @@ def _fetch_xla(paths: BatchPaths) -> None:
         raise RuntimeError("hydrated XLA commit differs")
 
 
-def _device_identity(paths: BatchPaths) -> dict[str, object]:
+def _device_identity(paths: BatchPaths, phase: dict[str, object]) -> dict[str, object]:
     log = paths.logs / "device.log"
-    _run(
-        ["nvidia-smi", "--query-gpu=name,uuid,driver_version", "--format=csv,noheader"],
-        cwd=None,
-        log=log,
-        phase="device",
-    )
+    _run(phase["argv"], cwd=None, log=log, phase=str(phase["name"]))
     rows = [row.strip() for row in log.read_text().splitlines() if row.strip()]
     if len(rows) != 1 or "H100" not in rows[0]:
         raise RuntimeError("batch requires exactly one visible H100")
@@ -258,32 +276,20 @@ def execute_batch(
     paths.logs.mkdir()
     paths.reports.mkdir()
     paths.bazel.parent.mkdir()
-    device = _device_identity(paths)
-    _fetch_xla(paths)
-    _run(
-        [
-            "curl",
-            "--fail",
-            "--location",
-            "--proto",
-            "=https",
-            "--proto-redir",
-            "=https",
-            "--output",
-            str(paths.bazel),
-            BAZEL_URL,
-        ],
-        cwd=None,
-        log=paths.logs / "bazel-fetch.log",
-        phase="fetch_bazel",
+    plan = batch_plan(
+        workspace=workspace,
+        runner_repository=runner_repository,
+        compiler_identity=_compiler_identity(source),
     )
+    phases = plan["phases"]
+    device = _device_identity(paths, phases[0])
+    _fetch_xla(paths, phases[1:5])
+    _run(phases[5]["argv"], cwd=None, log=paths.logs / "bazel_fetch.log", phase="bazel_fetch")
     if _file_sha256(paths.bazel) != BAZEL_SHA256:
         raise RuntimeError("hydrated Bazel SHA-256 differs")
     paths.bazel.chmod(0o755)
-    plan = batch_plan(workspace=workspace, runner_repository=runner_repository)
-    phases = plan["phases"]
-    _run(phases[2]["argv"], cwd=paths.xla, log=paths.logs / "xla.log", phase="xla")
-    _run(phases[3]["argv"], cwd=paths.xla, log=paths.logs / "shuttle.log", phase="shuttle")
+    _run(phases[6]["argv"], cwd=paths.xla, log=paths.logs / "xla.log", phase="xla")
+    _run(phases[7]["argv"], cwd=paths.xla, log=paths.logs / "shuttle.log", phase="shuttle")
     reports = {
         "exploratory_comparison": _read_json(paths.exploratory_comparison, "exploratory comparison"),
         "shuttle": _read_json(paths.shuttle_report, "Shuttle report"),
@@ -326,7 +332,12 @@ def main(argv: list[str] | None = None) -> int:
     action.add_argument("--execute", action="store_true")
     arguments = parser.parse_args(argv)
     if arguments.plan:
-        result = batch_plan(workspace=arguments.workspace, runner_repository=arguments.runner_repository)
+        source = validate_source_manifest(arguments.runner_repository, arguments.source_manifest)
+        result = batch_plan(
+            workspace=arguments.workspace,
+            runner_repository=arguments.runner_repository,
+            compiler_identity=_compiler_identity(source),
+        )
     else:
         result = execute_batch(
             workspace=arguments.workspace,

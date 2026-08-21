@@ -56,14 +56,32 @@ def _git(repository: Path, *arguments: str) -> str:
     return subprocess.run(["git", *arguments], cwd=repository, check=True, capture_output=True, text=True).stdout.strip()
 
 
+def _require_clean_source_closure(bundle_root: Path) -> None:
+    status = subprocess.run(
+        [
+            "git",
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--",
+            "lib/shuttle/mlir",
+        ],
+        cwd=bundle_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    if status:
+        raise RuntimeError("Track 2 source closure is dirty")
+
+
 def _source_paths(bundle_root: Path) -> list[Path]:
+    _require_clean_source_closure(bundle_root)
     output = subprocess.run(
         [
             "git",
             "ls-files",
             "--cached",
-            "--others",
-            "--exclude-standard",
             "-z",
             "--",
             "lib/shuttle/mlir",
@@ -330,6 +348,20 @@ def _write_create_only(path: Path, payload: bytes) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _reserve_create_only(path: Path) -> int:
+    try:
+        return os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, FILE_MODE)
+    except FileExistsError as error:
+        raise FileExistsError(f"receipt already exists: {path}") from error
+
+
+def _replace_reserved(descriptor: int, payload: bytes) -> None:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    os.ftruncate(descriptor, 0)
+    os.write(descriptor, payload)
+    os.fsync(descriptor)
+
+
 def _submit(request: controller_pb2.Controller.LaunchJobRequest, *, config: Path) -> str:
     with connect_controller(config_file=config) as endpoint:
         with rpc_client(endpoint.url, endpoint.credentials, timeout_ms=LAUNCH_TIMEOUT_MS) as client:
@@ -366,16 +398,28 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("reviewed request SHA-256 differs")
     request = decode_launch_request(raw, run=arguments.run)
     request_summary = _summary(raw, run=arguments.run)
-    submitted_job = _submit(request, config=arguments.config)
-    if submitted_job != request.name:
-        raise RuntimeError("Iris returned an unexpected job identity")
-    receipt = {
+    receipt_descriptor = _reserve_create_only(arguments.receipt)
+    pending = {
         "config": str(arguments.config),
-        "job_id": submitted_job,
         "request": request_summary,
         "schema": "shuttle_track2_h100_submit_receipt_v1",
+        "status": "submission_pending",
     }
-    _write_create_only(arguments.receipt, canonical_json(receipt))
+    _replace_reserved(receipt_descriptor, canonical_json(pending))
+    try:
+        submitted_job = _submit(request, config=arguments.config)
+        if submitted_job != request.name:
+            raise RuntimeError("Iris returned an unexpected job identity")
+        receipt = {
+            "config": str(arguments.config),
+            "job_id": submitted_job,
+            "request": request_summary,
+            "schema": "shuttle_track2_h100_submit_receipt_v1",
+            "status": "submitted",
+        }
+        _replace_reserved(receipt_descriptor, canonical_json(receipt))
+    finally:
+        os.close(receipt_descriptor)
     print(canonical_json(receipt).decode(), end="")
     return 0
 
