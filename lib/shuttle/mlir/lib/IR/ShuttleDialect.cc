@@ -913,6 +913,23 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
       return task.emitOpError(
           "dependencies must equal input-buffer producer tasks");
     }
+    const bool hasFoldRegionSources = task->hasAttr("fold_region_sources");
+    const bool hasFoldRegionPhases = task->hasAttr("fold_region_phases");
+    const bool hasFoldRegionBoundaryUses =
+        task->hasAttr("fold_region_boundary_uses");
+    const bool hasFoldRegionRecomputedSources =
+        task->hasAttr("fold_region_recomputed_sources");
+    if ((hasFoldRegionPhases || hasFoldRegionBoundaryUses ||
+         hasFoldRegionRecomputedSources) &&
+        !hasFoldRegionSources) {
+      return task.emitOpError(
+          "Fold-region phases, boundary uses, and recomputation require "
+          "Fold-region sources");
+    }
+    if (hasFoldRegionSources &&
+        task.getKind() != MaterializationTaskKind::Fold) {
+      return task.emitOpError("Fold-region provenance requires a Fold task");
+    }
     if (task.getKind() == MaterializationTaskKind::Fold) {
       ++foldCount;
       auto foldRegionSources =

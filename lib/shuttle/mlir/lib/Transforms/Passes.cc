@@ -4158,9 +4158,48 @@ std::string fusedFoldMapFingerprint(FoldOp fold,
 
 std::string foldRegionFingerprint(ArrayRef<Operation *> operations) {
   std::string normalized("fold-region-v2\n");
-  for (Operation *operation : operations) {
+  llvm::SmallDenseMap<Operation *, int64_t> operationOrdinals;
+  for (auto [ordinal, operation] : llvm::enumerate(operations))
+    operationOrdinals.try_emplace(operation, ordinal);
+  for (auto [ordinal, operation] : llvm::enumerate(operations)) {
     normalized.append(semanticTaskFingerprint(operation));
     normalized.push_back('\n');
+    for (auto [operandOrdinal, operand] :
+         llvm::enumerate(operation->getOperands())) {
+      normalized.append((llvm::Twine("edge:") + llvm::Twine(ordinal) + ":" +
+                         llvm::Twine(operandOrdinal) + ":")
+                            .str());
+      if (auto argument = dyn_cast<BlockArgument>(operand)) {
+        normalized.append(
+            (llvm::Twine("argument:") + llvm::Twine(argument.getArgNumber()))
+                .str());
+      } else if (auto result = dyn_cast<OpResult>(operand)) {
+        Operation *producer = result.getOwner();
+        auto producerOrdinal = operationOrdinals.find(producer);
+        if (producerOrdinal != operationOrdinals.end()) {
+          normalized.append((llvm::Twine("source:") +
+                             llvm::Twine(producerOrdinal->second) + ":" +
+                             llvm::Twine(result.getResultNumber()))
+                                .str());
+        } else {
+          normalized.append("external:");
+          if (Attribute source = producer->getAttr("source")) {
+            std::string sourceText;
+            llvm::raw_string_ostream sourceStream(sourceText);
+            source.print(sourceStream);
+            sourceStream.flush();
+            normalized.append(sourceText);
+          } else {
+            normalized.append(producer->getName().getStringRef());
+          }
+          normalized.append(
+              (llvm::Twine(":") + llvm::Twine(result.getResultNumber())).str());
+        }
+      } else {
+        normalized.append("unknown");
+      }
+      normalized.push_back('\n');
+    }
   }
   return sha256(normalized);
 }
@@ -4347,6 +4386,10 @@ FailureOr<DerivedPlan> deriveFoldRegionPlan(RegionOp region) {
       return failure();
     for (auto [phaseOrdinal, fold] : llvm::enumerate(phases)) {
       auto input = cast<RankedTensorType>(fold.getInputs().front().getType());
+      if (llvm::any_of(fold.getInputs(), [&](Value value) {
+            return !set.contains(value.getDefiningOp());
+          }))
+        return failure();
       ArrayRef<int64_t> reduction = fold.getReductionDimensions();
       const bool row =
           reduction.size() == 1 && reduction.front() == input.getRank() - 1;
@@ -7087,8 +7130,16 @@ FailureOr<std::string> emitFoldRegionPtx(
       task.getWorkgroupThreads() <= 0 || task.getWorkgroupThreads() > 256 ||
       task.getSerialTiles() <= 0)
     return failure();
-  const bool fullPrefix = primary.getReductionDimensions().size() ==
-                          static_cast<size_t>(domain.getRank() - 1);
+  ArrayRef<int64_t> primaryReduction = primary.getReductionDimensions();
+  const bool row = primaryReduction.size() == 1 &&
+                   primaryReduction.front() == domain.getRank() - 1;
+  const bool fullPrefix =
+      primaryReduction.size() == static_cast<size_t>(domain.getRank() - 1) &&
+      llvm::all_of(llvm::enumerate(primaryReduction), [](auto axis) {
+        return static_cast<int64_t>(axis.index()) == axis.value();
+      });
+  if (!row && !fullPrefix)
+    return failure();
   FailureOr<int64_t> reductionExtent =
       fullPrefix ? scheduleElementCount(domain.getShape().drop_back())
                  : FailureOr<int64_t>(domain.getShape().back());
@@ -7145,10 +7196,14 @@ FailureOr<std::string> emitFoldRegionPtx(
          std::min<int64_t>(*reductionExtent, task.getWorkgroupThreads()))
     sharedWidth *= 2;
   for (int64_t step = sharedWidth / 2; step >= 1; step /= 2) {
+    int64_t activeThreads =
+        std::min<int64_t>(step, task.getWorkgroupThreads() - step);
+    if (activeThreads <= 0)
+      continue;
     int64_t left = ptx.nextF32();
     int64_t right = ptx.nextF32();
     int64_t sum = ptx.nextF32();
-    ptx.stream << "  setp.ge.u32 %p2, %r0, " << step
+    ptx.stream << "  setp.ge.u32 %p2, %r0, " << activeThreads
                << ";\n  @%p2 bra $fold_region_skip" << step
                << ";\n  mul.lo.u32 %r5, %r0, 2;\n"
                   "  cvt.u64.u32 %rd4, %r5;\n"
@@ -7218,10 +7273,13 @@ FailureOr<std::string> emitFoldRegionPtx(
                << elementsPerBlock
                << ";\n  @%p3 bra $done;\n"
                   "  cvt.u64.u32 %rd0, %r1;\n"
-                  "  mul.lo.u64 %rd0, %rd0, "
-               << elementsPerBlock
-               << ";\n  cvt.u64.u32 %rd6, %r6;\n"
-                  "  add.u64 %rd0, %rd0, %rd6;\n";
+                  "  cvt.u64.u32 %rd6, %r6;\n";
+    if (row) {
+      ptx.stream << "  mad.lo.u64 %rd0, %rd0, " << elementsPerBlock
+                 << ", %rd6;\n";
+    } else {
+      ptx.stream << "  mad.lo.u64 %rd0, %rd6, " << *outputExtent << ", %rd0;\n";
+    }
     FailureOr<SmallVector<int64_t>> coordinates =
         emitOutputCoordinates(ptx, output);
     if (failed(coordinates))
