@@ -297,6 +297,37 @@ def test_matrix_numerical_failure_reports_one_bounded_role_specific_difference(
     assert len(str(raised.value)) < 1_024
 
 
+def test_matrix_rejects_bitwise_signed_zero_drift(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cache_directory = tmp_path / "cache"
+    cache_directory.mkdir()
+    monkeypatch.setattr(subject, "require_h100", lambda: None)
+    monkeypatch.setattr(subject, "configure_cache", lambda directory: None)
+    monkeypatch.setattr(subject.jax.monitoring, "register_event_listener", lambda listener: None)
+
+    def execute(coordinate: Coordinate):
+        primal = np.zeros(subject.SHAPES[coordinate.rank], dtype=ml_dtypes.bfloat16)
+        gradient = np.ones(subject.SHAPES[coordinate.rank], dtype=ml_dtypes.bfloat16)
+        if coordinate == Coordinate(2, Mode.SOURCE_ORDERED):
+            primal[0, 0] = ml_dtypes.bfloat16(-0.0)
+        cache_directory.joinpath(f"jit_{coordinate.label}-{coordinate.rank:064x}-cache").write_bytes(
+            coordinate.label.encode()
+        )
+        snapshot = () if coordinate.mode is Mode.DISABLED else _successful_snapshot(coordinate)
+        return (primal, gradient), snapshot
+
+    monkeypatch.setattr(subject, "_execute", execute)
+
+    with pytest.raises(RuntimeError, match="Track 1 numerical mismatch") as raised:
+        subject.run_matrix(cache_directory, reuse=False)
+
+    evidence = json.loads(str(raised.value).split(": ", 1)[1])
+    assert evidence["role"] == "primal"
+    assert evidence["first_index"] == [0, 0]
+    assert evidence["actual_bits"] == "0x8000"
+    assert evidence["expected_bits"] == "0x0000"
+    assert evidence["max_abs"] == 0.0
+
+
 def test_reuse_rejects_cache_drift_before_executing_subject(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cache_directory = tmp_path / "cache"
     cache_directory.mkdir()
