@@ -13,6 +13,7 @@
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/Parser/Parser.h"
+#include "shuttle/Runtime/GpuExecutable.h"
 #include "shuttle/Transforms/Observer.h"
 #include "shuttle/Transforms/XlaRegistration.h"
 #include "stablehlo/dialect/Register.h"
@@ -25,11 +26,22 @@ namespace {
 
 constexpr char kOptions[] =
     R"json({"execution_mode":"stablehlo_round_trip","numerics":"source_ordered","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+constexpr char kSm100GpuOptions[] =
+    R"json({"execution_mode":"gpu_executable_bundle","gpu_target":"sm_100","numerics":"source_ordered","pipeline_abi_version":23,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
 constexpr char kProgram[] = R"mlir(
 module {
   func.func @main(%arg0: tensor<7xf32>) -> tensor<7xf32> {
     %0 = stablehlo.tanh %arg0 : tensor<7xf32>
     return %0 : tensor<7xf32>
+  }
+}
+)mlir";
+constexpr char kContractMapProgram[] = R"mlir(
+module {
+  func.func @main(%lhs: tensor<3x5xbf16>, %rhs: tensor<5x2xbf16>) -> tensor<3x2xbf16> {
+    %contract = stablehlo.dot_general %lhs, %rhs, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<3x5xbf16>, tensor<5x2xbf16>) -> tensor<3x2xf32>
+    %result = stablehlo.convert %contract : (tensor<3x2xf32>) -> tensor<3x2xbf16>
+    return %result : tensor<3x2xbf16>
   }
 }
 )mlir";
@@ -133,6 +145,47 @@ TEST(ShuttleXlaRegistryAdapterTest,
   ASSERT_EQ(observed.phases.size(), 4);
   EXPECT_EQ(observed.phases.back(),
             mlir::shuttle::ShuttlePipelinePhase::Failure);
+}
+
+TEST(ShuttleXlaRegistryAdapterTest,
+     Abi23Sm100PreferFusionRunsThroughPlanningAndCodegen) {
+  ASSERT_TRUE(mlir::shuttle::registerShuttleXlaTransform().ok());
+  mlir::MLIRContext context;
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      parseModule(context, kContractMapProgram);
+  ASSERT_TRUE(module);
+
+  absl::Status status = xla::StablehloModuleTransformRegistry::Global().Run(
+      *module, kSm100GpuOptions, "shuttle");
+  ASSERT_TRUE(status.ok()) << status;
+  std::string transformed = moduleText(*module);
+  EXPECT_EQ(transformed.find("shuttle.region"), std::string::npos);
+  EXPECT_EQ(transformed.find("stablehlo.dot_general"), std::string::npos);
+  EXPECT_NE(transformed.find("shuttle.gpu.executable_bundle.v2"),
+            std::string::npos);
+  mlir::Operation *customCall = nullptr;
+  module->walk([&](mlir::Operation *operation) {
+    if (operation->getName().getStringRef() == "stablehlo.custom_call")
+      customCall = operation;
+  });
+  ASSERT_NE(customCall, nullptr);
+  auto backendConfig =
+      customCall->getAttrOfType<mlir::DictionaryAttr>("backend_config");
+  ASSERT_TRUE(backendConfig);
+  auto bundleBytes = backendConfig.getAs<mlir::StringAttr>("bundle_bytes");
+  ASSERT_TRUE(bundleBytes);
+  llvm::StringRef serialized = bundleBytes.getValue();
+  auto executable = mlir::shuttle::GpuExecutable::Load(llvm::ArrayRef<uint8_t>(
+      reinterpret_cast<const uint8_t *>(serialized.data()), serialized.size()));
+  ASSERT_TRUE(executable.ok()) << executable.status();
+  EXPECT_EQ((*executable)->deviceSchemaVersion(), 4);
+  EXPECT_EQ((*executable)->codeFormat(),
+            mlir::shuttle::ExecutableCodeFormat::CudaPtxSm100V1);
+  llvm::StringRef ptx(
+      reinterpret_cast<const char *>((*executable)->codeBytes().data()),
+      (*executable)->codeBytes().size());
+  EXPECT_TRUE(
+      ptx.starts_with(".version 8.7\n.target sm_100\n.address_size 64\n"));
 }
 
 } // namespace

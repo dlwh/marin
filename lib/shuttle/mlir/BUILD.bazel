@@ -632,6 +632,7 @@ cc_test(
     name = "xla_registry_adapter_test",
     srcs = ["test/xla-registry-adapter-test.cc"],
     deps = [
+        ":ShuttleGpuExecutable",
         ":ShuttlePasses",
         ":ShuttleXlaRegistryAdapter",
         "@com_google_absl//absl/status",

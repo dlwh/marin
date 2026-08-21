@@ -2055,9 +2055,22 @@ LogicalResult verifyManifestCoverage(ModuleOp module, DictionaryAttr manifest) {
       "{\"execution_mode\":\"gpu_executable_bundle\",\"numerics\":\"";
   gpuPrefix.append(policy.getValue().data(), policy.getValue().size());
   gpuPrefix.push_back('"');
+  std::string sm90GpuPrefix =
+      R"json({"execution_mode":"gpu_executable_bundle","gpu_target":"sm_90","numerics":")json";
+  sm90GpuPrefix.append(policy.getValue().data(), policy.getValue().size());
+  sm90GpuPrefix.push_back('"');
+  std::string sm100GpuPrefix =
+      R"json({"execution_mode":"gpu_executable_bundle","gpu_target":"sm_100","numerics":")json";
+  sm100GpuPrefix.append(policy.getValue().data(), policy.getValue().size());
+  sm100GpuPrefix.push_back('"');
+  const bool targetedGpuOptions =
+      (canonicalOptions.getValue().starts_with(sm90GpuPrefix) ||
+       canonicalOptions.getValue().starts_with(sm100GpuPrefix)) &&
+      canonicalOptions.getValue().contains(
+          "\"pipeline_abi_version\":23,\"schema_version\":1");
   const bool validOptionsPrefix =
       canonicalOptions.getValue().starts_with(roundTripPrefix) ||
-      canonicalOptions.getValue().starts_with(gpuPrefix);
+      canonicalOptions.getValue().starts_with(gpuPrefix) || targetedGpuOptions;
   if ((policy.getValue() != "source_ordered" && policy.getValue() != "fast") ||
       tuningDigest.getValue().size() != 64 ||
       !llvm::all_of(tuningDigest.getValue(), llvm::isHexDigit) ||
@@ -5446,18 +5459,21 @@ public:
     auto canonicalOptions =
         manifest ? manifest.getAs<StringAttr>("canonical_options")
                  : StringAttr{};
-    const bool abi22 =
+    const bool materializationTuningAbi =
         !canonicalOptions ||
         canonicalOptions.getValue().contains(
-            "\"pipeline_abi_version\":22,\"schema_version\":1");
+            "\"pipeline_abi_version\":22,\"schema_version\":1") ||
+        canonicalOptions.getValue().contains(
+            "\"pipeline_abi_version\":23,\"schema_version\":1");
     const bool validTuning =
         tuning && (tuning.getValue() == kDefaultCanonicalTuning ||
                    tuning.getValue() == kFusionCanonicalTuning ||
                    tuning.getValue() == kMaterializationCanonicalTuning);
-    if (!validTuning ||
-        (!abi22 && tuning.getValue() != kDefaultCanonicalTuning)) {
+    if (!validTuning || (!materializationTuningAbi &&
+                         tuning.getValue() != kDefaultCanonicalTuning)) {
       module.emitError(
-          "requires an exact ABI21 default or ABI22 materialization tuning");
+          "requires an exact ABI21 default or ABI22/ABI23 materialization "
+          "tuning");
       return signalPassFailure();
     }
     const bool preferFusion = tuning.getValue() == kFusionCanonicalTuning;
