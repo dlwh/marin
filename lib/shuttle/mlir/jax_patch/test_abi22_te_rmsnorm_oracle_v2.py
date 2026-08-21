@@ -403,7 +403,8 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
         for run in plan["runs"]:
             self.assertEqual(run["shape"], [2048, 4096])
             self.assertEqual(run["argv"][run["argv"].index("--epsilon") + 1], "1e-06")
-            self.assertEqual(Path(run["argv"][run["argv"].index("--case-directory") + 1]).name, run["input_pattern"])
+            expected_directory = "2048x4096" if run["input_pattern"] == QUALIFICATION_PATTERN else HELDOUT_PATTERN
+            self.assertEqual(Path(run["argv"][run["argv"].index("--case-directory") + 1]).name, expected_directory)
             self.assertIn(f"repeat{run['repeat']}", Path(run["argv"][-1]).name)
             self.assertTrue(Path(run["argv"][-1]).is_absolute())
         (directory / "x.bf16").write_bytes(b"tampered")
