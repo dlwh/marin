@@ -292,3 +292,35 @@ author: dlwh
   full local and independent review before another request.
 - Artifact:
   [`track2-shuttle-rmsnorm-r4-failure-20260821`](../../lib/shuttle/mlir/artifacts/track2-shuttle-rmsnorm-r4-failure-20260821/README.md).
+
+### 2026-08-21 15:57 - T2-SHUTTLE-004 r5 representative acceptance
+
+- Hypothesis: the uniquely derived nested runfiles root would let the
+  standalone GpuRunner matrix execute and accept the exact r12 held-out
+  RMSNorm input under both reduction policies.
+- Commit Hash: source `e916b99f0f35d0fc32604fd5fa59296e6fd53bf0`, tree
+  `a50f12f97555efd2e569bc3cca2cd96865877d1d`.
+- Command: sealed Iris job `/dlwh/shuttle-track2-rmsnorm-h100-r5` on
+  `cw-us-east-02a`, request SHA-256
+  `647c399405f1a7c0df2cbd693536e3ec65d8c4e1de827065376d4a72b23e2092`.
+- Config: one H100, batch priority, one replica, zero failure, preemption, and
+  task-failure budgets; Shuttle RMSNorm `[2048,4096]`; epsilon `1e-6`;
+  F/B/C; SOURCE_ORDERED and FAST; two fresh-process repeats; 10 warmups and
+  20 host-blocking plus 20 supplemental CUDA-event samples per coordinate.
+- Result: **accepted for the exact held-out numerical scope.** Iris reports
+  task exit 0, duration 247.37 seconds, zero failures, and zero preemptions.
+  All 12 policy/boundary/role repeat coordinates are bit-identical. The worst
+  masked BF16 distance is 1 ULP for `y` and `dx`; `dgamma` is exact.
+  Resources match the frozen contract: F is 1 launch/3 slots/0 temporary, B
+  is 3/6/8,192 bytes, and C is 4/7/8,192 bytes.
+- Interpretation: the representative standalone Shuttle RMSNorm compiler and
+  GPU path is numerically accepted for this input, shape, epsilon, policies,
+  toolchain, and H100 model. Host-blocking timings are reported without a
+  threshold. r12 and r5 used different physical H100s, so the TE/XLA ratios
+  are exploratory matched-model, matched-clock comparisons, not same-device
+  performance acceptance. Norm-to-Contract remains excluded.
+- Next action: preserve the canonical result and review the evidence closure;
+  any performance work should target the observed 2.74-5.53× gap to ordinary
+  JAX/XLA before proposing a threshold.
+- Artifact:
+  [`track2-shuttle-rmsnorm-r5-success-20260821`](../../lib/shuttle/mlir/artifacts/track2-shuttle-rmsnorm-r5-success-20260821/README.md).
