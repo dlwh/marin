@@ -11,8 +11,13 @@ import unittest
 from collections.abc import Mapping
 from pathlib import Path
 
+import ml_dtypes
+import numpy as np
 from abi22_te_rmsnorm_oracle_v2 import (
+    ACCEPTANCE_INPUT_DIGESTS,
     ACCEPTANCE_LIMITS,
+    ACCEPTANCE_PATTERN,
+    ACCEPTANCE_REFERENCE_DIGESTS,
     ARCHITECTURE_SHAPE,
     BOUNDARIES,
     EPSILON,
@@ -28,11 +33,12 @@ from abi22_te_rmsnorm_oracle_v2 import (
     ValidatedTeRuntimeIdentity,
     build_matched_acceptance,
     epsilon_sensitivity,
+    error_metrics,
     execute_plan,
     execute_qualification_plan,
     execution_plan,
     prepare_cases,
-    prepare_heldout_case,
+    prepare_policy_cases,
     qualification_plan,
     validate_build_manifest,
     validate_qualification_evidence,
@@ -91,6 +97,15 @@ def _cell(shape: tuple[int, int], boundary: str, *, provider: str) -> dict:
                 "reference_digest": REFERENCE_DIGESTS[shape][role],
                 "max_absolute_error": 0.0,
                 "max_bfloat16_ulp": 0,
+                "mean_absolute_error": 0.0,
+                "absolute_floor": ACCEPTANCE_LIMITS[role]["absolute_floor"],
+                "eligible_count": 1,
+                "max_relative_error_above_absolute_floor": 0.0,
+                "max_bfloat16_ulp_above_absolute_floor": 0,
+                "all_finite": True,
+                "raw_max_bfloat16_ulp_index": 0,
+                "raw_max_bfloat16_ulp_actual": 0.0,
+                "raw_max_bfloat16_ulp_reference": 0.0,
             }
             for role in roles
         ],
@@ -146,13 +161,16 @@ def _report(provider: str) -> dict:
 def _qualification_evidence() -> dict:
     cells = []
     for provider in ("transformer_engine_2_17", "ordinary_jax_xla"):
-        for pattern in (QUALIFICATION_PATTERN, HELDOUT_PATTERN):
+        for pattern in (QUALIFICATION_PATTERN, HELDOUT_PATTERN, ACCEPTANCE_PATTERN):
             if pattern == QUALIFICATION_PATTERN:
                 input_digests = INPUT_DIGESTS[REPRESENTATIVE_SHAPE]
                 reference_digests = REFERENCE_DIGESTS[REPRESENTATIVE_SHAPE]
-            else:
+            elif pattern == HELDOUT_PATTERN:
                 input_digests = HELDOUT_INPUT_DIGESTS
                 reference_digests = HELDOUT_REFERENCE_DIGESTS
+            else:
+                input_digests = ACCEPTANCE_INPUT_DIGESTS
+                reference_digests = ACCEPTANCE_REFERENCE_DIGESTS
             for boundary in BOUNDARIES:
                 for repeat in range(2):
                     cell = _cell(REPRESENTATIVE_SHAPE, boundary, provider=provider)
@@ -160,14 +178,18 @@ def _qualification_evidence() -> dict:
                         producer=provider,
                         input_pattern=pattern,
                         repeat=repeat,
-                        scope="representative_policy_qualification",
+                        scope=(
+                            "representative_policy_acceptance"
+                            if pattern == ACCEPTANCE_PATTERN
+                            else "representative_policy_qualification"
+                        ),
                     )
                     cell["input_digests"] = {role: input_digests[role] for role in cell["input_digests"]}
                     for output in cell["outputs"]:
                         output["digest"] = reference_digests[output["role"]]
                         output["reference_digest"] = reference_digests[output["role"]]
                     cells.append(cell)
-    return validate_qualification_evidence({"schema": "shuttle_abi22_rmsnorm_policy_evidence_v1", "cells": cells})
+    return validate_qualification_evidence({"schema": "shuttle_abi22_rmsnorm_policy_evidence_v2", "cells": cells})
 
 
 class TeRmsnormOracleV2Test(unittest.TestCase):
@@ -340,17 +362,36 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, producer):
                 execute_plan(plan, lambda argv, selected=producer: 7 if selected in argv[-1] else 0)
 
-    def test_role_policy_uses_a_predeclared_heldout_pattern_and_two_repeats(self) -> None:
+    def test_role_policy_uses_qualification_inputs_and_one_untouched_acceptance_pattern(self) -> None:
         self.assertEqual(
             NUMERICAL_POLICY,
             {
-                "schema": "shuttle_abi22_rmsnorm_role_policy_v1",
-                "patterns": ["qualification_linspace_v2", "heldout_reversed_linspace_v1"],
+                "schema": "shuttle_abi22_rmsnorm_role_policy_v2",
+                "qualification_patterns": ["qualification_linspace_v2", "heldout_reversed_linspace_v1"],
+                "acceptance_patterns": ["heldout_splitmix64_v1"],
                 "repeat_count": 2,
                 "limits_by_role": {
-                    "y": {"max_absolute_error": 0.0078125, "max_bfloat16_ulp": 2},
-                    "dx": {"max_absolute_error": 0.0625, "max_bfloat16_ulp": 64},
-                    "dgamma": {"max_absolute_error": 0.015625, "max_bfloat16_ulp": 8},
+                    "y": {
+                        "max_absolute_error": 0.0078125,
+                        "max_mean_absolute_error": 0.0078125,
+                        "absolute_floor": 0.015625,
+                        "max_relative_error_above_absolute_floor": 0.5,
+                        "max_bfloat16_ulp_above_absolute_floor": 2,
+                    },
+                    "dx": {
+                        "max_absolute_error": 0.0625,
+                        "max_mean_absolute_error": 0.0625,
+                        "absolute_floor": 0.125,
+                        "max_relative_error_above_absolute_floor": 0.5,
+                        "max_bfloat16_ulp_above_absolute_floor": 64,
+                    },
+                    "dgamma": {
+                        "max_absolute_error": 0.015625,
+                        "max_mean_absolute_error": 0.015625,
+                        "absolute_floor": 0.03125,
+                        "max_relative_error_above_absolute_floor": 0.5,
+                        "max_bfloat16_ulp_above_absolute_floor": 8,
+                    },
                 },
             },
         )
@@ -363,38 +404,61 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
             },
         )
         self.assertEqual(
-            HELDOUT_REFERENCE_DIGESTS,
+            ACCEPTANCE_INPUT_DIGESTS,
             {
-                "y": "15a4e1660f2dc93b91841a0ac8c54c90372548a4b1269a09cc9c428cdc3e98f5",
-                "dx": "d5e6be3d8cf52e4139235b9dde69a84db489a705580a376f08a613eb7beeab9a",
-                "dgamma": "06498bae527509f636aae0baa0b247e657e5f6dc1f7453cf3279e53db90664e0",
+                "x": "d5306b1c52e907c4f4df004e6f3a9c488f354acd80221eb5077e6f20a1c3f34e",
+                "gamma": "7666bd787eded8f496d15ecaa0ff1a09e2785076f6f5e5db47737a95152b86ec",
+                "dy": "2abeef4e00143b614ca27c6f310998493609de3490f4720538be507c4ddc4556",
+            },
+        )
+        self.assertEqual(
+            ACCEPTANCE_REFERENCE_DIGESTS,
+            {
+                "y": "dbf0c5cc4900ca5498099bd458edfdf31200a692fd2996e66960e8b98b77078e",
+                "dx": "938fe85ca5d7820ca1ae7dfb8acc970307ad88ec92d94b77bd024e904c2d8c55",
+                "dgamma": "209869785a9897bfd13ff39665e0ad781d2bb14b3b7c15067a1f6c752c4601fb",
             },
         )
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         case_root = Path(temporary.name) / "cases"
         prepare_cases(case_root)
-        heldout = prepare_heldout_case(case_root)
-        self.assertEqual(heldout["input_digests"], HELDOUT_INPUT_DIGESTS)
-        self.assertEqual(heldout["reference_digests"], HELDOUT_REFERENCE_DIGESTS)
-        directory = case_root / HELDOUT_PATTERN
-        for name, digest in {
-            "x.bf16": HELDOUT_INPUT_DIGESTS["x"],
-            "gamma.bf16": HELDOUT_INPUT_DIGESTS["gamma"],
-            "dy.bf16": HELDOUT_INPUT_DIGESTS["dy"],
-            "reference_y.bf16": HELDOUT_REFERENCE_DIGESTS["y"],
-            "reference_dx.bf16": HELDOUT_REFERENCE_DIGESTS["dx"],
-            "reference_dgamma.bf16": HELDOUT_REFERENCE_DIGESTS["dgamma"],
-        }.items():
-            self.assertEqual(hashlib.sha256((directory / name).read_bytes()).hexdigest(), digest)
+        prepared = prepare_policy_cases(case_root)
+        self.assertEqual(
+            prepared,
+            {
+                HELDOUT_PATTERN: {
+                    "input_digests": HELDOUT_INPUT_DIGESTS,
+                    "reference_digests": HELDOUT_REFERENCE_DIGESTS,
+                },
+                ACCEPTANCE_PATTERN: {
+                    "input_digests": ACCEPTANCE_INPUT_DIGESTS,
+                    "reference_digests": ACCEPTANCE_REFERENCE_DIGESTS,
+                },
+            },
+        )
+        for pattern, inputs, references in (
+            (HELDOUT_PATTERN, HELDOUT_INPUT_DIGESTS, HELDOUT_REFERENCE_DIGESTS),
+            (ACCEPTANCE_PATTERN, ACCEPTANCE_INPUT_DIGESTS, ACCEPTANCE_REFERENCE_DIGESTS),
+        ):
+            directory = case_root / pattern
+            for name, digest in {
+                "x.bf16": inputs["x"],
+                "gamma.bf16": inputs["gamma"],
+                "dy.bf16": inputs["dy"],
+                "reference_y.bf16": references["y"],
+                "reference_dx.bf16": references["dx"],
+                "reference_dgamma.bf16": references["dgamma"],
+            }.items():
+                self.assertEqual(hashlib.sha256((directory / name).read_bytes()).hexdigest(), digest)
         plan = qualification_plan("./te", "./xla.py", "./python", case_root)
-        self.assertEqual(plan["schema"], "shuttle_abi22_rmsnorm_policy_plan_v1")
-        self.assertEqual(len(plan["runs"]), 24)
+        self.assertEqual(plan["schema"], "shuttle_abi22_rmsnorm_policy_plan_v2")
+        self.assertEqual(len(plan["runs"]), 36)
         self.assertEqual(
             {(run["input_pattern"], run["boundary"], run["producer"], run["repeat"]) for run in plan["runs"]},
             {
                 (pattern, boundary, producer, repeat)
-                for pattern in (QUALIFICATION_PATTERN, HELDOUT_PATTERN)
+                for pattern in (QUALIFICATION_PATTERN, HELDOUT_PATTERN, ACCEPTANCE_PATTERN)
                 for boundary in BOUNDARIES
                 for producer in ("transformer_engine_2_17", "ordinary_jax_xla")
                 for repeat in range(2)
@@ -403,14 +467,15 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
         for run in plan["runs"]:
             self.assertEqual(run["shape"], [2048, 4096])
             self.assertEqual(run["argv"][run["argv"].index("--epsilon") + 1], "1e-06")
-            expected_directory = "2048x4096" if run["input_pattern"] == QUALIFICATION_PATTERN else HELDOUT_PATTERN
+            expected_directory = "2048x4096" if run["input_pattern"] == QUALIFICATION_PATTERN else run["input_pattern"]
             self.assertEqual(Path(run["argv"][run["argv"].index("--case-directory") + 1]).name, expected_directory)
             self.assertIn(f"repeat{run['repeat']}", Path(run["argv"][-1]).name)
             self.assertTrue(Path(run["argv"][-1]).is_absolute())
-        (directory / "x.bf16").write_bytes(b"tampered")
+        acceptance_directory = case_root / ACCEPTANCE_PATTERN
+        (acceptance_directory / "x.bf16").write_bytes(b"tampered")
         with self.assertRaisesRegex(ValueError, "case.*digest|case.*size"):
             qualification_plan("./te", "./xla.py", "./python", case_root)
-        prepare_heldout_case(case_root)
+        prepare_policy_cases(case_root)
         invoked: list[list[str]] = []
         execute_qualification_plan(plan, lambda argv: invoked.append(argv) or 0)
         self.assertEqual(invoked, [run["argv"] for run in plan["runs"]])
@@ -474,22 +539,6 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "call sequence"):
                     _validate(report, producer)
 
-        self.assertEqual(ACCEPTANCE_LIMITS, NUMERICAL_POLICY["limits_by_role"])
-        for producer in ("transformer_engine_2_17", "ordinary_jax_xla"):
-            for cell_index in (3, 4, 5):
-                for output_index in range(len(_report(producer)["cells"][cell_index]["outputs"])):
-                    role = _report(producer)["cells"][cell_index]["outputs"][output_index]["role"]
-                    limits = ACCEPTANCE_LIMITS[role]
-                    for field, value in (
-                        ("max_absolute_error", limits["max_absolute_error"] + 1.0e-6),
-                        ("max_bfloat16_ulp", limits["max_bfloat16_ulp"] + 1),
-                        ("max_absolute_error", float("nan")),
-                    ):
-                        report = _report(producer)
-                        report["cells"][cell_index]["outputs"][output_index][field] = value
-                        with self.assertRaisesRegex(ValueError, field):
-                            _validate(report, producer)
-
         qualified = _qualification_evidence()
         self.assertEqual(qualified["policy"], NUMERICAL_POLICY)
         for mutation, diagnostic in (
@@ -506,13 +555,28 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, diagnostic):
                 validate_qualification_evidence(evidence)
         for index, cell in enumerate(qualified["cells"]):
-            if cell["input_pattern"] != HELDOUT_PATTERN or cell["repeat"] != 0:
+            if cell["input_pattern"] != ACCEPTANCE_PATTERN or cell["repeat"] != 0:
                 continue
             for output_index, output in enumerate(cell["outputs"]):
                 role = output["role"]
                 for field, value in (
                     ("max_absolute_error", ACCEPTANCE_LIMITS[role]["max_absolute_error"] + 1.0e-6),
-                    ("max_bfloat16_ulp", ACCEPTANCE_LIMITS[role]["max_bfloat16_ulp"] + 1),
+                    (
+                        "mean_absolute_error",
+                        ACCEPTANCE_LIMITS[role]["max_mean_absolute_error"] + 1.0e-6,
+                    ),
+                    ("mean_absolute_error", float("nan")),
+                    (
+                        "max_relative_error_above_absolute_floor",
+                        ACCEPTANCE_LIMITS[role]["max_relative_error_above_absolute_floor"] + 1.0e-6,
+                    ),
+                    (
+                        "max_bfloat16_ulp_above_absolute_floor",
+                        ACCEPTANCE_LIMITS[role]["max_bfloat16_ulp_above_absolute_floor"] + 1,
+                    ),
+                    ("eligible_count", 0),
+                    ("absolute_floor", ACCEPTANCE_LIMITS[role]["absolute_floor"] * 2),
+                    ("all_finite", False),
                 ):
                     evidence = copy.deepcopy(qualified)
                     evidence["cells"][index]["outputs"][output_index][field] = value
@@ -520,12 +584,43 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
                         validate_qualification_evidence(evidence)
 
         diagnostic = copy.deepcopy(qualified)
-        diagnostic["cells"][12]["outputs"][0]["max_bfloat16_ulp"] = 3
-        with self.assertRaisesRegex(
-            ValueError,
-            "ordinary_jax_xla/qualification_linspace_v2/forward/repeat0/y: " "max_bfloat16_ulp 3 exceeds role limit 2",
-        ):
-            validate_qualification_evidence(diagnostic)
+        reversed_dx = next(
+            output
+            for cell in diagnostic["cells"]
+            if cell["producer"] == "transformer_engine_2_17"
+            and cell["input_pattern"] == HELDOUT_PATTERN
+            and cell["boundary"] == "backward_recompute"
+            and cell["repeat"] == 0
+            for output in cell["outputs"]
+            if output["role"] == "dx"
+        )
+        reversed_dx.update(max_absolute_error=0.0625, mean_absolute_error=0.0625, max_bfloat16_ulp=283)
+        validate_qualification_evidence(diagnostic)
+
+        global_ulp_is_diagnostic = copy.deepcopy(qualified)
+        acceptance_output = next(
+            output
+            for cell in global_ulp_is_diagnostic["cells"]
+            if cell["input_pattern"] == ACCEPTANCE_PATTERN
+            for output in cell["outputs"]
+        )
+        acceptance_output["max_bfloat16_ulp"] = 10_000
+        validate_qualification_evidence(global_ulp_is_diagnostic)
+
+        acceptance_repeat = copy.deepcopy(qualified)
+        repeated_output = next(
+            output
+            for cell in acceptance_repeat["cells"]
+            if cell["producer"] == "ordinary_jax_xla"
+            and cell["input_pattern"] == ACCEPTANCE_PATTERN
+            and cell["boundary"] == "composed"
+            and cell["repeat"] == 1
+            for output in cell["outputs"]
+            if output["role"] == "dx"
+        )
+        repeated_output["digest"] = "d" * 64
+        with self.assertRaisesRegex(ValueError, "repeat"):
+            validate_qualification_evidence(acceptance_repeat)
 
         distinct = copy.deepcopy(qualified)
         for index in (2, 3):
@@ -550,6 +645,24 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
             report["cells"][4]["outputs"][0]["digest"] = "not-a-sha"
             with self.assertRaisesRegex(ValueError, "output digest"):
                 _validate(report, producer)
+
+    def test_error_metrics_separates_global_ulp_from_the_absolute_floor_mask(self) -> None:
+        reference = np.array([-0.01, 0.125, 1.0], dtype=ml_dtypes.bfloat16)
+        actual = np.array([-0.0625, 0.0625, 1.0078125], dtype=ml_dtypes.bfloat16)
+
+        metrics = error_metrics(actual, reference, role="dx")
+
+        self.assertEqual(metrics["all_finite"], True)
+        self.assertEqual(metrics["max_absolute_error"], 0.0625)
+        self.assertAlmostEqual(metrics["mean_absolute_error"], 0.040934244791666664)
+        self.assertEqual(metrics["max_bfloat16_ulp"], 348)
+        self.assertEqual(metrics["raw_max_bfloat16_ulp_index"], 0)
+        self.assertEqual(metrics["raw_max_bfloat16_ulp_actual"], -0.0625)
+        self.assertEqual(metrics["raw_max_bfloat16_ulp_reference"], -0.010009765625)
+        self.assertEqual(metrics["absolute_floor"], 0.125)
+        self.assertEqual(metrics["eligible_count"], 2)
+        self.assertEqual(metrics["max_relative_error_above_absolute_floor"], 0.5)
+        self.assertEqual(metrics["max_bfloat16_ulp_above_absolute_floor"], 128)
 
     def test_reports_pin_provider_identity_and_supplemental_cuda_events(self) -> None:
         for path, value, diagnostic in (

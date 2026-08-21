@@ -13,6 +13,8 @@ from pathlib import Path
 import abi22_xla_rmsnorm_oracle_v2 as xla_oracle
 import pytest
 from abi22_te_rmsnorm_oracle_v2 import (
+    ACCEPTANCE_LIMITS,
+    ACCEPTANCE_PATTERN,
     BOUNDARIES,
     CALL_SEQUENCES,
     INPUT_DIGESTS,
@@ -114,15 +116,34 @@ def test_batch_plan_pins_te_wheel_source_build_and_exact_v2_matrix(tmp_path: Pat
         "run_count": 12,
     }
     assert plan["qualification"] == {
-        "schema": "shuttle_abi22_rmsnorm_role_policy_v1",
-        "patterns": ["qualification_linspace_v2", "heldout_reversed_linspace_v1"],
+        "schema": "shuttle_abi22_rmsnorm_role_policy_v2",
+        "qualification_patterns": ["qualification_linspace_v2", "heldout_reversed_linspace_v1"],
+        "acceptance_patterns": ["heldout_splitmix64_v1"],
         "repeat_count": 2,
         "limits_by_role": {
-            "y": {"max_absolute_error": 0.0078125, "max_bfloat16_ulp": 2},
-            "dx": {"max_absolute_error": 0.0625, "max_bfloat16_ulp": 64},
-            "dgamma": {"max_absolute_error": 0.015625, "max_bfloat16_ulp": 8},
+            "y": {
+                "max_absolute_error": 0.0078125,
+                "max_mean_absolute_error": 0.0078125,
+                "absolute_floor": 0.015625,
+                "max_relative_error_above_absolute_floor": 0.5,
+                "max_bfloat16_ulp_above_absolute_floor": 2,
+            },
+            "dx": {
+                "max_absolute_error": 0.0625,
+                "max_mean_absolute_error": 0.0625,
+                "absolute_floor": 0.125,
+                "max_relative_error_above_absolute_floor": 0.5,
+                "max_bfloat16_ulp_above_absolute_floor": 64,
+            },
+            "dgamma": {
+                "max_absolute_error": 0.015625,
+                "max_mean_absolute_error": 0.015625,
+                "absolute_floor": 0.03125,
+                "max_relative_error_above_absolute_floor": 0.5,
+                "max_bfloat16_ulp_above_absolute_floor": 8,
+            },
         },
-        "run_count": 24,
+        "run_count": 36,
     }
     assert SHUTTLE_BLOCKER == (
         "reviewed_dbff57e3_rmsnorm_canary_uses_epsilon_1e-6_but_does_not_admit_"
@@ -379,6 +400,15 @@ def _valid_cell(shape: tuple[int, int], boundary: str, *, te: bool) -> dict:
                 "reference_digest": REFERENCE_DIGESTS[shape][role],
                 "max_absolute_error": 0.0,
                 "max_bfloat16_ulp": 0,
+                "mean_absolute_error": 0.0,
+                "absolute_floor": ACCEPTANCE_LIMITS[role]["absolute_floor"],
+                "eligible_count": 1,
+                "max_relative_error_above_absolute_floor": 0.0,
+                "max_bfloat16_ulp_above_absolute_floor": 0,
+                "all_finite": True,
+                "raw_max_bfloat16_ulp_index": 0,
+                "raw_max_bfloat16_ulp_actual": 0.0,
+                "raw_max_bfloat16_ulp_reference": 0.0,
             }
             for role in roles
         ],
@@ -524,7 +554,13 @@ def test_execute_oracle_runs_exact_matrix_and_builds_matched_acceptance(
             for output in cell["outputs"]
         )
 
-    assert len(calls) == 36
+    policy_raw_path = paths.reports / "policy-raw-v2.json"
+    assert policy_raw_path.is_file()
+    policy_raw = json.loads(policy_raw_path.read_text())
+    assert policy_raw["schema"] == "shuttle_abi22_rmsnorm_policy_evidence_v2"
+    assert len(policy_raw["cells"]) == 36
+
+    assert len(calls) == 48
     assert [
         (call[call.index("--rows") + 1], call[call.index("--features") + 1], call[call.index("--boundary") + 1])
         for call in calls[:12:2]
@@ -537,6 +573,63 @@ def test_execute_oracle_runs_exact_matrix_and_builds_matched_acceptance(
     assert result["shuttle"] == {"status": "pending", "blocker": SHUTTLE_BLOCKER}
     assert set(result["reports"]) == {"transformer_engine_2_17", "ordinary_jax_xla"}
     assert all(path.is_file() for path in (paths.te_report, paths.xla_report, paths.acceptance))
+
+
+def test_execute_oracle_prints_and_persists_raw_policy_evidence_before_rejection(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    paths = BatchPaths.under(tmp_path / "workspace")
+    paths.workspace.mkdir()
+    paths.reports.mkdir()
+    paths.raw.mkdir()
+    paths.te_runner.write_bytes(b"runner-binary")
+    paths.te_library.parent.mkdir(parents=True)
+    paths.te_library.write_bytes(b"resolved-te-library")
+    calls: list[list[str]] = []
+
+    def corrupt_acceptance_output(argv: list[str]) -> int:
+        status = _fake_oracle_invoke(paths, calls, argv)
+        if (
+            argv[0] == str(paths.te_runner)
+            and ACCEPTANCE_PATTERN in argv
+            and argv[argv.index("--boundary") + 1] == "forward"
+            and "repeat0" in argv[-1]
+        ):
+            raw_path = paths.workspace / argv[argv.index("--output") + 1]
+            raw = json.loads(raw_path.read_text())
+            reference = Path(raw["output_files"]["y"])
+            actual = paths.raw / "nonfinite-acceptance-y.bf16"
+            payload = bytearray(reference.read_bytes())
+            payload[:2] = (0x7F80).to_bytes(2, "little")
+            actual.write_bytes(payload)
+            raw["output_files"]["y"] = str(actual)
+            raw_path.write_text(json.dumps(raw, sort_keys=True))
+        return status
+
+    with pytest.raises(ValueError, match="all_finite"):
+        execute_oracle(
+            paths=paths,
+            device={"model": "NVIDIA H100 80GB HBM3", "uuid": "GPU-test", "compute_capability": "9.0"},
+            invoke=corrupt_acceptance_output,
+        )
+
+    output = capsys.readouterr().out.splitlines()
+    raw_lines = [line for line in output if line.startswith("TRACK2_TE_POLICY_RAW=")]
+    assert len(raw_lines) == 1
+    printed = json.loads(raw_lines[0].split("=", 1)[1])
+    assert json.loads((paths.reports / "policy-raw-v2.json").read_text()) == printed
+    rejected = next(
+        output
+        for cell in printed["cells"]
+        if cell["producer"] == "transformer_engine_2_17"
+        and cell["input_pattern"] == ACCEPTANCE_PATTERN
+        and cell["boundary"] == "forward"
+        and cell["repeat"] == 0
+        for output in cell["outputs"]
+        if output["role"] == "y"
+    )
+    assert rejected["all_finite"] is False
+    assert rejected["raw_max_bfloat16_ulp_index"] == 0
 
 
 def test_execute_oracle_stops_on_first_failed_producer(tmp_path: Path) -> None:
@@ -621,7 +714,7 @@ def test_execute_batch_drives_validated_oracle_and_writes_closed_result(
     assert result["tools"]["cuda_runtime_headers"] == CUDA_HEADER_IDENTITY
     assert result["evidence"]["acceptance"]["accepted_shape"] == [2048, 4096]
     assert result["evidence"]["shuttle"] == {"status": "pending", "blocker": SHUTTLE_BLOCKER}
-    assert len(calls) == 36
+    assert len(calls) == 48
     assert json.loads(BatchPaths.under(workspace).result.read_bytes()) == result
     assert not any("shuttle" in path.name for path in BatchPaths.under(workspace).reports.iterdir())
 
