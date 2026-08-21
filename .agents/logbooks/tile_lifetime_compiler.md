@@ -5661,3 +5661,60 @@ author: dlwh
   evidence, TE parity, bitwise-JAX parity, or evidence for another architecture.
 - Next action: repeat the declared coordinates independently, then evaluate
   representative shapes and performance under separately reviewed gates.
+
+### 2026-08-21 - TLTC-ABI22-003 prospective LayerNorm forward contract on H100
+
+- Hypothesis: the generic dependent-Fold phase used by LayerNorm forward can
+  execute the prospectively sealed ABI22 schedule on one H100 for both
+  SOURCE_ORDERED and FAST, match that schedule bitwise across repeated runs,
+  and remain inside independently declared binary64 limits without a
+  near-zero ULP exception.
+- Executed source: reviewed commit
+  `3b1108c191d9327d423fb84c103352295d0611fe`, tree
+  `e763d21e9f44cd811afa4471db26db8b93293113`, source-manifest SHA-256
+  `2897a10650d190421f14404c83708b0bbd06496ce5f33815f526012d262d2a0f`.
+  Contract `abi22_layernorm_forward_h100_v1` has SHA-256
+  `35dddbabe2e8a074ef33f7cc625583a5e89ba687c450d13b0a3570a9ffe26233`.
+  It binds the SIMT32 contiguous-leaf/adjacent-pair Fold schedule,
+  `sqrt.rn.f32` then `div.rn.f32`, the declared f32 epilogue, raw ordered
+  finite-BF16 ULP distance for all elements, and no near-zero exception.
+- Config: `/dlwh/shuttle-layernorm-forward-h100-r4` ran on one batch-priority
+  H100 in `cw-rno2a`, with 32 CPU, 128 GiB memory, 500 GiB disk, one replica,
+  a four-hour timeout, and all retry/failure budgets zero. The 6,436,497-byte
+  request has SHA-256
+  `0d203bb61b5734dc57513671048854c1956572adab9f13954a41a41788c6ee93`;
+  its 6,432,533-byte bundle has SHA-256
+  `fb75ac0581d0c174fc51bc760e22b23afa44eec234e1ad7b0b48f7c547835975`.
+  Independent request review found no P0-P3 issue and a clean-source rerender
+  was byte-identical.
+- Result: Iris reports one successful task, exit code zero, no failure or
+  preemption, and 3 minutes 53.99 seconds duration. The host contract target
+  and manual H100 target passed. All eight coordinates formed by shapes
+  `[7,13]` and `[2048,4096]`, cases `balanced` and `positive_offset`, and both
+  numerical policies executed twice with zero schedule and repeatability
+  differences. Every coordinate used one launch, three external operands, one
+  external result, and no temporary allocation.
+- Numerical result: both `7x13` cases were bit-exact against binary64 after
+  BF16 rounding. At `2048x4096`, balanced had maximum absolute error
+  `0.015625`, mean absolute error `3.1493970653606596e-8`, relative Linf
+  `0.004975124378109453`, and maximum BF16 ULP error 9. Positive offset had
+  `0.0625`, `3.725290298461914e-8`, `0.005376344086021506`, and 1,
+  respectively. SOURCE_ORDERED and FAST matched the declared schedule for
+  these coordinates.
+- Artifacts:
+  `lib/shuttle/mlir/artifacts/layernorm-forward-h100-20260821/` preserves the
+  exact 28,523-byte task result log (SHA-256
+  `2938df61816b8e156901aaee6cd84f395a4e0d412390cbb7719a02b552aa1638`),
+  canonical result, exact per-cell digests/metrics/resources, terminal summary,
+  receipt, monitoring metadata, request identity, and file checksums. The
+  request bytes remain external. Verification command:
+  `(cd lib/shuttle/mlir/artifacts/layernorm-forward-h100-20260821 && shasum -a 256 -c SHA256SUMS)`.
+- Interpretation: this accepts only the direct Shuttle LayerNorm-forward
+  functional coordinates above. It is not backward, a composed
+  norm-to-Contract boundary, ordinary-JAX plugin admission, representative
+  production-shape evidence, or a performance result. The 2,636 ms GoogleTest
+  time and 212.609-second Bazel time include harness/build overhead and are not
+  kernel measurements.
+- Next action: keep performance under a separately reviewed CUDA-event
+  protocol and qualify backward/composed or ordinary-JAX boundaries through
+  their own versioned contracts rather than extending this claim.

@@ -1,0 +1,22 @@
+schema: shuttle_layernorm_forward_h100_terminal_summary_v1
+job: /dlwh/shuttle-layernorm-forward-h100-r4
+cluster: cw-rno2a
+state: succeeded
+tasks: 1/1 succeeded
+exit_code: 0
+failure_count: 0
+preemption_count: 0
+duration: 3 minutes and 53.99 seconds
+device: NVIDIA H100 80GB HBM3
+device_uuid: GPU-cacbf168-b226-0ed4-0320-032bd2f43cc2
+driver: 595.71.05
+bazel_elapsed_seconds: 212.609
+bazel_actions: 8077
+host_contract_target: passed
+h100_contract_target: passed
+h100_contract_gtest_milliseconds: 2636
+matrix_cells: 8
+repeatability_runs_per_cell: 2
+result_log_size: 28523
+result_log_sha256: 2938df61816b8e156901aaee6cd84f395a4e0d412390cbb7719a02b552aa1638
+scope: forward-only functional qualification; no performance, backward, composed-boundary, or ordinary-JAX plugin claim
