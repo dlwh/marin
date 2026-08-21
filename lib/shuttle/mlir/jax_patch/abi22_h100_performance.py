@@ -144,6 +144,7 @@ def _validate_cell(
         raise ValueError(f"{expected_case} {expected_policy} BF16 ULP error exceeds {maximum_ulp}")
 
     identity = _mapping(cell.get("identity"), f"{expected_case}.identity")
+    workload_digest = _digest(identity.get("workload_digest"), f"{expected_case}.identity.workload_digest")
     fixture_digest = _digest(identity.get("fixture_digest"), f"{expected_case}.identity.fixture_digest")
     executable_digest = _digest(identity.get("executable_digest"), f"{expected_case}.identity.executable_digest")
     module_load_digest = _digest(identity.get("module_load_digest"), f"{expected_case}.identity.module_load_digest")
@@ -167,6 +168,7 @@ def _validate_cell(
             "max_bf16_ulp": max_ulp,
         },
         "identity": {
+            "workload_digest": workload_digest,
             "fixture_digest": fixture_digest,
             "executable_digest": executable_digest,
             "ptx_digests": list(ptx_digests),
@@ -198,8 +200,8 @@ def validate_report(report: object, *, expected_producer: str | None = None) -> 
         raise ValueError("protocol.counterbalance must be forward_reverse_alternating")
     warmups = _integer(protocol.get("warmup_iterations"), "protocol.warmup_iterations", positive=True)
     measured = _integer(protocol.get("measured_iterations"), "protocol.measured_iterations", positive=True)
-    if measured < 2:
-        raise ValueError("protocol.measured_iterations must cover both counterbalance orders")
+    if measured < 2 or measured % 2 != 0:
+        raise ValueError("protocol.measured_iterations must be positive and even to counterbalance both orders")
     cells = _list(root.get("cells"), "cells")
     if len(cells) != len(CELL_KEYS):
         raise ValueError(f"{producer} report must contain the complete case/policy matrix")
@@ -241,6 +243,11 @@ def build_acceptance(
             raise ValueError(f"{producer} baseline device does not match Shuttle")
         if candidate["protocol"] != reference["protocol"]:
             raise ValueError(f"{producer} baseline timing protocol does not match Shuttle")
+        for index, (case, policy) in enumerate(CELL_KEYS):
+            reference_digest = reference["cells"][index]["identity"]["workload_digest"]
+            candidate_digest = candidate["cells"][index]["identity"]["workload_digest"]
+            if candidate_digest != reference_digest:
+                raise ValueError(f"{producer} {case} {policy} workload does not match Shuttle")
 
     comparisons = []
     for index, (case, policy) in enumerate(CELL_KEYS):

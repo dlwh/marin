@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <cmath>
@@ -129,6 +130,40 @@ std::string sha256(llvm::ArrayRef<uint8_t> prefix,
   llvm::SHA256 sha;
   sha.update(prefix);
   sha.update(suffix);
+  return llvm::toHex(sha.final(), true);
+}
+
+std::string performanceWorkloadDigest(
+    llvm::StringRef caseName, llvm::StringRef policy,
+    llvm::ArrayRef<int64_t> shape,
+    llvm::ArrayRef<std::vector<uint16_t>> operands) {
+  llvm::SHA256 sha;
+  auto updateInteger = [&](uint64_t value) {
+    std::array<uint8_t, 8> bytes;
+    for (size_t index = 0; index < bytes.size(); ++index)
+      bytes[index] = static_cast<uint8_t>(value >> (index * 8));
+    sha.update(bytes);
+  };
+  auto updateText = [&](llvm::StringRef value) {
+    updateInteger(value.size());
+    sha.update(llvm::ArrayRef<uint8_t>(
+        reinterpret_cast<const uint8_t *>(value.data()), value.size()));
+  };
+  updateText("shuttle-h100-performance-workload-v1");
+  updateText(caseName);
+  updateText(policy);
+  updateInteger(shape.size());
+  for (int64_t extent : shape)
+    updateInteger(static_cast<uint64_t>(extent));
+  updateInteger(operands.size());
+  for (const std::vector<uint16_t> &operand : operands) {
+    updateInteger(operand.size());
+    for (uint16_t bits : operand) {
+      std::array<uint8_t, 2> bytes{static_cast<uint8_t>(bits),
+                                   static_cast<uint8_t>(bits >> 8)};
+      sha.update(bytes);
+    }
+  }
   return llvm::toHex(sha.final(), true);
 }
 
@@ -4468,7 +4503,9 @@ TEST(GpuTransportV2Test,
 }
 
 TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
-  if (std::getenv("SHUTTLE_RUN_H100_PERFORMANCE") == nullptr)
+  const char *runPerformance =
+      std::getenv("SHUTTLE_RUN_H100_PERFORMANCE");
+  if (runPerformance == nullptr || llvm::StringRef(runPerformance) != "1")
     GTEST_SKIP() << "set SHUTTLE_RUN_H100_PERFORMANCE=1 on an H100 worker";
   const char *reportPath = std::getenv("SHUTTLE_H100_PERF_REPORT");
   const char *compilerIdentity = std::getenv("SHUTTLE_COMPILER_IDENTITY");
@@ -4683,6 +4720,10 @@ TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
 
   llvm::json::Array reportCells;
   for (auto [cellIndex, cell] : llvm::enumerate(cells)) {
+    llvm::StringRef policyName =
+        cell.policy == mlir::shuttle::NumericalPolicy::SourceOrdered
+            ? "source_ordered"
+            : "fast";
     float maximumAbsoluteError = 0.0f;
     int32_t maximumUlp = 0;
     llvm::json::Array outputDigests;
@@ -4750,6 +4791,9 @@ TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
         {"max_bf16_ulp", maximumUlp},
     };
     llvm::json::Object identity{
+        {"workload_digest",
+         performanceWorkloadDigest(cell.spec->caseName, policyName,
+                                   cell.spec->shape, cell.hostOperands)},
         {"fixture_digest", sha256(llvm::ArrayRef<uint8_t>(
                                reinterpret_cast<const uint8_t *>(
                                    cell.fixture.data()),
@@ -4761,10 +4805,7 @@ TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
     };
     reportCells.push_back(llvm::json::Object{
         {"case", cell.spec->caseName},
-        {"policy",
-         cell.policy == mlir::shuttle::NumericalPolicy::SourceOrdered
-             ? "source_ordered"
-             : "fast"},
+        {"policy", policyName},
         {"shape", std::move(shape)},
         {"samples_ns", std::move(samples)},
         {"sample_rounds", std::move(rounds)},

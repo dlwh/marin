@@ -6,6 +6,7 @@ load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("@xla//xla:lit.bzl", "lit_test_suite")
+load("@xla//third_party/rules_python/python:py_test.bzl", "py_test")
 load("@xla//xla/tsl/platform/default:cuda_build_defs.bzl", "if_cuda_is_configured")
 
 package(
@@ -432,6 +433,16 @@ sh_test(
         "manual",
         "requires-gpu-nvidia",
     ],
+)
+
+py_test(
+    name = "abi22_h100_performance_protocol_test",
+    srcs = [
+        "jax_patch/abi22_h100_performance.py",
+        "jax_patch/test_abi22_h100_performance.py",
+    ],
+    imports = ["jax_patch"],
+    main = "jax_patch/test_abi22_h100_performance.py",
 )
 
 cc_test(

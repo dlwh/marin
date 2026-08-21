@@ -6,8 +6,8 @@
 from __future__ import annotations
 
 import copy
+import unittest
 
-import pytest
 from abi22_h100_performance import CELL_KEYS, build_acceptance, validate_report
 
 HEX = "0" * 64
@@ -82,6 +82,7 @@ def _report(producer: str, base_ns: int) -> dict[str, object]:
                     "max_bf16_ulp": 1 if policy == "source_ordered" else 4,
                 },
                 "identity": {
+                    "workload_digest": HEX,
                     "fixture_digest": HEX,
                     "executable_digest": HEX,
                     "ptx_digests": [HEX] * _resources(case)["launch_count"],
@@ -104,66 +105,79 @@ def _report(producer: str, base_ns: int) -> dict[str, object]:
     }
 
 
-def test_complete_shuttle_report_preserves_raw_counterbalanced_samples() -> None:
-    report = validate_report(_report("shuttle", 100), expected_producer="shuttle")
+class PerformanceProtocolTest(unittest.TestCase):
+    def test_complete_shuttle_report_preserves_raw_counterbalanced_samples(self) -> None:
+        report = validate_report(_report("shuttle", 100), expected_producer="shuttle")
 
-    assert [(cell["case"], cell["policy"]) for cell in report["cells"]] == list(CELL_KEYS)
-    assert report["cells"][0]["samples_ns"] == [100, 101, 102, 103, 104, 105]
-    assert report["protocol"]["warmup_iterations"] == 3
+        self.assertEqual([(cell["case"], cell["policy"]) for cell in report["cells"]], list(CELL_KEYS))
+        self.assertEqual(report["cells"][0]["samples_ns"], [100, 101, 102, 103, 104, 105])
+        self.assertEqual(report["protocol"]["warmup_iterations"], 3)
+
+    def test_shuttle_report_rejects_partial_or_untrustworthy_measurements(self) -> None:
+        mutations = [
+            ("missing-cell", "complete case/policy matrix"),
+            ("short-samples", "measured_iterations"),
+            ("wrong-position", "counterbalanced position"),
+            ("nonpositive-sample", "positive integer nanoseconds"),
+            ("missing-ptx", "PTX digest"),
+            ("wrong-launch-count", "resource counters"),
+            ("loose-source-ordered-error", "BF16 ULP"),
+            ("odd-sample-count", "positive and even"),
+        ]
+        for mutation, diagnostic in mutations:
+            with self.subTest(mutation=mutation):
+                report = _report("shuttle", 100)
+                cells = report["cells"]
+                self.assertIsInstance(cells, list)
+                if mutation == "missing-cell":
+                    cells.pop()
+                elif mutation == "short-samples":
+                    cells[0]["samples_ns"].pop()
+                elif mutation == "wrong-position":
+                    cells[0]["sample_positions"][1] = 0
+                elif mutation == "nonpositive-sample":
+                    cells[0]["samples_ns"][0] = 0
+                elif mutation == "missing-ptx":
+                    cells[0]["identity"]["ptx_digests"] = []
+                elif mutation == "wrong-launch-count":
+                    cells[0]["resources"]["launch_count"] = 2
+                elif mutation == "loose-source-ordered-error":
+                    cells[0]["output"]["max_bf16_ulp"] = 2
+                elif mutation == "odd-sample-count":
+                    report["protocol"]["measured_iterations"] = 3
+                    for cell in cells:
+                        for field in ("samples_ns", "sample_rounds", "sample_positions"):
+                            cell[field] = cell[field][:3]
+
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    validate_report(report, expected_producer="shuttle")
+
+    def test_acceptance_requires_independent_complete_xla_and_te_inputs(self) -> None:
+        shuttle = _report("shuttle", 100)
+        xla = _report("xla", 200)
+        te = _report("te", 150)
+
+        accepted = build_acceptance(shuttle, xla, te)
+        self.assertEqual(accepted["schema"], "shuttle_h100_performance_acceptance_v1")
+        self.assertEqual(len(accepted["comparisons"]), len(CELL_KEYS))
+        self.assertEqual(accepted["comparisons"][0]["shuttle_median_ns"], 102.5)
+        self.assertEqual(accepted["comparisons"][0]["xla_median_ns"], 202.5)
+        self.assertEqual(accepted["comparisons"][0]["te_median_ns"], 152.5)
+
+        partial_xla = copy.deepcopy(xla)
+        partial_xla["cells"].pop()
+        with self.assertRaisesRegex(ValueError, r"xla.*complete case/policy matrix"):
+            build_acceptance(shuttle, partial_xla, te)
+        with self.assertRaisesRegex(ValueError, "xla baseline is required"):
+            build_acceptance(shuttle, None, te)
+        with self.assertRaisesRegex(ValueError, "te baseline is required"):
+            build_acceptance(shuttle, xla, None)
+
+        mismatched_xla = copy.deepcopy(xla)
+        mismatched_xla["cells"][0]["identity"]["workload_digest"] = "1" * 64
+        with self.assertRaisesRegex(ValueError, "xla rmsnorm_forward source_ordered workload does not match"):
+            build_acceptance(shuttle, mismatched_xla, te)
 
 
-@pytest.mark.parametrize(
-    ("mutation", "diagnostic"),
-    [
-        ("missing-cell", "complete case/policy matrix"),
-        ("short-samples", "measured_iterations"),
-        ("wrong-position", "counterbalanced position"),
-        ("nonpositive-sample", "positive integer nanoseconds"),
-        ("missing-ptx", "PTX digest"),
-        ("wrong-launch-count", "resource counters"),
-        ("loose-source-ordered-error", "BF16 ULP"),
-    ],
-)
-def test_shuttle_report_rejects_partial_or_untrustworthy_measurements(mutation: str, diagnostic: str) -> None:
-    report = _report("shuttle", 100)
-    cells = report["cells"]
-    assert isinstance(cells, list)
-    if mutation == "missing-cell":
-        cells.pop()
-    elif mutation == "short-samples":
-        cells[0]["samples_ns"].pop()
-    elif mutation == "wrong-position":
-        cells[0]["sample_positions"][1] = 0
-    elif mutation == "nonpositive-sample":
-        cells[0]["samples_ns"][0] = 0
-    elif mutation == "missing-ptx":
-        cells[0]["identity"]["ptx_digests"] = []
-    elif mutation == "wrong-launch-count":
-        cells[0]["resources"]["launch_count"] = 2
-    elif mutation == "loose-source-ordered-error":
-        cells[0]["output"]["max_bf16_ulp"] = 2
-
-    with pytest.raises(ValueError, match=diagnostic):
-        validate_report(report, expected_producer="shuttle")
-
-
-def test_acceptance_requires_independent_complete_xla_and_te_inputs() -> None:
-    shuttle = _report("shuttle", 100)
-    xla = _report("xla", 200)
-    te = _report("te", 150)
-
-    accepted = build_acceptance(shuttle, xla, te)
-    assert accepted["schema"] == "shuttle_h100_performance_acceptance_v1"
-    assert len(accepted["comparisons"]) == len(CELL_KEYS)
-    assert accepted["comparisons"][0]["shuttle_median_ns"] == 102.5
-    assert accepted["comparisons"][0]["xla_median_ns"] == 202.5
-    assert accepted["comparisons"][0]["te_median_ns"] == 152.5
-
-    partial_xla = copy.deepcopy(xla)
-    partial_xla["cells"].pop()
-    with pytest.raises(ValueError, match=r"xla.*complete case/policy matrix"):
-        build_acceptance(shuttle, partial_xla, te)
-    with pytest.raises(ValueError, match="xla baseline is required"):
-        build_acceptance(shuttle, None, te)
-    with pytest.raises(ValueError, match="te baseline is required"):
-        build_acceptance(shuttle, xla, None)
+if __name__ == "__main__":
+    unittest.main()
