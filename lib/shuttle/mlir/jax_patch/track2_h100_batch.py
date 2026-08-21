@@ -15,7 +15,6 @@ from pathlib import Path
 
 from track1_map_h100_build import (
     HERMETIC_CUDA_COMPUTE_CAPABILITIES,
-    HERMETIC_CUDA_VERSION,
     XLA_COMMIT,
 )
 from track1_map_h100_prototype import (
@@ -30,6 +29,7 @@ from track1_map_h100_prototype import (
 SOURCE_MANIFEST_SCHEMA = "shuttle_track2_h100_source_manifest_v1"
 SOURCE_MANIFEST_NAME = ".shuttle-track2-source-manifest.json"
 RESULT_SCHEMA = "shuttle_track2_h100_batch_result_v1"
+TRACK2_HERMETIC_CUDA_VERSION = "12.9.1"
 RUNTIME_PYTHON = Path("/opt/h100-evidence-runtime/bin/python")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 GIT_COMMIT = re.compile(r"[0-9a-f]{40}")
@@ -143,7 +143,7 @@ def _common_bazel(paths: BatchPaths, runner_repository: Path) -> list[str]:
         "test",
         f"--override_repository=shuttle_mlir={runner_repository / 'lib/shuttle/mlir'}",
         "--config=cuda",
-        f"--repo_env=HERMETIC_CUDA_VERSION={HERMETIC_CUDA_VERSION}",
+        f"--repo_env=HERMETIC_CUDA_VERSION={TRACK2_HERMETIC_CUDA_VERSION}",
         "--repo_env=HERMETIC_CUDA_COMPUTE_CAPABILITIES=" + ",".join(HERMETIC_CUDA_COMPUTE_CAPABILITIES),
         "--define=SHUTTLE_TEST_OBSERVER=1",
         "--nocache_test_results",
@@ -309,7 +309,7 @@ def execute_batch(
         "tools": {
             "bazel": {"sha256": BAZEL_SHA256, "version": BAZEL_VERSION},
             "cuda": {
-                "build_version": HERMETIC_CUDA_VERSION,
+                "build_version": TRACK2_HERMETIC_CUDA_VERSION,
                 "compute_capabilities": list(HERMETIC_CUDA_COMPUTE_CAPABILITIES),
                 "physical_root": str(PHYSICAL_CUDA_TOOLS_ROOT),
             },
