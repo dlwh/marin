@@ -5,13 +5,20 @@ NVIDIA GB200 with exit 0, zero failures, and zero preemptions. The task ran for
 269.97 seconds. The device reported compute capability 10.0 and driver
 `595.71.05`.
 
-The job executed production commit
-`43b52d73d2eb13b28c765bda2bfd5ad28af9ceab`. Gate commit
+The job compiled gate commit
 `f3342153b37f12dbed2f81eb39d7648898975b89`, tree
-`abb539d85b53ba38b3e297b7756a95327574ae3d`, contains the reviewed hardware
-fixture and sealed-request builder. The executed production source remained
-the commit above. The source manifest SHA-256 was
+`abb539d85b53ba38b3e297b7756a95327574ae3d`, through XLA's
+`override_repository`. The gate was based on production commit
+`43b52d73d2eb13b28c765bda2bfd5ad28af9ceab`; its patch changes the reviewed
+fixture, request builder, test, and build plumbing without changing the
+production implementation libraries. The source manifest SHA-256 was
 `c2571612301c6346cd9bef34635b29fc8eec81a5d8e6635ebe6db0f03e1b74ea`.
+
+`gate-source.patch.gz` preserves the 47,430-byte full-index diff from the
+reachable production commit to the gate commit. Decompressing and applying it
+to the production commit reconstructs gate tree
+`abb539d85b53ba38b3e297b7756a95327574ae3d`. The uncompressed patch SHA-256 is
+`366a15e1cb201225b475a896e517b560e30aff3884a6917a2f3c51e1c84dad21`.
 
 The ABI23 `prefer_fusion` pipeline generated schema 4
 `cuda_ptx_sm100_v1` artifacts with PTX 8.7 and target `sm_100`. The
@@ -35,7 +42,9 @@ The 3,989 canonical JSON bytes before that newline have SHA-256
 drops local CLI warnings, tunnel addresses, and log-client setup lines from
 the captured controller output. `job-summary.txt` and
 `submission-receipt.json` preserve the terminal state and submitted request
-identity. `SHA256SUMS` binds every preserved evidence file except itself.
+identity. The task-internal device, portability, Bazel, and XLA logs were not
+downloaded; `result.json` preserves only their self-reported hashes and sizes.
+`SHA256SUMS` binds every preserved evidence file except itself.
 
 This is a one-device correctness and portability result for SOURCE_ORDERED,
 one structurally eligible BF16-boundary Map fixture, and one small RMSNorm

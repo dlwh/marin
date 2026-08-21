@@ -5536,13 +5536,14 @@ author: dlwh
   schema 4 PTX 8.7 for `sm_100`, load it on compute capability 10.0, and
   execute a structurally eligible Map graph and RMSNorm forward with exact
   host-oracle parity.
-- Executed source: production commit
-  `43b52d73d2eb13b28c765bda2bfd5ad28af9ceab`; reviewed gate commit
+- Executed source: the job compiled reviewed gate commit
   `f3342153b37f12dbed2f81eb39d7648898975b89`, tree
   `abb539d85b53ba38b3e297b7756a95327574ae3d`, source-manifest SHA-256
-  `c2571612301c6346cd9bef34635b29fc8eec81a5d8e6635ebe6db0f03e1b74ea`.
-  The gate source at this commit contains the fixture and sealed-request
-  builder. It did not replace the production source identified in the result.
+  `c2571612301c6346cd9bef34635b29fc8eec81a5d8e6635ebe6db0f03e1b74ea`,
+  through XLA's `override_repository`. The gate was based on production commit
+  `43b52d73d2eb13b28c765bda2bfd5ad28af9ceab`; its diff changes the fixture,
+  request builder, test, and build plumbing without changing the production
+  implementation libraries.
 - Config: `/dlwh/shuttle-gb200-portability-r4` on batch-priority GB200x1 in
   `cw-us-east-08a`; request SHA-256
   `746f0f4516311ffce7d5cb1e4f6caba06c94a2e380d74f0760a1cfb06b45718c`;
@@ -5574,8 +5575,15 @@ author: dlwh
 - Artifacts:
   `lib/shuttle/mlir/artifacts/sm100-gb200-portability-20260821/` preserves the
   canonical result, terminal summary, submission receipt, sanitized result
-  log, request SHA-256 and size, and file checksum manifest. The 6,363,268-byte
-  request protobuf is omitted. Verification command:
+  log, reconstructable gate-source patch, request SHA-256 and size, and file
+  checksum manifest. The 6,363,268-byte request protobuf is omitted. The
+  compressed 47,430-byte full-index patch reconstructs gate tree
+  `abb539d85b53ba38b3e297b7756a95327574ae3d` from the reachable production
+  commit and has SHA-256
+  `366a15e1cb201225b475a896e517b560e30aff3884a6917a2f3c51e1c84dad21`.
+  The task-internal portability, device, Bazel, and XLA logs were not
+  downloaded; their hashes and sizes in the canonical result are self-reported.
+  Verification command:
   `(cd lib/shuttle/mlir/artifacts/sm100-gb200-portability-20260821 && sha256sum -c SHA256SUMS)`.
 - Interpretation: this accepts generic SM100 portability for the tested
   SOURCE_ORDERED Map and RMSNorm-forward coordinates on one GB200. It is not
