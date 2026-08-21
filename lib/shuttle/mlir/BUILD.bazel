@@ -435,6 +435,36 @@ sh_test(
     ],
 )
 
+sh_test(
+    name = "abi22_h100_xla_baseline_test",
+    srcs = ["test/run-h100-xla-baseline.sh"],
+    args = ["$(rootpath jax_patch/abi22_h100_xla_baseline.py)"],
+    data = [
+        "jax_patch/abi22_h100_performance.py",
+        "jax_patch/abi22_h100_xla_baseline.py",
+    ],
+    tags = [
+        "h100",
+        "manual",
+        "requires-gpu-nvidia",
+    ],
+)
+
+py_test(
+    name = "abi22_h100_xla_baseline_unit_test",
+    srcs = [
+        "jax_patch/abi22_h100_performance.py",
+        "jax_patch/abi22_h100_xla_baseline.py",
+        "jax_patch/test_abi22_h100_xla_baseline.py",
+    ],
+    deps = [
+        "@pypi//ml_dtypes",
+        "@pypi//numpy",
+    ],
+    imports = ["jax_patch"],
+    main = "jax_patch/test_abi22_h100_xla_baseline.py",
+)
+
 py_test(
     name = "abi22_h100_performance_protocol_test",
     srcs = [

@@ -10,8 +10,8 @@ if [ "$#" -ne 2 ]; then
 fi
 
 if [ "${SHUTTLE_RUN_H100_PERFORMANCE:-0}" != 1 ]; then
-  if [ "${SHUTTLE_H100_PERF_ACCEPTANCE:-0}" = 1 ]; then
-    echo "acceptance mode requires SHUTTLE_RUN_H100_PERFORMANCE=1" >&2
+  if [ "${SHUTTLE_H100_PERF_ACCEPTANCE:-0}" = 1 ] || [ "${SHUTTLE_H100_PERF_EXPLORATORY:-0}" = 1 ]; then
+    echo "comparison mode requires SHUTTLE_RUN_H100_PERFORMANCE=1" >&2
     exit 2
   fi
   echo "skipping H100 performance harness; set SHUTTLE_RUN_H100_PERFORMANCE=1"
@@ -24,6 +24,15 @@ if [ "${SHUTTLE_H100_PERF_ACCEPTANCE:-0}" = 1 ]; then
   : "${SHUTTLE_H100_XLA_REPORT:?set SHUTTLE_H100_XLA_REPORT in acceptance mode}"
   : "${SHUTTLE_H100_TE_REPORT:?set SHUTTLE_H100_TE_REPORT in acceptance mode}"
   : "${SHUTTLE_H100_PERF_ACCEPTANCE_REPORT:?set SHUTTLE_H100_PERF_ACCEPTANCE_REPORT in acceptance mode}"
+fi
+if [ "${SHUTTLE_H100_PERF_EXPLORATORY:-0}" = 1 ]; then
+  if [ "${SHUTTLE_H100_PERF_ACCEPTANCE:-0}" = 1 ]; then
+    echo "acceptance and exploratory modes are mutually exclusive" >&2
+    exit 2
+  fi
+  : "${SHUTTLE_H100_XLA_HOST_REPORT:?set SHUTTLE_H100_XLA_HOST_REPORT in exploratory mode}"
+  : "${SHUTTLE_H100_TE_STATUS:?set SHUTTLE_H100_TE_STATUS in exploratory mode}"
+  : "${SHUTTLE_H100_PERF_EXPLORATORY_REPORT:?set SHUTTLE_H100_PERF_EXPLORATORY_REPORT in exploratory mode}"
 fi
 
 SHUTTLE_RUN_H100_NUMERICS=1 \
@@ -42,4 +51,12 @@ if [ "${SHUTTLE_H100_PERF_ACCEPTANCE:-0}" = 1 ]; then
     --xla "$SHUTTLE_H100_XLA_REPORT" \
     --te "$SHUTTLE_H100_TE_REPORT" \
     --output "$SHUTTLE_H100_PERF_ACCEPTANCE_REPORT"
+fi
+
+if [ "${SHUTTLE_H100_PERF_EXPLORATORY:-0}" = 1 ]; then
+  python3 "$2" --exploratory \
+    --shuttle "$SHUTTLE_H100_PERF_REPORT" \
+    --xla "$SHUTTLE_H100_XLA_HOST_REPORT" \
+    --te-status "$SHUTTLE_H100_TE_STATUS" \
+    --output "$SHUTTLE_H100_PERF_EXPLORATORY_REPORT"
 fi
