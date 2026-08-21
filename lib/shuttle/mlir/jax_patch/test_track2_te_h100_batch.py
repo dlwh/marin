@@ -113,6 +113,17 @@ def test_batch_plan_pins_te_wheel_source_build_and_exact_v2_matrix(tmp_path: Pat
         "producer_order": ["transformer_engine_2_17", "ordinary_jax_xla"],
         "run_count": 12,
     }
+    assert plan["qualification"] == {
+        "schema": "shuttle_abi22_rmsnorm_role_policy_v1",
+        "patterns": ["qualification_linspace_v2", "heldout_reversed_linspace_v1"],
+        "repeat_count": 2,
+        "limits_by_role": {
+            "y": {"max_absolute_error": 0.0078125, "max_bfloat16_ulp": 2},
+            "dx": {"max_absolute_error": 0.0625, "max_bfloat16_ulp": 64},
+            "dgamma": {"max_absolute_error": 0.015625, "max_bfloat16_ulp": 8},
+        },
+        "run_count": 24,
+    }
     assert SHUTTLE_BLOCKER == (
         "reviewed_dbff57e3_rmsnorm_canary_uses_epsilon_1e-6_but_does_not_admit_"
         "representative_2048x4096_without_new_harness_authorization"
@@ -465,7 +476,16 @@ def _fake_oracle_invoke(paths: BatchPaths, calls: list[list[str]], argv: list[st
             )
         )
     else:
-        output.write_text(json.dumps(_valid_cell(shape, boundary, te=False), sort_keys=True))
+        case = Path(argument["case-directory"])
+        cell = _valid_cell(shape, boundary, te=False)
+        input_roles = ("x", "gamma") if boundary == "forward" else ("x", "gamma", "dy")
+        cell["input_digests"] = {
+            role: hashlib.sha256((case / f"{role}.bf16").read_bytes()).hexdigest() for role in input_roles
+        }
+        for role, result in zip(OUTPUT_ROLES[boundary], cell["outputs"], strict=True):
+            digest = hashlib.sha256((case / f"reference_{role}.bf16").read_bytes()).hexdigest()
+            result.update(digest=digest, reference_digest=digest)
+        output.write_text(json.dumps(cell, sort_keys=True))
     return 0
 
 
@@ -504,10 +524,10 @@ def test_execute_oracle_runs_exact_matrix_and_builds_matched_acceptance(
             for output in cell["outputs"]
         )
 
-    assert len(calls) == 12
+    assert len(calls) == 36
     assert [
         (call[call.index("--rows") + 1], call[call.index("--features") + 1], call[call.index("--boundary") + 1])
-        for call in calls[::2]
+        for call in calls[:12:2]
     ] == [(str(shape[0]), str(shape[1]), boundary) for shape in SHAPES for boundary in BOUNDARIES]
     assert all(call[call.index("--epsilon") + 1] == "1e-06" for call in calls)
     assert result["acceptance"]["status"] == "representative_numerics_accepted"
@@ -601,7 +621,7 @@ def test_execute_batch_drives_validated_oracle_and_writes_closed_result(
     assert result["tools"]["cuda_runtime_headers"] == CUDA_HEADER_IDENTITY
     assert result["evidence"]["acceptance"]["accepted_shape"] == [2048, 4096]
     assert result["evidence"]["shuttle"] == {"status": "pending", "blocker": SHUTTLE_BLOCKER}
-    assert len(calls) == 12
+    assert len(calls) == 36
     assert json.loads(BatchPaths.under(workspace).result.read_bytes()) == result
     assert not any("shuttle" in path.name for path in BatchPaths.under(workspace).reports.iterdir())
 
