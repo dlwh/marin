@@ -182,6 +182,8 @@ _CALL_SEQUENCE = {
     "backward_recompute": ["shuttle_rmsnorm_backward_recompute"],
     "composed": ["shuttle_rmsnorm_composed"],
 }
+_R12_RESULT_SHA256 = "bce080011168c768c70a6aca8dcbae82f8d021c1f4fae7610e57476c2b4b2439"
+_R12_POLICY_RAW_SHA256 = "92fbb8ad362b8d28c005c4e2edd34e8690c79016f8a24c5a93d388b13563bcf3"
 
 
 def _canonical_json(value: object) -> str:
@@ -494,6 +496,10 @@ def _repeat_diagnostics(cells: list[dict[str, object]]) -> dict[str, object]:
 
 
 def _external_evidence(r12_result: Path, r12_policy_raw: Path) -> dict[str, str]:
+    result_sha256 = _sha256_file(r12_result)
+    raw_sha256 = _sha256_file(r12_policy_raw)
+    if result_sha256 != _R12_RESULT_SHA256 or raw_sha256 != _R12_POLICY_RAW_SHA256:
+        raise ValueError("sealed r12 evidence identity drifted")
     result = json.loads(r12_result.read_text())
     raw = json.loads(r12_policy_raw.read_text())
     if result.get("schema") != "shuttle_track2_te_h100_batch_result_v4":
@@ -508,8 +514,8 @@ def _external_evidence(r12_result: Path, r12_policy_raw: Path) -> dict[str, str]
     validate_policy_v4_evidence(raw)
     return {
         "transformer_engine_xla_status": "heldout_splitmix64_v3_numerics_accepted",
-        "r12_result_sha256": _sha256_file(r12_result),
-        "r12_policy_raw_sha256": _sha256_file(r12_policy_raw),
+        "r12_result_sha256": result_sha256,
+        "r12_policy_raw_sha256": raw_sha256,
         "comparison": "same_h100_host_blocking_reported_without_threshold",
     }
 
@@ -541,6 +547,15 @@ def _evidence_document(cells: list[dict[str, object]], *, r12_result: Path, r12_
             "raw_outputs_persisted_before_validation": True,
         },
     }
+
+
+def _prevalidation_document(
+    cells: list[dict[str, object]], *, r12_result: Path, r12_policy_raw: Path
+) -> dict[str, object]:
+    document = _evidence_document(cells, r12_result=r12_result, r12_policy_raw=r12_policy_raw)
+    document["schema"] = "shuttle_abi22_rmsnorm_representative_prevalidation_raw_v1"
+    document["status"] = "unvalidated_numerical_evidence"
+    return document
 
 
 def _validate_metrics(output: Mapping[str, object], role: str) -> None:
@@ -746,12 +761,14 @@ def execute_representative(
                 case_root=case_root,
             )
         )
-    evidence = _evidence_document(cells, r12_result=r12_result, r12_policy_raw=r12_policy_raw)
     diagnostics = _repeat_diagnostics(cells)
     raw_path = reports_root / "shuttle-policy-raw-v1.json"
     diagnostics_path = reports_root / "shuttle-repeat-diagnostics-v1.json"
-    raw_path.write_text(_canonical_json(evidence))
+    raw_path.write_text(
+        _canonical_json(_prevalidation_document(cells, r12_result=r12_result, r12_policy_raw=r12_policy_raw))
+    )
     diagnostics_path.write_text(_canonical_json(diagnostics))
+    evidence = _evidence_document(cells, r12_result=r12_result, r12_policy_raw=r12_policy_raw)
     return validate_shuttle_evidence(
         evidence,
         r12_result=r12_result,
@@ -785,6 +802,7 @@ def main() -> int:
         r12_policy_raw=arguments.r12_policy_raw,
         invoke=invoke,
     )
+    arguments.output.parent.mkdir(parents=True, exist_ok=True)
     arguments.output.write_text(_canonical_json(evidence))
     print(_canonical_json(evidence), flush=True)
     return 0
