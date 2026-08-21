@@ -7,7 +7,6 @@ import shutil
 import subprocess
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import Mock
 
 import pytest
 from track1_map_h100_build import (
@@ -121,6 +120,15 @@ def _patch_source_repository(tmp_path: Path, capsule_name: str) -> Path:
     return repository
 
 
+def _tracked_source_bytes(repository: Path) -> dict[str, bytes]:
+    relative_files = subprocess.run(
+        ["git", "ls-files", "-z"], cwd=repository, check=True, capture_output=True
+    ).stdout.split(b"\0")
+    return {
+        relative.decode(): repository.joinpath(relative.decode()).read_bytes() for relative in relative_files if relative
+    }
+
+
 def test_exact_pinned_source_capsules_accept_both_complete_ordered_patch_stacks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -136,6 +144,26 @@ def test_exact_pinned_source_capsules_accept_both_complete_ordered_patch_stacks(
     assert "registerShuttleXlaTransform()" in jax_module
     xla_client = xla_repository.joinpath("xla/pjrt/c_api_client/pjrt_c_api_client.cc").read_text()
     assert "ApplyStablehloModuleTransform" in xla_client
+
+
+def test_late_xla_patch_failure_modifies_neither_exact_source_capsule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    jax_repository = _patch_source_repository(tmp_path, "jax_619764c1")
+    xla_repository = _patch_source_repository(tmp_path, "xla_9b6359")
+    xla_client = xla_repository / "xla/pjrt/c_api_client/pjrt_c_api_client.cc"
+    xla_client.write_text(xla_client.read_text().replace("using ProgramVariant =", "using ChangedProgramVariant ="))
+    jax_before = _tracked_source_bytes(jax_repository)
+    xla_before = _tracked_source_bytes(xla_repository)
+    inputs = replace(_inputs(tmp_path), jax_repository=jax_repository, xla_repository=xla_repository)
+    monkeypatch.setattr("track1_map_h100_build._require_live_source_snapshot", lambda value: None)
+
+    with pytest.raises(subprocess.CalledProcessError) as error:
+        apply_source_patches(inputs)
+
+    assert str(error.value.cmd[-1]).endswith("0004-apply-transform-before-c-api-plugin.patch")
+    assert _tracked_source_bytes(jax_repository) == jax_before
+    assert _tracked_source_bytes(xla_repository) == xla_before
 
 
 def test_offline_build_preflight_is_closed_over_source_tools_and_image(
@@ -251,41 +279,6 @@ def test_hydration_source_identity_rejects_tracked_untracked_and_head_drift(tmp_
 
         with pytest.raises(RuntimeError, match="hydration changed patched JAX or XLA source"):
             require_source_checkouts_unchanged(expected, jax_repository=case_jax, xla_repository=case_xla)
-
-
-def test_source_patching_checks_both_repositories_before_applying(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    inputs = _inputs(tmp_path)
-    _materialize(inputs)
-    run = Mock()
-    monkeypatch.setattr("track1_map_h100_build.subprocess.run", run)
-    monkeypatch.setattr("track1_map_h100_build._require_live_source_snapshot", lambda value: None)
-
-    apply_source_patches(inputs)
-
-    commands = [call.args[0] for call in run.call_args_list]
-    assert commands[0][0:3] == ["git", "apply", "--check"]
-    assert commands[1][0:3] == ["git", "apply", "--check"]
-    assert commands[2][0:2] == ["git", "apply"]
-    assert commands[3][0:2] == ["git", "apply"]
-    assert run.call_args_list[0].kwargs["cwd"] == inputs.jax_repository
-    assert run.call_args_list[1].kwargs["cwd"] == inputs.xla_repository
-    assert run.call_args_list[2].kwargs["cwd"] == inputs.jax_repository
-    assert run.call_args_list[3].kwargs["cwd"] == inputs.xla_repository
-
-
-def test_source_patch_check_failure_applies_neither_repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    inputs = _inputs(tmp_path)
-    _materialize(inputs)
-    run = Mock(side_effect=[None, RuntimeError("xla check failed")])
-    monkeypatch.setattr("track1_map_h100_build.subprocess.run", run)
-    monkeypatch.setattr("track1_map_h100_build._require_live_source_snapshot", lambda value: None)
-
-    with pytest.raises(RuntimeError, match="xla check failed"):
-        apply_source_patches(inputs)
-
-    assert run.call_count == 2
 
 
 def test_wheel_command_is_gpu_observable_and_download_disabled(tmp_path: Path) -> None:
