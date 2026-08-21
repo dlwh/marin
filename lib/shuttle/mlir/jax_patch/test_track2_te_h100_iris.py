@@ -18,8 +18,10 @@ from track2_te_h100_iris import (
     _require_clean_source_closure,
     build_launch_request,
     build_launch_request_v3,
+    build_launch_request_v4,
     decode_launch_request,
     decode_launch_request_v3,
+    decode_launch_request_v4,
     job_name,
     main,
     validate_launch_request,
@@ -116,6 +118,25 @@ def test_v3_request_selects_only_the_versioned_batch_entrypoint() -> None:
     corrupted.entrypoint.run_command.argv[-1] = "--execute"
     with pytest.raises(ValueError, match="entrypoint"):
         decode_launch_request_v3(corrupted.SerializeToString(deterministic=True), run=11)
+
+
+def test_v4_request_changes_only_job_identity_and_versioned_entrypoint() -> None:
+    request = build_launch_request_v4(bundle_root=MARIN_REPOSITORY, run=12)
+    v3_request = build_launch_request_v3(bundle_root=MARIN_REPOSITORY, run=12)
+    raw = request.SerializeToString(deterministic=True)
+    self_checked = decode_launch_request_v4(raw, run=12)
+    assert self_checked.name == "/dlwh/shuttle-track2-te-h100-r12"
+    assert list(self_checked.entrypoint.run_command.argv)[-1] == "--execute-v4"
+    normalized = deepcopy(self_checked)
+    normalized.entrypoint.run_command.argv[-1] = "--execute-v3"
+    assert normalized.SerializeToString(deterministic=True) == v3_request.SerializeToString(deterministic=True)
+    with pytest.raises(ValueError, match="entrypoint"):
+        decode_launch_request_v3(raw, run=12)
+
+    corrupted = deepcopy(self_checked)
+    corrupted.entrypoint.run_command.argv[-1] = "--execute-v3"
+    with pytest.raises(ValueError, match="entrypoint"):
+        decode_launch_request_v4(corrupted.SerializeToString(deterministic=True), run=12)
 
 
 @pytest.mark.parametrize(
