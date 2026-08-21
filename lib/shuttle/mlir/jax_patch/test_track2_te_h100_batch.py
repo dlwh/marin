@@ -146,8 +146,11 @@ def test_batch_plan_pins_te_wheel_source_build_and_exact_v2_matrix(tmp_path: Pat
     assert "-Werror" in compile_argv
     assert "-Wl,--allow-shlib-undefined" in compile_argv
     assert set(RUNTIME_LIBRARY_PATHS) == {"cublas", "cublas_lt", "cudnn", "nccl", "cudart", "nvrtc"}
+    assert {path.parent for path in RUNTIME_LIBRARY_PATHS.values()} == {
+        Path("/opt/h100-evidence-runtime/lib/python3.12/site-packages/nvidia/cu13/lib")
+    }
     assert RUNTIME_LIBRARY_PATHS["nvrtc"] == (
-        Path("/opt/h100-evidence-runtime/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib/libnvrtc.so.13")
+        Path("/opt/h100-evidence-runtime/lib/python3.12/site-packages/nvidia/cu13/lib/libnvrtc.so.13")
     )
     libraries = [str(path) for path in RUNTIME_LIBRARY_PATHS.values()]
     no_as_needed = compile_argv.index("-Wl,--no-as-needed")
@@ -211,7 +214,7 @@ def test_hydration_binds_source_tree_wheel_and_resolved_library(tmp_path: Path, 
     assert environment["LD_LIBRARY_PATH"].split(":")[0] == str(paths.te_library.parent)
     assert "LD_BIND_NOW" not in environment
     assert environment["NVTE_CUDA_INCLUDE_DIR"] == (
-        "/opt/h100-evidence-runtime/lib/python3.12/site-packages/nvidia/cuda_runtime/include"
+        "/opt/h100-evidence-runtime/lib/python3.12/site-packages/nvidia/cu13/include"
     )
     for field, value in (("commit", "0" * 40), ("tree", "0" * 40), ("status", "dirty")):
         mutated = dict(observed)
