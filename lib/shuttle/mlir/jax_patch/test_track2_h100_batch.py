@@ -55,6 +55,7 @@ def test_batch_plan_runs_xla_then_shuttle_on_one_workspace_and_device(tmp_path: 
     assert plan["hardware"] == {"gpu_count": 1, "gpu_model": "H100"}
     assert [phase["name"] for phase in phases] == [
         "device",
+        "source_permissions",
         "xla_init",
         "xla_remote",
         "xla_fetch",
@@ -65,14 +66,20 @@ def test_batch_plan_runs_xla_then_shuttle_on_one_workspace_and_device(tmp_path: 
         "xla",
         "shuttle",
     ]
-    assert phases[1]["argv"] == ["git", "init", "--quiet"]
-    assert phases[2]["argv"] == ["git", "remote", "add", "origin", "https://github.com/openxla/xla.git"]
-    assert phases[3]["argv"][0:4] == ["git", "fetch", "--depth=1", "origin"]
-    assert phases[4]["argv"] == ["git", "checkout", "--detach", "FETCH_HEAD"]
+    assert phases[1]["argv"] == [
+        "chmod",
+        "755",
+        "/app/lib/shuttle/mlir/test/run-h100-xla-baseline.sh",
+        "/app/lib/shuttle/mlir/test/run-h100-performance.sh",
+    ]
+    assert phases[2]["argv"] == ["git", "init", "--quiet"]
+    assert phases[3]["argv"] == ["git", "remote", "add", "origin", "https://github.com/openxla/xla.git"]
+    assert phases[4]["argv"][0:4] == ["git", "fetch", "--depth=1", "origin"]
+    assert phases[5]["argv"] == ["git", "checkout", "--detach", "FETCH_HEAD"]
     expected_patch = Path("/app") / XLA_WORKSPACE_PATCH
-    assert phases[5]["argv"] == ["git", "apply", "--check", str(expected_patch)]
-    assert phases[6]["argv"] == ["git", "apply", str(expected_patch)]
-    assert phases[7]["argv"][0:7] == [
+    assert phases[6]["argv"] == ["git", "apply", "--check", str(expected_patch)]
+    assert phases[7]["argv"] == ["git", "apply", str(expected_patch)]
+    assert phases[8]["argv"][0:7] == [
         "curl",
         "--fail",
         "--location",
@@ -81,8 +88,8 @@ def test_batch_plan_runs_xla_then_shuttle_on_one_workspace_and_device(tmp_path: 
         "--proto-redir",
         "=https",
     ]
-    xla_command = phases[8]["argv"]
-    shuttle_command = phases[9]["argv"]
+    xla_command = phases[9]["argv"]
+    shuttle_command = phases[10]["argv"]
     assert "@shuttle_mlir//:abi22_h100_xla_baseline_test" in xla_command
     assert "@shuttle_mlir//:gpu_transport_v2_h100_performance_test" in shuttle_command
     assert xla_command[0:2] == shuttle_command[0:2]
