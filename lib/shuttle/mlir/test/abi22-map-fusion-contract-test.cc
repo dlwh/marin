@@ -202,6 +202,7 @@ struct PtxDataflow {
     std::vector<std::string> operands;
   };
   std::map<std::string, Definition> definitions;
+  std::map<std::string, std::string> currentValues;
   std::vector<PtxStore> stores;
   std::vector<std::string> sharedStores;
 };
@@ -261,6 +262,11 @@ bool hasDisjointContiguousFoldLoop(llvm::StringRef ptx,
     llvm::StringRef lane = laneTokens[0];
     for (size_t startLine = laneLine + 1; startLine < lines.size();
          ++startLine) {
+      if (lines[startLine].starts_with("bra ") || lines[startLine] == "ret;" ||
+          lines[startLine].contains(" ret;") || lines[startLine] == "exit;" ||
+          lines[startLine].contains(" exit;") ||
+          lines[startLine].ends_with(":"))
+        break;
       if (defines(lines[startLine], lane))
         break;
       std::vector<std::string> startTokens = ptxTokens(lines[startLine]);
@@ -362,11 +368,12 @@ bool hasDisjointContiguousFoldLoop(llvm::StringRef ptx,
                   .str();
           if (lines[line + 1] != update)
             return false;
-          for (const auto &[value, definition] : flow.definitions) {
-            if (!llvm::StringRef(value).starts_with(
-                    (llvm::Twine(leaf) + "@").str()))
-              continue;
-            std::set<std::string> closure = ptxDependencyClosure(flow, value);
+          PtxDataflow reachingFlow = ptxDataflow(
+              llvm::join(llvm::ArrayRef(lines).take_front(line), "\n"));
+          auto reachingLeaf = reachingFlow.currentValues.find(leaf.str());
+          if (reachingLeaf != reachingFlow.currentValues.end()) {
+            std::set<std::string> closure =
+                ptxDependencyClosure(reachingFlow, reachingLeaf->second);
             accumulatedIndexedLeaf |=
                 llvm::any_of(indexedLeafLoads, [&](const std::string &load) {
                   return closure.count(load);
@@ -440,6 +447,7 @@ PtxDataflow ptxDataflow(llvm::StringRef ptx) {
     result.definitions[destination] = {opcode.str(), std::move(dependencies)};
     currentRegister[tokens.front()] = destination;
   }
+  result.currentValues = std::move(currentRegister);
   return result;
 }
 
@@ -1825,6 +1833,14 @@ $finished:
            replace(correctFoldLoop, "mov.f32 %f0, 0f00000000;", "exit;"),
            replace(correctFoldLoop, "cvt.u64.u32 %rd0, %r4;",
                    "cvt.u64.u32 %rd0, %r7;"),
+           replace(correctFoldLoop, "mul.lo.u32 %r4, %r0, 2;",
+                   "bra $loaded;\n  mul.lo.u32 %r4, %r0, 2;"),
+           replace(correctFoldLoop, "mul.lo.u32 %r4, %r0, 2;",
+                   "ret;\n  mul.lo.u32 %r4, %r0, 2;"),
+           replace(correctFoldLoop, "mul.lo.u32 %r4, %r0, 2;",
+                   "$skip:\n  mul.lo.u32 %r4, %r0, 2;"),
+           replace(correctFoldLoop, "add.rn.f32 %f2, %f0, %f1;",
+                   "mov.f32 %f1, 0f00000000;\n  add.rn.f32 %f2, %f0, %f1;"),
        })
     EXPECT_FALSE(hasDisjointContiguousFoldLoop(mutation, 330, 2));
 }
