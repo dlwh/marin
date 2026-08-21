@@ -1,0 +1,89 @@
+{
+  "schema": "shuttle_track2_h100_local_artifacts_v1",
+  "job_id": "/dlwh/shuttle-track2-h100-r11",
+  "cluster": "cw-rno2a",
+  "request_sha256": "412ea5c918495808a509adafb9b5f96a53a2ad9ae8c37872c0e29740832d77ad",
+  "request_bundle_sha256": "d3d58a497cd02218e57a2d1d1809009e2012c450f37003bdf42dfb200ce685cc",
+  "source_commit": "5047e923c9b90055feed9c07e29ecec69f578984",
+  "source_tree": "1532b805a904f4d7c1ffa953d56a1985ef640df4",
+  "source_manifest_sha256": "0fdcec09940656ba706e3bfd1fcd3e95c3af2a53d68ce7ba4f719ac7e4183cb7",
+  "device": {
+    "model": "NVIDIA H100 80GB HBM3",
+    "uuid": "GPU-cacbf168-b226-0ed4-0320-032bd2f43cc2",
+    "driver": "595.71.05"
+  },
+  "task": {
+    "state": "succeeded",
+    "exit_code": 0,
+    "duration_seconds": 239.77,
+    "failures": 0,
+    "preemptions": 0
+  },
+  "files": [
+    {
+      "path": "README.md",
+      "size": 4021,
+      "sha256": "31f659578783a943aa8c158e7a8626abd95d15ba0233a7a93423808b6e158c9d"
+    },
+    {
+      "path": "controller.log",
+      "size": 33107,
+      "sha256": "7f064071c8d119cb68f116d21d5049faee78634c71ee583cf016cce19dc5ffdf"
+    },
+    {
+      "path": "east-cancellations.txt",
+      "size": 2411,
+      "sha256": "12c08203484257464b639e422195ba4fa5726e0efa6950b1eb0c405135b5b053"
+    },
+    {
+      "path": "exploratory-comparison.json",
+      "size": 2605,
+      "sha256": "1c8bd60b2eea38fca43045d7833f90a9297819c7d04b75620bece3dd8e700dfc"
+    },
+    {
+      "path": "job-summary.txt",
+      "size": 617,
+      "sha256": "d8c99c4d7cb07de87eb686b47cc494659d744be8bf4ae2b1c52991c43c0f18cc"
+    },
+    {
+      "path": "request.pb",
+      "size": 5990891,
+      "sha256": "412ea5c918495808a509adafb9b5f96a53a2ad9ae8c37872c0e29740832d77ad"
+    },
+    {
+      "path": "result.json",
+      "size": 70205,
+      "sha256": "e7bc4613c6cf04657def447f450297553e768e627c980d55c3b43ecd03069c5d"
+    },
+    {
+      "path": "shuttle-report.json",
+      "size": 23951,
+      "sha256": "b7617cd508535b79bfc96a68336e4ab6523b371a591e113a291ed16bb8da42d1"
+    },
+    {
+      "path": "shuttle-validated.json",
+      "size": 16827,
+      "sha256": "c9638456957aab0cf6a447d6d6eb7365c29473c7c60ca55926de302dd3eb9922"
+    },
+    {
+      "path": "submission-receipt.json",
+      "size": 764,
+      "sha256": "05823b3fa73f5b5e8e281c05630892704e01f402764011ec7828a42e3fb1e850"
+    },
+    {
+      "path": "te-status.json",
+      "size": 226,
+      "sha256": "0e713d88d955262650e5a76310a52899761c5eeaefc29be202839bac3dec68b7"
+    },
+    {
+      "path": "validation.json",
+      "size": 572,
+      "sha256": "f551f2be98244215dc3641935f187973d1496b5a9671e1632cab16763d36e21a"
+    },
+    {
+      "path": "xla-report.json",
+      "size": 11864,
+      "sha256": "f402e0095813786307b1aeabf67906635eff0eb1a11f2ebf613115e7cdc98a78"
+    }
+  ]
+}

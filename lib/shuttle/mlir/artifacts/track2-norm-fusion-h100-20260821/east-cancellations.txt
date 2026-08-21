@@ -1,0 +1,32 @@
+R9 SUMMARY
+I20260821 05:13:35 8418467456 iris.cluster.config Loading config from lib/iris/config/cw-us-east-02a.yaml
+I20260821 05:13:35 8418467456 iris.cli.connect Establishing tunnel to controller...
+I20260821 05:13:36 8418467456 iris.cluster.platforms.k8s.service Tunnel ready: 127.0.0.1:10002 -> iris-controller-svc:10000
+Job: /dlwh/shuttle-track2-h100-r9 (/dlwh/shuttle-track2-h100-r9)
+State: killed  exit=0  failures=0  preemptions=0
+Tasks: 1/1 completed  killed=1
+Error: Terminated by user
+
+  TASK  STATE      EXIT  DURATION    PEAK MEM    CUR MEM    ERROR
+     0  killed        0  -           -           -          Terminated by user
+
+R10 SUMMARY
+I20260821 05:13:35 8418467456 iris.cluster.config Loading config from lib/iris/config/cw-us-east-02a.yaml
+I20260821 05:13:35 8418467456 iris.cli.connect Establishing tunnel to controller...
+I20260821 05:13:36 8418467456 iris.cluster.platforms.k8s.service Tunnel ready: 127.0.0.1:10003 -> iris-controller-svc:10000
+Job: /dlwh/shuttle-track2-h100-r10 (/dlwh/shuttle-track2-h100-r10)
+State: killed  exit=0  failures=0  preemptions=0
+Tasks: 1/1 completed  killed=1
+Error: Terminated by user
+
+  TASK  STATE      EXIT  DURATION    PEAK MEM    CUR MEM    ERROR
+     0  killed        0  -           -           -          Terminated by user
+
+TASK ROWS
+I20260821 05:13:35 8418467456 iris.cluster.config Loading config from lib/iris/config/cw-us-east-02a.yaml
+I20260821 05:13:35 8418467456 iris.cli.connect Establishing tunnel to controller...
+I20260821 05:13:36 8418467456 iris.cluster.platforms.k8s.service Tunnel ready: 127.0.0.1:10001 -> iris-controller-svc:10000
+task_id,state,exit_code,started_at_ms,finished_at_ms,current_worker_id,status_message
+/dlwh/shuttle-track2-h100-r10/0,6,,1787312961560,1787314247630,,SchedulingGated: Scheduling is blocked due to non-empty scheduling gates; Kueue workload pod-iris-dlwh-shuttle-track2-h100-r10-0-395299ab-0-9c52f32b81168e80-3d43d: queue=cw-use02a-lq; waiting for Kueue admission
+/dlwh/shuttle-track2-h100-r9/0,6,,1787312961560,1787314247217,,"SchedulingGated: Scheduling is blocked due to non-empty scheduling gates; Kueue workload pod-iris-dlwh-shuttle-track2-h100-r9-0-fd5e3972-0-c65a568b948c2402-6772a: queue=cw-use02a-lq; QuotaReserved (Pending): couldn't assign flavors to pod set main: topology ""infiniband"" doesn't allow to fit any of 1 pod(s). Total nodes: 36; excluded: resource ""nvidia.com/gpu"": 36"
+

@@ -3,3 +3,5 @@ lib/marin/src/marin/inference/quick_serve_dashboard.html linguist-generated=true
 
 # Immutable benchmark captures may contain binary payloads and source-exact whitespace.
 lib/tile_lifetime/benchmarks/artifacts/** -whitespace linguist-generated=true
+lib/shuttle/mlir/artifacts/track1-map-h100-prototype-20260821/** -whitespace linguist-generated=true
+lib/shuttle/mlir/artifacts/track2-norm-fusion-h100-20260821/** -whitespace linguist-generated=true

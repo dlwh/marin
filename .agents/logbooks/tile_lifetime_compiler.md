@@ -16,6 +16,19 @@ author: dlwh
 
 ## Current TL;DR
 
+- Two deliberately bounded H100 milestones are now complete. The ordinary-JAX
+  plugin path is replicated for generic Map islands while unsupported
+  `stablehlo.abs` remains XLA-owned. Separately, standalone ABI22 Fold and
+  norm-to-Contract bundles are bit-exact against an independent host oracle
+  and have exploratory same-GPU timing. These results prove the integration
+  seam and useful backend generation, respectively; they do not accept the
+  RMSNorm target. Ordinary-JAX RMSNorm plugin ownership, a matched strong
+  CUDA-event oracle, representative shapes, SM100/B200, and the remaining
+  target matrix are open. Evidence: entries `TLTC-MLIR-037` and
+  `TLTC-ABI22-001`. The
+  [target/oracle matrix](../projects/tile_lifetime_compiler/oracle_target_matrix_20260821.md)
+  records the matched semantic and performance controls for the remaining
+  targets.
 - The active path replaces generic forward and reverse regions in a natural
   one-layer Grug training step after JAX-owned AD. The accepted ten-call H100
   boundary owns routed forward, two input-adjoint Contracts, a shared Contract
@@ -35,6 +48,25 @@ author: dlwh
 
 ### Active
 
+- `TLTC-MLIR-038`: ordinary-JAX RMSNorm forward, backward, and composed
+  regions can reuse the generic ABI22 Fold-region and Contract machinery while
+  unsupported operations remain XLA-owned. Evidence: `TLTC-MLIR-037` and
+  `TLTC-ABI22-001`. Next test: close the small H100 fixture through `jax.jit`,
+  then run the representative `[2048,4096]` boundary.
+- `TLTC-ORACLE-001`: a versioned Transformer Engine runner can cover epsilon
+  `1e-6`, RMSNorm forward and backward, and both norm-to-Contract boundaries
+  with the same CUDA-event boundary as Shuttle. Evidence: `TLTC-ABI22-001`.
+  Next test: extend the TE 2.17 adapter or pin a newer compatible oracle before
+  another timing run.
+- `TLTC-SM100-001`: the generic ABI22 lowering can acquire explicit SM100
+  target, toolchain, and module identities without workload-specific dispatch.
+  Evidence: `TLTC-ABI22-001` is SM90-only. Next test: compile and execute the
+  smallest correctness matrix on one batch-priority B200.
+- `TLTC-PERF-001`: direct generic-kernel evaluation can expose SASS, registers,
+  spills, occupancy, compile cost, persistent-cache cost, and structurally
+  generic shape sweeps in addition to PTX and launch resources. Evidence:
+  `TLTC-ABI22-001`. Next test: add one versioned profiler/report contract before
+  broadening the H100 shape matrix.
 - `TLTC-MSA-001`: MSA's native token-and-GQA-group route can lower to the existing generic relation and normalized-exponential state machinery, then drive a Shuttle-owned SM100 KV-major skeleton within 1.20 times the pinned official oracle. Next test: close the exact payload boundary on one GB200 and compile a natural StableHLO fixture into the same relation.
 - `TLTC-RSA-003`: query-major and KV-major performance cross over as relation degree, KV reuse, padding, and partial-state traffic change. Next test: use a deliberately non-monotone relation and implement actual cross-query KV staging; current grouped CTAs do not share staged K/V.
 - `TLTC-005`: the semantic recognizer can tolerate ordinary JAX broadcast, multiply-order, and projection variations while rejecting near-misses with structured diagnostics. Next test: add permuted and illegal StableHLO fixtures.
@@ -53,6 +85,12 @@ author: dlwh
 
 ### Promoted
 
+- `TLTC-MLIR-037`: the Map-only ordinary-JAX H100 plugin prototype passes
+  three independent batch jobs with exact outputs, transform attribution, and
+  fresh-process persistent-cache reuse.
+- `TLTC-ABI22-001`: standalone generated RMSNorm forward/backward and
+  norm-to-Contract bundles pass all eight H100 numerical cells and preserve raw
+  CUDA-event and exploratory XLA evidence.
 - `TLTC-RSA-001`: executable FP32 attention partial state and stable slot-order merge match an independently materialized selected-mask reference for causal GQA, uneven relation degree, padding, and a sequence tail.
 - `TLTC-RSA-002`: `RelationPlan` now drives both source traversal and compact destination-major offsets/sorted source identities. The full package suite passes without changing existing MoE behavior.
 - `TLTC-RSA-004`: an executable deterministic slot-wave plan consumes the generic relation directly, updates one FP32 online state per query without atomics or edge partials, and measures 4.017344 ms at 16K.
@@ -5359,3 +5397,135 @@ author: dlwh
   strict review found no P1 or P2 issue. Authority, build/image/wheel/tool
   identities, GPU execution, timing, upload, and acceptance remain null or
   absent; the launcher fails before external action.
+
+### 2026-08-21 - TLTC-MLIR-037 replicated ordinary-JAX Map plugin wiring
+
+- Hypothesis: the production-shaped Shuttle registration and module-transform
+  seam can own generic Map islands inside an ordinary `jax.jit` compilation,
+  lower them to typed FFI and generated PTX, leave unsupported operations to
+  XLA, and preserve numerical-policy cache identity across a fresh process.
+- Executed source: integration commit
+  `41502f2079385df29fccbf1137bce553aa090297`, tree
+  `a1c4babf2b5822ac8f1a96b0d6a133b61426d72a`. The reviewed evidence closure
+  continued through `715dfe1a27db38f16a911cc40820a4ed1c14e12d`. Both are
+  ancestors of the artifact-preservation base
+  `5047e923c9b90055feed9c07e29ecec69f578984`, tree
+  `1532b805a904f4d7c1ffa953d56a1985ef640df4`; the preservation base did
+  not execute in these jobs.
+- Config: batch-priority H100x1; pinned JAX/jaxlib 0.10.1 and XLA
+  `9b635916ecc6df6efee62d8e4b0c7ef87ef84d69`; ranks two `[2,3]` and
+  three `[2,3,5]`; disabled, SOURCE_ORDERED, and FAST modes; one populate
+  process followed by one fresh reuse process. The eligible BF16-boundary,
+  f32-internal Maps are Shuttle-owned; `stablehlo.abs` remains XLA-owned.
+- Jobs: `/dlwh/shuttle-track1-map-h100-prototype-r9`, `r10`, and `r11`
+  all exited zero with no failure or preemption. Durations were 15 minutes
+  16.84 seconds, 29 minutes 17.49 seconds, and 28 minutes 48.79 seconds.
+  Authorization SHA-256 was
+  `cb7231dfbd997ccbb23ce923d06a0670bc2133316a7a3f88984bcecbdcf0b75b`;
+  the common bundle SHA-256 was
+  `2c88c14732d42fdb2d8a8cc8d116b6fa4a1b05e9b704aa83e664c0c210fb3e55`.
+  Request SHA-256 values were `2afc795c99a73d5c3ab77ca999d42b3b4143f3bdf24a41509a8ca04b8d8820df`,
+  `6457368b2b0fcf20ecb2da0fb5362866562c414e61ee58a474d0831226410fad`,
+  and `e5605432fe1aa2b3ff620557dac956dc5912dcd6aa12424fb3a97e2b45cf8044`.
+- Result: all six rank/mode coordinates in all three jobs have exact primal
+  and analytic-gradient bytes. Rank-two primal and gradient SHA-256 values are
+  `4b1058001f2bd0f865be72c6cd88a1aaef71216a7b8d51edc2387ceb471bbc13`
+  and `55e7508b2474bfea60a43f7e57473108ed044459ab5148c029136679d5cf201e`.
+  Rank-three values are
+  `b6be51d8cf5785e8b44a7cba7020e508bdbf5868f72225a4f0bcf35d4e0c66e4`
+  and `925af5eda26d3695047a753aa0e63574a57d72d9da7113985041330fb01fefb3`.
+- Provenance and cache result: populate emitted enabled observer invocation IDs
+  `[1,2,3,4]`, with selected Map membership, unsupported-operation
+  attribution, generated-bundle identity, and final erasure. The six modes
+  populated distinct persistent-cache entries. Reuse resolved the same six
+  entries in a fresh process and emitted no transform observer event.
+- Artifacts:
+  `lib/shuttle/mlir/artifacts/track1-map-h100-prototype-20260821/` preserves
+  all three extracted result documents. File SHA-256 values are
+  `025251f00697e5fa591a891f49485c2fe94594aec581a9772aa9cd7e6680c78f`,
+  `2b00efe7f9fe2ab553e9cee260e4644539952e56ccd5ae97c48d405481d6e888`,
+  and `f34d6d8bdf541de99c51ea83d0719650c94181f55846bb2fee9e3933217c029d`.
+  The r9 canonical JSON before extraction added a newline is 9,346 bytes with
+  SHA-256 `2d863b350ee287b76dfcbdab88700cb62834f0ad7d66116566e3e222e9779e19`.
+- Reproducibility residual: independently rebuilt wheel bytes differ across
+  r9, r10, and r11. The r9 wheel hashes begin `1047614b`, `8624f2da`, and
+  `8e6f7e32`; r10 begins `bbd5ca96`, `83164768`, and `23ca6551`; r11 begins
+  `adee218f`, `89165b0c`, and `a520e870`. Runtime outputs, cache entries, and
+  observer evidence are otherwise identical.
+- Command:
+  `(cd lib/shuttle/mlir/artifacts/track1-map-h100-prototype-20260821 && sha256sum -c SHA256SUMS)`.
+  The exact interactive controller-submission shell command was not retained;
+  the sealed request, authorization, bundle, and job identities above are the
+  execution provenance. This gap must not be filled with a reconstructed
+  command presented as historical fact.
+- Interpretation: this is replicated evidence for the revised Map-only wiring
+  milestone. It is not performance evidence, a strong independent-oracle
+  result, or RMSNorm target acceptance. The ordinary JAX subject returns an
+  analytic gradient; it does not prove that JAX-owned AD was transformed.
+- Next action: admit the existing generic Fold-region and Contract machinery
+  through the same ordinary-JAX plugin path for RMSNorm forward, JAX-owned
+  backward, and a composed consumer.
+
+### 2026-08-21 - TLTC-ABI22-001 standalone norm fusion H100 evidence
+
+- Hypothesis: generic ABI22 Fold-region planning and norm-to-Contract
+  composition can generate exact and useful H100 kernels before the ordinary
+  JAX plugin admits those regions.
+- Commit Hash: `5047e923c9b90055feed9c07e29ecec69f578984`, tree
+  `1532b805a904f4d7c1ffa953d56a1985ef640df4`, source-manifest SHA-256
+  `0fdcec09940656ba706e3bfd1fcd3e95c3af2a53d68ce7ba4f719ac7e4183cb7`.
+- Config: `/dlwh/shuttle-track2-h100-r11` on batch-priority H100x1 in
+  `cw-rno2a`; request SHA-256
+  `412ea5c918495808a509adafb9b5f96a53a2ad9ae8c37872c0e29740832d77ad`;
+  H100 80GB HBM3 UUID `GPU-cacbf168-b226-0ed4-0320-032bd2f43cc2`, driver
+  `595.71.05`; pinned XLA
+  `9b635916ecc6df6efee62d8e4b0c7ef87ef84d69`; Bazel 7.7.0; hermetic
+  CUDA 12.9.1 for SM90 with physical tools under `/usr/local/cuda-13.2`.
+  The job exited zero after 239.77 seconds with no failure or preemption.
+- Numerical result: all eight cells have maximum absolute error zero and
+  maximum BF16 ULP error zero against an independent host implementation.
+
+  | Boundary | Shape | SOURCE_ORDERED median ns | FAST median ns |
+  | --- | --- | ---: | ---: |
+  | RMSNorm forward | `[2,7,19]` | 8,592 | 8,752 |
+  | RMSNorm backward | `[2,7,19]` | 20,032 | 20,176 |
+  | Norm-to-Contract inline | `[5,19,7]` | 30,000 | 9,712 |
+  | Norm-to-Contract compact | `[5,19,257]` | 36,832 | 13,200 |
+
+  Each median contains 20 CUDA-event samples after three excluded warmups in
+  counterbalanced order. Forward uses one launch, three slots, and no
+  temporary. Backward uses three launches, six slots, and one 56-byte
+  temporary. Inline uses one launch, four slots, and no temporary. Compact
+  uses two launches, five slots, and one 20-byte temporary.
+- Exploratory same-GPU result: host-blocking XLA/Shuttle comparison used 20
+  measured samples after three warmups. Shuttle speedup over XLA for
+  SOURCE_ORDERED/FAST pairing was `1.846x/1.838x` forward,
+  `0.910x/0.899x` backward, `1.117x/1.578x` inline, and
+  `1.030x/1.501x` compact. The XLA policy labels only pair an unchanged
+  ordinary-JAX baseline with a Shuttle cell; XLA does not implement Shuttle's
+  policies.
+- Oracle stop: Transformer Engine 2.17 was unavailable with exact blocker
+  `te_2_17_runner_lacks_required_shapes_epsilon_and_norm_contract`. The
+  host-blocking comparison is protocol `exploratory_host_v1`, not the matched
+  XLA-plus-strong-oracle CUDA-event contract, and cannot accept performance.
+- ABI caveat: Shuttle backward output digest order is `{dw, dx}` while JAX's
+  public result order is `{dx, dw}`. Labeled values match exactly; positional
+  digest comparison is invalid.
+- Artifacts:
+  `lib/shuttle/mlir/artifacts/track2-norm-fusion-h100-20260821/` preserves
+  the result and reports, raw samples, validation, receipt, controller log,
+  and cancellation proof. Original manifest SHA-256 is
+  `526fd57cc552dbbac61986a0b493946b3eb01dc901821e9343101710e2dde260`.
+  The 5,990,891-byte `request.pb` is intentionally omitted; its SHA-256 is
+  `412ea5c918495808a509adafb9b5f96a53a2ad9ae8c37872c0e29740832d77ad`.
+- Command:
+  `(cd lib/shuttle/mlir/artifacts/track2-norm-fusion-h100-20260821 && sha256sum -c SHA256SUMS)`;
+  `jq -e '.request_sha256_matches_preserved_bytes and .manifest_sizes_and_sha256_match and .canonical_result_subreports_match_preserved_reports and .shuttle_report_revalidates_exactly and .xla_exploratory_report_revalidates_exactly and .exploratory_comparison_rebuilds_exactly and .shuttle_cells == 8 and .comparison_cells == 8 and .te_status == "unavailable"' lib/shuttle/mlir/artifacts/track2-norm-fusion-h100-20260821/validation.json`.
+- Interpretation: the revised standalone backend milestone is complete on one
+  H100. This is not architecturally conforming RMSNorm target evidence because
+  it bypasses the ordinary `jax.jit` plugin seam. The shapes are structural
+  fixtures, not a representative sweep. SASS, registers, spills, occupancy,
+  compile/tuning cost, persistent-cache cost, and SM100/B200 remain absent.
+- Next action: connect the same generic region machinery to ordinary JAX,
+  extend a strong oracle to the exact public boundary, repeat at representative
+  shapes, and establish SM100 portability separately.

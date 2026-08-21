@@ -1,0 +1,9 @@
+I20260821 05:12:59 8418467456 iris.cluster.config Loading config from lib/iris/config/cw-rno2a.yaml
+I20260821 05:12:59 8418467456 iris.cli.connect Establishing tunnel to controller...
+I20260821 05:12:59 8418467456 iris.cluster.platforms.k8s.service Tunnel ready: 127.0.0.1:10001 -> iris-controller-svc:10000
+Job: /dlwh/shuttle-track2-h100-r11 (/dlwh/shuttle-track2-h100-r11)
+State: succeeded  exit=0  failures=0  preemptions=0
+Tasks: 1/1 completed  succeeded=1
+
+  TASK  STATE        EXIT  DURATION                     PEAK MEM    CUR MEM    ERROR
+     0  succeeded       0  3 minutes and 59.77 seconds  -           -

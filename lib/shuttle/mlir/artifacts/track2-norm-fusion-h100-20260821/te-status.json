@@ -1,0 +1,7 @@
+{
+  "blocker": "te_2_17_runner_lacks_required_shapes_epsilon_and_norm_contract",
+  "producer": "te",
+  "protocol_mode": "exploratory_host_v1",
+  "schema": "shuttle_h100_exploratory_unavailable_v1",
+  "status": "unavailable"
+}

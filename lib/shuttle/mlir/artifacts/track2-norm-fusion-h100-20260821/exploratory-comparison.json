@@ -1,0 +1,89 @@
+{
+  "comparisons": [
+    {
+      "case": "rmsnorm_forward",
+      "policy": "source_ordered",
+      "shuttle_median_ns": 35696.5,
+      "speedup_vs_xla": 1.8459232697883545,
+      "xla_median_ns": 65893
+    },
+    {
+      "case": "rmsnorm_forward",
+      "policy": "fast",
+      "shuttle_median_ns": 35615,
+      "speedup_vs_xla": 1.837526323178436,
+      "xla_median_ns": 65443.5
+    },
+    {
+      "case": "rmsnorm_backward",
+      "policy": "source_ordered",
+      "shuttle_median_ns": 87035,
+      "speedup_vs_xla": 0.9097259723099902,
+      "xla_median_ns": 79178
+    },
+    {
+      "case": "rmsnorm_backward",
+      "policy": "fast",
+      "shuttle_median_ns": 87144,
+      "speedup_vs_xla": 0.8990177178004223,
+      "xla_median_ns": 78344
+    },
+    {
+      "case": "rmsnorm_contract_inline",
+      "policy": "source_ordered",
+      "shuttle_median_ns": 63725.5,
+      "speedup_vs_xla": 1.1173235204117662,
+      "xla_median_ns": 71202
+    },
+    {
+      "case": "rmsnorm_contract_inline",
+      "policy": "fast",
+      "shuttle_median_ns": 45419.5,
+      "speedup_vs_xla": 1.5776813923535045,
+      "xla_median_ns": 71657.5
+    },
+    {
+      "case": "rmsnorm_contract_compact",
+      "policy": "source_ordered",
+      "shuttle_median_ns": 70118,
+      "speedup_vs_xla": 1.0297855044353803,
+      "xla_median_ns": 72206.5
+    },
+    {
+      "case": "rmsnorm_contract_compact",
+      "policy": "fast",
+      "shuttle_median_ns": 48138,
+      "speedup_vs_xla": 1.500862104782085,
+      "xla_median_ns": 72248.5
+    }
+  ],
+  "compiler_identities": {
+    "shuttle": {
+      "identity": "shuttle-abi22:5047e923c9b90055feed9c07e29ecec69f578984:1532b805a904f4d7c1ffa953d56a1985ef640df4:0fdcec09940656ba706e3bfd1fcd3e95c3af2a53d68ce7ba4f719ac7e4183cb7",
+      "options_digest": "2288c8cabbf0f0405561724342b1bd50fe4e61f0e6e0de7ce9ce86a27ef5134a"
+    },
+    "xla": {
+      "identity": "ordinary-jax-0.10.1-jaxlib-0.10.1",
+      "options_digest": "2a8c5b93f7281ed197b49cb0a7a8c0664f3530fabac47e9a8e196338e734c916"
+    }
+  },
+  "device": {
+    "model": "NVIDIA H100 80GB HBM3",
+    "ordinal": 0
+  },
+  "protocol": {
+    "clock": "host_block_until_ready",
+    "counterbalance": "forward_reverse_alternating",
+    "measured_iterations": 20,
+    "mode": "exploratory_host_v1",
+    "warmup_iterations": 3
+  },
+  "schema": "shuttle_h100_exploratory_comparison_v1",
+  "te": {
+    "blocker": "te_2_17_runner_lacks_required_shapes_epsilon_and_norm_contract",
+    "producer": "te",
+    "protocol_mode": "exploratory_host_v1",
+    "schema": "shuttle_h100_exploratory_unavailable_v1",
+    "status": "unavailable"
+  }
+}

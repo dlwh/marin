@@ -1,0 +1,14 @@
+{
+  "schema": "shuttle_track2_h100_local_validation_v1",
+  "result_schema": "shuttle_track2_h100_batch_result_v1",
+  "request_sha256_matches_preserved_bytes": true,
+  "manifest_sizes_and_sha256_match": true,
+  "canonical_result_subreports_match_preserved_reports": true,
+  "shuttle_report_revalidates_exactly": true,
+  "xla_exploratory_report_revalidates_exactly": true,
+  "exploratory_comparison_rebuilds_exactly": true,
+  "shuttle_cells": 8,
+  "comparison_cells": 8,
+  "te_status": "unavailable",
+  "r9_r10_had_no_worker_or_runtime_duration_before_cancellation": true
+}
