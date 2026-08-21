@@ -6,6 +6,7 @@
 import hashlib
 import json
 import statistics
+import subprocess
 import zipfile
 from pathlib import Path
 
@@ -29,6 +30,7 @@ from track2_te_h100_batch import (
     TE_WHEEL_SHA256,
     TE_WHEEL_URL,
     BatchPaths,
+    _elf_soname,
     _invoke_oracle,
     _validate_link_closure,
     _validated_cuda_include,
@@ -279,6 +281,18 @@ def test_runtime_libraries_bind_resolved_paths_sonames_and_bytes(tmp_path: Path)
             approved_roots=(root,),
             soname_reader=lambda path: path.name,
         )
+
+
+def test_elf_soname_parses_the_gnu_readelf_soname_field(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    library = tmp_path / "libcublas.so.13"
+    library.write_bytes(b"library")
+    output = " 0x000000000000000e (SONAME)             Library soname: [libcublas.so.13]\n"
+    monkeypatch.setattr(
+        "track2_te_h100_batch.subprocess.run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, stdout=output, stderr=""),
+    )
+
+    assert _elf_soname(library) == "libcublas.so.13"
 
 
 def test_cuda_runtime_headers_are_bound_to_the_nvrtc_package_generation(tmp_path: Path) -> None:
