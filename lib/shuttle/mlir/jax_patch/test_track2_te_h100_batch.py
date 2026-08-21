@@ -28,6 +28,7 @@ from track2_te_h100_batch import (
     TE_WHEEL_URL,
     BatchPaths,
     _invoke_oracle,
+    _validate_link_closure,
     _validated_xla_raw_cell,
     batch_plan,
     canonical_json,
@@ -106,6 +107,7 @@ def test_batch_plan_pins_te_wheel_source_build_and_exact_v2_matrix(tmp_path: Pat
         "te_wheel_fetch",
         "te_wheel_extract",
         "te_runner_build",
+        "te_runner_link_check",
     ]
     assert phases[3]["argv"] == ["git", "fetch", "--depth=1", "origin", TE_SOURCE_COMMIT]
     assert phases[4]["argv"] == ["git", "checkout", "--detach", "FETCH_HEAD"]
@@ -124,6 +126,7 @@ def test_batch_plan_pins_te_wheel_source_build_and_exact_v2_matrix(tmp_path: Pat
     compile_argv = phases[7]["argv"]
     assert compile_argv[:4] == ["/usr/bin/g++", "-std=c++20", "-O3", "-Wall"]
     assert "-Werror" in compile_argv
+    assert "-Wl,--allow-shlib-undefined" in compile_argv
     te_include = str(BatchPaths.under(workspace).te_source / "transformer_engine/common/include")
     assert compile_argv[compile_argv.index("-isystem") : compile_argv.index("-isystem") + 2] == [
         "-isystem",
@@ -135,6 +138,7 @@ def test_batch_plan_pins_te_wheel_source_build_and_exact_v2_matrix(tmp_path: Pat
     assert "-ltransformer_engine" in compile_argv
     assert "-lcudart" in compile_argv
     assert str(BatchPaths.under(workspace).te_runner) == compile_argv[-1]
+    assert phases[8]["argv"] == ["ldd", str(BatchPaths.under(workspace).te_runner)]
     assert TE_WHEEL_SHA256 == "1c8e6627cf02358201f513ab902c7b4f82f179214bd775edc97ce0f2001d82da"
     assert TE_SOURCE_COMMIT == "2e559f062497bef768dfbe9d7e45548fadeca80a"
     assert TE_SOURCE_TREE == "c722c6cd46cc59a0dbabadd846af3f45b15c1a95"
@@ -191,6 +195,19 @@ def test_hydration_binds_source_tree_wheel_and_resolved_library(tmp_path: Path, 
     paths.te_library.write_bytes(b"ambient-library")
     with pytest.raises(RuntimeError, match="extracted Transformer Engine library"):
         validate_te_hydration(paths)
+
+
+def test_link_closure_rejects_any_unresolved_runtime_dependency(tmp_path: Path) -> None:
+    log = tmp_path / "ldd.log"
+    log.write_text(
+        "libtransformer_engine.so => /tmp/runtime/libtransformer_engine.so\nlibcudnn.so.9 => /opt/cudnn/libcudnn.so.9\n"
+    )
+
+    _validate_link_closure(log)
+
+    log.write_text("libnccl.so.2 => not found\n")
+    with pytest.raises(RuntimeError, match="runtime dependency closure"):
+        _validate_link_closure(log)
 
 
 def _valid_cell(shape: tuple[int, int], boundary: str, *, te: bool) -> dict:
