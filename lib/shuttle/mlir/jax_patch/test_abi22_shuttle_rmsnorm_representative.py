@@ -5,21 +5,28 @@ import copy
 import hashlib
 import json
 import math
+import shutil
 from pathlib import Path
 
+import ml_dtypes
+import numpy as np
 import pytest
 from abi22_shuttle_rmsnorm_representative import (
     ACCEPTANCE_PATTERN,
+    BINDING_CONTRACT,
     BOUNDARIES,
     POLICIES,
     REPRESENTATIVE_SHAPE,
     RESOURCE_CONTRACT,
     RESULT_ROLES,
     ROLE_LIMITS,
+    execute_representative,
     execution_plan,
+    prepare_representative_cases,
     validate_output_artifact,
     validate_shuttle_evidence,
 )
+from abi22_te_rmsnorm_oracle_v2 import error_metrics_v4
 
 MLIR_ROOT = Path(__file__).resolve().parents[1]
 R12_ROOT = MLIR_ROOT / "artifacts/track2-te-rmsnorm-r12-success-20260821"
@@ -93,67 +100,207 @@ EXPECTED_RESOURCES = {
         "temporary_bytes": 8_192,
     },
 }
+FULL_BYTES = 2048 * 4096 * 2
+FEATURE_BYTES = 4096 * 2
+EXPECTED_BINDINGS = {
+    "forward": {
+        "operands": (
+            {
+                "role": "x",
+                "runner_index": 0,
+                "slot_ordinal": 0,
+                "required_bytes": FULL_BYTES,
+                "tensor_type": "bf16[2048,4096]",
+                "alignment": 2,
+            },
+            {
+                "role": "gamma",
+                "runner_index": 1,
+                "slot_ordinal": 1,
+                "required_bytes": FEATURE_BYTES,
+                "tensor_type": "bf16[4096]",
+                "alignment": 2,
+            },
+        ),
+        "results": (
+            {
+                "role": "y",
+                "public_result_index": 0,
+                "runner_index": 0,
+                "slot_ordinal": 2,
+                "required_bytes": FULL_BYTES,
+                "tensor_type": "bf16[2048,4096]",
+                "alignment": 2,
+            },
+        ),
+    },
+    "backward_recompute": {
+        "operands": (
+            {
+                "role": "x",
+                "runner_index": 0,
+                "slot_ordinal": 0,
+                "required_bytes": FULL_BYTES,
+                "tensor_type": "bf16[2048,4096]",
+                "alignment": 2,
+            },
+            {
+                "role": "gamma",
+                "runner_index": 1,
+                "slot_ordinal": 1,
+                "required_bytes": FEATURE_BYTES,
+                "tensor_type": "bf16[4096]",
+                "alignment": 2,
+            },
+            {
+                "role": "dy",
+                "runner_index": 2,
+                "slot_ordinal": 2,
+                "required_bytes": FULL_BYTES,
+                "tensor_type": "bf16[2048,4096]",
+                "alignment": 2,
+            },
+        ),
+        "results": (
+            {
+                "role": "dx",
+                "public_result_index": 0,
+                "runner_index": 0,
+                "slot_ordinal": 5,
+                "required_bytes": FULL_BYTES,
+                "tensor_type": "bf16[2048,4096]",
+                "alignment": 2,
+            },
+            {
+                "role": "dgamma",
+                "public_result_index": 1,
+                "runner_index": 1,
+                "slot_ordinal": 4,
+                "required_bytes": FEATURE_BYTES,
+                "tensor_type": "bf16[4096]",
+                "alignment": 2,
+            },
+        ),
+    },
+    "composed": {
+        "operands": (
+            {
+                "role": "x",
+                "runner_index": 0,
+                "slot_ordinal": 0,
+                "required_bytes": FULL_BYTES,
+                "tensor_type": "bf16[2048,4096]",
+                "alignment": 2,
+            },
+            {
+                "role": "gamma",
+                "runner_index": 1,
+                "slot_ordinal": 1,
+                "required_bytes": FEATURE_BYTES,
+                "tensor_type": "bf16[4096]",
+                "alignment": 2,
+            },
+            {
+                "role": "dy",
+                "runner_index": 2,
+                "slot_ordinal": 2,
+                "required_bytes": FULL_BYTES,
+                "tensor_type": "bf16[2048,4096]",
+                "alignment": 2,
+            },
+        ),
+        "results": (
+            {
+                "role": "y",
+                "public_result_index": 0,
+                "runner_index": 0,
+                "slot_ordinal": 4,
+                "required_bytes": FULL_BYTES,
+                "tensor_type": "bf16[2048,4096]",
+                "alignment": 2,
+            },
+            {
+                "role": "dx",
+                "public_result_index": 1,
+                "runner_index": 1,
+                "slot_ordinal": 6,
+                "required_bytes": FULL_BYTES,
+                "tensor_type": "bf16[2048,4096]",
+                "alignment": 2,
+            },
+            {
+                "role": "dgamma",
+                "public_result_index": 2,
+                "runner_index": 2,
+                "slot_ordinal": 5,
+                "required_bytes": FEATURE_BYTES,
+                "tensor_type": "bf16[4096]",
+                "alignment": 2,
+            },
+        ),
+    },
+}
 
 
 def _sha(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
-def _metrics(role: str) -> dict[str, object]:
-    limits = EXPECTED_LIMITS[role]
-    return {
-        "all_finite": True,
-        "absolute_floor": limits["absolute_floor"],
-        "below_floor_count": limits["below_floor_count"],
-        "eligible_count": limits["eligible_count"],
-        "max_absolute_error": 0.0,
-        "max_absolute_error_below_floor": 0.0,
-        "max_absolute_error_above_floor": 0.0,
-        "mean_absolute_error": 0.0,
-        "max_relative_error_above_absolute_floor": 0.0,
-        "max_bfloat16_ulp_above_absolute_floor": 0,
-        "raw_max_bfloat16_ulp": 0,
-    }
+def _arguments(argv: list[str]) -> dict[str, str]:
+    return {value[2:]: argv[index + 1] for index, value in enumerate(argv[:-1]) if value.startswith("--")}
 
 
-def _cell(policy: str, boundary: str, repeat: int) -> dict[str, object]:
-    roles = RESULT_ROLES[boundary]
-    outputs = []
-    for index, role in enumerate(roles):
-        digest = _sha(f"shuttle/{policy}/{boundary}/{role}")
-        outputs.append(
-            {
-                "role": role,
-                "public_result_index": index,
-                "digest": digest,
-                "reference_digest": SHA256[role],
-                "artifact": {
-                    "path": f"raw/{policy}/{boundary}/repeat-{repeat}/{role}.bf16",
-                    "byte_count": (2048 * 4096 if role != "dgamma" else 4096) * 2,
-                    "sha256": digest,
-                },
-                **_metrics(role),
-            }
-        )
-    inputs = {"x": SHA256["x"], "gamma": SHA256["gamma"]}
-    if boundary != "forward":
-        inputs["dy"] = SHA256["dy"]
-    return {
-        "schema": "shuttle_abi22_rmsnorm_representative_cell_v1",
-        "producer": "shuttle_gpu_executable_bundle",
-        "input_pattern": ACCEPTANCE_PATTERN,
-        "shape": [2048, 4096],
-        "epsilon": 1e-6,
+def _fake_runner(
+    calls: list[list[str]],
+    argv: list[str],
+    *,
+    failure_coordinate: tuple[str, str, int] | None = None,
+    omit_cell: bool = False,
+    corrupt_output: bool = False,
+    corrupt_artifact_size: bool = False,
+    corrupt_artifact_sha: bool = False,
+) -> int:
+    calls.append(argv)
+    arguments = _arguments(argv)
+    coordinate = (arguments["policy"], arguments["boundary"], int(arguments["repeat"]))
+    if coordinate == failure_coordinate:
+        return 17
+    case_root = Path(arguments["case-root"])
+    raw_root = Path(arguments["raw-root"])
+    policy, boundary, repeat = coordinate
+    directory = raw_root / policy / boundary / f"repeat-{repeat}"
+    directory.mkdir(parents=True, exist_ok=True)
+    if omit_cell and coordinate == ("source_ordered", "forward", 0):
+        return 0
+    external_bindings = []
+    for binding in EXPECTED_BINDINGS[boundary]["operands"]:
+        external_bindings.append({"kind": "operand", **binding})
+    for binding in EXPECTED_BINDINGS[boundary]["results"]:
+        role = binding["role"]
+        output_path = directory / f"result-{binding['runner_index']}.bf16"
+        shutil.copyfile(case_root / ACCEPTANCE_PATTERN / f"reference_{role}.bf16", output_path)
+        if corrupt_output and coordinate == ("source_ordered", "forward", 0) and role == "y":
+            output_path.write_bytes(b"\x00\x00" * (2048 * 4096))
+        artifact = {
+            "path": str(output_path),
+            "byte_count": output_path.stat().st_size,
+            "sha256": hashlib.sha256(output_path.read_bytes()).hexdigest(),
+        }
+        if corrupt_artifact_size and coordinate == ("source_ordered", "forward", 0) and role == "y":
+            artifact["byte_count"] += 2
+        if corrupt_artifact_sha and coordinate == ("source_ordered", "forward", 0) and role == "y":
+            artifact["sha256"] = "0" * 64
+        external_bindings.append({"kind": "result", **binding, "artifact": artifact})
+    cell = {
+        "schema": "shuttle_abi22_rmsnorm_representative_raw_cell_v1",
         "policy": policy,
         "boundary": boundary,
         "repeat": repeat,
-        "inputs": inputs,
-        "call_sequence": {
-            "forward": ["shuttle_rmsnorm_forward"],
-            "backward_recompute": ["shuttle_rmsnorm_backward_recompute"],
-            "composed": ["shuttle_rmsnorm_composed"],
-        }[boundary],
-        "outputs": outputs,
+        "runner_api": {
+            "host": "GpuRunner::Execute_BlockHostUntilDone",
+            "cuda_event": "GpuRunner::ExecuteTimed",
+        },
+        "external_bindings": external_bindings,
         "resources": copy.deepcopy(EXPECTED_RESOURCES[boundary]),
         "transport": {
             "contract_operation_count": 0,
@@ -174,50 +321,73 @@ def _cell(policy: str, boundary: str, repeat: int) -> dict[str, object]:
             "cuda_event_samples_ns": list(range(500, 520)),
         },
     }
+    (directory / "cell.json").write_text(json.dumps(cell, sort_keys=True, separators=(",", ":")))
+    return 0
 
 
-def _evidence() -> dict[str, object]:
-    cells = [
-        _cell(policy, boundary, repeat)
-        for policy in ("source_ordered", "fast")
-        for boundary in ("forward", "backward_recompute", "composed")
-        for repeat in range(2)
-    ]
-    return {
-        "schema": "shuttle_abi22_rmsnorm_representative_evidence_v1",
-        "status": "heldout_splitmix64_v3_shuttle_numerics_accepted",
-        "producer": "shuttle_gpu_executable_bundle",
-        "shape": [2048, 4096],
-        "epsilon": 1e-6,
-        "input_pattern": ACCEPTANCE_PATTERN,
-        "compiler": {
-            "source_commit": "a" * 40,
-            "source_tree": "b" * 40,
-            "compiler_identity": _sha("compiler"),
-        },
-        "external_evidence": {
-            "transformer_engine_xla_status": "heldout_splitmix64_v3_numerics_accepted",
-            "r12_result_sha256": SHA256["r12_result"],
-            "r12_policy_raw_sha256": SHA256["r12_raw"],
-            "comparison": "same_h100_host_blocking_reported_without_threshold",
-        },
-        "protocol": {
-            "fresh_process_per_coordinate": True,
-            "warmup_iterations": 10,
-            "measured_iterations": 20,
-            "acceptance_clock": "host_blocking",
-            "cuda_event_status": "supplemental_not_acceptance",
-        },
-        "cells": cells,
-        "scope": {
-            "norm_contract": "excluded",
-            "performance": "reported_without_threshold",
-            "raw_outputs_persisted_before_validation": True,
-        },
+@pytest.fixture(scope="module")
+def prepared_case_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    case_root = tmp_path_factory.mktemp("shuttle-representative-cases")
+    prepared = prepare_representative_cases(case_root)
+    assert prepared == {
+        "input_digests": {role: SHA256[role] for role in ("x", "gamma", "dy")},
+        "reference_digests": {role: SHA256[role] for role in ("y", "dx", "dgamma")},
     }
+    expected_sizes = {
+        "x.bf16": FULL_BYTES,
+        "gamma.bf16": FEATURE_BYTES,
+        "dy.bf16": FULL_BYTES,
+        "reference_y.bf16": FULL_BYTES,
+        "reference_dx.bf16": FULL_BYTES,
+        "reference_dgamma.bf16": FEATURE_BYTES,
+    }
+    for name, size in expected_sizes.items():
+        path = case_root / ACCEPTANCE_PATTERN / name
+        assert path.stat().st_size == size
+        assert (
+            hashlib.sha256(path.read_bytes()).hexdigest()
+            == SHA256[name.removesuffix(".bf16").removeprefix("reference_")]
+        )
+    return case_root
 
 
-def test_contract_freezes_r12_inputs_role_limits_resources_and_coordinates() -> None:
+@pytest.fixture(scope="module")
+def executed_evidence(
+    tmp_path_factory: pytest.TempPathFactory, prepared_case_root: Path
+) -> tuple[dict[str, object], Path, Path, list[list[str]]]:
+    workspace = tmp_path_factory.mktemp("shuttle-representative-execution")
+    raw_root = workspace / "raw"
+    reports_root = workspace / "reports"
+    calls: list[list[str]] = []
+    evidence = execute_representative(
+        runner=workspace / "run-h100-shuttle-rmsnorm-representative.sh",
+        case_root=prepared_case_root,
+        raw_root=raw_root,
+        reports_root=reports_root,
+        r12_result=R12_RESULT,
+        r12_policy_raw=R12_RAW,
+        invoke=lambda argv: _fake_runner(calls, argv),
+    )
+    return evidence, raw_root, reports_root, calls
+
+
+def _validate(
+    evidence: dict[str, object],
+    executed: tuple[dict[str, object], Path, Path, list[list[str]]],
+    case_root: Path,
+) -> dict[str, object]:
+    return validate_shuttle_evidence(
+        evidence,
+        r12_result=R12_RESULT,
+        r12_policy_raw=R12_RAW,
+        raw_root=executed[1],
+        case_root=case_root,
+    )
+
+
+def test_contract_freezes_r12_inputs_role_limits_resources_and_coordinates(
+    executed_evidence: tuple[dict[str, object], Path, Path, list[list[str]]], prepared_case_root: Path
+) -> None:
     assert ACCEPTANCE_PATTERN == "heldout_splitmix64_v3"
     assert REPRESENTATIVE_SHAPE == (2048, 4096)
     assert BOUNDARIES == ("forward", "backward_recompute", "composed")
@@ -229,12 +399,97 @@ def test_contract_freezes_r12_inputs_role_limits_resources_and_coordinates() -> 
     }
     assert ROLE_LIMITS == EXPECTED_LIMITS
     assert RESOURCE_CONTRACT == EXPECTED_RESOURCES
+    assert BINDING_CONTRACT == EXPECTED_BINDINGS
     assert hashlib.sha256(R12_RESULT.read_bytes()).hexdigest() == SHA256["r12_result"]
     assert hashlib.sha256(R12_RAW.read_bytes()).hexdigest() == SHA256["r12_raw"]
 
-    evidence = _evidence()
-    assert validate_shuttle_evidence(evidence, r12_result=R12_RESULT, r12_policy_raw=R12_RAW) == evidence
+    evidence = executed_evidence[0]
+    assert _validate(evidence, executed_evidence, prepared_case_root) == evidence
     assert len(evidence["cells"]) == 12
+
+
+def test_executor_invokes_exact_matrix_and_assembles_file_backed_evidence(
+    executed_evidence: tuple[dict[str, object], Path, Path, list[list[str]]], prepared_case_root: Path
+) -> None:
+    evidence, raw_root, reports_root, calls = executed_evidence
+    expected_plan = execution_plan(runner=Path(calls[0][0]), case_root=prepared_case_root, raw_root=raw_root)
+    assert calls == [run["argv"] for run in expected_plan["runs"]]
+    assert len(calls) == 12
+    assert (
+        validate_shuttle_evidence(
+            evidence,
+            r12_result=R12_RESULT,
+            r12_policy_raw=R12_RAW,
+            raw_root=raw_root,
+            case_root=prepared_case_root,
+        )
+        == evidence
+    )
+    assert json.loads((reports_root / "shuttle-policy-raw-v1.json").read_text()) == evidence
+    for cell in evidence["cells"]:
+        contract = EXPECTED_BINDINGS[cell["boundary"]]["results"]
+        assert [
+            (output["role"], output["public_result_index"], output["runner_result_index"], output["slot_ordinal"])
+            for output in cell["outputs"]
+        ] == [
+            (binding["role"], binding["public_result_index"], binding["runner_index"], binding["slot_ordinal"])
+            for binding in contract
+        ]
+        for output in cell["outputs"]:
+            artifact = output["artifact"]
+            assert validate_output_artifact(artifact, raw_root=raw_root, case_root=prepared_case_root) == artifact
+
+
+@pytest.mark.parametrize("failure", ["nonzero", "missing_cell", "artifact_size", "artifact_sha"])
+def test_executor_fails_closed_on_process_and_persisted_output_failures(
+    tmp_path: Path, prepared_case_root: Path, failure: str
+) -> None:
+    raw_root = tmp_path / "raw"
+    reports_root = tmp_path / "reports"
+    kwargs: dict[str, object] = {}
+    if failure == "nonzero":
+        kwargs["failure_coordinate"] = ("source_ordered", "forward", 0)
+    elif failure == "missing_cell":
+        kwargs["omit_cell"] = True
+    elif failure == "artifact_size":
+        kwargs["corrupt_artifact_size"] = True
+    else:
+        kwargs["corrupt_artifact_sha"] = True
+    with pytest.raises(ValueError):
+        execute_representative(
+            runner=tmp_path / "runner",
+            case_root=prepared_case_root,
+            raw_root=raw_root,
+            reports_root=reports_root,
+            r12_result=R12_RESULT,
+            r12_policy_raw=R12_RAW,
+            invoke=lambda argv: _fake_runner([], argv, **kwargs),
+        )
+
+
+def test_executor_persists_raw_outputs_and_diagnostics_before_numerical_rejection(
+    tmp_path: Path, prepared_case_root: Path
+) -> None:
+    raw_root = tmp_path / "raw"
+    reports_root = tmp_path / "reports"
+    with pytest.raises(ValueError):
+        execute_representative(
+            runner=tmp_path / "runner",
+            case_root=prepared_case_root,
+            raw_root=raw_root,
+            reports_root=reports_root,
+            r12_result=R12_RESULT,
+            r12_policy_raw=R12_RAW,
+            invoke=lambda argv: _fake_runner([], argv, corrupt_output=True),
+        )
+    raw_path = reports_root / "shuttle-policy-raw-v1.json"
+    diagnostics_path = reports_root / "shuttle-repeat-diagnostics-v1.json"
+    assert raw_path.is_file()
+    assert diagnostics_path.is_file()
+    raw = json.loads(raw_path.read_text())
+    failed = raw["cells"][0]["outputs"][0]
+    assert failed["max_absolute_error"] > EXPECTED_LIMITS["y"]["max_absolute_error_below_floor"]
+    assert Path(failed["artifact"]["path"]).is_file()
 
 
 def test_execution_plan_is_exact_fresh_process_matrix(tmp_path: Path) -> None:
@@ -271,8 +526,14 @@ def test_execution_plan_is_exact_fresh_process_matrix(tmp_path: Path) -> None:
 @pytest.mark.parametrize("provider", ["source_ordered", "fast"])
 @pytest.mark.parametrize("boundary", ["forward", "backward_recompute", "composed"])
 @pytest.mark.parametrize("repeat", [0, 1])
-def test_every_acceptance_cell_enforces_metrics_roles_and_resources(provider: str, boundary: str, repeat: int) -> None:
-    baseline = _evidence()
+def test_every_acceptance_cell_enforces_metrics_roles_and_resources(
+    provider: str,
+    boundary: str,
+    repeat: int,
+    executed_evidence: tuple[dict[str, object], Path, Path, list[list[str]]],
+    prepared_case_root: Path,
+) -> None:
+    baseline = executed_evidence[0]
     index = next(
         index
         for index, cell in enumerate(baseline["cells"])
@@ -294,17 +555,33 @@ def test_every_acceptance_cell_enforces_metrics_roles_and_resources(provider: st
             changed = copy.deepcopy(baseline)
             changed["cells"][index]["outputs"][role_index][field] = value
             with pytest.raises(ValueError):
-                validate_shuttle_evidence(changed, r12_result=R12_RESULT, r12_policy_raw=R12_RAW)
+                _validate(changed, executed_evidence, prepared_case_root)
         changed = copy.deepcopy(baseline)
         changed["cells"][index]["outputs"][role_index]["max_absolute_error"] = math.nan
         with pytest.raises(ValueError):
-            validate_shuttle_evidence(changed, r12_result=R12_RESULT, r12_policy_raw=R12_RAW)
+            _validate(changed, executed_evidence, prepared_case_root)
+        changed = copy.deepcopy(baseline)
+        output = changed["cells"][index]["outputs"][role_index]
+        output["below_floor_count"] += 1
+        output["eligible_count"] -= 1
+        with pytest.raises(ValueError):
+            _validate(changed, executed_evidence, prepared_case_root)
+        changed = copy.deepcopy(baseline)
+        changed["cells"][index]["outputs"][role_index]["absolute_floor"] = limits["absolute_floor"] * 2
+        with pytest.raises(ValueError):
+            _validate(changed, executed_evidence, prepared_case_root)
+        changed = copy.deepcopy(baseline)
+        changed["cells"][index]["outputs"][role_index]["max_absolute_error"] = (
+            limits["max_absolute_error_below_floor"] / 2
+        )
+        with pytest.raises(ValueError):
+            _validate(changed, executed_evidence, prepared_case_root)
 
     for field in EXPECTED_RESOURCES[boundary]:
         changed = copy.deepcopy(baseline)
         changed["cells"][index]["resources"][field] += 1
         with pytest.raises(ValueError):
-            validate_shuttle_evidence(changed, r12_result=R12_RESULT, r12_policy_raw=R12_RAW)
+            _validate(changed, executed_evidence, prepared_case_root)
 
 
 @pytest.mark.parametrize(
@@ -319,6 +596,9 @@ def test_every_acceptance_cell_enforces_metrics_roles_and_resources(provider: st
         "wrong_reference",
         "wrong_role_order",
         "wrong_public_index",
+        "wrong_runner_index",
+        "wrong_slot_ordinal",
+        "wrong_runner_api",
         "repeat_drift",
         "contract_fusion",
         "wrong_warmup",
@@ -328,8 +608,12 @@ def test_every_acceptance_cell_enforces_metrics_roles_and_resources(provider: st
         "wrong_external_raw",
     ],
 )
-def test_structural_transport_repeat_and_external_evidence_mutations_reject(mutation: str) -> None:
-    changed = copy.deepcopy(_evidence())
+def test_structural_transport_repeat_and_external_evidence_mutations_reject(
+    mutation: str,
+    executed_evidence: tuple[dict[str, object], Path, Path, list[list[str]]],
+    prepared_case_root: Path,
+) -> None:
+    changed = copy.deepcopy(executed_evidence[0])
     cell = changed["cells"][0]
     if mutation == "missing_cell":
         changed["cells"].pop()
@@ -350,13 +634,37 @@ def test_structural_transport_repeat_and_external_evidence_mutations_reject(muta
         backward["outputs"].reverse()
     elif mutation == "wrong_public_index":
         cell["outputs"][0]["public_result_index"] = 1
+    elif mutation == "wrong_runner_index":
+        cell["outputs"][0]["runner_result_index"] = 1
+    elif mutation == "wrong_slot_ordinal":
+        cell["outputs"][0]["slot_ordinal"] += 1
+    elif mutation == "wrong_runner_api":
+        cell["runner_api"]["host"] = "stream_ordered_without_fence"
     elif mutation == "repeat_drift":
         repeated = next(
             entry
             for entry in changed["cells"]
             if entry["policy"] == cell["policy"] and entry["boundary"] == cell["boundary"] and entry["repeat"] == 1
         )
-        repeated["outputs"][0]["digest"] = "0" * 64
+        output = repeated["outputs"][0]
+        original = Path(output["artifact"]["path"])
+        drift_path = original.with_name("result-0-drift.bf16")
+        actual_bits = np.fromfile(original, dtype=np.uint16)
+        reference_bits = np.fromfile(prepared_case_root / ACCEPTANCE_PATTERN / "reference_y.bf16", dtype=np.uint16)
+        reference_f32 = reference_bits.view(ml_dtypes.bfloat16).astype(np.float32)
+        index = int(np.flatnonzero(np.abs(reference_f32) >= EXPECTED_LIMITS["y"]["absolute_floor"])[0])
+        actual_bits[index] ^= np.uint16(1)
+        drift_path.write_bytes(actual_bits.tobytes())
+        actual = actual_bits.view(ml_dtypes.bfloat16).reshape(REPRESENTATIVE_SHAPE)
+        reference = reference_bits.view(ml_dtypes.bfloat16).reshape(REPRESENTATIVE_SHAPE)
+        output.update(error_metrics_v4(actual, reference, role="y"))
+        digest = hashlib.sha256(drift_path.read_bytes()).hexdigest()
+        output["digest"] = digest
+        output["artifact"] = {
+            "path": str(drift_path),
+            "byte_count": drift_path.stat().st_size,
+            "sha256": digest,
+        }
     elif mutation == "contract_fusion":
         cell["transport"]["contract_operation_count"] = 1
     elif mutation == "wrong_warmup":
@@ -372,7 +680,7 @@ def test_structural_transport_repeat_and_external_evidence_mutations_reject(muta
     else:
         raise AssertionError(mutation)
     with pytest.raises(ValueError):
-        validate_shuttle_evidence(changed, r12_result=R12_RESULT, r12_policy_raw=R12_RAW)
+        _validate(changed, executed_evidence, prepared_case_root)
 
 
 def test_output_artifact_validation_rejects_case_alias_and_wrong_storage(tmp_path: Path) -> None:
@@ -405,12 +713,22 @@ def test_output_artifact_validation_rejects_case_alias_and_wrong_storage(tmp_pat
         validate_output_artifact(outside, raw_root=raw_root, case_root=case_root)
 
 
-def test_r12_external_evidence_is_revalidated_not_self_reported(tmp_path: Path) -> None:
+def test_r12_external_evidence_is_revalidated_not_self_reported(
+    tmp_path: Path,
+    executed_evidence: tuple[dict[str, object], Path, Path, list[list[str]]],
+    prepared_case_root: Path,
+) -> None:
     changed_result = json.loads(R12_RESULT.read_text())
     changed_result["evidence"]["acceptance"]["accepted_shape"] = [2048, 4097]
     changed_path = tmp_path / "result-v4.json"
     changed_path.write_text(json.dumps(changed_result, sort_keys=True, separators=(",", ":")))
-    document = _evidence()
+    document = copy.deepcopy(executed_evidence[0])
     document["external_evidence"]["r12_result_sha256"] = hashlib.sha256(changed_path.read_bytes()).hexdigest()
     with pytest.raises(ValueError):
-        validate_shuttle_evidence(document, r12_result=changed_path, r12_policy_raw=R12_RAW)
+        validate_shuttle_evidence(
+            document,
+            r12_result=changed_path,
+            r12_policy_raw=R12_RAW,
+            raw_root=executed_evidence[1],
+            case_root=prepared_case_root,
+        )

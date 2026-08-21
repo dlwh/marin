@@ -3040,6 +3040,60 @@ TEST(Abi22MapFusionContract,
       ASSERT_TRUE(executable.ok()) << executable.status();
       EXPECT_EQ((*executable)->launches().size(), boundary.launches);
       EXPECT_EQ((*executable)->slots().size(), boundary.slots);
+      struct ExpectedBinding {
+        mlir::shuttle::ExecutableBindingKind kind;
+        int64_t index;
+        int64_t slot;
+        int64_t bytes;
+        llvm::SmallVector<int64_t> shape;
+      };
+      constexpr int64_t fullBytes = 2048LL * 4096 * sizeof(uint16_t);
+      constexpr int64_t featureBytes = 4096LL * sizeof(uint16_t);
+      llvm::SmallVector<ExpectedBinding> expectedBindings = {
+          {mlir::shuttle::ExecutableBindingKind::Operand, 0, 0, fullBytes,
+           {2048, 4096}},
+          {mlir::shuttle::ExecutableBindingKind::Operand, 1, 1, featureBytes,
+           {4096}},
+      };
+      if (boundary.name != "forward")
+        expectedBindings.push_back(
+            {mlir::shuttle::ExecutableBindingKind::Operand, 2, 2, fullBytes,
+             {2048, 4096}});
+      if (boundary.name == "forward") {
+        expectedBindings.push_back(
+            {mlir::shuttle::ExecutableBindingKind::Result, 0, 2, fullBytes,
+             {2048, 4096}});
+      } else if (boundary.name == "backward_recompute") {
+        expectedBindings.append({
+            {mlir::shuttle::ExecutableBindingKind::Result, 0, 5, fullBytes,
+             {2048, 4096}},
+            {mlir::shuttle::ExecutableBindingKind::Result, 1, 4,
+             featureBytes, {4096}},
+        });
+      } else {
+        expectedBindings.append({
+            {mlir::shuttle::ExecutableBindingKind::Result, 0, 4, fullBytes,
+             {2048, 4096}},
+            {mlir::shuttle::ExecutableBindingKind::Result, 1, 6, fullBytes,
+             {2048, 4096}},
+            {mlir::shuttle::ExecutableBindingKind::Result, 2, 5,
+             featureBytes, {4096}},
+        });
+      }
+      ASSERT_EQ((*executable)->externalBindings().size(),
+                expectedBindings.size());
+      for (auto [binding, expected] : llvm::zip_equal(
+               (*executable)->externalBindings(), expectedBindings)) {
+        EXPECT_EQ(binding.kind, expected.kind);
+        EXPECT_EQ(binding.index, expected.index);
+        EXPECT_EQ(binding.slotOrdinal, expected.slot);
+        EXPECT_EQ(binding.requiredBytes, expected.bytes);
+        EXPECT_EQ(binding.alignment, 2);
+        auto type = mlir::dyn_cast<mlir::RankedTensorType>(binding.tensorType);
+        ASSERT_TRUE(type);
+        EXPECT_EQ(type.getShape(), llvm::ArrayRef<int64_t>(expected.shape));
+        EXPECT_TRUE(type.getElementType().isBF16());
+      }
       EXPECT_EQ(llvm::count_if((*executable)->externalBindings(), [](auto binding) {
                   return binding.kind ==
                          mlir::shuttle::ExecutableBindingKind::Operand;

@@ -574,6 +574,7 @@ py_test(
 py_test(
     name = "abi22_shuttle_rmsnorm_representative_test",
     srcs = [
+        "jax_patch/abi22_te_rmsnorm_oracle_v2.py",
         "jax_patch/abi22_shuttle_rmsnorm_representative.py",
         "jax_patch/test_abi22_shuttle_rmsnorm_representative.py",
     ],
