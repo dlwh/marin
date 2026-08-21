@@ -3720,6 +3720,7 @@ std::string ptxOutputControlDigest(llvm::StringRef ptx,
   start = ptx.take_front(start).rfind('\n');
   start = start == llvm::StringRef::npos ? 0 : start + 1;
   llvm::StringRef slice = ptx.slice(start, done + doneLabel.size());
+  PtxDataflow prefixFlow = ptxDataflow(ptx.take_front(start));
 
   std::map<std::string, std::string> registers;
   int64_t nextPredicate = 0;
@@ -3731,6 +3732,15 @@ std::string ptxOutputControlDigest(llvm::StringRef ptx,
     auto found = registers.find(token.str());
     if (found != registers.end())
       return found->second;
+    if (token == "%r0" || token == "%r1") {
+      auto reaching = prefixFlow.currentValues.find(token.str());
+      if (reaching == prefixFlow.currentValues.end())
+        return {};
+      std::string canonical =
+          "$live:" + ptxFingerprintDigest(prefixFlow, reaching->second);
+      registers.try_emplace(token.str(), canonical);
+      return canonical;
+    }
     llvm::StringRef prefix;
     int64_t *next = nullptr;
     if (token.starts_with("%p")) {
@@ -3761,7 +3771,11 @@ std::string ptxOutputControlDigest(llvm::StringRef ptx,
     if (position == llvm::StringRef::npos)
       return {};
     skeleton += slice.slice(cursor, position).str();
-    skeleton += token.starts_with("%") ? canonicalRegister(token) : token.str();
+    std::string replacement =
+        token.starts_with("%") ? canonicalRegister(token) : token.str();
+    if (replacement.empty())
+      return {};
+    skeleton += replacement;
     cursor = position + token.size();
   }
   skeleton += slice.drop_front(cursor).str();
@@ -3952,6 +3966,15 @@ std::string redirectFirstPtxOutputGuard(llvm::StringRef ptx) {
   return result;
 }
 
+std::string rerouteFirstFoldOutputGuardToBlockId(llvm::StringRef ptx) {
+  std::string result = ptx.str();
+  const std::string correct = "setp.ne.u32 %p3, %r0, 0;";
+  size_t position = result.find(correct);
+  if (position != std::string::npos)
+    result.replace(position, correct.size(), "setp.ne.u32 %p3, %r1, 0;");
+  return result;
+}
+
 constexpr llvm::StringLiteral kGenericSharedStatAlgebra = R"mlir(
 #matrix = affine_map<(d0, d1) -> (d0, d1)>
 #row = affine_map<(d0, d1) -> (d0)>
@@ -4062,6 +4085,10 @@ module attributes {
 TEST(Abi22MapFusionContract,
      SharedRowStatsPartitionRowAndSiblingColumnOutputsGenerically) {
   llvm::StringRef source = kGenericSharedStatAlgebra;
+  constexpr std::array<llvm::StringLiteral, 2> directFoldControlDigests = {
+      "a574d2e3a5d2e2e2c56a7b19f5f35f0c5011f4e61c30a57446227a91c88ad512",
+      "59f8da67863782cda325603bdec07ee371ddb657e55678e00120771efd6c7e60",
+  };
   struct ShapeCase {
     int64_t rows;
     int64_t features;
@@ -4086,6 +4113,29 @@ TEST(Abi22MapFusionContract,
       ASSERT_TRUE(built);
       EXPECT_TRUE(hasGenericSharedStatPartition(*built->module, shape.rows,
                                                 shape.features));
+
+      auto device =
+          *built->module->getOps<mlir::shuttle::DeviceModuleOp>().begin();
+      auto entries = llvm::to_vector(
+          device.getBody().front().getOps<mlir::shuttle::DeviceEntryOp>());
+      ASSERT_EQ(entries.size(), 2u);
+      auto featureEntry = entries[1];
+      llvm::StringRef ptx(
+          reinterpret_cast<const char *>(device.getCode().data() +
+                                         featureEntry.getCodeOffset()),
+          featureEntry.getCodeLength());
+      for (auto [outputOrdinal, expected] :
+           llvm::enumerate(directFoldControlDigests))
+        EXPECT_EQ(ptxOutputControlDigest(ptx, outputOrdinal), expected);
+      auto expectFirstFoldControlRejected = [&](std::string mutated) {
+        ASSERT_NE(mutated, ptx);
+        EXPECT_NE(ptxOutputControlDigest(mutated, 0),
+                  directFoldControlDigests[0]);
+      };
+      expectFirstFoldControlRejected(
+          rerouteFirstFoldOutputGuardToBlockId(ptx));
+      expectFirstFoldControlRejected(flipFirstPtxOutputGuardPolarity(ptx));
+      expectFirstFoldControlRejected(redirectFirstPtxOutputGuard(ptx));
 
       for (llvm::StringRef mutation :
            {"source-order", "drop-stat-input", "swap-stat-bindings",
@@ -4216,11 +4266,11 @@ TEST(Abi22MapFusionContract,
         "948ec3995104fbff504ef2af2bdef2d5c5b84d72c26c36a1b4f321a8763ffcbd",
         "4ea4548e103b339bd5d55854a32d9ed632ce44a3fac32d39385cfafd84677835",
         "ba762e537b95bdc44ff9ea14e83475661a6ade0179251a656a85b8dd7204a783", ""},
-       {"97fdcf5a0fc69518bdcff4e7aee2868ffb5301a3c559ba87ca3407c74182fc06",
-        "5a25f3f711d286de78fb8266fe0aa343bbb144096d7b26df83cc2fc12b257a4c",
-        "7d251567f750a86380a918d6e771fa986541e5226da4a7434ff83022bae14197",
-        "f5a7ba8c9ecfc240cd1350358d6b497be1cd3a912e69d2fcac316c9c40fbf566",
-        "ae4ed1493af4beb3dc60a8fd8e0d2b4a28d193d53af1c3b9e3e0bcdaf60e0961",
+       {"45d5a22cff40debc4aa9f94931bc48963b2a40d18a13aaa802caa085a2511125",
+        "541f42872150196df4f51c5f02a4ddaa7d7bf868ba9e0b6aa50f24b03c3194e4",
+        "8243c7964b200ca043eec5c49337518c02c43d96a55260f4b189885e04938288",
+        "9a4162f457f270197017d0ec305c6c76f4eaab47127d28cd501586455f59fef1",
+        "b0eca7cf355f42f5a90aeb0175feb7395fddf91e4d02c2274b9211bdf09f1025",
         ""},
        {"p0", "p0", "p0,p1,p2", "p1", "p0,p1,p2,p3", ""}},
       {"jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-composed.mlir",
@@ -4240,12 +4290,12 @@ TEST(Abi22MapFusionContract,
         "e982e5187665143b7060ee99f8df8c6ecba60aa816514bccd8a0e631c4489dca",
         "4ea4548e103b339bd5d55854a32d9ed632ce44a3fac32d39385cfafd84677835",
         "ba762e537b95bdc44ff9ea14e83475661a6ade0179251a656a85b8dd7204a783"},
-       {"b9a41d0609c5b9b5caf55c09a914acbacbe68c13b5bedc20349f3c1219b7c25c",
-        "bc92c9e300241bc1b369a3bbdf16e95f041f8df2de08be33697828743fb378da",
-        "5000b8ed594ef13757b41fedc06602fdfaab812216fb897cf3715bc6ff4fe9bd",
-        "08fd53780e238d5029776df9043ad2a37f97a3093883fcebf18e65caba841585",
-        "f5a7ba8c9ecfc240cd1350358d6b497be1cd3a912e69d2fcac316c9c40fbf566",
-        "ae4ed1493af4beb3dc60a8fd8e0d2b4a28d193d53af1c3b9e3e0bcdaf60e0961"},
+       {"c6703f2336e2ba3f0463c60c230ab74e3c9d9590b0c9f69f9072970e474e9a4c",
+        "629665b0c4ad9d08745198fed97aa22b191a2aa61d2cefb99de7594b8d3aceec",
+        "cc34100e4aa0eaf70dc91e0b77cbd4843cd0d65233ee85e3d7f4e85d318a25e1",
+        "402b8a3732d87b33e6acf6ea7ac357d8192740c477bbb5eac290357f955aff26",
+        "9a4162f457f270197017d0ec305c6c76f4eaab47127d28cd501586455f59fef1",
+        "b0eca7cf355f42f5a90aeb0175feb7395fddf91e4d02c2274b9211bdf09f1025"},
        {"p0", "p0", "p0,p1,p2", "p0,p1,p3", "p1", "p0,p1,p2,p3"}},
       {"jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-backward.mlir",
        2048,
@@ -4262,11 +4312,11 @@ TEST(Abi22MapFusionContract,
         "f287dceb40d1523dd06b1bce7d4d7502c62ca0c7782dd6b1ca4688704d611de8",
         "4764abf32a66ed2208781e798b792197df47b5ba9af9d7d759ad9af5f3dac018",
         "cd2b45f73b977d0258420899923c80e038a52a1792f4a076a40367529b6711ec", ""},
-       {"4f77ad4d56a7f2ca413c7c5a442d26831eac28b5e81c77b5e384a02a77888de6",
-        "d6a7fe52bf220794c8132f6d0305949d511968149ad9d1c360f345d627ccfd1e",
-        "a074d17bb65eb862d4f80c336fdd24df6368fa502c25400bf65aeb88fedb9492",
-        "f4b4e412ee05a363c0d98420d01ffc199348f8cce084f489a6802768336aa50f",
-        "211ac33ef1ce83db74a9f60165d39130e01c35113151ca24bae80c2be00622bb",
+       {"3290c72b40857b474228e51426ee17d5fb2eec392abc6eb76084f8883cba97c4",
+        "05665ce8138b8112a59c5807e0f59a5e73dc9452a6eb34df9826284272e033af",
+        "b3e8d81fb1694b8a474ef874c4642c9356fc8d3b5925f36b300fe0b808fa5f37",
+        "031ffa1049ca2a3c95d222efc10a485470c56143b7c91a5ed2eaf830923961d9",
+        "e3e4422fb331199ede3a78a72fc402538fba46f2b8251fb9d0679d71d8c75917",
         ""},
        {"p0", "p0", "p0,p1,p2", "p1", "p0,p1,p2,p3", ""}},
       {"jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-composed.mlir",
@@ -4286,12 +4336,12 @@ TEST(Abi22MapFusionContract,
         "b43694d152c34ab031548b757d6c6a48cb72390c768ab10b0bfbb1f493f9003d",
         "4764abf32a66ed2208781e798b792197df47b5ba9af9d7d759ad9af5f3dac018",
         "cd2b45f73b977d0258420899923c80e038a52a1792f4a076a40367529b6711ec"},
-       {"d4c50ab5ee5a10dfb5dafbde8decf511cda81dae7b3c06d643d51499fca1fda0",
-        "10fddc433dcc231b17a904cddd2e486ee10c01d014699de2efec3b191d93f60e",
-        "c5962176df663f6619bf18bdf9f9ecca4959e53c6ea550494943a132bc2a594f",
-        "6ab35b5df1d0a16b2414005154106b61167293828b910652f3f20b40389412cd",
-        "f4b4e412ee05a363c0d98420d01ffc199348f8cce084f489a6802768336aa50f",
-        "211ac33ef1ce83db74a9f60165d39130e01c35113151ca24bae80c2be00622bb"},
+       {"afe90d94f6e03940b678df98a010ddb786badb660870b3ddd9c0f374b8e8fddf",
+        "73e71124680600c64327470c8aca8fe3956b325490e54470284c3910ec424b75",
+        "39d35d22b5285784d4f69bac0a965052b5b111298b7b4489a18a1c4403cd8902",
+        "a5d458aaebcdf13f686dd6918abc4bf1a7e9b88432c3899e1daf33f07dc15861",
+        "031ffa1049ca2a3c95d222efc10a485470c56143b7c91a5ed2eaf830923961d9",
+        "e3e4422fb331199ede3a78a72fc402538fba46f2b8251fb9d0679d71d8c75917"},
        {"p0", "p0", "p0,p1,p2", "p0,p1,p3", "p1", "p0,p1,p2,p3"}},
   }};
   for (const Fixture &fixture : fixtures) {
