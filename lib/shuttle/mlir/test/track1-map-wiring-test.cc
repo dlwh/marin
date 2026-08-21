@@ -143,8 +143,7 @@ module @jit__lambda {
 
 class RecordingObserver final : public mlir::shuttle::ShuttlePipelineObserver {
 public:
-  void observe(
-      const mlir::shuttle::ShuttlePipelineEvent &event) const final {
+  void observe(const mlir::shuttle::ShuttlePipelineEvent &event) const final {
     std::lock_guard<std::mutex> lock(mutex);
     events.push_back(event);
   }
@@ -176,6 +175,15 @@ std::string moduleText(mlir::ModuleOp module) {
   return result;
 }
 
+absl::Status runRegisteredShuttleTransform(mlir::ModuleOp module,
+                                           llvm::StringRef policy) {
+  absl::Status registration = mlir::shuttle::registerShuttleXlaTransform();
+  if (!registration.ok())
+    return registration;
+  return xla::StablehloModuleTransformRegistry::Global().Run(
+      module, policy.str(), "shuttle");
+}
+
 size_t countOccurrences(llvm::StringRef text, llvm::StringRef pattern) {
   size_t count = 0;
   size_t offset = 0;
@@ -201,17 +209,17 @@ void expectObservedSuccess(
   EXPECT_FALSE(events[0].coverageManifest().empty());
   EXPECT_EQ(events[0].coverageManifest(), events[1].coverageManifest());
   for (int64_t operation = 0; operation < 3; ++operation) {
-    EXPECT_NE(events[0].regionMembership().find(
-                  ("#shuttle.source_ref<0, 0, " +
-                   std::to_string(operation) + ", 0>")),
-              std::string::npos);
+    EXPECT_NE(
+        events[0].regionMembership().find(("#shuttle.source_ref<0, 0, " +
+                                           std::to_string(operation) + ", 0>")),
+        std::string::npos);
   }
-  EXPECT_EQ(events[0].regionMembership().find(
-                "#shuttle.source_ref<0, 0, 3, 0>"),
-            std::string::npos);
-  EXPECT_NE(events[0].coverageManifest().find(
-                "#shuttle.source_ref<0, 0, 3, 0>"),
-            std::string::npos);
+  EXPECT_EQ(
+      events[0].regionMembership().find("#shuttle.source_ref<0, 0, 3, 0>"),
+      std::string::npos);
+  EXPECT_NE(
+      events[0].coverageManifest().find("#shuttle.source_ref<0, 0, 3, 0>"),
+      std::string::npos);
   EXPECT_NE(events[0].coverageManifest().find("unsupported_operation"),
             std::string::npos);
   EXPECT_FALSE(events[0].unsupportedFingerprint().empty());
@@ -302,9 +310,7 @@ TEST(TrackOneMapWiringTest,
       mlir::MLIRContext context;
       mlir::OwningOpRef<mlir::ModuleOp> module = parseModule(context, program);
       ASSERT_TRUE(module);
-      absl::Status status =
-          xla::StablehloModuleTransformRegistry::Global().Run(
-              *module, policy.str(), "shuttle");
+      absl::Status status = runRegisteredShuttleTransform(*module, policy);
       ASSERT_TRUE(status.ok()) << status;
 
       std::string transformed = moduleText(*module);
@@ -344,15 +350,12 @@ TEST(TrackOneMapWiringTest,
       mlir::MLIRContext context;
       mlir::OwningOpRef<mlir::ModuleOp> module = parseModule(context, program);
       ASSERT_TRUE(module);
-      absl::Status status =
-          xla::StablehloModuleTransformRegistry::Global().Run(
-              *module, policy.str(), "shuttle");
+      absl::Status status = runRegisteredShuttleTransform(*module, policy);
       ASSERT_TRUE(status.ok()) << status;
 
       std::string transformed = moduleText(*module);
-      EXPECT_EQ(countOccurrences(transformed,
-                                 "shuttle.gpu.executable_bundle.v2"),
-                1);
+      EXPECT_EQ(
+          countOccurrences(transformed, "shuttle.gpu.executable_bundle.v2"), 1);
       EXPECT_EQ(countOccurrences(transformed, "stablehlo.abs"), 1);
       EXPECT_EQ(transformed.find("stablehlo.convert"), std::string::npos);
       EXPECT_EQ(transformed.find("stablehlo.negate"), std::string::npos);
@@ -374,19 +377,19 @@ TEST(TrackOneMapWiringTest,
       auto bundleBytes = backendConfig.getAs<mlir::StringAttr>("bundle_bytes");
       ASSERT_TRUE(bundleBytes);
       llvm::StringRef serialized = bundleBytes.getValue();
-      auto loaded = mlir::shuttle::GpuExecutable::Load(
-          llvm::ArrayRef<uint8_t>(
-              reinterpret_cast<const uint8_t *>(serialized.data()),
-              serialized.size()));
+      auto loaded = mlir::shuttle::GpuExecutable::Load(llvm::ArrayRef<uint8_t>(
+          reinterpret_cast<const uint8_t *>(serialized.data()),
+          serialized.size()));
       ASSERT_TRUE(loaded.ok()) << loaded.status();
       EXPECT_EQ((*loaded)->launches().size(), 3);
       EXPECT_EQ((*loaded)->slots().size(), 4);
       EXPECT_EQ((*loaded)->externalBindings().size(), 2);
-      EXPECT_EQ(std::count_if((*loaded)->slots().begin(),
-                              (*loaded)->slots().end(), [](const auto &slot) {
-                  return slot.storage ==
-                         mlir::shuttle::MaterializationStorage::Temporary;
-                }),
+      EXPECT_EQ(std::count_if(
+                    (*loaded)->slots().begin(), (*loaded)->slots().end(),
+                    [](const auto &slot) {
+                      return slot.storage ==
+                             mlir::shuttle::MaterializationStorage::Temporary;
+                    }),
                 2);
       expectObservedSuccess(
           observer->snapshot(),
@@ -408,9 +411,7 @@ TEST(TrackOneMapWiringTest,
       mlir::MLIRContext context;
       mlir::OwningOpRef<mlir::ModuleOp> module = parseModule(context, program);
       ASSERT_TRUE(module);
-      absl::Status status =
-          xla::StablehloModuleTransformRegistry::Global().Run(
-              *module, policy.str(), "shuttle");
+      absl::Status status = runRegisteredShuttleTransform(*module, policy);
       ASSERT_TRUE(status.ok()) << status;
 
       llvm::SmallVector<mlir::Operation *> customCalls;
@@ -443,8 +444,8 @@ TEST(TrackOneMapWiringTest,
             backendConfig.getAs<mlir::StringAttr>("bundle_bytes");
         ASSERT_TRUE(bundleBytes);
         llvm::StringRef serialized = bundleBytes.getValue();
-        auto loaded = mlir::shuttle::GpuExecutable::Load(
-            llvm::ArrayRef<uint8_t>(
+        auto loaded =
+            mlir::shuttle::GpuExecutable::Load(llvm::ArrayRef<uint8_t>(
                 reinterpret_cast<const uint8_t *>(serialized.data()),
                 serialized.size()));
         ASSERT_TRUE(loaded.ok()) << loaded.status();
@@ -464,11 +465,9 @@ TEST(TrackOneMapWiringTest,
   }
 }
 
-TEST(TrackOneMapWiringTest,
-     LateMapCodegenFailureLeavesTheJaxGraphUnchanged) {
+TEST(TrackOneMapWiringTest, LateMapCodegenFailureLeavesTheJaxGraphUnchanged) {
   auto observer = std::make_shared<RecordingObserver>();
-  auto subscription =
-      mlir::shuttle::subscribeShuttlePipelineObserver(observer);
+  auto subscription = mlir::shuttle::subscribeShuttlePipelineObserver(observer);
   mlir::MLIRContext context;
   mlir::OwningOpRef<mlir::ModuleOp> module =
       parseModule(context, kUnsupportedMapBodyProgram);
@@ -485,8 +484,7 @@ TEST(TrackOneMapWiringTest,
   EXPECT_EQ(events[0].phase(),
             mlir::shuttle::ShuttlePipelinePhase::AlgebraCoverage);
   EXPECT_EQ(events[1].phase(), mlir::shuttle::ShuttlePipelinePhase::Failure);
-  EXPECT_EQ(events[1].failurePass(),
-            "shuttle-build-gpu-executable-bundle");
+  EXPECT_EQ(events[1].failurePass(), "shuttle-build-gpu-executable-bundle");
 }
 
 TEST(TrackOneMapWiringTest,
@@ -511,10 +509,8 @@ TEST(TrackOneMapWiringTest,
     ASSERT_EQ(events.size(), 2);
     EXPECT_EQ(events[0].phase(),
               mlir::shuttle::ShuttlePipelinePhase::AlgebraCoverage);
-    EXPECT_EQ(events[1].phase(),
-              mlir::shuttle::ShuttlePipelinePhase::Failure);
-    EXPECT_EQ(events[1].failurePass(),
-              "shuttle-plan-row-fold-materialization");
+    EXPECT_EQ(events[1].phase(), mlir::shuttle::ShuttlePipelinePhase::Failure);
+    EXPECT_EQ(events[1].failurePass(), "shuttle-plan-row-fold-materialization");
   }
 }
 
