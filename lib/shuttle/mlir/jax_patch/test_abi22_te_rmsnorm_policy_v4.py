@@ -363,9 +363,7 @@ class TeRmsnormPolicyV4Test(unittest.TestCase):
             },
         )
         acceptance_cells = [
-            (index, cell)
-            for index, cell in enumerate(validated["cells"])
-            if cell["input_pattern"] == ACCEPTANCE_PATTERN and cell["repeat"] == 0
+            (index, cell) for index, cell in enumerate(validated["cells"]) if cell["input_pattern"] == ACCEPTANCE_PATTERN
         ]
         for index, cell in acceptance_cells:
             for output_index, output in enumerate(cell["outputs"]):
@@ -477,8 +475,9 @@ class TeRmsnormPolicyV4Test(unittest.TestCase):
                 output["mean_absolute_error"] = 1024.0
                 output["max_relative_error_above_absolute_floor"] = 1024.0
                 output["max_bfloat16_ulp_above_absolute_floor"] = 65_535
+                output["digest"] = ("e" if cell["repeat"] == 0 else "f") * 64
             repeat1 = next(cell for cell in cells if cell["repeat"] == 1)
-            next(output for output in repeat1["outputs"] if output["role"] == role)["digest"] = "f" * 64
+            self.assertEqual(next(output for output in repeat1["outputs"] if output["role"] == role)["digest"], "f" * 64)
 
             validated = validate(evidence)
             self.assertEqual(validated["acceptance"]["status"], "accepted")
@@ -490,11 +489,68 @@ class TeRmsnormPolicyV4Test(unittest.TestCase):
                         "input_pattern": pattern,
                         "boundary": boundary,
                         "role": role,
-                        "repeat0_digest": _pattern_digests(pattern)[1][role],
+                        "repeat0_digest": "e" * 64,
                         "repeat1_digest": "f" * 64,
                     }
                 ],
             )
+
+    def test_validator_binds_complete_matrix_provenance_roles_and_partitions(self) -> None:
+        validate = _api("validate_policy_v4_evidence")
+        evidence = _policy_evidence()
+        for cells in (
+            evidence["cells"][:-1],
+            [*evidence["cells"], copy.deepcopy(evidence["cells"][-1])],
+            [evidence["cells"][1], evidence["cells"][0], *evidence["cells"][2:]],
+        ):
+            corrupted = copy.deepcopy(evidence)
+            corrupted["cells"] = cells
+            with self.assertRaisesRegex(ValueError, "cell|coordinate|matrix"):
+                validate(corrupted)
+
+        for index, cell in enumerate(evidence["cells"]):
+            input_role = next(iter(cell["input_digests"]))
+            mutations = (
+                ("shape", [1, 1]),
+                ("scope", "wrong_scope"),
+                ("input_digests", {**cell["input_digests"], input_role: "0" * 64}),
+                (
+                    "execution",
+                    {"call_sequence": ["wrong_call"], "rsigma_state": "invocation_local_not_public"},
+                ),
+            )
+            for field, value in mutations:
+                corrupted = copy.deepcopy(evidence)
+                corrupted["cells"][index][field] = value
+                with self.assertRaisesRegex(ValueError, "coordinate|input|call|provenance|scope|shape"):
+                    validate(corrupted)
+
+            role_order = copy.deepcopy(evidence)
+            outputs = role_order["cells"][index]["outputs"]
+            if len(outputs) == 1:
+                outputs[0]["role"] = "dx"
+            else:
+                outputs[0], outputs[1] = outputs[1], outputs[0]
+            with self.assertRaisesRegex(ValueError, "role"):
+                validate(role_order)
+
+            for output_index in range(len(cell["outputs"])):
+                bad_reference = copy.deepcopy(evidence)
+                bad_reference["cells"][index]["outputs"][output_index]["reference_digest"] = "0" * 64
+                with self.assertRaisesRegex(ValueError, "reference"):
+                    validate(bad_reference)
+
+                bad_count = copy.deepcopy(evidence)
+                count_output = bad_count["cells"][index]["outputs"][output_index]
+                count_output["below_floor_count"] += 1
+                count_output["eligible_count"] -= 1
+                with self.assertRaisesRegex(ValueError, "count"):
+                    validate(bad_count)
+
+                bad_closure = copy.deepcopy(evidence)
+                bad_closure["cells"][index]["outputs"][output_index]["max_absolute_error"] = 1.0
+                with self.assertRaisesRegex(ValueError, "partition|whole|max_absolute"):
+                    validate(bad_closure)
 
     def test_repeat_diagnostics_reports_pairwise_drift_before_rejection(self) -> None:
         first = np.asarray([0.0, 1.0, -2.0], dtype=ml_dtypes.bfloat16)

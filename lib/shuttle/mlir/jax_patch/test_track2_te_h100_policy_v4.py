@@ -8,6 +8,7 @@ import copy
 import hashlib
 import io
 import json
+import shutil
 import statistics
 import tempfile
 import unittest
@@ -42,7 +43,15 @@ def _arguments(argv: list[str]) -> dict[str, str]:
     return {value[2:]: argv[index + 1] for index, value in enumerate(argv[:-1]) if value.startswith("--")}
 
 
-def _fake_invoke(paths: BatchPaths, calls: list[list[str]], argv: list[str]) -> int:
+def _fake_invoke(
+    paths: BatchPaths,
+    calls: list[list[str]],
+    argv: list[str],
+    *,
+    acceptance_drift: bool = True,
+    qualification_drift: bool = False,
+    alias_te_outputs: bool = False,
+) -> int:
     calls.append(argv)
     arguments = _arguments(argv)
     shape = (int(arguments["rows"]), int(arguments["features"]))
@@ -54,6 +63,13 @@ def _fake_invoke(paths: BatchPaths, calls: list[list[str]], argv: list[str]) -> 
     input_roles = ("x", "gamma") if boundary == "forward" else ("x", "gamma", "dy")
 
     if argv[0] == str(paths.te_runner):
+        output_files = {}
+        for role in roles:
+            reference_path = case / f"reference_{role}.bf16"
+            output_path = reference_path if alias_te_outputs else output.parent / f"{output.stem}-{role}.bf16"
+            if not alias_te_outputs:
+                shutil.copyfile(reference_path, output_path)
+            output_files[role] = str(output_path)
         output.write_text(
             json.dumps(
                 {
@@ -64,7 +80,7 @@ def _fake_invoke(paths: BatchPaths, calls: list[list[str]], argv: list[str]) -> 
                     "warmup_invocations": 10,
                     "raw_host_blocking_ns": [100_000 + index for index in range(20)],
                     "raw_cuda_event_ns": [50_000 + index for index in range(20)],
-                    "output_files": {role: str(case / f"reference_{role}.bf16") for role in roles},
+                    "output_files": output_files,
                     "workspace_bytes": {"forward": 0, "backward": 0},
                 },
                 sort_keys=True,
@@ -95,7 +111,19 @@ def _fake_invoke(paths: BatchPaths, calls: list[list[str]], argv: list[str]) -> 
                 **error_metrics(actual, reference, role=role),
             }
         )
-    if any(ACCEPTANCE_PATTERN in argument for argument in argv) and boundary == "composed" and "repeat1" in output.name:
+    acceptance_coordinate = (
+        acceptance_drift
+        and any(ACCEPTANCE_PATTERN in argument for argument in argv)
+        and boundary == "composed"
+        and "repeat1" in output.name
+    )
+    qualification_coordinate = (
+        qualification_drift
+        and any(oracle.QUALIFICATION_PATTERN in argument for argument in argv)
+        and boundary == "composed"
+        and "repeat1" in output.name
+    )
+    if acceptance_coordinate or qualification_coordinate:
         actual_path = Path(output_files["y"])
         payload = bytearray(actual_path.read_bytes())
         payload[:2] = (int.from_bytes(payload[:2], "little") + 1).to_bytes(2, "little")
@@ -216,6 +244,75 @@ class Track2TeH100PolicyV4Test(unittest.TestCase):
         execute_v4.assert_called_once()
         self.assertEqual(json.loads(BatchPaths.under(workspace).result.read_text()), result)
 
+    def test_worker_reports_qualification_drift_without_rejecting_acceptance(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        paths = BatchPaths.under(Path(temporary.name) / "workspace")
+        paths.workspace.mkdir()
+        paths.reports.mkdir()
+        paths.raw.mkdir()
+        paths.te_runner.write_bytes(b"runner-binary")
+        paths.te_library.parent.mkdir(parents=True)
+        paths.te_library.write_bytes(b"resolved-te-library")
+        calls: list[list[str]] = []
+
+        result = batch.execute_oracle_v4(
+            paths=paths,
+            device=DEVICE,
+            invoke=lambda argv: _fake_invoke(
+                paths,
+                calls,
+                argv,
+                acceptance_drift=False,
+                qualification_drift=True,
+            ),
+        )
+
+        self.assertEqual(result["acceptance"]["status"], "heldout_splitmix64_v3_numerics_accepted")
+        drift = next(item for item in result["repeat_diagnostics"]["coordinates"] if item["mismatch_count"])
+        self.assertEqual(
+            result["qualification"]["qualification"]["repeat_digest_drifts"],
+            [
+                {
+                    "producer": "ordinary_jax_xla",
+                    "input_pattern": oracle.QUALIFICATION_PATTERN,
+                    "boundary": "composed",
+                    "role": "y",
+                    "repeat0_digest": drift["repeat0_digest"],
+                    "repeat1_digest": drift["repeat1_digest"],
+                }
+            ],
+        )
+        self.assertEqual(
+            (drift["producer"], drift["input_pattern"], drift["boundary"], drift["role"]),
+            ("ordinary_jax_xla", oracle.QUALIFICATION_PATTERN, "composed", "y"),
+        )
+        self.assertEqual(len(calls), 72)
+
+    def test_worker_rejects_te_output_paths_that_alias_case_inputs(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        paths = BatchPaths.under(Path(temporary.name) / "workspace")
+        paths.workspace.mkdir()
+        paths.reports.mkdir()
+        paths.raw.mkdir()
+        paths.te_runner.write_bytes(b"runner-binary")
+        paths.te_library.parent.mkdir(parents=True)
+        paths.te_library.write_bytes(b"resolved-te-library")
+
+        with self.assertRaisesRegex(ValueError, "output.*path|raw output"):
+            batch.execute_oracle_v4(
+                paths=paths,
+                device=DEVICE,
+                invoke=lambda argv: _fake_invoke(
+                    paths,
+                    [],
+                    argv,
+                    acceptance_drift=False,
+                    alias_te_outputs=True,
+                ),
+            )
+
     def test_worker_persists_raw_outputs_and_repeat_diagnostics_before_rejection(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -331,8 +428,13 @@ class Track2TeH100PolicyV4Test(unittest.TestCase):
                 self.assertEqual(output["digest"], _digest(Path(expected_files[-1])))
             self.assertEqual(item["raw_output_files"], expected_files)
             self.assertTrue(all(Path(path).is_file() for path in expected_files))
-            if producer == "ordinary_jax_xla":
-                self.assertNotEqual(expected_files[0], expected_files[1])
+            self.assertNotEqual(expected_files[0], expected_files[1])
+            rows, features = oracle.REPRESENTATIVE_SHAPE
+            case_directory = paths.cases / (f"{rows}x{features}" if pattern == oracle.QUALIFICATION_PATTERN else pattern)
+            for path in map(Path, expected_files):
+                self.assertTrue(path.resolve().is_relative_to(paths.raw.resolve()))
+                self.assertFalse(path.resolve().is_relative_to(paths.cases.resolve()))
+                self.assertNotEqual(path.stat().st_ino, (case_directory / f"reference_{role}.bf16").stat().st_ino)
             repeat_values = [
                 np.fromfile(path, dtype=np.uint16).view(ml_dtypes.bfloat16).reshape(output_shape)
                 for path in expected_files
