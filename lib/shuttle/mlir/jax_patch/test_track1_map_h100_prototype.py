@@ -24,6 +24,7 @@ from track1_map_h100_prototype import (
     require_source_bundle,
     source_bundle_document,
     validate_result_pair,
+    validate_rmsnorm_result,
     wheel_set,
 )
 
@@ -189,7 +190,7 @@ def test_checked_in_source_manifest_matches_the_live_iris_bundle_closure(tmp_pat
         load_authorization(changed_path, approved_sha256)
 
 
-def test_dry_run_renders_one_network_hydration_then_offline_build_and_two_workers(tmp_path: Path) -> None:
+def test_dry_run_renders_one_network_hydration_then_offline_build_and_three_workers(tmp_path: Path) -> None:
     _, _, authorization = _authorization(tmp_path)
     workspace = tmp_path / "fresh"
 
@@ -217,6 +218,7 @@ def test_dry_run_renders_one_network_hydration_then_offline_build_and_two_worker
         "verify_jax_runtime",
         "populate",
         "reuse",
+        "rmsnorm",
     ]
     hydration = phases[3]["argv"]
     offline = phases[4]["argv"]
@@ -242,6 +244,7 @@ def test_dry_run_renders_one_network_hydration_then_offline_build_and_two_worker
     assert all("pip" not in argument and "http" not in argument for argument in phases[7]["argv"])
     assert phases[9]["argv"][phases[9]["argv"].index("--role") + 1] == "populate"
     assert phases[10]["argv"][phases[10]["argv"].index("--role") + 1] == "reuse"
+    assert phases[11]["argv"][-2:] == ["--output", str(workspace / "rmsnorm.json")]
     assert not workspace.exists()
 
     workspace.mkdir()
@@ -280,6 +283,54 @@ def _worker_document(worker: str, pid: int) -> dict[str, object]:
                 }
             )
     return {"coordinates": coordinates, "pid": pid, "schema_version": 1, "worker": worker}
+
+
+def _rmsnorm_document() -> dict[str, object]:
+    coordinates = []
+    for shape in ((2, 7, 19), (3, 2, 5, 11, 263)):
+        for boundary, roles in (
+            ("forward", ("result",)),
+            ("backward", ("input_cotangent", "weight_cotangent")),
+            ("composed", ("result", "input_cotangent", "weight_cotangent")),
+        ):
+            for mode in ("disabled", "source_ordered", "fast"):
+                coordinates.append(
+                    {
+                        "boundary": boundary,
+                        "mode": mode,
+                        "observer": (
+                            None
+                            if mode == "disabled"
+                            else {
+                                "final_module_sha256": "1" * 64,
+                                "generated_bundle_sha256": "2" * 64,
+                                "invocation_id": len(coordinates) + 1,
+                            }
+                        ),
+                        "results": {
+                            role: hashlib.sha256(f"{shape}:{boundary}:{mode}:{role}".encode()).hexdigest()
+                            for role in roles
+                        },
+                        "shape": list(shape),
+                    }
+                )
+    return {"coordinates": coordinates, "pid": 303, "schema": "track1_rmsnorm_h100_result", "schema_version": 1}
+
+
+def test_rmsnorm_result_requires_exact_coordinate_output_and_observer_closure() -> None:
+    document = _rmsnorm_document()
+    assert validate_rmsnorm_result(document) == document
+
+    for mutation in ("coordinate", "result", "observer"):
+        changed = deepcopy(document)
+        if mutation == "coordinate":
+            changed["coordinates"][0]["boundary"] = "composed"
+        elif mutation == "result":
+            changed["coordinates"][4]["results"].pop("weight_cotangent")
+        else:
+            changed["coordinates"][1]["observer"] = None
+        with pytest.raises(ValueError, match="RMSNorm"):
+            validate_rmsnorm_result(changed)
 
 
 def test_result_pair_requires_fresh_process_reuse_of_exact_outputs_and_cache() -> None:

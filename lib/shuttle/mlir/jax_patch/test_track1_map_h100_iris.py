@@ -12,6 +12,7 @@ import pytest
 from iris.rpc import controller_pb2, job_pb2
 from track1_map_h100_iris import (
     CLIENT_REVISION_DATE,
+    Campaign,
     build_launch_request,
     decode_launch_request,
     job_name,
@@ -34,6 +35,7 @@ def _request(retry: int = 1) -> controller_pb2.Controller.LaunchJobRequest:
         bundle_root=MARIN_REPOSITORY,
         authorization_path=AUTHORIZATION_PATH,
         approved_authorization_sha256=_approved_authorization_sha256(),
+        campaign=Campaign.RMSNORM_CANARY,
         retry=retry,
     )
 
@@ -66,17 +68,20 @@ def test_dry_run_emits_and_decodes_the_real_fail_closed_launch_request(
     raw = output.read_bytes()
     request = controller_pb2.Controller.LaunchJobRequest()
     request.ParseFromString(raw)
-    decoded = decode_launch_request(raw, approved_authorization_sha256=approved, retry=4)
+    decoded = decode_launch_request(
+        raw, approved_authorization_sha256=approved, campaign=Campaign.RMSNORM_CANARY, retry=4
+    )
     summary = json.loads(capsys.readouterr().out)
 
     assert request == decoded
     assert summary["request_sha256"] == hashlib.sha256(raw).hexdigest()
     assert summary["bundle_sha256"] == request.bundle_id
     assert summary["authorization_sha256"] == approved
-    assert summary["job_name"] == job_name(4)
+    assert summary["campaign"] == Campaign.RMSNORM_CANARY.value
+    assert summary["job_name"] == job_name(Campaign.RMSNORM_CANARY, 4)
     assert summary["retry"] == 4
 
-    assert request.name == "/dlwh/shuttle-track1-map-h100-prototype-r4"
+    assert request.name == "/dlwh/shuttle-track1-rmsnorm-h100-canary-r4"
     assert request.client_revision_date == CLIENT_REVISION_DATE
     assert request.task_image == BASE_IMAGE
     assert request.bundle_init_image == ""
@@ -125,12 +130,12 @@ def test_request_bytes_are_deterministic_and_output_is_create_only(tmp_path: Pat
     first = _request().SerializeToString(deterministic=True)
     second = _request().SerializeToString(deterministic=True)
     assert first == second
-    assert _request(4).name == "/dlwh/shuttle-track1-map-h100-prototype-r4"
+    assert _request(4).name == "/dlwh/shuttle-track1-rmsnorm-h100-canary-r4"
     assert _request(4).SerializeToString(deterministic=True) != first
     with pytest.raises(ValueError, match="protobuf is malformed"):
-        decode_launch_request(b"\xff", approved_authorization_sha256=approved, retry=1)
+        decode_launch_request(b"\xff", approved_authorization_sha256=approved, campaign=Campaign.RMSNORM_CANARY, retry=1)
     with pytest.raises(ValueError, match="positive integer"):
-        job_name(0)
+        job_name(Campaign.RMSNORM_CANARY, 0)
 
     output = tmp_path / "launch.pb"
     output.write_bytes(b"do not replace")
