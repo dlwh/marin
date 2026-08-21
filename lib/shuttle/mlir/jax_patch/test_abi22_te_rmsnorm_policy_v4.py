@@ -360,6 +360,7 @@ class TeRmsnormPolicyV4Test(unittest.TestCase):
                 "status": "diagnostic_only",
                 "patterns": list(QUALIFICATION_PATTERNS),
                 "repeat_digest_drifts": [],
+                "numerical_anomalies": [],
             },
         )
         acceptance_cells = [
@@ -481,6 +482,7 @@ class TeRmsnormPolicyV4Test(unittest.TestCase):
 
             validated = validate(evidence)
             self.assertEqual(validated["acceptance"]["status"], "accepted")
+            self.assertEqual(validated["qualification"]["numerical_anomalies"], [])
             self.assertEqual(
                 validated["qualification"]["repeat_digest_drifts"],
                 [
@@ -549,8 +551,66 @@ class TeRmsnormPolicyV4Test(unittest.TestCase):
 
                 bad_closure = copy.deepcopy(evidence)
                 bad_closure["cells"][index]["outputs"][output_index]["max_absolute_error"] = 1.0
-                with self.assertRaisesRegex(ValueError, "partition|whole|max_absolute"):
-                    validate(bad_closure)
+                if cell["input_pattern"] == ACCEPTANCE_PATTERN:
+                    with self.assertRaisesRegex(ValueError, "partition|whole|max_absolute"):
+                        validate(bad_closure)
+                else:
+                    diagnosed = validate(bad_closure)
+                    self.assertEqual(
+                        diagnosed["qualification"]["numerical_anomalies"],
+                        [
+                            {
+                                "producer": cell["producer"],
+                                "input_pattern": cell["input_pattern"],
+                                "boundary": cell["boundary"],
+                                "repeat": cell["repeat"],
+                                "role": cell["outputs"][output_index]["role"],
+                                "issues": ["partition_closure"],
+                            }
+                        ],
+                    )
+
+    def test_qualification_nonfinite_metrics_are_complete_diagnostics_not_acceptance_failures(self) -> None:
+        validate = _api("validate_policy_v4_evidence")
+        evidence = _policy_evidence()
+        for index, cell in enumerate(evidence["cells"]):
+            if cell["input_pattern"] == ACCEPTANCE_PATTERN:
+                continue
+            for output_index, output in enumerate(cell["outputs"]):
+                corrupted = copy.deepcopy(evidence)
+                observed = corrupted["cells"][index]["outputs"][output_index]
+                observed.update(
+                    all_finite=False,
+                    max_absolute_error="nan",
+                    mean_absolute_error="nan",
+                    max_absolute_error_below_floor="nan",
+                    max_absolute_error_above_floor="nan",
+                    max_relative_error_above_absolute_floor="nan",
+                    raw_max_bfloat16_ulp_actual="nan",
+                )
+                validated = validate(corrupted)
+                self.assertEqual(validated["acceptance"]["status"], "accepted")
+                self.assertEqual(
+                    validated["qualification"]["numerical_anomalies"],
+                    [
+                        {
+                            "producer": cell["producer"],
+                            "input_pattern": cell["input_pattern"],
+                            "boundary": cell["boundary"],
+                            "repeat": cell["repeat"],
+                            "role": output["role"],
+                            "issues": [
+                                "all_finite_false",
+                                "max_absolute_error_nonfinite",
+                                "max_absolute_error_above_floor_nonfinite",
+                                "max_absolute_error_below_floor_nonfinite",
+                                "max_relative_error_above_absolute_floor_nonfinite",
+                                "mean_absolute_error_nonfinite",
+                                "raw_max_bfloat16_ulp_actual_nonfinite",
+                            ],
+                        }
+                    ],
+                )
 
     def test_repeat_diagnostics_reports_pairwise_drift_before_rejection(self) -> None:
         first = np.asarray([0.0, 1.0, -2.0], dtype=ml_dtypes.bfloat16)
