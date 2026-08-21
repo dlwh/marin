@@ -553,6 +553,11 @@ def test_failed_rmsnorm_contract_phase_surfaces_the_complete_primal_checkpoint_l
     assert prototype.validate_rmsnorm_contract_primal_checkpoint(recovered) == recovered
     assert len(recovered["coordinates"]) == 6
 
+    changed = deepcopy(recovered)
+    changed["coordinates"][1]["disabled_jax_equal"] = not changed["coordinates"][1]["disabled_jax_equal"]
+    with pytest.raises(ValueError, match="disabled diagnostic differs"):
+        prototype.validate_rmsnorm_contract_primal_checkpoint(changed)
+
 
 def test_rmsnorm_result_requires_exact_coordinate_output_and_observer_closure() -> None:
     document = _rmsnorm_document()
