@@ -8,7 +8,13 @@ from __future__ import annotations
 import copy
 import unittest
 
-from abi22_h100_performance import CELL_KEYS, build_acceptance, validate_report
+from abi22_h100_performance import (
+    CELL_KEYS,
+    build_acceptance,
+    build_exploratory,
+    validate_exploratory_report,
+    validate_report,
+)
 
 HEX = "0" * 64
 MEASURED_ITERATIONS = 6
@@ -105,6 +111,67 @@ def _report(producer: str, base_ns: int) -> dict[str, object]:
     }
 
 
+def _shuttle_host_report(base_ns: int) -> dict[str, object]:
+    report = _report("shuttle", base_ns)
+    report["host_protocol"] = {
+        "mode": "exploratory_host_v1",
+        "clock": "host_block_until_ready",
+        "counterbalance": "forward_reverse_alternating",
+        "warmup_iterations": 3,
+        "measured_iterations": MEASURED_ITERATIONS,
+    }
+    for cell_index, cell in enumerate(report["cells"]):
+        cell["host_samples_ns"] = [
+            base_ns + 1_000 + cell_index * 10 + round_index for round_index in range(MEASURED_ITERATIONS)
+        ]
+    return report
+
+
+def _exploratory_report(producer: str, base_ns: int) -> dict[str, object]:
+    accepted = _report(producer, base_ns)
+    cells = []
+    for cell in accepted["cells"]:
+        cells.append(
+            {
+                "case": cell["case"],
+                "policy": cell["policy"],
+                "shape": cell["shape"],
+                "samples_ns": cell["samples_ns"],
+                "sample_rounds": cell["sample_rounds"],
+                "sample_positions": cell["sample_positions"],
+                "output": cell["output"],
+                "identity": {
+                    "workload_digest": cell["identity"]["workload_digest"],
+                    "executable_digest": cell["identity"]["executable_digest"],
+                },
+            }
+        )
+    return {
+        "schema": "shuttle_h100_exploratory_host_v1",
+        "producer": producer,
+        "device": accepted["device"],
+        "compiler": accepted["compiler"],
+        "protocol": {
+            "mode": "exploratory_host_v1",
+            "clock": "host_block_until_ready",
+            "counterbalance": "forward_reverse_alternating",
+            "warmup_iterations": 3,
+            "measured_iterations": MEASURED_ITERATIONS,
+        },
+        "cells": cells,
+    }
+
+
+def _te_unavailable() -> dict[str, object]:
+    return {
+        "schema": "shuttle_h100_exploratory_unavailable_v1",
+        "producer": "te",
+        "protocol_mode": "exploratory_host_v1",
+        "status": "unavailable",
+        "blocker": "te_2_17_runner_lacks_norm_contract_cells",
+    }
+
+
 class PerformanceProtocolTest(unittest.TestCase):
     def test_complete_shuttle_report_preserves_raw_counterbalanced_samples(self) -> None:
         report = validate_report(_report("shuttle", 100), expected_producer="shuttle")
@@ -177,6 +244,48 @@ class PerformanceProtocolTest(unittest.TestCase):
         mismatched_xla["cells"][0]["identity"]["workload_digest"] = "1" * 64
         with self.assertRaisesRegex(ValueError, "xla rmsnorm_forward source_ordered workload does not match"):
             build_acceptance(shuttle, mismatched_xla, te)
+
+        with self.assertRaisesRegex(ValueError, "schema"):
+            build_acceptance(shuttle, _exploratory_report("xla", 200), te)
+
+    def test_exploratory_host_comparison_uses_only_matched_host_samples(self) -> None:
+        shuttle = _shuttle_host_report(100)
+        xla = _exploratory_report("xla", 200)
+
+        explored = build_exploratory(shuttle, xla, _te_unavailable())
+
+        self.assertEqual(explored["schema"], "shuttle_h100_exploratory_comparison_v1")
+        self.assertEqual(explored["protocol"]["clock"], "host_block_until_ready")
+        self.assertEqual(explored["comparisons"][0]["shuttle_median_ns"], 1102.5)
+        self.assertEqual(explored["comparisons"][0]["xla_median_ns"], 202.5)
+        self.assertEqual(explored["te"], _te_unavailable())
+
+    def test_exploratory_host_comparison_rejects_partial_or_cross_clock_inputs(self) -> None:
+        shuttle = _shuttle_host_report(100)
+        xla = _exploratory_report("xla", 200)
+
+        missing_host = copy.deepcopy(shuttle)
+        del missing_host["cells"][0]["host_samples_ns"]
+        with self.assertRaisesRegex(ValueError, "host_samples_ns"):
+            build_exploratory(missing_host, xla, _te_unavailable())
+
+        wrong_clock = copy.deepcopy(xla)
+        wrong_clock["protocol"]["clock"] = "cuda_event"
+        with self.assertRaisesRegex(ValueError, "host_block_until_ready"):
+            validate_exploratory_report(wrong_clock, expected_producer="xla")
+
+        mismatched_workload = copy.deepcopy(xla)
+        mismatched_workload["cells"][0]["identity"]["workload_digest"] = "1" * 64
+        with self.assertRaisesRegex(ValueError, "workload does not match"):
+            build_exploratory(shuttle, mismatched_workload, _te_unavailable())
+
+        incomplete_xla = copy.deepcopy(xla)
+        incomplete_xla["cells"].pop()
+        with self.assertRaisesRegex(ValueError, "complete case/policy matrix"):
+            build_exploratory(shuttle, incomplete_xla, _te_unavailable())
+
+        with self.assertRaisesRegex(ValueError, "TE exploratory blocker"):
+            build_exploratory(shuttle, xla, None)
 
 
 if __name__ == "__main__":
