@@ -317,7 +317,8 @@ bool ptxDependsOn(const PtxDataflow &flow, llvm::StringRef value,
 
 bool containsRmsNormReciprocalSubgraph(const PtxDataflow &flow,
                                        llvm::StringRef value,
-                                       llvm::StringRef extent) {
+                                       llvm::StringRef extent,
+                                       llvm::StringRef meanDependency) {
   std::set<std::string> closure = ptxDependencyClosure(flow, value);
   if (closure.count("$op:neg.f32"))
     return false;
@@ -342,7 +343,7 @@ bool containsRmsNormReciprocalSubgraph(const PtxDataflow &flow,
       const auto *mean = ptxDefinition(flow, epsilonAdd->operands[meanOperand]);
       if (!mean || mean->opcode != "div.rn.f32" || mean->operands.size() < 2)
         continue;
-      if (ptxDependsOn(flow, mean->operands[0], "$shared") &&
+      if (ptxDependsOn(flow, mean->operands[0], meanDependency) &&
           ptxDependsOn(flow, mean->operands[1], extent))
         return true;
     }
@@ -1580,7 +1581,7 @@ TEST(Abi22MapFusionContract,
   PtxDataflow valid = ptxDataflow(correct);
   ASSERT_EQ(valid.stores.size(), 1u);
   EXPECT_TRUE(containsRmsNormReciprocalSubgraph(
-      valid, valid.stores.front().value, "0f41980000"));
+      valid, valid.stores.front().value, "0f41980000", "$shared"));
   EXPECT_TRUE(containsStagedSharedAdd(valid));
 
   for (std::string mutation : {
@@ -1595,7 +1596,7 @@ TEST(Abi22MapFusionContract,
     PtxDataflow flow = ptxDataflow(mutation);
     ASSERT_EQ(flow.stores.size(), 1u);
     EXPECT_FALSE(containsRmsNormReciprocalSubgraph(
-        flow, flow.stores.front().value, "0f41980000"));
+        flow, flow.stores.front().value, "0f41980000", "$shared"));
   }
   PtxDataflow reassociated = ptxDataflow(
       replace(correct, "add.rn.f32 %f4, %f2, %f3", "sub.rn.f32 %f4, %f2, %f3"));
@@ -2002,7 +2003,8 @@ TEST(Abi22MapFusionContract,
           EXPECT_TRUE(valueDependencies.count("0f358637BD"));
           EXPECT_TRUE(valueDependencies.count("$op:cvt.rn.bf16.f32"));
           EXPECT_TRUE(containsRmsNormReciprocalSubgraph(
-              flow, flow.stores.front().value, extent));
+              flow, flow.stores.front().value, extent,
+              backward ? "p1" : "$shared"));
           EXPECT_FALSE(valueDependencies.count("$op:neg.f32"));
         }
       }
@@ -2158,7 +2160,7 @@ module @anonymous {
       ASSERT_TRUE(entries.front().getBlock());
       const bool large = candidate.find("2048x4096") != std::string::npos;
       EXPECT_EQ(*entries.front().getGrid(),
-                llvm::ArrayRef<int64_t>({large ? 2048 : 2}));
+                llvm::ArrayRef<int64_t>({large ? 2048 : 2, 1, 1}));
       EXPECT_LE(entries.front().getBlock()->front(), 256);
       llvm::StringRef ptx(
           reinterpret_cast<const char *>(device.getCode().data() +
