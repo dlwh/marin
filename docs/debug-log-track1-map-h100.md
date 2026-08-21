@@ -119,6 +119,40 @@ mutation proves that neither live checkout changes on validation failure. The
 fourth JAX patch now anchors its registration call to the exact post-observer
 function context.
 
+## r6 observer failure
+
+r6 built the patched wheels, passed runtime import and GPU preflight, and
+entered populate. The disabled coordinate completed first. The first enabled
+coordinate then compiled and blocked on both the primal and analytic-gradient
+GPU results before observer validation failed with:
+
+```text
+ValueError: observer phases do not share one positive invocation
+```
+
+The validator had already established that the snapshot contained exactly the
+three ordered `algebra_coverage`, `generated_bundle`, and `final_erasure`
+records. The native value-and-gradient fixture reproduces the same module: one
+JIT compilation contains two selected Map regions, becomes two custom calls,
+and emits three module-level observer records rather than records per region or
+per result. All three records share invocation ID zero.
+
+The producer initialized its atomic invocation counter to zero and returned the
+pre-increment value. Disabled compilation emits no Shuttle records, so the
+first enabled transform in a fresh process necessarily received zero. This is
+why local tests that checked only equality between IDs passed while the public
+subject's intentional positive-ID contract rejected the snapshot.
+
+## r7 observer repair
+
+Observer IDs now begin at one. A wrapped counter returns zero only after the
+entire positive 64-bit space has been consumed; that state terminates with a
+stable exhaustion diagnostic rather than reusing an ID. The public registered
+transform regression now requires a positive ID and equality across all three
+phases. It fails on the first transform at the old tip and covers the same
+multi-custom-call value-and-gradient fixture used by the H100 subject without
+relaxing subject attribution.
+
 ## Future work
 
-- [ ] Record final wheel/DSO evidence from r6 or a later authorized H100 run.
+- [ ] Record final wheel/DSO evidence from r7 or a later authorized H100 run.

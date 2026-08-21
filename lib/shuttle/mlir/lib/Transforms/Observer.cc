@@ -195,7 +195,15 @@ ObserverRegistry &observerRegistry() {
   return *registry;
 }
 
-std::atomic<uint64_t> nextInvocationId{0};
+std::atomic<uint64_t> nextInvocationId{1};
+
+uint64_t takeNextInvocationId() {
+  uint64_t invocationId =
+      nextInvocationId.fetch_add(1, std::memory_order_relaxed);
+  if (invocationId == 0)
+    llvm::report_fatal_error("Shuttle observer invocation ID space exhausted");
+  return invocationId;
+}
 
 } // namespace
 
@@ -325,8 +333,7 @@ void ShuttleObserverInvocation::emit(ShuttlePipelinePhase phase,
 std::shared_ptr<ShuttleObserverInvocation> beginShuttleObserverInvocation(
     ShuttlePipelineIdentity identity,
     std::shared_ptr<const ShuttlePipelineObserver> directObserver) {
-  uint64_t invocationId =
-      nextInvocationId.fetch_add(1, std::memory_order_relaxed);
+  uint64_t invocationId = takeNextInvocationId();
   return std::shared_ptr<ShuttleObserverInvocation>(
       new ShuttleObserverInvocation(
           std::make_unique<ShuttleObserverInvocation::Impl>(
