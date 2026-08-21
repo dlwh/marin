@@ -518,6 +518,39 @@ py_test(
     main = "jax_patch/test_abi22_te_rmsnorm_oracle_v2.py",
 )
 
+py_test(
+    name = "abi22_te_rmsnorm_policy_v3_test",
+    srcs = [
+        "jax_patch/abi22_te_rmsnorm_oracle_v2.py",
+        "jax_patch/test_abi22_te_rmsnorm_policy_v3.py",
+    ],
+    deps = [
+        "@pypi//ml_dtypes",
+        "@pypi//numpy",
+    ],
+    imports = ["jax_patch"],
+    main = "jax_patch/test_abi22_te_rmsnorm_policy_v3.py",
+)
+
+py_test(
+    name = "track2_te_h100_policy_v3_test",
+    srcs = [
+        "jax_patch/abi22_te_rmsnorm_oracle_v2.py",
+        "jax_patch/test_track2_te_h100_policy_v3.py",
+        "jax_patch/track1_map_h100_build.py",
+        "jax_patch/track1_map_h100_prototype.py",
+        "jax_patch/track1_rmsnorm_numerical_policy.py",
+        "jax_patch/track2_te_h100_batch.py",
+    ],
+    data = ["jax_patch/track1-rmsnorm-h100-numerical-policy-v1.json"],
+    deps = [
+        "@pypi//ml_dtypes",
+        "@pypi//numpy",
+    ],
+    imports = ["jax_patch"],
+    main = "jax_patch/test_track2_te_h100_policy_v3.py",
+)
+
 cc_test(
     name = "abi19_libdevice_contract_test",
     srcs = ["test/abi19-libdevice-contract-test.cc"],
