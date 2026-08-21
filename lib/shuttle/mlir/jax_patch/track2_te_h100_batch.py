@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any
 
 from abi22_te_rmsnorm_oracle_v2 import (
+    ACCEPTANCE_INPUT_DIGESTS,
+    ACCEPTANCE_PATTERN,
     BOUNDARIES,
     HELDOUT_INPUT_DIGESTS,
     HELDOUT_PATTERN,
@@ -36,7 +38,7 @@ from abi22_te_rmsnorm_oracle_v2 import (
     execution_plan,
     load_te_raw_cell,
     prepare_cases,
-    prepare_heldout_case,
+    prepare_policy_cases,
     qualification_plan,
     validate_build_manifest,
     validate_qualification_evidence,
@@ -235,7 +237,7 @@ def batch_plan(*, workspace: Path, runner_repository: Path) -> dict[str, Any]:
             "producer_order": ["transformer_engine_2_17", "ordinary_jax_xla"],
             "run_count": len(SHAPES) * len(BOUNDARIES) * 2,
         },
-        "qualification": {**NUMERICAL_POLICY, "run_count": 24},
+        "qualification": {**NUMERICAL_POLICY, "run_count": 36},
         "phases": [
             {
                 "name": "device",
@@ -486,7 +488,13 @@ def _execute_hydration(paths: BatchPaths, plan: dict[str, Any]) -> dict[str, Any
 
 
 def _artifact_identities(paths: BatchPaths) -> dict[str, dict[str, int | str]]:
-    files = [paths.te_report, paths.xla_report, paths.acceptance, paths.runtime_manifest]
+    files = [
+        paths.te_report,
+        paths.xla_report,
+        paths.acceptance,
+        paths.runtime_manifest,
+        paths.reports / "policy-raw-v2.json",
+    ]
     files.extend(sorted(path for path in paths.raw.iterdir() if path.is_file() and not path.is_symlink()))
     return {
         str(path.relative_to(paths.workspace)): {"sha256": _file_sha256(path), "size": path.stat().st_size}
@@ -540,7 +548,7 @@ def execute_oracle(
 ) -> dict[str, Any]:
     """Execute and validate the closed v2 producer matrix."""
     prepare_cases(paths.cases)
-    prepare_heldout_case(paths.cases)
+    prepare_policy_cases(paths.cases)
     runtime_manifest = {
         "schema": "shuttle_abi22_te_rmsnorm_runtime_v2",
         "runner_sha256": _file_sha256(paths.te_runner),
@@ -594,13 +602,18 @@ def execute_oracle(
         pattern = run["input_pattern"]
         boundary = run["boundary"]
         repeat = run["repeat"]
-        case = paths.cases / (f"{rows}x{features}" if pattern == QUALIFICATION_PATTERN else HELDOUT_PATTERN)
+        case = paths.cases / (f"{rows}x{features}" if pattern == QUALIFICATION_PATTERN else pattern)
         raw = paths.raw / f"policy-{producer}-{pattern}-{boundary}-repeat{repeat}.json"
         if producer == "transformer_engine_2_17":
             cell = load_te_raw_cell(
                 raw,
                 case,
-                expected_input_digests=HELDOUT_INPUT_DIGESTS if pattern == HELDOUT_PATTERN else None,
+                expected_input_digests=(
+                    HELDOUT_INPUT_DIGESTS
+                    if pattern == HELDOUT_PATTERN
+                    else ACCEPTANCE_INPUT_DIGESTS if pattern == ACCEPTANCE_PATTERN else None
+                ),
+                expected_pattern=pattern if pattern != QUALIFICATION_PATTERN else None,
             )
         else:
             cell, runtime = _validated_xla_raw_cell(
@@ -611,6 +624,8 @@ def execute_oracle(
         input_digests = INPUT_DIGESTS[REPRESENTATIVE_SHAPE]
         if pattern == HELDOUT_PATTERN:
             input_digests = HELDOUT_INPUT_DIGESTS
+        elif pattern == ACCEPTANCE_PATTERN:
+            input_digests = ACCEPTANCE_INPUT_DIGESTS
         roles = ("x", "gamma") if boundary == "forward" else ("x", "gamma", "dy")
         if cell["input_digests"] != {role: input_digests[role] for role in roles}:
             raise ValueError("policy input bytes differ from the predeclared pattern")
@@ -618,22 +633,28 @@ def execute_oracle(
             producer=producer,
             input_pattern=pattern,
             repeat=repeat,
-            scope="representative_policy_qualification",
+            scope=(
+                "representative_policy_acceptance"
+                if pattern == ACCEPTANCE_PATTERN
+                else "representative_policy_qualification"
+            ),
         )
         policy_cells[(producer, pattern, boundary, repeat)] = cell
-    qualification = validate_qualification_evidence(
-        {
-            "schema": "shuttle_abi22_rmsnorm_policy_evidence_v1",
-            "cells": [
-                policy_cells[(producer, pattern, boundary, repeat)]
-                for producer in PRODUCERS
-                for pattern in (QUALIFICATION_PATTERN, HELDOUT_PATTERN)
-                for boundary in BOUNDARIES
-                for repeat in range(2)
-            ],
-        }
-    )
-    print(f"TRACK2_TE_POLICY_DIAGNOSTICS={canonical_json(qualification).decode()}")
+    raw_policy = {
+        "schema": "shuttle_abi22_rmsnorm_policy_evidence_v2",
+        "cells": [
+            policy_cells[(producer, pattern, boundary, repeat)]
+            for producer in PRODUCERS
+            for pattern in (QUALIFICATION_PATTERN, HELDOUT_PATTERN, ACCEPTANCE_PATTERN)
+            for boundary in BOUNDARIES
+            for repeat in range(2)
+        ],
+    }
+    raw_policy_bytes = canonical_json(raw_policy)
+    (paths.reports / "policy-raw-v2.json").write_bytes(raw_policy_bytes)
+    print(f"TRACK2_TE_POLICY_RAW={raw_policy_bytes.decode()}", flush=True)
+    qualification = validate_qualification_evidence(raw_policy)
+    print(f"TRACK2_TE_POLICY_DIAGNOSTICS={canonical_json(qualification).decode()}", flush=True)
     diagnostics = {
         producer: [{"shape": cell["shape"], "boundary": cell["boundary"], "outputs": cell["outputs"]} for cell in cells]
         for producer, cells in (

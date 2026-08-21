@@ -25,14 +25,34 @@ WARMUP_INVOCATIONS = 10
 NORM_CONTRACT_BLOCKER = "te_2_17_rmsnorm_oracle_v2_does_not_cover_norm_contract"
 QUALIFICATION_PATTERN = "qualification_linspace_v2"
 HELDOUT_PATTERN = "heldout_reversed_linspace_v1"
+ACCEPTANCE_PATTERN = "heldout_splitmix64_v1"
 ACCEPTANCE_LIMITS = {
-    "y": {"max_absolute_error": 0.0078125, "max_bfloat16_ulp": 2},
-    "dx": {"max_absolute_error": 0.0625, "max_bfloat16_ulp": 64},
-    "dgamma": {"max_absolute_error": 0.015625, "max_bfloat16_ulp": 8},
+    "y": {
+        "max_absolute_error": 0.0078125,
+        "max_mean_absolute_error": 0.0078125,
+        "absolute_floor": 0.015625,
+        "max_relative_error_above_absolute_floor": 0.5,
+        "max_bfloat16_ulp_above_absolute_floor": 2,
+    },
+    "dx": {
+        "max_absolute_error": 0.0625,
+        "max_mean_absolute_error": 0.0625,
+        "absolute_floor": 0.125,
+        "max_relative_error_above_absolute_floor": 0.5,
+        "max_bfloat16_ulp_above_absolute_floor": 64,
+    },
+    "dgamma": {
+        "max_absolute_error": 0.015625,
+        "max_mean_absolute_error": 0.015625,
+        "absolute_floor": 0.03125,
+        "max_relative_error_above_absolute_floor": 0.5,
+        "max_bfloat16_ulp_above_absolute_floor": 8,
+    },
 }
 NUMERICAL_POLICY = {
-    "schema": "shuttle_abi22_rmsnorm_role_policy_v1",
-    "patterns": [QUALIFICATION_PATTERN, HELDOUT_PATTERN],
+    "schema": "shuttle_abi22_rmsnorm_role_policy_v2",
+    "qualification_patterns": [QUALIFICATION_PATTERN, HELDOUT_PATTERN],
+    "acceptance_patterns": [ACCEPTANCE_PATTERN],
     "repeat_count": 2,
     "limits_by_role": ACCEPTANCE_LIMITS,
 }
@@ -83,6 +103,21 @@ HELDOUT_REFERENCE_DIGESTS = {
     "y": "15a4e1660f2dc93b91841a0ac8c54c90372548a4b1269a09cc9c428cdc3e98f5",
     "dx": "d5e6be3d8cf52e4139235b9dde69a84db489a705580a376f08a613eb7beeab9a",
     "dgamma": "06498bae527509f636aae0baa0b247e657e5f6dc1f7453cf3279e53db90664e0",
+}
+ACCEPTANCE_INPUT_DIGESTS = {
+    "x": "d5306b1c52e907c4f4df004e6f3a9c488f354acd80221eb5077e6f20a1c3f34e",
+    "gamma": "7666bd787eded8f496d15ecaa0ff1a09e2785076f6f5e5db47737a95152b86ec",
+    "dy": "2abeef4e00143b614ca27c6f310998493609de3490f4720538be507c4ddc4556",
+}
+ACCEPTANCE_REFERENCE_DIGESTS = {
+    "y": "dbf0c5cc4900ca5498099bd458edfdf31200a692fd2996e66960e8b98b77078e",
+    "dx": "938fe85ca5d7820ca1ae7dfb8acc970307ad88ec92d94b77bd024e904c2d8c55",
+    "dgamma": "209869785a9897bfd13ff39665e0ad781d2bb14b3b7c15067a1f6c752c4601fb",
+}
+ELIGIBLE_COUNTS = {
+    QUALIFICATION_PATTERN: {"y": 8_225_616, "dx": 6_523_647, "dgamma": 4_096},
+    HELDOUT_PATTERN: {"y": 8_388_455, "dx": 5_397_253, "dgamma": 4_096},
+    ACCEPTANCE_PATTERN: {"y": 8_305_853, "dx": 7_722_818, "dgamma": 4_091},
 }
 INPUT_RANGES = ((-0.75, 0.875), (-0.625, 1.0), (-0.5, 1.125))
 
@@ -238,35 +273,75 @@ def _heldout_case_files() -> dict[str, tuple[int, str]]:
     }
 
 
-def _verify_heldout_case(case_root: Path) -> None:
-    for name, (size, digest) in _heldout_case_files().items():
-        path = case_root / HELDOUT_PATTERN / name
-        if not path.is_file():
-            raise ValueError(f"case file missing: {path}")
-        payload = path.read_bytes()
-        if len(payload) != size:
-            raise ValueError(f"case file size drifted: {path}")
-        if _sha256_bytes(payload) != digest:
-            raise ValueError(f"case file digest drifted: {path}")
+def _splitmix_values(count: int, seed: int, lower: float, upper: float) -> np.ndarray:
+    value = np.arange(count, dtype=np.uint64) + np.uint64(seed)
+    value = (value ^ (value >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+    value = (value ^ (value >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+    value ^= value >> np.uint64(31)
+    fraction = (value >> np.uint64(40)).astype(np.uint32).astype(np.float32) / np.float32(16777215.0)
+    return (np.float32(lower) + np.float32(upper - lower) * fraction).astype(ml_dtypes.bfloat16)
 
 
-def prepare_heldout_case(case_root: Path) -> dict[str, dict[str, str]]:
-    """Write the predeclared representative input that was not used to tune the role limits."""
-    directory = case_root / HELDOUT_PATTERN
-    directory.mkdir(parents=True, exist_ok=True)
-    x, gamma, dy = _heldout_inputs()
-    y, dx, dgamma = _reference(x, gamma, dy, EPSILON)
-    for name, value in {
-        "x.bf16": x,
-        "gamma.bf16": gamma,
-        "dy.bf16": dy,
-        "reference_y.bf16": y,
-        "reference_dx.bf16": dx,
-        "reference_dgamma.bf16": dgamma,
-    }.items():
-        (directory / name).write_bytes(_bf16_bytes(value))
-    _verify_heldout_case(case_root)
-    return {"input_digests": HELDOUT_INPUT_DIGESTS, "reference_digests": HELDOUT_REFERENCE_DIGESTS}
+def _acceptance_inputs() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    rows, features = REPRESENTATIVE_SHAPE
+    return (
+        _splitmix_values(rows * features, 0x9E3779B97F4A7C15, -1.0, 1.0).reshape(rows, features),
+        _splitmix_values(features, 0x243F6A8885A308D3, 0.5, 1.5),
+        _splitmix_values(rows * features, 0x13198A2E03707344, -1.0, 1.0).reshape(rows, features),
+    )
+
+
+def _acceptance_case_files() -> dict[str, tuple[int, str]]:
+    rows, features = REPRESENTATIVE_SHAPE
+    return {
+        "x.bf16": (rows * features * 2, ACCEPTANCE_INPUT_DIGESTS["x"]),
+        "gamma.bf16": (features * 2, ACCEPTANCE_INPUT_DIGESTS["gamma"]),
+        "dy.bf16": (rows * features * 2, ACCEPTANCE_INPUT_DIGESTS["dy"]),
+        "reference_y.bf16": (rows * features * 2, ACCEPTANCE_REFERENCE_DIGESTS["y"]),
+        "reference_dx.bf16": (rows * features * 2, ACCEPTANCE_REFERENCE_DIGESTS["dx"]),
+        "reference_dgamma.bf16": (features * 2, ACCEPTANCE_REFERENCE_DIGESTS["dgamma"]),
+    }
+
+
+def _verify_policy_cases(case_root: Path) -> None:
+    for pattern, files in (
+        (HELDOUT_PATTERN, _heldout_case_files()),
+        (ACCEPTANCE_PATTERN, _acceptance_case_files()),
+    ):
+        for name, (size, digest) in files.items():
+            path = case_root / pattern / name
+            if not path.is_file():
+                raise ValueError(f"case file missing: {path}")
+            payload = path.read_bytes()
+            if len(payload) != size:
+                raise ValueError(f"case file size drifted: {path}")
+            if _sha256_bytes(payload) != digest:
+                raise ValueError(f"case file digest drifted: {path}")
+
+
+def prepare_policy_cases(case_root: Path) -> dict[str, dict[str, dict[str, str]]]:
+    """Write both reviewed qualification and untouched acceptance inputs."""
+    result = {}
+    for pattern, inputs, input_digests, reference_digests in (
+        (HELDOUT_PATTERN, _heldout_inputs(), HELDOUT_INPUT_DIGESTS, HELDOUT_REFERENCE_DIGESTS),
+        (ACCEPTANCE_PATTERN, _acceptance_inputs(), ACCEPTANCE_INPUT_DIGESTS, ACCEPTANCE_REFERENCE_DIGESTS),
+    ):
+        directory = case_root / pattern
+        directory.mkdir(parents=True, exist_ok=True)
+        x, gamma, dy = inputs
+        y, dx, dgamma = _reference(x, gamma, dy, EPSILON)
+        for name, value in {
+            "x.bf16": x,
+            "gamma.bf16": gamma,
+            "dy.bf16": dy,
+            "reference_y.bf16": y,
+            "reference_dx.bf16": dx,
+            "reference_dgamma.bf16": dgamma,
+        }.items():
+            (directory / name).write_bytes(_bf16_bytes(value))
+        result[pattern] = {"input_digests": input_digests, "reference_digests": reference_digests}
+    _verify_policy_cases(case_root)
+    return result
 
 
 def _ordered_bf16(value: np.ndarray) -> np.ndarray:
@@ -370,13 +445,13 @@ def qualification_plan(
     python: str,
     case_root: Path,
 ) -> ValidatedQualificationPlan:
-    """Return the repeated qualification and held-out matrix for the role policy."""
+    """Return the repeated qualification and acceptance matrix for the role policy."""
     _verify_case_directory(case_root)
-    _verify_heldout_case(case_root)
+    _verify_policy_cases(case_root)
     rows, features = REPRESENTATIVE_SHAPE
     runs = []
-    for pattern in (QUALIFICATION_PATTERN, HELDOUT_PATTERN):
-        directory = case_root / (f"{rows}x{features}" if pattern == QUALIFICATION_PATTERN else HELDOUT_PATTERN)
+    for pattern in (QUALIFICATION_PATTERN, HELDOUT_PATTERN, ACCEPTANCE_PATTERN):
+        directory = case_root / (f"{rows}x{features}" if pattern == QUALIFICATION_PATTERN else pattern)
         for boundary in BOUNDARIES:
             for producer in PRODUCERS:
                 prefix = [te_runner] if producer == "transformer_engine_2_17" else [python, xla_runner]
@@ -384,7 +459,11 @@ def qualification_plan(
                     runs.append(
                         {
                             "shape": [rows, features],
-                            "scope": "representative_policy_qualification",
+                            "scope": (
+                                "representative_policy_acceptance"
+                                if pattern == ACCEPTANCE_PATTERN
+                                else "representative_policy_qualification"
+                            ),
                             "input_pattern": pattern,
                             "boundary": boundary,
                             "producer": producer,
@@ -411,7 +490,7 @@ def qualification_plan(
                         }
                     )
     return ValidatedQualificationPlan(
-        schema="shuttle_abi22_rmsnorm_policy_plan_v1",
+        schema="shuttle_abi22_rmsnorm_policy_plan_v2",
         policy=NUMERICAL_POLICY,
         case_root=str(case_root),
         executables={"te": te_runner, "xla": xla_runner, "python": python},
@@ -537,12 +616,48 @@ def _read_bf16_file(path: Path, shape: tuple[int, ...]) -> np.ndarray:
     return value.view(ml_dtypes.bfloat16).reshape(shape)
 
 
-def _error_metrics(actual: np.ndarray, reference: np.ndarray) -> dict[str, float | int]:
+def _json_number(value: float) -> float | str:
+    if math.isfinite(value):
+        return value
+    if math.isnan(value):
+        return "nan"
+    return "inf" if value > 0 else "-inf"
+
+
+def error_metrics(actual: np.ndarray, reference: np.ndarray, *, role: str) -> dict[str, float | int | bool | str]:
+    """Return whole-output and above-floor BF16 error metrics for one role."""
+    if role not in ACCEPTANCE_LIMITS or actual.shape != reference.shape:
+        raise ValueError("error metric role or shape drifted")
+    actual_f32 = actual.astype(np.float32)
+    reference_f32 = reference.astype(np.float32)
+    finite = np.isfinite(actual_f32) & np.isfinite(reference_f32)
+    difference = np.abs(actual_f32 - reference_f32)
+    ulp = np.abs(_ordered_bf16(actual) - _ordered_bf16(reference))
+    raw_index = int(np.argmax(ulp)) if ulp.size else 0
+    floor = float(ACCEPTANCE_LIMITS[role]["absolute_floor"])
+    eligible = finite & (np.abs(reference_f32) >= floor)
+    eligible_count = int(np.count_nonzero(eligible))
+    if eligible_count:
+        relative = difference[eligible] / np.abs(reference_f32[eligible])
+        max_relative = float(np.max(relative))
+        max_masked_ulp = int(np.max(ulp[eligible]))
+    else:
+        max_relative = 0.0
+        max_masked_ulp = 0
     return {
-        "max_absolute_error": float(
-            np.max(np.abs(actual.astype(np.float32) - reference.astype(np.float32)), initial=0.0)
+        "max_absolute_error": _json_number(float(np.max(difference, initial=0.0))),
+        "mean_absolute_error": _json_number(float(np.mean(difference)) if difference.size else 0.0),
+        "max_bfloat16_ulp": int(np.max(ulp, initial=0)),
+        "raw_max_bfloat16_ulp_index": raw_index,
+        "raw_max_bfloat16_ulp_actual": _json_number(float(actual_f32.flat[raw_index]) if actual_f32.size else 0.0),
+        "raw_max_bfloat16_ulp_reference": _json_number(
+            float(reference_f32.flat[raw_index]) if reference_f32.size else 0.0
         ),
-        "max_bfloat16_ulp": int(np.max(np.abs(_ordered_bf16(actual) - _ordered_bf16(reference)), initial=0)),
+        "absolute_floor": floor,
+        "eligible_count": eligible_count,
+        "max_relative_error_above_absolute_floor": _json_number(max_relative),
+        "max_bfloat16_ulp_above_absolute_floor": max_masked_ulp,
+        "all_finite": bool(np.all(finite)),
     }
 
 
@@ -551,6 +666,7 @@ def load_te_raw_cell(
     case_directory: Path,
     *,
     expected_input_digests: Mapping[str, str] | None = None,
+    expected_pattern: str | None = None,
 ) -> dict[str, Any]:
     """Convert one TE runner observation into a validated-report cell."""
     raw = json.loads(path.read_text())
@@ -573,10 +689,13 @@ def load_te_raw_cell(
     boundary = raw["boundary"]
     if shape not in SHAPES or boundary not in BOUNDARIES:
         raise ValueError("raw TE coordinate is outside the matrix")
-    expected_directory = f"{shape[0]}x{shape[1]}" if expected_input_digests is None else HELDOUT_PATTERN
+    expected_directory = f"{shape[0]}x{shape[1]}" if expected_pattern is None else expected_pattern
     if case_directory.name != expected_directory:
         raise ValueError("raw TE case directory does not match its shape")
-    _verify_case_directory(case_directory.parent)
+    if expected_pattern is None:
+        _verify_case_directory(case_directory.parent)
+    else:
+        _verify_policy_cases(case_directory.parent)
     roles = OUTPUT_ROLES[boundary]
     output_files = raw["output_files"]
     if not isinstance(output_files, Mapping) or tuple(sorted(output_files)) != tuple(sorted(roles)):
@@ -591,7 +710,7 @@ def load_te_raw_cell(
                 "role": role,
                 "digest": _sha256_bytes(_bf16_bytes(actual)),
                 "reference_digest": _sha256_bytes(_bf16_bytes(reference)),
-                **_error_metrics(actual, reference),
+                **error_metrics(actual, reference, role=role),
             }
         )
     host = _positive_samples(raw["raw_host_blocking_ns"], "host", permitted_none=False)
@@ -786,15 +905,12 @@ def validate_report(
                 raise ValueError("composed reference provenance drifted")
             absolute = output.get("max_absolute_error")
             ulp = output.get("max_bfloat16_ulp")
+            if output.get("all_finite") is not True:
+                raise ValueError("all_finite must be true")
             if type(absolute) not in (int, float) or not math.isfinite(float(absolute)) or absolute < 0:
                 raise ValueError("max_absolute_error must be nonnegative and finite")
-            limits = ACCEPTANCE_LIMITS[role]
-            if shape == REPRESENTATIVE_SHAPE and float(absolute) > limits["max_absolute_error"]:
-                raise ValueError("max_absolute_error exceeds acceptance limit")
             if type(ulp) is not int or ulp < 0:
                 raise ValueError("max_bfloat16_ulp must be a nonnegative integer")
-            if shape == REPRESENTATIVE_SHAPE and ulp > limits["max_bfloat16_ulp"]:
-                raise ValueError("max_bfloat16_ulp exceeds acceptance limit")
         timing = cell.get("timing")
         if not isinstance(timing, Mapping) or timing.get("warmup_invocations") != WARMUP_INVOCATIONS:
             raise ValueError("timing warmup contract drifted")
@@ -813,11 +929,11 @@ def validate_report(
 
 
 def validate_qualification_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
-    """Validate both repeated representative patterns against the frozen role policy."""
+    """Validate repeated qualification patterns and the untouched acceptance pattern."""
     document = dict(value)
     if set(document) not in ({"schema", "cells"}, {"schema", "policy", "cells"}):
         raise ValueError("qualification evidence fields drifted")
-    if document.get("schema") != "shuttle_abi22_rmsnorm_policy_evidence_v1":
+    if document.get("schema") != "shuttle_abi22_rmsnorm_policy_evidence_v2":
         raise ValueError("qualification evidence schema drifted")
     if "policy" in document and document["policy"] != NUMERICAL_POLICY:
         raise ValueError("qualification numerical policy drifted")
@@ -825,7 +941,7 @@ def validate_qualification_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
     expected_coordinates = [
         (producer, pattern, boundary, repeat)
         for producer in PRODUCERS
-        for pattern in (QUALIFICATION_PATTERN, HELDOUT_PATTERN)
+        for pattern in (QUALIFICATION_PATTERN, HELDOUT_PATTERN, ACCEPTANCE_PATTERN)
         for boundary in BOUNDARIES
         for repeat in range(NUMERICAL_POLICY["repeat_count"])
     ]
@@ -841,15 +957,23 @@ def validate_qualification_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
             or cell.get("boundary") != boundary
             or cell.get("repeat") != repeat
             or tuple(cell.get("shape", ())) != REPRESENTATIVE_SHAPE
-            or cell.get("scope") != "representative_policy_qualification"
+            or cell.get("scope")
+            != (
+                "representative_policy_acceptance"
+                if pattern == ACCEPTANCE_PATTERN
+                else "representative_policy_qualification"
+            )
         ):
             raise ValueError("qualification coordinate drifted")
         if pattern == QUALIFICATION_PATTERN:
             input_digests = INPUT_DIGESTS[REPRESENTATIVE_SHAPE]
             reference_digests = REFERENCE_DIGESTS[REPRESENTATIVE_SHAPE]
-        else:
+        elif pattern == HELDOUT_PATTERN:
             input_digests = HELDOUT_INPUT_DIGESTS
             reference_digests = HELDOUT_REFERENCE_DIGESTS
+        else:
+            input_digests = ACCEPTANCE_INPUT_DIGESTS
+            reference_digests = ACCEPTANCE_REFERENCE_DIGESTS
         if cell.get("input_digests") != {
             role: input_digests[role] for role in (("x", "gamma") if boundary == "forward" else ("x", "gamma", "dy"))
         }:
@@ -865,19 +989,57 @@ def validate_qualification_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
             if _sha(output.get("reference_digest"), "qualification reference digest") != reference_digests[role]:
                 raise ValueError("qualification reference digest drifted")
             absolute = output.get("max_absolute_error")
+            mean_absolute = output.get("mean_absolute_error")
             ulp = output.get("max_bfloat16_ulp")
+            all_finite = output.get("all_finite")
+            if all_finite is not True:
+                raise ValueError("qualification all_finite must be true")
             if type(absolute) not in (int, float) or not math.isfinite(float(absolute)) or absolute < 0:
                 raise ValueError("qualification max_absolute_error must be finite and nonnegative")
+            if type(mean_absolute) not in (int, float) or not math.isfinite(float(mean_absolute)) or mean_absolute < 0:
+                raise ValueError("qualification mean_absolute_error must be finite and nonnegative")
             if type(ulp) is not int or ulp < 0:
                 raise ValueError("qualification max_bfloat16_ulp must be nonnegative")
             limits = ACCEPTANCE_LIMITS[role]
+            floor = output.get("absolute_floor")
+            eligible_count = output.get("eligible_count")
+            relative = output.get("max_relative_error_above_absolute_floor")
+            masked_ulp = output.get("max_bfloat16_ulp_above_absolute_floor")
+            if floor != limits["absolute_floor"]:
+                raise ValueError("qualification absolute_floor drifted")
+            if eligible_count != ELIGIBLE_COUNTS[pattern][role]:
+                raise ValueError("qualification eligible_count drifted")
+            if type(relative) not in (int, float) or not math.isfinite(float(relative)) or relative < 0:
+                raise ValueError("qualification max_relative_error_above_absolute_floor must be finite")
+            if type(masked_ulp) is not int or masked_ulp < 0:
+                raise ValueError("qualification max_bfloat16_ulp_above_absolute_floor must be nonnegative")
+            raw_index = output.get("raw_max_bfloat16_ulp_index")
+            if type(raw_index) is not int or raw_index < 0:
+                raise ValueError("qualification raw_max_bfloat16_ulp_index must be nonnegative")
+            for field in ("raw_max_bfloat16_ulp_actual", "raw_max_bfloat16_ulp_reference"):
+                raw_value = output.get(field)
+                if type(raw_value) not in (int, float) or not math.isfinite(float(raw_value)):
+                    raise ValueError(f"qualification {field} must be finite")
             coordinate = f"{producer}/{pattern}/{boundary}/repeat{repeat}/{role}"
-            if float(absolute) > limits["max_absolute_error"]:
+            if pattern == ACCEPTANCE_PATTERN and float(absolute) > limits["max_absolute_error"]:
                 raise ValueError(
-                    f"{coordinate}: max_absolute_error {absolute} exceeds role limit " f"{limits['max_absolute_error']}"
+                    f"{coordinate}: max_absolute_error {absolute} exceeds role limit {limits['max_absolute_error']}"
                 )
-            if ulp > limits["max_bfloat16_ulp"]:
-                raise ValueError(f"{coordinate}: max_bfloat16_ulp {ulp} exceeds role limit {limits['max_bfloat16_ulp']}")
+            if pattern == ACCEPTANCE_PATTERN and float(mean_absolute) > limits["max_mean_absolute_error"]:
+                raise ValueError(
+                    f"{coordinate}: mean_absolute_error {mean_absolute} exceeds role limit "
+                    f"{limits['max_mean_absolute_error']}"
+                )
+            if pattern == ACCEPTANCE_PATTERN and float(relative) > limits["max_relative_error_above_absolute_floor"]:
+                raise ValueError(
+                    f"{coordinate}: max_relative_error_above_absolute_floor {relative} exceeds role limit "
+                    f"{limits['max_relative_error_above_absolute_floor']}"
+                )
+            if pattern == ACCEPTANCE_PATTERN and masked_ulp > limits["max_bfloat16_ulp_above_absolute_floor"]:
+                raise ValueError(
+                    f"{coordinate}: max_bfloat16_ulp_above_absolute_floor {masked_ulp} exceeds role limit "
+                    f"{limits['max_bfloat16_ulp_above_absolute_floor']}"
+                )
             digests[(producer, pattern, boundary, repeat, role)] = digest
         timing = cell.get("timing")
         if not isinstance(timing, Mapping) or timing.get("warmup_invocations") != WARMUP_INVOCATIONS:
@@ -894,7 +1056,7 @@ def validate_qualification_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
         if (producer == "transformer_engine_2_17") != (cuda is not None):
             raise ValueError("qualification CUDA-event provider contract drifted")
     for producer in PRODUCERS:
-        for pattern in (QUALIFICATION_PATTERN, HELDOUT_PATTERN):
+        for pattern in (QUALIFICATION_PATTERN, HELDOUT_PATTERN, ACCEPTANCE_PATTERN):
             for boundary in BOUNDARIES:
                 for role in OUTPUT_ROLES[boundary]:
                     if (
@@ -903,7 +1065,7 @@ def validate_qualification_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
                     ):
                         raise ValueError("qualification repeat output digest drifted")
     return {
-        "schema": "shuttle_abi22_rmsnorm_policy_evidence_v1",
+        "schema": "shuttle_abi22_rmsnorm_policy_evidence_v2",
         "policy": NUMERICAL_POLICY,
         "cells": [dict(cell) for cell in cells],
     }
@@ -945,11 +1107,21 @@ def build_matched_acceptance(
         ratios[boundary] = te_cell["timing"]["median_host_blocking_ns"] / xla_cell["timing"]["median_host_blocking_ns"]
     return {
         "schema": "shuttle_abi22_te_xla_rmsnorm_acceptance_v2",
-        "status": "representative_numerics_accepted",
+        "status": "heldout_splitmix64_numerics_accepted",
+        "accepted_input_pattern": ACCEPTANCE_PATTERN,
         "accepted_shape": list(REPRESENTATIVE_SHAPE),
         "accepted_boundaries": list(BOUNDARIES),
         "excluded_architecture_fixture_shape": list(ARCHITECTURE_SHAPE),
         "numerical_policy": NUMERICAL_POLICY,
+        "metric_scope": {
+            "whole_output": ["all_finite", "max_absolute_error", "mean_absolute_error"],
+            "above_absolute_floor": [
+                "eligible_count_nonzero",
+                "max_relative_error",
+                "max_bfloat16_ulp",
+            ],
+            "raw_global_bfloat16_ulp": "diagnostic_only",
+        },
         "qualification": qualified,
         "performance": {
             "status": "reported_without_threshold",

@@ -25,6 +25,7 @@ from abi22_te_rmsnorm_oracle_v2 import (
     OUTPUT_ROLES,
     SHAPES,
     WARMUP_INVOCATIONS,
+    error_metrics,
 )
 from jaxlib import version as jaxlib_version
 
@@ -61,20 +62,6 @@ def _read_bf16(path: Path, shape: tuple[int, ...]) -> np.ndarray:
 
 def _digest(value: np.ndarray) -> str:
     return hashlib.sha256(value.view(np.uint16).tobytes(order="C")).hexdigest()
-
-
-def _ordered_bf16(value: np.ndarray) -> np.ndarray:
-    bits = value.view(np.uint16).astype(np.int32)
-    return np.where((bits & 0x8000) != 0, 0x7FFF - (bits & 0x7FFF), 0x8000 + bits)
-
-
-def _metrics(actual: np.ndarray, reference: np.ndarray) -> dict[str, float | int]:
-    return {
-        "max_absolute_error": float(
-            np.max(np.abs(actual.astype(np.float32) - reference.astype(np.float32)), initial=0.0)
-        ),
-        "max_bfloat16_ulp": int(np.max(np.abs(_ordered_bf16(actual) - _ordered_bf16(reference)), initial=0)),
-    }
 
 
 def _rmsnorm(x: jax.Array, gamma: jax.Array) -> jax.Array:
@@ -147,7 +134,7 @@ def run_cell(boundary: str, shape: tuple[int, int], case_directory: Path) -> dic
                 "role": role,
                 "digest": _digest(actual),
                 "reference_digest": _digest(reference),
-                **_metrics(actual, reference),
+                **error_metrics(actual, reference, role=role),
             }
         )
     return {
