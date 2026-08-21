@@ -139,6 +139,8 @@ class Track2TeH100PolicyV3Test(unittest.TestCase):
         stdout = io.StringIO()
         execute_oracle_v3 = getattr(batch, "execute_oracle_v3", None)
         self.assertTrue(callable(execute_oracle_v3), "versioned v3 worker API is missing")
+        repeat_output_diagnostics_v3 = getattr(oracle, "repeat_output_diagnostics_v3", None)
+        self.assertTrue(callable(repeat_output_diagnostics_v3), "versioned repeat diagnostic API is missing")
 
         with contextlib.redirect_stdout(stdout), self.assertRaisesRegex(ValueError, "repeat"):
             execute_oracle_v3(paths=paths, device=DEVICE, invoke=lambda argv: _fake_invoke(paths, calls, argv))
@@ -204,6 +206,7 @@ class Track2TeH100PolicyV3Test(unittest.TestCase):
             boundary = item["boundary"]
             role = item["role"]
             expected_files = []
+            output_shape = oracle.REPRESENTATIVE_SHAPE if role != "dgamma" else (oracle.REPRESENTATIVE_SHAPE[1],)
             for repeat in range(2):
                 raw_cell = json.loads(
                     (paths.raw / f"policy-{producer}-{pattern}-{boundary}-repeat{repeat}.json").read_text()
@@ -216,6 +219,21 @@ class Track2TeH100PolicyV3Test(unittest.TestCase):
             self.assertTrue(all(Path(path).is_file() for path in expected_files))
             if producer == "ordinary_jax_xla":
                 self.assertNotEqual(expected_files[0], expected_files[1])
+            repeat_values = [
+                np.fromfile(path, dtype=np.uint16).view(ml_dtypes.bfloat16).reshape(output_shape)
+                for path in expected_files
+            ]
+            expected_item = {
+                "producer": producer,
+                "input_pattern": pattern,
+                "boundary": boundary,
+                "role": role,
+                "repeat0_digest": _digest(Path(expected_files[0])),
+                "repeat1_digest": _digest(Path(expected_files[1])),
+                **repeat_output_diagnostics_v3(*repeat_values),
+                "raw_output_files": expected_files,
+            }
+            self.assertEqual(item, expected_item)
             if (producer, pattern, boundary, role) != (
                 "ordinary_jax_xla",
                 ACCEPTANCE_PATTERN,

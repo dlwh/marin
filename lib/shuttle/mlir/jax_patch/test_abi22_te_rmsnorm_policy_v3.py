@@ -387,6 +387,47 @@ class TeRmsnormPolicyV3Test(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "partition|whole|max_absolute"):
                     validate(corrupted)
 
+        structural_cells = [(index, cell) for index, cell in enumerate(validated["cells"]) if cell["repeat"] == 0]
+        for index, cell in structural_cells:
+            for output_index, output in enumerate(cell["outputs"]):
+                coordinate = f"{cell['producer']}/{cell['input_pattern']}/{cell['boundary']}/{output['role']}"
+                count_swap = copy.deepcopy(validated)
+                count_output = count_swap["cells"][index]["outputs"][output_index]
+                count_output["below_floor_count"] += 1
+                count_output["eligible_count"] -= 1
+                with self.assertRaisesRegex(ValueError, "count", msg=coordinate):
+                    validate(count_swap)
+
+                for field in (
+                    "max_absolute_error",
+                    "mean_absolute_error",
+                    "max_absolute_error_below_floor",
+                    "max_absolute_error_above_floor",
+                    "max_relative_error_above_absolute_floor",
+                ):
+                    nonfinite = copy.deepcopy(validated)
+                    nonfinite["cells"][index]["outputs"][output_index][field] = float("nan")
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "finite|absolute|relative",
+                        msg=f"{coordinate}/{field}",
+                    ):
+                        validate(nonfinite)
+
+                false_finite = copy.deepcopy(validated)
+                false_finite["cells"][index]["outputs"][output_index]["all_finite"] = False
+                with self.assertRaisesRegex(ValueError, "finite", msg=coordinate):
+                    validate(false_finite)
+
+                inconsistent_whole = copy.deepcopy(validated)
+                inconsistent_whole["cells"][index]["outputs"][output_index]["max_absolute_error"] = 0.125
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "partition|whole|max_absolute",
+                    msg=coordinate,
+                ):
+                    validate(inconsistent_whole)
+
         repeated = copy.deepcopy(validated)
         repeat_coordinates = [
             (producer, pattern, boundary, role)
