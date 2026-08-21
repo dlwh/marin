@@ -5,6 +5,7 @@
 
 import hashlib
 import json
+import statistics
 import zipfile
 from pathlib import Path
 
@@ -200,7 +201,7 @@ def _valid_cell(shape: tuple[int, int], boundary: str, *, te: bool) -> dict:
         "timing": {
             "warmup_invocations": 10,
             "raw_host_blocking_ns": samples,
-            "median_host_blocking_ns": sorted(samples)[9] + 500,
+            "median_host_blocking_ns": statistics.median(samples),
             "raw_cuda_event_ns": [50_000 + index * 100 for index in range(20)] if te else None,
         },
     }
@@ -238,7 +239,7 @@ def _fake_oracle_invoke(paths: BatchPaths, calls: list[list[str]], argv: list[st
 
 
 def test_execute_oracle_runs_exact_matrix_and_builds_matched_acceptance(tmp_path: Path) -> None:
-    paths = BatchPaths.under(tmp_path)
+    paths = BatchPaths.under(tmp_path / "workspace")
     paths.workspace.mkdir()
     paths.reports.mkdir()
     paths.raw.mkdir()
@@ -269,7 +270,7 @@ def test_execute_oracle_runs_exact_matrix_and_builds_matched_acceptance(tmp_path
 
 
 def test_execute_oracle_stops_on_first_failed_producer(tmp_path: Path) -> None:
-    paths = BatchPaths.under(tmp_path)
+    paths = BatchPaths.under(tmp_path / "workspace")
     paths.workspace.mkdir()
     paths.reports.mkdir()
     paths.raw.mkdir()
@@ -352,7 +353,7 @@ def test_execute_batch_drives_validated_oracle_and_writes_closed_result(
 
 
 def test_oracle_subprocess_uses_resolved_te_library_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    paths = BatchPaths.under(tmp_path)
+    paths = BatchPaths.under(tmp_path / "workspace")
     paths.workspace.mkdir()
     paths.te_library.parent.mkdir(parents=True)
     paths.te_library.write_bytes(b"resolved-te-library")
