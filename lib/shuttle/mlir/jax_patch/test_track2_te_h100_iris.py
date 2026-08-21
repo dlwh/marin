@@ -107,7 +107,7 @@ def test_v3_request_selects_only_the_versioned_batch_entrypoint() -> None:
     assert list(self_checked.entrypoint.run_command.argv)[-1] == "--execute-v3"
     assert list(v1_request.entrypoint.run_command.argv)[-1] == "--execute"
     normalized = deepcopy(self_checked)
-    normalized.entrypoint.CopyFrom(v1_request.entrypoint)
+    normalized.entrypoint.run_command.argv[-1] = "--execute"
     assert normalized.SerializeToString(deterministic=True) == v1_request.SerializeToString(deterministic=True)
     with pytest.raises(ValueError, match="entrypoint"):
         decode_launch_request(raw, run=11)
