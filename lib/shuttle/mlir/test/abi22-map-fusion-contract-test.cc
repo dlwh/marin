@@ -210,6 +210,8 @@ struct PtxDataflow {
 PtxDataflow ptxDataflow(llvm::StringRef ptx);
 std::set<std::string> ptxDependencyClosure(const PtxDataflow &flow,
                                            llvm::StringRef root);
+const PtxDataflow::Definition *ptxDefinition(const PtxDataflow &flow,
+                                             llvm::StringRef value);
 
 std::vector<std::string> ptxTokens(llvm::StringRef text) {
   std::vector<std::string> tokens;
@@ -233,7 +235,7 @@ std::vector<std::string> ptxTokens(llvm::StringRef text) {
   return tokens;
 }
 
-bool hasDisjointContiguousFoldLoop(llvm::StringRef ptx,
+bool hasDisjointContiguousFoldLoop(llvm::StringRef ptx, int64_t outputExtent,
                                    int64_t reductionExtent,
                                    int64_t serialTiles) {
   llvm::SmallVector<llvm::StringRef> lines;
@@ -260,7 +262,26 @@ bool hasDisjointContiguousFoldLoop(llvm::StringRef ptx,
         laneTokens[1] != "%tid")
       continue;
     llvm::StringRef lane = laneTokens[0];
-    for (size_t startLine = laneLine + 1; startLine < lines.size();
+    if (laneLine + 4 >= lines.size())
+      continue;
+    std::vector<std::string> rowTokens = ptxTokens(lines[laneLine + 1]);
+    if (!lines[laneLine + 1].starts_with("mov.u32 ") ||
+        !lines[laneLine + 1].ends_with(", %ctaid.x;") ||
+        rowTokens.size() != 2 || rowTokens[1] != "%ctaid")
+      continue;
+    llvm::StringRef row = rowTokens[0];
+    std::vector<std::string> guardTokens = ptxTokens(lines[laneLine + 2]);
+    if (guardTokens.size() != 2 || guardTokens[1] != row ||
+        lines[laneLine + 2] !=
+            (llvm::Twine("setp.ge.u32 ") + guardTokens[0] + ", " + row + ", " +
+             llvm::Twine(outputExtent) + ";")
+                .str())
+      continue;
+    llvm::StringRef outputGuard = guardTokens[0];
+    if (lines[laneLine + 3] !=
+        (llvm::Twine("@") + outputGuard + " bra $done;").str())
+      continue;
+    for (size_t startLine = laneLine + 4; startLine < lines.size();
          ++startLine) {
       if (lines[startLine].starts_with("bra ") || lines[startLine] == "ret;" ||
           lines[startLine].contains(" ret;") || lines[startLine] == "exit;" ||
@@ -314,6 +335,18 @@ bool hasDisjointContiguousFoldLoop(llvm::StringRef ptx,
       }
       if (accumulator.empty())
         return false;
+      PtxDataflow preheaderFlow = ptxDataflow(
+          llvm::join(llvm::ArrayRef(lines).take_front(loopLine), "\n"));
+      auto reachingAccumulator = preheaderFlow.currentValues.find(accumulator);
+      if (reachingAccumulator == preheaderFlow.currentValues.end())
+        return false;
+      const PtxDataflow::Definition *accumulatorDefinition =
+          ptxDefinition(preheaderFlow, reachingAccumulator->second);
+      if (!accumulatorDefinition ||
+          accumulatorDefinition->opcode != "mov.f32" ||
+          accumulatorDefinition->operands !=
+              std::vector<std::string>{"0f00000000"})
+        return false;
       llvm::StringRef loop = lines[loopLine].drop_back();
       std::vector<std::string> predicateTokens =
           ptxTokens(lines[loopLine + 1]);
@@ -334,20 +367,6 @@ bool hasDisjointContiguousFoldLoop(llvm::StringRef ptx,
           (llvm::Twine("add.u32 ") + start + ", " + start + ", 1;").str();
       const std::string backedge = (llvm::Twine("bra ") + loop + ";").str();
       const std::string exitLabel = (llvm::Twine(exit) + ":").str();
-      PtxDataflow flow = ptxDataflow(ptx);
-      std::set<std::string> indexedLeafLoads;
-      for (const auto &[indexValue, definition] : flow.definitions) {
-        if (definition.opcode != "cvt.u64.u32" || definition.operands.empty() ||
-            !llvm::StringRef(definition.operands.front())
-                 .starts_with((llvm::Twine(start) + "@").str()))
-          continue;
-        for (const auto &[loadValue, load] : flow.definitions) {
-          if (llvm::StringRef(load.opcode).starts_with("ld.global.") &&
-              ptxDependencyClosure(flow, loadValue).count(indexValue))
-            indexedLeafLoads.insert(loadValue);
-        }
-      }
-      bool sawLeafLoad = false;
       bool accumulatedIndexedLeaf = false;
       for (size_t line = loopLine + 3; line + 2 < lines.size(); ++line) {
         if (lines[line] == exitLabel || lines[line].starts_with("bra ") ||
@@ -357,7 +376,6 @@ bool hasDisjointContiguousFoldLoop(llvm::StringRef ptx,
             defines(lines[line], end) ||
             (defines(lines[line], start) && lines[line] != increment))
           return false;
-        sawLeafLoad |= lines[line].starts_with("ld.global.");
         std::vector<std::string> tokens = ptxTokens(lines[line]);
         if (lines[line].starts_with("add.rn.f32 ") && tokens.size() == 3 &&
             (tokens[1] == accumulator || tokens[2] == accumulator)) {
@@ -368,16 +386,22 @@ bool hasDisjointContiguousFoldLoop(llvm::StringRef ptx,
                   .str();
           if (lines[line + 1] != update)
             return false;
-          PtxDataflow reachingFlow = ptxDataflow(
-              llvm::join(llvm::ArrayRef(lines).take_front(line), "\n"));
-          auto reachingLeaf = reachingFlow.currentValues.find(leaf.str());
-          if (reachingLeaf != reachingFlow.currentValues.end()) {
+          PtxDataflow bodyFlow = ptxDataflow(llvm::join(
+              llvm::ArrayRef(lines).slice(loopLine + 3, line - loopLine - 3),
+              "\n"));
+          auto reachingLeaf = bodyFlow.currentValues.find(leaf.str());
+          if (reachingLeaf != bodyFlow.currentValues.end()) {
             std::set<std::string> closure =
-                ptxDependencyClosure(reachingFlow, reachingLeaf->second);
-            accumulatedIndexedLeaf |=
-                llvm::any_of(indexedLeafLoads, [&](const std::string &load) {
-                  return closure.count(load);
-                });
+                ptxDependencyClosure(bodyFlow, reachingLeaf->second);
+            for (const auto &[loadValue, load] : bodyFlow.definitions) {
+              if (!closure.count(loadValue) ||
+                  !llvm::StringRef(load.opcode).starts_with("ld.global."))
+                continue;
+              std::set<std::string> loadClosure =
+                  ptxDependencyClosure(bodyFlow, loadValue);
+              accumulatedIndexedLeaf |= loadClosure.count(start.str()) &&
+                                        loadClosure.count("$op:cvt.u64.u32");
+            }
           }
           ++line;
           continue;
@@ -385,8 +409,8 @@ bool hasDisjointContiguousFoldLoop(llvm::StringRef ptx,
         if (defines(lines[line], accumulator))
           return false;
         if (lines[line] == increment)
-          return sawLeafLoad && accumulatedIndexedLeaf &&
-                 lines[line + 1] == backedge && lines[line + 2] == exitLabel;
+          return accumulatedIndexedLeaf && lines[line + 1] == backedge &&
+                 lines[line + 2] == exitLabel;
       }
       return false;
     }
@@ -1771,6 +1795,9 @@ TEST(Abi22MapFusionContract,
 
   constexpr llvm::StringLiteral correctFoldLoop = R"ptx(
   mov.u32 %r0, %tid.x;
+  mov.u32 %r1, %ctaid.x;
+  setp.ge.u32 %p0, %r1, 3;
+  @%p0 bra $done;
   mul.lo.u32 %r4, %r0, 2;
   add.u32 %r7, %r4, 2;
   min.u32 %r7, %r7, 330;
@@ -1785,9 +1812,13 @@ $load:
   add.u32 %r4, %r4, 1;
   bra $load;
 $loaded:
+$done:
 )ptx";
   constexpr llvm::StringLiteral renamedFoldLoop = R"ptx(
   mov.u32 %r31, %tid.x;
+  mov.u32 %r29, %ctaid.x;
+  setp.ge.u32 %p3, %r29, 3;
+  @%p3 bra $done;
   mul.lo.u32 %r18, %r31, 2;
   add.u32 %r22, %r18, 2;
   min.u32 %r22, %r22, 330;
@@ -1802,9 +1833,10 @@ $again:
   add.u32 %r18, %r18, 1;
   bra $again;
 $finished:
+$done:
 )ptx";
-  EXPECT_TRUE(hasDisjointContiguousFoldLoop(correctFoldLoop, 330, 2));
-  EXPECT_TRUE(hasDisjointContiguousFoldLoop(renamedFoldLoop, 330, 2));
+  EXPECT_TRUE(hasDisjointContiguousFoldLoop(correctFoldLoop, 3, 330, 2));
+  EXPECT_TRUE(hasDisjointContiguousFoldLoop(renamedFoldLoop, 3, 330, 2));
   for (std::string mutation : {
            replace(correctFoldLoop, "@%p1 bra $loaded;", "nop;"),
            replace(correctFoldLoop, "add.u32 %r4, %r4, 1;",
@@ -1833,6 +1865,18 @@ $finished:
            replace(correctFoldLoop, "mov.f32 %f0, 0f00000000;", "exit;"),
            replace(correctFoldLoop, "cvt.u64.u32 %rd0, %r4;",
                    "cvt.u64.u32 %rd0, %r7;"),
+           replace(correctFoldLoop, "mov.f32 %f0, 0f00000000;",
+                   "mov.f32 %f0, 0f00000000;\n  mov.f32 %f0, 0f3F800000;"),
+           replace(replace(correctFoldLoop, "cvt.u64.u32 %rd0, %r4;", "nop;"),
+                   "mov.f32 %f0, 0f00000000;",
+                   "cvt.u64.u32 %rd0, %r4;\n  mov.f32 %f0, "
+                   "0f00000000;"),
+           replace(correctFoldLoop, "@%p0 bra $done;", "bra $done;"),
+           replace(correctFoldLoop, "setp.ge.u32 %p0, %r1, 3;",
+                   "setp.lt.u32 %p0, %r1, 3;"),
+           replace(correctFoldLoop, "setp.ge.u32 %p0, %r1, 3;",
+                   "setp.ge.u32 %p0, %r1, 0;"),
+           replace(correctFoldLoop, "@%p0 bra $done;", "@%p0 bra $loaded;"),
            replace(correctFoldLoop, "mul.lo.u32 %r4, %r0, 2;",
                    "bra $loaded;\n  mul.lo.u32 %r4, %r0, 2;"),
            replace(correctFoldLoop, "mul.lo.u32 %r4, %r0, 2;",
@@ -1842,7 +1886,7 @@ $finished:
            replace(correctFoldLoop, "add.rn.f32 %f2, %f0, %f1;",
                    "mov.f32 %f1, 0f00000000;\n  add.rn.f32 %f2, %f0, %f1;"),
        })
-    EXPECT_FALSE(hasDisjointContiguousFoldLoop(mutation, 330, 2));
+    EXPECT_FALSE(hasDisjointContiguousFoldLoop(mutation, 3, 330, 2));
 }
 
 TEST(Abi22MapFusionContract,
@@ -2209,6 +2253,11 @@ TEST(Abi22MapFusionContract,
             firstPhase.get("domain_shape"));
         auto reduction = mlir::cast<mlir::DenseI64ArrayAttr>(
             firstPhase.get("reduction_dimensions"));
+        auto primaryFold = mlir::cast<mlir::shuttle::FoldOp>(
+            algebraOperations.lookup(firstPhase.get("source")));
+        const int64_t outputExtent =
+            staticElementCount(mlir::cast<mlir::RankedTensorType>(
+                primaryFold.getResult(0).getType()));
         int64_t reductionExtent = 1;
         for (int64_t axis : reduction.asArrayRef())
           reductionExtent *= domain.asArrayRef()[axis];
@@ -2222,7 +2271,7 @@ TEST(Abi22MapFusionContract,
         const int64_t serialTiles =
             (reductionExtent + reductionTile - 1) / reductionTile;
         EXPECT_TRUE(hasDisjointContiguousFoldLoop(
-            ptx, reductionExtent, serialTiles));
+            ptx, outputExtent, reductionExtent, serialTiles));
         EXPECT_NE(ptx.find("ld.global.u16"), llvm::StringRef::npos);
         EXPECT_NE(ptx.find("cvt.f32.bf16"), llvm::StringRef::npos);
         EXPECT_NE(ptx.find("add.rn.f32"), llvm::StringRef::npos);
