@@ -1,0 +1,15 @@
+{
+  "authorization_sha256": "67d4352b187e8d149bc49f3ffe6701815c4327ed8cd9712c64c360dc1d054e30",
+  "bundle_sha256": "44dab7b08a79c0314c78dd9cae62c3ee66cb1504af1cf48ea87986e16c5d81f4",
+  "cluster": "cw-rno2a",
+  "config": "lib/iris/config/cw-rno2a.yaml",
+  "job_id": "/dlwh/shuttle-track1-rmsnorm-h100-canary-r3",
+  "last_check_ms": 1787325280000,
+  "request_path": "/private/tmp/shuttle-rmsnorm-r3-reviewed-request.s4fgMt/launch.pb",
+  "request_sha256": "1473f85738b6765559adf4158505eb3a3c5a3c55f13aa4c7df056703291e0eef",
+  "restart_count": 0,
+  "result_sha256": "4bd11ab0c6c89faa0a4ed2c2bf0063734f5cb56fcfadadf9ecd2c9e2ce0f38cb",
+  "result_size": 38152,
+  "resubmit_command": "forbidden_without_review",
+  "status": "SUCCEEDED"
+}

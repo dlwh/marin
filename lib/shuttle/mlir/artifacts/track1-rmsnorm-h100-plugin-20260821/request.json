@@ -1,0 +1,10 @@
+{
+  "bundle_sha256": "44dab7b08a79c0314c78dd9cae62c3ee66cb1504af1cf48ea87986e16c5d81f4",
+  "bundle_size": 6372341,
+  "external_request_bytes_preserved": false,
+  "job_id": "/dlwh/shuttle-track1-rmsnorm-h100-canary-r3",
+  "request_sha256": "1473f85738b6765559adf4158505eb3a3c5a3c55f13aa4c7df056703291e0eef",
+  "request_size": 6373340,
+  "schema": "track1_rmsnorm_h100_request_identity",
+  "schema_version": 1
+}
