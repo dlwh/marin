@@ -78,9 +78,12 @@ mandatory.
 
 Disabled JAX is diagnostic-only and cannot reject the v2 campaign. The matrix
 runs all six primal coordinates before any composed coordinate, so the
-normative 1-launch and 2-launch special plans emit durable per-cell evidence
-even if a later composed coordinate fails. The compiler, planner, emitter, and
-runtime are unchanged.
+normative 1-launch and 2-launch special plans complete first. The worker then
+fsyncs one bounded canonical checkpoint containing all six primal result and
+oracle identities, metrics, repeat status, and observer topology. If composed
+work later fails, the prototype validates that checkpoint and places it last in
+the surfaced error, after the bounded phase-log tail. The compiler, planner,
+emitter, and runtime are unchanged.
 
 ## Future work
 
