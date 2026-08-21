@@ -4362,12 +4362,14 @@ FailureOr<int64_t> checkedShapeElements(ArrayRef<int64_t> shape) {
   return elements;
 }
 
-FailureOr<DerivedPlan> deriveNormContractPlan(RegionOp region) {
-  SmallVector<Operation *> algebra;
+FailureOr<DerivedPlan> deriveNormContractSubplan(RegionOp region,
+                                                 ArrayRef<Operation *> algebra,
+                                                 Value yieldedValue) {
   SmallVector<FoldOp> folds;
   SmallVector<ContractOp> contracts;
   SmallVector<MapOp> reciprocalMaps;
-  for (Operation &operation : region.getBody().front().without_terminator()) {
+  for (Operation *candidate : algebra) {
+    Operation &operation = *candidate;
     if (auto map = dyn_cast<MapOp>(operation)) {
       if (!isClosedFoldRegionMap(map))
         return failure();
@@ -4384,18 +4386,14 @@ FailureOr<DerivedPlan> deriveNormContractPlan(RegionOp region) {
     } else {
       return failure();
     }
-    algebra.push_back(&operation);
   }
-  auto yield = dyn_cast<YieldOp>(region.getBody().front().getTerminator());
-  if (folds.size() != 1 || contracts.size() != 1 ||
-      reciprocalMaps.size() != 1 || !yield || yield.getValues().size() != 1 ||
-      region.getBody().front().getNumArguments() != 3)
+  if (folds.size() != 1 || contracts.size() != 1 || reciprocalMaps.size() != 1)
     return failure();
   FoldOp fold = folds.front();
   ContractOp contract = contracts.front();
   MapOp reciprocal = reciprocalMaps.front();
   MapOp boundary = contract.getInputs().front().getDefiningOp<MapOp>();
-  MapOp epilogue = yield.getValues().front().getDefiningOp<MapOp>();
+  MapOp epilogue = yieldedValue.getDefiningOp<MapOp>();
   if (!isClosedAdditivePlanningFold(fold) ||
       !hasExactPositiveZeroInitializer(fold) || fold.getNumResults() != 1 ||
       !isClosedProjectedContract(contract) || !boundary || !epilogue ||
@@ -4482,16 +4480,14 @@ FailureOr<DerivedPlan> deriveNormContractPlan(RegionOp region) {
     return success();
   };
   llvm::SmallDenseSet<Operation *> allSources;
-  if (failed(
-          collect(yield.getValues().front(), nullptr, allSources, collect)) ||
+  if (failed(collect(yieldedValue, nullptr, allSources, collect)) ||
       allSources.size() != algebra.size())
     return failure();
   llvm::SmallDenseSet<Operation *> foldSources;
   if (failed(collect(reciprocal.getResult(0), nullptr, foldSources, collect)))
     return failure();
   llvm::SmallDenseSet<Operation *> contractSources;
-  if (failed(collect(yield.getValues().front(), reciprocal, contractSources,
-                     collect)))
+  if (failed(collect(yieldedValue, reciprocal, contractSources, collect)))
     return failure();
   llvm::SmallDenseSet<Operation *> covered(foldSources);
   covered.insert(contractSources.begin(), contractSources.end());
@@ -4531,11 +4527,21 @@ FailureOr<DerivedPlan> deriveNormContractPlan(RegionOp region) {
     return failure();
   Value weightValue = *llvm::find_if(
       boundaryExternal, [&](Value value) { return value != activationValue; });
+  auto activationArgument = dyn_cast<BlockArgument>(activationValue);
+  auto weightArgument = dyn_cast<BlockArgument>(weightValue);
+  auto projectionArgument = dyn_cast<BlockArgument>(projectionValue);
   auto activationBoundary =
       dyn_cast<RankedTensorType>(activationValue.getType());
   auto weightBoundary = dyn_cast<RankedTensorType>(weightValue.getType());
-  if (!activationBoundary || !weightBoundary ||
-      activationBoundary != activation || weightBoundary.getRank() != 1 ||
+  if (!activationArgument || !weightArgument || !projectionArgument ||
+      activationArgument.getOwner() != &region.getBody().front() ||
+      weightArgument.getOwner() != &region.getBody().front() ||
+      projectionArgument.getOwner() != &region.getBody().front() ||
+      activationArgument == weightArgument ||
+      activationArgument == projectionArgument ||
+      weightArgument == projectionArgument || !activationBoundary ||
+      !weightBoundary || activationBoundary != activation ||
+      weightBoundary.getRank() != 1 ||
       weightBoundary.getDimSize(0) != activation.getShape().back() ||
       !weightBoundary.getElementType().isBF16())
     return failure();
@@ -4584,7 +4590,7 @@ FailureOr<DerivedPlan> deriveNormContractPlan(RegionOp region) {
   plan.hasContract = true;
   plan.hasContractRegion = true;
   llvm::SmallDenseMap<Value, int64_t> bufferForValue;
-  for (BlockArgument argument : region.getBody().front().getArguments()) {
+  for (Value argument : {activationValue, weightValue, projectionValue}) {
     bufferForValue.try_emplace(argument, plan.buffers.size());
     plan.buffers.push_back({argument, std::nullopt, {}, false});
   }
@@ -4595,11 +4601,9 @@ FailureOr<DerivedPlan> deriveNormContractPlan(RegionOp region) {
     plan.buffers.push_back({reciprocal.getResult(0), int64_t{0}, {}, false});
   }
   int64_t outputBuffer = plan.buffers.size();
-  bufferForValue.try_emplace(yield.getValues().front(), outputBuffer);
-  plan.buffers.push_back({yield.getValues().front(),
-                          inlineFold ? int64_t{0} : int64_t{1},
-                          {},
-                          true});
+  bufferForValue.try_emplace(yieldedValue, outputBuffer);
+  plan.buffers.push_back(
+      {yieldedValue, inlineFold ? int64_t{0} : int64_t{1}, {}, true});
 
   auto boundaryValues = [&](ArrayRef<Operation *> sources,
                             Operation *materializedStop) {
@@ -4735,6 +4739,16 @@ FailureOr<DerivedPlan> deriveNormContractPlan(RegionOp region) {
       plan.buffers[input].consumers.push_back(taskOrdinal);
   }
   return plan;
+}
+
+FailureOr<DerivedPlan> deriveNormContractPlan(RegionOp region) {
+  SmallVector<Operation *> algebra;
+  for (Operation &operation : region.getBody().front().without_terminator())
+    algebra.push_back(&operation);
+  auto yield = dyn_cast<YieldOp>(region.getBody().front().getTerminator());
+  if (!yield || yield.getValues().size() != 1)
+    return failure();
+  return deriveNormContractSubplan(region, algebra, yield.getValues().front());
 }
 
 FailureOr<DerivedPlan> deriveFoldRegionPlan(RegionOp region) {
@@ -5524,6 +5538,298 @@ FailureOr<DerivedPlan> fuseEligibleMapTasks(RegionOp region,
   return fused;
 }
 
+FailureOr<DerivedPlan> deriveHybridNormContractPlan(RegionOp region,
+                                                    DerivedPlan generic) {
+  SmallVector<Operation *> algebra;
+  for (Operation &operation : region.getBody().front().without_terminator())
+    algebra.push_back(&operation);
+  auto regionYield =
+      dyn_cast<YieldOp>(region.getBody().front().getTerminator());
+  if (!regionYield || regionYield.getValues().size() < 2)
+    return failure();
+
+  std::optional<DerivedPlan> specialized;
+  SmallVector<Operation *> specializedSources;
+  Value specializedOutput;
+  for (Value yielded : regionYield.getValues()) {
+    llvm::SmallDenseSet<Operation *> closure;
+    SmallVector<Value> worklist{yielded};
+    bool closed = true;
+    while (!worklist.empty() && closed) {
+      Operation *producer = worklist.pop_back_val().getDefiningOp();
+      if (!producer)
+        continue;
+      if (producer->getParentOfType<RegionOp>() != region ||
+          !isa<MapOp, FoldOp, ContractOp>(producer)) {
+        closed = false;
+        break;
+      }
+      if (closure.insert(producer).second)
+        llvm::append_range(worklist, producer->getOperands());
+    }
+    if (!closed)
+      continue;
+    SmallVector<Operation *> ordered;
+    llvm::copy_if(
+        algebra, std::back_inserter(ordered),
+        [&](Operation *operation) { return closure.contains(operation); });
+    if (ordered.size() != closure.size())
+      continue;
+    FailureOr<DerivedPlan> candidate =
+        deriveNormContractSubplan(region, ordered, yielded);
+    if (failed(candidate))
+      continue;
+    if (specialized)
+      return failure();
+    specialized = std::move(*candidate);
+    specializedSources = std::move(ordered);
+    specializedOutput = yielded;
+  }
+  if (!specialized)
+    return failure();
+
+  auto specializedContractIt =
+      llvm::find_if(specialized->tasks, [](PlannedTask &task) {
+        return !task.contractRegionSources.empty();
+      });
+  if (specializedContractIt == specialized->tasks.end())
+    return failure();
+  PlannedTask *specializedContract = &*specializedContractIt;
+  if (!specializedContract->contractRegionBf16Boundary ||
+      !specializedContract->contractRegionContract ||
+      specializedContract->contractRegionEpilogueSources.size() != 1)
+    return failure();
+  Value normalized =
+      cast<MapOp>(specializedContract->contractRegionBf16Boundary).getResult(0);
+  Value contractIntermediate =
+      cast<ContractOp>(specializedContract->contractRegionContract)
+          .getResult(0);
+  Operation *epilogue = specializedContract->contractRegionEpilogueSources[0];
+
+  auto taskSources = [](const PlannedTask &task) {
+    SmallVector<Operation *> sources;
+    if (!task.contractRegionSources.empty()) {
+      llvm::append_range(sources, task.contractRegionSources);
+    } else if (!task.foldRegionSources.empty()) {
+      llvm::append_range(sources, task.foldRegionSources);
+    } else if (task.fusedFold) {
+      sources.push_back(task.fusedFold);
+      llvm::append_range(sources, task.fusedOperations);
+    } else if (!task.fusedOperations.empty()) {
+      llvm::append_range(sources, task.fusedOperations);
+    } else {
+      sources.push_back(task.operation);
+    }
+    return sources;
+  };
+  auto singletonTask = [&](Operation *operation) -> std::optional<int64_t> {
+    std::optional<int64_t> found;
+    for (auto [ordinal, task] : llvm::enumerate(generic.tasks)) {
+      SmallVector<Operation *> sources = taskSources(task);
+      if (sources.size() != 1 || sources.front() != operation)
+        continue;
+      if (found)
+        return std::nullopt;
+      found = ordinal;
+    }
+    return found;
+  };
+  std::optional<int64_t> boundaryTask =
+      singletonTask(specializedContract->contractRegionBf16Boundary);
+  std::optional<int64_t> contractTask =
+      singletonTask(specializedContract->contractRegionContract);
+  std::optional<int64_t> epilogueTask = singletonTask(epilogue);
+  if (!boundaryTask || !contractTask || !epilogueTask ||
+      !(*boundaryTask < *contractTask && *contractTask < *epilogueTask))
+    return failure();
+
+  DerivedPlan hybrid;
+  hybrid.hasContract = generic.hasContract;
+  hybrid.hasRankNFold = generic.hasRankNFold;
+  hybrid.hasContractRegion = true;
+  hybrid.hasFoldRegion =
+      llvm::any_of(specialized->tasks, [](const PlannedTask &task) {
+        return !task.foldRegionSources.empty();
+      });
+  SmallVector<int64_t> oldBufferToNew(generic.buffers.size(), -1);
+  llvm::SmallDenseMap<Value, int64_t> combinedBufferForValue;
+  for (auto [ordinal, buffer] : llvm::enumerate(generic.buffers)) {
+    if (buffer.value == contractIntermediate)
+      continue;
+    int64_t combined = hybrid.buffers.size();
+    oldBufferToNew[ordinal] = combined;
+    combinedBufferForValue.try_emplace(buffer.value, combined);
+    hybrid.buffers.push_back({buffer.value, std::nullopt, {}, buffer.liveOut});
+  }
+  auto normalizedBuffer = combinedBufferForValue.find(normalized);
+  auto outputBuffer = combinedBufferForValue.find(specializedOutput);
+  if (normalizedBuffer == combinedBufferForValue.end() ||
+      outputBuffer == combinedBufferForValue.end() ||
+      hybrid.buffers[normalizedBuffer->second].liveOut)
+    return failure();
+
+  SmallVector<int64_t> specializedBufferToCombined(specialized->buffers.size(),
+                                                   -1);
+  for (auto [ordinal, buffer] : llvm::enumerate(specialized->buffers)) {
+    if (!buffer.producer || buffer.liveOut) {
+      auto found = combinedBufferForValue.find(buffer.value);
+      if (found == combinedBufferForValue.end())
+        return failure();
+      specializedBufferToCombined[ordinal] = found->second;
+      continue;
+    }
+    specializedBufferToCombined[ordinal] = hybrid.buffers.size();
+    hybrid.buffers.push_back({buffer.value, std::nullopt, {}, false});
+  }
+
+  auto remap = [](SmallVectorImpl<int64_t> &ordinals,
+                  ArrayRef<int64_t> mapping) -> LogicalResult {
+    for (int64_t &ordinal : ordinals) {
+      if (ordinal < 0 || ordinal >= static_cast<int64_t>(mapping.size()) ||
+          mapping[ordinal] < 0)
+        return failure();
+      ordinal = mapping[ordinal];
+    }
+    return success();
+  };
+  for (auto [ordinal, original] : llvm::enumerate(generic.tasks)) {
+    if (ordinal == *boundaryTask) {
+      for (PlannedTask task : specialized->tasks) {
+        if (failed(remap(task.inputs, specializedBufferToCombined)) ||
+            failed(remap(task.outputs, specializedBufferToCombined)))
+          return failure();
+        if (!task.contractRegionSources.empty())
+          task.outputs.insert(task.outputs.begin(), normalizedBuffer->second);
+        task.dependencies.clear();
+        hybrid.tasks.push_back(std::move(task));
+      }
+      continue;
+    }
+    if (ordinal == *contractTask || ordinal == *epilogueTask)
+      continue;
+    PlannedTask task = original;
+    if (failed(remap(task.inputs, oldBufferToNew)) ||
+        failed(remap(task.outputs, oldBufferToNew)))
+      return failure();
+    task.dependencies.clear();
+    hybrid.tasks.push_back(std::move(task));
+  }
+
+  for (PlannedBuffer &buffer : hybrid.buffers) {
+    buffer.producer.reset();
+    buffer.consumers.clear();
+  }
+  for (auto [ordinal, task] : llvm::enumerate(hybrid.tasks)) {
+    for (int64_t output : task.outputs) {
+      if (output < 0 || output >= static_cast<int64_t>(hybrid.buffers.size()) ||
+          hybrid.buffers[output].producer)
+        return failure();
+      hybrid.buffers[output].producer = ordinal;
+    }
+  }
+
+  SmallVector<bool> requiredTasks(hybrid.tasks.size(), false);
+  SmallVector<bool> requiredBuffers(hybrid.buffers.size(), false);
+  SmallVector<int64_t> worklist;
+  for (auto [ordinal, buffer] : llvm::enumerate(hybrid.buffers)) {
+    if (!buffer.liveOut)
+      continue;
+    requiredBuffers[ordinal] = true;
+    worklist.push_back(ordinal);
+  }
+  while (!worklist.empty()) {
+    int64_t bufferOrdinal = worklist.pop_back_val();
+    std::optional<int64_t> producer = hybrid.buffers[bufferOrdinal].producer;
+    if (!producer || requiredTasks[*producer])
+      continue;
+    requiredTasks[*producer] = true;
+    PlannedTask &task = hybrid.tasks[*producer];
+    for (int64_t output : task.outputs) {
+      if (output < 0 || output >= static_cast<int64_t>(hybrid.buffers.size()))
+        return failure();
+      requiredBuffers[output] = true;
+    }
+    for (int64_t input : task.inputs) {
+      if (input < 0 || input >= static_cast<int64_t>(hybrid.buffers.size()))
+        return failure();
+      if (requiredBuffers[input])
+        continue;
+      requiredBuffers[input] = true;
+      worklist.push_back(input);
+    }
+  }
+
+  SmallVector<int64_t> liveBufferMapping(hybrid.buffers.size(), -1);
+  DerivedPlan live;
+  live.hasContract = hybrid.hasContract;
+  live.hasRankNFold = hybrid.hasRankNFold;
+  live.hasContractRegion = hybrid.hasContractRegion;
+  live.hasFoldRegion = hybrid.hasFoldRegion;
+  for (auto [ordinal, buffer] : llvm::enumerate(hybrid.buffers)) {
+    if (!requiredBuffers[ordinal])
+      continue;
+    liveBufferMapping[ordinal] = live.buffers.size();
+    live.buffers.push_back({buffer.value, std::nullopt, {}, buffer.liveOut});
+  }
+  for (auto [ordinal, task] : llvm::enumerate(hybrid.tasks)) {
+    if (!requiredTasks[ordinal])
+      continue;
+    if (failed(remap(task.inputs, liveBufferMapping)) ||
+        failed(remap(task.outputs, liveBufferMapping)))
+      return failure();
+    task.dependencies.clear();
+    live.tasks.push_back(std::move(task));
+  }
+  hybrid = std::move(live);
+
+  llvm::SmallDenseSet<Operation *> seenSources;
+  for (PlannedTask &task : hybrid.tasks) {
+    const bool regionTask =
+        !task.foldRegionSources.empty() || !task.contractRegionSources.empty();
+    task.foldRegionRecomputedSources.clear();
+    task.contractRegionRecomputedSources.clear();
+    SmallVector<Operation *> sources = taskSources(task);
+    for (Operation *operation : sources) {
+      if (!seenSources.contains(operation))
+        continue;
+      if (!regionTask || !isa<MapOp, FoldOp>(operation))
+        return failure();
+      if (!task.foldRegionSources.empty())
+        task.foldRegionRecomputedSources.push_back(operation);
+      else
+        task.contractRegionRecomputedSources.push_back(operation);
+    }
+    seenSources.insert(sources.begin(), sources.end());
+  }
+
+  for (auto [ordinal, task] : llvm::enumerate(hybrid.tasks)) {
+    for (int64_t output : task.outputs) {
+      if (output < 0 || output >= static_cast<int64_t>(hybrid.buffers.size()) ||
+          hybrid.buffers[output].producer)
+        return failure();
+      hybrid.buffers[output].producer = ordinal;
+    }
+  }
+  for (auto [ordinal, task] : llvm::enumerate(hybrid.tasks)) {
+    for (int64_t input : task.inputs) {
+      if (input < 0 || input >= static_cast<int64_t>(hybrid.buffers.size()))
+        return failure();
+      PlannedBuffer &buffer = hybrid.buffers[input];
+      if (buffer.consumers.empty() || buffer.consumers.back() != ordinal)
+        buffer.consumers.push_back(ordinal);
+      if (buffer.producer &&
+          !llvm::is_contained(task.dependencies, *buffer.producer))
+        task.dependencies.push_back(*buffer.producer);
+    }
+    llvm::sort(task.dependencies);
+  }
+  for (const PlannedBuffer &buffer : hybrid.buffers) {
+    if (!buffer.liveOut && buffer.producer && buffer.consumers.empty())
+      return failure();
+  }
+  return hybrid;
+}
+
 FailureOr<DerivedPlan> deriveGpuPlan(RegionOp region,
                                      bool preferFusion = false) {
   SmallVector<Operation *> algebra;
@@ -5746,7 +6052,12 @@ FailureOr<DerivedPlan> deriveGpuPlan(RegionOp region,
       deriveSharedStatFoldRegionPlan(region);
   if (succeeded(sharedStatFoldRegion))
     return sharedStatFoldRegion;
-  return fuseEligibleMapTasks(region, std::move(result));
+  FailureOr<DerivedPlan> fused =
+      fuseEligibleMapTasks(region, std::move(result));
+  if (failed(fused))
+    return failure();
+  FailureOr<DerivedPlan> hybrid = deriveHybridNormContractPlan(region, *fused);
+  return succeeded(hybrid) ? std::move(*hybrid) : std::move(*fused);
 }
 
 Operation *createMaterializationRecord(OpBuilder &builder, Location location,
@@ -5992,8 +6303,12 @@ public:
                        builder.getI64IntegerAttr(cost.compactStatBytes))})));
           if (!task.contractRegionRecomputedSources.empty()) {
             SmallVector<Attribute> recomputed;
-            for (Operation *operation : task.contractRegionRecomputedSources)
-              recomputed.push_back(cast<MapOp>(operation).getSource());
+            for (Operation *operation : task.contractRegionRecomputedSources) {
+              if (auto map = dyn_cast<MapOp>(operation))
+                recomputed.push_back(map.getSource());
+              else
+                recomputed.push_back(cast<FoldOp>(operation).getSource());
+            }
             attrs.push_back(
                 builder.getNamedAttr("contract_region_recomputed_sources",
                                      builder.getArrayAttr(recomputed)));
@@ -6142,9 +6457,12 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
     }
   }
   llvm::SmallDenseSet<Operation *> bound;
+  llvm::SmallDenseSet<Operation *> legacyBound;
   llvm::SmallDenseMap<Operation *, int64_t> foldRegionOccurrences;
+  llvm::SmallDenseMap<Operation *, int64_t> legacyRecomputationOccurrences;
   llvm::SmallDenseMap<Operation *, int64_t> recomputationDeclarations;
   bool sawFoldRegion = false;
+  bool sawContractRegion = false;
   for (MaterializationTaskOp task : tasks) {
     auto fusedSources = task->getAttrOfType<ArrayAttr>("fused_sources");
     auto composedMaps =
@@ -6160,7 +6478,7 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
     auto contractRegionSources =
         task->getAttrOfType<ArrayAttr>("contract_region_sources");
     if (contractRegionSources) {
-      sawFoldRegion = true;
+      sawContractRegion = true;
       if (fusedSources || composedMaps || epilogueSources || epilogueMaps ||
           foldRegionSources || foldRegionOutputSources ||
           task.getKind() != MaterializationTaskKind::Contract) {
@@ -6178,6 +6496,10 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
           return failure();
         }
         operations.push_back(found->second);
+        if (legacyBound.contains(found->second)) {
+          ++foldRegionOccurrences[found->second];
+          ++legacyRecomputationOccurrences[found->second];
+        }
         bound.insert(found->second);
         ++foldRegionOccurrences[found->second];
       }
@@ -6213,10 +6535,10 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
               "contract_region_recomputed_sources")) {
         for (Attribute source : recomputed) {
           Operation *operation = sourceOperations.lookup(source);
-          if (!operation || !isa<MapOp>(operation) ||
+          if (!operation || !isa<MapOp, FoldOp>(operation) ||
               !llvm::is_contained(operations, operation)) {
             task.emitOpError(
-                "Contract-region recomputation must bind a task-local Map");
+                "Contract-region recomputation must bind task-local algebra");
             return failure();
           }
           ++recomputationDeclarations[operation];
@@ -6241,6 +6563,10 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
           return failure();
         }
         operations.push_back(found->second);
+        if (legacyBound.contains(found->second)) {
+          ++foldRegionOccurrences[found->second];
+          ++legacyRecomputationOccurrences[found->second];
+        }
         bound.insert(found->second);
         ++foldRegionOccurrences[found->second];
       }
@@ -6287,7 +6613,7 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
       task.emitOpError("Fold-region outputs require Fold-region sources");
       return failure();
     }
-    if (sawFoldRegion) {
+    if (sawFoldRegion && !sawContractRegion) {
       task.emitOpError("cannot mix Fold-region and legacy tasks");
       return failure();
     }
@@ -6465,11 +6791,17 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
       task.emitOpError("domain does not match bound algebra indexing");
       return failure();
     }
+    legacyBound.insert(source);
+    legacyBound.insert(fusedOperations.begin(), fusedOperations.end());
   }
-  if (sawFoldRegion) {
+  if (sawFoldRegion || sawContractRegion) {
     for (auto [operation, occurrences] : foldRegionOccurrences) {
       const int64_t declarations = recomputationDeclarations.lookup(operation);
-      if ((occurrences > 1 && declarations != occurrences) ||
+      const int64_t expectedDeclarations =
+          occurrences > 1
+              ? occurrences - legacyRecomputationOccurrences.lookup(operation)
+              : 0;
+      if ((occurrences > 1 && declarations != expectedDeclarations) ||
           (occurrences == 1 && declarations != 0)) {
         plan.emitOpError(
             "Fold-region recomputation must exactly declare repeated sources");
@@ -6526,8 +6858,13 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
       for (Operation *operation : expectedTask.contractRegionEpilogueSources)
         expectedEpilogues.push_back(cast<MapOp>(operation).getSource());
       SmallVector<Attribute> expectedRecomputed;
-      for (Operation *operation : expectedTask.contractRegionRecomputedSources)
-        expectedRecomputed.push_back(cast<MapOp>(operation).getSource());
+      for (Operation *operation :
+           expectedTask.contractRegionRecomputedSources) {
+        if (auto map = dyn_cast<MapOp>(operation))
+          expectedRecomputed.push_back(map.getSource());
+        else
+          expectedRecomputed.push_back(cast<FoldOp>(operation).getSource());
+      }
       auto actualStrategy =
           actual->getAttrOfType<StringAttr>("contract_region_strategy");
       auto actualEpilogues =
@@ -8771,9 +9108,14 @@ FailureOr<std::string> emitContractRegionPtx(
       "contract_region_contract_source");
   auto boundarySource = materializationTask->getAttrOfType<SourceRefAttr>(
       "contract_region_bf16_boundary_source");
+  auto epilogueSources = materializationTask->getAttrOfType<ArrayAttr>(
+      "contract_region_epilogue_sources");
+  ArrayRef<int64_t> outputBuffers = materializationTask.getOutputBuffers();
+  const bool materializesNormalized = outputBuffers.size() == 2;
   if (!sourceAttributes || !strategy || !cost || !foldSource ||
-      !contractSource || !boundarySource ||
-      materializationTask.getOutputBuffers().size() != 1 ||
+      !contractSource || !boundarySource || !epilogueSources ||
+      epilogueSources.size() != 1 ||
+      (outputBuffers.size() != 1 && !materializesNormalized) ||
       task.getGridShape().size() != 2)
     return failure();
   auto rows = cost.getAs<IntegerAttr>("rows");
@@ -8806,7 +9148,10 @@ FailureOr<std::string> emitContractRegionPtx(
       dyn_cast_or_null<ContractOp>(sourceOperations.lookup(contractSource));
   MapOp boundary =
       dyn_cast_or_null<MapOp>(sourceOperations.lookup(boundarySource));
-  if (!fold || !contract || !boundary || !isRneF32ToBf16Map(boundary))
+  MapOp epilogue = dyn_cast_or_null<MapOp>(
+      sourceOperations.lookup(epilogueSources.getValue().front()));
+  if (!fold || !contract || !boundary || !epilogue ||
+      !isRneF32ToBf16Map(boundary) || !isRneF32ToBf16Map(epilogue))
     return failure();
   MapOp reciprocal;
   for (const auto &[source, operation] : sourceOperations) {
@@ -8834,11 +9179,22 @@ FailureOr<std::string> emitContractRegionPtx(
   auto lhsType = cast<RankedTensorType>(boundary.getResult(0).getType());
   auto rhsType = cast<RankedTensorType>(contract.getInputs()[1].getType());
   auto resultType = cast<RankedTensorType>(contract.getResult(0).getType());
+  if (llvm::any_of(outputBuffers, [&](int64_t ordinal) {
+        return ordinal < 0 || ordinal >= static_cast<int64_t>(buffers.size());
+      }))
+    return failure();
+  if (materializesNormalized &&
+      buffers[outputBuffers.front()].getTensorType() != lhsType)
+    return failure();
+  if (buffers[outputBuffers.back()].getTensorType() !=
+      cast<RankedTensorType>(epilogue.getResult(0).getType()))
+    return failure();
   if (lhsType.getShape().back() != reduction ||
       rhsType.getShape() != ArrayRef<int64_t>({reduction, columns}))
     return failure();
 
-  PtxEmitter ptx(materializationTask.getInputBuffers().size() + 1);
+  PtxEmitter ptx(materializationTask.getInputBuffers().size() +
+                 outputBuffers.size());
   ptx.header(task.getSemanticFingerprint(), /*usesDynamicSharedMemory=*/true);
   FoldRegionPtxContext context{ptx,
                                materializationTask,
@@ -9009,6 +9365,28 @@ FailureOr<std::string> emitContractRegionPtx(
       context.boundaryParameters.find(contract.getInputs()[1]);
   if (failed(lhs) || projectionParameter == context.boundaryParameters.end())
     return failure();
+  if (materializesNormalized) {
+    const int64_t normalizedParameter =
+        materializationTask.getInputBuffers().size();
+    int64_t normalizedLinear = ptx.nextU64();
+    int64_t normalizedPointer = ptx.nextU64();
+    int64_t normalizedRounded = ptx.nextBF16();
+    ptx.stream << "  setp.ne.u32 %p3, %r2, 0;\n"
+                  "  @%p3 bra $contract_region_normalized_done;\n"
+                  "  setp.ne.u32 %p3, %r5, 0;\n"
+                  "  @%p3 bra $contract_region_normalized_done;\n"
+                  "  cvt.u64.u32 %rd"
+               << normalizedLinear << ", %r1;\n  mad.lo.u64 %rd"
+               << normalizedLinear << ", %rd" << normalizedLinear << ", "
+               << reduction << ", %rd" << reductionCoordinate
+               << ";\n  ld.param.u64 %rd" << normalizedPointer << ", [p"
+               << normalizedParameter << "];\n  mad.lo.u64 %rd"
+               << normalizedPointer << ", %rd" << normalizedLinear << ", 2, %rd"
+               << normalizedPointer << ";\n  cvt.rn.bf16.f32 %h"
+               << normalizedRounded << ", %f" << *lhs
+               << ";\n  st.global.u16 [%rd" << normalizedPointer << "], %h"
+               << normalizedRounded << ";\n$contract_region_normalized_done:\n";
+  }
   FailureOr<int64_t> rhs = emitMapInput(ptx, projectionParameter->second,
                                         rhsType, rhsMap, contractCoordinates);
   if (failed(rhs))
@@ -9039,7 +9417,8 @@ FailureOr<std::string> emitContractRegionPtx(
   }
   int64_t outputPointer = ptx.nextU64();
   int64_t rounded = ptx.nextBF16();
-  const int64_t outputParameter = materializationTask.getInputBuffers().size();
+  const int64_t outputParameter = materializationTask.getInputBuffers().size() +
+                                  (materializesNormalized ? 1 : 0);
   ptx.stream << "  ld.param.u64 %rd" << outputPointer << ", [p"
              << outputParameter << "];\n  mad.lo.u64 %rd" << outputPointer
              << ", %rd" << outputLinear << ", 2, %rd" << outputPointer

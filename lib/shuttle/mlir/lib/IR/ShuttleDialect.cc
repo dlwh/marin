@@ -1180,6 +1180,8 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
         auto cost = task->getAttrOfType<DictionaryAttr>("contract_region_cost");
         auto recomputed = task->getAttrOfType<ArrayAttr>(
             "contract_region_recomputed_sources");
+        ArrayRef<int64_t> outputBuffers = task.getOutputBuffers();
+        const bool materializesNormalized = outputBuffers.size() == 2;
         if (getSchemaVersion() != 2 || contractSources.empty() || !strategy ||
             !foldSource || !contractSource || !boundarySource ||
             !epilogueSources || epilogueSources.empty() || !normalizedOperand ||
@@ -1189,10 +1191,10 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
             task->getAttr("fold_epilogue_sources") ||
             task->getAttr("epilogue_input_maps") ||
             task->getAttr("fold_region_sources") || task.getOrderFree() ||
-            task.getOutputBuffers().size() != 1) {
+            (outputBuffers.size() != 1 && !materializesNormalized)) {
           return task.emitOpError(
               "schema-v2 Contract regions require closed provenance, cost, "
-              "and one output");
+              "one result, and at most one normalized boundary output");
         }
         const bool inlineFold = strategy.getValue() == "inline_fold";
         const bool compactStat = strategy.getValue() == "compact_stat";
@@ -1294,7 +1296,7 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
         ArrayRef<int64_t> domain = task.getDomainShape();
         const int64_t reductionAxis = domain.size() - 1;
         auto outputType = cast<RankedTensorType>(
-            buffers[task.getOutputBuffers().front()].getTensorType());
+            buffers[outputBuffers.back()].getTensorType());
         if (domain.size() < 3 || domain.size() > 9 ||
             task.getReductionDimensions() !=
                 ArrayRef<int64_t>({reductionAxis}) ||
@@ -1302,6 +1304,20 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
             !outputType.getElementType().isBF16()) {
           return task.emitOpError(
               "Contract-region domain and BF16 output must bind its cost");
+        }
+        if (materializesNormalized) {
+          MaterializationBufferOp normalized = buffers[outputBuffers.front()];
+          auto normalizedType =
+              cast<RankedTensorType>(normalized.getTensorType());
+          if (normalized.getLiveOut() ||
+              normalized.getStorage() != MaterializationStorage::Temporary ||
+              normalizedType.getShape() !=
+                  ArrayRef<int64_t>({rows, reduction}) ||
+              !normalizedType.getElementType().isBF16()) {
+            return task.emitOpError(
+                "Contract-region normalized output must be one private BF16 "
+                "row boundary");
+          }
         }
         for (auto [inputOrdinal, bufferOrdinal] :
              llvm::enumerate(task.getInputBuffers())) {
@@ -1395,7 +1411,8 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
     compactContractRegion |= strategy && strategy.getValue() == "compact_stat";
   }
   if (contractRegionCount > 1 ||
-      (contractCount != contractRegionCount && foldRegionCount != 0) ||
+      (contractCount != contractRegionCount && foldRegionCount != 0 &&
+       !compactContractRegion) ||
       (foldRegionCount != 0 && !compactContractRegion && contractCount != 0) ||
       getSchemaVersion() !=
           (contractCount != 0 || foldRegionCount != 0 ? 2 : 1)) {
