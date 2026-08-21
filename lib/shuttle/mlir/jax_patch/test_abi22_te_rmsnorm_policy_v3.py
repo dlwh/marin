@@ -75,6 +75,28 @@ ABOVE_COUNTS = {"y": 8_305_127, "dx": 7_725_746, "dgamma": 4_091}
 BELOW_COUNTS = {"y": 83_481, "dx": 662_862, "dgamma": 5}
 OUTPUT_SIZES = {"y": 8_388_608, "dx": 8_388_608, "dgamma": 4_096}
 REFERENCE_MAXIMA = {"y": 2.640625, "dx": 2.6875, "dgamma": 94.0}
+PARTITION_COUNTS = {
+    "qualification_linspace_v2": {
+        "y": {"below_floor": 162_992, "above_floor": 8_225_616},
+        "dx": {"below_floor": 1_864_961, "above_floor": 6_523_647},
+        "dgamma": {"below_floor": 0, "above_floor": 4_096},
+    },
+    "heldout_reversed_linspace_v1": {
+        "y": {"below_floor": 153, "above_floor": 8_388_455},
+        "dx": {"below_floor": 2_991_355, "above_floor": 5_397_253},
+        "dgamma": {"below_floor": 0, "above_floor": 4_096},
+    },
+    "heldout_splitmix64_v1": {
+        "y": {"below_floor": 82_755, "above_floor": 8_305_853},
+        "dx": {"below_floor": 665_790, "above_floor": 7_722_818},
+        "dgamma": {"below_floor": 5, "above_floor": 4_091},
+    },
+    ACCEPTANCE_PATTERN: {
+        "y": {"below_floor": 83_481, "above_floor": 8_305_127},
+        "dx": {"below_floor": 662_862, "above_floor": 7_725_746},
+        "dgamma": {"below_floor": 5, "above_floor": 4_091},
+    },
+}
 
 
 def _api(name: str) -> Callable[..., Any]:
@@ -189,10 +211,7 @@ class TeRmsnormPolicyV3Test(unittest.TestCase):
         self.assertEqual(_v3_value("POLICY_V3_ACCEPTANCE_INPUT_DIGESTS"), INPUT_DIGESTS)
         self.assertEqual(_v3_value("POLICY_V3_ACCEPTANCE_REFERENCE_DIGESTS"), REFERENCE_DIGESTS)
         self.assertEqual(_v3_value("POLICY_V3_REFERENCE_MAXIMA"), REFERENCE_MAXIMA)
-        self.assertEqual(
-            _v3_value("POLICY_V3_PARTITION_COUNTS")[ACCEPTANCE_PATTERN],
-            {role: {"below_floor": BELOW_COUNTS[role], "above_floor": ABOVE_COUNTS[role]} for role in OUTPUT_SIZES},
-        )
+        self.assertEqual(_v3_value("POLICY_V3_PARTITION_COUNTS"), PARTITION_COUNTS)
         for role in OUTPUT_SIZES:
             self.assertEqual(BELOW_COUNTS[role] + ABOVE_COUNTS[role], OUTPUT_SIZES[role])
         for role, preimage in SEED_PREIMAGES.items():
@@ -218,9 +237,61 @@ class TeRmsnormPolicyV3Test(unittest.TestCase):
         self.assertEqual(plan["schema"], "shuttle_abi22_rmsnorm_policy_plan_v3")
         self.assertEqual(len(plan["runs"]), 48)
         self.assertEqual(
-            {run["input_pattern"] for run in plan["runs"]},
-            {*QUALIFICATION_PATTERNS, ACCEPTANCE_PATTERN},
+            [(run["input_pattern"], run["boundary"], run["producer"], run["repeat"]) for run in plan["runs"]],
+            [
+                (pattern, boundary, producer, repeat)
+                for pattern in (*QUALIFICATION_PATTERNS, ACCEPTANCE_PATTERN)
+                for boundary in oracle.BOUNDARIES
+                for producer in oracle.PRODUCERS
+                for repeat in range(2)
+            ],
         )
+        rows, features = oracle.REPRESENTATIVE_SHAPE
+        for run in plan["runs"]:
+            pattern = run["input_pattern"]
+            directory = case_root / (f"{rows}x{features}" if pattern == oracle.QUALIFICATION_PATTERN else pattern)
+            prefix = ["./te"] if run["producer"] == "transformer_engine_2_17" else ["./python", "./xla.py"]
+            output = (
+                case_root.parent
+                / "raw"
+                / (f"policy-{run['producer']}-{pattern}-{run['boundary']}" f"-repeat{run['repeat']}.json")
+            )
+            self.assertEqual(
+                run,
+                {
+                    "shape": [rows, features],
+                    "scope": (
+                        "representative_policy_acceptance"
+                        if pattern == ACCEPTANCE_PATTERN
+                        else "representative_policy_qualification"
+                    ),
+                    "input_pattern": pattern,
+                    "boundary": run["boundary"],
+                    "producer": run["producer"],
+                    "repeat": run["repeat"],
+                    "argv": [
+                        *prefix,
+                        "--boundary",
+                        run["boundary"],
+                        "--rows",
+                        str(rows),
+                        "--features",
+                        str(features),
+                        "--epsilon",
+                        "1e-06",
+                        "--case-directory",
+                        str(directory),
+                        "--output",
+                        str(output),
+                    ],
+                },
+            )
+        invoked: list[list[str]] = []
+        _api("execute_qualification_plan_v3")(plan, lambda argv: invoked.append(argv) or 0)
+        self.assertEqual(invoked, [run["argv"] for run in plan["runs"]])
+        plan["runs"][0]["argv"][-1] = str(case_root.parent / "raw" / "substituted.json")
+        with self.assertRaisesRegex(ValueError, "canonical|plan"):
+            _api("execute_qualification_plan_v3")(plan, lambda argv: 0)
 
     def test_piecewise_metrics_cover_every_element_and_close_whole_maximum(self) -> None:
         actual = np.asarray([0.0244140625, -0.25, 1.03125], dtype=ml_dtypes.bfloat16)
@@ -232,12 +303,28 @@ class TeRmsnormPolicyV3Test(unittest.TestCase):
         self.assertEqual(metrics["below_floor_count"] + metrics["eligible_count"], actual.size)
         self.assertEqual(metrics["max_absolute_error_below_floor"], 0.03118896484375)
         self.assertEqual(metrics["max_absolute_error_above_floor"], 0.03125)
+        self.assertEqual(metrics["max_absolute_error"], 0.03125)
+        self.assertEqual(metrics["mean_absolute_error"], 0.02081298828125)
+        self.assertEqual(metrics["max_bfloat16_ulp"], 30_887)
+        self.assertEqual(metrics["raw_max_bfloat16_ulp_index"], 0)
+        self.assertEqual(metrics["raw_max_bfloat16_ulp_actual"], 0.0244140625)
+        self.assertEqual(metrics["raw_max_bfloat16_ulp_reference"], -0.00677490234375)
         self.assertEqual(
             metrics["max_absolute_error"],
             max(metrics["max_absolute_error_below_floor"], metrics["max_absolute_error_above_floor"]),
         )
         self.assertEqual(metrics["max_relative_error_above_absolute_floor"], 0.03125)
+        self.assertEqual(metrics["max_bfloat16_ulp_above_absolute_floor"], 4)
+        self.assertIs(metrics["all_finite"], True)
         self.assertGreater(metrics["max_absolute_error_below_floor"], LIMITS["y"]["max_absolute_error_below_floor"])
+
+        for nonfinite in (float("nan"), float("inf")):
+            nonfinite_actual = np.asarray([nonfinite, 1.0], dtype=ml_dtypes.bfloat16)
+            finite_reference = np.asarray([0.0, 1.0], dtype=ml_dtypes.bfloat16)
+            self.assertIs(
+                _api("error_metrics_v3")(nonfinite_actual, finite_reference, role="y")["all_finite"],
+                False,
+            )
 
     def test_validator_mutation_locks_every_acceptance_gate_and_repeat_digest(self) -> None:
         validate = _api("validate_policy_v3_evidence")
@@ -276,23 +363,65 @@ class TeRmsnormPolicyV3Test(unittest.TestCase):
                     with self.assertRaises(ValueError, msg=f"{role}/{field}"):
                         validate(corrupted)
 
+                count_swap = copy.deepcopy(validated)
+                count_output = count_swap["cells"][index]["outputs"][output_index]
+                count_output["below_floor_count"] += 1
+                count_output["eligible_count"] -= 1
+                with self.assertRaisesRegex(ValueError, "count"):
+                    validate(count_swap)
+
+                for field in (
+                    "max_absolute_error",
+                    "mean_absolute_error",
+                    "max_absolute_error_below_floor",
+                    "max_absolute_error_above_floor",
+                    "max_relative_error_above_absolute_floor",
+                ):
+                    nonfinite = copy.deepcopy(validated)
+                    nonfinite["cells"][index]["outputs"][output_index][field] = float("nan")
+                    with self.assertRaisesRegex(ValueError, "finite|absolute|relative"):
+                        validate(nonfinite)
+
                 corrupted = copy.deepcopy(validated)
                 corrupted["cells"][index]["outputs"][output_index]["max_absolute_error"] = 0.125
                 with self.assertRaisesRegex(ValueError, "partition|whole|max_absolute"):
                     validate(corrupted)
 
         repeated = copy.deepcopy(validated)
-        cell = next(
+        repeat_coordinates = [
+            (producer, pattern, boundary, role)
+            for producer in oracle.PRODUCERS
+            for pattern in (*QUALIFICATION_PATTERNS, ACCEPTANCE_PATTERN)
+            for boundary in oracle.BOUNDARIES
+            for role in oracle.OUTPUT_ROLES[boundary]
+        ]
+        for producer, pattern, boundary, role in repeat_coordinates:
+            repeated = copy.deepcopy(validated)
+            cell = next(
+                cell
+                for cell in repeated["cells"]
+                if cell["producer"] == producer
+                and cell["input_pattern"] == pattern
+                and cell["boundary"] == boundary
+                and cell["repeat"] == 1
+            )
+            output = next(output for output in cell["outputs"] if output["role"] == role)
+            output["digest"] = "f" * 64
+            with self.assertRaisesRegex(ValueError, "repeat"):
+                validate(repeated)
+
+        role_swap = copy.deepcopy(validated)
+        composed = next(
             cell
-            for cell in repeated["cells"]
-            if cell["producer"] == "ordinary_jax_xla"
+            for cell in role_swap["cells"]
+            if cell["producer"] == "transformer_engine_2_17"
             and cell["input_pattern"] == ACCEPTANCE_PATTERN
             and cell["boundary"] == "composed"
-            and cell["repeat"] == 1
+            and cell["repeat"] == 0
         )
-        cell["outputs"][0]["digest"] = "f" * 64
-        with self.assertRaisesRegex(ValueError, "repeat"):
-            validate(repeated)
+        composed["outputs"][0], composed["outputs"][1] = composed["outputs"][1], composed["outputs"][0]
+        with self.assertRaisesRegex(ValueError, "role"):
+            validate(role_swap)
 
     def test_repeat_diagnostics_reports_pairwise_drift_before_rejection(self) -> None:
         first = np.asarray([0.0, 1.0, -2.0], dtype=ml_dtypes.bfloat16)

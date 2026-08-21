@@ -15,7 +15,8 @@ from pathlib import Path
 import abi22_te_rmsnorm_oracle_v2 as oracle
 import ml_dtypes
 import numpy as np
-from track2_te_h100_batch import BatchPaths, execute_oracle
+import track2_te_h100_batch as batch
+from track2_te_h100_batch import BatchPaths
 
 ACCEPTANCE_PATTERN = "heldout_splitmix64_v2"
 DEVICE = {"model": "NVIDIA H100 80GB HBM3", "uuid": "GPU-test", "compute_capability": "9.0"}
@@ -136,9 +137,11 @@ class Track2TeH100PolicyV3Test(unittest.TestCase):
         paths.te_library.write_bytes(b"resolved-te-library")
         calls: list[list[str]] = []
         stdout = io.StringIO()
+        execute_oracle_v3 = getattr(batch, "execute_oracle_v3", None)
+        self.assertTrue(callable(execute_oracle_v3), "versioned v3 worker API is missing")
 
         with contextlib.redirect_stdout(stdout), self.assertRaisesRegex(ValueError, "repeat"):
-            execute_oracle(paths=paths, device=DEVICE, invoke=lambda argv: _fake_invoke(paths, calls, argv))
+            execute_oracle_v3(paths=paths, device=DEVICE, invoke=lambda argv: _fake_invoke(paths, calls, argv))
 
         lines = stdout.getvalue().splitlines()
         raw_lines = [line for line in lines if line.startswith("TRACK2_TE_POLICY_RAW_V3=")]
@@ -151,6 +154,77 @@ class Track2TeH100PolicyV3Test(unittest.TestCase):
         self.assertEqual(json.loads((paths.reports / "policy-repeat-diagnostics-v3.json").read_text()), diagnostics)
         self.assertEqual(raw["schema"], "shuttle_abi22_rmsnorm_policy_evidence_v3")
         self.assertEqual(len(raw["cells"]), 48)
+        expected_coordinates = [
+            (producer, pattern, boundary, role)
+            for producer in oracle.PRODUCERS
+            for pattern in (
+                oracle.QUALIFICATION_PATTERN,
+                oracle.HELDOUT_PATTERN,
+                oracle.ACCEPTANCE_PATTERN,
+                ACCEPTANCE_PATTERN,
+            )
+            for boundary in oracle.BOUNDARIES
+            for role in oracle.OUTPUT_ROLES[boundary]
+        ]
+        self.assertEqual(
+            [
+                (item["producer"], item["input_pattern"], item["boundary"], item["role"])
+                for item in diagnostics["coordinates"]
+            ],
+            expected_coordinates,
+        )
+        self.assertEqual(diagnostics["schema"], "shuttle_abi22_rmsnorm_repeat_diagnostics_v3")
+        policy_cells = {
+            (cell["producer"], cell["input_pattern"], cell["boundary"], cell["repeat"]): cell for cell in raw["cells"]
+        }
+        for item in diagnostics["coordinates"]:
+            self.assertEqual(
+                set(item),
+                {
+                    "producer",
+                    "input_pattern",
+                    "boundary",
+                    "role",
+                    "repeat0_digest",
+                    "repeat1_digest",
+                    "mismatch_count",
+                    "max_absolute_error",
+                    "max_bfloat16_ulp",
+                    "first_mismatch_index",
+                    "first_mismatch_repeat0",
+                    "first_mismatch_repeat1",
+                    "max_absolute_error_index",
+                    "max_absolute_error_repeat0",
+                    "max_absolute_error_repeat1",
+                    "raw_output_files",
+                },
+            )
+            producer = item["producer"]
+            pattern = item["input_pattern"]
+            boundary = item["boundary"]
+            role = item["role"]
+            expected_files = []
+            for repeat in range(2):
+                raw_cell = json.loads(
+                    (paths.raw / f"policy-{producer}-{pattern}-{boundary}-repeat{repeat}.json").read_text()
+                )
+                expected_files.append(raw_cell["output_files"][role])
+                cell = policy_cells[(producer, pattern, boundary, repeat)]
+                output = next(output for output in cell["outputs"] if output["role"] == role)
+                self.assertEqual(output["digest"], _digest(Path(expected_files[-1])))
+            self.assertEqual(item["raw_output_files"], expected_files)
+            self.assertTrue(all(Path(path).is_file() for path in expected_files))
+            if producer == "ordinary_jax_xla":
+                self.assertNotEqual(expected_files[0], expected_files[1])
+            if (producer, pattern, boundary, role) != (
+                "ordinary_jax_xla",
+                ACCEPTANCE_PATTERN,
+                "composed",
+                "y",
+            ):
+                self.assertEqual(item["mismatch_count"], 0)
+                self.assertEqual(item["max_absolute_error"], 0.0)
+                self.assertEqual(item["max_bfloat16_ulp"], 0)
         mismatch = next(
             item
             for item in diagnostics["coordinates"]
