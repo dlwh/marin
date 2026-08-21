@@ -270,9 +270,10 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
                     "--case-directory",
                     str(case_root / f"{rows}x{features}"),
                     "--output",
-                    f"raw/{run['producer']}-{rows}x{features}-{run['boundary']}.json",
+                    str(case_root.parent / "raw" / f"{run['producer']}-{rows}x{features}-{run['boundary']}.json"),
                 ],
             )
+            self.assertTrue(Path(run["argv"][-1]).is_absolute())
         self.assertTrue(all("contract" not in run["boundary"] for run in plan["runs"]))
         self.assertEqual(plan["excluded_capability"], NORM_CONTRACT_BLOCKER)
 

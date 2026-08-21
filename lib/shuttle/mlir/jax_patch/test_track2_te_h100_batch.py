@@ -9,6 +9,7 @@ import statistics
 import zipfile
 from pathlib import Path
 
+import abi22_xla_rmsnorm_oracle_v2 as xla_oracle
 import pytest
 from abi22_te_rmsnorm_oracle_v2 import (
     BOUNDARIES,
@@ -27,6 +28,7 @@ from track2_te_h100_batch import (
     TE_WHEEL_URL,
     BatchPaths,
     _invoke_oracle,
+    _validated_xla_raw_cell,
     batch_plan,
     canonical_json,
     execute_batch,
@@ -35,6 +37,17 @@ from track2_te_h100_batch import (
     validate_source_manifest,
     validate_te_hydration,
 )
+
+XLA_OBSERVED_RUNTIME = {
+    "backend": "gpu",
+    "device_count": 1,
+    "device_id": 0,
+    "device_kind": "NVIDIA H100 80GB HBM3",
+    "jax_git_commit": "619764c15117fbefc4ba13ab941871cb514c23f6",
+    "jax_version": "0.10.1",
+    "jaxlib_version": "0.10.1",
+    "platform_version": "CUDA 13.2.0",
+}
 
 
 def _manifest(root: Path, relative: str, payload: bytes) -> Path:
@@ -179,7 +192,7 @@ def _valid_cell(shape: tuple[int, int], boundary: str, *, te: bool) -> dict:
     input_roles = ("x", "gamma") if boundary == "forward" else ("x", "gamma", "dy")
     scale = 1 if te else 2
     samples = [scale * (100_000 + index * 1_000) for index in range(20)]
-    return {
+    cell = {
         "shape": list(shape),
         "scope": "architecture_fixture" if shape == SHAPES[0] else "representative_acceptance",
         "boundary": boundary,
@@ -205,6 +218,64 @@ def _valid_cell(shape: tuple[int, int], boundary: str, *, te: bool) -> dict:
             "raw_cuda_event_ns": [50_000 + index * 100 for index in range(20)] if te else None,
         },
     }
+    if not te:
+        cell["observed_runtime"] = dict(XLA_OBSERVED_RUNTIME)
+    return cell
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("backend", "cpu"),
+        ("device_count", 2),
+        ("device_id", 1),
+        ("device_kind", "NVIDIA L4"),
+        ("jax_git_commit", "0" * 40),
+        ("jax_version", "0.10.0"),
+        ("jaxlib_version", "0.10.0"),
+        ("platform_version", ""),
+    ],
+)
+def test_xla_raw_cell_requires_observed_h100_runtime(field: str, value: object) -> None:
+    cell = _valid_cell(SHAPES[1], "forward", te=False)
+    cell["observed_runtime"][field] = value
+
+    with pytest.raises(ValueError, match=r"ordinary-JAX.*runtime|H100"):
+        _validated_xla_raw_cell(
+            cell,
+            expected_device={"model": "NVIDIA H100 80GB HBM3", "uuid": "GPU-test", "compute_capability": "9.0"},
+        )
+
+
+def test_xla_raw_cell_returns_claimed_identity_from_observed_runtime() -> None:
+    cell = _valid_cell(SHAPES[1], "forward", te=False)
+
+    validated, runtime = _validated_xla_raw_cell(
+        cell,
+        expected_device={"model": "NVIDIA H100 80GB HBM3", "uuid": "GPU-test", "compute_capability": "9.0"},
+    )
+
+    assert "observed_runtime" not in validated
+    assert runtime == XLA_OBSERVED_RUNTIME
+
+
+def test_xla_producer_observes_one_h100_and_its_loaded_versions(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Client:
+        platform_version = "CUDA 13.2.0"
+
+    class Device:
+        client = Client()
+        device_kind = "NVIDIA H100 80GB HBM3"
+        id = 0
+
+    monkeypatch.setattr(xla_oracle.jax, "default_backend", lambda: "gpu")
+    monkeypatch.setattr(xla_oracle.jax, "devices", lambda _: [Device()])
+
+    assert xla_oracle._observed_runtime() == XLA_OBSERVED_RUNTIME
+
+    monkeypatch.setattr(xla_oracle.jax, "default_backend", lambda: "cpu")
+    with pytest.raises(RuntimeError, match="GPU backend"):
+        xla_oracle._observed_runtime()
 
 
 def _fake_oracle_invoke(paths: BatchPaths, calls: list[list[str]], argv: list[str]) -> int:
@@ -264,6 +335,7 @@ def test_execute_oracle_runs_exact_matrix_and_builds_matched_acceptance(tmp_path
     assert result["acceptance"]["status"] == "representative_numerics_accepted"
     assert result["acceptance"]["accepted_shape"] == [2048, 4096]
     assert result["acceptance"]["performance"]["median_ratio_te_over_xla"] == {boundary: 0.5 for boundary in BOUNDARIES}
+    assert result["observed_xla_runtime"] == XLA_OBSERVED_RUNTIME
     assert result["shuttle"] == {"status": "pending", "blocker": SHUTTLE_BLOCKER}
     assert set(result["reports"]) == {"transformer_engine_2_17", "ordinary_jax_xla"}
     assert all(path.is_file() for path in (paths.te_report, paths.xla_report, paths.acceptance))
