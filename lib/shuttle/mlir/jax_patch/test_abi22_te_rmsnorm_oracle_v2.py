@@ -497,14 +497,7 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
             (lambda report: report["cells"][0]["timing"]["raw_host_blocking_ns"].pop(), "samples"),
             (lambda report: report["cells"][0]["timing"]["raw_cuda_event_ns"].pop(), "CUDA-event"),
             (lambda report: report["cells"][0]["outputs"][0].update(role="dx"), "roles"),
-            (
-                lambda report: report["cells"][3]["outputs"][0].update(max_absolute_error=0.5),
-                "max_absolute_error",
-            ),
-            (
-                lambda report: report["cells"][3]["outputs"][0].update(max_bfloat16_ulp=100),
-                "max_bfloat16_ulp",
-            ),
+            (lambda report: report["cells"][3]["outputs"][0].update(all_finite=False), "all_finite"),
             (
                 lambda report: report["cells"][5]["outputs"][0].update(reference_digest="f" * 64),
                 "composed",
@@ -526,6 +519,17 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
             mutation(report)
             with self.assertRaisesRegex(ValueError, diagnostic):
                 _validate(report, "transformer_engine_2_17")
+
+        for producer in ("transformer_engine_2_17", "ordinary_jax_xla"):
+            qualification_only = _report(producer)
+            qualification_only["cells"][3]["outputs"][0].update(
+                max_absolute_error=0.5,
+                mean_absolute_error=0.25,
+                max_bfloat16_ulp=10_000,
+                max_relative_error_above_absolute_floor=2.0,
+                max_bfloat16_ulp_above_absolute_floor=10_000,
+            )
+            _validate(qualification_only, producer)
 
         wrong_sequences = {
             "forward": ["rmsnorm_backward"],
