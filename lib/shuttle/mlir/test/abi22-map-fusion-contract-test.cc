@@ -5067,10 +5067,13 @@ TEST(Abi22MapFusionContract,
   struct Boundary {
     const char *filename;
     int64_t columns;
+    bool rankThree;
   };
   constexpr Boundary boundaries[] = {
-      {"jax-0.10.1-bf16-rmsnorm_contract-5x19x7-composed.mlir", 7},
-      {"jax-0.10.1-bf16-rmsnorm_contract-5x19x257-composed.mlir", 257},
+      {"jax-0.10.1-bf16-rmsnorm_contract-5x19x7-composed.mlir", 7, false},
+      {"jax-0.10.1-bf16-rmsnorm_contract-5x19x257-composed.mlir", 257,
+       false},
+      {"jax-0.10.1-bf16-rmsnorm_contract-2x5x19x7-composed.mlir", 7, true},
   };
   for (const Boundary &boundary : boundaries) {
     SCOPED_TRACE(boundary.filename);
@@ -5152,6 +5155,13 @@ TEST(Abi22MapFusionContract,
 
       std::optional<mlir::shuttle::MaterializationBufferOp> normalized;
       std::optional<mlir::shuttle::MaterializationBufferOp> primalResult;
+      llvm::SmallVector<int64_t> normalizedShape =
+          boundary.rankThree ? llvm::SmallVector<int64_t>({2, 5, 19})
+                             : llvm::SmallVector<int64_t>({5, 19});
+      llvm::SmallVector<int64_t> primalShape =
+          boundary.rankThree
+              ? llvm::SmallVector<int64_t>({2, 5, boundary.columns})
+              : llvm::SmallVector<int64_t>({5, boundary.columns});
       for (int64_t output : specializedTask.getOutputBuffers()) {
         auto found = llvm::find_if(buffers, [&](auto buffer) {
           return buffer.getOrdinal() == output;
@@ -5160,13 +5170,12 @@ TEST(Abi22MapFusionContract,
         auto type =
             mlir::dyn_cast<mlir::RankedTensorType>(found->getTensorType());
         ASSERT_TRUE(type);
-        if (type.getShape() == llvm::ArrayRef<int64_t>({5, 19}) &&
+        if (type.getShape() == llvm::ArrayRef<int64_t>(normalizedShape) &&
             type.getElementType().isBF16() && !found->getLiveOut()) {
           ASSERT_FALSE(normalized);
           normalized = *found;
         }
-        if (type.getShape() ==
-                llvm::ArrayRef<int64_t>({5, boundary.columns}) &&
+        if (type.getShape() == llvm::ArrayRef<int64_t>(primalShape) &&
             type.getElementType().isBF16() && found->getLiveOut()) {
           ASSERT_FALSE(primalResult);
           primalResult = *found;
@@ -5229,6 +5238,62 @@ TEST(Abi22MapFusionContract,
       EXPECT_EQ(specializedLaunch.outputSlots.back(),
                 primalResult->getOrdinal());
     }
+  }
+}
+
+TEST(Abi22MapFusionContract,
+     CompactHybridDeclaresEverySharedRegionRecomputation) {
+  std::optional<std::string> source = fixtureSource(
+      "jax-0.10.1-bf16-rmsnorm_contract-5x19x257-projection-vjp.mlir");
+  ASSERT_TRUE(source);
+  for (mlir::shuttle::NumericalPolicy policy :
+       {mlir::shuttle::NumericalPolicy::SourceOrdered,
+        mlir::shuttle::NumericalPolicy::Fast}) {
+    SCOPED_TRACE(mlir::shuttle::stringifyNumericalPolicy(policy).str());
+    std::unique_ptr<BuiltModule> built =
+        build(*source, policy, kFusionTuning, false, true);
+    ASSERT_TRUE(built);
+    std::optional<PlanSummary> planSummary = summary(*built->module);
+    ASSERT_TRUE(planSummary);
+    EXPECT_TRUE(planSummary->hasContractRegion);
+    EXPECT_TRUE(planSummary->hasFoldRegion);
+    EXPECT_TRUE(planSummary->exactSourceCoverage);
+
+    auto plan = *built->module->getOps<mlir::shuttle::MaterializationPlanOp>()
+                     .begin();
+    auto tasks = llvm::to_vector(
+        plan.getBody()
+            .front()
+            .getOps<mlir::shuttle::MaterializationTaskOp>());
+    auto foldTask = llvm::find_if(tasks, [](auto task) {
+      return static_cast<bool>(task->template getAttrOfType<mlir::ArrayAttr>(
+          "fold_region_sources"));
+    });
+    auto contractTask = llvm::find_if(tasks, [](auto task) {
+      return static_cast<bool>(task->template getAttrOfType<mlir::ArrayAttr>(
+          "contract_region_sources"));
+    });
+    ASSERT_NE(foldTask, tasks.end());
+    ASSERT_NE(contractTask, tasks.end());
+    mlir::shuttle::MaterializationTaskOp foldRegion = *foldTask;
+    mlir::shuttle::MaterializationTaskOp contractRegion = *contractTask;
+    auto foldRecomputed = foldRegion->getAttrOfType<mlir::ArrayAttr>(
+        "fold_region_recomputed_sources");
+    auto contractRecomputed = contractRegion->getAttrOfType<mlir::ArrayAttr>(
+        "contract_region_recomputed_sources");
+    ASSERT_TRUE(foldRecomputed);
+    ASSERT_TRUE(contractRecomputed);
+    EXPECT_EQ(sourceOperationOrdinals(foldRecomputed),
+              llvm::ArrayRef<int64_t>({0}));
+    EXPECT_EQ(sourceOperationOrdinals(contractRecomputed),
+              llvm::ArrayRef<int64_t>({0}));
+
+    mlir::FailureOr<llvm::SmallVector<uint8_t>> transport =
+        mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+    ASSERT_TRUE(mlir::succeeded(transport));
+    auto executable = mlir::shuttle::GpuExecutable::Load(*transport);
+    ASSERT_TRUE(executable.ok()) << executable.status();
+    EXPECT_EQ((*executable)->launches().size(), tasks.size());
   }
 }
 
