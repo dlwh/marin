@@ -635,6 +635,10 @@ cc_test(
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-3x2x5x11x263-backward.mlir",
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-3x2x5x11x263-composed.mlir",
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-3x2x5x11x263-forward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-rmsnorm_contract-5x19x257-composed.mlir",
+        "test/Inputs/jax-0.10.1-bf16-rmsnorm_contract-5x19x257-forward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-rmsnorm_contract-5x19x7-composed.mlir",
+        "test/Inputs/jax-0.10.1-bf16-rmsnorm_contract-5x19x7-forward.mlir",
     ],
     deps = [
         ":ShuttleGpuExecutable",

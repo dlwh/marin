@@ -85,14 +85,18 @@ def test_boundary_function_matches_public_primal_and_vjp_role_order_on_host() ->
     for shape in SHAPES:
         inputs = deterministic_inputs(shape)
         for boundary in Boundary:
-            arrays = jax.jit(subject.boundary_function(boundary))(*map(jax.device_put, inputs))
+            compiled = jax.jit(subject.boundary_function(boundary))
+            arrays = compiled(*map(jax.device_put, inputs))
             actual = tuple(np.asarray(value) for value in arrays)
+            repeated = tuple(np.asarray(value) for value in compiled(*map(jax.device_put, inputs)))
             roles = subject.result_roles(boundary)
             expected = binary64_oracle(shape)
             assert len(actual) == len(roles)
             assert tuple(value.shape for value in actual) == tuple(expected[role].shape for role in roles)
             assert all(value.dtype == np.dtype(ml_dtypes.bfloat16) for value in actual)
             assert all(np.isfinite(value.astype(np.float32)).all() for value in actual)
+            validated = subject.validate_coordinate(Coordinate(shape, boundary, Mode.DISABLED), actual, repeated, ())
+            assert tuple(validated.results) == roles
 
 
 def test_observer_requires_normative_primal_topology_but_records_composed_topology_diagnostically() -> None:
@@ -146,3 +150,21 @@ def test_validate_coordinate_rejects_repeat_nonfinite_role_and_threshold_drift()
     exceeded[2].flat[0] = ml_dtypes.bfloat16(1024.0)
     with pytest.raises(RuntimeError, match="independent binary64 threshold"):
         subject.validate_coordinate(coordinate, tuple(exceeded), tuple(exceeded), snapshot)
+
+
+def test_disabled_jax_comparison_is_labeled_diagnostic_not_the_acceptance_oracle() -> None:
+    coordinate = Coordinate((5, 19, 7), Boundary.PRIMAL, Mode.SOURCE_ORDERED)
+    expected = subject.emitted_primal_oracle(coordinate.shape, fast=False)
+    disabled = expected.copy()
+    disabled.view(np.uint16).flat[0] ^= np.uint16(1)
+
+    accepted = subject.validate_coordinate(
+        coordinate,
+        (expected,),
+        (expected.copy(),),
+        _observer_snapshot(coordinate, 1, 0),
+        disabled_jax=(disabled,),
+    )
+
+    assert accepted.disabled_jax_equal == {"result": False}
+    assert accepted.disabled_jax_results["result"] != accepted.results["result"]
