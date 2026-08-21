@@ -202,6 +202,8 @@ void expectObservedSuccess(
   EXPECT_EQ(events[0].phase(), ShuttlePipelinePhase::AlgebraCoverage);
   EXPECT_EQ(events[1].phase(), middlePhase);
   EXPECT_EQ(events[2].phase(), ShuttlePipelinePhase::FinalErasure);
+  EXPECT_GT(events[0].invocationId(), 0);
+  EXPECT_EQ(events[0].invocationId(), events[1].invocationId());
   EXPECT_EQ(events[0].invocationId(), events[2].invocationId());
   EXPECT_EQ(events[0].identity(), events[2].identity());
   EXPECT_FALSE(events[0].regionMembership().empty());
