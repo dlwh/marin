@@ -4525,7 +4525,7 @@ TEST(Abi22MapFusionContract,
       "return %1, %11, %7 : tensor<17x19xbf16>, tensor<17x33xbf16>, "
       "tensor<33x19xbf16>";
   constexpr llvm::StringLiteral expandedReturn =
-      "return %1, %12, %11, %7 : tensor<17x19xbf16>, "
+      "return %12, %1, %11, %7 : tensor<17x19xbf16>, "
       "tensor<17x19xbf16>, tensor<17x33xbf16>, tensor<33x19xbf16>";
   constexpr llvm::StringLiteral originalResults =
       "-> (tensor<17x19xbf16> {jax.result_info = \"result[0]\"}, "
@@ -4569,11 +4569,12 @@ TEST(Abi22MapFusionContract,
       cotangentOperand = index;
   }
   ASSERT_GE(cotangentOperand, 0);
-  regions[1]->setOperand(cotangentOperand, regions[0].getResult(1));
+  regions[1]->setOperand(cotangentOperand, regions[0].getResult(0));
   auto originalReturnOp =
       mlir::cast<mlir::func::ReturnOp>(function.getBody().front().back());
   ASSERT_EQ(originalReturnOp.getNumOperands(), 4u);
-  ASSERT_EQ(originalReturnOp.getOperand(1), regions[0].getResult(1));
+  ASSERT_EQ(originalReturnOp.getOperand(0), regions[0].getResult(1));
+  ASSERT_EQ(originalReturnOp.getOperand(1), regions[0].getResult(0));
   originalReturnOp->eraseOperands(1);
   llvm::SmallVector<mlir::Type> publicResultTypes;
   for (mlir::Value result : originalReturnOp.getOperands())
