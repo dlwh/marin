@@ -243,6 +243,21 @@ std::vector<std::string> ptxTokens(llvm::StringRef text) {
   return tokens;
 }
 
+std::string ptxInstructionSkeleton(llvm::StringRef instruction) {
+  std::string result;
+  size_t cursor = 0;
+  for (llvm::StringRef token : ptxTokens(instruction)) {
+    size_t position = instruction.find(token, cursor);
+    if (position == llvm::StringRef::npos)
+      return {};
+    result += instruction.slice(cursor, position).str();
+    result += "$";
+    cursor = position + token.size();
+  }
+  result += instruction.drop_front(cursor).str();
+  return result;
+}
+
 bool hasDisjointContiguousFoldLoop(llvm::StringRef ptx, int64_t outputExtent,
                                    int64_t reductionExtent,
                                    int64_t serialTiles) {
@@ -673,7 +688,9 @@ std::string ptxSemanticFingerprint(const PtxDataflow &flow,
       return current.str();
     if (!active.insert(current.str()).second)
       return "$cycle";
-    std::string result = definition->opcode + "(";
+    std::string result = definition->predicated ? "@" : "";
+    result += ptxInstructionSkeleton(definition->instruction);
+    result += "(";
     for (llvm::StringRef operand : definition->operands) {
       result += self(self, operand);
       result += ",";
@@ -1673,6 +1690,17 @@ TEST(Abi22MapFusionContract, DependentRowFoldsShareOneGenericFoldRegion) {
   wrongStride.insert(coordinateEnd + 1,
                      "  mad.lo.u64 %rd0, %rd1, 8192, %rd0;\n");
   EXPECT_FALSE(hasDependentRowFoldPhaseDataflow(wrongStride, 4096, 16));
+
+  std::string wrongAddressScale = ptx.str();
+  phase = wrongAddressScale.find("$fold_region_phase_1_load:");
+  size_t firstLoad = wrongAddressScale.find("  ld.global.u16 ", phase);
+  ASSERT_NE(firstLoad, std::string::npos);
+  size_t secondLoad = wrongAddressScale.find("  ld.global.u16 ", firstLoad + 1);
+  ASSERT_NE(secondLoad, std::string::npos);
+  size_t addressScale = wrongAddressScale.rfind(", 2, ", secondLoad);
+  ASSERT_GT(addressScale, firstLoad);
+  wrongAddressScale.replace(addressScale + 2, 1, "4");
+  EXPECT_FALSE(hasDependentRowFoldPhaseDataflow(wrongAddressScale, 4096, 16));
 
   std::string zeroInnerOperand = ptx.str();
   phase = zeroInnerOperand.find("$fold_region_phase_1_load:");
