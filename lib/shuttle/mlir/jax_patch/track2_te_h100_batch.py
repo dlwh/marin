@@ -54,14 +54,16 @@ RUNTIME_PYTHON = Path("/opt/h100-evidence-runtime/bin/python")
 RUNTIME_SITE_PACKAGES = Path("/opt/h100-evidence-runtime/lib/python3.12/site-packages")
 CUDA_ROOT = Path("/usr/local/cuda-13.2")
 NVIDIA_SITE_PACKAGES = RUNTIME_SITE_PACKAGES / "nvidia"
-NVTE_CUDA_INCLUDE_DIR = NVIDIA_SITE_PACKAGES / "cuda_runtime/include"
+NVIDIA_CU13_ROOT = NVIDIA_SITE_PACKAGES / "cu13"
+NVIDIA_CU13_LIB = NVIDIA_CU13_ROOT / "lib"
+NVTE_CUDA_INCLUDE_DIR = NVIDIA_CU13_ROOT / "include"
 RUNTIME_LIBRARY_PATHS = {
-    "cublas": NVIDIA_SITE_PACKAGES / "cublas/lib/libcublas.so.13",
-    "cublas_lt": NVIDIA_SITE_PACKAGES / "cublas/lib/libcublasLt.so.13",
-    "cudnn": NVIDIA_SITE_PACKAGES / "cudnn/lib/libcudnn.so.9",
-    "nccl": NVIDIA_SITE_PACKAGES / "nccl/lib/libnccl.so.2",
-    "cudart": CUDA_ROOT / "lib64/libcudart.so.13",
-    "nvrtc": NVIDIA_SITE_PACKAGES / "cuda_nvrtc/lib/libnvrtc.so.13",
+    "cublas": NVIDIA_CU13_LIB / "libcublas.so.13",
+    "cublas_lt": NVIDIA_CU13_LIB / "libcublasLt.so.13",
+    "cudnn": NVIDIA_CU13_LIB / "libcudnn.so.9",
+    "nccl": NVIDIA_CU13_LIB / "libnccl.so.2",
+    "cudart": NVIDIA_CU13_LIB / "libcudart.so.13",
+    "nvrtc": NVIDIA_CU13_LIB / "libnvrtc.so.13",
 }
 RUNNER_SOURCE = Path("lib/shuttle/mlir/jax_patch/abi22_te_rmsnorm_oracle_runner_v2.cpp")
 XLA_RUNNER = Path("lib/shuttle/mlir/jax_patch/abi22_xla_rmsnorm_oracle_v2.py")
@@ -447,10 +449,10 @@ def _execute_hydration(paths: BatchPaths, plan: dict[str, Any]) -> dict[str, Any
     _run(phases[6]["argv"], cwd=None, log=paths.logs / "te_wheel_extract.log", phase="te_wheel_extract")
     runner_repository = Path(plan["runner_repository"])
     validate_build_manifest(runner_repository / BUILD_MANIFEST, runner_repository / RUNNER_SOURCE)
-    cuda_runtime_headers = _validated_cuda_include(NVTE_CUDA_INCLUDE_DIR, approved_root=NVIDIA_SITE_PACKAGES)
+    cuda_runtime_headers = _validated_cuda_include(NVTE_CUDA_INCLUDE_DIR, approved_root=NVIDIA_CU13_ROOT)
     runtime_libraries = _validated_runtime_libraries(
         RUNTIME_LIBRARY_PATHS,
-        approved_roots=(CUDA_ROOT, NVIDIA_SITE_PACKAGES),
+        approved_roots=(NVIDIA_CU13_ROOT,),
         soname_reader=_elf_soname,
     )
     _run(phases[7]["argv"], cwd=None, log=paths.logs / "te_runner_build.log", phase="te_runner_build")
