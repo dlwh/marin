@@ -191,6 +191,7 @@ def batch_plan(*, workspace: Path, runner_repository: Path) -> dict[str, Any]:
         f"-L{CUDA_ROOT / 'lib64'}",
         f"-Wl,-rpath,{CUDA_ROOT / 'lib64'}",
         "-lcudart",
+        "-Wl,--allow-shlib-undefined",
         "-o",
         str(paths.te_runner),
     ]
@@ -239,6 +240,7 @@ def batch_plan(*, workspace: Path, runner_repository: Path) -> dict[str, Any]:
                 "argv": [str(RUNTIME_PYTHON), "-m", "zipfile", "-e", str(paths.te_wheel), str(paths.te_runtime)],
             },
             {"name": "te_runner_build", "argv": compile_argv},
+            {"name": "te_runner_link_check", "argv": ["ldd", str(paths.te_runner)]},
         ],
         "schema": "shuttle_track2_te_h100_batch_plan_v1",
         "runner_repository": str(runner_repository),
@@ -247,10 +249,12 @@ def batch_plan(*, workspace: Path, runner_repository: Path) -> dict[str, Any]:
     }
 
 
-def _run(argv: list[str], *, cwd: Path | None, log: Path, phase: str) -> None:
+def _run(
+    argv: list[str], *, cwd: Path | None, log: Path, phase: str, environment: Mapping[str, str] | None = None
+) -> None:
     print(f"TRACK2_TE_H100_PHASE={phase}", flush=True)
     with log.open("wb") as stream:
-        result = subprocess.run(argv, cwd=cwd, stdout=stream, stderr=subprocess.STDOUT, check=False)
+        result = subprocess.run(argv, cwd=cwd, env=environment, stdout=stream, stderr=subprocess.STDOUT, check=False)
     if result.returncode == 0:
         return
     tail = log.read_bytes()[-32 * 1024 :].decode(errors="replace")
@@ -320,6 +324,13 @@ def runtime_environment(paths: BatchPaths) -> dict[str, str]:
     return environment
 
 
+def _validate_link_closure(log: Path) -> None:
+    output = log.read_text()
+    required = ("libtransformer_engine.so", "libcublasLt.so.13", "libcudnn.so.9", "libnccl.so", "libnvrtc.so")
+    if "not found" in output or any(library not in output for library in required):
+        raise RuntimeError("Transformer Engine runtime dependency closure is incomplete")
+
+
 def _invoke_oracle(paths: BatchPaths, argv: list[str]) -> int:
     return subprocess.run(argv, cwd=paths.workspace, env=runtime_environment(paths), check=False).returncode
 
@@ -358,6 +369,15 @@ def _execute_hydration(paths: BatchPaths, plan: dict[str, Any]) -> dict[str, Any
     runner_repository = Path(plan["runner_repository"])
     validate_build_manifest(runner_repository / BUILD_MANIFEST, runner_repository / RUNNER_SOURCE)
     _run(phases[7]["argv"], cwd=None, log=paths.logs / "te_runner_build.log", phase="te_runner_build")
+    link_log = paths.logs / "te_runner_link_check.log"
+    _run(
+        phases[8]["argv"],
+        cwd=None,
+        log=link_log,
+        phase="te_runner_link_check",
+        environment=runtime_environment(paths),
+    )
+    _validate_link_closure(link_log)
     observed["transformer_engine"] = validate_te_hydration(paths)
     return observed
 
