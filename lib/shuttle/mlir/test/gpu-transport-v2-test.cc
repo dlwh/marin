@@ -46,6 +46,7 @@
 #include "xla/stream_executor/mock_stream_executor.h"
 #include "xla/stream_executor/platform_manager.h"
 #include "xla/stream_executor/stream_executor_address_allocator.h"
+#include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -4295,6 +4296,14 @@ uint16_t roundToBf16(float value) {
   return static_cast<uint16_t>(bits >> 16);
 }
 
+uint16_t roundBinary64ToBf16(double value) {
+  llvm::APFloat converted(value);
+  bool losesInformation = false;
+  converted.convert(llvm::APFloat::BFloat(),
+                    llvm::APFloat::rmNearestTiesToEven, &losesInformation);
+  return static_cast<uint16_t>(converted.bitcastToAPInt().getZExtValue());
+}
+
 float expandBf16(uint16_t value) {
   uint32_t bits = static_cast<uint32_t>(value) << 16;
   float result;
@@ -4867,6 +4876,374 @@ void expectProspectiveLayerNormMetrics(
       << "element " << metrics.maxUlpElement;
 }
 
+struct ProspectiveLayerNormBCInputs {
+  std::vector<uint16_t> x;
+  std::vector<uint16_t> gamma;
+  std::vector<uint16_t> beta;
+  std::vector<uint16_t> dy;
+};
+
+struct ProspectiveLayerNormBCOutputs {
+  std::vector<uint16_t> y;
+  std::vector<uint16_t> dx;
+  std::vector<uint16_t> dgamma;
+  std::vector<uint16_t> dbeta;
+};
+
+struct ProspectiveLayerNormBCShape {
+  int64_t rows;
+  int64_t features;
+  llvm::StringLiteral xDigest;
+  llvm::StringLiteral gammaDigest;
+  llvm::StringLiteral betaDigest;
+  llvm::StringLiteral dyDigest;
+  llvm::StringLiteral yBinary64Digest;
+  llvm::StringLiteral yScheduleDigest;
+  ProspectiveLayerNormMetrics yScheduleMetrics;
+  llvm::StringLiteral dxBinary64Digest;
+  llvm::StringLiteral dxScheduleDigest;
+  ProspectiveLayerNormMetrics dxScheduleMetrics;
+  llvm::StringLiteral dgammaBinary64Digest;
+  llvm::StringLiteral dgammaScheduleDigest;
+  ProspectiveLayerNormMetrics dgammaScheduleMetrics;
+  llvm::StringLiteral dbetaBinary64Digest;
+  llvm::StringLiteral dbetaScheduleDigest;
+  ProspectiveLayerNormMetrics dbetaScheduleMetrics;
+};
+
+constexpr ProspectiveLayerNormBCShape prospectiveLayerNormBCShapes[] = {
+    {7,
+     13,
+     "0fe6d5e5084b72bf57bcbb4affabdf6ce0038d15c251c6dce924b1c8a8559be6",
+     "c9e5c9f0e550b03a02010b475cb92577d091cccb5425b342b9c8c2823c69cb32",
+     "17c936c8c05034e8d34e49c3530017d1a15a275dc16574529ff3bf814ccedadf",
+     "d045615e648a5d750f526e4a0a9e41fef8b207caf9bd6fd0b3f5abf19a13f18e",
+     "6d7901d6d945419ffe66a9b56b2d6e63aeaed5e7c07038015bdb1c050cd348f1",
+     "6d7901d6d945419ffe66a9b56b2d6e63aeaed5e7c07038015bdb1c050cd348f1",
+     {},
+     "81ae8b751e4ab5b858281c589b32b367bbeb2cd13f791a682b0c57854e9b9bbb",
+     "81ae8b751e4ab5b858281c589b32b367bbeb2cd13f791a682b0c57854e9b9bbb",
+     {},
+     "5686b2988a5bb2a4a10ec68a6cf2a893ec143a87f295df2c0118b8950aee9b8f",
+     "5686b2988a5bb2a4a10ec68a6cf2a893ec143a87f295df2c0118b8950aee9b8f",
+     {},
+     "28cd2c8159ce8c7c81935a3ee04d8caef7532f7987d5fc1c0c594e496fa298c1",
+     "28cd2c8159ce8c7c81935a3ee04d8caef7532f7987d5fc1c0c594e496fa298c1",
+     {}},
+    {2048,
+     4096,
+     "cd79bea91b72f77223c17571eb70bec5e68b374aae15b974928232fb88ef9596",
+     "1218887097652ad93aaf40297de7f801e4d2fa49d39376d2af5455b6c51a69cd",
+     "01b877aa71cd4723ff43634507d1fe887a598a8a9a1324f2a9f68457bd0241d9",
+     "286540355c5a50b6bfed5fe663ee90d3e52fc0316e29b2858062e72f0262001e",
+     "f7b1ab8d1f466f89b1d2abc58812de657c72872aeae50b9bb93d474d0c17ce04",
+     "1205d82496299537fb10e24372188ee75ff16792e1756e3d9ddeb08ee06d047a",
+     {0.015625, 6.057504975398587e-08, 0.004291845493562232, 67},
+     "d8e8882b084dae37cef5bf249c29567621a44bf9695bad7c4a246afeedba4ad9",
+     "acee3c6ca9328e9f0cdc79224eb76c0ec15a733f6b74bbaa1e75c57b0c122b07",
+     {0.0078125, 3.725514735597457e-08, 3.838689072327044e-07, 4},
+     "4fe9f3882c6d5b3a496f5af15788e099bec54f72499d722df43c1dd6bc65c4db",
+     "4fe9f3882c6d5b3a496f5af15788e099bec54f72499d722df43c1dd6bc65c4db",
+     {},
+     "ff5cd3c12d2677dc34e53bdf7a0339a5201b54269463e68b4ae9f3c9298f301e",
+     "44470b91df4564c1c10b4088bc100c6c7ea2656ec2aeb2628fc04338e26f75c6",
+     {1.0, 0.000244140625, 0.0064516129032258064, 1}},
+};
+
+constexpr mlir::shuttle::NumericalPolicy prospectiveLayerNormBCPolicies[] = {
+    mlir::shuttle::NumericalPolicy::SourceOrdered,
+    mlir::shuttle::NumericalPolicy::Fast,
+};
+
+uint32_t prospectiveLayerNormBCMix32(uint32_t index, uint32_t stream) {
+  uint32_t value = index + UINT32_C(0xBB67AE85) +
+                   stream * UINT32_C(0x9E3779B9);
+  value ^= value >> 16;
+  value *= UINT32_C(0x7FEB352D);
+  value ^= value >> 15;
+  value *= UINT32_C(0x846CA68B);
+  value ^= value >> 16;
+  return value;
+}
+
+ProspectiveLayerNormBCInputs prospectiveLayerNormBCInputs(
+    const ProspectiveLayerNormBCShape &shape) {
+  ProspectiveLayerNormBCInputs inputs;
+  inputs.x.resize(shape.rows * shape.features);
+  inputs.dy.resize(shape.rows * shape.features);
+  inputs.gamma.resize(shape.features);
+  inputs.beta.resize(shape.features);
+  for (size_t index = 0; index < inputs.x.size(); ++index) {
+    int32_t x = static_cast<int32_t>(prospectiveLayerNormBCMix32(index, 1) %
+                                     UINT32_C(513)) -
+                256;
+    int32_t dy = static_cast<int32_t>(prospectiveLayerNormBCMix32(index, 4) %
+                                      UINT32_C(385)) -
+                 192;
+    inputs.x[index] = roundToBf16(static_cast<float>(x) / 128.0f);
+    inputs.dy[index] = roundToBf16(static_cast<float>(dy) / 128.0f);
+  }
+  for (int64_t feature = 0; feature < shape.features; ++feature) {
+    uint32_t gammaBits = prospectiveLayerNormBCMix32(feature, 2);
+    int32_t gamma =
+        64 + static_cast<int32_t>(gammaBits % UINT32_C(129));
+    if ((gammaBits & UINT32_C(0x100)) != 0)
+      gamma = -gamma;
+    int32_t beta =
+        static_cast<int32_t>(prospectiveLayerNormBCMix32(feature, 3) %
+                             UINT32_C(257)) -
+        128;
+    inputs.gamma[feature] =
+        roundToBf16(static_cast<float>(gamma) / 128.0f);
+    inputs.beta[feature] =
+        roundToBf16(static_cast<float>(beta) / 128.0f);
+  }
+  if (shape.rows == 2048 && shape.features == 4096) {
+    for (int64_t row = 0; row < shape.rows; ++row) {
+      inputs.dy[row * shape.features] = roundToBf16(0.0f);
+      inputs.dy[row * shape.features + 1] = roundToBf16(0.0f);
+    }
+    constexpr float sentinel[] = {
+        -1.0f / 2048.0f, 512.0f,   -0.5f,    4.0f,
+        -16384.0f,        16384.0f, -256.0f, -128.0f,
+    };
+    for (auto [index, value] : llvm::enumerate(sentinel)) {
+      inputs.dy[index * 8 * shape.features] = roundToBf16(value);
+      inputs.dy[index * shape.features + 1] = roundToBf16(value);
+    }
+  }
+  return inputs;
+}
+
+std::vector<float> prospectiveScheduledColumnFold(
+    llvm::ArrayRef<float> values, int64_t rows, int64_t features) {
+  std::vector<float> transposed(values.size());
+  for (int64_t row = 0; row < rows; ++row)
+    for (int64_t feature = 0; feature < features; ++feature)
+      transposed[feature * rows + row] = values[row * features + feature];
+  return prospectiveScheduledFold(transposed, features, rows);
+}
+
+ProspectiveLayerNormBCOutputs prospectiveScheduledLayerNormBC(
+    const ProspectiveLayerNormBCInputs &inputs, int64_t rows,
+    int64_t features) {
+  const size_t elements = static_cast<size_t>(rows * features);
+  std::vector<float> x(elements), dy(elements), gamma(features), beta(features);
+  for (size_t index = 0; index < elements; ++index) {
+    x[index] = expandBf16(inputs.x[index]);
+    dy[index] = expandBf16(inputs.dy[index]);
+  }
+  for (int64_t feature = 0; feature < features; ++feature) {
+    gamma[feature] = expandBf16(inputs.gamma[feature]);
+    beta[feature] = expandBf16(inputs.beta[feature]);
+  }
+
+  std::vector<float> sums = prospectiveScheduledFold(x, rows, features);
+  std::vector<float> centered(elements), squared(elements), normalized(elements);
+  std::vector<float> means(rows);
+  for (int64_t row = 0; row < rows; ++row) {
+    means[row] = prospectiveDivide(sums[row], static_cast<float>(features));
+    for (int64_t feature = 0; feature < features; ++feature) {
+      size_t element = row * features + feature;
+      centered[element] = prospectiveSubtract(x[element], means[row]);
+      squared[element] =
+          prospectiveMultiply(centered[element], centered[element]);
+    }
+  }
+  std::vector<float> squaredSums =
+      prospectiveScheduledFold(squared, rows, features);
+  std::vector<float> inverse(rows), shifted(rows);
+  for (int64_t row = 0; row < rows; ++row) {
+    float variance = prospectiveDivide(squaredSums[row],
+                                       static_cast<float>(features));
+    shifted[row] = prospectiveAdd(variance, 1.0e-5f);
+    inverse[row] = prospectiveDivide(1.0f, prospectiveSqrt(shifted[row]));
+    for (int64_t feature = 0; feature < features; ++feature) {
+      size_t element = row * features + feature;
+      normalized[element] =
+          prospectiveMultiply(centered[element], inverse[row]);
+    }
+  }
+
+  std::vector<float> weighted(elements), centeredWeighted(elements);
+  for (int64_t row = 0; row < rows; ++row)
+    for (int64_t feature = 0; feature < features; ++feature) {
+      size_t element = row * features + feature;
+      weighted[element] = prospectiveMultiply(dy[element], gamma[feature]);
+      centeredWeighted[element] =
+          prospectiveMultiply(centered[element], weighted[element]);
+    }
+  std::vector<float> correctionSums =
+      prospectiveScheduledFold(centeredWeighted, rows, features);
+  std::vector<float> correction(rows);
+  for (int64_t row = 0; row < rows; ++row) {
+    correction[row] = prospectiveDivide(inverse[row], shifted[row]);
+    correction[row] = prospectiveMultiply(-0.5f, correction[row]);
+    correction[row] =
+        prospectiveMultiply(correctionSums[row], correction[row]);
+    correction[row] =
+        prospectiveDivide(correction[row], static_cast<float>(features));
+    correction[row] = prospectiveAdd(0.0f, correction[row]);
+  }
+  std::vector<float> joined(elements);
+  for (int64_t row = 0; row < rows; ++row)
+    for (int64_t feature = 0; feature < features; ++feature) {
+      size_t element = row * features + feature;
+      float direct = prospectiveMultiply(weighted[element], inverse[row]);
+      float correctionLeft =
+          prospectiveMultiply(centered[element], correction[row]);
+      joined[element] = prospectiveAdd(direct, correctionLeft);
+      float correctionRight =
+          prospectiveMultiply(correction[row], centered[element]);
+      joined[element] = prospectiveAdd(joined[element], correctionRight);
+    }
+  std::vector<float> negative(elements);
+  for (size_t element = 0; element < elements; ++element)
+    negative[element] = -joined[element];
+  std::vector<float> rowCorrections =
+      prospectiveScheduledFold(negative, rows, features);
+  for (float &value : rowCorrections) {
+    value = prospectiveDivide(value, static_cast<float>(features));
+    value = prospectiveAdd(0.0f, value);
+  }
+
+  ProspectiveLayerNormBCOutputs outputs;
+  outputs.y.resize(elements);
+  outputs.dx.resize(elements);
+  std::vector<float> dgammaInput(elements);
+  for (int64_t row = 0; row < rows; ++row)
+    for (int64_t feature = 0; feature < features; ++feature) {
+      size_t element = row * features + feature;
+      float y = prospectiveMultiply(normalized[element], gamma[feature]);
+      y = prospectiveAdd(y, beta[feature]);
+      outputs.y[element] = roundToBf16(y);
+      outputs.dx[element] =
+          roundToBf16(prospectiveAdd(joined[element], rowCorrections[row]));
+      dgammaInput[element] =
+          prospectiveMultiply(normalized[element], dy[element]);
+    }
+  std::vector<float> dgamma =
+      prospectiveScheduledColumnFold(dgammaInput, rows, features);
+  std::vector<float> dbeta =
+      prospectiveScheduledColumnFold(dy, rows, features);
+  outputs.dgamma.resize(features);
+  outputs.dbeta.resize(features);
+  for (int64_t feature = 0; feature < features; ++feature) {
+    outputs.dgamma[feature] =
+        roundToBf16(prospectiveAdd(0.0f, dgamma[feature]));
+    outputs.dbeta[feature] =
+        roundToBf16(prospectiveAdd(0.0f, dbeta[feature]));
+  }
+  return outputs;
+}
+
+ProspectiveLayerNormBCOutputs prospectiveBinary64LayerNormBC(
+    const ProspectiveLayerNormBCInputs &inputs, int64_t rows,
+    int64_t features) {
+  const size_t elements = static_cast<size_t>(rows * features);
+  std::vector<double> centered(elements), normalized(elements), weighted(elements);
+  std::vector<double> inverse(rows);
+  for (int64_t row = 0; row < rows; ++row) {
+    double sum = 0.0;
+    for (int64_t feature = 0; feature < features; ++feature)
+      sum += expandBf16(inputs.x[row * features + feature]);
+    double mean = sum / static_cast<double>(features);
+    double squaredSum = 0.0;
+    for (int64_t feature = 0; feature < features; ++feature) {
+      size_t element = row * features + feature;
+      centered[element] = static_cast<double>(expandBf16(inputs.x[element])) - mean;
+      squaredSum += centered[element] * centered[element];
+    }
+    inverse[row] =
+        1.0 / std::sqrt(squaredSum / static_cast<double>(features) +
+                        static_cast<double>(1.0e-5f));
+    for (int64_t feature = 0; feature < features; ++feature) {
+      size_t element = row * features + feature;
+      normalized[element] = centered[element] * inverse[row];
+      weighted[element] = static_cast<double>(expandBf16(inputs.dy[element])) *
+                          static_cast<double>(expandBf16(inputs.gamma[feature]));
+    }
+  }
+
+  ProspectiveLayerNormBCOutputs outputs;
+  outputs.y.resize(elements);
+  outputs.dx.resize(elements);
+  outputs.dgamma.resize(features);
+  outputs.dbeta.resize(features);
+  std::vector<double> dgamma(features, 0.0), dbeta(features, 0.0);
+  for (int64_t row = 0; row < rows; ++row) {
+    double meanWeighted = 0.0;
+    double meanWeightedNormalized = 0.0;
+    for (int64_t feature = 0; feature < features; ++feature) {
+      size_t element = row * features + feature;
+      meanWeighted += weighted[element];
+      meanWeightedNormalized += weighted[element] * normalized[element];
+    }
+    meanWeighted /= static_cast<double>(features);
+    meanWeightedNormalized /= static_cast<double>(features);
+    for (int64_t feature = 0; feature < features; ++feature) {
+      size_t element = row * features + feature;
+      double dy = expandBf16(inputs.dy[element]);
+      double y = normalized[element] * expandBf16(inputs.gamma[feature]) +
+                 expandBf16(inputs.beta[feature]);
+      double dx = inverse[row] *
+                  (weighted[element] - meanWeighted -
+                   normalized[element] * meanWeightedNormalized);
+      outputs.y[element] = roundBinary64ToBf16(y);
+      outputs.dx[element] = roundBinary64ToBf16(dx);
+      dgamma[feature] += dy * normalized[element];
+      dbeta[feature] += dy;
+    }
+  }
+  for (int64_t feature = 0; feature < features; ++feature) {
+    outputs.dgamma[feature] = roundBinary64ToBf16(dgamma[feature]);
+    outputs.dbeta[feature] = roundBinary64ToBf16(dbeta[feature]);
+  }
+  return outputs;
+}
+
+void expectProspectiveLayerNormBCLimits(
+    llvm::StringRef role, const ProspectiveLayerNormMetrics &metrics) {
+  if (role == "y") {
+    EXPECT_LE(metrics.maxAbsoluteError, 0.0625);
+    EXPECT_LE(metrics.meanAbsoluteError, 1.52587890625e-05);
+    EXPECT_LE(metrics.relativeLinfError, 0.015625);
+    EXPECT_LE(metrics.maxBf16UlpError, 128);
+  } else if (role == "dx") {
+    EXPECT_LE(metrics.maxAbsoluteError, 0.0625);
+    EXPECT_LE(metrics.meanAbsoluteError, 6.103515625e-05);
+    EXPECT_LE(metrics.relativeLinfError, 0.03125);
+    EXPECT_LE(metrics.maxBf16UlpError, 4);
+  } else {
+    EXPECT_LE(metrics.maxAbsoluteError, 2.0);
+    EXPECT_LE(metrics.meanAbsoluteError, 0.0625);
+    EXPECT_LE(metrics.relativeLinfError, 0.015625);
+    EXPECT_LE(metrics.maxBf16UlpError, 2);
+  }
+}
+
+bool prospectiveLayerNormBCMatrixIsExact(
+    llvm::ArrayRef<ProspectiveLayerNormBCShape> shapes,
+    llvm::ArrayRef<llvm::StringRef> boundaries,
+    llvm::ArrayRef<mlir::shuttle::NumericalPolicy> policies) {
+  if (shapes.size() != 2 || boundaries.size() != 2 || policies.size() != 2)
+    return false;
+  if (llvm::count_if(shapes, [](const auto &shape) {
+        return shape.rows == 7 && shape.features == 13;
+      }) != 1 ||
+      llvm::count_if(shapes, [](const auto &shape) {
+        return shape.rows == 2048 && shape.features == 4096;
+      }) != 1 ||
+      std::count(boundaries.begin(), boundaries.end(), "backward") != 1 ||
+      std::count(boundaries.begin(), boundaries.end(), "composed") != 1 ||
+      std::count(policies.begin(), policies.end(),
+                 mlir::shuttle::NumericalPolicy::SourceOrdered) != 1 ||
+      std::count(policies.begin(), policies.end(),
+                 mlir::shuttle::NumericalPolicy::Fast) != 1)
+    return false;
+  return shapes.size() * boundaries.size() * policies.size() == 8;
+}
+
 TEST(GpuTransportV2Test,
      ProspectiveLayerNormBinary64OraclePromotesPublicF32Epsilon) {
   LayerNormInputs inputs{
@@ -4959,6 +5336,185 @@ TEST(GpuTransportV2Test,
     EXPECT_EQ(metrics->maxBf16UlpError, cell.scheduleMaxBf16UlpError);
     expectProspectiveLayerNormMetrics(*metrics, cell);
   }
+}
+
+TEST(GpuTransportV2Test,
+     ProspectiveLayerNormBCMatrixRejectsRemovalAndDuplication) {
+  constexpr llvm::StringRef boundaries[] = {"backward", "composed"};
+  EXPECT_TRUE(prospectiveLayerNormBCMatrixIsExact(
+      prospectiveLayerNormBCShapes, boundaries,
+      prospectiveLayerNormBCPolicies));
+
+  std::vector<ProspectiveLayerNormBCShape> shapes(
+      std::begin(prospectiveLayerNormBCShapes),
+      std::end(prospectiveLayerNormBCShapes));
+  shapes.pop_back();
+  EXPECT_FALSE(prospectiveLayerNormBCMatrixIsExact(
+      shapes, boundaries, prospectiveLayerNormBCPolicies));
+  shapes.assign(std::begin(prospectiveLayerNormBCShapes),
+                std::end(prospectiveLayerNormBCShapes));
+  shapes[1] = shapes[0];
+  EXPECT_FALSE(prospectiveLayerNormBCMatrixIsExact(
+      shapes, boundaries, prospectiveLayerNormBCPolicies));
+
+  std::vector<llvm::StringRef> mutableBoundaries(std::begin(boundaries),
+                                                 std::end(boundaries));
+  mutableBoundaries.pop_back();
+  EXPECT_FALSE(prospectiveLayerNormBCMatrixIsExact(
+      prospectiveLayerNormBCShapes, mutableBoundaries,
+      prospectiveLayerNormBCPolicies));
+  mutableBoundaries = {"backward", "backward"};
+  EXPECT_FALSE(prospectiveLayerNormBCMatrixIsExact(
+      prospectiveLayerNormBCShapes, mutableBoundaries,
+      prospectiveLayerNormBCPolicies));
+
+  std::vector<mlir::shuttle::NumericalPolicy> policies(
+      std::begin(prospectiveLayerNormBCPolicies),
+      std::end(prospectiveLayerNormBCPolicies));
+  policies.pop_back();
+  EXPECT_FALSE(prospectiveLayerNormBCMatrixIsExact(
+      prospectiveLayerNormBCShapes, boundaries, policies));
+  policies = {mlir::shuttle::NumericalPolicy::Fast,
+              mlir::shuttle::NumericalPolicy::Fast};
+  EXPECT_FALSE(prospectiveLayerNormBCMatrixIsExact(
+      prospectiveLayerNormBCShapes, boundaries, policies));
+}
+
+TEST(GpuTransportV2Test,
+     ProspectiveLayerNormBCBinary64OracleRoundsDirectlyToBf16) {
+  const double value = 1.00390625 + std::ldexp(1.0, -30);
+  EXPECT_EQ(roundBinary64ToBf16(value), UINT16_C(0x3f81));
+  EXPECT_EQ(roundToBf16(static_cast<float>(value)), UINT16_C(0x3f80));
+}
+
+TEST(GpuTransportV2Test,
+     ProspectiveLayerNormBCContractMatchesIndependentHostModels) {
+  for (const ProspectiveLayerNormBCShape &shape :
+       prospectiveLayerNormBCShapes) {
+    SCOPED_TRACE(llvm::formatv("{0}x{1}", shape.rows, shape.features).str());
+    ProspectiveLayerNormBCInputs inputs = prospectiveLayerNormBCInputs(shape);
+    EXPECT_EQ(prospectiveBf16Digest(inputs.x, {shape.rows, shape.features}),
+              shape.xDigest);
+    EXPECT_EQ(prospectiveBf16Digest(inputs.gamma, {shape.features}),
+              shape.gammaDigest);
+    EXPECT_EQ(prospectiveBf16Digest(inputs.beta, {shape.features}),
+              shape.betaDigest);
+    EXPECT_EQ(prospectiveBf16Digest(inputs.dy, {shape.rows, shape.features}),
+              shape.dyDigest);
+
+    ProspectiveLayerNormBCOutputs binary64 =
+        prospectiveBinary64LayerNormBC(inputs, shape.rows, shape.features);
+    ProspectiveLayerNormBCOutputs scheduled =
+        prospectiveScheduledLayerNormBC(inputs, shape.rows, shape.features);
+    EXPECT_EQ(prospectiveBf16Digest(binary64.y,
+                                    {shape.rows, shape.features}),
+              shape.yBinary64Digest);
+    EXPECT_EQ(prospectiveBf16Digest(scheduled.y,
+                                    {shape.rows, shape.features}),
+              shape.yScheduleDigest);
+    EXPECT_EQ(prospectiveBf16Digest(binary64.dx,
+                                    {shape.rows, shape.features}),
+              shape.dxBinary64Digest);
+    EXPECT_EQ(prospectiveBf16Digest(scheduled.dx,
+                                    {shape.rows, shape.features}),
+              shape.dxScheduleDigest);
+    EXPECT_EQ(prospectiveBf16Digest(binary64.dgamma, {shape.features}),
+              shape.dgammaBinary64Digest);
+    EXPECT_EQ(prospectiveBf16Digest(scheduled.dgamma, {shape.features}),
+              shape.dgammaScheduleDigest);
+    EXPECT_EQ(prospectiveBf16Digest(binary64.dbeta, {shape.features}),
+              shape.dbetaBinary64Digest);
+    EXPECT_EQ(prospectiveBf16Digest(scheduled.dbeta, {shape.features}),
+              shape.dbetaScheduleDigest);
+
+    auto expectMetrics = [&](llvm::StringRef role,
+                             llvm::ArrayRef<uint16_t> actual,
+                             llvm::ArrayRef<uint16_t> reference,
+                             const ProspectiveLayerNormMetrics &sealed) {
+      auto metrics = prospectiveLayerNormMetrics(actual, reference);
+      ASSERT_TRUE(metrics);
+      EXPECT_DOUBLE_EQ(metrics->maxAbsoluteError, sealed.maxAbsoluteError);
+      EXPECT_DOUBLE_EQ(metrics->meanAbsoluteError, sealed.meanAbsoluteError);
+      EXPECT_DOUBLE_EQ(metrics->relativeLinfError, sealed.relativeLinfError);
+      EXPECT_EQ(metrics->maxBf16UlpError, sealed.maxBf16UlpError);
+      expectProspectiveLayerNormBCLimits(role, *metrics);
+    };
+    expectMetrics("y", scheduled.y, binary64.y, shape.yScheduleMetrics);
+    expectMetrics("dx", scheduled.dx, binary64.dx,
+                  shape.dxScheduleMetrics);
+    expectMetrics("dgamma", scheduled.dgamma, binary64.dgamma,
+                  shape.dgammaScheduleMetrics);
+    expectMetrics("dbeta", scheduled.dbeta, binary64.dbeta,
+                  shape.dbetaScheduleMetrics);
+
+    auto wrongDx = prospectiveLayerNormMetrics(scheduled.y, binary64.dx);
+    ASSERT_TRUE(wrongDx);
+    EXPECT_TRUE(wrongDx->maxAbsoluteError > 0.0625 ||
+                wrongDx->maxBf16UlpError > 4);
+    auto swappedFeature =
+        prospectiveLayerNormMetrics(scheduled.dbeta, binary64.dgamma);
+    ASSERT_TRUE(swappedFeature);
+    EXPECT_TRUE(swappedFeature->maxAbsoluteError > 2.0 ||
+                swappedFeature->maxBf16UlpError > 2);
+
+    if (shape.rows == 2048 && shape.features == 4096) {
+      ASSERT_GE(scheduled.dbeta.size(), 2u);
+      EXPECT_EQ(scheduled.dbeta[0], UINT16_C(0x4303));
+      EXPECT_EQ(scheduled.dbeta[1], UINT16_C(0x4304));
+      std::array<std::vector<float>, 2> columns;
+      for (int64_t feature = 0; feature < 2; ++feature) {
+        columns[feature].reserve(shape.rows);
+        for (int64_t row = 0; row < shape.rows; ++row)
+          columns[feature].push_back(
+              expandBf16(inputs.dy[row * shape.features + feature]));
+      }
+      auto expectWrongFold = [&](llvm::StringRef name, auto fold) {
+        std::vector<uint16_t> wrong = scheduled.dbeta;
+        for (int64_t feature = 0; feature < 2; ++feature)
+          wrong[feature] = roundToBf16(fold(columns[feature]));
+        EXPECT_NE(prospectiveBf16Digest(wrong, {shape.features}),
+                  shape.dbetaScheduleDigest)
+            << name.str();
+      };
+      expectWrongFold("serial", [](llvm::ArrayRef<float> values) {
+        float accumulator = 0.0f;
+        for (float value : values)
+          accumulator = prospectiveAdd(accumulator, value);
+        return accumulator;
+      });
+      expectWrongFold("global_adjacent_pair",
+                      [](llvm::ArrayRef<float> values) {
+                        std::vector<float> partials(values.begin(),
+                                                    values.end());
+                        while (partials.size() > 1) {
+                          std::vector<float> reduced((partials.size() + 1) /
+                                                     2);
+                          size_t pairs = partials.size() / 2;
+                          for (size_t pair = 0; pair < pairs; ++pair)
+                            reduced[pair] = prospectiveAdd(
+                                partials[pair * 2], partials[pair * 2 + 1]);
+                          if ((partials.size() & 1) != 0)
+                            reduced[pairs] = partials.back();
+                          partials = std::move(reduced);
+                        }
+                        return partials.front();
+                      });
+      expectWrongFold("reverse_serial", [](llvm::ArrayRef<float> values) {
+        float accumulator = 0.0f;
+        for (float value : llvm::reverse(values))
+          accumulator = prospectiveAdd(accumulator, value);
+        return accumulator;
+      });
+    }
+  }
+
+  std::vector<uint16_t> nearZero{roundToBf16(-2.6077032089233398e-08f)};
+  std::vector<uint16_t> gross{roundToBf16(1.0f / 256.0f)};
+  auto grossMetrics = prospectiveLayerNormMetrics(gross, nearZero);
+  ASSERT_TRUE(grossMetrics);
+  EXPECT_GT(grossMetrics->maxBf16UlpError, 128);
+  std::vector<uint16_t> nonfinite{UINT16_C(0x7f80)};
+  EXPECT_FALSE(prospectiveLayerNormMetrics(nonfinite, nearZero));
 }
 
 TEST(GpuTransportV2Test, H100RunnerExecutesThreeMapBf16Chain) {
@@ -5400,6 +5956,340 @@ TEST(GpuTransportV2Test,
       "7x13_balanced_source_ordered",
       "7x13_positive_offset_fast",
       "7x13_positive_offset_source_ordered",
+  };
+  EXPECT_EQ(executedCoordinates, expectedCoordinates);
+}
+
+TEST(GpuTransportV2Test,
+     H100RunnerMatchesProspectiveLayerNormBCContractV1) {
+  if (std::getenv("SHUTTLE_RUN_H100_NUMERICS") == nullptr)
+    GTEST_SKIP() << "set SHUTTLE_RUN_H100_NUMERICS=1 on an H100 worker";
+
+  auto platform = stream_executor::PlatformManager::PlatformWithName("CUDA");
+  ASSERT_TRUE(platform.ok()) << platform.status();
+  auto executor = (*platform)->ExecutorForDevice(0);
+  ASSERT_TRUE(executor.ok()) << executor.status();
+  ASSERT_NE((*executor)->GetDeviceDescription().name().find("H100"),
+            std::string::npos);
+  auto stream = (*executor)->CreateStream();
+  ASSERT_TRUE(stream.ok()) << stream.status();
+  stream_executor::StreamExecutorAddressAllocator allocator(*executor);
+  const auto &capability =
+      (*executor)->GetDeviceDescription().gpu_compute_capability();
+
+  constexpr llvm::StringLiteral sourceOrderedOptions =
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+  constexpr llvm::StringLiteral fastOptions =
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+  constexpr llvm::StringLiteral tuning =
+      R"json({"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json";
+  constexpr llvm::StringRef boundaries[] = {"backward", "composed"};
+  ASSERT_TRUE(prospectiveLayerNormBCMatrixIsExact(
+      prospectiveLayerNormBCShapes, boundaries,
+      prospectiveLayerNormBCPolicies));
+
+  std::vector<std::string> executedCoordinates;
+  for (const ProspectiveLayerNormBCShape &shape :
+       prospectiveLayerNormBCShapes) {
+    ProspectiveLayerNormBCInputs inputs = prospectiveLayerNormBCInputs(shape);
+    ProspectiveLayerNormBCOutputs scheduled =
+        prospectiveScheduledLayerNormBC(inputs, shape.rows, shape.features);
+    ProspectiveLayerNormBCOutputs binary64 =
+        prospectiveBinary64LayerNormBC(inputs, shape.rows, shape.features);
+    ASSERT_EQ(prospectiveBf16Digest(inputs.x, {shape.rows, shape.features}),
+              shape.xDigest);
+    ASSERT_EQ(prospectiveBf16Digest(inputs.gamma, {shape.features}),
+              shape.gammaDigest);
+    ASSERT_EQ(prospectiveBf16Digest(inputs.beta, {shape.features}),
+              shape.betaDigest);
+    ASSERT_EQ(prospectiveBf16Digest(inputs.dy, {shape.rows, shape.features}),
+              shape.dyDigest);
+    const int64_t matrixBytes =
+        shape.rows * shape.features * static_cast<int64_t>(sizeof(uint16_t));
+    const int64_t featureBytes =
+        shape.features * static_cast<int64_t>(sizeof(uint16_t));
+    const llvm::StringRef stem =
+        shape.rows == 7 ? "81928ab3539c0f03" : "44d152ecc3e9ff18";
+    for (llvm::StringRef boundary : boundaries) {
+      const bool composed = boundary == "composed";
+      std::string fixture =
+          (llvm::Twine("jax-0.10.1-bf16-layer_norm_") + stem + "-" +
+           boundary + ".mlir")
+              .str();
+      auto source = fixtureSource(fixture);
+      ASSERT_TRUE(source);
+      const std::vector<const std::vector<uint16_t> *> hostOperands =
+          composed
+              ? std::vector<const std::vector<uint16_t> *>{
+                    &inputs.x, &inputs.gamma, &inputs.beta, &inputs.dy}
+              : std::vector<const std::vector<uint16_t> *>{
+                    &inputs.x, &inputs.gamma, &inputs.dy};
+      const std::vector<const std::vector<uint16_t> *> scheduledOutputs =
+          composed
+              ? std::vector<const std::vector<uint16_t> *>{
+                    &scheduled.y, &scheduled.dx, &scheduled.dgamma,
+                    &scheduled.dbeta}
+              : std::vector<const std::vector<uint16_t> *>{
+                    &scheduled.dx, &scheduled.dgamma, &scheduled.dbeta};
+      const std::vector<const std::vector<uint16_t> *> binary64Outputs =
+          composed
+              ? std::vector<const std::vector<uint16_t> *>{
+                    &binary64.y, &binary64.dx, &binary64.dgamma,
+                    &binary64.dbeta}
+              : std::vector<const std::vector<uint16_t> *>{
+                    &binary64.dx, &binary64.dgamma, &binary64.dbeta};
+      const std::vector<llvm::StringRef> outputRoles =
+          composed ? std::vector<llvm::StringRef>{"y", "dx", "dgamma",
+                                                       "dbeta"}
+                   : std::vector<llvm::StringRef>{"dx", "dgamma", "dbeta"};
+      auto expectSealedOutput = [&](llvm::StringRef role,
+                                    llvm::ArrayRef<uint16_t> scheduledOutput,
+                                    llvm::ArrayRef<uint16_t> binary64Output,
+                                    llvm::StringRef scheduledDigest,
+                                    llvm::StringRef binary64Digest,
+                                    const ProspectiveLayerNormMetrics &sealed) {
+        EXPECT_EQ(prospectiveBf16Digest(scheduledOutput,
+                                        role == "dgamma" || role == "dbeta"
+                                            ? llvm::ArrayRef<int64_t>{
+                                                  shape.features}
+                                            : llvm::ArrayRef<int64_t>{
+                                                  shape.rows, shape.features}),
+                  scheduledDigest);
+        EXPECT_EQ(prospectiveBf16Digest(binary64Output,
+                                        role == "dgamma" || role == "dbeta"
+                                            ? llvm::ArrayRef<int64_t>{
+                                                  shape.features}
+                                            : llvm::ArrayRef<int64_t>{
+                                                  shape.rows, shape.features}),
+                  binary64Digest);
+        auto metrics =
+            prospectiveLayerNormMetrics(scheduledOutput, binary64Output);
+        ASSERT_TRUE(metrics);
+        EXPECT_DOUBLE_EQ(metrics->maxAbsoluteError, sealed.maxAbsoluteError);
+        EXPECT_DOUBLE_EQ(metrics->meanAbsoluteError,
+                         sealed.meanAbsoluteError);
+        EXPECT_DOUBLE_EQ(metrics->relativeLinfError,
+                         sealed.relativeLinfError);
+        EXPECT_EQ(metrics->maxBf16UlpError, sealed.maxBf16UlpError);
+        expectProspectiveLayerNormBCLimits(role, *metrics);
+      };
+      if (composed)
+        expectSealedOutput("y", scheduled.y, binary64.y,
+                           shape.yScheduleDigest, shape.yBinary64Digest,
+                           shape.yScheduleMetrics);
+      expectSealedOutput("dx", scheduled.dx, binary64.dx,
+                         shape.dxScheduleDigest, shape.dxBinary64Digest,
+                         shape.dxScheduleMetrics);
+      expectSealedOutput("dgamma", scheduled.dgamma, binary64.dgamma,
+                         shape.dgammaScheduleDigest,
+                         shape.dgammaBinary64Digest,
+                         shape.dgammaScheduleMetrics);
+      expectSealedOutput("dbeta", scheduled.dbeta, binary64.dbeta,
+                         shape.dbetaScheduleDigest,
+                         shape.dbetaBinary64Digest,
+                         shape.dbetaScheduleMetrics);
+      const std::vector<int64_t> expectedBindingBytes =
+          composed ? std::vector<int64_t>{matrixBytes, featureBytes,
+                                                   featureBytes, matrixBytes,
+                                                   matrixBytes, matrixBytes,
+                                                   featureBytes, featureBytes}
+                   : std::vector<int64_t>{matrixBytes, featureBytes,
+                                                   matrixBytes, matrixBytes,
+                                                   featureBytes, featureBytes};
+      const std::vector<int64_t> expectedBindingSlots =
+          composed ? std::vector<int64_t>{0, 1, 2, 3, 6, 9, 8, 7}
+                   : std::vector<int64_t>{0, 1, 2, 7, 6, 5};
+      const std::vector<std::vector<int64_t>> expectedLaunchInputs =
+          composed ? std::vector<std::vector<int64_t>>{{0, 1, 2, 3},
+                                                        {0, 3, 4, 5}}
+                   : std::vector<std::vector<int64_t>>{{0, 1, 2},
+                                                        {0, 2, 3, 4}};
+      const std::vector<std::vector<int64_t>> expectedLaunchOutputs =
+          composed ? std::vector<std::vector<int64_t>>{{4, 5, 6, 9}, {7, 8}}
+                   : std::vector<std::vector<int64_t>>{{3, 4, 7}, {5, 6}};
+      const std::vector<int64_t> temporarySlots =
+          composed ? std::vector<int64_t>{4, 5}
+                   : std::vector<int64_t>{3, 4};
+      for (mlir::shuttle::NumericalPolicy policy :
+           prospectiveLayerNormBCPolicies) {
+        const llvm::StringRef policyName =
+            policy == mlir::shuttle::NumericalPolicy::SourceOrdered
+                ? "source_ordered"
+                : "fast";
+        SCOPED_TRACE(llvm::formatv("{0} {1}x{2} {3}", boundary, shape.rows,
+                                   shape.features, policyName)
+                         .str());
+        auto built =
+            buildFixture(*source, policy,
+                         policy == mlir::shuttle::NumericalPolicy::SourceOrdered
+                             ? sourceOrderedOptions
+                             : fastOptions,
+                         tuning);
+        ASSERT_TRUE(built);
+        auto transport =
+            mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+        ASSERT_TRUE(mlir::succeeded(transport));
+        auto executable = mlir::shuttle::GpuExecutable::Load(*transport);
+        ASSERT_TRUE(executable.ok()) << executable.status();
+        const auto &bindings = (*executable)->externalBindings();
+        ASSERT_EQ(bindings.size(), expectedBindingBytes.size());
+        for (auto [ordinal, binding] : llvm::enumerate(bindings)) {
+          const bool operand = ordinal < hostOperands.size();
+          EXPECT_EQ(binding.kind,
+                    operand
+                        ? mlir::shuttle::ExecutableBindingKind::Operand
+                        : mlir::shuttle::ExecutableBindingKind::Result);
+          EXPECT_EQ(binding.index,
+                    operand ? static_cast<int64_t>(ordinal)
+                            : static_cast<int64_t>(ordinal -
+                                                   hostOperands.size()));
+          EXPECT_EQ(binding.slotOrdinal, expectedBindingSlots[ordinal]);
+          EXPECT_EQ(binding.requiredBytes, expectedBindingBytes[ordinal]);
+        }
+        ASSERT_EQ((*executable)->slots().size(), composed ? 10u : 8u);
+        for (int64_t slot : temporarySlots) {
+          EXPECT_EQ((*executable)->slots()[slot].storage,
+                    mlir::shuttle::MaterializationStorage::Temporary);
+          EXPECT_EQ((*executable)->slots()[slot].requiredBytes,
+                    shape.rows * 4);
+        }
+        const auto &launches = (*executable)->launches();
+        ASSERT_EQ(launches.size(), 2u);
+        const int64_t rowThreads =
+            ((std::min<int64_t>(shape.features, 256) + 31) / 32) * 32;
+        const int64_t featureThreads =
+            ((std::min<int64_t>(shape.rows, 256) + 31) / 32) * 32;
+        for (int64_t launch = 0; launch < 2; ++launch) {
+          EXPECT_EQ(launches[launch].taskOrdinal, launch);
+          EXPECT_EQ(launches[launch].inputSlots,
+                    expectedLaunchInputs[launch]);
+          EXPECT_EQ(launches[launch].outputSlots,
+                    expectedLaunchOutputs[launch]);
+          EXPECT_EQ(launches[launch].dependencies,
+                    launch == 0 ? std::vector<int64_t>{}
+                                : std::vector<int64_t>{0});
+          EXPECT_EQ(launches[launch].grid,
+                    (std::array<uint64_t, 3>{
+                        static_cast<uint64_t>(launch == 0 ? shape.rows
+                                                          : shape.features),
+                        1, 1}));
+          const int64_t threads = launch == 0 ? rowThreads : featureThreads;
+          EXPECT_EQ(launches[launch].block,
+                    (std::array<uint64_t, 3>{
+                        static_cast<uint64_t>(threads), 1, 1}));
+          EXPECT_EQ(launches[launch].dynamicSharedMemoryBytes,
+                    static_cast<uint64_t>(threads * 4));
+        }
+
+        auto runner = mlir::shuttle::GpuRunner::Create(
+            *transport, &allocator, 0, stream->get(), &capability);
+        ASSERT_TRUE(runner.ok()) << runner.status();
+        const auto &resources = (*runner)->resources();
+        EXPECT_EQ(resources.launchCount, 2);
+        EXPECT_EQ(resources.externalOperandCount, hostOperands.size());
+        EXPECT_EQ(resources.externalResultCount, scheduledOutputs.size());
+        EXPECT_EQ(resources.slotCount, composed ? 10 : 8);
+        EXPECT_EQ(resources.temporaryAllocationCount, 2);
+        EXPECT_EQ(resources.temporaryBytes, shape.rows * 8);
+
+        std::vector<stream_executor::DeviceAddressBase> deviceOperands;
+        llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> operands;
+        for (const std::vector<uint16_t> *host : hostOperands) {
+          auto device = (*executor)->AllocateArray<uint16_t>(host->size());
+          ASSERT_TRUE(device);
+          ASSERT_TRUE((*executor)
+                          ->SynchronousMemcpyH2D(
+                              host->data(), host->size() * sizeof(uint16_t),
+                              &device)
+                          .ok());
+          deviceOperands.push_back(device);
+          operands.push_back(
+              {device.opaque(), static_cast<int64_t>(device.size())});
+        }
+        std::vector<stream_executor::DeviceAddressBase> deviceResults;
+        llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> results;
+        for (const std::vector<uint16_t> *expected : scheduledOutputs) {
+          auto device = (*executor)->AllocateArray<uint16_t>(expected->size());
+          ASSERT_TRUE(device);
+          deviceResults.push_back(device);
+          results.push_back(
+              {device.opaque(), static_cast<int64_t>(device.size())});
+        }
+        std::vector<std::vector<std::vector<uint16_t>>> actualRuns(2);
+        for (auto &run : actualRuns) {
+          run.resize(scheduledOutputs.size());
+          for (size_t output = 0; output < scheduledOutputs.size(); ++output) {
+            run[output].assign(scheduledOutputs[output]->size(),
+                               UINT16_C(0x7FC1));
+            ASSERT_TRUE((*executor)
+                            ->SynchronousMemcpyH2D(
+                                run[output].data(),
+                                run[output].size() * sizeof(uint16_t),
+                                &deviceResults[output])
+                            .ok());
+          }
+          absl::Status execution = (*runner)->Execute(operands, results);
+          ASSERT_TRUE(execution.ok()) << execution;
+          ASSERT_TRUE((*runner)->AwaitCompletion().ok());
+          for (size_t output = 0; output < scheduledOutputs.size(); ++output)
+            ASSERT_TRUE((*executor)
+                            ->SynchronousMemcpyD2H(
+                                deviceResults[output],
+                                run[output].size() * sizeof(uint16_t),
+                                run[output].data())
+                            .ok());
+        }
+
+        for (size_t output = 0; output < scheduledOutputs.size(); ++output) {
+          int64_t repeatabilityDifferences = 0;
+          int64_t scheduleDifferences = 0;
+          for (size_t element = 0; element < actualRuns[0][output].size();
+               ++element) {
+            repeatabilityDifferences +=
+                actualRuns[0][output][element] !=
+                actualRuns[1][output][element];
+            scheduleDifferences += actualRuns[0][output][element] !=
+                                   (*scheduledOutputs[output])[element];
+          }
+          EXPECT_EQ(repeatabilityDifferences, 0) << outputRoles[output].str();
+          EXPECT_EQ(scheduleDifferences, 0) << outputRoles[output].str();
+          auto metrics = prospectiveLayerNormMetrics(
+              actualRuns[0][output], *binary64Outputs[output]);
+          ASSERT_TRUE(metrics) << outputRoles[output].str();
+          expectProspectiveLayerNormBCLimits(outputRoles[output], *metrics);
+          RecordProperty(
+              llvm::formatv("metrics_{0}_{1}x{2}_{3}_{4}", boundary,
+                            shape.rows, shape.features, policyName,
+                            outputRoles[output])
+                  .str(),
+              llvm::formatv(
+                  "max_absolute={0},mean_absolute={1},relative_linf={2},"
+                  "max_bf16_ulp={3},schedule_differences={4},"
+                  "repeatability_differences={5}",
+                  metrics->maxAbsoluteError, metrics->meanAbsoluteError,
+                  metrics->relativeLinfError, metrics->maxBf16UlpError,
+                  scheduleDifferences, repeatabilityDifferences)
+                  .str());
+        }
+        executedCoordinates.push_back(
+            llvm::formatv("{0}_{1}x{2}_{3}", boundary, shape.rows,
+                          shape.features, policyName)
+                .str());
+
+        runner->reset();
+        for (auto &device : deviceResults)
+          (*executor)->Deallocate(&device);
+        for (auto &device : deviceOperands)
+          (*executor)->Deallocate(&device);
+      }
+    }
+  }
+  std::sort(executedCoordinates.begin(), executedCoordinates.end());
+  const std::vector<std::string> expectedCoordinates = {
+      "backward_2048x4096_fast", "backward_2048x4096_source_ordered",
+      "backward_7x13_fast",      "backward_7x13_source_ordered",
+      "composed_2048x4096_fast", "composed_2048x4096_source_ordered",
+      "composed_7x13_fast",      "composed_7x13_source_ordered",
   };
   EXPECT_EQ(executedCoordinates, expectedCoordinates);
 }
