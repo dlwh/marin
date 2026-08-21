@@ -5595,3 +5595,70 @@ author: dlwh
 - Next action: measure representative RMSNorm shapes and both numerical
   policies, then add backward and resource/performance evidence under separate
   reviewed gates.
+
+### 2026-08-21 - TLTC-ABI22-002 ordinary-JAX RMSNorm plugin F/B/C on H100
+
+- Hypothesis: the generic ABI22 Fold-region path can execute ordinary-JAX
+  RMSNorm forward, backward, and composed boundaries at rank 3 and rank 5 in
+  both SOURCE_ORDERED and FAST modes, preserve public result order and observer
+  attribution, repeat deterministically, and satisfy a predeclared independent
+  binary64 numerical contract.
+- Executed source: reviewed clean commit
+  `97b1fe38ce2c2f0f75868f6f96280d97f8667425`; source-manifest SHA-256
+  `39339a33778c67d5aca853cc5de11efcc0950304ed43ad1757e4cffd9b09138a`;
+  authorization SHA-256
+  `67d4352b187e8d149bc49f3ffe6701815c4327ed8cd9712c64c360dc1d054e30`;
+  numerical-policy SHA-256
+  `4f3b354d8908101072c35b94fc308d500a64ebee22b9b88f475ac3137cdf7df9`.
+  Independent review found no remaining defect before launch. The canary and
+  policy history was replayed without conflict from current integration base
+  `5ddfeb12b568ea42499ec457f508e94ba2843315`; preservation snapshot
+  `2f86af2a55a86a7708059daa3c5345ea38eab801` contains the reachable replayed
+  commits and artifact.
+- Config: `/dlwh/shuttle-track1-rmsnorm-h100-canary-r3` on one batch-priority
+  H100 in `cw-rno2a`, 32 CPU, 128 GiB memory, 500 GiB disk, four-hour timeout,
+  and all retry/failure budgets zero. The 6,373,340-byte request has SHA-256
+  `1473f85738b6765559adf4158505eb3a3c5a3c55f13aa4c7df056703291e0eef`;
+  its 6,372,341-byte source bundle has SHA-256
+  `44dab7b08a79c0314c78dd9cae62c3ee66cb1504af1cf48ea87986e16c5d81f4`.
+  The reviewed request was submitted verbatim with
+  `connect_controller(config_file=Path("lib/iris/config/cw-rno2a.yaml"))` and
+  `rpc_client.launch_job(request)` after deterministic decode, validation, and
+  SHA checks.
+- Result: Iris reports one successful task, exit code zero, no failure, no
+  preemption, and 15 minutes 12.34 seconds duration. All 18 coordinates passed:
+  `[2,7,19]` and `[3,2,5,11,263]`; forward, backward, and composed; disabled
+  JAX, SOURCE_ORDERED, and FAST. Every enabled result repeated bitwise within
+  the process. Enabled observer invocation IDs were exactly 1 through 12. The
+  bundle topology was 1 launch/0 temporaries for forward, 3/1 for backward,
+  and 4/1 for composed.
+- Numerical result: the worst observed BF16 ULP error was 1 at a limit of 1.
+  The worst absolute error was `0.02949355642030227` at the weight-cotangent
+  limit `0.03125`; worst mean absolute error was `0.006515962406162605` at the
+  weight-cotangent limit `0.015625`; worst relative Linf error was
+  `0.003138256088840048` at limit `0.00390625`. The versioned policy binds the
+  actual ABI22 positive-zero lane initialization, per-lane adjacent-pair
+  accumulation, shared adjacent-pair tree, final Fold initializer add, and
+  `sqrt.rn.f32` then `div.rn.f32` realization. It does not import ABI21's
+  schedule-exact identity.
+- Diagnostic: rank-5 backward and composed `input_cotangent` differed bitwise
+  from disabled JAX in SOURCE_ORDERED and FAST. Enabled output SHA-256 was
+  `b7b633ae8f64da15b63b74be5c8582c18ec9c8d3a978bac3edb646168ea97b31`;
+  disabled JAX was
+  `a1e8d5a1a707f1e2171fc39f184f3d89a8c6bb14e38ba3eaab839f16a6d0d056`.
+  Both enabled modes matched the predeclared emitted-tree digest and all
+  independent thresholds. Disabled JAX is a labeled diagnostic, not the
+  acceptance oracle, and this result makes no bitwise-JAX-equivalence claim.
+- Artifacts:
+  `lib/shuttle/mlir/artifacts/track1-rmsnorm-h100-plugin-20260821/` preserves
+  the 38,152-byte canonical result (SHA-256
+  `4bd11ab0c6c89faa0a4ed2c2bf0063734f5cb56fcfadadf9ecd2c9e2ce0f38cb`),
+  terminal summary, receipt, monitoring metadata, request identity, and file
+  checksums. The request bytes remain external. Verification command:
+  `(cd lib/shuttle/mlir/artifacts/track1-rmsnorm-h100-plugin-20260821 && shasum -a 256 -c SHA256SUMS)`.
+- Interpretation: this accepts the generic ordinary-JAX ABI22 RMSNorm plugin
+  path for the listed functional coordinates on one H100 under the declared
+  numerical contract. It is not a representative-shape sweep, performance
+  evidence, TE parity, bitwise-JAX parity, or evidence for another architecture.
+- Next action: repeat the declared coordinates independently, then evaluate
+  representative shapes and performance under separately reviewed gates.
