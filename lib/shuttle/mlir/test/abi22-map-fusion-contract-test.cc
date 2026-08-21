@@ -401,6 +401,15 @@ bool hasDisjointContiguousFoldLoop(llvm::StringRef ptx, int64_t outputExtent,
           if (reachingLeaf != bodyFlow.currentValues.end()) {
             std::set<std::string> closure =
                 ptxDependencyClosure(bodyFlow, reachingLeaf->second);
+            const bool unpredicatedLeaf =
+                !closure.count(accumulator) &&
+                llvm::all_of(closure, [&](const std::string &value) {
+                  const PtxDataflow::Definition *definition =
+                      ptxDefinition(bodyFlow, value);
+                  return !definition || !definition->predicated;
+                });
+            if (!unpredicatedLeaf)
+              return false;
             for (const auto &[loadValue, load] : bodyFlow.definitions) {
               if (!closure.count(loadValue) ||
                   !llvm::StringRef(load.opcode).starts_with("ld.global.") ||
@@ -1887,6 +1896,10 @@ $all_done:
                    "cvt.u64.u32 %rd0, %r7;"),
            replace(correctFoldLoop, "cvt.u64.u32 %rd0, %r4;",
                    "@%p1 cvt.u64.u32 %rd0, %r4;"),
+           replace(correctFoldLoop, "add.rn.f32 %f2, %f0, %f1;",
+                   "@%p1 mov.f32 %f3, %f1;\n  add.rn.f32 %f2, %f0, %f3;"),
+           replace(correctFoldLoop, "add.rn.f32 %f2, %f0, %f1;",
+                   "mul.rn.f32 %f1, %f1, %f0;\n  add.rn.f32 %f2, %f0, %f1;"),
            replace(correctFoldLoop, "mov.f32 %f0, 0f00000000;",
                    "mov.f32 %f0, 0f00000000;\n  mov.f32 %f0, 0f3F800000;"),
            replace(replace(correctFoldLoop, "cvt.u64.u32 %rd0, %r4;", "nop;"),
