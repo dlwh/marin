@@ -1,0 +1,78 @@
+{
+  "schema": "shuttle_track2_te_rmsnorm_v2_failure_summary_v1",
+  "job": {
+    "id": "/dlwh/shuttle-track2-te-h100-r10",
+    "config": "/Users/dlwh/src/marin/lib/iris/config/cw-rno2a.yaml",
+    "state": "failed",
+    "task_exit": 1,
+    "failures": 1,
+    "preemptions": 0,
+    "duration_seconds": 120.96
+  },
+  "source": {
+    "commit": "721e1edca6d205c92df6101f542b93972525b4ac",
+    "tree": "ebf6d299fdad77eef235bcbb5fbac53e4a2adf4c"
+  },
+  "request": {
+    "path": "/private/tmp/shuttle-track2-te-request-r10.HsEbOp/request.pb",
+    "sha256": "c967d0905613c2527b71f0dffaeae727688ff9b9c3449b80f326ec71f62faa75",
+    "size": 6702889,
+    "bundle_sha256": "049b49742fdf694ed2985653ce392066906916f14737977576ae4cee68fd7d59",
+    "bundle_size": 6702123
+  },
+  "receipt": {
+    "path": "/private/tmp/shuttle-track2-te-request-r10.HsEbOp/receipt.json",
+    "sha256": "c02fdc0be591cb2fddccee5106b0b8a9b0fb06562af3e10e4815b6e6e1708884",
+    "size": 798
+  },
+  "raw_policy": {
+    "iris_log_payload_sha256_without_trailing_newline": "ac506b4d612b19127aea229b5e0d8bf573f708682d58be043f7862c8a6bf3915",
+    "iris_log_payload_size_without_trailing_newline": 69955,
+    "local_pretty_path": "/private/tmp/shuttle-track2-te-policy-v2/scratch/r10-raw-policy.json",
+    "local_pretty_sha256": "185aa1095fa301b67530c340c781ee5c9f8d36911d6fda8c4b4534d3dba35f78",
+    "local_pretty_size": 104646,
+    "cell_count": 36
+  },
+  "threshold_violations": {
+    "count": 8,
+    "coordinates": "both producers x forward/composed x both repeats x y",
+    "field": "max_absolute_error",
+    "observed": 0.015625,
+    "limit": 0.0078125
+  },
+  "first_failure": {
+    "producer": "transformer_engine_2_17",
+    "pattern": "heldout_splitmix64_v1",
+    "boundary": "forward",
+    "repeat": 0,
+    "role": "y",
+    "max_absolute_error": 0.015625,
+    "mean_absolute_error": 3.4313416108489037e-08,
+    "absolute_floor": 0.015625,
+    "eligible_count": 8305853,
+    "max_relative_error_above_absolute_floor": 0.007751937955617905,
+    "max_bfloat16_ulp_above_absolute_floor": 1,
+    "max_bfloat16_ulp": 1,
+    "raw_max_bfloat16_ulp_index": 294230,
+    "raw_max_bfloat16_ulp_actual": -1.0703125,
+    "raw_max_bfloat16_ulp_reference": -1.078125,
+    "all_finite": true
+  },
+  "repeat_digest_mismatches": [
+    {
+      "producer": "ordinary_jax_xla",
+      "boundary": "composed",
+      "role": "y",
+      "repeat0": "6cfc02f95b30758af5f5ae3d5b15aacdf33161994f01f7f78a6aa91695c747dd",
+      "repeat1": "b7215b7eee5b09b5e0c23c78af786e9a2b07762f1ed8e9da6afd480a88c6a53a"
+    },
+    {
+      "producer": "ordinary_jax_xla",
+      "boundary": "composed",
+      "role": "dx",
+      "repeat0": "70f3e84152897a9a8c1b205544197381f144a5ff8187fd09fc52f6be43a58f58",
+      "repeat1": "9e7ecab1632755e5eb43e76606ef30369628bd9ee9738916c1b78c0e5b28738f"
+    }
+  ],
+  "decision": "qualification_failure_no_policy_widening_no_resubmission"
+}
