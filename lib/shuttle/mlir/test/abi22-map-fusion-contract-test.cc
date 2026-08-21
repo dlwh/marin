@@ -1970,9 +1970,15 @@ TEST(Abi22MapFusionContract,
         int64_t reductionExtent = 1;
         for (int64_t axis : reduction.asArrayRef())
           reductionExtent *= domain.asArrayRef()[axis];
-        const int64_t serialTiles =
-            (reductionExtent + std::min<int64_t>(reductionExtent, 256) - 1) /
+        const int64_t reductionTile =
             std::min<int64_t>(reductionExtent, 256);
+        const int64_t workgroupThreads =
+            ((reductionTile + 31) / 32) * 32;
+        ASSERT_TRUE(entry.getBlock());
+        EXPECT_EQ(*entry.getBlock(),
+                  llvm::ArrayRef<int64_t>({workgroupThreads, 1, 1}));
+        const int64_t serialTiles =
+            (reductionExtent + reductionTile - 1) / reductionTile;
         const std::string chunkBounds =
             (llvm::Twine("  mul.lo.u32 %r4, %r0, ") +
              llvm::Twine(serialTiles) + ";\n  add.u32 %r7, %r4, " +
