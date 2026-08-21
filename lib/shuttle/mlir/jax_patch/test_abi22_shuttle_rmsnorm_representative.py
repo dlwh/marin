@@ -325,9 +325,17 @@ def _fake_runner(
     }
     first_coordinate = coordinate == ("source_ordered", "forward", 0)
     if raw_mutation == "backward_runner_index" and coordinate == ("source_ordered", "backward_recompute", 0):
-        next(binding for binding in external_bindings if binding["kind"] == "result")["runner_index"] = 1
+        results = [binding for binding in external_bindings if binding["kind"] == "result"]
+        results[0]["runner_index"], results[1]["runner_index"] = (
+            results[1]["runner_index"],
+            results[0]["runner_index"],
+        )
     elif raw_mutation == "composed_slot" and coordinate == ("source_ordered", "composed", 0):
-        next(binding for binding in external_bindings if binding["kind"] == "result")["slot_ordinal"] = 3
+        results = [binding for binding in external_bindings if binding["kind"] == "result"]
+        results[0]["slot_ordinal"], results[1]["slot_ordinal"] = (
+            results[1]["slot_ordinal"],
+            results[0]["slot_ordinal"],
+        )
     elif first_coordinate and raw_mutation not in (None, "backward_runner_index", "composed_slot"):
         operand = next(binding for binding in external_bindings if binding["kind"] == "operand")
         result = next(binding for binding in external_bindings if binding["kind"] == "result")
@@ -353,6 +361,8 @@ def _fake_runner(
             cell["timing"]["warmup_iterations"] = 9
         elif raw_mutation == "measured_iterations":
             cell["timing"]["measured_iterations"] = 19
+            cell["timing"]["host_samples_ns"].pop()
+            cell["timing"]["cuda_event_samples_ns"].pop()
         elif raw_mutation == "host_clock":
             cell["timing"]["host_clock"] = "wall_clock_ns"
         elif raw_mutation == "event_status":
@@ -753,11 +763,23 @@ def test_structural_transport_repeat_and_external_evidence_mutations_reject(
         backward = next(entry for entry in changed["cells"] if entry["boundary"] == "backward_recompute")
         backward["outputs"].reverse()
     elif mutation == "wrong_public_index":
-        cell["outputs"][0]["public_result_index"] = 1
+        backward = next(entry for entry in changed["cells"] if entry["boundary"] == "backward_recompute")
+        backward["outputs"][0]["public_result_index"], backward["outputs"][1]["public_result_index"] = (
+            backward["outputs"][1]["public_result_index"],
+            backward["outputs"][0]["public_result_index"],
+        )
     elif mutation == "wrong_runner_index":
-        cell["outputs"][0]["runner_result_index"] = 1
+        backward = next(entry for entry in changed["cells"] if entry["boundary"] == "backward_recompute")
+        backward["outputs"][0]["runner_result_index"], backward["outputs"][1]["runner_result_index"] = (
+            backward["outputs"][1]["runner_result_index"],
+            backward["outputs"][0]["runner_result_index"],
+        )
     elif mutation == "wrong_slot_ordinal":
-        cell["outputs"][0]["slot_ordinal"] += 1
+        composed = next(entry for entry in changed["cells"] if entry["boundary"] == "composed")
+        composed["outputs"][0]["slot_ordinal"], composed["outputs"][1]["slot_ordinal"] = (
+            composed["outputs"][1]["slot_ordinal"],
+            composed["outputs"][0]["slot_ordinal"],
+        )
     elif mutation == "wrong_runner_api":
         cell["runner_api"]["host"] = "stream_ordered_without_fence"
     elif mutation == "repeat_drift":
