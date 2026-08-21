@@ -1823,6 +1823,7 @@ def validate_policy_v4_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(cells, list) or len(cells) != len(expected_coordinates):
         raise ValueError("qualification cell matrix drifted")
     digests: dict[tuple[str, str, str, int, str], str] = {}
+    numerical_anomalies = []
     for cell, (producer, pattern, boundary, repeat) in zip(cells, expected_coordinates, strict=True):
         if not isinstance(cell, Mapping):
             raise ValueError("qualification cell is not an object")
@@ -1854,26 +1855,48 @@ def validate_policy_v4_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
             digest = _sha(output.get("digest"), "qualification output digest")
             if _sha(output.get("reference_digest"), "qualification reference digest") != reference_digests[role]:
                 raise ValueError("qualification reference digest drifted")
-            if output.get("all_finite") is not True:
-                raise ValueError("qualification all_finite must be true")
-            absolute = _finite_nonnegative(output.get("max_absolute_error"), "qualification max_absolute_error")
-            mean_absolute = _finite_nonnegative(output.get("mean_absolute_error"), "qualification mean_absolute_error")
-            below_absolute = _finite_nonnegative(
-                output.get("max_absolute_error_below_floor"),
-                "qualification max_absolute_error_below_floor",
-            )
-            above_absolute = _finite_nonnegative(
-                output.get("max_absolute_error_above_floor"),
-                "qualification max_absolute_error_above_floor",
-            )
-            relative = _finite_nonnegative(
-                output.get("max_relative_error_above_absolute_floor"),
-                "qualification max_relative_error_above_absolute_floor",
-            )
+            is_acceptance = pattern == POLICY_V4_ACCEPTANCE_PATTERN
+            issues = []
+            all_finite = output.get("all_finite")
+            if type(all_finite) is not bool:
+                raise ValueError("qualification all_finite field drifted")
+            if not all_finite:
+                if is_acceptance:
+                    raise ValueError("acceptance all_finite must be true")
+                issues.append("all_finite_false")
+
+            def metric(
+                field: str,
+                output: Mapping[str, Any] = output,
+                is_acceptance: bool = is_acceptance,
+                issues: list[str] = issues,
+            ) -> float | None:
+                observed = output.get(field)
+                if type(observed) in (int, float) and math.isfinite(float(observed)) and float(observed) >= 0:
+                    return float(observed)
+                if type(observed) in (int, float) or observed in ("nan", "inf", "-inf"):
+                    if is_acceptance:
+                        raise ValueError(f"acceptance {field} must be finite and nonnegative")
+                    issues.append(f"{field}_nonfinite")
+                    return None
+                raise ValueError(f"qualification {field} field drifted")
+
+            absolute = metric("max_absolute_error")
+            above_absolute = metric("max_absolute_error_above_floor")
+            below_absolute = metric("max_absolute_error_below_floor")
+            relative = metric("max_relative_error_above_absolute_floor")
+            mean_absolute = metric("mean_absolute_error")
             raw_ulp = output.get("max_bfloat16_ulp")
             masked_ulp = output.get("max_bfloat16_ulp_above_absolute_floor")
-            if type(raw_ulp) is not int or raw_ulp < 0 or type(masked_ulp) is not int or masked_ulp < 0:
-                raise ValueError("qualification BF16 ULP metrics must be nonnegative integers")
+            if type(raw_ulp) is not int or type(masked_ulp) is not int:
+                raise ValueError("qualification BF16 ULP metric fields drifted")
+            if raw_ulp < 0 or masked_ulp < 0:
+                if is_acceptance:
+                    raise ValueError("acceptance BF16 ULP metrics must be nonnegative")
+                if raw_ulp < 0:
+                    issues.append("max_bfloat16_ulp_negative")
+                if masked_ulp < 0:
+                    issues.append("max_bfloat16_ulp_above_absolute_floor_negative")
             limits = POLICY_V4_ACCEPTANCE_LIMITS[role]
             if output.get("absolute_floor") != limits["absolute_floor"]:
                 raise ValueError("qualification absolute_floor drifted")
@@ -1885,17 +1908,30 @@ def validate_policy_v4_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
             output_size = REPRESENTATIVE_SHAPE[1] if role == "dgamma" else math.prod(REPRESENTATIVE_SHAPE)
             if below_count + above_count != output_size:
                 raise ValueError("qualification partition counts do not cover the output")
-            if absolute != max(below_absolute, above_absolute):
-                raise ValueError("qualification whole max_absolute_error differs from partition maxima")
+            if absolute is not None and below_absolute is not None and above_absolute is not None:
+                if absolute != max(below_absolute, above_absolute):
+                    if is_acceptance:
+                        raise ValueError("acceptance whole max_absolute_error differs from partition maxima")
+                    issues.append("partition_closure")
             raw_index = output.get("raw_max_bfloat16_ulp_index")
             if type(raw_index) is not int or raw_index < 0 or raw_index >= output_size:
                 raise ValueError("qualification raw_max_bfloat16_ulp_index drifted")
             for field in ("raw_max_bfloat16_ulp_actual", "raw_max_bfloat16_ulp_reference"):
                 raw_value = output.get(field)
-                if type(raw_value) not in (int, float) or not math.isfinite(float(raw_value)):
-                    raise ValueError(f"qualification {field} must be finite")
+                if type(raw_value) in (int, float) and math.isfinite(float(raw_value)):
+                    continue
+                if type(raw_value) in (int, float) or raw_value in ("nan", "inf", "-inf"):
+                    if is_acceptance:
+                        raise ValueError(f"acceptance {field} must be finite")
+                    issues.append(f"{field}_nonfinite")
+                    continue
+                raise ValueError(f"qualification {field} field drifted")
             coordinate = f"{producer}/{pattern}/{boundary}/repeat{repeat}/{role}"
-            if pattern == POLICY_V4_ACCEPTANCE_PATTERN:
+            if is_acceptance:
+                assert below_absolute is not None
+                assert above_absolute is not None
+                assert mean_absolute is not None
+                assert relative is not None
                 for observed, field in (
                     (below_absolute, "max_absolute_error_below_floor"),
                     (above_absolute, "max_absolute_error_above_floor"),
@@ -1905,6 +1941,17 @@ def validate_policy_v4_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
                 ):
                     if observed > limits[field]:
                         raise ValueError(f"{coordinate}: {field} {observed} exceeds role limit {limits[field]}")
+            elif issues:
+                numerical_anomalies.append(
+                    {
+                        "producer": producer,
+                        "input_pattern": pattern,
+                        "boundary": boundary,
+                        "repeat": repeat,
+                        "role": role,
+                        "issues": issues,
+                    }
+                )
             digests[(producer, pattern, boundary, repeat, role)] = digest
         timing = cell.get("timing")
         if not isinstance(timing, Mapping) or timing.get("warmup_invocations") != WARMUP_INVOCATIONS:
@@ -1955,6 +2002,7 @@ def validate_policy_v4_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
             "status": "diagnostic_only",
             "patterns": list(POLICY_V4_QUALIFICATION_PATTERNS),
             "repeat_digest_drifts": qualification_drifts,
+            "numerical_anomalies": numerical_anomalies,
         },
     }
 
