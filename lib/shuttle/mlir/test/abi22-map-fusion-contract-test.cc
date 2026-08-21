@@ -270,6 +270,8 @@ bool hasDisjointContiguousFoldLoop(llvm::StringRef ptx, int64_t outputExtent,
         rowTokens.size() != 2 || rowTokens[1] != "%ctaid")
       continue;
     llvm::StringRef row = rowTokens[0];
+    if (row == lane)
+      continue;
     std::vector<std::string> guardTokens = ptxTokens(lines[laneLine + 2]);
     if (guardTokens.size() != 2 || guardTokens[1] != row ||
         lines[laneLine + 2] !=
@@ -1877,6 +1879,9 @@ $done:
            replace(correctFoldLoop, "setp.ge.u32 %p0, %r1, 3;",
                    "setp.ge.u32 %p0, %r1, 0;"),
            replace(correctFoldLoop, "@%p0 bra $done;", "@%p0 bra $loaded;"),
+           replace(replace(correctFoldLoop, "mov.u32 %r1, %ctaid.x;",
+                           "mov.u32 %r0, %ctaid.x;"),
+                   "setp.ge.u32 %p0, %r1, 3;", "setp.ge.u32 %p0, %r0, 3;"),
            replace(correctFoldLoop, "mul.lo.u32 %r4, %r0, 2;",
                    "bra $loaded;\n  mul.lo.u32 %r4, %r0, 2;"),
            replace(correctFoldLoop, "mul.lo.u32 %r4, %r0, 2;",
