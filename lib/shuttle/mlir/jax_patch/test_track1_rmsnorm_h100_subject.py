@@ -104,7 +104,39 @@ def test_rmsnorm_inputs_and_boundary_results_match_independent_shapes() -> None:
             )
 
 
-def test_run_matrix_rejects_enabled_result_drift_through_public_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
+def _next_bf16(value: np.ndarray) -> None:
+    bits = value.view(np.uint16)
+    bits.flat[0] = np.uint16(int(bits.flat[0]) + 1)
+
+
+def test_run_matrix_accepts_in_contract_enabled_drift_as_a_labeled_disabled_jax_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(subject, "require_h100", lambda: None)
+
+    def execute(coordinate: Coordinate):
+        roles = subject.result_roles(coordinate.boundary)
+        arrays = [value.copy() for value in subject.host_oracle(coordinate.shape, coordinate.boundary)]
+        for index, role in enumerate(roles):
+            if coordinate == Coordinate((3, 2, 5, 11, 263), Boundary.BACKWARD, Mode.SOURCE_ORDERED) and role == (
+                "input_cotangent"
+            ):
+                _next_bf16(arrays[index])
+        snapshot = () if coordinate.mode is Mode.DISABLED else _observer_snapshot(coordinate)
+        return tuple(arrays), snapshot
+
+    monkeypatch.setattr(subject, "_execute", execute)
+    results = subject.run_matrix()
+
+    changed = next(
+        result
+        for result in results
+        if result.coordinate == Coordinate((3, 2, 5, 11, 263), Boundary.BACKWARD, Mode.SOURCE_ORDERED)
+    )
+    assert changed.disabled_jax_bitwise_equal == {"input_cotangent": False, "weight_cotangent": True}
+
+
+def test_run_matrix_rejects_independent_binary64_threshold_exceedance(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(subject, "require_h100", lambda: None)
 
     def execute(coordinate: Coordinate):
@@ -112,21 +144,65 @@ def test_run_matrix_rejects_enabled_result_drift_through_public_boundary(monkeyp
         arrays = [value.copy() for value in subject.host_oracle(coordinate.shape, coordinate.boundary)]
         for index, role in enumerate(roles):
             if coordinate == Coordinate((2, 7, 19), Boundary.COMPOSED, Mode.FAST) and role == "input_cotangent":
-                arrays[index].flat[0] = ml_dtypes.bfloat16(-0.0)
+                arrays[index].flat[0] = ml_dtypes.bfloat16(64.0)
         snapshot = () if coordinate.mode is Mode.DISABLED else _observer_snapshot(coordinate)
         return tuple(arrays), snapshot
 
     monkeypatch.setattr(subject, "_execute", execute)
 
-    with pytest.raises(RuntimeError, match="RMSNorm numerical mismatch") as raised:
+    with pytest.raises(RuntimeError, match="independent binary64 threshold"):
         subject.run_matrix()
 
-    evidence = json.loads(str(raised.value).split(": ", 1)[1])
-    assert evidence["boundary"] == "composed"
-    assert evidence["mode"] == "fast"
-    assert evidence["role"] == "input_cotangent"
-    assert evidence["actual_sha256"] != evidence["expected_sha256"]
-    assert len(str(raised.value)) < 1_024
+
+@pytest.mark.parametrize("nonfinite", [float("nan"), float("inf"), float("-inf")])
+def test_run_matrix_rejects_nonfinite_public_results(monkeypatch: pytest.MonkeyPatch, nonfinite: float) -> None:
+    monkeypatch.setattr(subject, "require_h100", lambda: None)
+
+    def execute(coordinate: Coordinate):
+        arrays = [value.copy() for value in subject.host_oracle(coordinate.shape, coordinate.boundary)]
+        if coordinate == Coordinate((2, 7, 19), Boundary.FORWARD, Mode.SOURCE_ORDERED):
+            arrays[0].flat[0] = ml_dtypes.bfloat16(nonfinite)
+        snapshot = () if coordinate.mode is Mode.DISABLED else _observer_snapshot(coordinate)
+        return tuple(arrays), snapshot
+
+    monkeypatch.setattr(subject, "_execute", execute)
+
+    with pytest.raises(RuntimeError, match="finite"):
+        subject.run_matrix()
+
+
+def test_run_matrix_rejects_backward_public_result_order_drift(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(subject, "require_h100", lambda: None)
+
+    def execute(coordinate: Coordinate):
+        arrays = list(subject.host_oracle(coordinate.shape, coordinate.boundary))
+        if coordinate == Coordinate((2, 7, 19), Boundary.BACKWARD, Mode.SOURCE_ORDERED):
+            arrays.reverse()
+        snapshot = () if coordinate.mode is Mode.DISABLED else _observer_snapshot(coordinate)
+        return tuple(arrays), snapshot
+
+    monkeypatch.setattr(subject, "_execute", execute)
+
+    with pytest.raises(RuntimeError, match="result type differs from its public boundary"):
+        subject.run_matrix()
+
+
+def test_run_matrix_rejects_repeat_drift_before_accepting_numerics(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(subject, "require_h100", lambda: None)
+    calls: dict[Coordinate, int] = {}
+
+    def execute(coordinate: Coordinate):
+        calls[coordinate] = calls.get(coordinate, 0) + 1
+        arrays = [value.copy() for value in subject.host_oracle(coordinate.shape, coordinate.boundary)]
+        if coordinate == Coordinate((2, 7, 19), Boundary.FORWARD, Mode.SOURCE_ORDERED) and calls[coordinate] == 2:
+            _next_bf16(arrays[0])
+        snapshot = () if coordinate.mode is Mode.DISABLED else _observer_snapshot(coordinate)
+        return tuple(arrays), snapshot
+
+    monkeypatch.setattr(subject, "_execute", execute)
+
+    with pytest.raises(RuntimeError, match="repeat result drift"):
+        subject.run_matrix()
 
 
 def test_run_matrix_rejects_a_shared_disabled_and_enabled_host_oracle_drift(
