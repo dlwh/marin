@@ -4819,7 +4819,7 @@ TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
           cell.runner->Execute(cell.operandBindings, cell.resultBindings);
       ASSERT_TRUE(execution.ok())
           << execution << " " << cell.spec->caseName << " "
-          << mlir::shuttle::stringifyNumericalPolicy(cell.policy);
+          << mlir::shuttle::stringifyNumericalPolicy(cell.policy).str();
     }
   }
   for (int64_t round = 0; round < measuredIterations; ++round) {
