@@ -167,6 +167,10 @@ def batch_plan(*, workspace: Path, runner_repository: Path, compiler_identity: s
         raise ValueError("compiler identity is invalid")
     paths = BatchPaths.under(workspace)
     workspace_patch = runner_repository / XLA_WORKSPACE_PATCH
+    wrappers = [
+        runner_repository / "lib/shuttle/mlir/test/run-h100-xla-baseline.sh",
+        runner_repository / "lib/shuttle/mlir/test/run-h100-performance.sh",
+    ]
     common = _common_bazel(paths, runner_repository)
     xla = [
         *common,
@@ -196,6 +200,7 @@ def batch_plan(*, workspace: Path, runner_repository: Path, compiler_identity: s
                 "name": "device",
                 "argv": ["nvidia-smi", "--query-gpu=name,uuid,driver_version", "--format=csv,noheader"],
             },
+            {"name": "source_permissions", "argv": ["chmod", "755", *(str(path) for path in wrappers)]},
             {"name": "xla_init", "argv": ["git", "init", "--quiet"]},
             {
                 "name": "xla_remote",
@@ -287,13 +292,14 @@ def execute_batch(
     )
     phases = plan["phases"]
     device = _device_identity(paths, phases[0])
-    _fetch_xla(paths, phases[1:7])
-    _run(phases[7]["argv"], cwd=None, log=paths.logs / "bazel_fetch.log", phase="bazel_fetch")
+    _run(phases[1]["argv"], cwd=None, log=paths.logs / "source_permissions.log", phase="source_permissions")
+    _fetch_xla(paths, phases[2:8])
+    _run(phases[8]["argv"], cwd=None, log=paths.logs / "bazel_fetch.log", phase="bazel_fetch")
     if _file_sha256(paths.bazel) != BAZEL_SHA256:
         raise RuntimeError("hydrated Bazel SHA-256 differs")
     paths.bazel.chmod(0o755)
-    _run(phases[8]["argv"], cwd=paths.xla, log=paths.logs / "xla.log", phase="xla")
-    _run(phases[9]["argv"], cwd=paths.xla, log=paths.logs / "shuttle.log", phase="shuttle")
+    _run(phases[9]["argv"], cwd=paths.xla, log=paths.logs / "xla.log", phase="xla")
+    _run(phases[10]["argv"], cwd=paths.xla, log=paths.logs / "shuttle.log", phase="shuttle")
     reports = {
         "exploratory_comparison": _read_json(paths.exploratory_comparison, "exploratory comparison"),
         "shuttle": _read_json(paths.shuttle_report, "Shuttle report"),
