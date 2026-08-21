@@ -104,6 +104,7 @@ struct PlanSummary {
   std::vector<int64_t> fusedMapGroupSizes;
   std::vector<int64_t> fusedFoldMapGroupSizes;
   bool hasFoldRegion = false;
+  bool hasContractRegion = false;
   bool exactSourceCoverage = false;
   std::string fingerprint;
 };
@@ -749,12 +750,25 @@ std::optional<PlanSummary> summary(mlir::ModuleOp module) {
         task->getAttrOfType<mlir::ArrayAttr>("fold_epilogue_sources");
     auto foldRegionSources =
         task->getAttrOfType<mlir::ArrayAttr>("fold_region_sources");
+    auto contractRegionSources =
+        task->getAttrOfType<mlir::ArrayAttr>("contract_region_sources");
     if (static_cast<int>(static_cast<bool>(fusedSources)) +
             static_cast<int>(static_cast<bool>(foldEpilogueSources)) +
-            static_cast<int>(static_cast<bool>(foldRegionSources)) >
+            static_cast<int>(static_cast<bool>(foldRegionSources)) +
+            static_cast<int>(static_cast<bool>(contractRegionSources)) >
         1)
       return std::nullopt;
-    if (foldRegionSources) {
+    if (contractRegionSources) {
+      result.hasContractRegion = true;
+      if (task.getKind() != mlir::shuttle::MaterializationTaskKind::Contract ||
+          contractRegionSources.empty())
+        return std::nullopt;
+      for (mlir::Attribute source : contractRegionSources) {
+        if (!mlir::isa<mlir::shuttle::SourceRefAttr>(source))
+          return std::nullopt;
+        plannedSources.insert(source);
+      }
+    } else if (foldRegionSources) {
       result.hasFoldRegion = true;
       if (task.getKind() != mlir::shuttle::MaterializationTaskKind::Fold ||
           foldRegionSources.empty())
@@ -2581,6 +2595,372 @@ module @anonymous {
       "    %15 = stablehlo.convert %joined : (tensor<2x19xf32>) -> "
       "tensor<2x19xbf16>");
   remainsUnfused(std::move(secondFold));
+}
+
+std::string replaceAllText(std::string value, llvm::StringRef oldText,
+                           llvm::StringRef newText) {
+  size_t position = 0;
+  while ((position = value.find(oldText.str(), position)) !=
+         std::string::npos) {
+    value.replace(position, oldText.size(), newText.str());
+    position += newText.size();
+  }
+  return value;
+}
+
+llvm::SmallVector<int64_t> sourceOperationOrdinals(mlir::ArrayAttr sources) {
+  llvm::SmallVector<int64_t> ordinals;
+  for (mlir::Attribute attribute : sources) {
+    auto source = mlir::dyn_cast<mlir::shuttle::SourceRefAttr>(attribute);
+    if (!source)
+      return {};
+    ordinals.push_back(source.getOperationOrdinal());
+  }
+  return ordinals;
+}
+
+int64_t materializationBytes(mlir::shuttle::MaterializationBufferOp buffer) {
+  auto type = mlir::cast<mlir::RankedTensorType>(buffer.getTensorType());
+  int64_t bytes = staticElementCount(type);
+  if (type.getElementType().isBF16())
+    return bytes * 2;
+  if (type.getElementType().isF32())
+    return bytes * 4;
+  return -1;
+}
+
+TEST(Abi22MapFusionContract,
+     NormContractCandidatesBindCostTopologyTransportAndPolicy) {
+  struct Boundary {
+    const char *filename;
+    int64_t rows;
+    int64_t reduction;
+    int64_t columns;
+  };
+  constexpr Boundary boundaries[] = {
+      {"jax-0.10.1-bf16-rmsnorm_contract-5x19x7-forward.mlir", 5, 19, 7},
+      {"jax-0.10.1-bf16-rmsnorm_contract-3x2x5x11x263x521-forward.mlir",
+       330, 263, 521},
+  };
+  for (const Boundary &boundary : boundaries) {
+    SCOPED_TRACE(boundary.filename);
+    std::optional<std::string> source = fixtureSource(boundary.filename);
+    ASSERT_TRUE(source);
+    std::optional<std::string> sourceOrderedFingerprint;
+    for (mlir::shuttle::NumericalPolicy policy :
+         {mlir::shuttle::NumericalPolicy::SourceOrdered,
+          mlir::shuttle::NumericalPolicy::Fast}) {
+      const int64_t outputCapacity =
+          policy == mlir::shuttle::NumericalPolicy::Fast ? 8 : 256;
+      const int64_t outputTile = std::min(boundary.columns, outputCapacity);
+      const int64_t outputTiles =
+          (boundary.columns + outputTile - 1) / outputTile;
+      const bool inlineFold = outputTiles == 1;
+      const int64_t expectedTasks = inlineFold ? 1 : 2;
+      const int64_t expectedBuffers = inlineFold ? 4 : 5;
+      const int64_t expectedTemporaryBytes = inlineFold ? 0 : boundary.rows * 4;
+
+      std::unique_ptr<BuiltModule> built =
+          build(*source, policy, kFusionTuning, false, true);
+      ASSERT_TRUE(built);
+      std::optional<PlanSummary> planSummary = summary(*built->module);
+      ASSERT_TRUE(planSummary);
+      EXPECT_TRUE(planSummary->hasContractRegion);
+      EXPECT_TRUE(planSummary->exactSourceCoverage);
+      EXPECT_EQ(planSummary->maps, 19);
+      EXPECT_EQ(planSummary->folds, 1);
+      EXPECT_EQ(planSummary->contracts, 1);
+      EXPECT_EQ(planSummary->tasks, expectedTasks);
+      EXPECT_EQ(planSummary->buffers, expectedBuffers);
+
+      auto plan = *built->module->getOps<mlir::shuttle::MaterializationPlanOp>()
+                       .begin();
+      EXPECT_EQ(plan.getSchemaVersion(), 2);
+      auto tasks = llvm::to_vector(
+          plan.getBody()
+              .front()
+              .getOps<mlir::shuttle::MaterializationTaskOp>());
+      auto buffers = llvm::to_vector(
+          plan.getBody()
+              .front()
+              .getOps<mlir::shuttle::MaterializationBufferOp>());
+      ASSERT_EQ(tasks.size(), expectedTasks);
+      ASSERT_EQ(buffers.size(), expectedBuffers);
+      auto contractTask = llvm::find_if(tasks, [](auto task) {
+        return task.getKind() ==
+               mlir::shuttle::MaterializationTaskKind::Contract;
+      });
+      ASSERT_NE(contractTask, tasks.end());
+      mlir::shuttle::MaterializationTaskOp contract = *contractTask;
+      EXPECT_EQ(contract.getInputBuffers(),
+                inlineFold ? llvm::ArrayRef<int64_t>({0, 1, 2})
+                           : llvm::ArrayRef<int64_t>({0, 3, 1, 2}));
+      EXPECT_EQ(contract.getOutputBuffers(),
+                llvm::ArrayRef<int64_t>({inlineFold ? 3 : 4}));
+      EXPECT_EQ(contract.getDependencies(),
+                inlineFold ? llvm::ArrayRef<int64_t>()
+                           : llvm::ArrayRef<int64_t>({0}));
+
+      auto strategy = contract->getAttrOfType<mlir::StringAttr>(
+          "contract_region_strategy");
+      auto sources = contract->getAttrOfType<mlir::ArrayAttr>(
+          "contract_region_sources");
+      auto foldSource =
+          contract->getAttrOfType<mlir::shuttle::SourceRefAttr>(
+              "contract_region_fold_source");
+      auto contractSource =
+          contract->getAttrOfType<mlir::shuttle::SourceRefAttr>(
+              "contract_region_contract_source");
+      auto boundarySource =
+          contract->getAttrOfType<mlir::shuttle::SourceRefAttr>(
+              "contract_region_bf16_boundary_source");
+      auto epilogueSources = contract->getAttrOfType<mlir::ArrayAttr>(
+          "contract_region_epilogue_sources");
+      auto normalizedOperand = contract->getAttrOfType<mlir::IntegerAttr>(
+          "contract_region_normalized_operand");
+      auto cost = contract->getAttrOfType<mlir::DictionaryAttr>(
+          "contract_region_cost");
+      ASSERT_TRUE(strategy);
+      ASSERT_TRUE(sources);
+      ASSERT_TRUE(foldSource);
+      ASSERT_TRUE(contractSource);
+      ASSERT_TRUE(boundarySource);
+      ASSERT_TRUE(epilogueSources);
+      ASSERT_TRUE(normalizedOperand);
+      ASSERT_TRUE(cost);
+      EXPECT_EQ(strategy.getValue(), inlineFold ? "inline_fold" : "compact_stat");
+      EXPECT_EQ(foldSource.getOperationOrdinal(), 3);
+      EXPECT_EQ(contractSource.getOperationOrdinal(), 19);
+      EXPECT_EQ(boundarySource.getOperationOrdinal(), 18);
+      EXPECT_EQ(normalizedOperand.getInt(), 0);
+      EXPECT_EQ(sourceOperationOrdinals(epilogueSources),
+                llvm::ArrayRef<int64_t>({20}));
+      EXPECT_EQ(sourceOperationOrdinals(sources),
+                inlineFold
+                    ? llvm::to_vector(llvm::seq<int64_t>(0, 21))
+                    : llvm::SmallVector<int64_t>({0, 12, 13, 14, 15, 16, 17,
+                                                  18, 19, 20}));
+      auto expectCost = [&](llvm::StringRef field, int64_t expected) {
+        auto value = cost.getAs<mlir::IntegerAttr>(field);
+        ASSERT_TRUE(value) << field.str();
+        EXPECT_EQ(value.getInt(), expected) << field.str();
+      };
+      expectCost("rows", boundary.rows);
+      expectCost("reduction", boundary.reduction);
+      expectCost("columns", boundary.columns);
+      expectCost("output_tile", outputTile);
+      expectCost("output_tiles", outputTiles);
+      expectCost("duplicated_fold_elements",
+                 boundary.rows * boundary.reduction * (outputTiles - 1));
+      expectCost("normalized_temporary_bytes",
+                 boundary.rows * boundary.reduction * 2);
+      expectCost("contract_temporary_bytes",
+                 boundary.rows * boundary.columns * 4);
+      expectCost("compact_stat_bytes", expectedTemporaryBytes);
+
+      int64_t actualTemporaryBytes = 0;
+      for (auto buffer : buffers) {
+        if (buffer.getStorage() ==
+            mlir::shuttle::MaterializationStorage::Temporary)
+          actualTemporaryBytes += materializationBytes(buffer);
+      }
+      EXPECT_EQ(actualTemporaryBytes, expectedTemporaryBytes);
+      if (!inlineFold) {
+        auto foldTask = llvm::find_if(tasks, [](auto task) {
+          return task.getKind() ==
+                 mlir::shuttle::MaterializationTaskKind::Fold;
+        });
+        ASSERT_NE(foldTask, tasks.end());
+        mlir::shuttle::MaterializationTaskOp compactFold = *foldTask;
+        EXPECT_EQ(compactFold.getInputBuffers(), llvm::ArrayRef<int64_t>({0}));
+        EXPECT_EQ(compactFold.getOutputBuffers(), llvm::ArrayRef<int64_t>({3}));
+        EXPECT_TRUE(compactFold.getDependencies().empty());
+        auto foldSources = compactFold->getAttrOfType<mlir::ArrayAttr>(
+            "fold_region_sources");
+        ASSERT_TRUE(foldSources);
+        EXPECT_EQ(sourceOperationOrdinals(foldSources),
+                  llvm::to_vector(llvm::seq<int64_t>(0, 12)));
+        auto foldRecomputed = compactFold->getAttrOfType<mlir::ArrayAttr>(
+            "fold_region_recomputed_sources");
+        auto contractRecomputed = contract->getAttrOfType<mlir::ArrayAttr>(
+            "contract_region_recomputed_sources");
+        ASSERT_TRUE(foldRecomputed);
+        ASSERT_TRUE(contractRecomputed);
+        EXPECT_EQ(sourceOperationOrdinals(foldRecomputed),
+                  llvm::ArrayRef<int64_t>({0}));
+        EXPECT_EQ(sourceOperationOrdinals(contractRecomputed),
+                  llvm::ArrayRef<int64_t>({0}));
+      }
+
+      auto device =
+          *built->module->getOps<mlir::shuttle::DeviceModuleOp>().begin();
+      auto entries = llvm::to_vector(
+          device.getBody().front().getOps<mlir::shuttle::DeviceEntryOp>());
+      ASSERT_EQ(entries.size(), expectedTasks);
+      mlir::shuttle::DeviceEntryOp contractEntry = entries.back();
+      ASSERT_TRUE(contractEntry.getGrid());
+      ASSERT_TRUE(contractEntry.getBlock());
+      EXPECT_EQ(*contractEntry.getGrid(),
+                llvm::ArrayRef<int64_t>({boundary.rows, outputTiles, 1}));
+      const int64_t expectedContractThreads =
+          policy == mlir::shuttle::NumericalPolicy::Fast
+              ? outputTile * 32
+              : ((outputTile + 31) / 32) * 32;
+      EXPECT_EQ(*contractEntry.getBlock(),
+                llvm::ArrayRef<int64_t>({expectedContractThreads, 1, 1}));
+      EXPECT_EQ(*contractEntry.getDynamicSharedBytes(),
+                inlineFold ? ((boundary.reduction + 31) / 32) * 32 * 4
+                           : std::min<int64_t>(boundary.reduction, 256) * 2);
+      if (!inlineFold) {
+        ASSERT_TRUE(entries.front().getGrid());
+        ASSERT_TRUE(entries.front().getBlock());
+        EXPECT_EQ(*entries.front().getGrid(),
+                  llvm::ArrayRef<int64_t>({boundary.rows, 1, 1}));
+        EXPECT_EQ(*entries.front().getBlock(),
+                  llvm::ArrayRef<int64_t>({256, 1, 1}));
+        EXPECT_EQ(*entries.front().getDynamicSharedBytes(), 1024);
+      }
+
+      llvm::StringRef contractPtx(
+          reinterpret_cast<const char *>(device.getCode().data() +
+                                         contractEntry.getCodeOffset()),
+          contractEntry.getCodeLength());
+      EXPECT_NE(contractPtx.find("cvt.rn.bf16.f32"), llvm::StringRef::npos);
+      EXPECT_NE(contractPtx.find("cvt.f32.bf16"), llvm::StringRef::npos);
+      EXPECT_NE(contractPtx.find("fma.rn.f32"), llvm::StringRef::npos);
+      EXPECT_NE(contractPtx.find(policy == mlir::shuttle::NumericalPolicy::Fast
+                                     ? "shfl.sync.down.b32"
+                                     : "add.u64"),
+                llvm::StringRef::npos);
+      EXPECT_EQ(contractPtx.count("st.global.u16"), 1u);
+
+      mlir::FailureOr<llvm::SmallVector<uint8_t>> transport =
+          mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+      ASSERT_TRUE(mlir::succeeded(transport));
+      auto executable = mlir::shuttle::GpuExecutable::Load(*transport);
+      ASSERT_TRUE(executable.ok()) << executable.status();
+      EXPECT_EQ((*executable)->launches().size(), expectedTasks);
+      EXPECT_EQ((*executable)->slots().size(), expectedBuffers);
+      int64_t transportedTemporarySlots = 0;
+      int64_t transportedTemporaryBytes = 0;
+      for (const mlir::shuttle::GpuSlot &slot : (*executable)->slots()) {
+        if (slot.storage != mlir::shuttle::MaterializationStorage::Temporary)
+          continue;
+        ++transportedTemporarySlots;
+        transportedTemporaryBytes += slot.requiredBytes;
+      }
+      EXPECT_EQ(transportedTemporarySlots, inlineFold ? 0 : 1);
+      EXPECT_EQ(transportedTemporaryBytes, expectedTemporaryBytes);
+
+      std::unique_ptr<BuiltModule> renamed =
+          build(*source, policy, kFusionTuning, true, true);
+      ASSERT_TRUE(renamed);
+      auto renamedPlan =
+          *renamed->module->getOps<mlir::shuttle::MaterializationPlanOp>()
+               .begin();
+      EXPECT_EQ(plan.getFingerprint(), renamedPlan.getFingerprint());
+      if (sourceOrderedFingerprint)
+        EXPECT_NE(*sourceOrderedFingerprint, plan.getFingerprint());
+      else
+        sourceOrderedFingerprint = plan.getFingerprint().str();
+    }
+  }
+}
+
+TEST(Abi22MapFusionContract,
+     NormContractFusionRejectsLiveOutFanoutWrongAxisAndMissingBf16Boundary) {
+  std::optional<std::string> fixture = fixtureSource(
+      "jax-0.10.1-bf16-rmsnorm_contract-5x19x7-forward.mlir");
+  ASSERT_TRUE(fixture);
+  std::vector<std::string> mutations;
+
+  mutations.push_back(replaceAllText(
+      replaceAllText(
+          *fixture,
+          ") -> (tensor<5x7xbf16> {jax.result_info = \"result\"}) {",
+          ") -> (tensor<5x7xbf16>, tensor<5x19xbf16>) {"),
+      "return %17 : tensor<5x7xbf16>",
+      "return %17, %15 : tensor<5x7xbf16>, tensor<5x19xbf16>"));
+  mutations.push_back(replaceAllText(
+      replaceAllText(
+          *fixture,
+          ") -> (tensor<5x7xbf16> {jax.result_info = \"result\"}) {",
+          ") -> (tensor<5x7xbf16>, tensor<5x1xf32>) {"),
+      "return %17 : tensor<5x7xbf16>",
+      "return %17, %8 : tensor<5x7xbf16>, tensor<5x1xf32>"));
+
+  std::string fanout = replaceAllText(
+      *fixture,
+      "    %17 = stablehlo.convert %16 : (tensor<5x7xf32>) -> "
+      "tensor<5x7xbf16>",
+      "    %17 = stablehlo.convert %16 : (tensor<5x7xf32>) -> "
+      "tensor<5x7xbf16>\n"
+      "    %extra = stablehlo.dot_general %15, %arg2, contracting_dims = [1] "
+      "x [0], precision = [DEFAULT, DEFAULT] : (tensor<5x19xbf16>, "
+      "tensor<19x7xbf16>) -> tensor<5x7xf32>\n"
+      "    %extra_bf16 = stablehlo.convert %extra : (tensor<5x7xf32>) -> "
+      "tensor<5x7xbf16>");
+  fanout = replaceAllText(
+      replaceAllText(
+          fanout,
+          ") -> (tensor<5x7xbf16> {jax.result_info = \"result\"}) {",
+          ") -> (tensor<5x7xbf16>, tensor<5x7xbf16>) {"),
+      "return %17 : tensor<5x7xbf16>",
+      "return %17, %extra_bf16 : tensor<5x7xbf16>, tensor<5x7xbf16>");
+  mutations.push_back(std::move(fanout));
+
+  std::string wrongAxis = replaceAllText(
+      *fixture, "%arg2: tensor<19x7xbf16>", "%arg2: tensor<5x7xbf16>");
+  wrongAxis = replaceAllText(
+      wrongAxis,
+      "%16 = stablehlo.dot_general %15, %arg2, contracting_dims = [1] x [0], "
+      "precision = [DEFAULT, DEFAULT] : (tensor<5x19xbf16>, "
+      "tensor<19x7xbf16>) -> tensor<5x7xf32>",
+      "%16 = stablehlo.dot_general %15, %arg2, contracting_dims = [0] x [0], "
+      "precision = [DEFAULT, DEFAULT] : (tensor<5x19xbf16>, "
+      "tensor<5x7xbf16>) -> tensor<19x7xf32>");
+  wrongAxis = replaceAllText(
+      wrongAxis,
+      "%17 = stablehlo.convert %16 : (tensor<5x7xf32>) -> tensor<5x7xbf16>",
+      "%17 = stablehlo.convert %16 : (tensor<19x7xf32>) -> "
+      "tensor<19x7xbf16>");
+  wrongAxis = replaceAllText(
+      wrongAxis,
+      ") -> (tensor<5x7xbf16> {jax.result_info = \"result\"}) {",
+      ") -> (tensor<19x7xbf16> {jax.result_info = \"result\"}) {");
+  wrongAxis = replaceAllText(wrongAxis, "return %17 : tensor<5x7xbf16>",
+                             "return %17 : tensor<19x7xbf16>");
+  mutations.push_back(std::move(wrongAxis));
+
+  std::string noBf16Boundary = replaceAllText(
+      *fixture, "%arg2: tensor<19x7xbf16>", "%arg2: tensor<19x7xf32>");
+  noBf16Boundary = replaceAllText(
+      noBf16Boundary,
+      "%16 = stablehlo.dot_general %15, %arg2, contracting_dims = [1] x [0], "
+      "precision = [DEFAULT, DEFAULT] : (tensor<5x19xbf16>, "
+      "tensor<19x7xbf16>) -> tensor<5x7xf32>",
+      "%16 = stablehlo.dot_general %14, %arg2, contracting_dims = [1] x [0], "
+      "precision = [DEFAULT, DEFAULT] : (tensor<5x19xf32>, "
+      "tensor<19x7xf32>) -> tensor<5x7xf32>");
+  mutations.push_back(std::move(noBf16Boundary));
+
+  for (const std::string &mutation : mutations) {
+    for (mlir::shuttle::NumericalPolicy policy :
+         {mlir::shuttle::NumericalPolicy::SourceOrdered,
+          mlir::shuttle::NumericalPolicy::Fast}) {
+      SCOPED_TRACE(policy == mlir::shuttle::NumericalPolicy::Fast ? "fast"
+                                                                  : "source");
+      std::unique_ptr<BuiltModule> built =
+          build(mutation, policy, kFusionTuning, false, false);
+      if (!built)
+        continue;
+      auto plan = *built->module->getOps<mlir::shuttle::MaterializationPlanOp>()
+                       .begin();
+      for (auto task : plan.getBody().front().getOps<
+               mlir::shuttle::MaterializationTaskOp>())
+        EXPECT_FALSE(task->getAttr("contract_region_sources"));
+    }
+  }
 }
 
 } // namespace
