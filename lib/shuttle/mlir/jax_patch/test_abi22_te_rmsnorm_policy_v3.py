@@ -256,6 +256,10 @@ class TeRmsnormPolicyV3Test(unittest.TestCase):
                 / "raw"
                 / (f"policy-{run['producer']}-{pattern}-{run['boundary']}" f"-repeat{run['repeat']}.json")
             )
+            output_files = output.parent / f"{output.stem}-outputs"
+            persistence_argv = (
+                ["--output-files-directory", str(output_files)] if run["producer"] == "ordinary_jax_xla" else []
+            )
             self.assertEqual(
                 run,
                 {
@@ -283,6 +287,7 @@ class TeRmsnormPolicyV3Test(unittest.TestCase):
                         str(directory),
                         "--output",
                         str(output),
+                        *persistence_argv,
                     ],
                 },
             )

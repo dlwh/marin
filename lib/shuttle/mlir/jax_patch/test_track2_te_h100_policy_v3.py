@@ -75,9 +75,11 @@ def _fake_invoke(paths: BatchPaths, calls: list[list[str]], argv: list[str]) -> 
         error_metrics = oracle.error_metrics
     output_files = {}
     outputs = []
+    output_directory = Path(arguments.get("output-files-directory", paths.raw / f"{output.stem}-outputs"))
+    output_directory.mkdir(parents=True, exist_ok=True)
     for role in roles:
         reference_path = case / f"reference_{role}.bf16"
-        actual_path = paths.raw / f"{output.stem}-{role}.bf16"
+        actual_path = output_directory / f"{role}.bf16"
         actual_path.write_bytes(reference_path.read_bytes())
         output_files[role] = str(actual_path)
         output_shape = shape if role != "dgamma" else (shape[1],)
