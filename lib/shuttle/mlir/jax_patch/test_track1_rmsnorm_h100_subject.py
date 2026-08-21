@@ -28,6 +28,8 @@ def _observer_snapshot(coordinate: Coordinate) -> tuple[tuple[object, ...], ...]
             "",
             False,
             "",
+            0,
+            0,
         ),
         (
             31,
@@ -41,6 +43,8 @@ def _observer_snapshot(coordinate: Coordinate) -> tuple[tuple[object, ...], ...]
             "b" * 64,
             False,
             "",
+            subject.expected_bundle_shape(coordinate.boundary)[0],
+            subject.expected_bundle_shape(coordinate.boundary)[1],
         ),
         (
             31,
@@ -54,6 +58,8 @@ def _observer_snapshot(coordinate: Coordinate) -> tuple[tuple[object, ...], ...]
             "c" * 64,
             True,
             "",
+            0,
+            0,
         ),
     )
 
@@ -127,6 +133,25 @@ def test_run_matrix_rejects_enabled_result_drift_through_public_boundary(monkeyp
     assert len(str(raised.value)) < 1_024
 
 
+def test_run_matrix_rejects_a_shared_disabled_and_enabled_host_oracle_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(subject, "require_h100", lambda: None)
+
+    def execute(coordinate: Coordinate):
+        arrays = []
+        for role in subject.result_roles(coordinate.boundary):
+            shape = (coordinate.shape[-1],) if role == "weight_cotangent" else coordinate.shape
+            arrays.append(np.zeros(shape, dtype=ml_dtypes.bfloat16))
+        snapshot = () if coordinate.mode is Mode.DISABLED else _observer_snapshot(coordinate)
+        return tuple(arrays), snapshot
+
+    monkeypatch.setattr(subject, "_execute", execute)
+
+    with pytest.raises(RuntimeError, match="host oracle"):
+        subject.run_matrix()
+
+
 def test_result_document_binds_all_output_hashes_and_observer_invocations(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(subject, "require_h100", lambda: None)
 
@@ -149,3 +174,5 @@ def test_result_document_binds_all_output_hashes_and_observer_invocations(monkey
         if item["observer"] is not None:
             assert item["observer"]["invocation_id"] == 31
             assert item["observer"]["generated_bundle_sha256"] == "b" * 64
+            expected = subject.expected_bundle_shape(Boundary(item["boundary"]))
+            assert (item["observer"]["launch_count"], item["observer"]["temporary_count"]) == expected

@@ -584,6 +584,12 @@ TEST(TrackOneMapWiringTest,
       EXPECT_EQ(events[0].regionMembership(), events[1].regionMembership());
       EXPECT_FALSE(events[0].noShuttleSemantics());
       EXPECT_FALSE(events[1].noShuttleSemantics());
+      EXPECT_EQ(events[0].bundleLaunchCount(), 0);
+      EXPECT_EQ(events[0].bundleTemporaryCount(), 0);
+      EXPECT_EQ(events[1].bundleLaunchCount(), boundary.launches);
+      EXPECT_EQ(events[1].bundleTemporaryCount(), boundary.temporaries);
+      EXPECT_EQ(events[2].bundleLaunchCount(), 0);
+      EXPECT_EQ(events[2].bundleTemporaryCount(), 0);
       EXPECT_TRUE(events[2].noShuttleSemantics());
       EXPECT_TRUE(events[2].regionMembership().empty());
     }
