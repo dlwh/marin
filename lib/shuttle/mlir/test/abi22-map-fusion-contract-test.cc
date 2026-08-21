@@ -215,6 +215,8 @@ std::set<std::string> ptxDependencyClosure(const PtxDataflow &flow,
                                            llvm::StringRef root);
 const PtxDataflow::Definition *ptxDefinition(const PtxDataflow &flow,
                                              llvm::StringRef value);
+bool ptxDependsOn(const PtxDataflow &flow, llvm::StringRef value,
+                  llvm::StringRef dependency);
 
 std::vector<std::string> ptxTokens(llvm::StringRef text) {
   std::vector<std::string> tokens;
@@ -495,11 +497,70 @@ bool hasDependentRowFoldPhaseDataflow(llvm::StringRef ptx,
   PtxDataflow flow = ptxDataflow(phase);
   if (flow.sharedStores.size() != 1)
     return false;
-  std::set<std::string> closure =
-      ptxDependencyClosure(flow, flow.sharedStores.front());
-  return closure.count("$ld.global.u16") && closure.count("$shared") &&
-         closure.count("$op:add.rn.f32") && closure.count("$op:sub.rn.f32") &&
-         closure.count("$op:mul.rn.f32") && closure.count("p0");
+  auto rowMajorFound = flow.currentValues.find("%rd0");
+  if (rowMajorFound == flow.currentValues.end())
+    return false;
+  llvm::StringRef rowMajorValue = rowMajorFound->second;
+  const PtxDataflow::Definition *rowMajor = ptxDefinition(flow, rowMajorValue);
+  if (!rowMajor || rowMajor->opcode != "mad.lo.u64" ||
+      rowMajor->operands.size() != 2 ||
+      !ptxDependsOn(flow, rowMajor->operands[0], "%r1") ||
+      !ptxDependsOn(flow, rowMajor->operands[1], "%r0"))
+    return false;
+
+  llvm::StringRef storedValue = flow.sharedStores.front();
+  const PtxDataflow::Definition *stored = ptxDefinition(flow, storedValue);
+  if (!stored || stored->opcode != "mov.f32" || stored->operands.size() != 1)
+    return false;
+  const PtxDataflow::Definition *combined =
+      ptxDefinition(flow, stored->operands.front());
+  if (!combined || combined->opcode != "add.rn.f32" ||
+      combined->operands.size() != 2)
+    return false;
+  int accumulatorOperand = -1;
+  for (int operand : {0, 1}) {
+    const PtxDataflow::Definition *candidate =
+        ptxDefinition(flow, combined->operands[operand]);
+    if (candidate && candidate->opcode == "mov.f32" &&
+        candidate->operands == std::vector<std::string>{"0f00000000"})
+      accumulatorOperand = operand;
+  }
+  if (accumulatorOperand < 0)
+    return false;
+  const PtxDataflow::Definition *leaf =
+      ptxDefinition(flow, combined->operands[1 - accumulatorOperand]);
+  if (!leaf || leaf->opcode != "mul.rn.f32" || leaf->operands.size() != 2)
+    return false;
+  auto isCenteredInput = [&](llvm::StringRef value) {
+    const PtxDataflow::Definition *centered = ptxDefinition(flow, value);
+    if (!centered || centered->opcode != "sub.rn.f32" ||
+        centered->operands.size() != 2)
+      return false;
+    std::set<std::string> input =
+        ptxDependencyClosure(flow, centered->operands[0]);
+    std::set<std::string> mean =
+        ptxDependencyClosure(flow, centered->operands[1]);
+    return input.count("$ld.global.u16") && input.count("p0") &&
+           input.count(rowMajorValue.str()) && mean.count("$shared");
+  };
+  if (!isCenteredInput(leaf->operands[0]) ||
+      !isCenteredInput(leaf->operands[1]))
+    return false;
+
+  llvm::StringRef accumulator = storedValue.take_front(storedValue.find('@'));
+  llvm::StringRef combinedValue = stored->operands.front();
+  llvm::StringRef combinedRegister =
+      combinedValue.take_front(combinedValue.find('@'));
+  int64_t accumulatorDefinitions =
+      llvm::count_if(flow.definitions, [&](const auto &definition) {
+        return llvm::StringRef(definition.first)
+            .starts_with((llvm::Twine(accumulator) + "@").str());
+      });
+  const std::string recurrence =
+      (llvm::Twine("  mov.f32 ") + accumulator + ", " + combinedRegister +
+       ";\n  add.u32 %r4, %r4, 1;")
+          .str();
+  return accumulatorDefinitions == 2 && phase.contains(recurrence);
 }
 
 PtxDataflow ptxDataflow(llvm::StringRef ptx) {
@@ -1550,21 +1611,44 @@ TEST(Abi22MapFusionContract, DependentRowFoldsShareOneGenericFoldRegion) {
       replaceAfterPhase("cvt.u64.u32 %rd1, %r1;", "cvt.u64.u32 %rd1, %r0;"),
       4096, 16));
 
-  std::string zeroLeaf = ptx.str();
-  size_t phase = zeroLeaf.find("$fold_region_phase_1_load:");
-  size_t increment = zeroLeaf.find("  add.u32 %r4, %r4, 1;", phase);
-  size_t combine = zeroLeaf.rfind("  add.rn.f32 ", increment);
+  std::string nonzeroInitializer = ptx.str();
+  size_t phase = nonzeroInitializer.find("$fold_region_phase_1_load:");
+  ASSERT_NE(phase, std::string::npos);
+  size_t initializer = nonzeroInitializer.rfind("  mov.f32 ", phase);
+  ASSERT_NE(initializer, std::string::npos);
+  size_t zero = nonzeroInitializer.find("0f00000000", initializer);
+  ASSERT_LT(zero, phase);
+  nonzeroInitializer.replace(zero, strlen("0f00000000"), "0f3F800000");
+  EXPECT_FALSE(hasDependentRowFoldPhaseDataflow(nonzeroInitializer, 4096, 16));
+
+  std::string wrongCoordinate = ptx.str();
+  phase = wrongCoordinate.find("$fold_region_phase_1_load:");
+  size_t coordinate =
+      wrongCoordinate.find("  mad.lo.u64 %rd0, %rd1, 4096, %rd0;", phase);
+  ASSERT_NE(coordinate, std::string::npos);
+  size_t coordinateEnd = wrongCoordinate.find('\n', coordinate);
+  ASSERT_NE(coordinateEnd, std::string::npos);
+  wrongCoordinate.insert(coordinateEnd + 1, "  mov.u64 %rd0, 0;\n");
+  EXPECT_FALSE(hasDependentRowFoldPhaseDataflow(wrongCoordinate, 4096, 16));
+
+  std::string zeroInnerOperand = ptx.str();
+  phase = zeroInnerOperand.find("$fold_region_phase_1_load:");
+  size_t increment = zeroInnerOperand.find("  add.u32 %r4, %r4, 1;", phase);
+  size_t combine = zeroInnerOperand.rfind("  add.rn.f32 ", increment);
   ASSERT_NE(phase, std::string::npos);
   ASSERT_NE(increment, std::string::npos);
   ASSERT_NE(combine, std::string::npos);
-  size_t combineEnd = zeroLeaf.find('\n', combine);
-  std::vector<std::string> combineTokens =
-      ptxTokens(llvm::StringRef(zeroLeaf).slice(combine, combineEnd));
-  ASSERT_EQ(combineTokens.size(), 3u);
-  size_t leaf = zeroLeaf.find(combineTokens[2], combine);
-  ASSERT_LT(leaf, combineEnd);
-  zeroLeaf.replace(leaf, combineTokens[2].size(), "0f00000000");
-  EXPECT_FALSE(hasDependentRowFoldPhaseDataflow(zeroLeaf, 4096, 16));
+  size_t multiply = zeroInnerOperand.rfind("  mul.rn.f32 ", combine);
+  ASSERT_NE(multiply, std::string::npos);
+  size_t multiplyEnd = zeroInnerOperand.find('\n', multiply);
+  std::vector<std::string> multiplyTokens =
+      ptxTokens(llvm::StringRef(zeroInnerOperand).slice(multiply, multiplyEnd));
+  ASSERT_EQ(multiplyTokens.size(), 3u);
+  size_t innerOperand = zeroInnerOperand.find(multiplyTokens[1], multiply);
+  ASSERT_LT(innerOperand, multiplyEnd);
+  zeroInnerOperand.replace(innerOperand, multiplyTokens[1].size(),
+                           "0f00000000");
+  EXPECT_FALSE(hasDependentRowFoldPhaseDataflow(zeroInnerOperand, 4096, 16));
 }
 
 TEST(Abi22MapFusionContract,
