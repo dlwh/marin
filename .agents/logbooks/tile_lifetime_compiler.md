@@ -5529,3 +5529,59 @@ author: dlwh
 - Next action: connect the same generic region machinery to ordinary JAX,
   extend a strong oracle to the exact public boundary, repeat at representative
   shapes, and establish SM100 portability separately.
+
+### 2026-08-21 - TLTC-ABI23-001 SM100 portability on GB200
+
+- Hypothesis: the registered ordinary-JAX ABI23 `prefer_fusion` path can emit
+  schema 4 PTX 8.7 for `sm_100`, load it on compute capability 10.0, and
+  execute a structurally eligible Map graph and RMSNorm forward with exact
+  host-oracle parity.
+- Executed source: production commit
+  `43b52d73d2eb13b28c765bda2bfd5ad28af9ceab`; reviewed gate commit
+  `f3342153b37f12dbed2f81eb39d7648898975b89`, tree
+  `abb539d85b53ba38b3e297b7756a95327574ae3d`, source-manifest SHA-256
+  `c2571612301c6346cd9bef34635b29fc8eec81a5d8e6635ebe6db0f03e1b74ea`.
+  The gate source at this commit contains the fixture and sealed-request
+  builder. It did not replace the production source identified in the result.
+- Config: `/dlwh/shuttle-gb200-portability-r4` on batch-priority GB200x1 in
+  `cw-us-east-08a`; request SHA-256
+  `746f0f4516311ffce7d5cb1e4f6caba06c94a2e380d74f0760a1cfb06b45718c`;
+  NVIDIA GB200 UUID `GPU-bdaee5ad-43a2-1d4b-ad02-3d8a3208f8c8`, driver
+  `595.71.05`, compute capability 10.0; XLA
+  `9b635916ecc6df6efee62d8e4b0c7ef87ef84d69`; Bazel 7.7.0; CUDA
+  12.9.1; pinned image
+  `ghcr.io/marin-community/iris-task@sha256:95ef45bc351fd7bd6cedc76f7b76e9b9c19616027dc36c2c06d844a871245788`.
+  The job exited zero after 269.97 seconds with no failure or preemption.
+- Identity result: ABI23 SOURCE_ORDERED with `prefer_fusion` emitted device
+  schema 4, code format `cuda_ptx_sm100_v1`, PTX 8.7, and target `sm_100`.
+  Policy and tuning digests were
+  `b9073351d04385dbc62b906142eb8a02e1bdabbb50503c32328ed3f768f345f2`
+  and
+  `528d87798df49d74838ca85396578213dc949a9d7ad76d9db7b8be4d0b64868a`.
+- Numerical result: the ordinary-JAX BF16-to-F32, negate, F32-to-BF16 Map
+  fixture launched three kernels with maximum absolute error zero. Its PTX
+  and transport SHA-256 values were
+  `804efcdf770fcf2d9b5dbb5f426e32f78d03c640c3490c585b408ddc42721a7d`
+  and
+  `0ebcf04f05a0dc08a28e137b45886b6268dc01f92c7972d946895e23298fdeeb`.
+  The `[2,7,19]` RMSNorm forward fixture launched one kernel with maximum BF16
+  ULP error zero. Its PTX and transport SHA-256 values were
+  `1b9a09f263d0335bad254a9327dda08336829f9ca1f8dc7740c24bc9393d8272`
+  and
+  `5a75b84e1304304cbb25183b9c4425b99e10c08174dc4a642bfc147a9339f13b`.
+- Submission command:
+  `uv run python lib/shuttle/mlir/jax_patch/gb200_portability_iris.py submit --request /private/tmp/shuttle-gb200-evidence-f334215/request.pb --run 4 --expected-sha256 746f0f4516311ffce7d5cb1e4f6caba06c94a2e380d74f0760a1cfb06b45718c --config /Users/dlwh/src/marin/lib/iris/config/cw-us-east-08a.yaml --receipt /private/tmp/shuttle-gb200-evidence-f334215/receipt.json`.
+- Artifacts:
+  `lib/shuttle/mlir/artifacts/sm100-gb200-portability-20260821/` preserves the
+  canonical result, terminal summary, submission receipt, sanitized result
+  log, request SHA-256 and size, and file checksum manifest. The 6,363,268-byte
+  request protobuf is omitted. Verification command:
+  `(cd lib/shuttle/mlir/artifacts/sm100-gb200-portability-20260821 && sha256sum -c SHA256SUMS)`.
+- Interpretation: this accepts generic SM100 portability for the tested
+  SOURCE_ORDERED Map and RMSNorm-forward coordinates on one GB200. It is not
+  FAST-policy, backward, performance, compile-cost, persistent-cache-reuse,
+  representative-shape, resource-usage, or SASS evidence. The 269.97-second
+  task duration includes setup and compilation and is not a kernel benchmark.
+- Next action: measure representative RMSNorm shapes and both numerical
+  policies, then add backward and resource/performance evidence under separate
+  reviewed gates.

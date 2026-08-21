@@ -1,0 +1,10 @@
+warning: The `extra-build-dependencies` option is experimental and may change without warning. Pass `--preview-features extra-build-dependencies` to disable this warning.
+I20260821 07:25:17 8418467456 iris.cluster.config Loading config from lib/iris/config/cw-us-east-08a.yaml
+I20260821 07:25:17 8418467456 iris.cli.connect Establishing tunnel to controller...
+I20260821 07:25:18 8418467456 iris.cluster.platforms.k8s.service Tunnel ready: 127.0.0.1:10002 -> iris-controller-svc:10000
+Job: /dlwh/shuttle-gb200-portability-r4 (/dlwh/shuttle-gb200-portability-r4)
+State: succeeded  exit=0  failures=0  preemptions=0
+Tasks: 1/1 completed  succeeded=1
+
+  TASK  STATE        EXIT  DURATION                     PEAK MEM    CUR MEM    ERROR
+     0  succeeded       0  4 minutes and 29.97 seconds  -           -
