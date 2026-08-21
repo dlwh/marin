@@ -20,7 +20,7 @@ class _RecordingOutput(io.StringIO):
         super().flush()
 
 
-def test_worker_flushes_canonical_cell_evidence_before_subject_failure(monkeypatch, tmp_path) -> None:
+def test_worker_flushes_canonical_cell_and_primal_checkpoint_before_subject_failure(monkeypatch, tmp_path) -> None:
     cell = {
         "boundary": "composed",
         "mode": "disabled",
@@ -30,8 +30,16 @@ def test_worker_flushes_canonical_cell_evidence_before_subject_failure(monkeypat
         "shape": [5, 19, 7],
     }
 
-    def fail_after_report(*, report_cell):
+    checkpoint = {
+        "coordinates": [],
+        "numerical_policy_sha256": "a" * 64,
+        "schema": "track1_rmsnorm_contract_h100_primal_checkpoint",
+        "schema_version": 1,
+    }
+
+    def fail_after_report(*, report_cell, report_primal_checkpoint):
         report_cell(cell)
+        report_primal_checkpoint(checkpoint)
         raise RuntimeError("RMSNorm Contract input_cotangent exceeds its independent binary64 threshold")
 
     output = _RecordingOutput()
@@ -39,7 +47,14 @@ def test_worker_flushes_canonical_cell_evidence_before_subject_failure(monkeypat
     monkeypatch.setattr(sys, "stdout", output)
 
     with pytest.raises(RuntimeError, match="input_cotangent exceeds"):
-        worker.main(["--output", str(tmp_path / "result.json")])
+        worker.main(
+            [
+                "--output",
+                str(tmp_path / "result.json"),
+                "--primal-checkpoint",
+                str(tmp_path / "primal.json"),
+            ]
+        )
 
     line = output.getvalue()
     assert line.startswith(worker.CELL_REPORT_PREFIX)
@@ -49,3 +64,4 @@ def test_worker_flushes_canonical_cell_evidence_before_subject_failure(monkeypat
     phase_log.write_text(line)
 
     assert prototype._sanitized_log_tail(phase_log) == line.rstrip("\n")
+    assert (tmp_path / "primal.json").read_bytes() == prototype.canonical_json(checkpoint)

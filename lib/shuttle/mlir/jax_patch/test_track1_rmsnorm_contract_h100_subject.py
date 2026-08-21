@@ -193,6 +193,7 @@ def test_disabled_jax_is_diagnostic_but_enabled_masked_ulp_is_gated() -> None:
 
 def test_run_matrix_completes_every_primal_coordinate_before_composed_execution(monkeypatch) -> None:
     observed: list[Coordinate] = []
+    checkpoints: list[dict[str, object]] = []
 
     def execute(coordinate: Coordinate):
         observed.append(coordinate)
@@ -212,10 +213,14 @@ def test_run_matrix_completes_every_primal_coordinate_before_composed_execution(
     monkeypatch.setattr(subject, "_execute", execute)
 
     with pytest.raises(RuntimeError, match="independently reported primal campaign"):
-        subject.run_matrix()
+        subject.run_matrix(report_primal_checkpoint=checkpoints.append)
 
     assert observed[:6] == [Coordinate(shape, Boundary.PRIMAL, mode) for shape in SHAPES for mode in Mode]
     assert observed[6] == Coordinate(SHAPES[0], Boundary.COMPOSED, Mode.DISABLED)
+    assert len(checkpoints) == 1
+    assert checkpoints[0]["schema"] == "track1_rmsnorm_contract_h100_primal_checkpoint"
+    assert [item["shape"] for item in checkpoints[0]["coordinates"]] == [list(shape) for shape in SHAPES for _ in Mode]
+    assert [item["mode"] for item in checkpoints[0]["coordinates"]] == [mode.value for _ in SHAPES for mode in Mode]
 
 
 def test_threshold_failure_reports_every_role_before_rejecting_the_coordinate() -> None:

@@ -509,6 +509,46 @@ def test_rmsnorm_contract_result_keeps_disabled_and_raw_ulp_metrics_diagnostic()
         validate_rmsnorm_contract_result(document)
 
 
+def test_failed_rmsnorm_contract_phase_surfaces_the_complete_primal_checkpoint_last(tmp_path: Path) -> None:
+    full = _rmsnorm_contract_document()
+    checkpoint = {
+        "coordinates": [
+            {
+                "analytic_oracle": item["analytic_oracle"]["result"],
+                "disabled_jax_equal": item["disabled_jax_equal"]["result"],
+                "mode": item["mode"],
+                "numerics": item["numerics"]["result"],
+                "observer": item["observer"],
+                "repeat_bitwise_equal": True,
+                "result": item["results"]["result"],
+                "shape": item["shape"],
+            }
+            for item in full["coordinates"][:6]
+        ],
+        "numerical_policy_sha256": CONTRACT_POLICY_SHA256,
+        "schema": "track1_rmsnorm_contract_h100_primal_checkpoint",
+        "schema_version": 1,
+    }
+    checkpoint_path = tmp_path / "primal.json"
+    checkpoint_path.write_bytes(canonical_json(checkpoint))
+
+    with pytest.raises(RuntimeError, match="primal checkpoint follows phase tail") as raised:
+        prototype._run(
+            [sys.executable, "-c", "import sys; print('late composed failure ' * 2000); sys.exit(19)"],
+            cwd=None,
+            log=tmp_path / "phase.log",
+            phase="rmsnorm_contract",
+            failure_evidence=checkpoint_path,
+        )
+
+    surfaced = str(raised.value)
+    marker = "canonical RMSNorm Contract primal checkpoint:\n"
+    assert surfaced.endswith(marker + canonical_json(checkpoint).decode().rstrip("\n"))
+    recovered = json.loads(surfaced.rsplit(marker, 1)[1])
+    assert prototype.validate_rmsnorm_contract_primal_checkpoint(recovered) == recovered
+    assert len(recovered["coordinates"]) == 6
+
+
 def test_rmsnorm_result_requires_exact_coordinate_output_and_observer_closure() -> None:
     document = _rmsnorm_document()
     assert validate_rmsnorm_result(document) == document
