@@ -82,6 +82,10 @@ numerics and ABI policy remain part of downstream compile/cache identity. The
 direct MLIR-to-HLO path uses the same helper; a second call observes the cleared
 enable bit and cannot double-transform.
 
+Disabled compilation returns without materializing a `debug_options` field, so
+ordinary XLA request bytes remain unchanged. The XLA regression serializes
+disabled options before and after preprocessing and requires byte equality.
+
 ## Future work
 
 - [ ] Record final wheel/DSO evidence from r5 or a later authorized H100 run.

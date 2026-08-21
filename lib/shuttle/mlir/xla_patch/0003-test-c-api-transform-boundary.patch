@@ -118,7 +118,30 @@
          "@com_google_absl//absl/status:statusor",
 --- a/xla/pjrt/mlir_to_hlo_test.cc
 +++ b/xla/pjrt/mlir_to_hlo_test.cc
-@@ -138,7 +138,24 @@
+@@ -33,6 +33,7 @@
+ #include "xla/hlo/builder/xla_computation.h"
+ #include "xla/hlo/testlib/test.h"
+ #include "xla/pjrt/pjrt_executable.h"
++#include "xla/pjrt/proto/compile_options.pb.h"
+ #include "xla/pjrt/stablehlo_module_transform.h"
+ #include "xla/tsl/lib/core/status_test_util.h"
+ #include "xla/tsl/platform/statusor.h"
+@@ -119,6 +119,14 @@
+   mlir::MLIRContext context;
+   TF_ASSERT_OK_AND_ASSIGN(mlir::OwningOpRef<mlir::ModuleOp> module,
+                           ParseMlirModuleString(kProgram, context));
++  CompileOptions disabled_options;
++  TF_ASSERT_OK_AND_ASSIGN(CompileOptionsProto disabled_before,
++                          disabled_options.ToProto());
++  TF_EXPECT_OK(ApplyStablehloModuleTransform(*module, disabled_options));
++  TF_ASSERT_OK_AND_ASSIGN(CompileOptionsProto disabled_after,
++                          disabled_options.ToProto());
++  EXPECT_EQ(disabled_after.SerializeAsString(),
++            disabled_before.SerializeAsString());
+   OptionForwardingTestObserver& observer = GetOptionForwardingTestObserver();
+   observer.Reset();
+   TF_ASSERT_OK(RegisterOptionForwardingTestTransform());
+@@ -138,7 +146,24 @@
                ElementsAre("{\"numerics\":\"source_ordered\"}"));
    EXPECT_TRUE(compile_options.executable_build_options.debug_options()
                    .xla_cpu_enable_fast_math());
@@ -143,3 +166,13 @@
    TF_EXPECT_OK(compile_options.ApplyAllOptionOverrides());
    EXPECT_FALSE(compile_options.executable_build_options.debug_options()
                     .xla_cpu_enable_fast_math());
+--- a/xla/pjrt/BUILD
++++ b/xla/pjrt/BUILD
+@@ -1029,6 +1029,7 @@
+     deps = [
+         ":mlir_to_hlo",
+         ":pjrt_executable",
+         ":stablehlo_module_transform",
++        "//xla/pjrt/proto:compile_options_proto",
+         "//xla/hlo/builder:xla_computation",
+         "//xla/hlo/testlib:test",

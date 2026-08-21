@@ -22,7 +22,7 @@
  #include <memory>
  #include <optional>
  #include <string>
-@@ -96,6 +97,27 @@
+@@ -96,6 +97,28 @@
    return absl::OkStatus();
  }
  }  // namespace
@@ -30,11 +30,12 @@
 +absl::Status ApplyStablehloModuleTransform(
 +    mlir::ModuleOp module, CompileOptions& compile_options) {
 +  TF_RETURN_IF_ERROR(ApplyStablehloTransformOptionOverrides(compile_options));
-+  auto* debug_options =
-+      compile_options.executable_build_options.mutable_debug_options();
-+  if (!debug_options->xla_shuttle_enable()) {
++  auto& build_options = compile_options.executable_build_options;
++  if (!build_options.has_debug_options() ||
++      !build_options.debug_options().xla_shuttle_enable()) {
 +    return absl::OkStatus();
 +  }
++  auto* debug_options = build_options.mutable_debug_options();
 +  TF_RETURN_IF_ERROR(StablehloModuleTransformRegistry::Global().Run(
 +      module, debug_options->xla_shuttle_options(),
 +      /*required_transform=*/"shuttle"));
@@ -50,7 +51,7 @@
 
  void RegisterAllHloDialects(mlir::DialectRegistry& registry) {
    registry.insert<mlir::arith::ArithDialect>();
-@@ -184,13 +206,6 @@
+@@ -184,13 +207,6 @@
      use_tuple_args = false;
    }
 
@@ -64,7 +65,7 @@
    TF_ASSIGN_OR_RETURN(std::unique_ptr<HloModule> hlo_module,
                        xla::ConvertStablehloToHloWithOptions(
                            module, use_tuple_args, return_tuple));
-@@ -203,7 +218,8 @@
+@@ -203,7 +219,8 @@
      mlir::ModuleOp module, XlaComputation& xla_computation, bool use_tuple_args,
      bool return_tuple, CompileOptions& compile_options,
      const ChloLegalizeToHighLevelMhloPassOptions& chlo_opts) {
