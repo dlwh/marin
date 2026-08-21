@@ -1,0 +1,46 @@
+{
+  "artifacts": {
+    "receipt": {
+      "sha256": "844f3d4c7d5e4c80cfcdec4e73565c09c13fc6eec5b50ea2e288436fc59382b7",
+      "size": 773
+    },
+    "request": {
+      "sha256": "92b56d65ab43d12e9b5d2b97170805d825eb0183cbbc3d33fd2f2efcc95e3766",
+      "size": 6429738
+    },
+    "task_log": {
+      "sha256": "557a74331635867df401a894528fda1d680eefdc05b287a1040480aa2174060c",
+      "size": 2799
+    },
+    "terminal_summary": {
+      "sha256": "7ed2355e58819ecbb5a160678fbb6c4d92912ce959eb0883453a9dceb9c19434",
+      "size": 1497
+    }
+  },
+  "bundle": {
+    "sha256": "071d3d1d7a8b17166dafcf108d900a73a2bd91595345a287e4371c69c41fe5b8",
+    "size": 6428973
+  },
+  "failure": {
+    "coordinate": "transformer_engine_2_17/heldout_reversed_linspace_v1/backward_recompute/repeat0/dx",
+    "failures": 1,
+    "max_bfloat16_ulp": 283,
+    "preemptions": 0,
+    "role_limit": 64,
+    "status": "failed"
+  },
+  "job": "/dlwh/shuttle-track2-te-h100-r9",
+  "request_scope": {
+    "failure_budget": 0,
+    "gpu": "1xH100",
+    "priority": "batch",
+    "replicas": 1,
+    "retry_budget": 0,
+    "task_failure_budget": 0
+  },
+  "schema": "shuttle_track2_te_rmsnorm_r9_failure_v1",
+  "source": {
+    "commit": "c2fd5aeaa54e07cd78dc6433b83f364fac428c58",
+    "tree": "92ae0f808ab73d06a562277ca3e8b2bdcc6f1c9f"
+  }
+}

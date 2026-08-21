@@ -1,0 +1,41 @@
+{
+  "classification": {
+    "exact_actual_value": null,
+    "exact_index": null,
+    "exact_max_absolute_error": null,
+    "exact_max_relative_error": null,
+    "exact_mean_absolute_error": null,
+    "reason_pointwise_values_are_unknown": "r9 deleted its ephemeral batch workspace after validation failed; no raw BF16 outputs or policy reports were uploaded or printed",
+    "recoverable_conclusion": "the 283-ULP pair is in the low-magnitude same-sign tail, crosses multiple BF16 exponent bins, and is not a sign or zero crossing; substantive pointwise relative error is unresolved"
+  },
+  "compatibility_envelope": {
+    "all_compatible_pairs_same_sign": true,
+    "compatible_fraction": 0.24501383304595947,
+    "compatible_reference_count": 2055325,
+    "maximum_compatible_actual_magnitude": 0.07861328125,
+    "maximum_compatible_reference_magnitude": 0.07861328125,
+    "minimum_compatible_reference_magnitude": 2.0302832126617432e-07,
+    "reference_element_count": 8388608,
+    "reference_maximum_magnitude": 253.0,
+    "reference_mean_absolute_value": 0.6091404242855933,
+    "reference_rms": 5.1256984218042625,
+    "sign_crossing_count": 0
+  },
+  "method": {
+    "absolute_error_bound_source": "validate_qualification_evidence checks whole-output max_absolute_error <= 0.0625 before max_bfloat16_ulp",
+    "enumeration": "for every heldout_reversed_linspace_v1 BF16 reference dx value, enumerate both finite BF16 values exactly 283 ordered codes away and retain pairs with absolute error <= 0.0625",
+    "warning": "compatible_fraction is a combinatorial feasible-set fraction, not an observed error prevalence or probability"
+  },
+  "observed_r9": {
+    "boundary": "backward_recompute",
+    "input_pattern": "heldout_reversed_linspace_v1",
+    "max_absolute_error_upper_bound": 0.0625,
+    "max_bfloat16_ulp": 283,
+    "preemptions": 0,
+    "producer": "transformer_engine_2_17",
+    "repeat": 0,
+    "role": "dx",
+    "status": "failed_role_policy"
+  },
+  "schema": "shuttle_track2_te_rmsnorm_r9_failure_analysis_v1"
+}

@@ -1,0 +1,92 @@
+{
+  "cells": [
+    {
+      "boundary": "forward",
+      "producer": "transformer_engine_2_17",
+      "role": "y",
+      "max_absolute_error": 0.00390625,
+      "max_bfloat16_ulp": 1
+    },
+    {
+      "boundary": "backward_recompute",
+      "producer": "transformer_engine_2_17",
+      "role": "dx",
+      "max_absolute_error": 0.03125,
+      "max_bfloat16_ulp": 35
+    },
+    {
+      "boundary": "backward_recompute",
+      "producer": "transformer_engine_2_17",
+      "role": "dgamma",
+      "max_absolute_error": 0.0,
+      "max_bfloat16_ulp": 0
+    },
+    {
+      "boundary": "composed",
+      "producer": "transformer_engine_2_17",
+      "role": "y",
+      "max_absolute_error": 0.00390625,
+      "max_bfloat16_ulp": 1
+    },
+    {
+      "boundary": "composed",
+      "producer": "transformer_engine_2_17",
+      "role": "dx",
+      "max_absolute_error": 0.03125,
+      "max_bfloat16_ulp": 35
+    },
+    {
+      "boundary": "composed",
+      "producer": "transformer_engine_2_17",
+      "role": "dgamma",
+      "max_absolute_error": 0.0,
+      "max_bfloat16_ulp": 0
+    },
+    {
+      "boundary": "forward",
+      "producer": "ordinary_jax_xla",
+      "role": "y",
+      "max_absolute_error": 0.00390625,
+      "max_bfloat16_ulp": 1
+    },
+    {
+      "boundary": "backward_recompute",
+      "producer": "ordinary_jax_xla",
+      "role": "dx",
+      "max_absolute_error": 0.0078125,
+      "max_bfloat16_ulp": 24
+    },
+    {
+      "boundary": "backward_recompute",
+      "producer": "ordinary_jax_xla",
+      "role": "dgamma",
+      "max_absolute_error": 0.0,
+      "max_bfloat16_ulp": 0
+    },
+    {
+      "boundary": "composed",
+      "producer": "ordinary_jax_xla",
+      "role": "y",
+      "max_absolute_error": 0.00390625,
+      "max_bfloat16_ulp": 1
+    },
+    {
+      "boundary": "composed",
+      "producer": "ordinary_jax_xla",
+      "role": "dx",
+      "max_absolute_error": 0.0078125,
+      "max_bfloat16_ulp": 24
+    },
+    {
+      "boundary": "composed",
+      "producer": "ordinary_jax_xla",
+      "role": "dgamma",
+      "max_absolute_error": 0.0,
+      "max_bfloat16_ulp": 0
+    }
+  ],
+  "input_pattern": "qualification_linspace_v2",
+  "schema": "shuttle_track2_te_rmsnorm_r7_qualification_metrics_v1",
+  "shape": [2048, 4096],
+  "source_log_sha256": "f63528d2eb396c31a768b9c9e9cd64afebc2421053d5495afa93200fdee05dd3"
+}

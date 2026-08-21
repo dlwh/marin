@@ -1,0 +1,84 @@
+{
+  "acceptance_pattern": {
+    "generator": {
+      "conversion": "float32 range mapping followed by round-to-nearest-even BF16 conversion",
+      "fraction": "float32(uint32(splitmix64(index + seed) >> 40)) / float32(16777215)",
+      "index": "row-major uint64 counter starting at zero",
+      "mix": [
+        "z = (z xor (z >> 30)) * 0xbf58476d1ce4e5b9 modulo 2^64",
+        "z = (z xor (z >> 27)) * 0x94d049bb133111eb modulo 2^64",
+        "z = z xor (z >> 31)"
+      ],
+      "roles": {
+        "dy": {"range": [-1.0, 1.0], "seed": "0x13198a2e03707344"},
+        "gamma": {"range": [0.5, 1.5], "seed": "0x243f6a8885a308d3"},
+        "x": {"range": [-1.0, 1.0], "seed": "0x9e3779b97f4a7c15"}
+      }
+    },
+    "inputs": {
+      "dy": {"sha256": "2abeef4e00143b614ca27c6f310998493609de3490f4720538be507c4ddc4556", "size": 16777216},
+      "gamma": {"sha256": "7666bd787eded8f496d15ecaa0ff1a09e2785076f6f5e5db47737a95152b86ec", "size": 8192},
+      "x": {"sha256": "d5306b1c52e907c4f4df004e6f3a9c488f354acd80221eb5077e6f20a1c3f34e", "size": 16777216}
+    },
+    "name": "heldout_splitmix64_v1",
+    "references": {
+      "dgamma": {"sha256": "209869785a9897bfd13ff39665e0ad781d2bb14b3b7c15067a1f6c752c4601fb", "size": 8192},
+      "dx": {"sha256": "938fe85ca5d7820ca1ae7dfb8acc970307ad88ec92d94b77bd024e904c2d8c55", "size": 16777216},
+      "y": {"sha256": "dbf0c5cc4900ca5498099bd458edfdf31200a692fd2996e66960e8b98b77078e", "size": 16777216}
+    },
+    "status": "predeclared_unexecuted"
+  },
+  "acceptance_scope": {
+    "boundaries": ["forward", "backward_recompute", "composed"],
+    "epsilon": 1e-06,
+    "hardware": "one H100 in the reviewed immutable image",
+    "producers": ["transformer_engine_2_17", "ordinary_jax_xla"],
+    "repeat_count": 2,
+    "shape": [2048, 4096]
+  },
+  "diagnostic_metrics": [
+    "raw_max_bfloat16_ulp",
+    "mean_absolute_error",
+    "max_relative_error_above_absolute_floor"
+  ],
+  "gates": {
+    "all_outputs_finite": true,
+    "exact_output_digest_repeatability_within_each_provider_pattern_boundary_role": true,
+    "masked_ulp_reference_predicate": "abs(reference) >= absolute_floor",
+    "nonempty_mask_per_provider_repeat_boundary_role": true,
+    "role_limits": {
+      "dgamma": {
+        "absolute_floor": 0.03125,
+        "max_absolute_error": 0.015625,
+        "max_bfloat16_ulp_above_absolute_floor": 8
+      },
+      "dx": {
+        "absolute_floor": 0.125,
+        "max_absolute_error": 0.0625,
+        "max_bfloat16_ulp_above_absolute_floor": 64
+      },
+      "y": {
+        "absolute_floor": 0.015625,
+        "max_absolute_error": 0.0078125,
+        "max_bfloat16_ulp_above_absolute_floor": 2
+      }
+    },
+    "validate_literal_floor_and_eligible_count": true,
+    "whole_output_max_absolute_error": true
+  },
+  "qualification_patterns": [
+    {
+      "name": "qualification_linspace_v2",
+      "source_run": "/dlwh/shuttle-track2-te-h100-r7",
+      "use": "diagnostic_and_repeatability_only"
+    },
+    {
+      "name": "heldout_reversed_linspace_v1",
+      "source_run": "/dlwh/shuttle-track2-te-h100-r9",
+      "use": "diagnostic_and_repeatability_only"
+    }
+  ],
+  "rationale": "When whole-output max absolute error is at most atol, selecting abs(reference) >= 2*atol guarantees selected actual values have the same nonzero sign and pointwise relative absolute error at most 50 percent. Ordered BF16 ULP distance is evaluated only in that region.",
+  "schema": "shuttle_abi22_rmsnorm_role_policy_v2_proposal",
+  "status": "reviewed_predeclared_not_implemented"
+}
