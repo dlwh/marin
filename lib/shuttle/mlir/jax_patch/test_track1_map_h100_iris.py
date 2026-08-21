@@ -86,6 +86,7 @@ def test_dry_run_emits_and_decodes_the_real_fail_closed_launch_request(
     assert request.name == "/dlwh/shuttle-track1-rmsnorm-h100-canary-r4"
     assert request.client_revision_date == CLIENT_REVISION_DATE
     assert request.task_image == BASE_IMAGE
+    assert request.bundle_init_image == ""
     assert request.resources.cpu_millicores == 32_000
     assert request.resources.memory_bytes == 128 * 1024**3
     assert request.resources.disk_bytes == 500 * 1024**3
@@ -109,6 +110,7 @@ def test_dry_run_emits_and_decodes_the_real_fail_closed_launch_request(
     assert command[-1] == "--execute"
     assert request.bundle_id == hashlib.sha256(request.bundle_blob).hexdigest()
     assert request.bundle_blob
+    assert not request.HasField("exact_bundle_upload")
 
     manifest = json.loads(SOURCE_MANIFEST_PATH.read_bytes())
     expected_paths = {entry["path"] for entry in manifest["entries"]}
@@ -173,6 +175,8 @@ def test_default_is_unsealed_before_bundle_or_request_output(tmp_path: Path) -> 
     [
         "authorization",
         "bundle_hash",
+        "bundle_image",
+        "bundle_integration_field",
         "bundle_zip",
         "client_revision",
         "cpu",
@@ -201,6 +205,11 @@ def test_decoded_request_rejects_every_launch_scope_mutation(mutation: str) -> N
         command[list(command).index(approved)] = "f" * 64
     elif mutation == "bundle_hash":
         changed.bundle_id = "f" * 64
+    elif mutation == "bundle_image":
+        changed.bundle_init_image = BASE_IMAGE
+    elif mutation == "bundle_integration_field":
+        changed.exact_bundle_upload.bundle_id = changed.bundle_id
+        changed.exact_bundle_upload.blob = changed.bundle_blob
     elif mutation == "bundle_zip":
         stream = io.BytesIO(changed.bundle_blob)
         with zipfile.ZipFile(stream, "a") as archive:
