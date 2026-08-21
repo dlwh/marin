@@ -4508,6 +4508,119 @@ TEST(Abi22MapFusionContract,
   }
 }
 
+TEST(Abi22MapFusionContract,
+     PublicResultProjectionReplacesPartialMultiRegionGraph) {
+  auto fixture = fixtureSource(
+      "jax-0.10.1-bf16-matmul-vjp-17x33x19-composed.mlir");
+  ASSERT_TRUE(fixture);
+  constexpr llvm::StringLiteral originalConversion =
+      "%1 = stablehlo.convert %0 : (tensor<17x19xf32>) -> "
+      "tensor<17x19xbf16>";
+  constexpr llvm::StringLiteral duplicatedConversion =
+      "%1 = stablehlo.convert %0 : (tensor<17x19xf32>) -> "
+      "tensor<17x19xbf16>\n"
+      "    %12 = stablehlo.convert %0 : (tensor<17x19xf32>) -> "
+      "tensor<17x19xbf16>";
+  constexpr llvm::StringLiteral originalReturn =
+      "return %1, %11, %7 : tensor<17x19xbf16>, tensor<17x33xbf16>, "
+      "tensor<33x19xbf16>";
+  constexpr llvm::StringLiteral expandedReturn =
+      "return %1, %12, %11, %7 : tensor<17x19xbf16>, "
+      "tensor<17x19xbf16>, tensor<17x33xbf16>, tensor<33x19xbf16>";
+  constexpr llvm::StringLiteral originalResults =
+      "-> (tensor<17x19xbf16> {jax.result_info = \"result[0]\"}, "
+      "tensor<17x33xbf16> {jax.result_info = \"result[1]\"}, "
+      "tensor<33x19xbf16> {jax.result_info = \"result[2]\"})";
+  constexpr llvm::StringLiteral expandedResults =
+      "-> (tensor<17x19xbf16> {jax.result_info = \"result[0]\"}, "
+      "tensor<17x19xbf16> {jax.result_info = \"internal\"}, "
+      "tensor<17x33xbf16> {jax.result_info = \"result[1]\"}, "
+      "tensor<33x19xbf16> {jax.result_info = \"result[2]\"})";
+  std::string source = *fixture;
+  ASSERT_EQ(llvm::StringRef(source).count(originalConversion), 1u);
+  ASSERT_EQ(llvm::StringRef(source).count(originalReturn), 1u);
+  ASSERT_EQ(llvm::StringRef(source).count(originalResults), 1u);
+  size_t position = source.find(originalResults.str());
+  source.replace(position, originalResults.size(), expandedResults.str());
+  position = source.find(originalConversion.str());
+  source.replace(position, originalConversion.size(),
+                 duplicatedConversion.str());
+  position = source.find(originalReturn.str());
+  source.replace(position, originalReturn.size(), expandedReturn.str());
+  std::unique_ptr<BuiltModule> built =
+      build(source, mlir::shuttle::NumericalPolicy::SourceOrdered,
+            kFusionTuning, false, true);
+  ASSERT_TRUE(built);
+  EXPECT_EQ(llvm::range_size(
+                built->module->getOps<mlir::shuttle::ExecutableBundleOp>()),
+            2u);
+
+  mlir::func::FuncOp function =
+      *built->module->getOps<mlir::func::FuncOp>().begin();
+  llvm::SmallVector<mlir::shuttle::RegionOp> regions;
+  function.walk(
+      [&](mlir::shuttle::RegionOp region) { regions.push_back(region); });
+  ASSERT_EQ(regions.size(), 2u);
+  ASSERT_EQ(regions[0].getNumResults(), 2u);
+  ASSERT_EQ(function.getNumArguments(), 3u);
+  int64_t cotangentOperand = -1;
+  for (auto [index, input] : llvm::enumerate(regions[1].getInputs())) {
+    if (input == function.getArgument(2))
+      cotangentOperand = index;
+  }
+  ASSERT_GE(cotangentOperand, 0);
+  regions[1]->setOperand(cotangentOperand, regions[0].getResult(1));
+  auto originalReturnOp =
+      mlir::cast<mlir::func::ReturnOp>(function.getBody().front().back());
+  ASSERT_EQ(originalReturnOp.getNumOperands(), 4u);
+  ASSERT_EQ(originalReturnOp.getOperand(1), regions[0].getResult(1));
+  originalReturnOp->eraseOperands(1);
+  llvm::SmallVector<mlir::Type> publicResultTypes;
+  for (mlir::Value result : originalReturnOp.getOperands())
+    publicResultTypes.push_back(result.getType());
+  function.setType(mlir::FunctionType::get(
+      built->context.get(), function.getArgumentTypes(), publicResultTypes));
+
+  mlir::PassManager replace(built->context.get());
+  replace.addPass(mlir::shuttle::createReplaceWithGpuExecutableBundlePass());
+  ASSERT_TRUE(mlir::succeeded(replace.run(*built->module)));
+  llvm::SmallVector<mlir::Operation *> shuttleCalls;
+  built->module->walk([&](mlir::Operation *operation) {
+    if (operation->getName().getStringRef() != "stablehlo.custom_call")
+      return;
+    auto target = operation->getAttrOfType<mlir::StringAttr>(
+        "call_target_name");
+    ASSERT_TRUE(target);
+    if (target.getValue() == "shuttle.gpu.executable_bundle.v2")
+      shuttleCalls.push_back(operation);
+  });
+  ASSERT_EQ(shuttleCalls.size(), 2u);
+  ASSERT_EQ(shuttleCalls[0]->getNumResults(), 2u);
+  ASSERT_EQ(shuttleCalls[1]->getNumResults(), 2u);
+  int64_t interCallOperands = 0;
+  for (mlir::Value operand : shuttleCalls[1]->getOperands()) {
+    auto result = mlir::dyn_cast<mlir::OpResult>(operand);
+    if (!result || result.getOwner() != shuttleCalls[0])
+      continue;
+    ++interCallOperands;
+    EXPECT_EQ(result.getResultNumber(), 1u);
+  }
+  EXPECT_EQ(interCallOperands, 1);
+
+  auto returnOp =
+      mlir::cast<mlir::func::ReturnOp>(function.getBody().front().back());
+  ASSERT_EQ(returnOp.getNumOperands(), 3u);
+  auto first = mlir::cast<mlir::OpResult>(returnOp.getOperand(0));
+  auto second = mlir::cast<mlir::OpResult>(returnOp.getOperand(1));
+  auto third = mlir::cast<mlir::OpResult>(returnOp.getOperand(2));
+  EXPECT_EQ(first.getOwner(), shuttleCalls[0]);
+  EXPECT_EQ(first.getResultNumber(), 0u);
+  EXPECT_EQ(second.getOwner(), shuttleCalls[1]);
+  EXPECT_EQ(second.getResultNumber(), 0u);
+  EXPECT_EQ(third.getOwner(), shuttleCalls[1]);
+  EXPECT_EQ(third.getResultNumber(), 1u);
+}
+
 bool hasSourceOrderedContractRecurrence(llvm::StringRef ptx,
                                         int64_t reduction) {
   llvm::SmallVector<llvm::StringRef> lines;

@@ -365,6 +365,8 @@ struct Decoded {
   llvm::SmallVector<uint64_t> slotReuseOffsets;
   llvm::SmallVector<uint8_t> slotStorage;
   llvm::SmallVector<uint8_t> slotBinding;
+  llvm::SmallVector<int64_t> slotBindingIndex;
+  llvm::SmallVector<uint64_t> slotBindingIndexOffsets;
   llvm::SmallVector<llvm::SmallVector<int64_t>> slotDimensions;
   llvm::SmallVector<llvm::SmallVector<int64_t>> slotStrides;
   llvm::SmallVector<int64_t> slotRequiredBytes;
@@ -576,6 +578,7 @@ decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes,
   llvm::SmallVector<llvm::SmallVector<uint64_t>> slotDimensionOffsets;
   llvm::SmallVector<uint64_t> slotRequiredOffsets;
   llvm::SmallVector<int64_t> slotBindingIndex;
+  llvm::SmallVector<uint64_t> slotBindingIndexOffsets;
   for (int64_t ordinal = 0; ordinal < static_cast<int64_t>(slotCount);
        ++ordinal) {
     if (reader.i64() != ordinal || reader.i64() != ordinal)
@@ -625,9 +628,11 @@ decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes,
     uint8_t hasBindingIndex = reader.u8();
     if (binding > 2 || hasBindingIndex > 1)
       return std::nullopt;
+    uint64_t bindingIndexOffset = reader.position();
     int64_t bindingIndex = hasBindingIndex ? reader.i64() : -1;
     slotStorage.push_back(storage);
     slotBinding.push_back(binding);
+    slotBindingIndexOffsets.push_back(hasBindingIndex ? bindingIndexOffset : 0);
     slotDimensions.push_back(std::move(dimensions));
     slotStrides.push_back(std::move(strides));
     slotRequiredBytes.push_back(required);
@@ -754,6 +759,8 @@ decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes,
                  std::move(slotReuseOffsets),
                  std::move(slotStorage),
                  std::move(slotBinding),
+                 std::move(slotBindingIndex),
+                 std::move(slotBindingIndexOffsets),
                  std::move(slotDimensions),
                  std::move(slotStrides),
                  std::move(slotRequiredBytes),
@@ -883,6 +890,21 @@ void rehashInvocationAndBundle(llvm::MutableArrayRef<uint8_t> bytes,
   writeDigest(bytes, decoded.bundleInvocationRootPayloadOffset, invocationRoot);
   writeDigest(bytes, decoded.bundleRootPayloadOffset,
               sha256(bytes.take_front(decoded.bundleRootOffset)));
+}
+
+llvm::SmallVector<uint8_t>
+mutateBindingIndexAndRehash(llvm::ArrayRef<uint8_t> bytes,
+                            const Decoded &decoded, int64_t slot,
+                            int64_t bindingIndex) {
+  if (slot < 0 || slot >= static_cast<int64_t>(decoded.slots) ||
+      decoded.slotBinding[slot] == 0 ||
+      decoded.slotBindingIndexOffsets[slot] == 0)
+    return {};
+  llvm::SmallVector<uint8_t> result(bytes);
+  writeU64(result, decoded.slotBindingIndexOffsets[slot],
+           static_cast<uint64_t>(bindingIndex));
+  rehashInvocationAndBundle(result, decoded);
+  return result;
 }
 
 llvm::SmallVector<uint8_t> oversizedLaunchGrid(llvm::ArrayRef<uint8_t> bytes,
@@ -4359,6 +4381,49 @@ LayerNormForwardOracle layerNormForwardReference(const LayerNormInputs &inputs,
     }
   }
   return oracle;
+}
+
+TEST(GpuTransportV2Test,
+     PublicResultBindingPermutationRejectsMalformedSerializedIndices) {
+  auto source = fixtureSource(
+      "jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-backward.mlir");
+  ASSERT_TRUE(source);
+  constexpr llvm::StringLiteral options =
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+  constexpr llvm::StringLiteral tuning =
+      R"json({"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json";
+  auto built = buildFixture(*source,
+                            mlir::shuttle::NumericalPolicy::SourceOrdered,
+                            options, tuning);
+  ASSERT_TRUE(built);
+  auto transport =
+      mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+  ASSERT_TRUE(mlir::succeeded(transport));
+  auto decoded = decodeInlineSchema2(*transport);
+  ASSERT_TRUE(decoded);
+  ASSERT_TRUE(mlir::shuttle::GpuExecutable::Load(*transport).ok());
+
+  llvm::SmallVector<int64_t> resultSlots;
+  for (int64_t slot = 0; slot < decoded->slots; ++slot)
+    if (decoded->slotBinding[slot] == 2)
+      resultSlots.push_back(slot);
+  ASSERT_EQ(resultSlots.size(), 3u);
+  EXPECT_EQ(decoded->slotBindingIndex[resultSlots[0]], 2);
+  EXPECT_EQ(decoded->slotBindingIndex[resultSlots[1]], 1);
+  EXPECT_EQ(decoded->slotBindingIndex[resultSlots[2]], 0);
+
+  auto expectRejected = [](llvm::ArrayRef<uint8_t> mutation) {
+    ASSERT_FALSE(mutation.empty());
+    EXPECT_FALSE(decodeInlineSchema2(mutation));
+    EXPECT_FALSE(mlir::shuttle::GpuExecutable::Load(mutation).ok());
+  };
+  expectRejected(mutateBindingIndexAndRehash(
+      *transport, *decoded, resultSlots[1],
+      decoded->slotBindingIndex[resultSlots[2]]));
+  expectRejected(
+      mutateBindingIndexAndRehash(*transport, *decoded, resultSlots[0], 3));
+  expectRejected(
+      mutateBindingIndexAndRehash(*transport, *decoded, resultSlots[0], -1));
 }
 
 TEST(GpuTransportV2Test,
