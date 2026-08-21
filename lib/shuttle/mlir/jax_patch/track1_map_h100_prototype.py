@@ -44,6 +44,9 @@ JAX_URL = "https://github.com/jax-ml/jax.git"
 XLA_URL = "https://github.com/openxla/xla.git"
 AUTHORIZATION_SCHEMA = "track1_map_h100_prototype_authorization"
 MAX_AUTHORIZATION_BYTES = 32 * 1024
+LOG_TAIL_READ_BYTES = 64 * 1024
+LOG_TAIL_MAX_CHARACTERS = 8 * 1024
+LOG_TAIL_MAX_LINES = 80
 WHEEL_PREFIXES = ("jaxlib-", "jax_cuda13_plugin-", "jax_cuda13_pjrt-")
 WORKER_MODES = ("disabled", "source_ordered", "fast")
 SOURCE_MANIFEST_RELATIVE = Path("scripts/shuttle/track1_map_h100_source_manifest.json")
@@ -453,9 +456,53 @@ def _load_canonical_document(path: Path, name: str) -> dict[str, object]:
     return document
 
 
-def _run(command: list[str], *, cwd: Path | None, log: Path, environment: dict[str, str] | None = None) -> None:
+def _sanitized_log_tail(log: Path) -> str:
+    with log.open("rb") as stream:
+        stream.seek(0, os.SEEK_END)
+        start = max(0, stream.tell() - LOG_TAIL_READ_BYTES)
+        stream.seek(start)
+        raw = stream.read()
+    if start:
+        _, _, raw = raw.partition(b"\n")
+    tail = raw.decode(errors="replace")
+    tail = re.sub(
+        (
+            r"(?i)\b((?:[A-Za-z0-9_]*(?:api[_-]?key|authorization|credential|password|passwd|secret|token)"
+            r"[A-Za-z0-9_]*)\s*[:=]\s*)\S+"
+        ),
+        r"\1[REDACTED]",
+        tail,
+    )
+    tail = re.sub(r"(?i)\b(bearer\s+)\S+", r"\1[REDACTED]", tail)
+    tail = re.sub(r"(?i)(https?://)[^/@\s]+@", r"\1[REDACTED]@", tail)
+    tail = re.sub(
+        r"(?i)([?&](?:api[_-]?key|authorization|credential|password|secret|token)=)[^&\s]+",
+        r"\1[REDACTED]",
+        tail,
+    )
+    tail = re.sub(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b", "[REDACTED]", tail)
+    tail = "".join(character if character in "\n\t" or character.isprintable() else "�" for character in tail)
+    tail = "\n".join(tail.splitlines()[-LOG_TAIL_MAX_LINES:])
+    if len(tail) > LOG_TAIL_MAX_CHARACTERS:
+        tail = "[tail truncated]\n" + tail[-LOG_TAIL_MAX_CHARACTERS:]
+    return tail or "[no output]"
+
+
+def _run(
+    command: list[str],
+    *,
+    cwd: Path | None,
+    log: Path,
+    phase: str,
+    environment: dict[str, str] | None = None,
+) -> None:
     with log.open("wb") as stream:
-        subprocess.run(command, cwd=cwd, env=environment, stdout=stream, stderr=subprocess.STDOUT, check=True)
+        result = subprocess.run(command, cwd=cwd, env=environment, stdout=stream, stderr=subprocess.STDOUT, check=False)
+    if result.returncode:
+        raise RuntimeError(
+            f"prototype phase {phase} exited with status {result.returncode}; sanitized log tail:\n"
+            f"{_sanitized_log_tail(log)}"
+        )
 
 
 def _git(repository: Path, *arguments: str) -> str:
@@ -512,14 +559,26 @@ def _hydration_identity(
 
 def _initialize_repository(path: Path, url: str, commit: str, log: Path) -> None:
     path.mkdir()
-    _run(["git", "init", "--quiet"], cwd=path, log=log)
-    _run(["git", "remote", "add", "origin", url], cwd=path, log=log.with_suffix(".remote.log"))
+    source = path.name
+    _run(["git", "init", "--quiet"], cwd=path, log=log, phase=f"fetch_{source}_init")
+    _run(
+        ["git", "remote", "add", "origin", url],
+        cwd=path,
+        log=log.with_suffix(".remote.log"),
+        phase=f"fetch_{source}_remote",
+    )
     _run(
         ["git", "fetch", "--depth=1", "origin", commit],
         cwd=path,
         log=log.with_suffix(".fetch.log"),
+        phase=f"fetch_{source}",
     )
-    _run(["git", "checkout", "--detach", "FETCH_HEAD"], cwd=path, log=log.with_suffix(".checkout.log"))
+    _run(
+        ["git", "checkout", "--detach", "FETCH_HEAD"],
+        cwd=path,
+        log=log.with_suffix(".checkout.log"),
+        phase=f"fetch_{source}_checkout",
+    )
 
 
 def _runtime_environment(paths: PrototypePaths, runner_repository: Path) -> dict[str, str]:
@@ -584,6 +643,7 @@ def execute_prototype(
         ],
         cwd=None,
         log=paths.logs / "bazel-fetch.log",
+        phase="fetch_bazel",
     )
     observed_bazel_sha256 = _sha256_file(paths.bazel)
     if observed_bazel_sha256 != BAZEL_SHA256:
@@ -611,7 +671,12 @@ def execute_prototype(
     hydration_identity = _hydration_identity(paths, cuda_root, inspected, patched_sources, source_manifest_sha256)
     paths.hydration_identity.write_bytes(canonical_json(hydration_identity))
     hydrate, offline = _build_commands(paths, runner_repository)
-    _run(hydrate, cwd=paths.jax, log=paths.logs / "hydrate-build.log")
+    _run(
+        hydrate,
+        cwd=paths.jax,
+        log=paths.logs / "hydrate-build.log",
+        phase="hydrate_bazel_repositories",
+    )
     require_source_checkouts_unchanged(
         patched_sources,
         jax_repository=paths.jax,
@@ -624,13 +689,14 @@ def execute_prototype(
         jax_repository=paths.jax,
         xla_repository=paths.xla,
     )
-    _run(offline, cwd=paths.jax, log=paths.logs / "offline-build.log")
+    _run(offline, cwd=paths.jax, log=paths.logs / "offline-build.log", phase="offline_wheel_build")
     wheels = wheel_set(paths.wheels)
 
     _run(
         [str(python), "-m", "venv", "--system-site-packages", str(paths.runtime)],
         cwd=None,
         log=paths.logs / "runtime.log",
+        phase="create_runtime",
     )
     _run(
         [
@@ -644,18 +710,21 @@ def execute_prototype(
         ],
         cwd=None,
         log=paths.logs / "wheel-install.log",
+        phase="install_wheels",
     )
     environment = _runtime_environment(paths, runner_repository)
     _run(
         _worker_command(paths, runner_repository, "populate"),
         cwd=runner_repository,
         log=paths.logs / "populate.log",
+        phase="populate",
         environment=environment,
     )
     _run(
         _worker_command(paths, runner_repository, "reuse"),
         cwd=runner_repository,
         log=paths.logs / "reuse.log",
+        phase="reuse",
         environment=environment,
     )
     workers = validate_result_pair(
