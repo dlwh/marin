@@ -5,6 +5,7 @@
 
 import hashlib
 import json
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -26,7 +27,9 @@ from track2_te_h100_batch import (
     BatchPaths,
     batch_plan,
     canonical_json,
+    execute_batch,
     execute_oracle,
+    runtime_environment,
     validate_source_manifest,
     validate_te_hydration,
 )
@@ -106,6 +109,8 @@ def test_batch_plan_pins_te_wheel_source_build_and_exact_v2_matrix(tmp_path: Pat
     compile_argv = phases[7]["argv"]
     assert compile_argv[:4] == ["/usr/bin/g++", "-std=c++20", "-O3", "-Wall"]
     assert "-Werror" in compile_argv
+    assert f"-L{BatchPaths.under(workspace).te_library.parent}" in compile_argv
+    assert f"-Wl,-rpath,{BatchPaths.under(workspace).te_library.parent}" in compile_argv
     assert "-ltransformer_engine" in compile_argv
     assert "-lcudart" in compile_argv
     assert str(BatchPaths.under(workspace).te_runner) == compile_argv[-1]
@@ -121,7 +126,8 @@ def test_hydration_binds_source_tree_wheel_and_resolved_library(tmp_path: Path, 
     (paths.te_source / "build_tools").mkdir()
     (paths.te_source / "build_tools/VERSION.txt").write_text("2.17.0\n")
     paths.te_wheel.parent.mkdir(parents=True, exist_ok=True)
-    paths.te_wheel.write_bytes(b"wheel")
+    with zipfile.ZipFile(paths.te_wheel, "w") as archive:
+        archive.writestr("transformer_engine/wheel_lib/libtransformer_engine.so", b"library")
     paths.te_library.parent.mkdir(parents=True)
     paths.te_library.write_bytes(b"library")
 
@@ -146,6 +152,7 @@ def test_hydration_binds_source_tree_wheel_and_resolved_library(tmp_path: Path, 
         "library_path": str(paths.te_library),
         "library_sha256": hashlib.sha256(b"library").hexdigest(),
     }
+    assert runtime_environment(paths)["LD_LIBRARY_PATH"].split(":")[0] == str(paths.te_library.parent)
     for field, value in (("commit", "0" * 40), ("tree", "0" * 40), ("status", "dirty")):
         mutated = dict(observed)
         mutated[field] = value
@@ -155,6 +162,13 @@ def test_hydration_binds_source_tree_wheel_and_resolved_library(tmp_path: Path, 
     monkeypatch.setattr("track2_te_h100_batch._observed_te_source", lambda _: observed)
     monkeypatch.setattr("track2_te_h100_batch._file_sha256", lambda _: "0" * 64)
     with pytest.raises(RuntimeError, match="wheel SHA-256"):
+        validate_te_hydration(paths)
+    monkeypatch.setattr(
+        "track2_te_h100_batch._file_sha256",
+        lambda path: TE_WHEEL_SHA256 if path == paths.te_wheel else hashlib.sha256(path.read_bytes()).hexdigest(),
+    )
+    paths.te_library.write_bytes(b"ambient-library")
+    with pytest.raises(RuntimeError, match="extracted Transformer Engine library"):
         validate_te_hydration(paths)
 
 
@@ -276,6 +290,80 @@ def test_execute_oracle_stops_on_first_failed_producer(tmp_path: Path) -> None:
             invoke=fail_sixth,
         )
     assert len(calls) == 6
+
+
+def test_execute_batch_drives_validated_oracle_and_writes_closed_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    manifest = _manifest(repository, "lib/shuttle/mlir/probe.txt", b"reviewed bytes")
+    workspace = tmp_path / "workspace"
+    calls: list[list[str]] = []
+
+    def fake_hydration(paths: BatchPaths, plan: dict) -> dict:
+        assert all("shuttle" not in phase["name"] for phase in plan["phases"])
+        paths.te_runner.write_bytes(b"runner-binary")
+        paths.te_library.parent.mkdir(parents=True)
+        paths.te_library.write_bytes(b"resolved-te-library")
+        return {
+            "device": {"model": "NVIDIA H100 80GB HBM3", "uuid": "GPU-test", "compute_capability": "9.0"},
+            "driver": "580.00",
+            "transformer_engine": {"source_commit": TE_SOURCE_COMMIT, "source_tree": TE_SOURCE_TREE},
+        }
+
+    monkeypatch.setattr("track2_te_h100_batch.platform.system", lambda: "Linux")
+    monkeypatch.setattr("track2_te_h100_batch._execute_hydration", fake_hydration)
+    monkeypatch.setattr(
+        "track2_te_h100_batch._invoke_oracle",
+        lambda paths, argv: _fake_oracle_invoke(paths, calls, argv),
+    )
+
+    result = execute_batch(
+        workspace=workspace,
+        runner_repository=repository,
+        manifest_path=manifest,
+        observed_base_image=BASE_IMAGE,
+    )
+
+    assert result["schema"] == "shuttle_track2_te_h100_batch_result_v1"
+    assert result["source"]["commit"] == "1" * 40
+    assert result["tools"]["transformer_engine"]["source_commit"] == TE_SOURCE_COMMIT
+    assert result["evidence"]["acceptance"]["accepted_shape"] == [2048, 4096]
+    assert result["evidence"]["shuttle"] == {"status": "pending", "blocker": SHUTTLE_BLOCKER}
+    assert len(calls) == 12
+    assert json.loads(BatchPaths.under(workspace).result.read_bytes()) == result
+    assert not any("shuttle" in path.name for path in BatchPaths.under(workspace).reports.iterdir())
+
+
+def test_execute_batch_rejects_zero_exit_with_missing_oracle_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    manifest = _manifest(repository, "lib/shuttle/mlir/probe.txt", b"reviewed bytes")
+    workspace = tmp_path / "workspace"
+
+    def fake_hydration(paths: BatchPaths, plan: dict) -> dict:
+        paths.te_runner.write_bytes(b"runner-binary")
+        paths.te_library.parent.mkdir(parents=True)
+        paths.te_library.write_bytes(b"resolved-te-library")
+        return {
+            "device": {"model": "H100", "uuid": "GPU-test", "compute_capability": "9.0"},
+            "driver": "580.00",
+            "transformer_engine": {},
+        }
+
+    monkeypatch.setattr("track2_te_h100_batch.platform.system", lambda: "Linux")
+    monkeypatch.setattr("track2_te_h100_batch._execute_hydration", fake_hydration)
+    monkeypatch.setattr("track2_te_h100_batch._invoke_oracle", lambda paths, argv: 0)
+    with pytest.raises((FileNotFoundError, ValueError), match=r"raw|No such file"):
+        execute_batch(
+            workspace=workspace,
+            runner_repository=repository,
+            manifest_path=manifest,
+            observed_base_image=BASE_IMAGE,
+        )
 
 
 def test_source_manifest_binds_every_declared_byte(tmp_path: Path) -> None:

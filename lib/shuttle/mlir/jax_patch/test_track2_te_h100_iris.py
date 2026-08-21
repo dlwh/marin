@@ -103,8 +103,12 @@ def test_render_emits_one_exact_batch_priority_zero_retry_h100_request(
         "bundle_id",
         "name",
         "gpu",
+        "gpu_variant",
         "cpu",
+        "memory",
+        "disk",
         "image",
+        "bundle_init_image",
         "replicas",
         "timeout",
         "preemption",
@@ -116,6 +120,15 @@ def test_render_emits_one_exact_batch_priority_zero_retry_h100_request(
         "entrypoint",
         "priority",
         "ports",
+        "client_revision",
+        "constraints",
+        "scheduling_timeout",
+        "coscheduling",
+        "preemption_policy",
+        "container_profile",
+        "submit_argv",
+        "federation",
+        "exact_bundle_upload",
     ],
 )
 def test_request_rejects_execution_scope_mutations(mutation: str) -> None:
@@ -128,10 +141,18 @@ def test_request_rejects_execution_scope_mutations(mutation: str) -> None:
         request.name = "/dlwh/other"
     elif mutation == "gpu":
         request.resources.device.gpu.count = 2
+    elif mutation == "gpu_variant":
+        request.resources.device.gpu.variant = "B200"
     elif mutation == "cpu":
         request.resources.cpu = 64
+    elif mutation == "memory":
+        request.resources.memory = "256GB"
+    elif mutation == "disk":
+        request.resources.disk = "1TB"
     elif mutation == "image":
         request.task_image = "ghcr.io/marin-community/iris-task-h100-evidence:latest"
+    elif mutation == "bundle_init_image":
+        request.bundle_init_image = "example.invalid/init@sha256:" + "0" * 64
     elif mutation == "replicas":
         request.replicas = 2
     elif mutation == "timeout":
@@ -154,6 +175,24 @@ def test_request_rejects_execution_scope_mutations(mutation: str) -> None:
         request.priority_band = job_pb2.PRIORITY_BAND_PRODUCTION
     elif mutation == "ports":
         request.ports.append("1234")
+    elif mutation == "client_revision":
+        request.client_revision_date = "1970-01-01"
+    elif mutation == "constraints":
+        request.constraints.add().SetInParent()
+    elif mutation == "scheduling_timeout":
+        request.scheduling_timeout.seconds = 1
+    elif mutation == "coscheduling":
+        request.coscheduling.SetInParent()
+    elif mutation == "preemption_policy":
+        request.preemption_policy = 1
+    elif mutation == "container_profile":
+        request.container_profile = 1
+    elif mutation == "submit_argv":
+        request.submit_argv.append("drift")
+    elif mutation == "federation":
+        request.federation.SetInParent()
+    elif mutation == "exact_bundle_upload":
+        request.exact_bundle_upload.SetInParent()
 
     with pytest.raises(ValueError, match="LaunchJobRequest"):
         validate_launch_request(request, run=1)
@@ -173,6 +212,29 @@ def _submit_arguments(request_path: Path, raw: bytes, receipt: Path) -> list[str
         "--receipt",
         str(receipt),
     ]
+
+
+def test_submit_rejects_unreviewed_request_digest_before_receipt_or_rpc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request_path = tmp_path / "reviewed.pb"
+    raw = _request().SerializeToString(deterministic=True)
+    request_path.write_bytes(raw)
+    receipt = tmp_path / "receipt.json"
+    submitted = False
+
+    def fake_submit(*args: object, **kwargs: object) -> str:
+        nonlocal submitted
+        submitted = True
+        return "/dlwh/shuttle-track2-te-h100-r1"
+
+    monkeypatch.setattr("track2_te_h100_iris._submit", fake_submit)
+    arguments = _submit_arguments(request_path, raw, receipt)
+    arguments[arguments.index("--expected-request-sha256") + 1] = "0" * 64
+    with pytest.raises(ValueError, match="reviewed request SHA-256"):
+        main(arguments)
+    assert not submitted
+    assert not receipt.exists()
 
 
 def test_submit_reserves_pending_receipt_before_rpc_and_finalizes_success(
