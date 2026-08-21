@@ -200,10 +200,15 @@ def _reference(workload: Workload) -> tuple[np.ndarray, ...]:
     return _reference_contract(*workload.operands, fast=workload.policy == "fast")
 
 
-def _ready(value: Any) -> tuple[np.ndarray, ...]:
+def _block(value: Any) -> None:
     leaves = jax.tree.leaves(value)
     for leaf in leaves:
         leaf.block_until_ready()
+
+
+def _ready(value: Any) -> tuple[np.ndarray, ...]:
+    leaves = jax.tree.leaves(value)
+    _block(value)
     return tuple(np.asarray(leaf) for leaf in leaves)
 
 
@@ -270,13 +275,13 @@ def collect_report() -> dict[str, Any]:
     cells = _compile_cells(device)
     for cell in cells:
         for _ in range(WARMUP_ITERATIONS):
-            _ready(cell.executable(*cell.device_operands))
+            _block(cell.executable(*cell.device_operands))
     for round_index in range(MEASURED_ITERATIONS):
         for position in range(len(cells)):
             cell_index = position if round_index % 2 == 0 else len(cells) - 1 - position
             cell = cells[cell_index]
             start = time.perf_counter_ns()
-            _ready(cell.executable(*cell.device_operands))
+            _block(cell.executable(*cell.device_operands))
             elapsed = time.perf_counter_ns() - start
             if elapsed <= 0:
                 raise RuntimeError("host-blocking timer returned no elapsed time")
