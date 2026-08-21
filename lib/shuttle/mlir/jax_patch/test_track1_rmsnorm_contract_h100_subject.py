@@ -152,6 +152,66 @@ def test_validate_coordinate_rejects_repeat_nonfinite_role_and_threshold_drift()
         subject.validate_coordinate(coordinate, tuple(exceeded), tuple(exceeded), snapshot)
 
 
+def test_disabled_jax_is_diagnostic_but_enabled_masked_ulp_is_gated() -> None:
+    shape = (5, 19, 7)
+    oracle = binary64_oracle(shape)
+    roles = subject.result_roles(Boundary.COMPOSED)
+    arrays = tuple(oracle[role].astype(ml_dtypes.bfloat16) for role in roles)
+    changed = [value.copy() for value in arrays]
+    role = "input_cotangent"
+    reference = oracle[role]
+    eligible = np.flatnonzero(np.abs(reference.reshape(-1)) >= subject.MASKED_ULP_ABSOLUTE_FLOORS[role])
+    flat_index = int(eligible[0])
+    bits = changed[1].view(np.uint16).reshape(-1)
+    bits[flat_index] = np.uint16(int(bits[flat_index]) + subject.MASKED_ULP_LIMITS[role] + 1)
+    changed_tuple = tuple(changed)
+
+    accepted = subject.validate_coordinate(
+        Coordinate(shape, Boundary.COMPOSED, Mode.DISABLED),
+        changed_tuple,
+        tuple(value.copy() for value in changed_tuple),
+        (),
+    )
+    assert accepted.numerics[role]["maximum_masked_bf16_ulp_error"] > subject.MASKED_ULP_LIMITS[role]
+
+    enabled = Coordinate(shape, Boundary.COMPOSED, Mode.SOURCE_ORDERED)
+    with pytest.raises(RuntimeError, match="masked BF16 ULP threshold"):
+        subject.validate_coordinate(
+            enabled,
+            changed_tuple,
+            tuple(value.copy() for value in changed_tuple),
+            _observer_snapshot(enabled, 42, 38),
+            disabled_jax=arrays,
+        )
+
+
+def test_run_matrix_completes_every_primal_coordinate_before_composed_execution(monkeypatch) -> None:
+    observed: list[Coordinate] = []
+
+    def execute(coordinate: Coordinate):
+        observed.append(coordinate)
+        if coordinate.boundary is Boundary.COMPOSED:
+            raise RuntimeError("stop after the independently reported primal campaign")
+        if coordinate.mode is Mode.DISABLED:
+            value = binary64_oracle(coordinate.shape)["result"].astype(ml_dtypes.bfloat16)
+            snapshot = ()
+        else:
+            value = subject.emitted_primal_oracle(coordinate.shape, fast=coordinate.mode is Mode.FAST)
+            launches, temporaries = (1, 0) if coordinate.shape[-1] == 7 else (2, 1)
+            snapshot = _observer_snapshot(coordinate, launches, temporaries)
+        return (value,), (value.copy(),), snapshot
+
+    monkeypatch.setattr(subject, "require_h100", lambda: None)
+    monkeypatch.setattr(subject, "load_numerical_policy", lambda: {})
+    monkeypatch.setattr(subject, "_execute", execute)
+
+    with pytest.raises(RuntimeError, match="independently reported primal campaign"):
+        subject.run_matrix()
+
+    assert observed[:6] == [Coordinate(shape, Boundary.PRIMAL, mode) for shape in SHAPES for mode in Mode]
+    assert observed[6] == Coordinate(SHAPES[0], Boundary.COMPOSED, Mode.DISABLED)
+
+
 def test_threshold_failure_reports_every_role_before_rejecting_the_coordinate() -> None:
     coordinate = Coordinate((5, 19, 7), Boundary.COMPOSED, Mode.DISABLED)
     roles = subject.result_roles(coordinate.boundary)
