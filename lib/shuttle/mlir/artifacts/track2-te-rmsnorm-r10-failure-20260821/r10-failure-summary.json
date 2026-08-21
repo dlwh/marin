@@ -58,20 +58,49 @@
     "raw_max_bfloat16_ulp_reference": -1.078125,
     "all_finite": true
   },
+  "repeat_digest_mismatch_coordinate_count": 3,
   "repeat_digest_mismatches": [
     {
       "producer": "ordinary_jax_xla",
+      "pattern": "qualification_linspace_v2",
       "boundary": "composed",
-      "role": "y",
-      "repeat0": "6cfc02f95b30758af5f5ae3d5b15aacdf33161994f01f7f78a6aa91695c747dd",
-      "repeat1": "b7215b7eee5b09b5e0c23c78af786e9a2b07762f1ed8e9da6afd480a88c6a53a"
+      "role": "dx",
+      "repeat0": "b09429e74cce38c20cc84b56a7d99aa51ded89a0e3d1a942e96eb43390965249",
+      "repeat1": "502041f57708e86411c5e2fafe675aba5208a89194cc82b3f8db43e0b5f6ace5",
+      "repeat0_max_absolute_error": 0.0078125,
+      "repeat1_max_absolute_error": 0.0078125,
+      "repeat0_mean_absolute_error": 5.458664276147829e-08,
+      "repeat1_mean_absolute_error": 5.4586557496349997e-08,
+      "repeat0_max_bfloat16_ulp": 24,
+      "repeat1_max_bfloat16_ulp": 24
     },
     {
       "producer": "ordinary_jax_xla",
+      "pattern": "heldout_splitmix64_v1",
+      "boundary": "composed",
+      "role": "y",
+      "repeat0": "6cfc02f95b30758af5f5ae3d5b15aacdf33161994f01f7f78a6aa91695c747dd",
+      "repeat1": "b7215b7eee5b09b5e0c23c78af786e9a2b07762f1ed8e9da6afd480a88c6a53a",
+      "repeat0_max_absolute_error": 0.015625,
+      "repeat1_max_absolute_error": 0.015625,
+      "repeat0_mean_absolute_error": 3.3440301194787025e-08,
+      "repeat1_mean_absolute_error": 3.0930095817893744e-08,
+      "repeat0_max_bfloat16_ulp": 1,
+      "repeat1_max_bfloat16_ulp": 1
+    },
+    {
+      "producer": "ordinary_jax_xla",
+      "pattern": "heldout_splitmix64_v1",
       "boundary": "composed",
       "role": "dx",
       "repeat0": "70f3e84152897a9a8c1b205544197381f144a5ff8187fd09fc52f6be43a58f58",
-      "repeat1": "9e7ecab1632755e5eb43e76606ef30369628bd9ee9738916c1b78c0e5b28738f"
+      "repeat1": "9e7ecab1632755e5eb43e76606ef30369628bd9ee9738916c1b78c0e5b28738f",
+      "repeat0_max_absolute_error": 0.015625,
+      "repeat1_max_absolute_error": 0.015625,
+      "repeat0_mean_absolute_error": 3.537907389272732e-08,
+      "repeat1_mean_absolute_error": 3.89515832921461e-08,
+      "repeat0_max_bfloat16_ulp": 1,
+      "repeat1_max_bfloat16_ulp": 1
     }
   ],
   "decision": "qualification_failure_no_policy_widening_no_resubmission"

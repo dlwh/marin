@@ -21,11 +21,13 @@ request, source, job, and failure identities. The first failing cell retained
 masked relative error `0.007751937955617905`, and masked/raw BF16 distance of
 one ULP. Eight cells violated the same `y` absolute limit.
 
-Ordinary JAX/XLA composed `y` and `dx` output digests differed between repeats
-despite identical input/reference digests and call provenance. The raw report
-did not persist XLA output arrays, so exact mismatch counts, pairwise repeat
-ULP, and pairwise repeat maximum absolute error are unrecoverable. Exact
-repeatability remains a required gate; r10 does not justify weakening it.
+Ordinary JAX/XLA had three composed repeat-digest mismatches despite identical
+input/reference digests and call provenance: qualification-linspace `dx`, plus
+SplitMix `y` and `dx`. The per-repeat oracle metrics are preserved in the
+failure summary. The raw report did not persist XLA output arrays, so element
+mismatch counts, pairwise repeat ULP, and pairwise repeat maximum absolute
+error are unrecoverable. Exact repeatability remains a required gate; r10 does
+not justify weakening it.
 
 [`r10-submission-receipt.json`](r10-submission-receipt.json) preserves the
 create-only submission receipt. [`SHA256SUMS`](SHA256SUMS) seals the tracked
