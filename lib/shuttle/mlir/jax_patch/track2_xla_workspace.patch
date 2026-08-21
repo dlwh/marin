@@ -1,0 +1,10 @@
+diff --git a/WORKSPACE b/WORKSPACE
+--- a/WORKSPACE
++++ b/WORKSPACE
+@@ -142 +142,6 @@ load("//build_tools/pjrt_wheels:release_candidate.bzl", "rc_number_repo")
+ rc_number_repo(name = "rc_number")
++
++local_repository(
++    name = "shuttle_mlir",
++    path = "/app/lib/shuttle/mlir",
++)

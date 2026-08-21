@@ -97,6 +97,7 @@ def _source_paths(bundle_root: Path) -> list[Path]:
         Path("lib/shuttle/mlir/jax_patch/track2_h100_batch.py"),
         Path("lib/shuttle/mlir/jax_patch/abi22_h100_performance.py"),
         Path("lib/shuttle/mlir/jax_patch/abi22_h100_xla_baseline.py"),
+        Path("lib/shuttle/mlir/jax_patch/track2_xla_workspace.patch"),
         Path("lib/shuttle/mlir/test/run-h100-performance.sh"),
         Path("lib/shuttle/mlir/test/run-h100-xla-baseline.sh"),
     }

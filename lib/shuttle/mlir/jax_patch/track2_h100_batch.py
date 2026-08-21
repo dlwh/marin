@@ -30,6 +30,7 @@ SOURCE_MANIFEST_SCHEMA = "shuttle_track2_h100_source_manifest_v1"
 SOURCE_MANIFEST_NAME = ".shuttle-track2-source-manifest.json"
 RESULT_SCHEMA = "shuttle_track2_h100_batch_result_v1"
 TRACK2_HERMETIC_CUDA_VERSION = "12.9.1"
+XLA_WORKSPACE_PATCH = Path("lib/shuttle/mlir/jax_patch/track2_xla_workspace.patch")
 RUNTIME_PYTHON = Path("/opt/h100-evidence-runtime/bin/python")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 GIT_COMMIT = re.compile(r"[0-9a-f]{40}")
@@ -165,6 +166,7 @@ def batch_plan(*, workspace: Path, runner_repository: Path, compiler_identity: s
     if not compiler_identity.startswith("shuttle-abi22:") or not compiler_identity.strip():
         raise ValueError("compiler identity is invalid")
     paths = BatchPaths.under(workspace)
+    workspace_patch = runner_repository / XLA_WORKSPACE_PATCH
     common = _common_bazel(paths, runner_repository)
     xla = [
         *common,
@@ -201,6 +203,8 @@ def batch_plan(*, workspace: Path, runner_repository: Path, compiler_identity: s
             },
             {"name": "xla_fetch", "argv": ["git", "fetch", "--depth=1", "origin", XLA_COMMIT]},
             {"name": "xla_checkout", "argv": ["git", "checkout", "--detach", "FETCH_HEAD"]},
+            {"name": "xla_workspace_check", "argv": ["git", "apply", "--check", str(workspace_patch)]},
+            {"name": "xla_workspace_apply", "argv": ["git", "apply", str(workspace_patch)]},
             {
                 "name": "bazel_fetch",
                 "argv": [
@@ -283,13 +287,13 @@ def execute_batch(
     )
     phases = plan["phases"]
     device = _device_identity(paths, phases[0])
-    _fetch_xla(paths, phases[1:5])
-    _run(phases[5]["argv"], cwd=None, log=paths.logs / "bazel_fetch.log", phase="bazel_fetch")
+    _fetch_xla(paths, phases[1:7])
+    _run(phases[7]["argv"], cwd=None, log=paths.logs / "bazel_fetch.log", phase="bazel_fetch")
     if _file_sha256(paths.bazel) != BAZEL_SHA256:
         raise RuntimeError("hydrated Bazel SHA-256 differs")
     paths.bazel.chmod(0o755)
-    _run(phases[6]["argv"], cwd=paths.xla, log=paths.logs / "xla.log", phase="xla")
-    _run(phases[7]["argv"], cwd=paths.xla, log=paths.logs / "shuttle.log", phase="shuttle")
+    _run(phases[8]["argv"], cwd=paths.xla, log=paths.logs / "xla.log", phase="xla")
+    _run(phases[9]["argv"], cwd=paths.xla, log=paths.logs / "shuttle.log", phase="shuttle")
     reports = {
         "exploratory_comparison": _read_json(paths.exploratory_comparison, "exploratory comparison"),
         "shuttle": _read_json(paths.shuttle_report, "Shuttle report"),
@@ -315,6 +319,7 @@ def execute_batch(
             },
             "logs": log_identities,
             "xla_commit": XLA_COMMIT,
+            "xla_workspace_patch_sha256": _file_sha256(runner_repository / XLA_WORKSPACE_PATCH),
         },
     }
     paths.result.write_bytes(canonical_json(result))
