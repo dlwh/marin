@@ -871,10 +871,13 @@ def validate_qualification_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
             if type(ulp) is not int or ulp < 0:
                 raise ValueError("qualification max_bfloat16_ulp must be nonnegative")
             limits = ACCEPTANCE_LIMITS[role]
+            coordinate = f"{producer}/{pattern}/{boundary}/repeat{repeat}/{role}"
             if float(absolute) > limits["max_absolute_error"]:
-                raise ValueError("qualification max_absolute_error exceeds role limit")
+                raise ValueError(
+                    f"{coordinate}: max_absolute_error {absolute} exceeds role limit " f"{limits['max_absolute_error']}"
+                )
             if ulp > limits["max_bfloat16_ulp"]:
-                raise ValueError("qualification max_bfloat16_ulp exceeds role limit")
+                raise ValueError(f"{coordinate}: max_bfloat16_ulp {ulp} exceeds role limit {limits['max_bfloat16_ulp']}")
             digests[(producer, pattern, boundary, repeat, role)] = digest
         timing = cell.get("timing")
         if not isinstance(timing, Mapping) or timing.get("warmup_invocations") != WARMUP_INVOCATIONS:
