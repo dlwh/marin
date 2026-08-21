@@ -223,7 +223,8 @@ completeSchema2Packet(llvm::ArrayRef<uint64_t> codeLengths,
   const std::string schedule(64, 'a');
   const std::string plan(64, 'b');
   constexpr llvm::StringLiteral ptxMarker =
-      ".visible .entry shuttle_entry(\n)\n";
+      ".version 8.0\n.target sm_90\n.address_size 64\n"
+      ".visible .entry shuttle_entry(\n)\n{\n  ret;\n}\n";
 
   llvm::SmallVector<uint8_t> code;
   llvm::SmallVector<std::string> entryDigests;
@@ -411,7 +412,12 @@ decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes,
   for (char expected : llvm::StringRef("SHUTGPU\0", 8))
     if (reader.u8() != static_cast<uint8_t>(expected))
       return std::nullopt;
-  if (reader.u32() != 2 || reader.i64() != 3 || reader.u8() != 2)
+  if (reader.u32() != 2)
+    return std::nullopt;
+  const int64_t deviceSchema = reader.i64();
+  const uint8_t codeFormat = reader.u8();
+  if (!((deviceSchema == 3 && codeFormat == 2) ||
+        (deviceSchema == 4 && codeFormat == 3)))
     return std::nullopt;
   uint64_t devicePolicyOffset = reader.position();
   uint8_t policy = reader.u8();
@@ -993,13 +999,14 @@ module @live_f32_and_bf16 {
 }
 )mlir";
 
-std::unique_ptr<BuiltBundle>
-buildFixture(llvm::StringRef source,
-             mlir::shuttle::NumericalPolicy policy =
-                 mlir::shuttle::NumericalPolicy::SourceOrdered,
-             llvm::StringRef canonicalOptions = {},
-             llvm::StringRef canonicalTuning =
-                 R"json({"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json") {
+std::unique_ptr<BuiltBundle> buildFixture(
+    llvm::StringRef source,
+    mlir::shuttle::NumericalPolicy policy =
+        mlir::shuttle::NumericalPolicy::SourceOrdered,
+    llvm::StringRef canonicalOptions = {},
+    llvm::StringRef canonicalTuning =
+        R"json({"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json",
+    mlir::shuttle::GpuTarget gpuTarget = mlir::shuttle::GpuTarget::Sm90) {
   mlir::DialectRegistry registry;
   mlir::stablehlo::registerAllDialects(registry);
   registry.insert<mlir::arith::ArithDialect, mlir::func::FuncDialect,
@@ -1026,11 +1033,86 @@ buildFixture(llvm::StringRef source,
   manager.addPass(mlir::shuttle::createConvertStablehloToAlgebraPass());
   manager.addPass(mlir::shuttle::createPlanRowFoldMaterializationPass());
   manager.addPass(mlir::shuttle::createPlanSimt32RowFoldSchedulePass());
-  manager.addPass(mlir::shuttle::createBuildGpuExecutableBundlePass());
+  manager.addPass(mlir::shuttle::createBuildGpuExecutableBundlePass(gpuTarget));
   manager.addPass(mlir::shuttle::createVerifyGpuExecutableBundlePass());
   if (mlir::failed(manager.run(*result->module)))
     return {};
   return result;
+}
+
+TEST(GpuTransportV2Test, Sm100CodegenAndTransportAreTargetBound) {
+  auto source = fixtureSource(
+      "jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-backward.mlir");
+  ASSERT_TRUE(source);
+  auto sm90 = buildFixture(*source);
+  auto sm100 =
+      buildFixture(*source, mlir::shuttle::NumericalPolicy::SourceOrdered, {},
+                   {}, mlir::shuttle::GpuTarget::Sm100);
+  ASSERT_TRUE(sm90);
+  ASSERT_TRUE(sm100);
+  auto sm90Device =
+      *sm90->module->getOps<mlir::shuttle::DeviceModuleOp>().begin();
+  auto sm100Device =
+      *sm100->module->getOps<mlir::shuttle::DeviceModuleOp>().begin();
+  EXPECT_EQ(sm90Device.getSchemaVersion(), 3);
+  EXPECT_EQ(sm100Device.getSchemaVersion(), 4);
+  EXPECT_EQ(sm90Device.getCodeFormat(),
+            mlir::shuttle::ExecutableCodeFormat::CudaPtxSm90V1);
+  EXPECT_EQ(sm100Device.getCodeFormat(),
+            mlir::shuttle::ExecutableCodeFormat::CudaPtxSm100V1);
+  llvm::StringRef sm90Ptx(
+      reinterpret_cast<const char *>(sm90Device.getCode().data()),
+      sm90Device.getCode().size());
+  llvm::StringRef sm100Ptx(
+      reinterpret_cast<const char *>(sm100Device.getCode().data()),
+      sm100Device.getCode().size());
+  EXPECT_TRUE(sm90Ptx.starts_with(".version 8.0\n.target sm_90\n"));
+  EXPECT_TRUE(sm100Ptx.starts_with(".version 8.7\n.target sm_100\n"));
+  llvm::SmallVector<mlir::shuttle::DeviceEntryOp> sm90Entries(
+      sm90Device.getBody().front().getOps<mlir::shuttle::DeviceEntryOp>());
+  llvm::SmallVector<mlir::shuttle::DeviceEntryOp> sm100Entries(
+      sm100Device.getBody().front().getOps<mlir::shuttle::DeviceEntryOp>());
+  ASSERT_EQ(sm90Entries.size(), sm100Entries.size());
+  ASSERT_GT(sm90Entries.size(), 1);
+  constexpr llvm::StringLiteral sm90Header = ".version 8.0\n.target sm_90\n";
+  constexpr llvm::StringLiteral sm100Header = ".version 8.7\n.target sm_100\n";
+  for (auto [sm90Entry, sm100Entry] :
+       llvm::zip_equal(sm90Entries, sm100Entries)) {
+    llvm::StringRef sm90EntryPtx =
+        sm90Ptx.substr(sm90Entry.getCodeOffset(), sm90Entry.getCodeLength());
+    llvm::StringRef sm100EntryPtx =
+        sm100Ptx.substr(sm100Entry.getCodeOffset(), sm100Entry.getCodeLength());
+    ASSERT_TRUE(sm90EntryPtx.starts_with(sm90Header));
+    ASSERT_TRUE(sm100EntryPtx.starts_with(sm100Header));
+    EXPECT_EQ(sm90EntryPtx.drop_front(sm90Header.size()),
+              sm100EntryPtx.drop_front(sm100Header.size()));
+  }
+  EXPECT_NE(sm90Device.getFingerprint(), sm100Device.getFingerprint());
+
+  auto sm90Transport =
+      mlir::shuttle::serializeGpuExecutableBundle(*sm90->module);
+  auto sm100Transport =
+      mlir::shuttle::serializeGpuExecutableBundle(*sm100->module);
+  ASSERT_TRUE(mlir::succeeded(sm90Transport));
+  ASSERT_TRUE(mlir::succeeded(sm100Transport));
+  EXPECT_NE(mlir::shuttle::gpuExecutableBundleDigest(*sm90Transport),
+            mlir::shuttle::gpuExecutableBundleDigest(*sm100Transport));
+  auto loaded = mlir::shuttle::GpuExecutable::Load(*sm100Transport);
+  ASSERT_TRUE(loaded.ok()) << loaded.status();
+  EXPECT_EQ((*loaded)->deviceSchemaVersion(), 4);
+  EXPECT_EQ((*loaded)->codeFormat(),
+            mlir::shuttle::ExecutableCodeFormat::CudaPtxSm100V1);
+
+  auto decoded = decodeInlineSchema2(*sm100Transport);
+  ASSERT_TRUE(decoded);
+  auto wrongHeader = replaceEntryCodeAndRehash(*sm100Transport, *decoded, 0,
+                                               ".version 8.7", ".version 8.0");
+  ASSERT_FALSE(wrongHeader.empty());
+  EXPECT_FALSE(mlir::shuttle::GpuExecutable::Load(wrongHeader).ok());
+  llvm::SmallVector<uint8_t> crossedPair(*sm100Transport);
+  writeU64(crossedPair, /*device schema offset=*/12, 3);
+  rehashDeviceAndBundle(crossedPair, *decoded);
+  EXPECT_FALSE(mlir::shuttle::GpuExecutable::Load(crossedPair).ok());
 }
 
 std::unique_ptr<BuiltBundle>
@@ -1779,7 +1861,7 @@ TEST(GpuTransportV2Test, Abi17ThroughAbi21PreserveEveryTransportAndRuntimeCap) {
     EXPECT_FALSE(mlir::shuttle::GpuExecutable::Load(mutation).ok());
   };
 
-  const auto baselinePacket = completeSchema2Packet({64, 64});
+  const auto baselinePacket = completeSchema2Packet({128, 128});
   ASSERT_TRUE(decodeInlineSchema2(baselinePacket));
   ASSERT_TRUE(mlir::shuttle::GpuExecutable::Load(baselinePacket).ok());
 
@@ -1809,7 +1891,7 @@ TEST(GpuTransportV2Test, Abi17ThroughAbi21PreserveEveryTransportAndRuntimeCap) {
 
   // Device closure requires one distinct produced slot per entry, so the
   // shared 256-record ceiling necessarily couples entry and slot counts.
-  llvm::SmallVector<uint64_t> recordLengths(257, 64);
+  llvm::SmallVector<uint64_t> recordLengths(257, 128);
   DecodeLimits raisedRecords;
   raisedRecords.records = 258;
   expectOnlyCapsRejected("records", completeSchema2Packet(recordLengths),
@@ -1821,7 +1903,7 @@ TEST(GpuTransportV2Test, Abi17ThroughAbi21PreserveEveryTransportAndRuntimeCap) {
   expectOnlyCapsRejected(
       "entry",
       completeSchema2Packet(
-          {mlir::shuttle::kMaximumGpuEntryCodeBytes + 1, 64}),
+          {mlir::shuttle::kMaximumGpuEntryCodeBytes + 1, 128}),
       raisedEntry);
 
   llvm::SmallVector<uint8_t> sharedCap(*bytes);
@@ -1832,13 +1914,13 @@ TEST(GpuTransportV2Test, Abi17ThroughAbi21PreserveEveryTransportAndRuntimeCap) {
   expectOnlyCapsRejected("shared", sharedCap, raisedShared);
 
   const auto positionsPacket = completeSchema2Packet(
-      {64, 64}, mlir::shuttle::kMaximumGpuAggregateTaskPositions + 1);
+      {128, 128}, mlir::shuttle::kMaximumGpuAggregateTaskPositions + 1);
   DecodeLimits raisedPositions;
   raisedPositions.taskPositions =
       2 * (mlir::shuttle::kMaximumGpuAggregateTaskPositions + 1);
   expectOnlyCapsRejected("positions", positionsPacket, raisedPositions);
 
-  llvm::SmallVector<uint64_t> slotCountLengths(256, 64);
+  llvm::SmallVector<uint64_t> slotCountLengths(256, 128);
   DecodeLimits raisedSlots;
   raisedSlots.records = 257;
   expectOnlyCapsRejected("slots", completeSchema2Packet(slotCountLengths),
@@ -1846,7 +1928,7 @@ TEST(GpuTransportV2Test, Abi17ThroughAbi21PreserveEveryTransportAndRuntimeCap) {
 
   DecodeLimits raisedRank;
   raisedRank.rank = 9;
-  expectOnlyCapsRejected("rank", completeSchema2Packet({64, 64}, 1, 0, 9),
+  expectOnlyCapsRejected("rank", completeSchema2Packet({128, 128}, 1, 0, 9),
                          raisedRank);
 
   llvm::SmallVector<uint8_t> slotByteCap(*bytes);
@@ -3759,6 +3841,56 @@ dynamicSlotAddresses(const Decoded &decoded,
     if (decoded.slotStorage[ordinal] == 1)
       externalSlots[ordinal] = groups.lookup(decoded.slotReuseGroups[ordinal]);
   return externalSlots;
+}
+
+TEST(GpuTransportV2Test, Sm100RuntimeRequiresExactComputeCapability) {
+  auto source = fixtureSource(
+      "jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-forward.mlir");
+  ASSERT_TRUE(source);
+  auto built =
+      buildFixture(*source, mlir::shuttle::NumericalPolicy::SourceOrdered, {},
+                   {}, mlir::shuttle::GpuTarget::Sm100);
+  ASSERT_TRUE(built);
+  auto transport = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+  ASSERT_TRUE(mlir::succeeded(transport));
+  auto executable = mlir::shuttle::GpuExecutable::Load(*transport);
+  ASSERT_TRUE(executable.ok()) << executable.status();
+
+  SyntheticAllocator allocator;
+  stream_executor::MockStreamExecutor executor;
+  stream_executor::MockStream stream;
+  auto trace = std::make_shared<ExecutionTrace>();
+  EXPECT_CALL(stream, parent()).WillRepeatedly(testing::Return(&executor));
+  EXPECT_CALL(executor, LoadKernel(testing::_))
+      .Times((*executable)->launches().size())
+      .WillRepeatedly([trace](const stream_executor::KernelLoaderSpec &spec) {
+        return recordLoadedKernel(spec, trace);
+      });
+  stream_executor::GpuComputeCapability sm100{
+      stream_executor::CudaComputeCapability{10, 0}};
+  auto runner = mlir::shuttle::GpuRunner::Create(*transport, &allocator, 0,
+                                                 &stream, &sm100);
+  ASSERT_TRUE(runner.ok()) << runner.status();
+  ASSERT_EQ(trace->loads.size(), (*executable)->launches().size());
+  EXPECT_TRUE(llvm::all_of(trace->loads, [](const LoadedKernel &kernel) {
+    return llvm::StringRef(kernel.ptx)
+        .starts_with(".version 8.7\n.target sm_100\n.address_size 64\n");
+  }));
+
+  stream_executor::GpuComputeCapability sm90{
+      stream_executor::CudaComputeCapability{9, 0}};
+  EXPECT_FALSE(mlir::shuttle::GpuRunner::Create(*transport, &allocator, 0,
+                                                &stream, &sm90)
+                   .ok());
+
+  auto legacyBuilt = buildFixture(*source);
+  ASSERT_TRUE(legacyBuilt);
+  auto legacyTransport =
+      mlir::shuttle::serializeGpuExecutableBundle(*legacyBuilt->module);
+  ASSERT_TRUE(mlir::succeeded(legacyTransport));
+  EXPECT_FALSE(mlir::shuttle::GpuRunner::Create(*legacyTransport, &allocator, 0,
+                                                &stream, &sm100)
+                   .ok());
 }
 
 TEST(GpuTransportV2Test, ExportedFfiBundleOwnsEveryLifecycleStage) {

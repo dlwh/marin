@@ -12,6 +12,7 @@ SCHEMA_VERSION = 1
 # Bump when unchanged JSON fields acquire new compiler semantics. This forces a
 # distinct JAX/XLA cache identity even when the wire schema itself is stable.
 PIPELINE_ABI_VERSION = 22
+TARGETED_PIPELINE_ABI_VERSION = 23
 ENABLE_OPTION = "xla_shuttle_enable"
 OPTIONS_OPTION = "xla_shuttle_options"
 MAXIMUM_TENSOR_RANK = 8
@@ -31,6 +32,13 @@ class ExecutionMode(StrEnum):
 
     STABLEHLO_ROUND_TRIP = "stablehlo_round_trip"
     GPU_EXECUTABLE_BUNDLE = "gpu_executable_bundle"
+
+
+class GpuTarget(StrEnum):
+    """CUDA virtual architecture emitted by Shuttle GPU code generation."""
+
+    SM90 = "sm_90"
+    SM100 = "sm_100"
 
 
 class Materialization(StrEnum):
@@ -67,6 +75,7 @@ class Options:
     numerics: Numerics
     execution_mode: ExecutionMode
     tuning: Tuning
+    gpu_target: GpuTarget | None = None
 
     def __post_init__(self) -> None:
         if type(self.numerics) is not Numerics:
@@ -75,6 +84,10 @@ class Options:
             raise TypeError("execution_mode must be an ExecutionMode value")
         if type(self.tuning) is not Tuning:
             raise TypeError("tuning must be a Tuning value")
+        if self.gpu_target is not None and not isinstance(self.gpu_target, GpuTarget):
+            raise TypeError("gpu_target must be a GpuTarget value")
+        if self.gpu_target is not None and self.execution_mode is not ExecutionMode.GPU_EXECUTABLE_BUNDLE:
+            raise ValueError("gpu_target requires GPU_EXECUTABLE_BUNDLE execution")
 
 
 CompilerOptions = dict[str, bool | str]
@@ -85,9 +98,10 @@ def compiler_options(
     numerics: Numerics,
     tuning: Tuning,
     execution_mode: ExecutionMode = ExecutionMode.STABLEHLO_ROUND_TRIP,
+    gpu_target: GpuTarget | None = None,
 ) -> CompilerOptions:
     """Return canonical XLA compiler options for a Shuttle-enabled jaxlib."""
-    options = Options(numerics=numerics, execution_mode=execution_mode, tuning=tuning)
+    options = Options(numerics=numerics, execution_mode=execution_mode, tuning=tuning, gpu_target=gpu_target)
     return {
         ENABLE_OPTION: True,
         OPTIONS_OPTION: canonical_options_json(options),
@@ -96,10 +110,12 @@ def compiler_options(
 
 def canonical_options_json(options: Options) -> str:
     """Serialize options into the closed cache-identity wire format."""
-    payload = {
+    payload: dict[str, object] = {
         "execution_mode": options.execution_mode.value,
         "numerics": options.numerics.value,
-        "pipeline_abi_version": PIPELINE_ABI_VERSION,
+        "pipeline_abi_version": (
+            TARGETED_PIPELINE_ABI_VERSION if options.gpu_target is not None else PIPELINE_ABI_VERSION
+        ),
         "schema_version": SCHEMA_VERSION,
         "tuning": {
             "cluster_shape": list(options.tuning.cluster_shape),
@@ -109,6 +125,8 @@ def canonical_options_json(options: Options) -> str:
             "tile_sizes": list(options.tuning.tile_sizes),
         },
     }
+    if options.gpu_target is not None:
+        payload["gpu_target"] = options.gpu_target.value
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
@@ -117,9 +135,10 @@ def options_digest(
     numerics: Numerics,
     tuning: Tuning,
     execution_mode: ExecutionMode = ExecutionMode.STABLEHLO_ROUND_TRIP,
+    gpu_target: GpuTarget | None = None,
 ) -> str:
     """Return the stable digest used in compilation evidence."""
-    options = Options(numerics=numerics, execution_mode=execution_mode, tuning=tuning)
+    options = Options(numerics=numerics, execution_mode=execution_mode, tuning=tuning, gpu_target=gpu_target)
     return hashlib.sha256(canonical_options_json(options).encode()).hexdigest()
 
 

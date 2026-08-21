@@ -211,6 +211,8 @@ absl::Status invalidTransport(StringRef detail) {
 
 struct Parsed {
   std::unique_ptr<MLIRContext> context;
+  int64_t deviceSchemaVersion;
+  ExecutableCodeFormat codeFormat;
   SmallVector<uint8_t> code;
   std::vector<GpuLaunch> launches;
   std::vector<GpuSlot> slots;
@@ -248,16 +250,19 @@ absl::StatusOr<Parsed> parse(ArrayRef<uint8_t> bytes) {
   auto deviceRoot = reader.text();
   size_t deviceSuffixStart = reader.position();
   auto entryCount = reader.u64();
-  if (deviceSchema != 3 || format != 2 || policy > 1 || !schedule ||
-      !isDigest(*schedule) || !code || code->empty() ||
-      code->size() > kMaximumGpuCodeBytes || !codeDigest ||
-      *codeDigest != digest(*code) || !deviceRoot || !isDigest(*deviceRoot) ||
-      !entryCount || *entryCount == 0 ||
+  const bool supportedTarget =
+      (deviceSchema == 3 && format == 2) || (deviceSchema == 4 && format == 3);
+  if (!supportedTarget || policy > 1 || !schedule || !isDigest(*schedule) ||
+      !code || code->empty() || code->size() > kMaximumGpuCodeBytes ||
+      !codeDigest || *codeDigest != digest(*code) || !deviceRoot ||
+      !isDigest(*deviceRoot) || !entryCount || *entryCount == 0 ||
       *entryCount > kMaximumGpuExecutableRecords)
     return invalidTransport();
 
   Parsed parsed;
   parsed.context = std::make_unique<MLIRContext>();
+  parsed.deviceSchemaVersion = *deviceSchema;
+  parsed.codeFormat = static_cast<ExecutableCodeFormat>(*format);
   parsed.code.assign(code->begin(), code->end());
   int64_t expectedOffset = 0;
   uint64_t aggregatePositions = 0;
@@ -299,7 +304,14 @@ absl::StatusOr<Parsed> parse(ArrayRef<uint8_t> bytes) {
         expectedOffset > static_cast<int64_t>(code->size()) - *codeLength)
       return invalidTransport();
     ArrayRef<uint8_t> slice = code->slice(expectedOffset, *codeLength);
-    if (*entryDigest != digest(slice))
+    StringRef ptx(reinterpret_cast<const char *>(slice.data()), slice.size());
+    const StringRef expectedHeader =
+        *format == 2 ? ".version 8.0\n.target sm_90\n.address_size 64\n"
+                     : ".version 8.7\n.target sm_100\n.address_size 64\n";
+    if (*entryDigest != digest(slice) || !ptx.starts_with(expectedHeader) ||
+        !ptx.ends_with("\n") ||
+        !ptx.contains(".visible .entry shuttle_entry(") ||
+        !ptx.contains("ret;"))
       return invalidTransport();
     std::array<uint64_t, 3> grid;
     std::array<uint64_t, 3> block;
@@ -349,10 +361,6 @@ absl::StatusOr<Parsed> parse(ArrayRef<uint8_t> bytes) {
     for (int64_t output : *outputs)
       if (!producers.try_emplace(output, ordinal).second)
         return invalidTransport();
-    StringRef ptx(reinterpret_cast<const char *>(slice.data()), slice.size());
-    if (!ptx.ends_with("\n") ||
-        ptx.find(".visible .entry shuttle_entry(") == StringRef::npos)
-      return invalidTransport();
     parsed.launches.push_back(
         {ordinal, expectedOffset, *codeLength, entryDigest->str(), grid, block,
          *shared, std::vector<int64_t>(inputs->begin(), inputs->end()),
@@ -585,6 +593,12 @@ GpuExecutable::Load(ArrayRef<uint8_t> bytes) {
 ArrayRef<uint8_t> GpuExecutable::codeBytes() const {
   return implementation->parsed.code;
 }
+int64_t GpuExecutable::deviceSchemaVersion() const {
+  return implementation->parsed.deviceSchemaVersion;
+}
+ExecutableCodeFormat GpuExecutable::codeFormat() const {
+  return implementation->parsed.codeFormat;
+}
 ArrayRef<GpuLaunch> GpuExecutable::launches() const {
   return implementation->parsed.launches;
 }
@@ -610,14 +624,18 @@ FailureOr<SmallVector<uint8_t>> serializeGpuExecutableBundle(ModuleOp module) {
   DeviceModuleOp device = devices.front();
   InvocationAbiOp abi = abis.front();
   ExecutableBundleOp bundle = bundles.front();
-  if (device.getSchemaVersion() != 3 ||
-      device.getCodeFormat() != ExecutableCodeFormat::CudaPtxSm90V1 ||
-      abi.getSchemaVersion() != 3 || bundle.getSchemaVersion() != 2)
+  const bool supportedTarget =
+      (device.getSchemaVersion() == 3 &&
+       device.getCodeFormat() == ExecutableCodeFormat::CudaPtxSm90V1) ||
+      (device.getSchemaVersion() == 4 &&
+       device.getCodeFormat() == ExecutableCodeFormat::CudaPtxSm100V1);
+  if (!supportedTarget || abi.getSchemaVersion() != 3 ||
+      bundle.getSchemaVersion() != 2)
     return failure();
 
   Writer devicePrefix;
-  devicePrefix.i64(3);
-  devicePrefix.u8(2);
+  devicePrefix.i64(device.getSchemaVersion());
+  devicePrefix.u8(static_cast<uint8_t>(device.getCodeFormat()));
   devicePrefix.u8(static_cast<uint8_t>(device.getPolicy()));
   devicePrefix.text(device.getSourceScheduleFingerprint());
   devicePrefix.blob(device.getCode());

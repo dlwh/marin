@@ -1853,6 +1853,8 @@ std::string deviceModuleFingerprint(DeviceModuleOp module) {
     version = "shuttle.device_module.v2";
   } else if (module.getCodeFormat() == ExecutableCodeFormat::CudaPtxSm90V1) {
     version = "shuttle.device_module.v3";
+  } else if (module.getCodeFormat() == ExecutableCodeFormat::CudaPtxSm100V1) {
+    version = "shuttle.device_module.v4";
   }
   return executablePlanFingerprint<DeviceModuleOp, DeviceModuleYieldOp>(
       module, version);
@@ -1880,7 +1882,9 @@ LogicalResult DeviceModuleOp::verifyRegions() {
       (getSchemaVersion() == 2 &&
        getCodeFormat() == ExecutableCodeFormat::CpuBytecodeV2) ||
       (getSchemaVersion() == 3 &&
-       getCodeFormat() == ExecutableCodeFormat::CudaPtxSm90V1);
+       getCodeFormat() == ExecutableCodeFormat::CudaPtxSm90V1) ||
+      (getSchemaVersion() == 4 &&
+       getCodeFormat() == ExecutableCodeFormat::CudaPtxSm100V1);
   if (!validVersionPair) {
     return emitOpError(
         "requires a matching device-module and executable-code version");
@@ -1889,7 +1893,8 @@ LogicalResult DeviceModuleOp::verifyRegions() {
       getPolicy() != NumericalPolicy::SourceOrdered) {
     return emitOpError("requires source_ordered policy for CPU bytecode v2");
   }
-  const bool gpu = getCodeFormat() == ExecutableCodeFormat::CudaPtxSm90V1;
+  const bool gpu = getCodeFormat() == ExecutableCodeFormat::CudaPtxSm90V1 ||
+                   getCodeFormat() == ExecutableCodeFormat::CudaPtxSm100V1;
   if (!isLowerHexDigest(getSourceScheduleFingerprint()) ||
       !isLowerHexDigest(getCodeDigest()) ||
       !isLowerHexDigest(getFingerprint())) {
@@ -2013,13 +2018,17 @@ LogicalResult DeviceModuleOp::verifyRegions() {
     }
     StringRef ptx(reinterpret_cast<const char *>(entryCode.data()),
                   entryCode.size());
+    const StringRef expectedHeader =
+        getCodeFormat() == ExecutableCodeFormat::CudaPtxSm90V1
+            ? ".version 8.0\n.target sm_90\n"
+            : ".version 8.7\n.target sm_100\n";
     if (ptx.empty() || !ptx.ends_with("\n") ||
-        ptx.find(".version 8.0") == StringRef::npos ||
-        ptx.find(".target sm_90") == StringRef::npos ||
+        !ptx.starts_with(expectedHeader) ||
         ptx.find(".address_size 64") == StringRef::npos ||
         ptx.find(".visible .entry shuttle_entry(") == StringRef::npos ||
         ptx.find("ret;") == StringRef::npos) {
-      return entry.emitOpError("CUDA PTX slice is not the closed SM90 form");
+      return entry.emitOpError(
+          "CUDA PTX slice is not the closed SM90 form or closed SM100 form");
     }
     for (char character : ptx) {
       if (character != '\n' && character != '\t' &&
@@ -2217,8 +2226,9 @@ LogicalResult ExecutableBundleOp::verify() {
                            : "invalid closed GPU executable bundle");
   }
   const bool gpuBundle = getSchemaVersion() == 2;
-  if (gpuBundle != (deviceModule.getSchemaVersion() == 3) ||
-      gpuBundle != (abi.getSchemaVersion() == 3)) {
+  const bool gpuDevice = deviceModule.getSchemaVersion() == 3 ||
+                         deviceModule.getSchemaVersion() == 4;
+  if (gpuBundle != gpuDevice || gpuBundle != (abi.getSchemaVersion() == 3)) {
     return emitOpError("bundle schema does not match its device and ABI roots");
   }
   return success();

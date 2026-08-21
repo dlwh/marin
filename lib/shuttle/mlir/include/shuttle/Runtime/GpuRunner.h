@@ -36,7 +36,7 @@ struct GpuRunnerResources {
   uint64_t temporaryBytes;
 };
 
-// Owns one prepared and initialized SM90 Shuttle executable invocation.
+// Owns one prepared and initialized target-bound Shuttle GPU invocation.
 // The caller-owned allocator and stream must outlive the runner.
 class GpuRunner {
 public:

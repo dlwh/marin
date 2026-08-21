@@ -29,6 +29,7 @@ namespace {
 constexpr int64_t kSchemaVersion = 1;
 constexpr int64_t kHistoricalPipelineAbiVersion = 21;
 constexpr int64_t kPipelineAbiVersion = 22;
+constexpr int64_t kTargetedPipelineAbiVersion = 23;
 constexpr int64_t kMaximumNativeInteger = 2147483647;
 constexpr size_t kMaximumTensorRank = 8;
 constexpr size_t kMaximumClusterRank = 3;
@@ -147,22 +148,29 @@ parseShuttleXlaOptions(absl::string_view serializedOptions) {
     return invalidOptions("expected a JSON object");
   }
 
-  const llvm::StringRef rootFields[] = {"execution_mode", "numerics",
-                                        "pipeline_abi_version",
-                                        "schema_version", "tuning"};
-  if (absl::Status status = requireExactFields(*object, rootFields, "root");
-      !status.ok()) {
-    return status;
-  }
   if (object->getInteger("schema_version") != kSchemaVersion) {
     return invalidOptions("field 'schema_version' must be integer 1");
   }
   std::optional<int64_t> pipelineAbiVersion =
       object->getInteger("pipeline_abi_version");
   if (pipelineAbiVersion != kHistoricalPipelineAbiVersion &&
-      pipelineAbiVersion != kPipelineAbiVersion) {
+      pipelineAbiVersion != kPipelineAbiVersion &&
+      pipelineAbiVersion != kTargetedPipelineAbiVersion) {
     return invalidOptions(
-        "field 'pipeline_abi_version' must be integer 21 or 22");
+        "field 'pipeline_abi_version' must be integer 21, 22, or 23");
+  }
+  const llvm::StringRef historicalRootFields[] = {
+      "execution_mode", "numerics", "pipeline_abi_version", "schema_version",
+      "tuning"};
+  const llvm::StringRef targetedRootFields[] = {
+      "execution_mode", "gpu_target", "numerics", "pipeline_abi_version",
+      "schema_version", "tuning"};
+  absl::Status rootStatus =
+      pipelineAbiVersion == kTargetedPipelineAbiVersion
+          ? requireExactFields(*object, targetedRootFields, "root")
+          : requireExactFields(*object, historicalRootFields, "root");
+  if (!rootStatus.ok()) {
+    return rootStatus;
   }
 
   std::optional<llvm::StringRef> numerics = object->getString("numerics");
@@ -177,6 +185,21 @@ parseShuttleXlaOptions(absl::string_view serializedOptions) {
     return invalidOptions("field 'execution_mode' must be "
                           "'stablehlo_round_trip' or "
                           "'gpu_executable_bundle'");
+  }
+  if (pipelineAbiVersion == kTargetedPipelineAbiVersion) {
+    if (options.executionMode != ExecutionMode::GpuExecutableBundle) {
+      return invalidOptions(
+          "pipeline ABI 23 requires 'gpu_executable_bundle' execution");
+    }
+    std::optional<llvm::StringRef> gpuTarget =
+        object->getString("gpu_target");
+    if (gpuTarget && *gpuTarget == "sm_90") {
+      options.gpuTarget = GpuTarget::Sm90;
+    } else if (gpuTarget && *gpuTarget == "sm_100") {
+      options.gpuTarget = GpuTarget::Sm100;
+    } else {
+      return invalidOptions("field 'gpu_target' must be 'sm_90' or 'sm_100'");
+    }
   }
   if (numerics && *numerics == "source_ordered") {
     options.numerics = NumericalPolicy::SourceOrdered;

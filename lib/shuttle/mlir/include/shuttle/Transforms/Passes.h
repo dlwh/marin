@@ -37,6 +37,7 @@ std::unique_ptr<Pass> createVerifyMaterializationPlanPass();
 std::unique_ptr<Pass> createPlanSimt32RowFoldSchedulePass();
 std::unique_ptr<Pass> createVerifySimt32RowFoldSchedulePass();
 std::unique_ptr<Pass> createBuildGpuExecutableBundlePass();
+std::unique_ptr<Pass> createBuildGpuExecutableBundlePass(GpuTarget target);
 std::unique_ptr<Pass> createVerifyGpuExecutableBundlePass();
 std::unique_ptr<Pass> createReplaceWithGpuExecutableBundlePass();
 

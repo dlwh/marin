@@ -9,7 +9,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from shuttle import ExecutionMode, Materialization, Numerics, Tuning, compiler_options, options_digest
+from shuttle import ExecutionMode, GpuTarget, Materialization, Numerics, Tuning, compiler_options, options_digest
 
 
 def _tuning() -> Tuning:
@@ -128,6 +128,56 @@ def test_gpu_executable_mode_has_distinct_source_ordered_and_fast_cache_identiti
         numerics=Numerics.FAST,
         tuning=_tuning(),
     )
+
+
+def test_gpu_targets_have_explicit_distinct_cache_identities() -> None:
+    sm90 = compiler_options(
+        execution_mode=ExecutionMode.GPU_EXECUTABLE_BUNDLE,
+        gpu_target=GpuTarget.SM90,
+        numerics=Numerics.SOURCE_ORDERED,
+        tuning=_tuning(),
+    )
+    sm100 = compiler_options(
+        execution_mode=ExecutionMode.GPU_EXECUTABLE_BUNDLE,
+        gpu_target=GpuTarget.SM100,
+        numerics=Numerics.SOURCE_ORDERED,
+        tuning=_tuning(),
+    )
+
+    sm90_payload = json.loads(sm90["xla_shuttle_options"])
+    sm100_payload = json.loads(sm100["xla_shuttle_options"])
+    assert sm90_payload["pipeline_abi_version"] == 23
+    assert sm90_payload["gpu_target"] == "sm_90"
+    assert sm100_payload["gpu_target"] == "sm_100"
+    assert sm90["xla_shuttle_options"] != sm100["xla_shuttle_options"]
+    assert options_digest(
+        execution_mode=ExecutionMode.GPU_EXECUTABLE_BUNDLE,
+        gpu_target=GpuTarget.SM90,
+        numerics=Numerics.SOURCE_ORDERED,
+        tuning=_tuning(),
+    ) != options_digest(
+        execution_mode=ExecutionMode.GPU_EXECUTABLE_BUNDLE,
+        gpu_target=GpuTarget.SM100,
+        numerics=Numerics.SOURCE_ORDERED,
+        tuning=_tuning(),
+    )
+
+
+def test_gpu_target_rejects_round_trip_and_wrong_enum() -> None:
+    with pytest.raises(ValueError, match="GPU_EXECUTABLE_BUNDLE"):
+        compiler_options(
+            execution_mode=ExecutionMode.STABLEHLO_ROUND_TRIP,
+            gpu_target=GpuTarget.SM100,
+            numerics=Numerics.SOURCE_ORDERED,
+            tuning=_tuning(),
+        )
+    with pytest.raises(TypeError, match="GpuTarget"):
+        compiler_options(
+            execution_mode=ExecutionMode.GPU_EXECUTABLE_BUNDLE,
+            gpu_target=cast(GpuTarget, "sm_100"),
+            numerics=Numerics.SOURCE_ORDERED,
+            tuning=_tuning(),
+        )
 
 
 def test_cpu_executable_mode_is_not_public() -> None:

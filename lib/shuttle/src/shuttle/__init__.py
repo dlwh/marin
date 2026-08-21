@@ -5,6 +5,7 @@
 
 from shuttle.options import (
     ExecutionMode,
+    GpuTarget,
     Materialization,
     Numerics,
     Tuning,

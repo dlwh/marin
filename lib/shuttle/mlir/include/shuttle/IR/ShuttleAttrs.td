@@ -151,7 +151,9 @@ def Shuttle_ExecutableCodeFormat
                    I32EnumAttrCase<"CpuBytecodeV2", 1,
                                    "cpu_bytecode_v2">,
                    I32EnumAttrCase<"CudaPtxSm90V1", 2,
-                                   "cuda_ptx_sm90_v1">]> {
+                                   "cuda_ptx_sm90_v1">,
+                   I32EnumAttrCase<"CudaPtxSm100V1", 3,
+                                   "cuda_ptx_sm100_v1">]> {
   let genSpecializedAttr = 0;
   let cppNamespace = "::mlir::shuttle";
 }

@@ -92,14 +92,18 @@ def ShuttleVerifySimt32RowFoldSchedulePass
 
 def ShuttleBuildGpuExecutableBundlePass
     : Pass<"shuttle-build-gpu-executable-bundle", "::mlir::ModuleOp"> {
-  let summary = "Generate the closed SM90 PTX bundle from Shuttle IR";
+  let summary = "Generate a target-bound CUDA PTX bundle from Shuttle IR";
   let dependentDialects = ["::mlir::shuttle::ShuttleDialect"];
   let constructor = "createBuildGpuExecutableBundlePass()";
+  let options = [
+    Option<"target", "target", "std::string", "\"sm_90\"",
+           "CUDA architecture target: sm_90 or sm_100">
+  ];
 }
 
 def ShuttleVerifyGpuExecutableBundlePass
     : Pass<"shuttle-verify-gpu-executable-bundle", "::mlir::ModuleOp"> {
-  let summary = "Rederive and verify the closed SM90 PTX bundle";
+  let summary = "Rederive and verify the target-bound CUDA PTX bundle";
   let constructor = "createVerifyGpuExecutableBundlePass()";
 }
 

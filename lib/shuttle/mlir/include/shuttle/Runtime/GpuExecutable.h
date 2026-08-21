@@ -75,6 +75,8 @@ public:
   Load(llvm::ArrayRef<uint8_t> bytes);
 
   llvm::ArrayRef<uint8_t> codeBytes() const;
+  int64_t deviceSchemaVersion() const;
+  ExecutableCodeFormat codeFormat() const;
   llvm::ArrayRef<GpuLaunch> launches() const;
   llvm::ArrayRef<GpuSlot> slots() const;
   llvm::ArrayRef<GpuExternalBinding> externalBindings() const;

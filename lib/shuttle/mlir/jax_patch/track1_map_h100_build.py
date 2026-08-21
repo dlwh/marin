@@ -34,7 +34,7 @@ XLA_PATCH_NAMES = (
     "0004-apply-transform-before-c-api-plugin.patch",
 )
 XLA_PATCH_SHA256 = (
-    "8e50020606758a431f7e96b80e2720ef5ca40986746449cc6a20ab6ae9c7bb1e",
+    "8d19013159710eb149a2e96a7fd5c48ee2b7b4e6b8a58a47ba9dc5d46d328ffe",
     "e4f3121f3123d7e2ee781cc5ee92f1ddeb0df662b6702d37615bcae821ecbc99",
     "540980bc2d8cc61cd82c64fa0b1fd9c074d1d160a888837c9a0e007ceb230eb4",
     "dac562b9983df6454019e0d24a9111cd6c2d8e1b553a2235ceeb4bc0e2ead639",

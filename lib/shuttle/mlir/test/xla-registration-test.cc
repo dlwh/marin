@@ -34,6 +34,8 @@ constexpr char kGpuExecutableBundleOptions[] =
     R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
 constexpr char kGpuExecutableBundleFastOptions[] =
     R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+constexpr char kSm100GpuExecutableBundleOptions[] =
+    R"json({"execution_mode":"gpu_executable_bundle","gpu_target":"sm_100","numerics":"source_ordered","pipeline_abi_version":23,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
 constexpr char kAbi21ProjectedParameterSourceOrderedOptions[] =
     R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":21,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
 constexpr char kAbi21ProjectedParameterFastOptions[] =
@@ -117,6 +119,44 @@ TEST(ShuttleXlaOptionsTest, ParsesCanonicalPythonWireFormat) {
             mlir::shuttle::shuttlePipelineIdentity(*gpuFast).policyDigest);
 }
 
+TEST(ShuttleXlaOptionsTest, Sm100TargetIsExplicitAndCacheDistinct) {
+  auto sm90 =
+      mlir::shuttle::parseShuttleXlaOptions(kGpuExecutableBundleOptions);
+  ASSERT_TRUE(sm90.ok()) << sm90.status();
+  auto sm100 =
+      mlir::shuttle::parseShuttleXlaOptions(kSm100GpuExecutableBundleOptions);
+  ASSERT_TRUE(sm100.ok()) << sm100.status();
+  EXPECT_EQ(sm90->gpuTarget, mlir::shuttle::GpuTarget::Sm90);
+  EXPECT_EQ(sm100->gpuTarget, mlir::shuttle::GpuTarget::Sm100);
+  EXPECT_NE(mlir::shuttle::shuttlePipelineIdentity(*sm90).policyDigest,
+            mlir::shuttle::shuttlePipelineIdentity(*sm100).policyDigest);
+}
+
+TEST(ShuttleXlaOptionsTest, Sm100TargetRequiresCurrentTargetedAbi) {
+  constexpr const char *invalid[] = {
+      R"json({"execution_mode":"gpu_executable_bundle","gpu_target":"sm_100","numerics":"source_ordered","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":23,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
+      R"json({"execution_mode":"gpu_executable_bundle","gpu_target":"sm_101","numerics":"source_ordered","pipeline_abi_version":23,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
+  };
+  for (const char *serialized : invalid) {
+    auto parsed = mlir::shuttle::parseShuttleXlaOptions(serialized);
+    EXPECT_EQ(parsed.status().code(), absl::StatusCode::kInvalidArgument)
+        << serialized;
+  }
+}
+
+TEST(ShuttleXlaOptionsTest, ProgrammaticTargetIdentityMismatchFailsClosed) {
+  auto options =
+      mlir::shuttle::parseShuttleXlaOptions(kSm100GpuExecutableBundleOptions);
+  ASSERT_TRUE(options.ok()) << options.status();
+  options->gpuTarget = mlir::shuttle::GpuTarget::Sm90;
+  mlir::MLIRContext context;
+  auto module = parseModule(context, kContractMapProgram);
+  ASSERT_TRUE(module);
+  EXPECT_TRUE(
+      mlir::failed(mlir::shuttle::runShuttleXlaTransform(*module, *options)));
+}
+
 TEST(ShuttleXlaOptionsTest, RejectsRetiredCpuExecutableMode) {
   auto parsed =
       mlir::shuttle::parseShuttleXlaOptions(kRetiredCpuExecutableBundleOptions);
@@ -130,14 +170,15 @@ TEST(ShuttleXlaOptionsTest, RejectsAdjacentGpuPipelineAbis) {
       R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":18,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
       R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":19,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
       R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":20,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
-      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":23,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":24,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json",
   };
   for (const char *serialized : invalid) {
     auto parsed = mlir::shuttle::parseShuttleXlaOptions(serialized);
     ASSERT_FALSE(parsed.ok());
     EXPECT_EQ(parsed.status().code(), absl::StatusCode::kInvalidArgument);
-    EXPECT_NE(std::string(parsed.status().message()).find("integer 21 or 22"),
-              std::string::npos);
+    EXPECT_NE(
+        std::string(parsed.status().message()).find("integer 21, 22, or 23"),
+        std::string::npos);
   }
 }
 

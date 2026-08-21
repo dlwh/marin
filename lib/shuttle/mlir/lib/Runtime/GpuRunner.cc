@@ -69,7 +69,8 @@ projectExternalBindings(const GpuExecutable &executable) {
 }
 
 void addTransportAttributes(ffi::CallFrameBuilder &builder,
-                            llvm::ArrayRef<uint8_t> transport) {
+                            llvm::ArrayRef<uint8_t> transport,
+                            int64_t deviceSchemaVersion) {
   ffi::CallFrameBuilder::AttributesBuilder attributes;
   attributes.Insert(
       "bundle_bytes",
@@ -78,7 +79,7 @@ void addTransportAttributes(ffi::CallFrameBuilder &builder,
   attributes.Insert("bundle_sha256", gpuExecutableBundleDigest(transport));
   attributes.Insert("bundle_size", static_cast<int64_t>(transport.size()));
   attributes.Insert("transport_schema_version", int64_t{2});
-  attributes.Insert("device_schema_version", int64_t{3});
+  attributes.Insert("device_schema_version", deviceSchemaVersion);
   attributes.Insert("invocation_abi_schema_version", int64_t{3});
   attributes.Insert("bundle_schema_version", int64_t{2});
   attributes.Insert("completion", std::string("stream_ordered"));
@@ -137,11 +138,10 @@ absl::Status validateBufferAddresses(
   return absl::OkStatus();
 }
 
-absl::StatusOr<ffi::CallFrame>
-buildCallFrame(llvm::ArrayRef<uint8_t> transport,
-               const ExternalProjection &projection,
-               llvm::ArrayRef<GpuRunnerBuffer> operands,
-               llvm::ArrayRef<GpuRunnerBuffer> results) {
+absl::StatusOr<ffi::CallFrame> buildCallFrame(
+    llvm::ArrayRef<uint8_t> transport, const ExternalProjection &projection,
+    llvm::ArrayRef<GpuRunnerBuffer> operands,
+    llvm::ArrayRef<GpuRunnerBuffer> results, int64_t deviceSchemaVersion) {
   if (operands.size() != projection.operands.size() ||
       results.size() != projection.results.size())
     return invalid("GPU runner external buffer count is invalid");
@@ -158,7 +158,7 @@ buildCallFrame(llvm::ArrayRef<uint8_t> transport,
     if (absl::Status status = addBuffer(builder, binding, buffer, true);
         !status.ok())
       return status;
-  addTransportAttributes(builder, transport);
+  addTransportAttributes(builder, transport, deviceSchemaVersion);
   return builder.Build();
 }
 
@@ -281,9 +281,10 @@ absl::StatusOr<std::unique_ptr<GpuRunner>> GpuRunner::Create(
 
   auto [placeholderOperands, placeholderResults] =
       placeholderBuffers(implementation->projection);
-  absl::StatusOr<ffi::CallFrame> frame = buildCallFrame(
-      implementation->transport, implementation->projection,
-      placeholderOperands, placeholderResults);
+  absl::StatusOr<ffi::CallFrame> frame =
+      buildCallFrame(implementation->transport, implementation->projection,
+                     placeholderOperands, placeholderResults,
+                     implementation->executable->deviceSchemaVersion());
   if (!frame.ok())
     return frame.status();
   ffi::InvokeContext context = implementation->context();
@@ -312,9 +313,9 @@ absl::Status GpuRunner::Execute(llvm::ArrayRef<GpuRunnerBuffer> operands,
   if (implementation->pending)
     return absl::FailedPreconditionError(
         "GPU runner completion is pending; call AwaitCompletion");
-  absl::StatusOr<ffi::CallFrame> frame =
-      buildCallFrame(implementation->transport, implementation->projection,
-                     operands, results);
+  absl::StatusOr<ffi::CallFrame> frame = buildCallFrame(
+      implementation->transport, implementation->projection, operands, results,
+      implementation->executable->deviceSchemaVersion());
   if (!frame.ok())
     return frame.status();
   ffi::InvokeContext context = implementation->context();
@@ -333,9 +334,9 @@ GpuRunner::ExecuteTimed(llvm::ArrayRef<GpuRunnerBuffer> operands,
   if (implementation->pending)
     return absl::FailedPreconditionError(
         "GPU runner completion is pending; call AwaitCompletion");
-  absl::StatusOr<ffi::CallFrame> frame =
-      buildCallFrame(implementation->transport, implementation->projection,
-                     operands, results);
+  absl::StatusOr<ffi::CallFrame> frame = buildCallFrame(
+      implementation->transport, implementation->projection, operands, results,
+      implementation->executable->deviceSchemaVersion());
   if (!frame.ok())
     return frame.status();
   absl::StatusOr<std::unique_ptr<se::EventBasedTimer>> timer =

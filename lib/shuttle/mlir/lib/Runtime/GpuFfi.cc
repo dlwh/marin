@@ -168,7 +168,8 @@ instantiate(int64_t transportSchemaVersion, absl::string_view bundleBytes,
             int64_t deviceSchemaVersion, int64_t invocationAbiSchemaVersion,
             int64_t bundleSchemaVersion, absl::string_view completion) {
   try {
-    if (transportSchemaVersion != 2 || deviceSchemaVersion != 3 ||
+    if (transportSchemaVersion != 2 ||
+        (deviceSchemaVersion != 3 && deviceSchemaVersion != 4) ||
         invocationAbiSchemaVersion != 3 || bundleSchemaVersion != 2 ||
         completion != "stream_ordered" || bundleSize < 0 ||
         static_cast<size_t>(bundleSize) != bundleBytes.size() ||
@@ -184,6 +185,8 @@ instantiate(int64_t transportSchemaVersion, absl::string_view bundleBytes,
         GpuExecutable::Load(borrowed);
     if (!executable.ok())
       return executable.status();
+    if ((*executable)->deviceSchemaVersion() != deviceSchemaVersion)
+      return invalid("Shuttle GPU device schema metadata mismatch");
     std::vector<GpuExternalBinding> operands;
     std::vector<GpuExternalBinding> results;
     if (absl::Status status = projectBindings((*executable)->externalBindings(),
@@ -283,8 +286,15 @@ initialize(InstantiateState *state, se::Stream *stream,
       return invalid("GPU executable Initialize context is invalid");
     const se::CudaComputeCapability *cuda =
         capability->cuda_compute_capability();
-    if (cuda == nullptr || cuda->major != 9 || cuda->minor != 0)
-      return invalid("GPU executable requires CUDA compute capability 9.0");
+    const ExecutableCodeFormat format = state->executable->codeFormat();
+    const bool capabilityMatches =
+        cuda != nullptr && ((format == ExecutableCodeFormat::CudaPtxSm90V1 &&
+                             cuda->major == 9 && cuda->minor == 0) ||
+                            (format == ExecutableCodeFormat::CudaPtxSm100V1 &&
+                             cuda->major == 10 && cuda->minor == 0));
+    if (!capabilityMatches)
+      return invalid(
+          "GPU executable target does not match CUDA compute capability");
     auto initialized = std::make_unique<InitializeState>();
     initialized->ptx.reserve(state->executable->launches().size());
     initialized->kernels.reserve(state->executable->launches().size());

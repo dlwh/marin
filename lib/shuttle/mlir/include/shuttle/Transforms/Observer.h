@@ -17,9 +17,15 @@ enum class ExecutionMode {
   GpuExecutableBundle,
 };
 
+enum class GpuTarget {
+  Sm90,
+  Sm100,
+};
+
 struct ShuttlePipelineOptions {
   NumericalPolicy numerics = NumericalPolicy::SourceOrdered;
   ExecutionMode executionMode = ExecutionMode::StablehloRoundTrip;
+  GpuTarget gpuTarget = GpuTarget::Sm90;
   std::string canonicalOptions =
       R"json({"execution_mode":"stablehlo_round_trip","numerics":"source_ordered","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
   std::string canonicalTuning =

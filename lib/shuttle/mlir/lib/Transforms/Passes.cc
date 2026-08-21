@@ -7055,6 +7055,40 @@ struct PtxEmitter {
   llvm::raw_string_ostream stream;
 };
 
+FailureOr<GpuTarget> parseGpuTarget(StringRef target) {
+  if (target == "sm_90")
+    return GpuTarget::Sm90;
+  if (target == "sm_100")
+    return GpuTarget::Sm100;
+  return failure();
+}
+
+ExecutableCodeFormat codeFormatForTarget(GpuTarget target) {
+  return target == GpuTarget::Sm90 ? ExecutableCodeFormat::CudaPtxSm90V1
+                                   : ExecutableCodeFormat::CudaPtxSm100V1;
+}
+
+int64_t deviceSchemaForTarget(GpuTarget target) {
+  return target == GpuTarget::Sm90 ? 3 : 4;
+}
+
+FailureOr<GpuTarget> targetForCodeFormat(ExecutableCodeFormat format) {
+  if (format == ExecutableCodeFormat::CudaPtxSm90V1)
+    return GpuTarget::Sm90;
+  if (format == ExecutableCodeFormat::CudaPtxSm100V1)
+    return GpuTarget::Sm100;
+  return failure();
+}
+
+LogicalResult retargetPtx(std::string &ptx, GpuTarget target) {
+  constexpr StringLiteral sm90Header = ".version 8.0\n.target sm_90\n";
+  if (!StringRef(ptx).starts_with(sm90Header))
+    return failure();
+  if (target == GpuTarget::Sm100)
+    ptx.replace(0, sm90Header.size(), ".version 8.7\n.target sm_100\n");
+  return success();
+}
+
 LogicalResult emitLinearThread(PtxEmitter &ptx, int64_t elements) {
   if (elements <= 0 || elements > UINT32_MAX)
     return failure();
@@ -8535,7 +8569,7 @@ FailureOr<std::string> emitFoldPtx(FoldOp fold, ScheduleTaskOp task) {
 
 FailureOr<GpuExecutableSpec>
 deriveGpuExecutable(RegionOp region, MaterializationPlanOp materialization,
-                    SchedulePlanOp schedule) {
+                    SchedulePlanOp schedule, GpuTarget target) {
   SmallVector<Operation *> algebra;
   for (Operation &operation : region.getBody().front().without_terminator())
     algebra.push_back(&operation);
@@ -8618,7 +8652,11 @@ deriveGpuExecutable(RegionOp region, MaterializationPlanOp materialization,
       ptx = emitContractPtx(contract, task);
     }
     if (failed(ptx)) {
-      operation->emitOpError("cannot emit bounded generic SM90 PTX");
+      operation->emitOpError("cannot emit bounded generic CUDA PTX");
+      return failure();
+    }
+    if (failed(retargetPtx(*ptx, target))) {
+      operation->emitOpError("cannot bind generic CUDA PTX to its target");
       return failure();
     }
     const bool contractRegion =
@@ -8752,8 +8790,18 @@ class BuildGpuExecutableBundlePass
     : public impl::ShuttleBuildGpuExecutableBundlePassBase<
           BuildGpuExecutableBundlePass> {
 public:
+  BuildGpuExecutableBundlePass() = default;
+  explicit BuildGpuExecutableBundlePass(GpuTarget gpuTarget) {
+    target = gpuTarget == GpuTarget::Sm90 ? "sm_90" : "sm_100";
+  }
+
   void runOnOperation() override {
     ModuleOp module = getOperation();
+    FailureOr<GpuTarget> gpuTarget = parseGpuTarget(target);
+    if (failed(gpuTarget)) {
+      module.emitError("requires CUDA target sm_90 or sm_100");
+      return signalPassFailure();
+    }
     SmallVector<MaterializationPlanOp> materializations(
         module.getOps<MaterializationPlanOp>());
     SmallVector<SchedulePlanOp> schedules(module.getOps<SchedulePlanOp>());
@@ -8785,7 +8833,7 @@ public:
         return signalPassFailure();
       }
       FailureOr<GpuExecutableSpec> spec =
-          deriveGpuExecutable(region, materialization, schedule);
+          deriveGpuExecutable(region, materialization, schedule, *gpuTarget);
       if (failed(spec)) {
         module.emitError("failed to build exact GPU executable bundle");
         return signalPassFailure();
@@ -8807,11 +8855,13 @@ public:
       const std::string codeDigest = executableCodeDigest(spec.code);
       OperationState deviceState(module.getLoc(),
                                  DeviceModuleOp::getOperationName());
-      deviceState.addAttribute("schema_version", builder.getI64IntegerAttr(3));
+      deviceState.addAttribute(
+          "schema_version",
+          builder.getI64IntegerAttr(deviceSchemaForTarget(*gpuTarget)));
       deviceState.addAttribute(
           "code_format",
           ExecutableCodeFormatAttr::get(module.getContext(),
-                                        ExecutableCodeFormat::CudaPtxSm90V1));
+                                        codeFormatForTarget(*gpuTarget)));
       deviceState.addAttribute("policy", schedule.getPolicyAttr());
       deviceState.addAttribute("source_schedule_fingerprint",
                                schedule.getFingerprintAttr());
@@ -8990,9 +9040,15 @@ LogicalResult verifyGpuExecutableUnit(ModuleOp module, RegionOp region,
       failed(bundle.verify()))
     return failure();
   FailureOr<GpuExecutableSpec> expected =
-      deriveGpuExecutable(region, materialization, schedule);
-  if (failed(expected) || device.getSchemaVersion() != 3 ||
-      device.getCodeFormat() != ExecutableCodeFormat::CudaPtxSm90V1 ||
+      [&]() -> FailureOr<GpuExecutableSpec> {
+    FailureOr<GpuTarget> target = targetForCodeFormat(device.getCodeFormat());
+    if (failed(target))
+      return failure();
+    return deriveGpuExecutable(region, materialization, schedule, *target);
+  }();
+  FailureOr<GpuTarget> target = targetForCodeFormat(device.getCodeFormat());
+  if (failed(expected) || failed(target) ||
+      device.getSchemaVersion() != deviceSchemaForTarget(*target) ||
       device.getPolicy() != schedule.getPolicy() ||
       device.getSourceScheduleFingerprint() != schedule.getFingerprint() ||
       abi.getSchemaVersion() != 3 ||
@@ -9127,8 +9183,11 @@ LogicalResult verifyGpuExecutableAgainstSource(ModuleOp module) {
         failed(verifyGpuExecutableUnit(module, region, materialization,
                                        schedule, device, abi, bundle)))
       return failure();
+    FailureOr<GpuTarget> target = targetForCodeFormat(device.getCodeFormat());
+    if (failed(target))
+      return failure();
     FailureOr<GpuExecutableSpec> spec =
-        deriveGpuExecutable(region, materialization, schedule);
+        deriveGpuExecutable(region, materialization, schedule, *target);
     if (failed(spec))
       return failure();
     units.push_back({region, materialization, schedule, std::move(*spec)});
@@ -9155,6 +9214,7 @@ public:
 
 struct PreparedGpuCall {
   RegionOp region;
+  int64_t deviceSchemaVersion;
   SmallVector<uint8_t> bundleBytes;
   std::string digest;
   SmallVector<Attribute> operandLayouts;
@@ -9212,7 +9272,12 @@ FailureOr<PreparedGpuCall> prepareGpuCall(ModuleOp module, RegionOp region,
       serializeGpuExecutableBundle(*stripped);
   if (failed(bundleBytes))
     return failure();
-  PreparedGpuCall prepared{region, std::move(*bundleBytes), {}, {}, {}};
+  PreparedGpuCall prepared{region,
+                           static_cast<int64_t>(device.getSchemaVersion()),
+                           std::move(*bundleBytes),
+                           {},
+                           {},
+                           {}};
   prepared.digest = gpuExecutableBundleDigest(prepared.bundleBytes);
   for (Value input : region.getInputs())
     prepared.operandLayouts.push_back(
@@ -9296,8 +9361,9 @@ public:
                                                   prepared.bundleBytes.size())),
           builder.getNamedAttr("transport_schema_version",
                                builder.getI64IntegerAttr(2)),
-          builder.getNamedAttr("device_schema_version",
-                               builder.getI64IntegerAttr(3)),
+          builder.getNamedAttr(
+              "device_schema_version",
+              builder.getI64IntegerAttr(prepared.deviceSchemaVersion)),
           builder.getNamedAttr("invocation_abi_schema_version",
                                builder.getI64IntegerAttr(3)),
           builder.getNamedAttr("bundle_schema_version",
@@ -9445,7 +9511,7 @@ void buildShuttleGpuExecutablePipeline(
   manager.addPass(createVerifyMaterializationPlanPass());
   manager.addPass(createPlanSimt32RowFoldSchedulePass());
   manager.addPass(createVerifySimt32RowFoldSchedulePass());
-  manager.addPass(createBuildGpuExecutableBundlePass());
+  manager.addPass(createBuildGpuExecutableBundlePass(options.gpuTarget));
   manager.addPass(createVerifyGpuExecutableBundlePass());
   manager.addPass(createVerifySourceCoveragePass());
   manager.addPass(std::make_unique<EmitObserverPass>(
@@ -9484,6 +9550,18 @@ public:
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
+    const bool canonicalSm100 = StringRef(options.canonicalOptions)
+                                    .contains("\"gpu_target\":\"sm_100\"");
+    const bool canonicalSm90 = StringRef(options.canonicalOptions)
+                                   .contains("\"gpu_target\":\"sm_90\"");
+    const bool targetedAbi = StringRef(options.canonicalOptions)
+                                 .contains("\"pipeline_abi_version\":23");
+    if ((options.gpuTarget == GpuTarget::Sm100) != canonicalSm100 ||
+        (canonicalSm90 || canonicalSm100) != targetedAbi) {
+      module.emitError(
+          "GPU target does not match the canonical compiler identity");
+      return signalPassFailure();
+    }
     auto invocation = detail::beginShuttleObserverInvocation(
         shuttlePipelineIdentity(options), observer);
     auto failure = std::make_shared<FailureCaptureState>();
@@ -9579,6 +9657,10 @@ std::unique_ptr<Pass> createVerifySimt32RowFoldSchedulePass() {
 
 std::unique_ptr<Pass> createBuildGpuExecutableBundlePass() {
   return std::make_unique<BuildGpuExecutableBundlePass>();
+}
+
+std::unique_ptr<Pass> createBuildGpuExecutableBundlePass(GpuTarget target) {
+  return std::make_unique<BuildGpuExecutableBundlePass>(target);
 }
 
 std::unique_ptr<Pass> createVerifyGpuExecutableBundlePass() {
