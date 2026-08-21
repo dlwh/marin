@@ -5205,6 +5205,22 @@ TEST(Abi22MapFusionContract,
       auto executable = mlir::shuttle::GpuExecutable::Load(*transport);
       ASSERT_TRUE(executable.ok()) << executable.status();
       ASSERT_EQ((*executable)->launches().size(), tasks.size());
+      auto device =
+          *built->module->getOps<mlir::shuttle::DeviceModuleOp>().begin();
+      auto entries = llvm::to_vector(
+          device.getBody().front().getOps<mlir::shuttle::DeviceEntryOp>());
+      ASSERT_EQ(entries.size(), tasks.size());
+      mlir::shuttle::DeviceEntryOp specializedEntry =
+          entries[specializedTask.getOrdinal()];
+      llvm::StringRef specializedPtx(
+          reinterpret_cast<const char *>(
+              device.getCode().data() + specializedEntry.getCodeOffset()),
+          specializedEntry.getCodeLength());
+      PtxDataflow specializedFlow = ptxDataflow(specializedPtx);
+      ASSERT_EQ(specializedFlow.stores.size(), 2u);
+      EXPECT_TRUE(specializedFlow.stores.front().bf16);
+      EXPECT_TRUE(specializedFlow.stores.back().bf16);
+      EXPECT_EQ(specializedPtx.count("st.global.u16"), 2u);
       const auto &specializedLaunch =
           (*executable)->launches()[specializedTask.getOrdinal()];
       EXPECT_EQ(specializedLaunch.outputSlots.size(), 2u);
