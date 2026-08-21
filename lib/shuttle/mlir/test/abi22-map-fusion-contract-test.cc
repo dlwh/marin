@@ -2745,42 +2745,124 @@ bool hasSourceOrderedContractRecurrence(llvm::StringRef ptx,
                                         int64_t reduction) {
   llvm::SmallVector<llvm::StringRef> lines;
   ptx.split(lines, '\n');
+  for (llvm::StringRef &line : lines)
+    line = line.trim();
   auto tokens = [](llvm::StringRef line) {
-    llvm::SmallVector<llvm::StringRef> result;
-    line.split(result, " ,;\t", -1, false);
+    std::vector<std::string> result;
+    result.push_back(line.split(' ').first.str());
+    llvm::append_range(result, ptxTokens(line));
     return result;
   };
-  auto loop = llvm::find(lines, "$contract_region_source_ordered_loop:");
-  if (loop == lines.end())
-    return false;
-  std::optional<llvm::StringRef> coordinate;
-  std::optional<llvm::StringRef> accumulator;
-  bool increment = false;
-  for (auto line = std::next(loop); line != lines.end(); ++line) {
-    llvm::SmallVector<llvm::StringRef> instruction = tokens(*line);
-    if (instruction.empty())
+  for (size_t loopLine = 0; loopLine + 3 < lines.size(); ++loopLine) {
+    if (!lines[loopLine].ends_with(":"))
       continue;
-    if (instruction.front() == "setp.ge.u64") {
-      int64_t bound = 0;
-      if (instruction.size() != 4 ||
-          instruction.back().getAsInteger(10, bound) || bound != reduction)
+    std::vector<std::string> comparison = tokens(lines[loopLine + 1]);
+    const std::string boundSuffix =
+        (llvm::Twine(", ") + llvm::Twine(reduction) + ";").str();
+    if (comparison.size() != 3 || comparison[0] != "setp.ge.u64" ||
+        !lines[loopLine + 1].ends_with(boundSuffix))
+      continue;
+    llvm::StringRef predicate = comparison[1];
+    llvm::StringRef coordinate = comparison[2];
+    const std::string branchPrefix =
+        (llvm::Twine("@") + predicate + " bra ").str();
+    if (!lines[loopLine + 2].starts_with(branchPrefix) ||
+        !lines[loopLine + 2].ends_with(";"))
+      continue;
+    llvm::StringRef exit = lines[loopLine + 2]
+                               .drop_front(branchPrefix.size())
+                               .drop_back();
+    llvm::StringRef loop = lines[loopLine].drop_back();
+    const std::string increment =
+        (llvm::Twine("add.u64 ") + coordinate + ", " + coordinate + ", 1;")
+            .str();
+    const std::string backedge = (llvm::Twine("bra ") + loop + ";").str();
+    const std::string exitLabel = (llvm::Twine(exit) + ":").str();
+    int64_t recurrences = 0;
+    for (size_t line = loopLine + 3; line + 2 < lines.size(); ++line) {
+      if (lines[line] == exitLabel)
+        break;
+      if (lines[line].starts_with("bra ") || lines[line].contains(" bra ") ||
+          lines[line] == "ret;" || lines[line].contains(" ret;") ||
+          lines[line] == "exit;" || lines[line].contains(" exit;") ||
+          lines[line].ends_with(":"))
         return false;
-      coordinate = instruction[2];
-    } else if (instruction.front() == "fma.rn.f32") {
-      if (!coordinate || instruction.size() != 5 ||
+      std::vector<std::string> instruction = tokens(lines[line]);
+      if (instruction.size() != 5 || instruction[0] != "fma.rn.f32" ||
           instruction[1] != instruction[4])
+        continue;
+      PtxDataflow prefix = ptxDataflow(llvm::join(
+          llvm::ArrayRef(lines).slice(loopLine + 3, line - loopLine - 3),
+          "\n"));
+      bool indexedInputs = true;
+      for (llvm::StringRef operand : {instruction[2], instruction[3]}) {
+        auto reaching = prefix.currentValues.find(operand.str());
+        if (reaching == prefix.currentValues.end()) {
+          indexedInputs = false;
+          break;
+        }
+        std::set<std::string> closure =
+            ptxDependencyClosure(prefix, reaching->second);
+        indexedInputs &= closure.count(coordinate.str()) &&
+                         closure.count("$ld.global.u16");
+      }
+      if (!indexedInputs)
         return false;
-      accumulator = instruction[1];
-    } else if (instruction.front() == "add.u64" && coordinate) {
-      if (instruction.size() == 4 && instruction[1] == *coordinate &&
-          instruction[2] == *coordinate && instruction[3] == "1")
-        increment = true;
-    } else if (instruction.front() == "bra" && instruction.size() == 2 &&
-               instruction[1] == "$contract_region_source_ordered_loop") {
-      return accumulator.has_value() && increment;
+      ++recurrences;
+      if (lines[line + 1] != increment || lines[line + 2] != backedge ||
+          line + 3 >= lines.size() || lines[line + 3] != exitLabel)
+        return false;
+      return recurrences == 1;
     }
   }
   return false;
+}
+
+TEST(Abi22MapFusionContract,
+     SourceOrderedContractRecurrenceBindsControlAndIndexedLoads) {
+  constexpr llvm::StringLiteral recurrence = R"ptx(
+  mov.u64 %rd4, 0;
+  mov.f32 %f0, 0f00000000;
+$loop_renamable:
+  setp.ge.u64 %p0, %rd4, 65;
+  @%p0 bra $finished_renamable;
+  cvt.u64.u32 %rd5, %rd4;
+  ld.global.u16 %h0, [%rd5];
+  cvt.f32.bf16 %f1, %h0;
+  mul.lo.u64 %rd6, %rd4, 2;
+  ld.global.u16 %h1, [%rd6];
+  cvt.f32.bf16 %f2, %h1;
+  fma.rn.f32 %f0, %f1, %f2, %f0;
+  add.u64 %rd4, %rd4, 1;
+  bra $loop_renamable;
+$finished_renamable:
+)ptx";
+  auto replaceAll = [](llvm::StringRef source, llvm::StringRef oldText,
+                       llvm::StringRef newText) {
+    std::string changed = source.str();
+    size_t position = changed.find(oldText.str());
+    EXPECT_NE(position, std::string::npos);
+    while (position != std::string::npos) {
+      changed.replace(position, oldText.size(), newText.str());
+      position = changed.find(oldText.str(), position + newText.size());
+    }
+    return changed;
+  };
+  EXPECT_TRUE(hasSourceOrderedContractRecurrence(recurrence, 65));
+  EXPECT_TRUE(hasSourceOrderedContractRecurrence(
+      replaceAll(replaceAll(recurrence, "$loop_renamable", "$renamed_loop"),
+                 "$finished_renamable", "$renamed_exit"),
+      65));
+  for (std::string mutation : {
+           replaceAll(recurrence, "@%p0 bra $finished_renamable;",
+                      "@!%p0 bra $finished_renamable;"),
+           replaceAll(recurrence, "cvt.u64.u32 %rd5, %rd4;",
+                      "cvt.u64.u32 %rd5, %rd9;"),
+           replaceAll(recurrence, "add.u64 %rd4, %rd4, 1;", "nop;"),
+           replaceAll(recurrence, "fma.rn.f32 %f0, %f1, %f2, %f0;",
+                      "bra $finished_renamable;"),
+       })
+    EXPECT_FALSE(hasSourceOrderedContractRecurrence(mutation, 65));
 }
 
 TEST(Abi22MapFusionContract,
@@ -2793,6 +2875,7 @@ TEST(Abi22MapFusionContract,
   };
   constexpr Boundary boundaries[] = {
       {"jax-0.10.1-bf16-rmsnorm_contract-5x19x7-forward.mlir", 5, 19, 7},
+      {"jax-0.10.1-bf16-rmsnorm_contract-5x65x7-forward.mlir", 5, 65, 7},
       {"jax-0.10.1-bf16-rmsnorm_contract-5x19x9-forward.mlir", 5, 19, 9},
       {"jax-0.10.1-bf16-rmsnorm_contract-5x19x257-forward.mlir", 5, 19,
        257},
@@ -2984,9 +3067,16 @@ TEST(Abi22MapFusionContract,
           reinterpret_cast<const char *>(device.getCode().data() +
                                          contractEntry.getCodeOffset()),
           contractEntry.getCodeLength());
+      PtxDataflow contractFlow = ptxDataflow(contractPtx);
+      ASSERT_EQ(contractFlow.stores.size(), 1u);
+      std::set<std::string> contractValueDependencies = ptxDependencyClosure(
+          contractFlow, contractFlow.stores.front().value);
       EXPECT_NE(contractPtx.find("cvt.rn.bf16.f32"), llvm::StringRef::npos);
       EXPECT_NE(contractPtx.find("cvt.f32.bf16"), llvm::StringRef::npos);
       EXPECT_NE(contractPtx.find("fma.rn.f32"), llvm::StringRef::npos);
+      EXPECT_TRUE(contractValueDependencies.count("$op:cvt.rn.bf16.f32"));
+      EXPECT_TRUE(contractValueDependencies.count("$op:cvt.f32.bf16"));
+      EXPECT_TRUE(contractValueDependencies.count("$op:fma.rn.f32"));
       if (policy == mlir::shuttle::NumericalPolicy::SourceOrdered) {
         EXPECT_TRUE(
             hasSourceOrderedContractRecurrence(contractPtx, boundary.reduction));
@@ -2994,10 +3084,30 @@ TEST(Abi22MapFusionContract,
       } else {
         EXPECT_NE(contractPtx.find("shfl.sync.down.b32"),
                   llvm::StringRef::npos);
-        EXPECT_EQ(contractPtx.find("$contract_region_source_ordered_loop:"),
-                  llvm::StringRef::npos);
+        EXPECT_FALSE(
+            hasSourceOrderedContractRecurrence(contractPtx, boundary.reduction));
       }
       EXPECT_EQ(contractPtx.count("st.global.u16"), 1u);
+      if (!inlineFold) {
+        EXPECT_TRUE(contractValueDependencies.count("p1"));
+        EXPECT_TRUE(contractValueDependencies.count("$op:ld.global.f32"));
+
+        llvm::StringRef foldPtx(
+            reinterpret_cast<const char *>(device.getCode().data() +
+                                           entries.front().getCodeOffset()),
+            entries.front().getCodeLength());
+        PtxDataflow foldFlow = ptxDataflow(foldPtx);
+        ASSERT_EQ(foldFlow.stores.size(), 1u);
+        EXPECT_FALSE(foldFlow.stores.front().bf16);
+        std::set<std::string> foldPointerDependencies = ptxDependencyClosure(
+            foldFlow, foldFlow.stores.front().pointer);
+        EXPECT_TRUE(foldPointerDependencies.count("p1"));
+        llvm::StringRef reductionLiteral =
+            boundary.reduction == 263 ? "0f43838000" : "0f41980000";
+        EXPECT_TRUE(containsRmsNormReciprocalSubgraph(
+            foldFlow, foldFlow.stores.front().value, reductionLiteral,
+            "$shared"));
+      }
 
       mlir::FailureOr<llvm::SmallVector<uint8_t>> transport =
           mlir::shuttle::serializeGpuExecutableBundle(*built->module);

@@ -5,7 +5,7 @@
 // Evaluation oracle status: hardware_gate_pending
 // Hardware evidence: none
 // Generator: regenerate-jax-bf16-rmsnorm-contract-fixtures.py
-// Generator source SHA-256: 0F2118B74CE0307BC6D8BA77CF93D1EBB2EB69829D743AC29C4216214E0F6737
+// Generator source SHA-256: F030F627F82526AAFAE0277AE90B7A49D4D1692AE524C706A551D0C6E90A64DA
 // Source: jax.jit(ordinary JAX BF16 RMSNorm followed by matmul)
 //   .lower(...).compiler_ir(dialect="stablehlo")
 // Case ID: rmsnorm_contract_d3d61db6290a8ae6

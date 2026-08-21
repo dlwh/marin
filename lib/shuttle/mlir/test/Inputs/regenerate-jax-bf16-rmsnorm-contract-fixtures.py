@@ -56,6 +56,7 @@ class StructuralShape:
 
 SHAPES = (
     StructuralShape(activation=(5, 19), columns=7),
+    StructuralShape(activation=(5, 65), columns=7),
     StructuralShape(activation=(5, 19), columns=9),
     StructuralShape(activation=(5, 19), columns=257),
     StructuralShape(activation=(3, 2, 5, 11, 263), columns=521),
