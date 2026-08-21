@@ -53,6 +53,8 @@ LOG_TAIL_READ_BYTES = 64 * 1024
 LOG_TAIL_MAX_CHARACTERS = 8 * 1024
 LOG_TAIL_MAX_LINES = 80
 WHEEL_PREFIXES = ("jaxlib-", "jax_cuda13_plugin-", "jax_cuda13_pjrt-")
+JAX_PYTHON_VERSION = "0.10.1"
+JAX_SOURCE_HELPER_RELATIVE = Path("lib/shuttle/mlir/jax_patch/track1_map_h100_jax_source.py")
 WORKER_MODES = ("disabled", "source_ordered", "fast")
 SOURCE_MANIFEST_RELATIVE = Path("scripts/shuttle/track1_map_h100_source_manifest.json")
 SOURCE_ROOTS = (Path("lib/shuttle/mlir"), Path("lib/shuttle/src/shuttle"))
@@ -216,6 +218,14 @@ def _expected_authorization(source_manifest_sha256: str) -> dict[str, object]:
                 "offline_downloads": False,
                 "physical_tools_root": str(PHYSICAL_CUDA_TOOLS_ROOT),
             },
+            "python_package": {
+                "dependency_resolution": False,
+                "distribution": "jax",
+                "expected_base_version": JAX_PYTHON_VERSION,
+                "install_method": "site-packages-pth",
+                "network": False,
+                "source": "pinned_hydrated_checkout",
+            },
             "python": "3.12",
         },
     }
@@ -277,6 +287,15 @@ def _worker_command(paths: PrototypePaths, runner_repository: Path, role: str) -
     if role == "reuse":
         command.extend(("--populate-result", str(paths.populate)))
     return command
+
+
+def _jax_source_command(paths: PrototypePaths, runner_repository: Path, action: str) -> list[str]:
+    return [
+        str(paths.runtime / "bin/python"),
+        str(runner_repository / JAX_SOURCE_HELPER_RELATIVE),
+        action,
+        str(paths.jax),
+    ]
 
 
 def prototype_plan(
@@ -351,9 +370,12 @@ def prototype_plan(
                 "install",
                 "--disable-pip-version-check",
                 "--no-deps",
+                "--no-index",
                 *install_patterns,
             ],
         },
+        {"name": "install_jax_source", "argv": _jax_source_command(paths, runner_repository, "install")},
+        {"name": "verify_jax_runtime", "argv": _jax_source_command(paths, runner_repository, "verify")},
         {"name": "populate", "argv": _worker_command(paths, runner_repository, "populate")},
         {"name": "reuse", "argv": _worker_command(paths, runner_repository, "reuse")},
     ]
@@ -813,6 +835,7 @@ def execute_prototype(
             "install",
             "--disable-pip-version-check",
             "--no-deps",
+            "--no-index",
             *map(str, wheels),
         ],
         cwd=None,
@@ -820,6 +843,25 @@ def execute_prototype(
         phase="install_wheels",
     )
     environment = _runtime_environment(paths, runner_repository)
+    require_source_checkouts_unchanged(
+        patched_sources,
+        jax_repository=paths.jax,
+        xla_repository=paths.xla,
+    )
+    _run(
+        _jax_source_command(paths, runner_repository, "install"),
+        cwd=runner_repository,
+        log=paths.logs / "jax-source-install.log",
+        phase="install_jax_source",
+        environment=environment,
+    )
+    _run(
+        _jax_source_command(paths, runner_repository, "verify"),
+        cwd=runner_repository,
+        log=paths.logs / "jax-runtime-verify.log",
+        phase="verify_jax_runtime",
+        environment=environment,
+    )
     _run(
         _worker_command(paths, runner_repository, "populate"),
         cwd=runner_repository,
