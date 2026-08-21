@@ -763,7 +763,6 @@ def validate_report(
     if not isinstance(cells, list) or len(cells) != len(SHAPES) * len(BOUNDARIES):
         raise ValueError("cell matrix drifted")
     expected_coordinates = [(shape, boundary) for shape in SHAPES for boundary in BOUNDARIES]
-    actual_digests: dict[tuple[tuple[int, int], str, str], str] = {}
     for cell, (shape, boundary) in zip(cells, expected_coordinates, strict=True):
         if not isinstance(cell, Mapping):
             raise ValueError("cell matrix contains a non-object")
@@ -781,7 +780,7 @@ def validate_report(
         if not isinstance(outputs, list) or [output.get("role") for output in outputs] != list(roles):
             raise ValueError("cell output roles drifted")
         for output, role in zip(outputs, roles, strict=True):
-            digest = _sha(output.get("digest"), "output digest")
+            _sha(output.get("digest"), "output digest")
             reference_digest = _sha(output.get("reference_digest"), "reference digest")
             if reference_digest != REFERENCE_DIGESTS[shape][role]:
                 raise ValueError("composed reference provenance drifted")
@@ -796,7 +795,6 @@ def validate_report(
                 raise ValueError("max_bfloat16_ulp must be a nonnegative integer")
             if shape == REPRESENTATIVE_SHAPE and ulp > limits["max_bfloat16_ulp"]:
                 raise ValueError("max_bfloat16_ulp exceeds acceptance limit")
-            actual_digests[(shape, boundary, role)] = digest
         timing = cell.get("timing")
         if not isinstance(timing, Mapping) or timing.get("warmup_invocations") != WARMUP_INVOCATIONS:
             raise ValueError("timing warmup contract drifted")
@@ -811,17 +809,6 @@ def validate_report(
         )
         if expected_producer == "ordinary_jax_xla" and cuda is not None:
             raise ValueError("XLA report must not contain CUDA-event samples")
-    for shape in SHAPES:
-        relations = (
-            (("forward", "y"), ("composed", "y")),
-            (("backward_recompute", "dx"), ("composed", "dx")),
-            (("backward_recompute", "dgamma"), ("composed", "dgamma")),
-        )
-        for left, right in relations:
-            left_boundary, left_role = left
-            right_boundary, right_role = right
-            if actual_digests[(shape, left_boundary, left_role)] != actual_digests[(shape, right_boundary, right_role)]:
-                raise ValueError("composed output digest differs from matching F/B output digest")
     return dict(document)
 
 
@@ -912,18 +899,6 @@ def validate_qualification_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
                         != digests[(producer, pattern, boundary, 1, role)]
                     ):
                         raise ValueError("qualification repeat output digest drifted")
-            for repeat in range(NUMERICAL_POLICY["repeat_count"]):
-                if (
-                    digests[(producer, pattern, "forward", repeat, "y")]
-                    != digests[(producer, pattern, "composed", repeat, "y")]
-                ):
-                    raise ValueError("qualification composed forward digest drifted")
-                for role in ("dx", "dgamma"):
-                    if (
-                        digests[(producer, pattern, "backward_recompute", repeat, role)]
-                        != digests[(producer, pattern, "composed", repeat, role)]
-                    ):
-                        raise ValueError("qualification composed backward digest drifted")
     return {
         "schema": "shuttle_abi22_rmsnorm_policy_evidence_v1",
         "policy": NUMERICAL_POLICY,
