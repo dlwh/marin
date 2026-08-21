@@ -33,6 +33,7 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/Support/SHA256.h"
 #include "llvm/Support/raw_ostream.h"
 #include "gtest/gtest.h"
 
@@ -2500,10 +2501,10 @@ TEST(Abi22MapFusionContract,
       auto plan = *built->module->getOps<mlir::shuttle::MaterializationPlanOp>()
                        .begin();
       EXPECT_EQ(plan.getSchemaVersion(), 2);
-      auto tasks =
-          llvm::to_vector(plan.getBody()
-                              .front()
-                              .getOps<mlir::shuttle::MaterializationTaskOp>());
+      auto tasks = llvm::to_vector(
+          plan.getBody()
+              .front()
+              .getOps<mlir::shuttle::MaterializationTaskOp>());
       auto buffers = llvm::to_vector(
           plan.getBody()
               .front()
@@ -3686,23 +3687,34 @@ bool mutateGenericSharedStatPartition(mlir::ModuleOp module,
   return true;
 }
 
-bool hasExactMultiOutputStoreDataflow(llvm::StringRef ptx,
-                                      int64_t inputCount,
-                                      llvm::ArrayRef<bool> outputBf16) {
+std::string ptxFingerprintDigest(const PtxDataflow &flow,
+                                 llvm::StringRef value);
+
+struct ExpectedPtxOutput {
+  bool bf16;
+  llvm::StringRef pointerDigest;
+  llvm::StringRef valueDigest;
+  llvm::StringRef inputParameters;
+};
+
+bool hasExactMultiOutputStoreDataflow(
+    llvm::StringRef ptx, int64_t inputCount,
+    llvm::ArrayRef<ExpectedPtxOutput> expectedOutputs) {
   PtxDataflow flow = ptxDataflow(ptx);
-  if (flow.stores.size() != outputBf16.size())
+  if (flow.stores.size() != expectedOutputs.size())
     return false;
-  for (auto [outputOrdinal, store, bf16] :
-       llvm::enumerate(flow.stores, outputBf16)) {
-    std::set<std::string> pointer =
-        ptxDependencyClosure(flow, store.pointer);
+  for (auto [outputOrdinal, store, expected] :
+       llvm::enumerate(flow.stores, expectedOutputs)) {
+    std::set<std::string> pointer = ptxDependencyClosure(flow, store.pointer);
     const std::string parameter =
         (llvm::Twine("p") + llvm::Twine(inputCount + outputOrdinal)).str();
-    if (store.bf16 != bf16 || !pointer.count(parameter) ||
-        !pointer.count("$op:mad.lo.u64"))
+    if (store.bf16 != expected.bf16 || !pointer.count(parameter) ||
+        !pointer.count("$op:mad.lo.u64") ||
+        ptxFingerprintDigest(flow, store.pointer) != expected.pointerDigest ||
+        ptxFingerprintDigest(flow, store.value) != expected.valueDigest)
       return false;
     for (int64_t other = 0;
-         other < static_cast<int64_t>(outputBf16.size()); ++other) {
+         other < static_cast<int64_t>(expectedOutputs.size()); ++other) {
       const std::string otherParameter =
           (llvm::Twine("p") + llvm::Twine(inputCount + other)).str();
       if (other != static_cast<int64_t>(outputOrdinal) &&
@@ -3713,8 +3725,46 @@ bool hasExactMultiOutputStoreDataflow(llvm::StringRef ptx,
     if (!value.count("$shared") && !value.count("$ld.global.f32") &&
         !value.count("$ld.global.u16"))
       return false;
+    std::string parameters;
+    for (const std::string &dependency : value) {
+      if (!llvm::StringRef(dependency).starts_with("p"))
+        continue;
+      if (!parameters.empty())
+        parameters += ",";
+      parameters += dependency;
+    }
+    if (parameters != expected.inputParameters)
+      return false;
   }
   return true;
+}
+
+std::string ptxFingerprintDigest(const PtxDataflow &flow,
+                                 llvm::StringRef value) {
+  std::map<std::string, std::string> memo;
+  std::set<std::string> active;
+  auto digestValue = [&](auto &self, llvm::StringRef current) -> std::string {
+    auto memoized = memo.find(current.str());
+    if (memoized != memo.end())
+      return memoized->second;
+    if (!active.insert(current.str()).second)
+      return "$cycle";
+    llvm::SHA256 digest;
+    const PtxDataflow::Definition *definition = ptxDefinition(flow, current);
+    if (!definition) {
+      digest.update(current);
+    } else {
+      digest.update(definition->predicated ? "@" : "_");
+      digest.update(ptxInstructionSkeleton(definition->instruction));
+      for (llvm::StringRef operand : definition->operands)
+        digest.update(self(self, operand));
+    }
+    active.erase(current.str());
+    std::string result = llvm::toHex(digest.final(), true);
+    memo.try_emplace(current.str(), result);
+    return result;
+  };
+  return digestValue(digestValue, value);
 }
 
 std::string misrouteFirstPtxOutput(llvm::StringRef ptx, int64_t inputCount) {
@@ -3741,9 +3791,69 @@ std::string zeroFirstPtxOutputValue(llvm::StringRef ptx) {
   return result;
 }
 
-TEST(Abi22MapFusionContract,
-     SharedRowStatsPartitionRowAndSiblingColumnOutputsGenerically) {
-  constexpr llvm::StringLiteral source = R"mlir(
+std::string swapFirstTwoPtxOutputValues(llvm::StringRef ptx) {
+  std::string result = ptx.str();
+  llvm::SmallVector<size_t> stores;
+  for (size_t position = 0;
+       (position = result.find("st.global.", position)) != std::string::npos;
+       ++position)
+    stores.push_back(position);
+  if (stores.size() < 2)
+    return result;
+  auto valueRange = [&](size_t store) {
+    size_t begin = result.find(", ", store);
+    size_t end = begin == std::string::npos ? std::string::npos
+                                            : result.find(';', begin);
+    return std::pair(begin == std::string::npos ? begin : begin + 2, end);
+  };
+  auto [firstBegin, firstEnd] = valueRange(stores[0]);
+  auto [secondBegin, secondEnd] = valueRange(stores[1]);
+  if (firstEnd == std::string::npos || secondEnd == std::string::npos)
+    return result;
+  std::string first = result.substr(firstBegin, firstEnd - firstBegin);
+  std::string second = result.substr(secondBegin, secondEnd - secondBegin);
+  result.replace(secondBegin, secondEnd - secondBegin, first);
+  result.replace(firstBegin, firstEnd - firstBegin, second);
+  return result;
+}
+
+std::string rerouteFirstPtxInputLeaf(llvm::StringRef ptx) {
+  std::string result = ptx.str();
+  size_t position = result.find("[p0]");
+  if (position != std::string::npos)
+    result.replace(position, 4, "[p1]");
+  return result;
+}
+
+std::string changeFirstPtxOutputByteScale(llvm::StringRef ptx) {
+  std::string result = ptx.str();
+  size_t store = result.find("st.global.");
+  if (store == std::string::npos)
+    return result;
+  size_t lineStart = result.rfind('\n', store);
+  llvm::StringRef storeLine(result.data() + (lineStart + 1),
+                            result.find('\n', store) - lineStart - 1);
+  std::vector<std::string> storeTokens = ptxTokens(storeLine);
+  if (storeTokens.empty())
+    return result;
+  std::string definition = "mad.lo.u64 " + storeTokens[0] + ",";
+  size_t address = result.rfind(definition, store);
+  size_t addressEnd = address == std::string::npos ? std::string::npos
+                                                   : result.find('\n', address);
+  if (addressEnd == std::string::npos)
+    return result;
+  size_t scale = result.find(", 4,", address);
+  if (scale != std::string::npos && scale < addressEnd)
+    result.replace(scale, 4, ", 8,");
+  else {
+    scale = result.find(", 2,", address);
+    if (scale != std::string::npos && scale < addressEnd)
+      result.replace(scale, 4, ", 4,");
+  }
+  return result;
+}
+
+constexpr llvm::StringLiteral kGenericSharedStatAlgebra = R"mlir(
 #matrix = affine_map<(d0, d1) -> (d0, d1)>
 #row = affine_map<(d0, d1) -> (d0)>
 #vector = affine_map<(d0) -> (d0)>
@@ -3849,6 +3959,10 @@ module attributes {
   }
 }
 )mlir";
+
+TEST(Abi22MapFusionContract,
+     SharedRowStatsPartitionRowAndSiblingColumnOutputsGenerically) {
+  llvm::StringRef source = kGenericSharedStatAlgebra;
   struct ShapeCase {
     int64_t rows;
     int64_t features;
@@ -3891,9 +4005,56 @@ module attributes {
       }
     }
   }
+}
 
-  std::string sharedFoldSource = replaceAllText(
-      source.str(),
+bool hasSquareSharedStatFoldControl(mlir::ModuleOp module, bool sharedFold) {
+  auto plans =
+      llvm::to_vector(module.getOps<mlir::shuttle::MaterializationPlanOp>());
+  if (plans.size() != 1)
+    return false;
+  auto tasks =
+      llvm::to_vector(plans.front()
+                          .getBody()
+                          .front()
+                          .getOps<mlir::shuttle::MaterializationTaskOp>());
+  if (tasks.size() != 2)
+    return false;
+  auto sources = [](mlir::shuttle::MaterializationTaskOp task) {
+    return sourceOperationOrdinals(
+        task->getAttrOfType<mlir::ArrayAttr>("fold_region_sources"));
+  };
+  const llvm::SmallVector<int64_t> expectedRow =
+      llvm::to_vector(llvm::seq<int64_t>(0, 13));
+  const llvm::SmallVector<int64_t> expectedFeature =
+      sharedFold ? llvm::SmallVector<int64_t>{0, 1, 3, 8, 9, 13, 14, 15, 16, 17}
+                 : llvm::SmallVector<int64_t>{3, 8, 9, 13, 14, 15, 16};
+  const llvm::SmallVector<int64_t> expectedFeaturePhases =
+      sharedFold ? llvm::SmallVector<int64_t>{1, 14, 17}
+                 : llvm::SmallVector<int64_t>{14, 16};
+  return sources(tasks[0]) == expectedRow &&
+         sources(tasks[1]) == expectedFeature &&
+         foldRegionPhaseOrdinals(tasks[0]) ==
+             llvm::ArrayRef<int64_t>({1, 6, 11}) &&
+         foldRegionPhaseOrdinals(tasks[1]) == expectedFeaturePhases &&
+         tasks[0].getReductionDimensions() == llvm::ArrayRef<int64_t>({1}) &&
+         tasks[1].getReductionDimensions() == llvm::ArrayRef<int64_t>({1});
+}
+
+TEST(Abi22MapFusionContract, RejectsCrossTaskFoldRecomputationSpecifically) {
+  std::string controlSource = kGenericSharedStatAlgebra.str();
+  controlSource = replaceAllText(controlSource, "2x4", "4x4");
+  controlSource =
+      replaceAllText(controlSource, "tensor<2xf32>", "tensor<4xf32>");
+  controlSource =
+      replaceAllText(controlSource, "reduction_dimensions = array<i64: 0>",
+                     "reduction_dimensions = array<i64: 1>");
+  std::unique_ptr<BuiltModule> control = buildAlgebra(
+      controlSource, mlir::shuttle::NumericalPolicy::SourceOrdered, false);
+  ASSERT_TRUE(control);
+  ASSERT_TRUE(hasSquareSharedStatFoldControl(*control->module, false));
+
+  std::string shared = replaceAllText(
+      controlSource,
       "      %independent = \"shuttle.fold\"(%region_dy, %independent_init)",
       "      %shared_fold_input = \"shuttle.map\"(%region_dy, %mean_sum) "
       "({\n"
@@ -3901,28 +4062,28 @@ module attributes {
       "        %value = arith.addf %element, %row_sum : f32\n"
       "        \"shuttle.yield\"(%value) : (f32) -> ()\n"
       "      }) {indexing_maps = [#matrix, #row, #matrix], source = "
-      "#shuttle.source_ref<0, 0, 16, 0>} : (tensor<2x4xf32>, "
-      "tensor<2xf32>) -> tensor<2x4xf32>\n"
+      "#shuttle.source_ref<0, 0, 16, 0>} : (tensor<4x4xf32>, "
+      "tensor<4xf32>) -> tensor<4x4xf32>\n"
       "      %independent = \"shuttle.fold\"(%shared_fold_input, "
       "%independent_init)");
-  sharedFoldSource = replaceAllText(
-      sharedFoldSource,
-      "reduction_dimensions = array<i64: 0>, source = "
-      "#shuttle.source_ref<0, 0, 16, 0>} : (tensor<2x4xf32>, "
-      "tensor<f32>) -> tensor<4xf32>\n      \"shuttle.yield\"",
-      "reduction_dimensions = array<i64: 0>, source = "
-      "#shuttle.source_ref<0, 0, 17, 0>} : (tensor<2x4xf32>, "
-      "tensor<f32>) -> tensor<4xf32>\n      \"shuttle.yield\"");
-  sharedFoldSource = replaceAllText(
-      sharedFoldSource,
+  shared =
+      replaceAllText(shared,
+                     "reduction_dimensions = array<i64: 1>, source = "
+                     "#shuttle.source_ref<0, 0, 16, 0>} : (tensor<4x4xf32>, "
+                     "tensor<f32>) -> tensor<4xf32>\n      \"shuttle.yield\"",
+                     "reduction_dimensions = array<i64: 1>, source = "
+                     "#shuttle.source_ref<0, 0, 17, 0>} : (tensor<4x4xf32>, "
+                     "tensor<f32>) -> tensor<4xf32>\n      \"shuttle.yield\"");
+  shared = replaceAllText(
+      shared,
       "#shuttle.source_ref<0, 0, 15, 0>, #shuttle.source_ref<0, 0, 16, "
       "0>]}",
       "#shuttle.source_ref<0, 0, 15, 0>, #shuttle.source_ref<0, 0, 16, "
       "0>, #shuttle.source_ref<0, 0, 17, 0>]}");
-  std::unique_ptr<BuiltModule> sharedFold = buildAlgebra(
-      sharedFoldSource, mlir::shuttle::NumericalPolicy::SourceOrdered, false);
-  ASSERT_TRUE(sharedFold);
-  EXPECT_FALSE(hasGenericSharedStatPartition(*sharedFold->module, 2, 4));
+  std::unique_ptr<BuiltModule> rejected = buildAlgebra(
+      shared, mlir::shuttle::NumericalPolicy::SourceOrdered, false);
+  ASSERT_TRUE(rejected);
+  EXPECT_FALSE(hasSquareSharedStatFoldControl(*rejected->module, true));
 }
 
 TEST(Abi22MapFusionContract,
@@ -3932,16 +4093,82 @@ TEST(Abi22MapFusionContract,
     int64_t rows;
     int64_t features;
     bool composed;
+    int64_t rowOutputCount;
+    std::array<const char *, 6> pointerDigests;
+    std::array<const char *, 6> valueDigests;
+    std::array<const char *, 6> inputParameters;
   };
+  // These digests seal register-insensitive reaching-definition trees. They
+  // retain predicates, immediates, input parameters, and address byte scales.
   constexpr std::array<Fixture, 4> fixtures = {{
-      {"jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-backward.mlir", 7, 13,
-       false},
-      {"jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-composed.mlir", 7, 13,
-       true},
-      {"jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-backward.mlir", 2048,
-       4096, false},
-      {"jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-composed.mlir", 2048,
-       4096, true},
+      {"jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-backward.mlir",
+       7,
+       13,
+       false,
+       3,
+       {"bbddc0570461712a03c47ad9005bdffe0b6a4cb2bb9b3867906f5052a44e42da",
+        "a7f6c3dedf98acd3098ee27ae350b186062d8641f1743190da0c17c7232ca88d",
+        "b0796817f5f958da69d54927a5c2b0c3e081591ce6d1645b604f389bb4ea7a95",
+        "a9fcb27d2c0ce92b9f2f4855aae48676e5915b8cbd96471c7ae482cf5009f398",
+        "2264b4a85cf88e0ca855ec47de72346a2154c40441160baa4110620d75f5ddbd", ""},
+       {"7b71842ccee7fdfe2106329aadddf9a809b88dd7a49fe4a30335a5e359c87db5",
+        "e7cc4974afdecfe0069fc7d099ab9da3d6606aca3e468929d8d29b6afc5f4a7c",
+        "948ec3995104fbff504ef2af2bdef2d5c5b84d72c26c36a1b4f321a8763ffcbd",
+        "4ea4548e103b339bd5d55854a32d9ed632ce44a3fac32d39385cfafd84677835",
+        "ba762e537b95bdc44ff9ea14e83475661a6ade0179251a656a85b8dd7204a783", ""},
+       {"p0", "p0", "p0,p1,p2", "p1", "p0,p1,p2,p3", ""}},
+      {"jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-composed.mlir",
+       7,
+       13,
+       true,
+       4,
+       {"a7f6c3dedf98acd3098ee27ae350b186062d8641f1743190da0c17c7232ca88d",
+        "5baade21272a35250fab8e64012a6f3bf4d617a77f14eca81eb0d11a2e348f69",
+        "ce54909013fa6797c7617c231162a7dd902bd83b69e77bac9c9314f3514fb2ba",
+        "a7df71b6574756f25888934eb405878e32de265579d767533eaff963a74ef067",
+        "a9fcb27d2c0ce92b9f2f4855aae48676e5915b8cbd96471c7ae482cf5009f398",
+        "2264b4a85cf88e0ca855ec47de72346a2154c40441160baa4110620d75f5ddbd"},
+       {"7b71842ccee7fdfe2106329aadddf9a809b88dd7a49fe4a30335a5e359c87db5",
+        "e7cc4974afdecfe0069fc7d099ab9da3d6606aca3e468929d8d29b6afc5f4a7c",
+        "5a37df67cbfb820e044f7e08cbcc68de1b9008d695a5f07a74ac49018bc6743c",
+        "e982e5187665143b7060ee99f8df8c6ecba60aa816514bccd8a0e631c4489dca",
+        "4ea4548e103b339bd5d55854a32d9ed632ce44a3fac32d39385cfafd84677835",
+        "ba762e537b95bdc44ff9ea14e83475661a6ade0179251a656a85b8dd7204a783"},
+       {"p0", "p0", "p0,p1,p2", "p0,p1,p3", "p1", "p0,p1,p2,p3"}},
+      {"jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-backward.mlir",
+       2048,
+       4096,
+       false,
+       3,
+       {"bbddc0570461712a03c47ad9005bdffe0b6a4cb2bb9b3867906f5052a44e42da",
+        "a7f6c3dedf98acd3098ee27ae350b186062d8641f1743190da0c17c7232ca88d",
+        "f4065574218a062887a692c9bdbaae945c5d1818424c540d45247706cc367f49",
+        "e3434569ffbd6288dc2cae99d2f38122baddb12589013307fe6f297aceea8fdd",
+        "9a7596dd60d79efd5338d8a79ff4b08a6c7f71d39b8b7a12139c2ad171d4ef60", ""},
+       {"1d92bac043f65dcc9bd0ce68b749e3f12c4b55227d0bfa9d637d0f449ec3d977",
+        "3f4d6542eb0f8415523428c80e91eddb7ea852cb69a0b041aa298ac70e54c985",
+        "f287dceb40d1523dd06b1bce7d4d7502c62ca0c7782dd6b1ca4688704d611de8",
+        "4764abf32a66ed2208781e798b792197df47b5ba9af9d7d759ad9af5f3dac018",
+        "cd2b45f73b977d0258420899923c80e038a52a1792f4a076a40367529b6711ec", ""},
+       {"p0", "p0", "p0,p1,p2", "p1", "p0,p1,p2,p3", ""}},
+      {"jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-composed.mlir",
+       2048,
+       4096,
+       true,
+       4,
+       {"a7f6c3dedf98acd3098ee27ae350b186062d8641f1743190da0c17c7232ca88d",
+        "5baade21272a35250fab8e64012a6f3bf4d617a77f14eca81eb0d11a2e348f69",
+        "c709eb3af0a93256d5b76b94925c1e801582b4a26cbe0a9d29139c16685b23db",
+        "a4dfd0f1e306a074f90fd811c30ebbafff10629118f48f3d606aaf96838ec0fa",
+        "e3434569ffbd6288dc2cae99d2f38122baddb12589013307fe6f297aceea8fdd",
+        "9a7596dd60d79efd5338d8a79ff4b08a6c7f71d39b8b7a12139c2ad171d4ef60"},
+       {"1d92bac043f65dcc9bd0ce68b749e3f12c4b55227d0bfa9d637d0f449ec3d977",
+        "3f4d6542eb0f8415523428c80e91eddb7ea852cb69a0b041aa298ac70e54c985",
+        "f8e450703ba2b413689d264a5540531cb6becaf61ad710f1c8b2f37a151a5c7e",
+        "b43694d152c34ab031548b757d6c6a48cb72390c768ab10b0bfbb1f493f9003d",
+        "4764abf32a66ed2208781e798b792197df47b5ba9af9d7d759ad9af5f3dac018",
+        "cd2b45f73b977d0258420899923c80e038a52a1792f4a076a40367529b6711ec"},
+       {"p0", "p0", "p0,p1,p2", "p0,p1,p3", "p1", "p0,p1,p2,p3"}},
   }};
   for (const Fixture &fixture : fixtures) {
     SCOPED_TRACE(fixture.filename);
@@ -4016,25 +4243,41 @@ TEST(Abi22MapFusionContract,
       EXPECT_EQ(launches[1].outputSlots,
                 std::vector<int64_t>(expectedFeatureOutputs.begin(),
                                      expectedFeatureOutputs.end()));
-      for (const mlir::shuttle::GpuLaunch &launch : launches) {
-        llvm::SmallVector<bool> outputBf16;
-        for (int64_t slot : launch.outputSlots) {
+      for (auto [launchOrdinal, launch] : llvm::enumerate(launches)) {
+        llvm::SmallVector<ExpectedPtxOutput> expectedPtxOutputs;
+        const int64_t outputOffset =
+            launchOrdinal == 0 ? 0 : fixture.rowOutputCount;
+        for (auto [outputOrdinal, slot] : llvm::enumerate(launch.outputSlots)) {
           auto type = mlir::cast<mlir::RankedTensorType>(
               (*executable)->slots()[slot].tensorType);
-          outputBf16.push_back(type.getElementType().isBF16());
+          const int64_t expectedOrdinal = outputOffset + outputOrdinal;
+          expectedPtxOutputs.push_back(
+              {type.getElementType().isBF16(),
+               fixture.pointerDigests[expectedOrdinal],
+               fixture.valueDigests[expectedOrdinal],
+               fixture.inputParameters[expectedOrdinal]});
         }
         llvm::StringRef ptx(
-            reinterpret_cast<const char *>(
-                (*executable)->codeBytes().data() + launch.codeOffset),
+            reinterpret_cast<const char *>((*executable)->codeBytes().data() +
+                                           launch.codeOffset),
             launch.codeLength);
         ASSERT_TRUE(hasExactMultiOutputStoreDataflow(
-            ptx, launch.inputSlots.size(), outputBf16));
+            ptx, launch.inputSlots.size(), expectedPtxOutputs));
         EXPECT_FALSE(hasExactMultiOutputStoreDataflow(
             misrouteFirstPtxOutput(ptx, launch.inputSlots.size()),
-            launch.inputSlots.size(), outputBf16));
+            launch.inputSlots.size(), expectedPtxOutputs));
         EXPECT_FALSE(hasExactMultiOutputStoreDataflow(
             zeroFirstPtxOutputValue(ptx), launch.inputSlots.size(),
-            outputBf16));
+            expectedPtxOutputs));
+        EXPECT_FALSE(hasExactMultiOutputStoreDataflow(
+            swapFirstTwoPtxOutputValues(ptx), launch.inputSlots.size(),
+            expectedPtxOutputs));
+        EXPECT_FALSE(hasExactMultiOutputStoreDataflow(
+            rerouteFirstPtxInputLeaf(ptx), launch.inputSlots.size(),
+            expectedPtxOutputs));
+        EXPECT_FALSE(hasExactMultiOutputStoreDataflow(
+            changeFirstPtxOutputByteScale(ptx), launch.inputSlots.size(),
+            expectedPtxOutputs));
       }
       int64_t temporarySlots = 0;
       int64_t temporaryBytes = 0;
@@ -4225,10 +4468,10 @@ TEST(Abi22MapFusionContract,
       auto plan = *built->module->getOps<mlir::shuttle::MaterializationPlanOp>()
                        .begin();
       EXPECT_EQ(plan.getSchemaVersion(), 2);
-      auto tasks = llvm::to_vector(
-          plan.getBody()
-              .front()
-              .getOps<mlir::shuttle::MaterializationTaskOp>());
+      auto tasks =
+          llvm::to_vector(plan.getBody()
+                              .front()
+                              .getOps<mlir::shuttle::MaterializationTaskOp>());
       auto buffers = llvm::to_vector(
           plan.getBody()
               .front()
