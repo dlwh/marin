@@ -16,16 +16,16 @@ author: dlwh
 
 ## Current TL;DR
 
-- Two deliberately bounded H100 milestones are now complete. The ordinary-JAX
+- Three deliberately bounded H100 milestones are now complete. The ordinary-JAX
   plugin path is replicated for generic Map islands while unsupported
-  `stablehlo.abs` remains XLA-owned. Separately, standalone ABI22 Fold and
-  norm-to-Contract bundles are bit-exact against an independent host oracle
-  and have exploratory same-GPU timing. These results prove the integration
-  seam and useful backend generation, respectively; they do not accept the
-  RMSNorm target. Ordinary-JAX RMSNorm plugin ownership, a matched strong
-  CUDA-event oracle, representative shapes, SM100/B200, and the remaining
-  target matrix are open. Evidence: entries `TLTC-MLIR-037` and
-  `TLTC-ABI22-001`. The
+  `stablehlo.abs` remains XLA-owned. Standalone ABI22 Fold and norm-to-Contract
+  bundles are bit-exact against an independent host oracle and have exploratory
+  same-GPU timing. The ordinary-JAX RMSNorm plugin also passes the declared
+  forward, backward, and composed rank-3/rank-5 H100 matrix against its
+  independent numerical contract. Representative RMSNorm shapes, a matched
+  strong CUDA-event oracle, performance, and the remaining target matrix are
+  open. Evidence: entries `TLTC-MLIR-037`, `TLTC-ABI22-001`, and
+  `TLTC-ABI22-002`. The
   [target/oracle matrix](../projects/tile_lifetime_compiler/oracle_target_matrix_20260821.md)
   records the matched semantic and performance controls for the remaining
   targets.
@@ -41,27 +41,19 @@ author: dlwh
   candidate is generic Contract-plus-nested-Fold composition, not further
   narrowing tuning. Generic RMS reverse is correct on H100 but remains about
   `1.48x` XLA, so Fold decomposition remains a performance task. H100, B200,
-  and GB200 evidence remain separate. The available secondary Blackwell cluster
-  provides B200 portability evidence, not GB200 acceptance evidence.
+  and GB200 evidence remain separate. Generic SM100 portability on GB200 is
+  preserved under `TLTC-ABI23-001`; representative and performance acceptance
+  remain open.
 
 ## Hypothesis Queue
 
 ### Active
 
-- `TLTC-MLIR-038`: ordinary-JAX RMSNorm forward, backward, and composed
-  regions can reuse the generic ABI22 Fold-region and Contract machinery while
-  unsupported operations remain XLA-owned. Evidence: `TLTC-MLIR-037` and
-  `TLTC-ABI22-001`. Next test: close the small H100 fixture through `jax.jit`,
-  then run the representative `[2048,4096]` boundary.
 - `TLTC-ORACLE-001`: a versioned Transformer Engine runner can cover epsilon
   `1e-6`, RMSNorm forward and backward, and both norm-to-Contract boundaries
   with the same CUDA-event boundary as Shuttle. Evidence: `TLTC-ABI22-001`.
   Next test: extend the TE 2.17 adapter or pin a newer compatible oracle before
   another timing run.
-- `TLTC-SM100-001`: the generic ABI22 lowering can acquire explicit SM100
-  target, toolchain, and module identities without workload-specific dispatch.
-  Evidence: `TLTC-ABI22-001` is SM90-only. Next test: compile and execute the
-  smallest correctness matrix on one batch-priority B200.
 - `TLTC-PERF-001`: direct generic-kernel evaluation can expose SASS, registers,
   spills, occupancy, compile cost, persistent-cache cost, and structurally
   generic shape sweeps in addition to PTX and launch resources. Evidence:
@@ -85,6 +77,13 @@ author: dlwh
 
 ### Promoted
 
+- `TLTC-MLIR-038`: the ordinary-JAX RMSNorm plugin passes the declared
+  forward, backward, and composed rank-3/rank-5 H100 matrix in SOURCE_ORDERED
+  and FAST with exact observer attribution, repeat determinism, and independent
+  per-role numerical acceptance. Evidence: `TLTC-ABI22-002`.
+- `TLTC-SM100-001`: the generic registered ordinary-JAX path emits and executes
+  schema 4 PTX 8.7 for `sm_100` on one GB200 without workload-specific
+  dispatch. Evidence: `TLTC-ABI23-001`.
 - `TLTC-MLIR-037`: the Map-only ordinary-JAX H100 plugin prototype passes
   three independent batch jobs with exact outputs, transform attribution, and
   fresh-process persistent-cache reuse.
