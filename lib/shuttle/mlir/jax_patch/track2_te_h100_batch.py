@@ -26,6 +26,7 @@ from abi22_te_rmsnorm_oracle_v2 import (
     INPUT_DIGESTS,
     JAX_REVISION,
     NUMERICAL_POLICY,
+    NUMERICAL_POLICY_V3,
     OUTPUT_ROLES,
     POLICY_V3_ACCEPTANCE_INPUT_DIGESTS,
     POLICY_V3_ACCEPTANCE_PATTERN,
@@ -63,6 +64,7 @@ from track1_map_h100_prototype import BASE_IMAGE, canonical_json
 SOURCE_MANIFEST_SCHEMA = "shuttle_track2_te_h100_source_manifest_v1"
 SOURCE_MANIFEST_NAME = ".shuttle-track2-te-source-manifest.json"
 RESULT_SCHEMA = "shuttle_track2_te_h100_batch_result_v1"
+RESULT_SCHEMA_V3 = "shuttle_track2_te_h100_batch_result_v3"
 TE_SOURCE_URL = "https://github.com/NVIDIA/TransformerEngine.git"
 TE_SOURCE_COMMIT = "2e559f062497bef768dfbe9d7e45548fadeca80a"
 TE_SOURCE_TREE = "c722c6cd46cc59a0dbabadd846af3f45b15c1a95"
@@ -292,6 +294,14 @@ def batch_plan(*, workspace: Path, runner_repository: Path) -> dict[str, Any]:
         "shuttle": {"status": "pending", "blocker": SHUTTLE_BLOCKER},
         "workspace": str(workspace),
     }
+
+
+def batch_plan_v3(*, workspace: Path, runner_repository: Path) -> dict[str, Any]:
+    """Return the exact v3 external phase plan without executing it."""
+    plan = batch_plan(workspace=workspace, runner_repository=runner_repository)
+    plan["schema"] = "shuttle_track2_te_h100_batch_plan_v3"
+    plan["qualification"] = {**NUMERICAL_POLICY_V3, "run_count": 48}
+    return plan
 
 
 def _run(
@@ -1014,6 +1024,50 @@ def execute_batch(
     return result
 
 
+def execute_batch_v3(
+    *,
+    workspace: Path,
+    runner_repository: Path,
+    manifest_path: Path,
+    observed_base_image: str,
+) -> dict[str, Any]:
+    """Hydrate exact dependencies and execute the versioned v3 policy."""
+    if observed_base_image != BASE_IMAGE:
+        raise RuntimeError("observed base image differs from the sealed batch request")
+    if workspace.exists() or workspace.is_symlink():
+        raise RuntimeError("batch workspace must be fresh")
+    if platform.system() != "Linux":
+        raise RuntimeError("Track 2 TE H100 batch requires Linux")
+    source = validate_source_manifest(runner_repository, manifest_path)
+    workspace.mkdir(mode=0o700)
+    paths = BatchPaths.under(workspace)
+    paths.logs.mkdir()
+    paths.reports.mkdir()
+    paths.raw.mkdir()
+    plan = batch_plan_v3(workspace=workspace, runner_repository=runner_repository)
+    hydration = _execute_hydration(paths, plan)
+    evidence = execute_oracle_v3(paths=paths, device=hydration["device"], runner_repository=runner_repository)
+    logs = {
+        path.name: {"sha256": _file_sha256(path), "size": path.stat().st_size} for path in sorted(paths.logs.iterdir())
+    }
+    result = {
+        "base_image": BASE_IMAGE,
+        "device": {**hydration["device"], "driver": hydration["driver"]},
+        "evidence": evidence,
+        "schema": RESULT_SCHEMA_V3,
+        "source": source,
+        "tools": {
+            "cuda_runtime_headers": hydration["cuda_runtime_headers"],
+            "logs": logs,
+            "runner_binary_sha256": _file_sha256(paths.te_runner),
+            "runtime_libraries": hydration["runtime_libraries"],
+            "transformer_engine": hydration["transformer_engine"],
+        },
+    }
+    paths.result.write_bytes(canonical_json(result))
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--workspace", required=True, type=Path)
@@ -1023,12 +1077,20 @@ def main(argv: list[str] | None = None) -> int:
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument("--plan", action="store_true")
     action.add_argument("--execute", action="store_true")
+    action.add_argument("--execute-v3", action="store_true")
     arguments = parser.parse_args(argv)
     if arguments.plan:
         validate_source_manifest(arguments.runner_repository, arguments.source_manifest)
         result = batch_plan(workspace=arguments.workspace, runner_repository=arguments.runner_repository)
-    else:
+    elif arguments.execute:
         result = execute_batch(
+            workspace=arguments.workspace,
+            runner_repository=arguments.runner_repository,
+            manifest_path=arguments.source_manifest,
+            observed_base_image=arguments.base_image,
+        )
+    else:
+        result = execute_batch_v3(
             workspace=arguments.workspace,
             runner_repository=arguments.runner_repository,
             manifest_path=arguments.source_manifest,
