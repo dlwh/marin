@@ -153,6 +153,8 @@ def test_late_xla_patch_failure_modifies_neither_exact_source_capsule(
     xla_repository = _patch_source_repository(tmp_path, "xla_9b6359")
     xla_client = xla_repository / "xla/pjrt/c_api_client/pjrt_c_api_client.cc"
     xla_client.write_text(xla_client.read_text().replace("using ProgramVariant =", "using ChangedProgramVariant ="))
+    _run_git(xla_repository, "add", str(xla_client.relative_to(xla_repository)))
+    _run_git(xla_repository, "commit", "-qm", "mutate the final XLA patch context")
     jax_before = _tracked_source_bytes(jax_repository)
     xla_before = _tracked_source_bytes(xla_repository)
     inputs = replace(_inputs(tmp_path), jax_repository=jax_repository, xla_repository=xla_repository)

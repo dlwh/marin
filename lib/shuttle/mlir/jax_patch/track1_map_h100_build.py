@@ -8,6 +8,7 @@ import os
 import platform
 import stat
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,7 +25,7 @@ JAX_PATCH_SHA256 = (
     "1e8b1400ee05bf8c8037277046113e1f1b1fae5ef56077899b7e853855e3424e",
     "c4d5bc4aaa4b72ee7e2ecb44d28719be99da8defcf01ebd107308df41cb71942",
     "a98f04ac7afc6e5d8df63f2679cf89bc7cd0b29509a393da86f352cb6ba2ec9f",
-    "8802afac71dc689433e06385c373b9ab97292db483448565382250e592d1665f",
+    "d00baeccc0f01af06288b60f4008dc83287afd9fd026b0fa4c316285247cc801",
 )
 XLA_PATCH_NAMES = (
     "0001-add-stablehlo-module-transform-hook.patch",
@@ -182,6 +183,17 @@ def xla_patch_sha256(marin_repository: Path) -> tuple[str, ...]:
     return tuple(hashlib.sha256((patch_root / name).read_bytes()).hexdigest() for name in XLA_PATCH_NAMES)
 
 
+def _require_ordered_patch_stack_applies(repository: Path, patches: list[Path]) -> None:
+    with tempfile.TemporaryDirectory(prefix="shuttle-patch-index-") as directory:
+        environment = os.environ.copy()
+        environment["GIT_INDEX_FILE"] = str(Path(directory) / "index")
+        subprocess.run(["git", "read-tree", "HEAD"], cwd=repository, env=environment, check=True)
+        for patch in patches:
+            subprocess.run(["git", "apply", "--cached", "--check", patch], cwd=repository, env=environment, check=True)
+            subprocess.run(["git", "apply", "--cached", patch], cwd=repository, env=environment, check=True)
+        subprocess.run(["git", "diff", "--cached", "--check"], cwd=repository, env=environment, check=True)
+
+
 def apply_source_patches(inputs: BuildInputs) -> None:
     """Check both exact patch sets before modifying either clean checkout."""
     _require_live_source_snapshot(inputs)
@@ -191,14 +203,16 @@ def apply_source_patches(inputs: BuildInputs) -> None:
         raise RuntimeError("offline XLA patches changed before application")
     jax_patches = [inputs.marin_repository / "lib/shuttle/mlir/jax_patch" / name for name in PATCH_NAMES]
     xla_patches = [inputs.marin_repository / "lib/shuttle/mlir/xla_patch" / name for name in XLA_PATCH_NAMES]
-    commands = (
-        (inputs.jax_repository, ["git", "apply", "--check", *map(str, jax_patches)]),
-        (inputs.xla_repository, ["git", "apply", "--check", *map(str, xla_patches)]),
+    stacks = (
+        (inputs.jax_repository, jax_patches),
+        (inputs.xla_repository, xla_patches),
     )
-    for repository, command in commands:
-        subprocess.run(command, cwd=repository, check=True)
-    for repository, command in commands:
-        subprocess.run([*command[:2], *command[3:]], cwd=repository, check=True)
+    for repository, patches in stacks:
+        _require_ordered_patch_stack_applies(repository, patches)
+    _require_live_source_snapshot(inputs)
+    for repository, patches in stacks:
+        for patch in patches:
+            subprocess.run(["git", "apply", patch], cwd=repository, check=True)
 
 
 def _git(repository: Path, *arguments: str) -> str:

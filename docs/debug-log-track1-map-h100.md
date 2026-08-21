@@ -86,6 +86,39 @@ Disabled compilation returns without materializing a `debug_options` field, so
 ordinary XLA request bytes remain unchanged. The XLA regression serializes
 disabled options before and after preprocessing and requires byte equality.
 
+## r5 patch-stack failure
+
+r5 stopped before build or GPU execution after 16.44 seconds. The hydrated JAX
+checkout matched commit `619764c15117fbefc4ba13ab941871cb514c23f6`, but the
+ordered patch gate reported:
+
+```text
+error: patch failed: jaxlib/jax.cc:135
+error: jaxlib/jax.cc: patch does not apply
+```
+
+The fourth JAX patch had been checked against a synthetic post-observer file.
+Its module-initialization hunk incorrectly included `NB_MODULE` as adjacent
+context even though the exact pinned source has intervening initialization.
+The previous test mocked subprocess dispatch and therefore verified command
+shape without applying the complete stack to pinned source bytes.
+
+## r6 patch-stack repair
+
+Checked source capsules now contain every exact JAX and XLA file touched by the
+ordered patch rosters. Their manifests bind the upstream commit and tree plus
+each Git blob identity, SHA-256, size, and path. The public build boundary test
+materializes both capsules and applies both complete stacks; this reproduces
+the r5 failure before the repair.
+
+Patch validation now uses an isolated temporary Git index. Each patch is
+checked and applied to that index in roster order, allowing later patches to
+depend on earlier changes without touching either source checkout. Both stacks
+must validate before either live checkout is modified. A late fourth-XLA-patch
+mutation proves that neither live checkout changes on validation failure. The
+fourth JAX patch now anchors its registration call to the exact post-observer
+function context.
+
 ## Future work
 
-- [ ] Record final wheel/DSO evidence from r5 or a later authorized H100 run.
+- [ ] Record final wheel/DSO evidence from r6 or a later authorized H100 run.
