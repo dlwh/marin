@@ -202,6 +202,7 @@ struct PtxDataflow {
   struct Definition {
     std::string opcode;
     std::vector<std::string> operands;
+    std::string instruction;
     bool predicated = false;
   };
   std::map<std::string, Definition> definitions;
@@ -217,6 +218,8 @@ const PtxDataflow::Definition *ptxDefinition(const PtxDataflow &flow,
                                              llvm::StringRef value);
 bool ptxDependsOn(const PtxDataflow &flow, llvm::StringRef value,
                   llvm::StringRef dependency);
+std::string ptxSemanticFingerprint(const PtxDataflow &flow,
+                                   llvm::StringRef value);
 
 std::vector<std::string> ptxTokens(llvm::StringRef text) {
   std::vector<std::string> tokens;
@@ -502,7 +505,12 @@ bool hasDependentRowFoldPhaseDataflow(llvm::StringRef ptx,
     return false;
   llvm::StringRef rowMajorValue = rowMajorFound->second;
   const PtxDataflow::Definition *rowMajor = ptxDefinition(flow, rowMajorValue);
+  const std::string expectedRowMajor =
+      (llvm::Twine("mad.lo.u64 %rd0, %rd1, ") + llvm::Twine(reductionExtent) +
+       ", %rd0;")
+          .str();
   if (!rowMajor || rowMajor->opcode != "mad.lo.u64" ||
+      rowMajor->instruction != expectedRowMajor ||
       rowMajor->operands.size() != 2 ||
       !ptxDependsOn(flow, rowMajor->operands[0], "%r1") ||
       !ptxDependsOn(flow, rowMajor->operands[1], "%r0"))
@@ -545,6 +553,9 @@ bool hasDependentRowFoldPhaseDataflow(llvm::StringRef ptx,
   };
   if (!isCenteredInput(leaf->operands[0]) ||
       !isCenteredInput(leaf->operands[1]))
+    return false;
+  if (ptxSemanticFingerprint(flow, leaf->operands[0]) !=
+      ptxSemanticFingerprint(flow, leaf->operands[1]))
     return false;
 
   llvm::StringRef accumulator = storedValue.take_front(storedValue.find('@'));
@@ -614,6 +625,7 @@ PtxDataflow ptxDataflow(llvm::StringRef ptx) {
                                      llvm::Twine(generations[tokens.front()]++))
                                         .str();
     result.definitions[destination] = {opcode.str(), std::move(dependencies),
+                                       instruction.str(),
                                        line.starts_with("@")};
     currentRegister[tokens.front()] = destination;
   }
@@ -650,6 +662,27 @@ bool ptxDependsOn(const PtxDataflow &flow, llvm::StringRef value,
                   llvm::StringRef dependency) {
   auto closure = ptxDependencyClosure(flow, value);
   return closure.count(dependency.str()) != 0;
+}
+
+std::string ptxSemanticFingerprint(const PtxDataflow &flow,
+                                   llvm::StringRef value) {
+  std::set<std::string> active;
+  auto fingerprint = [&](auto &self, llvm::StringRef current) -> std::string {
+    const PtxDataflow::Definition *definition = ptxDefinition(flow, current);
+    if (!definition)
+      return current.str();
+    if (!active.insert(current.str()).second)
+      return "$cycle";
+    std::string result = definition->opcode + "(";
+    for (llvm::StringRef operand : definition->operands) {
+      result += self(self, operand);
+      result += ",";
+    }
+    active.erase(current.str());
+    result += ")";
+    return result;
+  };
+  return fingerprint(fingerprint, value);
 }
 
 bool containsRmsNormReciprocalSubgraph(const PtxDataflow &flow,
@@ -1631,6 +1664,16 @@ TEST(Abi22MapFusionContract, DependentRowFoldsShareOneGenericFoldRegion) {
   wrongCoordinate.insert(coordinateEnd + 1, "  mov.u64 %rd0, 0;\n");
   EXPECT_FALSE(hasDependentRowFoldPhaseDataflow(wrongCoordinate, 4096, 16));
 
+  std::string wrongStride = ptx.str();
+  phase = wrongStride.find("$fold_region_phase_1_load:");
+  coordinate = wrongStride.find("  mad.lo.u64 %rd0, %rd1, 4096, %rd0;", phase);
+  ASSERT_NE(coordinate, std::string::npos);
+  coordinateEnd = wrongStride.find('\n', coordinate);
+  ASSERT_NE(coordinateEnd, std::string::npos);
+  wrongStride.insert(coordinateEnd + 1,
+                     "  mad.lo.u64 %rd0, %rd1, 8192, %rd0;\n");
+  EXPECT_FALSE(hasDependentRowFoldPhaseDataflow(wrongStride, 4096, 16));
+
   std::string zeroInnerOperand = ptx.str();
   phase = zeroInnerOperand.find("$fold_region_phase_1_load:");
   size_t increment = zeroInnerOperand.find("  add.u32 %r4, %r4, 1;", phase);
@@ -1649,6 +1692,38 @@ TEST(Abi22MapFusionContract, DependentRowFoldsShareOneGenericFoldRegion) {
   zeroInnerOperand.replace(innerOperand, multiplyTokens[1].size(),
                            "0f00000000");
   EXPECT_FALSE(hasDependentRowFoldPhaseDataflow(zeroInnerOperand, 4096, 16));
+
+  std::string distinctCenteredValue = ptx.str();
+  phase = distinctCenteredValue.find("$fold_region_phase_1_load:");
+  increment = distinctCenteredValue.find("  add.u32 %r4, %r4, 1;", phase);
+  combine = distinctCenteredValue.rfind("  add.rn.f32 ", increment);
+  multiply = distinctCenteredValue.rfind("  mul.rn.f32 ", combine);
+  multiplyEnd = distinctCenteredValue.find('\n', multiply);
+  multiplyTokens = ptxTokens(
+      llvm::StringRef(distinctCenteredValue).slice(multiply, multiplyEnd));
+  ASSERT_EQ(multiplyTokens.size(), 3u);
+  const std::string secondCenteredPrefix =
+      (llvm::Twine("  sub.rn.f32 ") + multiplyTokens[2] + ",").str();
+  size_t secondCentered =
+      distinctCenteredValue.rfind(secondCenteredPrefix, multiply);
+  ASSERT_NE(secondCentered, std::string::npos);
+  size_t secondCenteredEnd = distinctCenteredValue.find('\n', secondCentered);
+  std::vector<std::string> centeredTokens =
+      ptxTokens(llvm::StringRef(distinctCenteredValue)
+                    .slice(secondCentered, secondCenteredEnd));
+  ASSERT_EQ(centeredTokens.size(), 3u);
+  const std::string centeredAdjustment = (llvm::Twine("  add.rn.f32 %f127, ") +
+                                          centeredTokens[2] + ", 0f3F800000;\n")
+                                             .str();
+  distinctCenteredValue.insert(secondCentered, centeredAdjustment);
+  secondCentered += centeredAdjustment.size();
+  secondCenteredEnd += centeredAdjustment.size();
+  size_t meanOperand =
+      distinctCenteredValue.find(centeredTokens[2], secondCentered);
+  ASSERT_LT(meanOperand, secondCenteredEnd);
+  distinctCenteredValue.replace(meanOperand, centeredTokens[2].size(), "%f127");
+  EXPECT_FALSE(
+      hasDependentRowFoldPhaseDataflow(distinctCenteredValue, 4096, 16));
 }
 
 TEST(Abi22MapFusionContract,
