@@ -7199,7 +7199,7 @@ FailureOr<std::string> emitFoldRegionPtx(
     int64_t right = ptx.nextF32();
     int64_t sum = ptx.nextF32();
     ptx.stream << "  setp.ge.u32 %p2, %r0, " << pairs
-               << ";\n  @%p2 bra $fold_region_skip_pairs" << active
+               << ";\n  @%p2 bra $fold_region_skip_pair_read" << active
                << ";\n  mul.lo.u32 %r5, %r0, 2;\n"
                   "  cvt.u64.u32 %rd4, %r5;\n"
                   "  mul.lo.u64 %rd4, %rd4, 4;\n"
@@ -7207,21 +7207,31 @@ FailureOr<std::string> emitFoldRegionPtx(
                   "  ld.shared.f32 %f"
                << left << ", [%rd4];\n  ld.shared.f32 %f" << right
                << ", [%rd4+4];\n  add.rn.f32 %f" << sum << ", %f" << left
-               << ", %f" << right
+               << ", %f" << right << ";\n$fold_region_skip_pair_read" << active
+               << ":\n";
+    std::optional<int64_t> carry;
+    if (active % 2 != 0) {
+      carry = ptx.nextF32();
+      ptx.stream << "  setp.ne.u32 %p3, %r0, " << pairs
+                 << ";\n  @%p3 bra $fold_region_skip_carry_read" << active
+                 << ";\n  ld.shared.f32 %f" << *carry << ", [%rd3+"
+                 << (active - 1) * static_cast<int64_t>(sizeof(float))
+                 << "];\n$fold_region_skip_carry_read" << active << ":\n";
+    }
+    ptx.stream << "  bar.sync 0;\n"
+                  "  @%p2 bra $fold_region_skip_pair_write"
+               << active
                << ";\n  cvt.u64.u32 %rd5, %r0;\n"
                   "  mul.lo.u64 %rd5, %rd5, 4;\n"
                   "  add.u64 %rd5, %rd3, %rd5;\n"
                   "  st.shared.f32 [%rd5], %f"
-               << sum << ";\n$fold_region_skip_pairs" << active << ":\n";
-    if (active % 2 != 0) {
-      int64_t carry = ptx.nextF32();
-      ptx.stream << "  setp.ne.u32 %p3, %r0, " << pairs
-                 << ";\n  @%p3 bra $fold_region_skip_carry" << active
-                 << ";\n  ld.shared.f32 %f" << carry << ", [%rd3+"
-                 << (active - 1) * static_cast<int64_t>(sizeof(float))
-                 << "];\n  st.shared.f32 [%rd3+"
+               << sum << ";\n$fold_region_skip_pair_write" << active << ":\n";
+    if (carry) {
+      ptx.stream << "  @%p3 bra $fold_region_skip_carry_write" << active
+                 << ";\n  st.shared.f32 [%rd3+"
                  << pairs * static_cast<int64_t>(sizeof(float)) << "], %f"
-                 << carry << ";\n$fold_region_skip_carry" << active << ":\n";
+                 << *carry << ";\n$fold_region_skip_carry_write" << active
+                 << ":\n";
     }
     ptx.stream << "  bar.sync 0;\n";
   }
