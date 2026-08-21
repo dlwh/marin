@@ -228,6 +228,94 @@ std::vector<std::string> ptxTokens(llvm::StringRef text) {
   return tokens;
 }
 
+bool hasDisjointContiguousFoldLoop(llvm::StringRef ptx,
+                                   int64_t reductionExtent,
+                                   int64_t serialTiles) {
+  llvm::SmallVector<llvm::StringRef> lines;
+  ptx.split(lines, '\n');
+  for (llvm::StringRef &line : lines)
+    line = line.trim();
+  auto defines = [](llvm::StringRef line, llvm::StringRef reg) {
+    if (line.empty() || line.starts_with("@") || line.starts_with("st.") ||
+        line.starts_with("bra ") || line.starts_with("bar.") ||
+        line == "ret;" || line.ends_with(":"))
+      return false;
+    std::vector<std::string> tokens = ptxTokens(line);
+    return !tokens.empty() && tokens.front() == reg;
+  };
+  for (size_t laneLine = 0; laneLine < lines.size(); ++laneLine) {
+    std::vector<std::string> laneTokens = ptxTokens(lines[laneLine]);
+    if (!lines[laneLine].starts_with("mov.u32 ") ||
+        laneTokens.size() != 2 || laneTokens[1] != "%tid")
+      continue;
+    llvm::StringRef lane = laneTokens[0];
+    for (size_t startLine = laneLine + 1; startLine < lines.size();
+         ++startLine) {
+      if (defines(lines[startLine], lane))
+        break;
+      std::vector<std::string> startTokens = ptxTokens(lines[startLine]);
+      const std::string serialSuffix =
+          (llvm::Twine(", ") + llvm::Twine(serialTiles) + ";").str();
+      if (!lines[startLine].starts_with("mul.lo.u32 ") ||
+          !lines[startLine].ends_with(serialSuffix) ||
+          startTokens.size() != 2 || startTokens[1] != lane)
+        continue;
+      llvm::StringRef start = startTokens[0];
+      if (startLine + 5 >= lines.size())
+        return false;
+      std::vector<std::string> endTokens = ptxTokens(lines[startLine + 1]);
+      if (!lines[startLine + 1].starts_with("add.u32 ") ||
+          !lines[startLine + 1].ends_with(serialSuffix) ||
+          endTokens.size() != 2 || endTokens[1] != start)
+        return false;
+      llvm::StringRef end = endTokens[0];
+      const std::string extentSuffix =
+          (llvm::Twine(", ") + llvm::Twine(reductionExtent) + ";").str();
+      std::vector<std::string> minTokens = ptxTokens(lines[startLine + 2]);
+      if (!lines[startLine + 2].starts_with("min.u32 ") ||
+          !lines[startLine + 2].ends_with(extentSuffix) ||
+          minTokens.size() != 2 || minTokens[0] != end ||
+          minTokens[1] != end)
+        return false;
+      size_t loopLine = startLine + 3;
+      while (loopLine < lines.size() && !lines[loopLine].ends_with(":"))
+        ++loopLine;
+      if (loopLine + 2 >= lines.size())
+        return false;
+      llvm::StringRef loop = lines[loopLine].drop_back();
+      std::vector<std::string> predicateTokens =
+          ptxTokens(lines[loopLine + 1]);
+      if (!lines[loopLine + 1].starts_with("setp.ge.u32 ") ||
+          predicateTokens.size() != 3 || predicateTokens[1] != start ||
+          predicateTokens[2] != end)
+        return false;
+      llvm::StringRef predicate = predicateTokens[0];
+      const std::string branchPrefix =
+          (llvm::Twine("@") + predicate + " bra ").str();
+      if (!lines[loopLine + 2].starts_with(branchPrefix) ||
+          !lines[loopLine + 2].ends_with(";"))
+        return false;
+      llvm::StringRef exit = lines[loopLine + 2]
+                                 .drop_front(branchPrefix.size())
+                                 .drop_back();
+      const std::string increment =
+          (llvm::Twine("add.u32 ") + start + ", " + start + ", 1;").str();
+      const std::string backedge = (llvm::Twine("bra ") + loop + ";").str();
+      const std::string exitLabel = (llvm::Twine(exit) + ":").str();
+      for (size_t line = loopLine + 3; line + 2 < lines.size(); ++line) {
+        if (lines[line] == exitLabel ||
+            (defines(lines[line], start) && lines[line] != increment))
+          return false;
+        if (lines[line] == increment)
+          return lines[line + 1] == backedge &&
+                 lines[line + 2] == exitLabel;
+      }
+      return false;
+    }
+  }
+  return false;
+}
+
 PtxDataflow ptxDataflow(llvm::StringRef ptx) {
   PtxDataflow result;
   std::map<std::string, std::string> currentRegister;
@@ -1601,6 +1689,46 @@ TEST(Abi22MapFusionContract,
   PtxDataflow reassociated = ptxDataflow(
       replace(correct, "add.rn.f32 %f4, %f2, %f3", "sub.rn.f32 %f4, %f2, %f3"));
   EXPECT_FALSE(containsStagedSharedAdd(reassociated));
+
+  constexpr llvm::StringLiteral correctFoldLoop = R"ptx(
+  mov.u32 %r0, %tid.x;
+  mul.lo.u32 %r4, %r0, 2;
+  add.u32 %r7, %r4, 2;
+  min.u32 %r7, %r7, 330;
+  mov.f32 %f0, 0f00000000;
+$load:
+  setp.ge.u32 %p1, %r4, %r7;
+  @%p1 bra $loaded;
+  ld.global.f32 %f1, [%rd0];
+  add.u32 %r4, %r4, 1;
+  bra $load;
+$loaded:
+)ptx";
+  constexpr llvm::StringLiteral renamedFoldLoop = R"ptx(
+  mov.u32 %r31, %tid.x;
+  mul.lo.u32 %r18, %r31, 2;
+  add.u32 %r22, %r18, 2;
+  min.u32 %r22, %r22, 330;
+  mov.f32 %f9, 0f00000000;
+$again:
+  setp.ge.u32 %p7, %r18, %r22;
+  @%p7 bra $finished;
+  ld.global.f32 %f12, [%rd6];
+  add.u32 %r18, %r18, 1;
+  bra $again;
+$finished:
+)ptx";
+  EXPECT_TRUE(hasDisjointContiguousFoldLoop(correctFoldLoop, 330, 2));
+  EXPECT_TRUE(hasDisjointContiguousFoldLoop(renamedFoldLoop, 330, 2));
+  for (std::string mutation : {
+           replace(correctFoldLoop, "@%p1 bra $loaded;", "nop;"),
+           replace(correctFoldLoop, "add.u32 %r4, %r4, 1;",
+                   "add.u32 %r4, %r4, 2;"),
+           replace(correctFoldLoop, "bra $load;", "bra $loaded;"),
+           replace(correctFoldLoop, "mov.u32 %r0, %tid.x;",
+                   "mov.u32 %r0, %ctaid.x;"),
+       })
+    EXPECT_FALSE(hasDisjointContiguousFoldLoop(mutation, 330, 2));
 }
 
 TEST(Abi22MapFusionContract,
@@ -1979,15 +2107,8 @@ TEST(Abi22MapFusionContract,
                   llvm::ArrayRef<int64_t>({workgroupThreads, 1, 1}));
         const int64_t serialTiles =
             (reductionExtent + reductionTile - 1) / reductionTile;
-        const std::string chunkBounds =
-            (llvm::Twine("  mul.lo.u32 %r4, %r0, ") +
-             llvm::Twine(serialTiles) + ";\n  add.u32 %r7, %r4, " +
-             llvm::Twine(serialTiles) + ";\n  min.u32 %r7, %r7, " +
-             llvm::Twine(reductionExtent) +
-             ";\n  mov.f32 %f0, 0f00000000;\n$fold_region_load:\n"
-             "  setp.ge.u32 %p1, %r4, %r7;")
-                .str();
-        EXPECT_NE(ptx.find(chunkBounds), llvm::StringRef::npos);
+        EXPECT_TRUE(hasDisjointContiguousFoldLoop(
+            ptx, reductionExtent, serialTiles));
         EXPECT_NE(ptx.find("ld.global.u16"), llvm::StringRef::npos);
         EXPECT_NE(ptx.find("cvt.f32.bf16"), llvm::StringRef::npos);
         EXPECT_NE(ptx.find("add.rn.f32"), llvm::StringRef::npos);
