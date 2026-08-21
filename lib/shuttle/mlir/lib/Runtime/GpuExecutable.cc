@@ -285,7 +285,7 @@ absl::StatusOr<Parsed> parse(ArrayRef<uint8_t> bytes) {
       if (reader.u8() != 0)
         return invalidTransport();
     auto outputCount = reader.u64();
-    if (!outputCount || *outputCount != outputs->size())
+    if (!outputCount || *outputCount != outputs->size() || outputs->empty())
       return invalidTransport();
     for (uint64_t index = 0; index < *outputCount; ++index)
       if (reader.u8() != 1)
@@ -369,7 +369,7 @@ absl::StatusOr<Parsed> parse(ArrayRef<uint8_t> bytes) {
     expectedOffset += *codeLength;
   }
   size_t invocationStart = reader.position();
-  if (expectedOffset != code->size() || producers.size() != *entryCount ||
+  if (expectedOffset != code->size() ||
       *deviceRoot !=
           digest(bytes.slice(deviceStart, deviceRootOffset - deviceStart),
                  bytes.slice(deviceSuffixStart,

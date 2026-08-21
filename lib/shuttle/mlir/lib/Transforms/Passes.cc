@@ -4051,6 +4051,7 @@ struct PlannedTask {
   Operation *fusedFold = nullptr;
   SmallVector<Operation *> foldRegionSources;
   SmallVector<Operation *> foldRegionPhases;
+  SmallVector<Operation *> foldRegionOutputs;
   struct BoundaryUse {
     int64_t inputBuffer;
     MapOp source;
@@ -4671,6 +4672,7 @@ FailureOr<DerivedPlan> deriveNormContractPlan(RegionOp region) {
       }
     }
     foldTask.outputs.push_back(compactBuffer);
+    foldTask.foldRegionOutputs.push_back(reciprocal);
     plan.tasks.push_back(std::move(foldTask));
   }
 
@@ -4842,8 +4844,9 @@ FailureOr<DerivedPlan> deriveFoldRegionPlan(RegionOp region) {
       if (auto fold = dyn_cast<FoldOp>(operation))
         phases.push_back(fold);
     }
-    if (phases.empty())
+    if (phases.empty()) {
       return failure();
+    }
     for (auto [phaseOrdinal, fold] : llvm::enumerate(phases)) {
       auto input = cast<RankedTensorType>(fold.getInputs().front().getType());
       if (llvm::any_of(fold.getInputs(), [&](Value value) {
@@ -4980,10 +4983,14 @@ FailureOr<DerivedPlan> deriveFoldRegionPlan(RegionOp region) {
     }
     if (task.foldRegionBoundaryUses.empty())
       return failure();
-    if (taskOrdinal == 0 && sourceSets.size() > 1)
+    if (taskOrdinal == 0 && sourceSets.size() > 1) {
       task.outputs.push_back(bufferForValue.lookup(primary.getResult(0)));
-    for (Value output : publicOutputs[taskOrdinal])
+      task.foldRegionOutputs.push_back(primary);
+    }
+    for (Value output : publicOutputs[taskOrdinal]) {
       task.outputs.push_back(bufferForValue.lookup(output));
+      task.foldRegionOutputs.push_back(output.getDefiningOp());
+    }
     for (int64_t input : task.inputs) {
       if (std::optional<int64_t> producer = result.buffers[input].producer;
           producer && !llvm::is_contained(task.dependencies, *producer))
@@ -4997,6 +5004,307 @@ FailureOr<DerivedPlan> deriveFoldRegionPlan(RegionOp region) {
       result.buffers[input].consumers.push_back(taskOrdinal);
   }
   result.hasFoldRegion = true;
+  return result;
+}
+
+FailureOr<int64_t> scheduleElementCount(ArrayRef<int64_t> shape);
+FailureOr<int64_t> staticElementCount(RankedTensorType type);
+
+FailureOr<DerivedPlan> deriveSharedStatFoldRegionPlan(RegionOp region) {
+  SmallVector<Operation *> algebra;
+  SmallVector<FoldOp> folds;
+  for (Operation &operation : region.getBody().front().without_terminator()) {
+    if (auto map = dyn_cast<MapOp>(operation)) {
+      if (!isClosedFoldRegionMap(map))
+        return failure();
+    } else if (auto fold = dyn_cast<FoldOp>(operation)) {
+      if (!isClosedAdditivePlanningFold(fold) ||
+          !hasExactPositiveZeroInitializer(fold) || fold.getNumResults() != 1)
+        return failure();
+      folds.push_back(fold);
+    } else {
+      return failure();
+    }
+    algebra.push_back(&operation);
+  }
+  if (folds.empty())
+    return failure();
+  auto regionYield =
+      dyn_cast<YieldOp>(region.getBody().front().getTerminator());
+  if (!regionYield || regionYield.getValues().size() < 3)
+    return failure();
+
+  RankedTensorType domain;
+  for (FoldOp fold : folds) {
+    auto input = cast<RankedTensorType>(fold.getInputs().front().getType());
+    if (fold.getReductionDimensions() ==
+        ArrayRef<int64_t>({input.getRank() - 1})) {
+      domain = input;
+      break;
+    }
+  }
+  if (!domain || domain.getRank() < 2)
+    return failure();
+  SmallVector<int64_t> rowShape(domain.getShape().drop_back());
+  SmallVector<int64_t> featureShape(domain.getShape().take_back());
+  SmallVector<Value> rowOutputs;
+  SmallVector<Value> featureOutputs;
+  llvm::SmallDenseMap<Value, int64_t> outputTask;
+  for (Value output : regionYield.getValues()) {
+    auto type = dyn_cast<RankedTensorType>(output.getType());
+    if (!type)
+      return failure();
+    if (type.getShape() == domain.getShape()) {
+      outputTask.try_emplace(output, 0);
+      rowOutputs.push_back(output);
+    } else if (type.getShape() == ArrayRef<int64_t>(featureShape)) {
+      outputTask.try_emplace(output, 1);
+      featureOutputs.push_back(output);
+    } else {
+      return failure();
+    }
+  }
+  if (rowOutputs.empty() || featureOutputs.size() < 2)
+    return failure();
+
+  auto collectSources = [&](Value root,
+                            const llvm::SmallDenseSet<Value> &stops,
+                            llvm::SmallDenseSet<Operation *> &set,
+                            auto &self) -> LogicalResult {
+    if (stops.contains(root))
+      return success();
+    Operation *producer = root.getDefiningOp();
+    if (!producer)
+      return success();
+    if (!isa<MapOp, FoldOp>(producer) ||
+        producer->getParentOfType<RegionOp>() != region)
+      return failure();
+    if (!set.insert(producer).second)
+      return success();
+    for (Value operand : producer->getOperands()) {
+      if (failed(self(operand, stops, set, self)))
+        return failure();
+    }
+    return success();
+  };
+  const llvm::SmallDenseSet<Value> noStops;
+  llvm::SmallDenseSet<Operation *> rowSet;
+  llvm::SmallDenseSet<Operation *> featureRawSet;
+  for (Value output : rowOutputs)
+    if (failed(collectSources(output, noStops, rowSet, collectSources)))
+      return failure();
+  for (Value output : featureOutputs)
+    if (failed(
+            collectSources(output, noStops, featureRawSet, collectSources)))
+      return failure();
+
+  SmallVector<Value> sharedStats;
+  llvm::SmallDenseSet<Value> sharedStatSet;
+  FailureOr<int64_t> rowElements = scheduleElementCount(rowShape);
+  if (failed(rowElements))
+    return failure();
+  for (Operation *operation : algebra) {
+    auto map = dyn_cast<MapOp>(operation);
+    if (!map || !rowSet.contains(operation) ||
+        !featureRawSet.contains(operation))
+      continue;
+    auto type = cast<RankedTensorType>(map.getResult(0).getType());
+    FailureOr<int64_t> elements = staticElementCount(type);
+    if (failed(elements) || *elements != *rowElements ||
+        !type.getElementType().isF32() ||
+        llvm::none_of(map.getResult(0).getUsers(), [&](Operation *user) {
+          auto resultType =
+              user->getNumResults() == 1
+                  ? dyn_cast<RankedTensorType>(user->getResult(0).getType())
+                  : RankedTensorType{};
+          if (!resultType)
+            return false;
+          FailureOr<int64_t> resultElements = staticElementCount(resultType);
+          return succeeded(resultElements) && *resultElements > *rowElements;
+        }))
+      continue;
+    sharedStats.push_back(map.getResult(0));
+    sharedStatSet.insert(map.getResult(0));
+  }
+  if (sharedStats.size() != 2)
+    return failure();
+
+  llvm::SmallDenseSet<Operation *> featureSet;
+  for (Value output : featureOutputs)
+    if (failed(collectSources(output, sharedStatSet, featureSet,
+                              collectSources)))
+      return failure();
+  llvm::SmallDenseSet<Operation *> covered(rowSet.begin(), rowSet.end());
+  covered.insert(featureSet.begin(), featureSet.end());
+  if (covered.size() != algebra.size())
+    return failure();
+
+  std::array<llvm::SmallDenseSet<Operation *> *, 2> sourceSets = {&rowSet,
+                                                                  &featureSet};
+  std::array<SmallVector<Operation *>, 2> orderedSources;
+  for (auto [taskOrdinal, set] : llvm::enumerate(sourceSets)) {
+    for (Operation *operation : algebra)
+      if (set->contains(operation))
+        orderedSources[taskOrdinal].push_back(operation);
+    SmallVector<FoldOp> phases;
+    for (Operation *operation : orderedSources[taskOrdinal])
+      if (auto fold = dyn_cast<FoldOp>(operation))
+        phases.push_back(fold);
+    if (phases.empty())
+      return failure();
+    auto firstInput =
+        cast<RankedTensorType>(phases.front().getInputs().front().getType());
+    ArrayRef<int64_t> firstReduction =
+        phases.front().getReductionDimensions();
+    for (auto [phaseOrdinal, fold] : llvm::enumerate(phases)) {
+      auto input = cast<RankedTensorType>(fold.getInputs().front().getType());
+      ArrayRef<int64_t> reduction = fold.getReductionDimensions();
+      const bool row = reduction == ArrayRef<int64_t>({input.getRank() - 1});
+      const bool column =
+          (input.getRank() == 2 && reduction == ArrayRef<int64_t>({0})) ||
+          isFullPrefixReduction(reduction, input.getRank());
+      int64_t cardinality = 1;
+      for (int64_t axis : reduction)
+        cardinality *= input.getDimSize(axis);
+      const bool degenerate = cardinality == 1;
+      if ((!row && !column) ||
+          (phaseOrdinal == 0 && input != domain) ||
+          (phaseOrdinal != 0 &&
+           ((!degenerate &&
+             (input != firstInput || reduction != firstReduction)) ||
+            fold.getResult(0).getType() !=
+                phases.front().getResult(0).getType() ||
+            (degenerate &&
+             !valueDependsOnOperation(fold.getInputs().front(),
+                                      phases[phaseOrdinal - 1]))))) {
+        return failure();
+      }
+      Value initializer = fold.getInitializers().front();
+      if (!set->contains(initializer.getDefiningOp())) {
+        return failure();
+      }
+    }
+    for (Operation *operation : orderedSources[taskOrdinal]) {
+      auto map = dyn_cast<MapOp>(operation);
+      if (!map)
+        continue;
+      for (auto [operandOrdinal, operand] : llvm::enumerate(map.getInputs())) {
+        if (isa_and_nonnull<FoldOp>(operand.getDefiningOp()) &&
+            set->contains(operand.getDefiningOp()) &&
+            !isCanonicalFoldResultExpansion(map, operandOrdinal)) {
+          return failure();
+        }
+      }
+    }
+  }
+
+  DerivedPlan result;
+  result.hasRankNFold = domain.getRank() > 2;
+  result.hasFoldRegion = true;
+  llvm::SmallDenseMap<Value, int64_t> bufferForValue;
+  for (BlockArgument argument : region.getBody().front().getArguments()) {
+    bufferForValue.try_emplace(argument, result.buffers.size());
+    result.buffers.push_back({argument, std::nullopt, {}, false});
+  }
+  for (Value stat : sharedStats) {
+    bufferForValue.try_emplace(stat, result.buffers.size());
+    result.buffers.push_back({stat, int64_t{0}, {}, false});
+  }
+  for (Value output : regionYield.getValues()) {
+    int64_t producer = outputTask.lookup(output);
+    bufferForValue.try_emplace(output, result.buffers.size());
+    result.buffers.push_back({output, producer, {}, true});
+  }
+
+  llvm::SmallDenseMap<Operation *, int64_t> sourceOccurrences;
+  for (auto *set : sourceSets)
+    for (Operation *operation : *set)
+      ++sourceOccurrences[operation];
+  for (auto [taskOrdinal, sources] : llvm::enumerate(orderedSources)) {
+    PlannedTask task;
+    task.foldRegionSources = sources;
+    llvm::SmallDenseSet<Operation *> taskSet(sources.begin(), sources.end());
+    for (Operation *operation : sources) {
+      if (isa<FoldOp>(operation))
+        task.foldRegionPhases.push_back(operation);
+      if (sourceOccurrences.lookup(operation) > 1)
+        task.foldRegionRecomputedSources.push_back(operation);
+    }
+    task.operation = task.foldRegionPhases.front();
+    task.kind = MaterializationTaskKind::Fold;
+    auto firstFold = cast<FoldOp>(task.operation);
+    task.domain.assign(domain.getShape().begin(), domain.getShape().end());
+    task.reductionDimensions.assign(firstFold.getReductionDimensions().begin(),
+                                    firstFold.getReductionDimensions().end());
+    task.orderFree = firstFold.getOrderFree();
+    auto addInput = [&](Value value) -> LogicalResult {
+      auto found = bufferForValue.find(value);
+      if (found == bufferForValue.end())
+        return failure();
+      if (!llvm::is_contained(task.inputs, found->second))
+        task.inputs.push_back(found->second);
+      return success();
+    };
+    for (Operation *operation : sources) {
+      auto map = dyn_cast<MapOp>(operation);
+      if (!map)
+        continue;
+      for (auto [operandOrdinal, operand] : llvm::enumerate(map.getInputs())) {
+        if (taskSet.contains(operand.getDefiningOp()))
+          continue;
+        if (failed(addInput(operand)))
+          return failure();
+        int64_t phase = 0;
+        for (Operation *phaseOperation : task.foldRegionPhases) {
+          if (cast<FoldOp>(phaseOperation).getSource().getOperationOrdinal() <
+              map.getSource().getOperationOrdinal())
+            ++phase;
+        }
+        phase = std::min<int64_t>(phase, task.foldRegionPhases.size() - 1);
+        task.foldRegionBoundaryUses.push_back(
+            {bufferForValue.lookup(operand), map,
+             static_cast<unsigned>(operandOrdinal),
+             cast<AffineMapAttr>(map.getIndexingMaps()[operandOrdinal])
+                 .getValue(),
+             phase});
+      }
+    }
+    llvm::sort(task.inputs);
+    for (Operation *phase : task.foldRegionPhases) {
+      Value input = cast<FoldOp>(phase).getInputs().front();
+      if (!taskSet.contains(input.getDefiningOp()) &&
+          (!bufferForValue.count(input) ||
+           !llvm::is_contained(task.inputs, bufferForValue.lookup(input))))
+        return failure();
+    }
+    if (task.foldRegionBoundaryUses.empty())
+      return failure();
+    if (taskOrdinal == 0) {
+      for (Value stat : sharedStats) {
+        task.outputs.push_back(bufferForValue.lookup(stat));
+        task.foldRegionOutputs.push_back(stat.getDefiningOp());
+      }
+      for (Value output : rowOutputs) {
+        task.outputs.push_back(bufferForValue.lookup(output));
+        task.foldRegionOutputs.push_back(output.getDefiningOp());
+      }
+    } else {
+      for (Value output : featureOutputs) {
+        task.outputs.push_back(bufferForValue.lookup(output));
+        task.foldRegionOutputs.push_back(output.getDefiningOp());
+      }
+    }
+    for (int64_t input : task.inputs) {
+      if (std::optional<int64_t> producer = result.buffers[input].producer;
+          producer && !llvm::is_contained(task.dependencies, *producer))
+        task.dependencies.push_back(*producer);
+    }
+    llvm::sort(task.dependencies);
+    result.tasks.push_back(std::move(task));
+  }
+  for (auto [taskOrdinal, task] : llvm::enumerate(result.tasks))
+    for (int64_t input : task.inputs)
+      result.buffers[input].consumers.push_back(taskOrdinal);
   return result;
 }
 
@@ -5431,6 +5739,10 @@ FailureOr<DerivedPlan> deriveGpuPlan(RegionOp region,
   FailureOr<DerivedPlan> foldRegion = deriveFoldRegionPlan(region);
   if (succeeded(foldRegion))
     return foldRegion;
+  FailureOr<DerivedPlan> sharedStatFoldRegion =
+      deriveSharedStatFoldRegionPlan(region);
+  if (succeeded(sharedStatFoldRegion))
+    return sharedStatFoldRegion;
   return fuseEligibleMapTasks(region, std::move(result));
 }
 
@@ -5727,6 +6039,15 @@ public:
           }
           attrs.push_back(builder.getNamedAttr("fold_region_sources",
                                                builder.getArrayAttr(sources)));
+          SmallVector<Attribute> outputs;
+          for (Operation *operation : task.foldRegionOutputs) {
+            if (auto map = dyn_cast<MapOp>(operation))
+              outputs.push_back(map.getSource());
+            else
+              outputs.push_back(cast<FoldOp>(operation).getSource());
+          }
+          attrs.push_back(builder.getNamedAttr("fold_region_output_sources",
+                                               builder.getArrayAttr(outputs)));
           attrs.push_back(builder.getNamedAttr("fold_region_phases",
                                                builder.getArrayAttr(phases)));
           attrs.push_back(builder.getNamedAttr(
@@ -5831,12 +6152,14 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
         task->getAttrOfType<ArrayAttr>("epilogue_input_maps");
     auto foldRegionSources =
         task->getAttrOfType<ArrayAttr>("fold_region_sources");
+    auto foldRegionOutputSources =
+        task->getAttrOfType<ArrayAttr>("fold_region_output_sources");
     auto contractRegionSources =
         task->getAttrOfType<ArrayAttr>("contract_region_sources");
     if (contractRegionSources) {
       sawFoldRegion = true;
       if (fusedSources || composedMaps || epilogueSources || epilogueMaps ||
-          foldRegionSources ||
+          foldRegionSources || foldRegionOutputSources ||
           task.getKind() != MaterializationTaskKind::Contract) {
         task.emitOpError(
             "cannot mix Contract-region and legacy fusion metadata");
@@ -5922,6 +6245,26 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
         task.emitOpError("does not fingerprint every Fold-region source");
         return failure();
       }
+      auto outputSources =
+          task->getAttrOfType<ArrayAttr>("fold_region_output_sources");
+      if (!outputSources ||
+          outputSources.size() != task.getOutputBuffers().size()) {
+        task.emitOpError("Fold-region outputs must bind ordered sources");
+        return failure();
+      }
+      for (auto [source, bufferOrdinal] :
+           llvm::zip_equal(outputSources, task.getOutputBuffers())) {
+        Operation *operation = sourceOperations.lookup(source);
+        if (!operation || !llvm::is_contained(operations, operation) ||
+            operation->getNumResults() != 1 || bufferOrdinal < 0 ||
+            bufferOrdinal >= static_cast<int64_t>(buffers.size()) ||
+            buffers[bufferOrdinal].getTensorType() !=
+                operation->getResult(0).getType()) {
+          task.emitOpError(
+              "Fold-region output buffers must match their source results");
+          return failure();
+        }
+      }
       if (auto recomputed = task->getAttrOfType<ArrayAttr>(
               "fold_region_recomputed_sources")) {
         for (Attribute source : recomputed) {
@@ -5936,6 +6279,10 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
         }
       }
       continue;
+    }
+    if (foldRegionOutputSources) {
+      task.emitOpError("Fold-region outputs require Fold-region sources");
+      return failure();
     }
     if (sawFoldRegion) {
       task.emitOpError("cannot mix Fold-region and legacy tasks");
@@ -6261,6 +6608,8 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
       }
       auto actualPhases =
           actual->getAttrOfType<ArrayAttr>("fold_region_phases");
+      auto actualOutputs =
+          actual->getAttrOfType<ArrayAttr>("fold_region_output_sources");
       auto actualBoundaryUses =
           actual->getAttrOfType<ArrayAttr>("fold_region_boundary_uses");
       auto actualRecomputed =
@@ -6272,10 +6621,19 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
         else
           expectedRecomputed.push_back(cast<FoldOp>(operation).getSource());
       }
+      SmallVector<Attribute> expectedOutputs;
+      for (Operation *operation : expectedTask.foldRegionOutputs) {
+        if (auto map = dyn_cast<MapOp>(operation))
+          expectedOutputs.push_back(map.getSource());
+        else
+          expectedOutputs.push_back(cast<FoldOp>(operation).getSource());
+      }
       bool matches =
-          actualFoldRegionSources && actualPhases && actualBoundaryUses &&
+          actualFoldRegionSources && actualPhases && actualOutputs &&
+          actualBoundaryUses &&
           actualFoldRegionSources.getValue() ==
               ArrayRef<Attribute>(expectedRegionSources) &&
+          actualOutputs.getValue() == ArrayRef<Attribute>(expectedOutputs) &&
           actualPhases.size() == expectedTask.foldRegionPhases.size() &&
           actualBoundaryUses.size() ==
               expectedTask.foldRegionBoundaryUses.size() &&
@@ -7942,8 +8300,11 @@ FailureOr<std::string> emitFoldRegionPtx(
       materializationTask->getAttrOfType<ArrayAttr>("fold_region_sources");
   auto phaseAttributes =
       materializationTask->getAttrOfType<ArrayAttr>("fold_region_phases");
+  auto outputAttributes = materializationTask->getAttrOfType<ArrayAttr>(
+      "fold_region_output_sources");
   if (!sourceAttributes || !phaseAttributes || phaseAttributes.empty() ||
-      materializationTask.getOutputBuffers().size() != 1)
+      !outputAttributes || outputAttributes.empty() ||
+      outputAttributes.size() != materializationTask.getOutputBuffers().size())
     return failure();
   SmallVector<Operation *> sources;
   llvm::SmallDenseSet<Operation *> sourceSet;
@@ -7952,6 +8313,14 @@ FailureOr<std::string> emitFoldRegionPtx(
     if (!operation || !sourceSet.insert(operation).second)
       return failure();
     sources.push_back(operation);
+  }
+  SmallVector<Operation *> outputOperations;
+  for (Attribute source : outputAttributes) {
+    Operation *operation = sourceOperations.lookup(source);
+    if (!operation || !sourceSet.contains(operation) ||
+        operation->getNumResults() != 1)
+      return failure();
+    outputOperations.push_back(operation);
   }
   SmallVector<FoldOp> phases;
   for (Attribute attribute : phaseAttributes) {
@@ -7991,7 +8360,8 @@ FailureOr<std::string> emitFoldRegionPtx(
       task.getWorkgroupThreads() * static_cast<int64_t>(sizeof(float)))
     return failure();
 
-  PtxEmitter ptx(materializationTask.getInputBuffers().size() + 1);
+  PtxEmitter ptx(materializationTask.getInputBuffers().size() +
+                 materializationTask.getOutputBuffers().size());
   ptx.header(task.getSemanticFingerprint(), /*usesDynamicSharedMemory=*/true);
   FoldRegionPtxContext context{ptx,
                                materializationTask,
@@ -8001,6 +8371,54 @@ FailureOr<std::string> emitFoldRegionPtx(
                                sourceSet,
                                DenseMap<Value, int64_t>(),
                                DenseMap<Value, int64_t>()};
+  auto boundaryUses = materializationTask->getAttrOfType<ArrayAttr>(
+      "fold_region_boundary_uses");
+  if (!boundaryUses)
+    return failure();
+  for (Attribute attribute : boundaryUses) {
+    auto use = dyn_cast<DictionaryAttr>(attribute);
+    auto map = use ? dyn_cast_or_null<MapOp>(
+                         sourceOperations.lookup(use.get("source")))
+                   : MapOp{};
+    auto operand = use ? dyn_cast_or_null<IntegerAttr>(use.get("operand"))
+                       : IntegerAttr{};
+    auto inputBuffer =
+        use ? dyn_cast_or_null<IntegerAttr>(use.get("input_buffer"))
+            : IntegerAttr{};
+    if (!map || !operand || !inputBuffer || operand.getInt() < 0 ||
+        operand.getInt() >= static_cast<int64_t>(map.getInputs().size()))
+      return failure();
+    auto found = llvm::find(materializationTask.getInputBuffers(),
+                            inputBuffer.getInt());
+    if (found == materializationTask.getInputBuffers().end())
+      return failure();
+    int64_t parameter =
+        std::distance(materializationTask.getInputBuffers().begin(), found);
+    Value value = map.getInputs()[operand.getInt()];
+    auto [position, inserted] =
+        context.boundaryParameters.try_emplace(value, parameter);
+    if (!inserted && position->second != parameter)
+      return failure();
+  }
+  auto emitLeaf = [&](Value value, ArrayRef<int64_t> coordinates)
+      -> FailureOr<int64_t> {
+    auto boundary = context.boundaryParameters.find(value);
+    if (boundary == context.boundaryParameters.end())
+      return emitFoldRegionValue(context, value, coordinates);
+    int64_t bufferOrdinal =
+        materializationTask.getInputBuffers()[boundary->second];
+    if (bufferOrdinal < 0 || bufferOrdinal >= buffers.size())
+      return failure();
+    auto input = dyn_cast<RankedTensorType>(
+        buffers[bufferOrdinal].getTensorType());
+    if (!input || input.getRank() != static_cast<int64_t>(coordinates.size()))
+      return failure();
+    return emitMapInput(
+        ptx, boundary->second, input,
+        AffineMap::getMultiDimIdentityMap(input.getRank(),
+                                          materializationTask.getContext()),
+        coordinates);
+  };
   int64_t accumulator = ptx.nextF32();
   ptx.stream << "  mov.u32 %r0, %tid.x;\n"
                 "  mov.u32 %r1, %ctaid.x;\n"
@@ -8025,8 +8443,8 @@ FailureOr<std::string> emitFoldRegionPtx(
       emitOutputCoordinates(ptx, domain);
   if (failed(reductionCoordinates))
     return failure();
-  FailureOr<int64_t> leaf = emitFoldRegionValue(
-      context, primary.getInputs().front(), *reductionCoordinates);
+  FailureOr<int64_t> leaf =
+      emitLeaf(primary.getInputs().front(), *reductionCoordinates);
   if (failed(leaf))
     return failure();
   int64_t combined = ptx.nextF32();
@@ -8125,8 +8543,8 @@ FailureOr<std::string> emitFoldRegionPtx(
           emitOutputCoordinates(ptx, input);
       if (failed(phaseCoordinates))
         return failure();
-      FailureOr<int64_t> phaseLeaf = emitFoldRegionValue(
-          context, fold.getInputs().front(), *phaseCoordinates);
+      FailureOr<int64_t> phaseLeaf =
+          emitLeaf(fold.getInputs().front(), *phaseCoordinates);
       if (failed(phaseLeaf))
         return failure();
       int64_t phaseCombined = ptx.nextF32();
@@ -8202,7 +8620,7 @@ FailureOr<std::string> emitFoldRegionPtx(
     if (failed(coordinates))
       return failure();
     FailureOr<int64_t> value =
-        emitFoldRegionValue(context, fold.getInputs().front(), *coordinates);
+        emitLeaf(fold.getInputs().front(), *coordinates);
     if (failed(value))
       return failure();
     int64_t initializer = ptx.nextF32();
@@ -8213,50 +8631,60 @@ FailureOr<std::string> emitFoldRegionPtx(
     context.foldValues[fold] = combined;
   }
 
-  Operation *finalOperation = sources.back();
-  int64_t outputBuffer = materializationTask.getOutputBuffers().front();
-  if (outputBuffer < 0 || outputBuffer >= buffers.size())
-    return failure();
-  auto output = cast<RankedTensorType>(buffers[outputBuffer].getTensorType());
-  FailureOr<int64_t> outputElements = staticElementCount(output);
-  if (failed(outputElements) || *outputElements % *outputExtent != 0)
-    return failure();
-  int64_t elementsPerBlock = *outputElements / *outputExtent;
-  int64_t outputParameter = materializationTask.getInputBuffers().size();
-  if (auto finalFold = dyn_cast<FoldOp>(finalOperation)) {
-    auto value = context.foldValues.find(finalFold);
-    if (value == context.foldValues.end() || elementsPerBlock != 1)
+  for (auto [outputOrdinal, outputOperation, outputBuffer] : llvm::enumerate(
+           outputOperations, materializationTask.getOutputBuffers())) {
+    if (outputBuffer < 0 || outputBuffer >= buffers.size())
       return failure();
-    ptx.stream << "  setp.ne.u32 %p3, %r0, 0;\n"
-                  "  @%p3 bra $done;\n"
-                  "  ld.param.u64 %rd6, [p"
-               << outputParameter
-               << "];\n  cvt.u64.u32 %rd7, %r1;\n"
-                  "  mad.lo.u64 %rd6, %rd7, 4, %rd6;\n"
-                  "  st.global.f32 [%rd6], %f"
-               << value->second << ";\n";
-  } else {
-    auto finalMap = dyn_cast<MapOp>(finalOperation);
-    if (!finalMap || finalMap.getResult(0).getType() != output)
+    auto output = cast<RankedTensorType>(buffers[outputBuffer].getTensorType());
+    FailureOr<int64_t> outputElements = staticElementCount(output);
+    if (failed(outputElements) || *outputElements % *outputExtent != 0)
       return failure();
-    ptx.stream << "  mov.u32 %r6, %r0;\n$fold_region_epilogue:\n"
+    int64_t elementsPerBlock = *outputElements / *outputExtent;
+    int64_t outputParameter = materializationTask.getInputBuffers().size() +
+                              static_cast<int64_t>(outputOrdinal);
+    if (auto outputFold = dyn_cast<FoldOp>(outputOperation)) {
+      auto value = context.foldValues.find(outputFold);
+      if (value == context.foldValues.end() || elementsPerBlock != 1 ||
+          !output.getElementType().isF32())
+        return failure();
+      ptx.stream << "  setp.ne.u32 %p3, %r0, 0;\n"
+                    "  @%p3 bra $fold_region_output_"
+                 << outputOrdinal
+                 << "_done;\n"
+                    "  ld.param.u64 %rd6, [p"
+                 << outputParameter
+                 << "];\n  cvt.u64.u32 %rd7, %r1;\n"
+                    "  mad.lo.u64 %rd6, %rd7, 4, %rd6;\n"
+                    "  st.global.f32 [%rd6], %f"
+                 << value->second << ";\n$fold_region_output_" << outputOrdinal
+                 << "_done:\n";
+      continue;
+    }
+    auto outputMap = dyn_cast<MapOp>(outputOperation);
+    if (!outputMap || outputMap.getResult(0).getType() != output)
+      return failure();
+    ptx.stream << "  mov.u32 %r6, %r0;\n$fold_region_output_"
+               << outputOrdinal
+               << "_epilogue:\n"
                   "  setp.ge.u32 %p3, %r6, "
                << elementsPerBlock
-               << ";\n  @%p3 bra $done;\n"
+               << ";\n  @%p3 bra $fold_region_output_" << outputOrdinal
+               << "_done;\n"
                   "  cvt.u64.u32 %rd0, %r1;\n"
                   "  cvt.u64.u32 %rd6, %r6;\n";
     if (row) {
       ptx.stream << "  mad.lo.u64 %rd0, %rd0, " << elementsPerBlock
                  << ", %rd6;\n";
     } else {
-      ptx.stream << "  mad.lo.u64 %rd0, %rd6, " << *outputExtent << ", %rd0;\n";
+      ptx.stream << "  mad.lo.u64 %rd0, %rd6, " << *outputExtent
+                 << ", %rd0;\n";
     }
     FailureOr<SmallVector<int64_t>> coordinates =
         emitOutputCoordinates(ptx, output);
     if (failed(coordinates))
       return failure();
     FailureOr<int64_t> value =
-        emitFoldRegionValue(context, finalMap.getResult(0), *coordinates);
+        emitFoldRegionValue(context, outputMap.getResult(0), *coordinates);
     if (failed(value))
       return failure();
     int64_t pointer = ptx.nextU64();
@@ -8274,9 +8702,13 @@ FailureOr<std::string> emitFoldRegionPtx(
                  << ";\n";
     }
     ptx.stream << "  add.u32 %r6, %r6, " << task.getWorkgroupThreads()
-               << ";\n  bra $fold_region_epilogue;\n";
+               << ";\n  bra $fold_region_output_" << outputOrdinal
+               << "_epilogue;\n$fold_region_output_" << outputOrdinal
+               << "_done:\n";
   }
-  if (ptx.f32 > 128 || ptx.u64 > 128 || ptx.bf16 > 16)
+  const int64_t maximumF32Registers =
+      outputOperations.size() > 1 ? 256 : 128;
+  if (ptx.f32 > maximumF32Registers || ptx.u64 > 128 || ptx.bf16 > 16)
     return failure();
   ptx.finish();
   return ptx.text;

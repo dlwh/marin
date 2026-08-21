@@ -121,6 +121,7 @@ def Shuttle_MaterializationTaskOp
       OptionalAttr<ArrayAttr>:$fold_epilogue_sources,
       OptionalAttr<AffineMapArrayAttr>:$epilogue_input_maps,
       OptionalAttr<ArrayAttr>:$fold_region_sources,
+      OptionalAttr<ArrayAttr>:$fold_region_output_sources,
       OptionalAttr<ArrayAttr>:$fold_region_phases,
       OptionalAttr<ArrayAttr>:$fold_region_boundary_uses,
       OptionalAttr<ArrayAttr>:$fold_region_recomputed_sources,

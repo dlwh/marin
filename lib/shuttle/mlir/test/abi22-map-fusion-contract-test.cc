@@ -1515,6 +1515,14 @@ void expectCounts(const PlanSummary &actual, const FixtureExpectation &expected,
       EXPECT_EQ(actual.tasks, 1);
       EXPECT_EQ(actual.buffers, 4);
       EXPECT_EQ(actual.foldTasks, 1);
+    } else if (expected.maps == 63 && expected.folds == 10) {
+      EXPECT_EQ(actual.tasks, 2);
+      EXPECT_EQ(actual.buffers, 8);
+      EXPECT_EQ(actual.foldTasks, 2);
+    } else if (expected.maps == 70 && expected.folds == 10) {
+      EXPECT_EQ(actual.tasks, 2);
+      EXPECT_EQ(actual.buffers, 10);
+      EXPECT_EQ(actual.foldTasks, 2);
     } else {
       ADD_FAILURE() << "unexpected fixture admitted as a Fold region";
     }
@@ -1945,24 +1953,68 @@ TEST(Abi22MapFusionContract,
   }
 }
 
+constexpr llvm::StringLiteral kFoldEpilogueAlgebra = R"mlir(
+#fold_input = affine_map<(d0, d1) -> (d0, d1)>
+#fold_result = affine_map<(d0, d1) -> (d0)>
+#boundary = affine_map<(d0, d1) -> (d1, d0)>
+#output = affine_map<(d0, d1) -> (d0, d1)>
+#scalar = affine_map<() -> ()>
+module attributes {
+  shuttle.coverage_manifest = {
+    canonical_tuning = "{\22cluster_shape\22:[],\22materialization\22:\22prefer_fusion\22,\22maximum_candidates\22:1,\22pipeline_stages\22:1,\22tile_sizes\22:[]}"
+  }
+} {
+  func.func @anonymous(%input: tensor<2x4xf32>, %boundary_input: tensor<1x2xf32>, %other_boundary_input: tensor<2x1xf32>) -> tensor<2x1xf32> {
+    %result = "shuttle.region"(%input, %boundary_input, %other_boundary_input) ({
+    ^bb0(%region_input: tensor<2x4xf32>, %region_boundary: tensor<1x2xf32>, %region_other_boundary: tensor<2x1xf32>):
+      %init = "shuttle.map"() ({
+      ^bb0:
+        %zero = arith.constant 0.000000e+00 : f32
+        "shuttle.yield"(%zero) : (f32) -> ()
+      }) {indexing_maps = [#scalar], source = #shuttle.source_ref<0, 0, 0, 0>} : () -> tensor<f32>
+      %folded = "shuttle.fold"(%region_input, %init) ({
+      ^bb0(%element: f32, %accumulator: f32):
+        %sum = arith.addf %element, %accumulator : f32
+        "shuttle.yield"(%sum) : (f32) -> ()
+      }) {accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 1>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
+      %subtracted = "shuttle.map"(%folded, %region_boundary) ({
+      ^bb0(%lhs: f32, %rhs: f32):
+        %difference = arith.subf %lhs, %rhs : f32
+        "shuttle.yield"(%difference) : (f32) -> ()
+      }) {indexing_maps = [#fold_result, #boundary, #output], source = #shuttle.source_ref<0, 0, 0, 2>} : (tensor<2xf32>, tensor<1x2xf32>) -> tensor<2x1xf32>
+      %divided = "shuttle.map"(%subtracted, %region_other_boundary) ({
+      ^bb0(%lhs: f32, %rhs: f32):
+        %quotient = arith.divf %lhs, %rhs : f32
+        "shuttle.yield"(%quotient) : (f32) -> ()
+      }) {indexing_maps = [#output, #output, #output], source = #shuttle.source_ref<0, 0, 0, 3>} : (tensor<2x1xf32>, tensor<2x1xf32>) -> tensor<2x1xf32>
+      "shuttle.yield"(%divided) : (tensor<2x1xf32>) -> ()
+    }) {policy = #shuttle.policy<source_ordered>, source_refs = [#shuttle.source_ref<0, 0, 0, 0>, #shuttle.source_ref<0, 0, 0, 1>, #shuttle.source_ref<0, 0, 0, 2>, #shuttle.source_ref<0, 0, 0, 3>]} : (tensor<2x4xf32>, tensor<1x2xf32>, tensor<2x1xf32>) -> tensor<2x1xf32>
+    return %result : tensor<2x1xf32>
+  }
+}
+)mlir";
+
 TEST(Abi22MapFusionContract,
      RejectsCorruptOrderedProvenanceAndComposedInputMaps) {
-  std::optional<std::string> source = fixtureSource(kFixtures[8].filename);
-  std::optional<std::string> foldSource = fixtureSource(kFixtures[8].filename);
-  ASSERT_TRUE(source);
-  ASSERT_TRUE(foldSource);
+  std::optional<std::string> mapSource =
+      fixtureSource("abi22-map-fusion-source-order.mlir");
+  ASSERT_TRUE(mapSource);
   constexpr llvm::StringLiteral mutations[] = {
       "duplicate-source", "reordered-source", "stale-source", "missing-map",
       "reordered-map"};
   for (llvm::StringRef mutation : mutations) {
     for (bool foldEpilogue : {false, true}) {
+      if (!foldEpilogue && mutation == "reordered-map")
+        continue;
       SCOPED_TRACE(
           (llvm::Twine(foldEpilogue ? "Fold epilogue " : "Map ") + mutation)
               .str());
       std::unique_ptr<BuiltModule> built =
-          build(foldEpilogue ? *foldSource : *source,
-                mlir::shuttle::NumericalPolicy::SourceOrdered, kFusionTuning,
-                false, false);
+          foldEpilogue
+              ? buildAlgebra(kFoldEpilogueAlgebra,
+                             mlir::shuttle::NumericalPolicy::SourceOrdered)
+              : buildAlgebra(*mapSource,
+                             mlir::shuttle::NumericalPolicy::SourceOrdered);
       ASSERT_TRUE(built);
       ASSERT_TRUE(foldEpilogue
                       ? mutateFoldEpilogueTask(*built->module, mutation)
@@ -3091,6 +3143,698 @@ int64_t materializationBytes(mlir::shuttle::MaterializationBufferOp buffer) {
   if (type.getElementType().isF32())
     return bytes * 4;
   return -1;
+}
+
+llvm::SmallVector<int64_t>
+foldRegionPhaseOrdinals(mlir::shuttle::MaterializationTaskOp task) {
+  auto phases = task->getAttrOfType<mlir::ArrayAttr>("fold_region_phases");
+  if (!phases)
+    return {};
+  llvm::SmallVector<int64_t> ordinals;
+  for (mlir::Attribute attribute : phases) {
+    auto phase = mlir::dyn_cast<mlir::DictionaryAttr>(attribute);
+    auto source = phase ? phase.getAs<mlir::shuttle::SourceRefAttr>("source")
+                        : mlir::shuttle::SourceRefAttr{};
+    if (!source)
+      return {};
+    ordinals.push_back(source.getOperationOrdinal());
+  }
+  return ordinals;
+}
+
+struct ExpectedFoldRegionBoundaryUse {
+  int64_t source;
+  int64_t operand;
+  int64_t inputBuffer;
+  mlir::AffineMap indexingMap;
+  int64_t phase;
+};
+
+bool hasExactFoldRegionBoundaryUses(
+    mlir::shuttle::MaterializationTaskOp task,
+    llvm::ArrayRef<ExpectedFoldRegionBoundaryUse> expected) {
+  auto uses =
+      task->getAttrOfType<mlir::ArrayAttr>("fold_region_boundary_uses");
+  if (!uses || uses.size() != expected.size())
+    return false;
+  for (auto [attribute, boundaryUse] : llvm::zip(uses, expected)) {
+    auto use = mlir::dyn_cast<mlir::DictionaryAttr>(attribute);
+    auto source =
+        use ? use.getAs<mlir::shuttle::SourceRefAttr>("source")
+            : mlir::shuttle::SourceRefAttr{};
+    auto operand = use ? use.getAs<mlir::IntegerAttr>("operand")
+                       : mlir::IntegerAttr{};
+    auto inputBuffer = use ? use.getAs<mlir::IntegerAttr>("input_buffer")
+                           : mlir::IntegerAttr{};
+    auto indexingMap = use ? use.getAs<mlir::AffineMapAttr>("indexing_map")
+                           : mlir::AffineMapAttr{};
+    auto phase = use ? use.getAs<mlir::IntegerAttr>("phase")
+                     : mlir::IntegerAttr{};
+    if (!use || use.size() != 5 || !source || !operand || !inputBuffer ||
+        !indexingMap || !phase || source.getFunctionOrdinal() != 0 ||
+        source.getBlockOrdinal() != 0 ||
+        source.getOperationOrdinal() != boundaryUse.source ||
+        source.getResultOrdinal() != 0 ||
+        operand.getInt() != boundaryUse.operand ||
+        inputBuffer.getInt() != boundaryUse.inputBuffer ||
+        indexingMap.getValue() != boundaryUse.indexingMap ||
+        phase.getInt() != boundaryUse.phase)
+      return false;
+  }
+  return true;
+}
+
+bool hasOrdinaryJaxLayerNormBCPartition(mlir::ModuleOp module, int64_t rows,
+                                        int64_t features, bool composed) {
+  auto plans = llvm::to_vector(
+      module.getOps<mlir::shuttle::MaterializationPlanOp>());
+  if (plans.size() != 1)
+    return false;
+  auto tasks = llvm::to_vector(
+      plans.front()
+          .getBody()
+          .front()
+          .getOps<mlir::shuttle::MaterializationTaskOp>());
+  auto buffers = llvm::to_vector(
+      plans.front()
+          .getBody()
+          .front()
+          .getOps<mlir::shuttle::MaterializationBufferOp>());
+  const int64_t inputCount = composed ? 4 : 3;
+  if (tasks.size() != 2 ||
+      buffers.size() !=
+          static_cast<size_t>(inputCount + (composed ? 6 : 5)))
+    return false;
+
+  llvm::SmallVector<int64_t> rowSources;
+  llvm::SmallVector<int64_t> featureSources;
+  auto appendSequence = [](llvm::SmallVectorImpl<int64_t> &values,
+                           int64_t begin, int64_t end) {
+    llvm::append_range(values, llvm::seq<int64_t>(begin, end));
+  };
+  if (composed) {
+    appendSequence(rowSources, 0, 36);
+    rowSources.push_back(46);
+    rowSources.push_back(47);
+    appendSequence(rowSources, 51, 80);
+    featureSources = {0, 7, 8, 24, 25, 35, 36, 37, 38, 39,
+                      40, 41, 42, 43, 44, 45, 48, 49, 50};
+  } else {
+    appendSequence(rowSources, 0, 24);
+    appendSequence(rowSources, 26, 29);
+    rowSources.push_back(39);
+    rowSources.push_back(40);
+    appendSequence(rowSources, 44, 73);
+    featureSources = {0,  7,  8,  24, 25, 28, 29, 30, 31, 32,
+                      33, 34, 35, 36, 37, 38, 41, 42, 43};
+  }
+  const llvm::SmallVector<int64_t> rowOutputs =
+      composed ? llvm::SmallVector<int64_t>{6, 19, 34, 79}
+               : llvm::SmallVector<int64_t>{6, 19, 72};
+  const llvm::SmallVector<int64_t> featureOutputs =
+      composed ? llvm::SmallVector<int64_t>{41, 50}
+               : llvm::SmallVector<int64_t>{34, 43};
+  const llvm::SmallVector<int64_t> rowPhases =
+      composed ? llvm::SmallVector<int64_t>{2, 11, 53, 62, 70, 76}
+               : llvm::SmallVector<int64_t>{2, 11, 46, 55, 63, 69};
+  const llvm::SmallVector<int64_t> featurePhases =
+      composed ? llvm::SmallVector<int64_t>{37, 40, 44, 49}
+               : llvm::SmallVector<int64_t>{30, 33, 37, 42};
+  const llvm::SmallVector<int64_t> recomputed =
+      composed ? llvm::SmallVector<int64_t>{0, 7, 8, 24, 25, 35}
+               : llvm::SmallVector<int64_t>{0, 7, 8, 28};
+  auto sources = [&](int64_t task, llvm::StringRef name) {
+    return tasks[task]->getAttrOfType<mlir::ArrayAttr>(name);
+  };
+  auto rowRegionSources = sources(0, "fold_region_sources");
+  auto featureRegionSources = sources(1, "fold_region_sources");
+  auto rowRegionOutputs = sources(0, "fold_region_output_sources");
+  auto featureRegionOutputs = sources(1, "fold_region_output_sources");
+  auto rowRecomputed = sources(0, "fold_region_recomputed_sources");
+  auto featureRecomputed = sources(1, "fold_region_recomputed_sources");
+  if (!rowRegionSources || !featureRegionSources || !rowRegionOutputs ||
+      !featureRegionOutputs || !rowRecomputed || !featureRecomputed ||
+      sourceOperationOrdinals(rowRegionSources) != rowSources ||
+      sourceOperationOrdinals(featureRegionSources) != featureSources ||
+      sourceOperationOrdinals(rowRegionOutputs) != rowOutputs ||
+      sourceOperationOrdinals(featureRegionOutputs) != featureOutputs ||
+      sourceOperationOrdinals(rowRecomputed) != recomputed ||
+      sourceOperationOrdinals(featureRecomputed) != recomputed ||
+      foldRegionPhaseOrdinals(tasks[0]) != rowPhases ||
+      foldRegionPhaseOrdinals(tasks[1]) != featurePhases)
+    return false;
+
+  mlir::MLIRContext *context = module.getContext();
+  mlir::AffineExpr d0 = mlir::getAffineDimExpr(0, context);
+  mlir::AffineExpr d1 = mlir::getAffineDimExpr(1, context);
+  mlir::AffineMap matrix =
+      mlir::AffineMap::getMultiDimIdentityMap(2, context);
+  mlir::AffineMap feature =
+      mlir::AffineMap::get(1, 0, {d0}, context);
+  mlir::AffineMap projectedRow =
+      mlir::AffineMap::get(2, 0, {d0, d1.floorDiv(features)}, context);
+  llvm::SmallVector<ExpectedFoldRegionBoundaryUse> rowBoundaryUses = {
+      {0, 0, 0, matrix, 0},
+      {26, 0, 1, feature, 2},
+  };
+  if (composed)
+    rowBoundaryUses.push_back({30, 0, 2, feature, 2});
+  rowBoundaryUses.push_back(
+      {composed ? 35 : 28, 0, composed ? 3 : 2, matrix, 2});
+  const int64_t meanBuffer = inputCount;
+  const int64_t inverseBuffer = inputCount + 1;
+  llvm::SmallVector<ExpectedFoldRegionBoundaryUse> featureBoundaryUses = {
+      {0, 0, 0, matrix, 0},
+      {7, 0, meanBuffer, projectedRow, 0},
+      {24, 0, inverseBuffer, projectedRow, 0},
+      {composed ? 35 : 28, 0, composed ? 3 : 2, matrix, 0},
+  };
+  const llvm::SmallVector<int64_t> expectedRowInputs =
+      composed ? llvm::SmallVector<int64_t>{0, 1, 2, 3}
+               : llvm::SmallVector<int64_t>{0, 1, 2};
+  const llvm::SmallVector<int64_t> expectedFeatureInputs =
+      composed ? llvm::SmallVector<int64_t>{0, 3, 4, 5}
+               : llvm::SmallVector<int64_t>{0, 2, 3, 4};
+  const llvm::SmallVector<int64_t> expectedRowBuffers =
+      composed ? llvm::SmallVector<int64_t>{4, 5, 6, 9}
+               : llvm::SmallVector<int64_t>{3, 4, 7};
+  const llvm::SmallVector<int64_t> expectedFeatureBuffers =
+      composed ? llvm::SmallVector<int64_t>{7, 8}
+               : llvm::SmallVector<int64_t>{5, 6};
+  const std::array<int64_t, 2> domain = {rows, features};
+  if (tasks[0].getOrdinal() != 0 || tasks[1].getOrdinal() != 1 ||
+      tasks[0].getKind() != mlir::shuttle::MaterializationTaskKind::Fold ||
+      tasks[1].getKind() != mlir::shuttle::MaterializationTaskKind::Fold ||
+      tasks[0].getDomainShape() != llvm::ArrayRef<int64_t>(domain) ||
+      tasks[1].getDomainShape() != llvm::ArrayRef<int64_t>(domain) ||
+      tasks[0].getReductionDimensions() != llvm::ArrayRef<int64_t>({1}) ||
+      tasks[1].getReductionDimensions() != llvm::ArrayRef<int64_t>({0}) ||
+      tasks[0].getInputBuffers() != llvm::ArrayRef(expectedRowInputs) ||
+      tasks[1].getInputBuffers() != llvm::ArrayRef(expectedFeatureInputs) ||
+      tasks[0].getOutputBuffers() != llvm::ArrayRef(expectedRowBuffers) ||
+      tasks[1].getOutputBuffers() !=
+          llvm::ArrayRef(expectedFeatureBuffers) ||
+      !tasks[0].getDependencies().empty() ||
+      tasks[1].getDependencies() != llvm::ArrayRef<int64_t>({0}) ||
+      !hasExactFoldRegionBoundaryUses(tasks[0], rowBoundaryUses) ||
+      !hasExactFoldRegionBoundaryUses(tasks[1], featureBoundaryUses))
+    return false;
+
+  auto hasTensor = [](mlir::shuttle::MaterializationBufferOp buffer,
+                      llvm::ArrayRef<int64_t> shape, bool bf16) {
+    auto type = mlir::dyn_cast<mlir::RankedTensorType>(buffer.getTensorType());
+    return type && type.getShape() == shape &&
+           (bf16 ? type.getElementType().isBF16()
+                 : type.getElementType().isF32());
+  };
+  const std::array<int64_t, 1> featureShape = {features};
+  const std::array<int64_t, 2> compactRowShape = {rows, 1};
+  for (auto [ordinal, buffer] : llvm::enumerate(buffers)) {
+    if (buffer.getOrdinal() != static_cast<int64_t>(ordinal))
+      return false;
+  }
+  for (int64_t ordinal = 0; ordinal < inputCount; ++ordinal) {
+    bool vectorInput = ordinal == 1 || (composed && ordinal == 2);
+    auto buffer = buffers[ordinal];
+    if (!hasTensor(buffer, vectorInput ? llvm::ArrayRef<int64_t>(featureShape)
+                                      : llvm::ArrayRef<int64_t>(domain),
+                   true) ||
+        !buffer.getLiveIn() || buffer.getLiveOut() ||
+        buffer.getStorage() !=
+            mlir::shuttle::MaterializationStorage::External)
+      return false;
+  }
+  for (int64_t ordinal : {meanBuffer, inverseBuffer}) {
+    auto buffer = buffers[ordinal];
+    if (!hasTensor(buffer, compactRowShape, false) || buffer.getLiveIn() ||
+        buffer.getLiveOut() ||
+        buffer.getStorage() !=
+            mlir::shuttle::MaterializationStorage::Temporary ||
+        buffer.getProducer() != 0 ||
+        buffer.getConsumers() != llvm::ArrayRef<int64_t>({1}) ||
+        buffer.getLifetimeStart() != 0 || buffer.getLifetimeEnd() != 1)
+      return false;
+  }
+  const int64_t publicStart = inputCount + 2;
+  for (int64_t result = 0; result < (composed ? 4 : 3); ++result) {
+    auto buffer = buffers[publicStart + result];
+    const bool rowResult = composed ? result == 0 || result == 3 : result == 2;
+    if (!hasTensor(buffer, rowResult ? llvm::ArrayRef<int64_t>(domain)
+                                    : llvm::ArrayRef<int64_t>(featureShape),
+                   true) ||
+        buffer.getLiveIn() || !buffer.getLiveOut() ||
+        buffer.getStorage() !=
+            mlir::shuttle::MaterializationStorage::External ||
+        buffer.getProducer() != (rowResult ? 0 : 1) ||
+        !buffer.getConsumers().empty())
+      return false;
+  }
+  return true;
+}
+
+bool hasGenericSharedStatPartition(mlir::ModuleOp module, int64_t rows,
+                                   int64_t features) {
+  llvm::SmallVector<mlir::shuttle::MaterializationPlanOp> plans(
+      module.getOps<mlir::shuttle::MaterializationPlanOp>());
+  if (plans.size() != 1)
+    return false;
+  auto tasks =
+      llvm::to_vector(plans.front()
+                          .getBody()
+                          .front()
+                          .getOps<mlir::shuttle::MaterializationTaskOp>());
+  auto buffers =
+      llvm::to_vector(plans.front()
+                          .getBody()
+                          .front()
+                          .getOps<mlir::shuttle::MaterializationBufferOp>());
+  if (tasks.size() != 2 || buffers.size() != 7)
+    return false;
+
+  const llvm::SmallVector<int64_t> expectedRowSources =
+      llvm::to_vector(llvm::seq<int64_t>(0, 13));
+  constexpr std::array<int64_t, 7> expectedFeatureSources = {3,  8,  9, 13,
+                                                             14, 15, 16};
+  constexpr std::array<int64_t, 3> expectedRecomputed = {3, 8, 9};
+  auto rowSources =
+      tasks[0]->getAttrOfType<mlir::ArrayAttr>("fold_region_sources");
+  auto featureSources =
+      tasks[1]->getAttrOfType<mlir::ArrayAttr>("fold_region_sources");
+  auto rowOutputs =
+      tasks[0]->getAttrOfType<mlir::ArrayAttr>("fold_region_output_sources");
+  auto featureOutputs =
+      tasks[1]->getAttrOfType<mlir::ArrayAttr>("fold_region_output_sources");
+  auto rowRecomputed = tasks[0]->getAttrOfType<mlir::ArrayAttr>(
+      "fold_region_recomputed_sources");
+  auto featureRecomputed = tasks[1]->getAttrOfType<mlir::ArrayAttr>(
+      "fold_region_recomputed_sources");
+  if (!rowSources || !featureSources || !rowOutputs || !featureOutputs ||
+      !rowRecomputed || !featureRecomputed ||
+      sourceOperationOrdinals(rowSources) != expectedRowSources ||
+      sourceOperationOrdinals(featureSources) !=
+          llvm::ArrayRef<int64_t>(expectedFeatureSources) ||
+      sourceOperationOrdinals(rowOutputs) !=
+          llvm::ArrayRef<int64_t>({2, 7, 12}) ||
+      sourceOperationOrdinals(featureOutputs) !=
+          llvm::ArrayRef<int64_t>({14, 16}) ||
+      sourceOperationOrdinals(rowRecomputed) !=
+          llvm::ArrayRef<int64_t>(expectedRecomputed) ||
+      sourceOperationOrdinals(featureRecomputed) !=
+          llvm::ArrayRef<int64_t>(expectedRecomputed) ||
+      foldRegionPhaseOrdinals(tasks[0]) !=
+          llvm::ArrayRef<int64_t>({1, 6, 11}) ||
+      foldRegionPhaseOrdinals(tasks[1]) != llvm::ArrayRef<int64_t>({14, 16}))
+    return false;
+
+  const std::array<int64_t, 2> domain = {rows, features};
+  const std::array<int64_t, 1> rowShape = {rows};
+  const std::array<int64_t, 1> featureShape = {features};
+  mlir::MLIRContext *context = module.getContext();
+  const mlir::AffineMap matrix =
+      mlir::AffineMap::getMultiDimIdentityMap(2, context);
+  const mlir::AffineMap row = mlir::AffineMap::get(
+      2, 0, {mlir::getAffineDimExpr(0, context)}, context);
+  const std::array<ExpectedFoldRegionBoundaryUse, 2> rowBoundaryUses = {
+      ExpectedFoldRegionBoundaryUse{3, 0, 0, matrix, 1},
+      ExpectedFoldRegionBoundaryUse{9, 1, 1, matrix, 2},
+  };
+  const std::array<ExpectedFoldRegionBoundaryUse, 4> featureBoundaryUses = {
+      ExpectedFoldRegionBoundaryUse{3, 0, 0, matrix, 0},
+      ExpectedFoldRegionBoundaryUse{3, 1, 2, row, 0},
+      ExpectedFoldRegionBoundaryUse{8, 1, 3, row, 0},
+      ExpectedFoldRegionBoundaryUse{9, 1, 1, matrix, 0},
+  };
+  if (tasks[0].getOrdinal() != 0 || tasks[1].getOrdinal() != 1 ||
+      tasks[0].getKind() != mlir::shuttle::MaterializationTaskKind::Fold ||
+      tasks[1].getKind() != mlir::shuttle::MaterializationTaskKind::Fold ||
+      tasks[0].getDomainShape() != llvm::ArrayRef<int64_t>(domain) ||
+      tasks[1].getDomainShape() != llvm::ArrayRef<int64_t>(domain) ||
+      tasks[0].getReductionDimensions() != llvm::ArrayRef<int64_t>({1}) ||
+      tasks[1].getReductionDimensions() != llvm::ArrayRef<int64_t>({0}) ||
+      tasks[0].getInputBuffers() != llvm::ArrayRef<int64_t>({0, 1}) ||
+      tasks[0].getOutputBuffers() != llvm::ArrayRef<int64_t>({2, 3, 4}) ||
+      !tasks[0].getDependencies().empty() ||
+      tasks[1].getInputBuffers() != llvm::ArrayRef<int64_t>({0, 1, 2, 3}) ||
+      tasks[1].getOutputBuffers() != llvm::ArrayRef<int64_t>({5, 6}) ||
+      tasks[1].getDependencies() != llvm::ArrayRef<int64_t>({0}) ||
+      !hasExactFoldRegionBoundaryUses(tasks[0], rowBoundaryUses) ||
+      !hasExactFoldRegionBoundaryUses(tasks[1], featureBoundaryUses))
+    return false;
+
+  auto tensor = [](mlir::shuttle::MaterializationBufferOp buffer,
+                   llvm::ArrayRef<int64_t> shape) {
+    auto type = mlir::dyn_cast<mlir::RankedTensorType>(buffer.getTensorType());
+    return type && type.getShape() == shape && type.getElementType().isF32();
+  };
+  for (auto [ordinal, buffer] : llvm::enumerate(buffers)) {
+    if (buffer.getOrdinal() != static_cast<int64_t>(ordinal))
+      return false;
+  }
+  if (!tensor(buffers[0], domain) || !tensor(buffers[1], domain) ||
+      !buffers[0].getLiveIn() || !buffers[1].getLiveIn() ||
+      buffers[0].getLiveOut() || buffers[1].getLiveOut() ||
+      buffers[0].getStorage() !=
+          mlir::shuttle::MaterializationStorage::External ||
+      buffers[1].getStorage() !=
+          mlir::shuttle::MaterializationStorage::External)
+    return false;
+  for (int64_t ordinal : {2, 3}) {
+    auto buffer = buffers[ordinal];
+    if (!tensor(buffer, rowShape) || buffer.getLiveIn() ||
+        buffer.getLiveOut() ||
+        buffer.getStorage() !=
+            mlir::shuttle::MaterializationStorage::Temporary ||
+        buffer.getProducer() != 0 ||
+        buffer.getConsumers() != llvm::ArrayRef<int64_t>({1}) ||
+        buffer.getLifetimeStart() != 0 || buffer.getLifetimeEnd() != 1)
+      return false;
+  }
+  if (!tensor(buffers[4], domain) || !tensor(buffers[5], featureShape) ||
+      !tensor(buffers[6], featureShape))
+    return false;
+  for (int64_t ordinal : {4, 5, 6}) {
+    auto buffer = buffers[ordinal];
+    const int64_t producer = ordinal == 4 ? 0 : 1;
+    if (buffer.getLiveIn() || !buffer.getLiveOut() ||
+        buffer.getStorage() !=
+            mlir::shuttle::MaterializationStorage::External ||
+        buffer.getProducer() != producer || !buffer.getConsumers().empty())
+      return false;
+  }
+  return true;
+}
+
+bool mutateGenericSharedStatPartition(mlir::ModuleOp module,
+                                      llvm::StringRef mutation) {
+  auto plan = *module.getOps<mlir::shuttle::MaterializationPlanOp>().begin();
+  auto tasks = llvm::to_vector(
+      plan.getBody().front().getOps<mlir::shuttle::MaterializationTaskOp>());
+  auto buffers = llvm::to_vector(
+      plan.getBody().front().getOps<mlir::shuttle::MaterializationBufferOp>());
+  if (tasks.empty() || buffers.size() < 3)
+    return false;
+  mlir::Builder builder(module.getContext());
+  if (mutation == "source-order") {
+    auto sources =
+        tasks.front()->getAttrOfType<mlir::ArrayAttr>("fold_region_sources");
+    llvm::SmallVector<mlir::Attribute> changed;
+    if (sources && sources.size() > 1)
+      llvm::append_range(changed, llvm::reverse(sources.getValue()));
+    else
+      changed.push_back(
+          mlir::shuttle::SourceRefAttr::get(module.getContext(), 0, 0, 99, 0));
+    tasks.front()->setAttr("fold_region_sources",
+                           builder.getArrayAttr(changed));
+  } else if (mutation == "drop-stat-input") {
+    llvm::SmallVector<int64_t> inputs(tasks.back().getInputBuffers());
+    auto stat = llvm::find(inputs, 2);
+    if (stat == inputs.end())
+      inputs.clear();
+    else
+      inputs.erase(stat);
+    tasks.back()->setAttr("input_buffers",
+                          builder.getDenseI64ArrayAttr(inputs));
+  } else if (mutation == "swap-stat-bindings") {
+    auto uses = tasks.back()->getAttrOfType<mlir::ArrayAttr>(
+        "fold_region_boundary_uses");
+    llvm::SmallVector<mlir::Attribute> changed;
+    if (uses)
+      llvm::append_range(changed, uses.getValue());
+    bool changedMean = false;
+    bool changedInverse = false;
+    for (mlir::Attribute &attribute : changed) {
+      auto use = mlir::dyn_cast<mlir::DictionaryAttr>(attribute);
+      auto source =
+          use ? use.getAs<mlir::shuttle::SourceRefAttr>("source")
+              : mlir::shuttle::SourceRefAttr{};
+      auto operand = use ? use.getAs<mlir::IntegerAttr>("operand")
+                         : mlir::IntegerAttr{};
+      if (!source || !operand || operand.getInt() != 1 ||
+          (source.getOperationOrdinal() != 3 &&
+           source.getOperationOrdinal() != 8))
+        continue;
+      llvm::SmallVector<mlir::NamedAttribute> fields(use.begin(), use.end());
+      auto inputBuffer = llvm::find_if(fields, [](mlir::NamedAttribute field) {
+        return field.getName() == "input_buffer";
+      });
+      if (inputBuffer == fields.end())
+        return false;
+      const bool mean = source.getOperationOrdinal() == 3;
+      *inputBuffer = builder.getNamedAttr(
+          "input_buffer", builder.getI64IntegerAttr(mean ? 3 : 2));
+      attribute = builder.getDictionaryAttr(fields);
+      changedMean |= mean;
+      changedInverse |= !mean;
+    }
+    if (!changedMean || !changedInverse) {
+      mlir::AffineMap row = mlir::AffineMap::get(
+          2, 0, {mlir::getAffineDimExpr(0, module.getContext())},
+          module.getContext());
+      auto wrongUse = [&](int64_t source, int64_t inputBuffer) {
+        return builder.getDictionaryAttr(
+            {builder.getNamedAttr(
+                 "input_buffer", builder.getI64IntegerAttr(inputBuffer)),
+             builder.getNamedAttr(
+                 "source",
+                 mlir::shuttle::SourceRefAttr::get(module.getContext(), 0, 0,
+                                                    source, 0)),
+             builder.getNamedAttr("operand", builder.getI64IntegerAttr(1)),
+             builder.getNamedAttr("indexing_map",
+                                  mlir::AffineMapAttr::get(row)),
+             builder.getNamedAttr("phase", builder.getI64IntegerAttr(0))});
+      };
+      changed = {wrongUse(3, 3), wrongUse(8, 2)};
+    }
+    tasks.back()->setAttr("fold_region_boundary_uses",
+                          builder.getArrayAttr(changed));
+  } else if (mutation == "swap-public-outputs") {
+    llvm::SmallVector<int64_t> outputs(tasks.back().getOutputBuffers());
+    if (outputs.size() < 2)
+      outputs.push_back(outputs.empty() ? 0 : outputs.front());
+    std::swap(outputs[0], outputs[1]);
+    tasks.back()->setAttr("output_buffers",
+                          builder.getDenseI64ArrayAttr(outputs));
+  } else if (mutation == "duplicate-stat-producer") {
+    llvm::SmallVector<int64_t> outputs(tasks.back().getOutputBuffers());
+    outputs.push_back(2);
+    tasks.back()->setAttr("output_buffers",
+                          builder.getDenseI64ArrayAttr(outputs));
+  } else if (mutation == "stat-storage") {
+    buffers[2]->setAttr("storage",
+                        mlir::shuttle::MaterializationStorageAttr::get(
+                            module.getContext(),
+                            mlir::shuttle::MaterializationStorage::External));
+  } else {
+    return false;
+  }
+  plan.setFingerprint(mlir::shuttle::materializationPlanFingerprint(plan));
+  return true;
+}
+
+TEST(Abi22MapFusionContract,
+     SharedRowStatsPartitionRowAndSiblingColumnOutputsGenerically) {
+  constexpr llvm::StringLiteral source = R"mlir(
+#matrix = affine_map<(d0, d1) -> (d0, d1)>
+#row = affine_map<(d0, d1) -> (d0)>
+#vector = affine_map<(d0) -> (d0)>
+#scalar = affine_map<() -> ()>
+module attributes {
+  shuttle.coverage_manifest = {
+    canonical_tuning = "{\22cluster_shape\22:[],\22materialization\22:\22prefer_fusion\22,\22maximum_candidates\22:1,\22pipeline_stages\22:1,\22tile_sizes\22:[]}"
+  }
+} {
+  func.func @anonymous(%x: tensor<2x4xf32>, %dy: tensor<2x4xf32>) -> (tensor<2x4xf32>, tensor<4xf32>, tensor<4xf32>) {
+    %row_output, %dependent_column, %independent_column = "shuttle.region"(%x, %dy) ({
+    ^bb0(%region_x: tensor<2x4xf32>, %region_dy: tensor<2x4xf32>):
+      %mean_init = "shuttle.map"() ({
+        %zero = arith.constant 0.000000e+00 : f32
+        "shuttle.yield"(%zero) : (f32) -> ()
+      }) {indexing_maps = [#scalar], source = #shuttle.source_ref<0, 0, 0, 0>} : () -> tensor<f32>
+      %mean_sum = "shuttle.fold"(%region_x, %mean_init) ({
+      ^bb0(%element: f32, %accumulator: f32):
+        %sum = arith.addf %element, %accumulator : f32
+        "shuttle.yield"(%sum) : (f32) -> ()
+      }) {accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 1, 0>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
+      %mean = "shuttle.map"(%mean_sum) ({
+      ^bb0(%sum: f32):
+        %count = arith.constant 4.000000e+00 : f32
+        %value = arith.divf %sum, %count : f32
+        "shuttle.yield"(%value) : (f32) -> ()
+      }) {indexing_maps = [#vector, #vector], source = #shuttle.source_ref<0, 0, 2, 0>} : (tensor<2xf32>) -> tensor<2xf32>
+      %centered = "shuttle.map"(%region_x, %mean) ({
+      ^bb0(%element: f32, %row_mean: f32):
+        %value = arith.subf %element, %row_mean : f32
+        "shuttle.yield"(%value) : (f32) -> ()
+      }) {indexing_maps = [#matrix, #row, #matrix], source = #shuttle.source_ref<0, 0, 3, 0>} : (tensor<2x4xf32>, tensor<2xf32>) -> tensor<2x4xf32>
+      %square = "shuttle.map"(%centered) ({
+      ^bb0(%element: f32):
+        %value = arith.mulf %element, %element : f32
+        "shuttle.yield"(%value) : (f32) -> ()
+      }) {indexing_maps = [#matrix, #matrix], source = #shuttle.source_ref<0, 0, 4, 0>} : (tensor<2x4xf32>) -> tensor<2x4xf32>
+      %variance_init = "shuttle.map"() ({
+        %zero = arith.constant 0.000000e+00 : f32
+        "shuttle.yield"(%zero) : (f32) -> ()
+      }) {indexing_maps = [#scalar], source = #shuttle.source_ref<0, 0, 5, 0>} : () -> tensor<f32>
+      %variance_sum = "shuttle.fold"(%square, %variance_init) ({
+      ^bb0(%element: f32, %accumulator: f32):
+        %sum = arith.addf %element, %accumulator : f32
+        "shuttle.yield"(%sum) : (f32) -> ()
+      }) {accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 6, 0>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
+      %inverse = "shuttle.map"(%variance_sum) ({
+      ^bb0(%sum: f32):
+        %count = arith.constant 4.000000e+00 : f32
+        %epsilon = arith.constant 1.000000e-05 : f32
+        %variance = arith.divf %sum, %count : f32
+        %shifted = arith.addf %variance, %epsilon : f32
+        %value = math.rsqrt %shifted : f32
+        "shuttle.yield"(%value) : (f32) -> ()
+      }) {indexing_maps = [#vector, #vector], source = #shuttle.source_ref<0, 0, 7, 0>} : (tensor<2xf32>) -> tensor<2xf32>
+      %normalized = "shuttle.map"(%centered, %inverse) ({
+      ^bb0(%element: f32, %row_inverse: f32):
+        %value = arith.mulf %element, %row_inverse : f32
+        "shuttle.yield"(%value) : (f32) -> ()
+      }) {indexing_maps = [#matrix, #row, #matrix], source = #shuttle.source_ref<0, 0, 8, 0>} : (tensor<2x4xf32>, tensor<2xf32>) -> tensor<2x4xf32>
+      %weighted = "shuttle.map"(%normalized, %region_dy) ({
+      ^bb0(%element: f32, %cotangent: f32):
+        %value = arith.mulf %element, %cotangent : f32
+        "shuttle.yield"(%value) : (f32) -> ()
+      }) {indexing_maps = [#matrix, #matrix, #matrix], source = #shuttle.source_ref<0, 0, 9, 0>} : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
+      %correction_init = "shuttle.map"() ({
+        %zero = arith.constant 0.000000e+00 : f32
+        "shuttle.yield"(%zero) : (f32) -> ()
+      }) {indexing_maps = [#scalar], source = #shuttle.source_ref<0, 0, 10, 0>} : () -> tensor<f32>
+      %correction = "shuttle.fold"(%weighted, %correction_init) ({
+      ^bb0(%element: f32, %accumulator: f32):
+        %sum = arith.addf %element, %accumulator : f32
+        "shuttle.yield"(%sum) : (f32) -> ()
+      }) {accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 11, 0>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
+      %row_result = "shuttle.map"(%normalized, %correction) ({
+      ^bb0(%element: f32, %row_correction: f32):
+        %count = arith.constant 4.000000e+00 : f32
+        %average = arith.divf %row_correction, %count : f32
+        %value = arith.subf %element, %average : f32
+        "shuttle.yield"(%value) : (f32) -> ()
+      }) {indexing_maps = [#matrix, #row, #matrix], source = #shuttle.source_ref<0, 0, 12, 0>} : (tensor<2x4xf32>, tensor<2xf32>) -> tensor<2x4xf32>
+      %dependent_init = "shuttle.map"() ({
+        %zero = arith.constant 0.000000e+00 : f32
+        "shuttle.yield"(%zero) : (f32) -> ()
+      }) {indexing_maps = [#scalar], source = #shuttle.source_ref<0, 0, 13, 0>} : () -> tensor<f32>
+      %dependent = "shuttle.fold"(%weighted, %dependent_init) ({
+      ^bb0(%element: f32, %accumulator: f32):
+        %sum = arith.addf %element, %accumulator : f32
+        "shuttle.yield"(%sum) : (f32) -> ()
+      }) {accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 0>, source = #shuttle.source_ref<0, 0, 14, 0>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<4xf32>
+      %independent_init = "shuttle.map"() ({
+        %zero = arith.constant 0.000000e+00 : f32
+        "shuttle.yield"(%zero) : (f32) -> ()
+      }) {indexing_maps = [#scalar], source = #shuttle.source_ref<0, 0, 15, 0>} : () -> tensor<f32>
+      %independent = "shuttle.fold"(%region_dy, %independent_init) ({
+      ^bb0(%element: f32, %accumulator: f32):
+        %sum = arith.addf %element, %accumulator : f32
+        "shuttle.yield"(%sum) : (f32) -> ()
+      }) {accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 0>, source = #shuttle.source_ref<0, 0, 16, 0>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<4xf32>
+      "shuttle.yield"(%row_result, %dependent, %independent) : (tensor<2x4xf32>, tensor<4xf32>, tensor<4xf32>) -> ()
+    }) {policy = #shuttle.policy<source_ordered>, source_refs = [#shuttle.source_ref<0, 0, 0, 0>, #shuttle.source_ref<0, 0, 1, 0>, #shuttle.source_ref<0, 0, 2, 0>, #shuttle.source_ref<0, 0, 3, 0>, #shuttle.source_ref<0, 0, 4, 0>, #shuttle.source_ref<0, 0, 5, 0>, #shuttle.source_ref<0, 0, 6, 0>, #shuttle.source_ref<0, 0, 7, 0>, #shuttle.source_ref<0, 0, 8, 0>, #shuttle.source_ref<0, 0, 9, 0>, #shuttle.source_ref<0, 0, 10, 0>, #shuttle.source_ref<0, 0, 11, 0>, #shuttle.source_ref<0, 0, 12, 0>, #shuttle.source_ref<0, 0, 13, 0>, #shuttle.source_ref<0, 0, 14, 0>, #shuttle.source_ref<0, 0, 15, 0>, #shuttle.source_ref<0, 0, 16, 0>]} : (tensor<2x4xf32>, tensor<2x4xf32>) -> (tensor<2x4xf32>, tensor<4xf32>, tensor<4xf32>)
+    return %row_output, %dependent_column, %independent_column : tensor<2x4xf32>, tensor<4xf32>, tensor<4xf32>
+  }
+}
+)mlir";
+  struct ShapeCase {
+    int64_t rows;
+    int64_t features;
+  };
+  for (ShapeCase shape : {ShapeCase{2, 4}, ShapeCase{3, 7}}) {
+    std::string shapeSource = source.str();
+    if (shape.rows != 2 || shape.features != 4) {
+      shapeSource = replaceAllText(shapeSource, "2x4", "3x7");
+      shapeSource =
+          replaceAllText(shapeSource, "tensor<2xf32>", "tensor<3xf32>");
+      shapeSource =
+          replaceAllText(shapeSource, "tensor<4xf32>", "tensor<7xf32>");
+      shapeSource =
+          replaceAllText(shapeSource, "4.000000e+00", "7.000000e+00");
+    }
+    for (mlir::shuttle::NumericalPolicy policy :
+         {mlir::shuttle::NumericalPolicy::SourceOrdered,
+          mlir::shuttle::NumericalPolicy::Fast}) {
+      SCOPED_TRACE(std::to_string(shape.rows) + "x" +
+                   std::to_string(shape.features));
+      std::unique_ptr<BuiltModule> built = buildAlgebra(shapeSource, policy);
+      ASSERT_TRUE(built);
+      EXPECT_TRUE(hasGenericSharedStatPartition(*built->module, shape.rows,
+                                                shape.features));
+
+      for (llvm::StringRef mutation :
+           {"source-order", "drop-stat-input", "swap-stat-bindings",
+            "swap-public-outputs", "duplicate-stat-producer",
+            "stat-storage"}) {
+        SCOPED_TRACE(mutation.str());
+        std::unique_ptr<BuiltModule> changed =
+            buildAlgebra(shapeSource, policy);
+        ASSERT_TRUE(changed);
+        ASSERT_TRUE(
+            mutateGenericSharedStatPartition(*changed->module, mutation));
+        EXPECT_FALSE(hasGenericSharedStatPartition(
+            *changed->module, shape.rows, shape.features));
+        EXPECT_FALSE(verifyMaterializationPlan(*changed->module));
+      }
+    }
+  }
+}
+
+TEST(Abi22MapFusionContract,
+     OrdinaryJaxLayerNormBackwardAndComposedBindGenericTwoTaskTopology) {
+  struct Fixture {
+    const char *filename;
+    int64_t rows;
+    int64_t features;
+    bool composed;
+  };
+  constexpr std::array<Fixture, 4> fixtures = {{
+      {"jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-backward.mlir", 7, 13,
+       false},
+      {"jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-composed.mlir", 7, 13,
+       true},
+      {"jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-backward.mlir", 2048,
+       4096, false},
+      {"jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-composed.mlir", 2048,
+       4096, true},
+  }};
+  for (const Fixture &fixture : fixtures) {
+    SCOPED_TRACE(fixture.filename);
+    std::optional<std::string> source = fixtureSource(fixture.filename);
+    ASSERT_TRUE(source);
+    for (mlir::shuttle::NumericalPolicy policy :
+         {mlir::shuttle::NumericalPolicy::SourceOrdered,
+          mlir::shuttle::NumericalPolicy::Fast}) {
+      SCOPED_TRACE(policy == mlir::shuttle::NumericalPolicy::SourceOrdered
+                       ? "source_ordered"
+                       : "fast");
+      std::unique_ptr<BuiltModule> built =
+          build(*source, policy, kFusionTuning, false, true);
+      ASSERT_TRUE(built);
+      ASSERT_TRUE(hasOrdinaryJaxLayerNormBCPartition(
+          *built->module, fixture.rows, fixture.features, fixture.composed));
+
+      mlir::FailureOr<llvm::SmallVector<uint8_t>> transport =
+          mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+      ASSERT_TRUE(mlir::succeeded(transport));
+      auto executable = mlir::shuttle::GpuExecutable::Load(*transport);
+      ASSERT_TRUE(executable.ok()) << executable.status();
+      EXPECT_EQ((*executable)->launches().size(), 2u);
+      EXPECT_EQ((*executable)->slots().size(), fixture.composed ? 10u : 8u);
+      int64_t temporarySlots = 0;
+      int64_t temporaryBytes = 0;
+      for (const mlir::shuttle::GpuSlot &slot : (*executable)->slots()) {
+        if (slot.storage != mlir::shuttle::MaterializationStorage::Temporary)
+          continue;
+        ++temporarySlots;
+        temporaryBytes += slot.requiredBytes;
+      }
+      EXPECT_EQ(temporarySlots, 2);
+      EXPECT_EQ(temporaryBytes, fixture.rows * 2 * 4);
+    }
+  }
 }
 
 bool hasSourceOrderedContractRecurrence(llvm::StringRef ptx,

@@ -916,6 +916,8 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
     }
     const bool hasFoldRegionSources = task->hasAttr("fold_region_sources");
     const bool hasFoldRegionPhases = task->hasAttr("fold_region_phases");
+    const bool hasFoldRegionOutputSources =
+        task->hasAttr("fold_region_output_sources");
     const bool hasFoldRegionBoundaryUses =
         task->hasAttr("fold_region_boundary_uses");
     const bool hasFoldRegionRecomputedSources =
@@ -937,7 +939,8 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
     const bool hasContractRegionCost = task->hasAttr("contract_region_cost");
     const bool hasContractRegionRecomputed =
         task->hasAttr("contract_region_recomputed_sources");
-    if ((hasFoldRegionPhases || hasFoldRegionBoundaryUses ||
+    if ((hasFoldRegionPhases || hasFoldRegionOutputSources ||
+         hasFoldRegionBoundaryUses ||
          hasFoldRegionRecomputedSources) &&
         !hasFoldRegionSources) {
       return task.emitOpError(
@@ -968,22 +971,25 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
       if (foldRegionSources) {
         ++foldRegionCount;
         auto phases = task->getAttrOfType<ArrayAttr>("fold_region_phases");
+        auto outputSources =
+            task->getAttrOfType<ArrayAttr>("fold_region_output_sources");
         auto boundaryUses =
             task->getAttrOfType<ArrayAttr>("fold_region_boundary_uses");
         auto recomputed =
             task->getAttrOfType<ArrayAttr>("fold_region_recomputed_sources");
         if (getSchemaVersion() != 2 || foldRegionSources.empty() || !phases ||
-            phases.empty() || !boundaryUses || boundaryUses.empty() ||
+            phases.empty() || !outputSources || outputSources.empty() ||
+            outputSources.size() != task.getOutputBuffers().size() ||
+            !boundaryUses || boundaryUses.empty() ||
             task->getAttr("fused_sources") ||
             task->getAttr("composed_input_maps") ||
             task->getAttr("fold_epilogue_sources") ||
             task->getAttr("epilogue_input_maps") ||
-            task.getInputBuffers().empty() ||
-            task.getOutputBuffers().size() != 1 ||
+            task.getInputBuffers().empty() || task.getOutputBuffers().empty() ||
             !task.getOrderFree().value_or(false)) {
           return task.emitOpError(
               "schema-v2 Fold regions require closed sources, phases, "
-              "boundary uses, and one output");
+              "boundary uses, and ordered outputs");
         }
         llvm::SmallDenseSet<Attribute> sourceSet;
         std::optional<SourceRefAttr> previousSource;
@@ -1003,6 +1009,14 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
                 "Fold region sources must be unique and source ordered");
           }
           previousSource = source;
+        }
+        llvm::SmallDenseSet<Attribute> outputSourceSet;
+        for (Attribute source : outputSources) {
+          if (!isa<SourceRefAttr>(source) || !sourceSet.contains(source) ||
+              !outputSourceSet.insert(source).second) {
+            return task.emitOpError(
+                "Fold region output sources must uniquely bind task sources");
+          }
         }
         for (auto [phaseOrdinal, attribute] : llvm::enumerate(phases)) {
           auto phase = dyn_cast<DictionaryAttr>(attribute);
