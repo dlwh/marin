@@ -41,7 +41,7 @@ def _manifest(root: Path, relative: str, payload: bytes) -> Path:
 
 def test_batch_plan_runs_xla_then_shuttle_on_one_workspace_and_device(tmp_path: Path) -> None:
     workspace = tmp_path / "work"
-    compiler_identity = "shuttle-abi22:" + "a" * 64
+    compiler_identity = f"shuttle-abi22:{'a' * 40}:{'b' * 40}:{'c' * 64}"
     plan = batch_plan(
         workspace=workspace,
         runner_repository=Path("/app"),
