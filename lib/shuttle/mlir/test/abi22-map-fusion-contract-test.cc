@@ -1959,6 +1959,29 @@ TEST(Abi22MapFusionContract,
             reinterpret_cast<const char *>(device.getCode().data() +
                                            entry.getCodeOffset()),
             entry.getCodeLength());
+        auto phases = tasks[entryOrdinal]->getAttrOfType<mlir::ArrayAttr>(
+            "fold_region_phases");
+        ASSERT_TRUE(phases);
+        auto firstPhase = mlir::cast<mlir::DictionaryAttr>(phases[0]);
+        auto domain = mlir::cast<mlir::DenseI64ArrayAttr>(
+            firstPhase.get("domain_shape"));
+        auto reduction = mlir::cast<mlir::DenseI64ArrayAttr>(
+            firstPhase.get("reduction_dimensions"));
+        int64_t reductionExtent = 1;
+        for (int64_t axis : reduction.asArrayRef())
+          reductionExtent *= domain.asArrayRef()[axis];
+        const int64_t serialTiles =
+            (reductionExtent + std::min<int64_t>(reductionExtent, 256) - 1) /
+            std::min<int64_t>(reductionExtent, 256);
+        const std::string chunkBounds =
+            (llvm::Twine("  mul.lo.u32 %r4, %r0, ") +
+             llvm::Twine(serialTiles) + ";\n  add.u32 %r7, %r4, " +
+             llvm::Twine(serialTiles) + ";\n  min.u32 %r7, %r7, " +
+             llvm::Twine(reductionExtent) +
+             ";\n  mov.f32 %f0, 0f00000000;\n$fold_region_load:\n"
+             "  setp.ge.u32 %p1, %r4, %r7;")
+                .str();
+        EXPECT_NE(ptx.find(chunkBounds), llvm::StringRef::npos);
         EXPECT_NE(ptx.find("ld.global.u16"), llvm::StringRef::npos);
         EXPECT_NE(ptx.find("cvt.f32.bf16"), llvm::StringRef::npos);
         EXPECT_NE(ptx.find("add.rn.f32"), llvm::StringRef::npos);
