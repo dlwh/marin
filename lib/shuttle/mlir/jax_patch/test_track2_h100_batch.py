@@ -9,6 +9,7 @@ import pytest
 from track2_h100_batch import (
     BASE_IMAGE,
     TRACK2_HERMETIC_CUDA_VERSION,
+    XLA_WORKSPACE_PATCH,
     BatchPaths,
     batch_plan,
     canonical_json,
@@ -58,6 +59,8 @@ def test_batch_plan_runs_xla_then_shuttle_on_one_workspace_and_device(tmp_path: 
         "xla_remote",
         "xla_fetch",
         "xla_checkout",
+        "xla_workspace_check",
+        "xla_workspace_apply",
         "bazel_fetch",
         "xla",
         "shuttle",
@@ -66,7 +69,10 @@ def test_batch_plan_runs_xla_then_shuttle_on_one_workspace_and_device(tmp_path: 
     assert phases[2]["argv"] == ["git", "remote", "add", "origin", "https://github.com/openxla/xla.git"]
     assert phases[3]["argv"][0:4] == ["git", "fetch", "--depth=1", "origin"]
     assert phases[4]["argv"] == ["git", "checkout", "--detach", "FETCH_HEAD"]
-    assert phases[5]["argv"][0:7] == [
+    expected_patch = Path("/app") / XLA_WORKSPACE_PATCH
+    assert phases[5]["argv"] == ["git", "apply", "--check", str(expected_patch)]
+    assert phases[6]["argv"] == ["git", "apply", str(expected_patch)]
+    assert phases[7]["argv"][0:7] == [
         "curl",
         "--fail",
         "--location",
@@ -75,8 +81,8 @@ def test_batch_plan_runs_xla_then_shuttle_on_one_workspace_and_device(tmp_path: 
         "--proto-redir",
         "=https",
     ]
-    xla_command = phases[6]["argv"]
-    shuttle_command = phases[7]["argv"]
+    xla_command = phases[8]["argv"]
+    shuttle_command = phases[9]["argv"]
     assert "@shuttle_mlir//:abi22_h100_xla_baseline_test" in xla_command
     assert "@shuttle_mlir//:gpu_transport_v2_h100_performance_test" in shuttle_command
     assert xla_command[0:2] == shuttle_command[0:2]
