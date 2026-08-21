@@ -200,7 +200,11 @@ def test_hydration_binds_source_tree_wheel_and_resolved_library(tmp_path: Path, 
 def test_link_closure_rejects_any_unresolved_runtime_dependency(tmp_path: Path) -> None:
     log = tmp_path / "ldd.log"
     log.write_text(
-        "libtransformer_engine.so => /tmp/runtime/libtransformer_engine.so\nlibcudnn.so.9 => /opt/cudnn/libcudnn.so.9\n"
+        "libtransformer_engine.so => /tmp/runtime/libtransformer_engine.so\n"
+        "libcublasLt.so.13 => /opt/cublas/libcublasLt.so.13\n"
+        "libcudnn.so.9 => /opt/cudnn/libcudnn.so.9\n"
+        "libnccl.so.2 => /opt/nccl/libnccl.so.2\n"
+        "libnvrtc.so.13 => /opt/nvrtc/libnvrtc.so.13\n"
     )
 
     _validate_link_closure(log)
