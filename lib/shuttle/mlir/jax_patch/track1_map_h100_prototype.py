@@ -887,6 +887,8 @@ def validate_rmsnorm_contract_result(document: object) -> dict[str, object]:
         _sha(observer["final_module_sha256"], "RMSNorm Contract final module")
         _sha(observer["generated_bundle_sha256"], "RMSNorm Contract generated bundle")
         topology = (observer["launch_count"], observer["temporary_count"])
+        if type(topology[0]) is not int or type(topology[1]) is not int:
+            raise ValueError("RMSNorm Contract bundle topology must use integers")
         if boundary == "primal":
             resources = PRIMAL_BUNDLE_SHAPES[shape]
             expected_topology = (resources["launches"], resources["temporaries"])
