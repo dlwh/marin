@@ -388,6 +388,13 @@ def test_rmsnorm_result_requires_exact_coordinate_output_and_observer_closure() 
             validate_rmsnorm_result(changed)
 
 
+def test_rmsnorm_result_survives_the_worker_canonical_json_boundary() -> None:
+    document = _rmsnorm_document()
+    reloaded = json.loads(canonical_json(document))
+
+    assert validate_rmsnorm_result(reloaded) == reloaded
+
+
 def test_rmsnorm_result_retains_disabled_jax_as_a_nonacceptance_diagnostic() -> None:
     document = _rmsnorm_document()
     disabled_sha256 = "3" * 64
