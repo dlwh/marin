@@ -16,17 +16,26 @@ from abi22_te_rmsnorm_oracle_v2 import (
     ARCHITECTURE_SHAPE,
     BOUNDARIES,
     EPSILON,
+    HELDOUT_INPUT_DIGESTS,
+    HELDOUT_PATTERN,
+    HELDOUT_REFERENCE_DIGESTS,
     INPUT_DIGESTS,
     NORM_CONTRACT_BLOCKER,
+    NUMERICAL_POLICY,
+    QUALIFICATION_PATTERN,
     REFERENCE_DIGESTS,
     REPRESENTATIVE_SHAPE,
     ValidatedTeRuntimeIdentity,
     build_matched_acceptance,
     epsilon_sensitivity,
     execute_plan,
+    execute_qualification_plan,
     execution_plan,
     prepare_cases,
+    prepare_heldout_case,
+    qualification_plan,
     validate_build_manifest,
+    validate_qualification_evidence,
     validate_report,
     validate_runtime_manifest,
 )
@@ -134,6 +143,33 @@ def _report(provider: str) -> dict:
     }
 
 
+def _qualification_evidence() -> dict:
+    cells = []
+    for provider in ("transformer_engine_2_17", "ordinary_jax_xla"):
+        for pattern in (QUALIFICATION_PATTERN, HELDOUT_PATTERN):
+            if pattern == QUALIFICATION_PATTERN:
+                input_digests = INPUT_DIGESTS[REPRESENTATIVE_SHAPE]
+                reference_digests = REFERENCE_DIGESTS[REPRESENTATIVE_SHAPE]
+            else:
+                input_digests = HELDOUT_INPUT_DIGESTS
+                reference_digests = HELDOUT_REFERENCE_DIGESTS
+            for boundary in BOUNDARIES:
+                for repeat in range(2):
+                    cell = _cell(REPRESENTATIVE_SHAPE, boundary, provider=provider)
+                    cell.update(
+                        producer=provider,
+                        input_pattern=pattern,
+                        repeat=repeat,
+                        scope="representative_policy_qualification",
+                    )
+                    cell["input_digests"] = {role: input_digests[role] for role in cell["input_digests"]}
+                    for output in cell["outputs"]:
+                        output["digest"] = reference_digests[output["role"]]
+                        output["reference_digest"] = reference_digests[output["role"]]
+                    cells.append(cell)
+    return validate_qualification_evidence({"schema": "shuttle_abi22_rmsnorm_policy_evidence_v1", "cells": cells})
+
+
 class TeRmsnormOracleV2Test(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -223,7 +259,7 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
                 "dgamma": {"max_absolute_error": 4.0, "max_bfloat16_ulp": 1},
             },
         )
-        self.assertGreater(sensitivity["y"]["max_absolute_error"], ACCEPTANCE_LIMITS["max_absolute_error"])
+        self.assertGreater(sensitivity["y"]["max_absolute_error"], ACCEPTANCE_LIMITS["y"]["max_absolute_error"])
         plan = execution_plan(
             "./abi22_te_rmsnorm_oracle_runner_v2",
             "./abi22_xla_rmsnorm_oracle_v2.py",
@@ -297,17 +333,86 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
         prepare_cases(case_root)
 
         invoked: list[list[str]] = []
-
-        def invoke(argv: list[str]) -> int:
-            invoked.append(argv)
-            return 0
-
-        execute_plan(plan, invoke)
+        execute_plan(plan, lambda argv: invoked.append(argv) or 0)
         self.assertEqual(invoked, [run["argv"] for run in plan["runs"]])
 
         for producer in ("transformer_engine_2_17", "ordinary_jax_xla"):
             with self.assertRaisesRegex(RuntimeError, producer):
                 execute_plan(plan, lambda argv, selected=producer: 7 if selected in argv[-1] else 0)
+
+    def test_role_policy_uses_a_predeclared_heldout_pattern_and_two_repeats(self) -> None:
+        self.assertEqual(
+            NUMERICAL_POLICY,
+            {
+                "schema": "shuttle_abi22_rmsnorm_role_policy_v1",
+                "patterns": ["qualification_linspace_v2", "heldout_reversed_linspace_v1"],
+                "repeat_count": 2,
+                "limits_by_role": {
+                    "y": {"max_absolute_error": 0.0078125, "max_bfloat16_ulp": 2},
+                    "dx": {"max_absolute_error": 0.0625, "max_bfloat16_ulp": 64},
+                    "dgamma": {"max_absolute_error": 0.015625, "max_bfloat16_ulp": 8},
+                },
+            },
+        )
+        self.assertEqual(
+            HELDOUT_INPUT_DIGESTS,
+            {
+                "x": "595fc9c13633ba99278591d4288b9150b1d7c71eb17bd9c5f0d4720e1762ea8b",
+                "gamma": "bc3f6002b8b4c4718db1aeee0cf2b459c18ec80aa69958d2c8945be915a409d6",
+                "dy": "237d26f9c6c048e5d3979da9e283aff46f062518d9a91ea5b74d2f8eaf80526d",
+            },
+        )
+        self.assertEqual(
+            HELDOUT_REFERENCE_DIGESTS,
+            {
+                "y": "15a4e1660f2dc93b91841a0ac8c54c90372548a4b1269a09cc9c428cdc3e98f5",
+                "dx": "d5e6be3d8cf52e4139235b9dde69a84db489a705580a376f08a613eb7beeab9a",
+                "dgamma": "06498bae527509f636aae0baa0b247e657e5f6dc1f7453cf3279e53db90664e0",
+            },
+        )
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        case_root = Path(temporary.name) / "cases"
+        prepare_cases(case_root)
+        heldout = prepare_heldout_case(case_root)
+        self.assertEqual(heldout["input_digests"], HELDOUT_INPUT_DIGESTS)
+        self.assertEqual(heldout["reference_digests"], HELDOUT_REFERENCE_DIGESTS)
+        directory = case_root / HELDOUT_PATTERN
+        for name, digest in {
+            "x.bf16": HELDOUT_INPUT_DIGESTS["x"],
+            "gamma.bf16": HELDOUT_INPUT_DIGESTS["gamma"],
+            "dy.bf16": HELDOUT_INPUT_DIGESTS["dy"],
+            "reference_y.bf16": HELDOUT_REFERENCE_DIGESTS["y"],
+            "reference_dx.bf16": HELDOUT_REFERENCE_DIGESTS["dx"],
+            "reference_dgamma.bf16": HELDOUT_REFERENCE_DIGESTS["dgamma"],
+        }.items():
+            self.assertEqual(hashlib.sha256((directory / name).read_bytes()).hexdigest(), digest)
+        plan = qualification_plan("./te", "./xla.py", "./python", case_root)
+        self.assertEqual(plan["schema"], "shuttle_abi22_rmsnorm_policy_plan_v1")
+        self.assertEqual(len(plan["runs"]), 24)
+        self.assertEqual(
+            {(run["input_pattern"], run["boundary"], run["producer"], run["repeat"]) for run in plan["runs"]},
+            {
+                (pattern, boundary, producer, repeat)
+                for pattern in (QUALIFICATION_PATTERN, HELDOUT_PATTERN)
+                for boundary in BOUNDARIES
+                for producer in ("transformer_engine_2_17", "ordinary_jax_xla")
+                for repeat in range(2)
+            },
+        )
+        for run in plan["runs"]:
+            self.assertEqual(run["shape"], [2048, 4096])
+            self.assertEqual(run["argv"][run["argv"].index("--epsilon") + 1], "1e-06")
+            self.assertEqual(Path(run["argv"][run["argv"].index("--case-directory") + 1]).name, run["input_pattern"])
+            self.assertIn(f"repeat{run['repeat']}", Path(run["argv"][-1]).name)
+            self.assertTrue(Path(run["argv"][-1]).is_absolute())
+        (directory / "x.bf16").write_bytes(b"tampered")
+        with self.assertRaisesRegex(ValueError, "case.*digest|case.*size"):
+            qualification_plan("./te", "./xla.py", "./python", case_root)
+        prepare_heldout_case(case_root)
+        invoked: list[list[str]] = []
+        execute_qualification_plan(plan, lambda argv: invoked.append(argv) or 0)
+        self.assertEqual(invoked, [run["argv"] for run in plan["runs"]])
 
     def test_reports_require_the_closed_te_and_xla_matrix(self) -> None:
         for producer in ("transformer_engine_2_17", "ordinary_jax_xla"):
@@ -368,19 +473,50 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "call sequence"):
                     _validate(report, producer)
 
-        self.assertEqual(ACCEPTANCE_LIMITS, {"max_absolute_error": 0.015625, "max_bfloat16_ulp": 8})
+        self.assertEqual(ACCEPTANCE_LIMITS, NUMERICAL_POLICY["limits_by_role"])
         for producer in ("transformer_engine_2_17", "ordinary_jax_xla"):
             for cell_index in (3, 4, 5):
                 for output_index in range(len(_report(producer)["cells"][cell_index]["outputs"])):
+                    role = _report(producer)["cells"][cell_index]["outputs"][output_index]["role"]
+                    limits = ACCEPTANCE_LIMITS[role]
                     for field, value in (
-                        ("max_absolute_error", 0.015626),
-                        ("max_bfloat16_ulp", 9),
+                        ("max_absolute_error", limits["max_absolute_error"] + 1.0e-6),
+                        ("max_bfloat16_ulp", limits["max_bfloat16_ulp"] + 1),
                         ("max_absolute_error", float("nan")),
                     ):
                         report = _report(producer)
                         report["cells"][cell_index]["outputs"][output_index][field] = value
                         with self.assertRaisesRegex(ValueError, field):
                             _validate(report, producer)
+
+        qualified = _qualification_evidence()
+        self.assertEqual(qualified["policy"], NUMERICAL_POLICY)
+        for mutation, diagnostic in (
+            (lambda evidence: evidence["cells"][0]["outputs"][0].update(role="dx"), "role"),
+            (
+                lambda evidence: evidence["cells"][6]["outputs"][0].update(max_absolute_error=float("inf")),
+                "finite",
+            ),
+            (lambda evidence: evidence["cells"][1]["outputs"][0].update(digest="d" * 64), "repeat"),
+            (lambda evidence: evidence["cells"][0].update(input_pattern=HELDOUT_PATTERN), "coordinate"),
+        ):
+            evidence = copy.deepcopy(qualified)
+            mutation(evidence)
+            with self.assertRaisesRegex(ValueError, diagnostic):
+                validate_qualification_evidence(evidence)
+        for index, cell in enumerate(qualified["cells"]):
+            if cell["input_pattern"] != HELDOUT_PATTERN or cell["repeat"] != 0:
+                continue
+            for output_index, output in enumerate(cell["outputs"]):
+                role = output["role"]
+                for field, value in (
+                    ("max_absolute_error", ACCEPTANCE_LIMITS[role]["max_absolute_error"] + 1.0e-6),
+                    ("max_bfloat16_ulp", ACCEPTANCE_LIMITS[role]["max_bfloat16_ulp"] + 1),
+                ):
+                    evidence = copy.deepcopy(qualified)
+                    evidence["cells"][index]["outputs"][output_index][field] = value
+                    with self.assertRaisesRegex(ValueError, field):
+                        validate_qualification_evidence(evidence)
 
         for producer in ("transformer_engine_2_17", "ordinary_jax_xla"):
             for boundary_index, output_index in ((3, 0), (4, 0), (4, 1), (5, 0), (5, 1), (5, 2)):
@@ -426,12 +562,17 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
         te = _report("transformer_engine_2_17")
         xla = _report("ordinary_jax_xla")
 
-        accepted = build_matched_acceptance(te, xla, expected_te_identity=_expected_te_identity())
+        qualification = _qualification_evidence()
+        accepted = build_matched_acceptance(
+            te, xla, qualification=qualification, expected_te_identity=_expected_te_identity()
+        )
 
         self.assertEqual(accepted["status"], "representative_numerics_accepted")
         self.assertEqual(accepted["accepted_shape"], [2048, 4096])
         self.assertEqual(accepted["accepted_boundaries"], list(BOUNDARIES))
         self.assertEqual(accepted["excluded_architecture_fixture_shape"], [7, 13])
+        self.assertEqual(accepted["numerical_policy"], NUMERICAL_POLICY)
+        self.assertEqual(accepted["qualification"], qualification)
         self.assertEqual(accepted["performance"]["clock"], "host_blocking_ns")
         self.assertEqual(set(accepted["performance"]["median_ratio_te_over_xla"]), set(BOUNDARIES))
         self.assertEqual(
@@ -449,32 +590,45 @@ class TeRmsnormOracleV2Test(unittest.TestCase):
             build_matched_acceptance(
                 architecture_only_te,
                 architecture_only_xla,
+                qualification=qualification,
                 expected_te_identity=_expected_te_identity(),
             )
 
         mismatched = copy.deepcopy(xla)
         mismatched["device"]["uuid"] = "GPU-other"
         with self.assertRaisesRegex(ValueError, "device"):
-            build_matched_acceptance(te, mismatched, expected_te_identity=_expected_te_identity())
+            build_matched_acceptance(
+                te, mismatched, qualification=qualification, expected_te_identity=_expected_te_identity()
+            )
 
         mismatched = copy.deepcopy(xla)
         mismatched["cells"][3]["input_digests"]["x"] = "f" * 64
         with self.assertRaisesRegex(ValueError, "input digest"):
-            build_matched_acceptance(te, mismatched, expected_te_identity=_expected_te_identity())
+            build_matched_acceptance(
+                te, mismatched, qualification=qualification, expected_te_identity=_expected_te_identity()
+            )
 
         changed_cuda = copy.deepcopy(te)
         changed_cuda["cells"][3]["timing"]["raw_cuda_event_ns"] = [1_000_000 + index for index in range(20)]
         self.assertEqual(
-            build_matched_acceptance(changed_cuda, xla, expected_te_identity=_expected_te_identity())["performance"][
-                "median_ratio_te_over_xla"
-            ],
+            build_matched_acceptance(
+                changed_cuda,
+                xla,
+                qualification=qualification,
+                expected_te_identity=_expected_te_identity(),
+            )["performance"]["median_ratio_te_over_xla"],
             {boundary: 0.5 for boundary in BOUNDARIES},
         )
 
         corrupt_median = copy.deepcopy(te)
         corrupt_median["cells"][3]["timing"]["median_host_blocking_ns"] += 1
         with self.assertRaisesRegex(ValueError, "median_host_blocking_ns"):
-            build_matched_acceptance(corrupt_median, xla, expected_te_identity=_expected_te_identity())
+            build_matched_acceptance(
+                corrupt_median,
+                xla,
+                qualification=qualification,
+                expected_te_identity=_expected_te_identity(),
+            )
 
     def test_runner_build_manifest_closes_the_external_te_binary(self) -> None:
         manifest = validate_build_manifest(BUILD_MANIFEST, TE_RUNNER)
