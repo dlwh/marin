@@ -15,6 +15,7 @@ import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import track1_rmsnorm_contract_numerical_policy as contract_policy
 from track1_map_h100_build import (
     HERMETIC_CUDA_COMPUTE_CAPABILITIES,
     HERMETIC_CUDA_VERSION,
@@ -143,6 +144,7 @@ class PrototypePaths:
     populate: Path
     reuse: Path
     rmsnorm: Path
+    rmsnorm_contract: Path
     logs: Path
     image_identity: Path
     hydration_identity: Path
@@ -162,6 +164,7 @@ class PrototypePaths:
             populate=workspace / "populate.json",
             reuse=workspace / "reuse.json",
             rmsnorm=workspace / "rmsnorm.json",
+            rmsnorm_contract=workspace / "rmsnorm-contract.json",
             logs=workspace / "logs",
             image_identity=workspace / "base-image.identity",
             hydration_identity=workspace / "hydration-identities.json",
@@ -188,6 +191,7 @@ def _sha256_file(path: Path) -> str:
 
 def _expected_authorization(source_manifest_sha256: str) -> dict[str, object]:
     load_numerical_policy()
+    contract_policy.load_numerical_policy()
     return {
         "attempts": 1,
         "base_image": BASE_IMAGE,
@@ -221,6 +225,24 @@ def _expected_authorization(source_manifest_sha256: str) -> dict[str, object]:
                 "numerical_policy": {"path": f"lib/shuttle/mlir/jax_patch/{POLICY_FILENAME}", "sha256": POLICY_SHA256},
                 "repeat_bitwise_required": True,
                 "shapes": [[2, 7, 19], [3, 2, 5, 11, 263]],
+            },
+            "rmsnorm_contract": {
+                "boundaries": ["primal", "composed"],
+                "composed_topology": "diagnostic_non_performant_not_architecture_target",
+                "disabled_jax_reference": True,
+                "disabled_jax_role": "diagnostic_only",
+                "host_oracle": "independent_binary64_rmsnorm_contract_vjp",
+                "modes": ["disabled", "source_ordered", "fast"],
+                "numerical_policy": {
+                    "path": f"lib/shuttle/mlir/jax_patch/{contract_policy.POLICY_FILENAME}",
+                    "sha256": contract_policy.POLICY_SHA256,
+                },
+                "primal_bundle_shapes": {
+                    "5x19x257": {"launches": 2, "temporary_bytes": 20, "temporaries": 1},
+                    "5x19x7": {"launches": 1, "temporary_bytes": 0, "temporaries": 0},
+                },
+                "repeat_bitwise_required": True,
+                "shapes": [list(shape) for shape in contract_policy.SHAPES],
             },
         },
         "sources": {
@@ -329,6 +351,15 @@ def _rmsnorm_worker_command(paths: PrototypePaths, runner_repository: Path) -> l
     ]
 
 
+def _rmsnorm_contract_worker_command(paths: PrototypePaths, runner_repository: Path) -> list[str]:
+    return [
+        str(paths.runtime / "bin/python"),
+        str(runner_repository / "lib/shuttle/mlir/jax_patch/track1_rmsnorm_contract_h100_worker.py"),
+        "--output",
+        str(paths.rmsnorm_contract),
+    ]
+
+
 def _jax_source_command(paths: PrototypePaths, runner_repository: Path, action: str) -> list[str]:
     command = [
         str(paths.runtime / "bin/python"),
@@ -422,6 +453,7 @@ def prototype_plan(
         {"name": "populate", "argv": _worker_command(paths, runner_repository, "populate")},
         {"name": "reuse", "argv": _worker_command(paths, runner_repository, "reuse")},
         {"name": "rmsnorm", "argv": _rmsnorm_worker_command(paths, runner_repository)},
+        {"name": "rmsnorm_contract", "argv": _rmsnorm_contract_worker_command(paths, runner_repository)},
     ]
     return {
         "authorization_sha256": authorization.sha256,
@@ -722,6 +754,137 @@ def validate_rmsnorm_result(document: object) -> dict[str, object]:
             }[boundary]
             if (observer["launch_count"], observer["temporary_count"]) != expected_bundle:
                 raise ValueError("RMSNorm generated bundle shape differs")
+    return document
+
+
+def validate_rmsnorm_contract_result(document: object) -> dict[str, object]:
+    """Validate the exact 12-coordinate RMSNorm-to-Contract H100 result."""
+    if type(document) is not dict or set(document) != {
+        "coordinates",
+        "numerical_policy_sha256",
+        "pid",
+        "schema",
+        "schema_version",
+    }:
+        raise ValueError("RMSNorm Contract result has the wrong root schema")
+    if document["schema"] != "track1_rmsnorm_contract_h100_result" or document["schema_version"] != 1:
+        raise ValueError("RMSNorm Contract result has the wrong schema identity")
+    if document["numerical_policy_sha256"] != contract_policy.POLICY_SHA256:
+        raise ValueError("RMSNorm Contract result numerical policy differs")
+    if type(document["pid"]) is not int or document["pid"] <= 0:
+        raise ValueError("RMSNorm Contract result PID must be positive")
+    coordinates = document["coordinates"]
+    if type(coordinates) is not list or len(coordinates) != 12:
+        raise ValueError("RMSNorm Contract result must cover 12 coordinates")
+    boundaries = (
+        ("primal", ("result",)),
+        ("composed", ("result", "input_cotangent", "weight_cotangent", "projection_cotangent")),
+    )
+    expected = [
+        (shape, boundary, roles, mode)
+        for shape in contract_policy.SHAPES
+        for boundary, roles in boundaries
+        for mode in WORKER_MODES
+    ]
+    policy = contract_policy.load_numerical_policy()
+    shape_policies = policy["shapes"]
+    if type(shape_policies) is not dict:
+        raise ValueError("RMSNorm Contract numerical policy is malformed")
+    baselines: dict[tuple[tuple[int, ...], str], dict[str, str]] = {}
+    invocation_ids: set[int] = set()
+    for item, (shape, boundary, roles, mode) in zip(coordinates, expected, strict=True):
+        if type(item) is not dict or set(item) != {
+            "analytic_oracle",
+            "boundary",
+            "disabled_jax_equal",
+            "disabled_jax_results",
+            "mode",
+            "numerics",
+            "observer",
+            "repeat_results",
+            "results",
+            "shape",
+        }:
+            raise ValueError("RMSNorm Contract result coordinate has the wrong schema")
+        if item["shape"] != list(shape) or item["boundary"] != boundary or item["mode"] != mode:
+            raise ValueError("RMSNorm Contract result coordinate order differs")
+        results = item["results"]
+        if type(results) is not dict or set(results) != set(roles):
+            raise ValueError("RMSNorm Contract result output roles differ")
+        for role in roles:
+            _sha(results[role], f"RMSNorm Contract {role}")
+        if item["repeat_results"] != results:
+            raise ValueError("RMSNorm Contract repeat result differs")
+        shape_policy = shape_policies["x".join(map(str, shape))]
+        analytic = item["analytic_oracle"]
+        expected_analytic = {role: shape_policy["binary64_rounded_outputs"][role] for role in roles}
+        if type(analytic) is not dict or analytic != expected_analytic:
+            raise ValueError("RMSNorm Contract analytic oracle identity differs")
+        numerics = item["numerics"]
+        if type(numerics) is not dict or set(numerics) != set(roles):
+            raise ValueError("RMSNorm Contract numerical metric roles differ")
+        for role in roles:
+            metrics = numerics[role]
+            if type(metrics) is not dict or set(metrics) != set(contract_policy.LIMITS[role]):
+                raise ValueError("RMSNorm Contract numerical metric schema differs")
+            for name, limit in contract_policy.LIMITS[role].items():
+                value = metrics[name]
+                expected_type = int if name == "maximum_bf16_ulp_error" else float
+                if type(value) is not expected_type or not math.isfinite(value) or value < 0 or value > limit:
+                    raise ValueError(f"RMSNorm Contract {role} exceeds its independent binary64 threshold")
+        key = (shape, boundary)
+        if mode == "disabled":
+            baselines[key] = results
+        elif boundary == "primal" and results["result"] != shape_policy["primal_emitted_outputs"][mode]:
+            raise ValueError("RMSNorm Contract primal differs from its emitted recurrence oracle")
+        disabled = item["disabled_jax_results"]
+        disabled_equal = item["disabled_jax_equal"]
+        if (
+            type(disabled) is not dict
+            or disabled != baselines[key]
+            or type(disabled_equal) is not dict
+            or set(disabled_equal) != set(roles)
+            or any(type(disabled_equal[role]) is not bool for role in roles)
+            or disabled_equal != {role: results[role] == disabled[role] for role in roles}
+        ):
+            raise ValueError("RMSNorm Contract disabled-JAX diagnostic differs")
+        observer = item["observer"]
+        if mode == "disabled":
+            if observer is not None:
+                raise ValueError("RMSNorm Contract disabled result has an observer")
+            continue
+        if type(observer) is not dict or set(observer) != {
+            "final_module_sha256",
+            "generated_bundle_sha256",
+            "invocation_id",
+            "launch_count",
+            "temporary_count",
+            "topology_status",
+        }:
+            raise ValueError("RMSNorm Contract enabled result has an invalid observer")
+        invocation_id = observer["invocation_id"]
+        if type(invocation_id) is not int or invocation_id <= 0 or invocation_id in invocation_ids:
+            raise ValueError("RMSNorm Contract observer invocation attribution differs")
+        invocation_ids.add(invocation_id)
+        _sha(observer["final_module_sha256"], "RMSNorm Contract final module")
+        _sha(observer["generated_bundle_sha256"], "RMSNorm Contract generated bundle")
+        topology = (observer["launch_count"], observer["temporary_count"])
+        if boundary == "primal":
+            expected_topology = (1, 0) if shape[-1] == 7 else (2, 1)
+            if topology != expected_topology or observer["topology_status"] != "normative_primal":
+                raise ValueError("RMSNorm Contract primal bundle topology differs")
+        elif (
+            type(topology[0]) is not int
+            or type(topology[1]) is not int
+            or topology[0] <= 0
+            or topology[0] > 128
+            or topology[1] <= 0
+            or topology[1] > 128
+            or observer["topology_status"] != "diagnostic_non_performant"
+        ):
+            raise ValueError("RMSNorm Contract composed diagnostic topology differs")
+    if len(invocation_ids) != 8:
+        raise ValueError("RMSNorm Contract observer invocation coverage differs")
     return document
 
 
@@ -1072,11 +1235,21 @@ def execute_prototype(
         phase="rmsnorm",
         environment=environment,
     )
+    _run(
+        _rmsnorm_contract_worker_command(paths, runner_repository),
+        cwd=runner_repository,
+        log=paths.logs / "rmsnorm-contract.log",
+        phase="rmsnorm_contract",
+        environment=environment,
+    )
     workers = validate_result_pair(
         _load_canonical_document(paths.populate, "populate result"),
         _load_canonical_document(paths.reuse, "reuse result"),
     )
     rmsnorm = validate_rmsnorm_result(_load_canonical_document(paths.rmsnorm, "RMSNorm result"))
+    rmsnorm_contract = validate_rmsnorm_contract_result(
+        _load_canonical_document(paths.rmsnorm_contract, "RMSNorm Contract result")
+    )
     return {
         "attempt": 1,
         "authorization_sha256": authorization.sha256,
@@ -1090,4 +1263,5 @@ def execute_prototype(
         ],
         "workers": workers,
         "rmsnorm": rmsnorm,
+        "rmsnorm_contract": rmsnorm_contract,
     }
