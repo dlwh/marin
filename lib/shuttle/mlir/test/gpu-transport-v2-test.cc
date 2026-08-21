@@ -3388,6 +3388,26 @@ TEST(GpuTransportV2Test, FoldDynamicSharedMemoryIsDeclaredAtModuleScope) {
     EXPECT_LT(addressSize, declaration);
     EXPECT_LT(declaration, entry);
     EXPECT_EQ(ptx.find(".extern .shared", entry), llvm::StringRef::npos);
+    size_t conversion = 0;
+    size_t conversionCount = 0;
+    while ((conversion = ptx.find("cvta.to.shared.u64 ", conversion)) !=
+           llvm::StringRef::npos) {
+      llvm::StringRef remaining = ptx.drop_front(conversion);
+      llvm::StringRef instruction = remaining.take_front(remaining.find('\n'));
+      auto operands = instruction.drop_front(
+          llvm::StringRef("cvta.to.shared.u64 ").size()).split(',');
+      llvm::StringRef destination = operands.first.trim();
+      llvm::StringRef source = operands.second.trim(" ;");
+      EXPECT_EQ(source, destination);
+      std::string symbolMove =
+          (llvm::Twine("mov.u64 ") + destination + ", shuttle_smem;").str();
+      size_t symbolMovePosition = ptx.take_front(conversion).rfind(symbolMove);
+      ASSERT_NE(symbolMovePosition, llvm::StringRef::npos);
+      EXPECT_LT(conversion - symbolMovePosition, 64u);
+      ++conversionCount;
+      conversion += instruction.size();
+    }
+    EXPECT_GT(conversionCount, 0u);
   }
   EXPECT_EQ(foldCount, 1);
 }
