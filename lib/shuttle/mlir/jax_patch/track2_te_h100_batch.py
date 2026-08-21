@@ -345,7 +345,7 @@ def runtime_environment(paths: BatchPaths) -> dict[str, str]:
 
 def _elf_soname(path: Path) -> str:
     result = subprocess.run(["readelf", "-d", path], check=True, capture_output=True, text=True)
-    matches = re.findall(r"\(SONAME\).*Shared library: \[([^]]+)\]", result.stdout)
+    matches = re.findall(r"\(SONAME\).*Library soname: \[([^]]+)\]", result.stdout)
     if len(matches) != 1:
         raise RuntimeError(f"runtime library has no unique ELF SONAME: {path}")
     return matches[0]
