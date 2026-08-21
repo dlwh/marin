@@ -4,9 +4,18 @@
 """Behavior contract for the sealed Track 2 TE/XLA H100 batch."""
 
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
+from abi22_te_rmsnorm_oracle_v2 import (
+    BOUNDARIES,
+    CALL_SEQUENCES,
+    INPUT_DIGESTS,
+    OUTPUT_ROLES,
+    REFERENCE_DIGESTS,
+    SHAPES,
+)
 from track2_te_h100_batch import (
     BASE_IMAGE,
     SHUTTLE_BLOCKER,
@@ -17,7 +26,9 @@ from track2_te_h100_batch import (
     BatchPaths,
     batch_plan,
     canonical_json,
+    execute_oracle,
     validate_source_manifest,
+    validate_te_hydration,
 )
 
 
@@ -63,6 +74,10 @@ def test_batch_plan_pins_te_wheel_source_build_and_exact_v2_matrix(tmp_path: Pat
         "producer_order": ["transformer_engine_2_17", "ordinary_jax_xla"],
         "run_count": 12,
     }
+    assert SHUTTLE_BLOCKER == (
+        "reviewed_dbff57e3_rmsnorm_canary_uses_epsilon_1e-6_but_does_not_admit_"
+        "representative_2048x4096_without_new_harness_authorization"
+    )
     assert plan["shuttle"] == {"status": "pending", "blocker": SHUTTLE_BLOCKER}
     assert [phase["name"] for phase in phases] == [
         "device",
@@ -97,6 +112,170 @@ def test_batch_plan_pins_te_wheel_source_build_and_exact_v2_matrix(tmp_path: Pat
     assert TE_WHEEL_SHA256 == "1c8e6627cf02358201f513ab902c7b4f82f179214bd775edc97ce0f2001d82da"
     assert TE_SOURCE_COMMIT == "2e559f062497bef768dfbe9d7e45548fadeca80a"
     assert TE_SOURCE_TREE == "c722c6cd46cc59a0dbabadd846af3f45b15c1a95"
+    assert all("shuttle" not in phase["name"] for phase in phases)
+
+
+def test_hydration_binds_source_tree_wheel_and_resolved_library(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    paths = BatchPaths.under(tmp_path)
+    paths.te_source.mkdir(parents=True)
+    (paths.te_source / "build_tools").mkdir()
+    (paths.te_source / "build_tools/VERSION.txt").write_text("2.17.0\n")
+    paths.te_wheel.parent.mkdir(parents=True, exist_ok=True)
+    paths.te_wheel.write_bytes(b"wheel")
+    paths.te_library.parent.mkdir(parents=True)
+    paths.te_library.write_bytes(b"library")
+
+    observed = {
+        "commit": TE_SOURCE_COMMIT,
+        "tree": TE_SOURCE_TREE,
+        "status": "",
+    }
+    monkeypatch.setattr("track2_te_h100_batch._observed_te_source", lambda _: observed)
+    monkeypatch.setattr(
+        "track2_te_h100_batch._file_sha256",
+        lambda path: TE_WHEEL_SHA256 if path == paths.te_wheel else hashlib.sha256(path.read_bytes()).hexdigest(),
+    )
+
+    identity = validate_te_hydration(paths)
+
+    assert identity == {
+        "source_commit": TE_SOURCE_COMMIT,
+        "source_tree": TE_SOURCE_TREE,
+        "version": "2.17.0",
+        "wheel_sha256": TE_WHEEL_SHA256,
+        "library_path": str(paths.te_library),
+        "library_sha256": hashlib.sha256(b"library").hexdigest(),
+    }
+    for field, value in (("commit", "0" * 40), ("tree", "0" * 40), ("status", "dirty")):
+        mutated = dict(observed)
+        mutated[field] = value
+        monkeypatch.setattr("track2_te_h100_batch._observed_te_source", lambda _, value=mutated: value)
+        with pytest.raises(RuntimeError, match="Transformer Engine source"):
+            validate_te_hydration(paths)
+    monkeypatch.setattr("track2_te_h100_batch._observed_te_source", lambda _: observed)
+    monkeypatch.setattr("track2_te_h100_batch._file_sha256", lambda _: "0" * 64)
+    with pytest.raises(RuntimeError, match="wheel SHA-256"):
+        validate_te_hydration(paths)
+
+
+def _valid_cell(shape: tuple[int, int], boundary: str, *, te: bool) -> dict:
+    roles = OUTPUT_ROLES[boundary]
+    input_roles = ("x", "gamma") if boundary == "forward" else ("x", "gamma", "dy")
+    scale = 1 if te else 2
+    samples = [scale * (100_000 + index * 1_000) for index in range(20)]
+    return {
+        "shape": list(shape),
+        "scope": "architecture_fixture" if shape == SHAPES[0] else "representative_acceptance",
+        "boundary": boundary,
+        "input_digests": {role: INPUT_DIGESTS[shape][role] for role in input_roles},
+        "execution": {
+            "call_sequence": list(CALL_SEQUENCES[boundary]),
+            "rsigma_state": "invocation_local_not_public",
+        },
+        "outputs": [
+            {
+                "role": role,
+                "digest": REFERENCE_DIGESTS[shape][role],
+                "reference_digest": REFERENCE_DIGESTS[shape][role],
+                "max_absolute_error": 0.0,
+                "max_bfloat16_ulp": 0,
+            }
+            for role in roles
+        ],
+        "timing": {
+            "warmup_invocations": 10,
+            "raw_host_blocking_ns": samples,
+            "median_host_blocking_ns": sorted(samples)[9] + 500,
+            "raw_cuda_event_ns": [50_000 + index * 100 for index in range(20)] if te else None,
+        },
+    }
+
+
+def _fake_oracle_invoke(paths: BatchPaths, calls: list[list[str]], argv: list[str]) -> int:
+    calls.append(argv)
+    argument = {argv[index][2:]: argv[index + 1] for index in range(1, len(argv), 2)}
+    shape = (int(argument["rows"]), int(argument["features"]))
+    boundary = argument["boundary"]
+    output = paths.workspace / argument["output"]
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if argv[0] == str(paths.te_runner):
+        roles = OUTPUT_ROLES[boundary]
+        case = Path(argument["case-directory"])
+        output.write_text(
+            json.dumps(
+                {
+                    "schema": "shuttle_abi22_te_rmsnorm_raw_cell_v2",
+                    "shape": list(shape),
+                    "boundary": boundary,
+                    "epsilon": 1e-6,
+                    "warmup_invocations": 10,
+                    "raw_host_blocking_ns": [100_000 + index * 1_000 for index in range(20)],
+                    "raw_cuda_event_ns": [50_000 + index * 100 for index in range(20)],
+                    "output_files": {role: str(case / f"reference_{role}.bf16") for role in roles},
+                    "workspace_bytes": {"forward": 0, "backward": 0},
+                },
+                sort_keys=True,
+            )
+        )
+    else:
+        output.write_text(json.dumps(_valid_cell(shape, boundary, te=False), sort_keys=True))
+    return 0
+
+
+def test_execute_oracle_runs_exact_matrix_and_builds_matched_acceptance(tmp_path: Path) -> None:
+    paths = BatchPaths.under(tmp_path)
+    paths.workspace.mkdir()
+    paths.reports.mkdir()
+    paths.raw.mkdir()
+    paths.te_runner.write_bytes(b"runner-binary")
+    paths.te_library.parent.mkdir(parents=True)
+    paths.te_library.write_bytes(b"resolved-te-library")
+    calls: list[list[str]] = []
+    device = {"model": "NVIDIA H100 80GB HBM3", "uuid": "GPU-test", "compute_capability": "9.0"}
+
+    result = execute_oracle(
+        paths=paths,
+        device=device,
+        invoke=lambda argv: _fake_oracle_invoke(paths, calls, argv),
+    )
+
+    assert len(calls) == 12
+    assert [
+        (call[call.index("--rows") + 1], call[call.index("--features") + 1], call[call.index("--boundary") + 1])
+        for call in calls[::2]
+    ] == [(str(shape[0]), str(shape[1]), boundary) for shape in SHAPES for boundary in BOUNDARIES]
+    assert all(call[call.index("--epsilon") + 1] == "1e-06" for call in calls)
+    assert result["acceptance"]["status"] == "representative_numerics_accepted"
+    assert result["acceptance"]["accepted_shape"] == [2048, 4096]
+    assert result["acceptance"]["performance"]["median_ratio_te_over_xla"] == {boundary: 0.5 for boundary in BOUNDARIES}
+    assert result["shuttle"] == {"status": "pending", "blocker": SHUTTLE_BLOCKER}
+    assert set(result["reports"]) == {"transformer_engine_2_17", "ordinary_jax_xla"}
+    assert all(path.is_file() for path in (paths.te_report, paths.xla_report, paths.acceptance))
+
+
+def test_execute_oracle_stops_on_first_failed_producer(tmp_path: Path) -> None:
+    paths = BatchPaths.under(tmp_path)
+    paths.workspace.mkdir()
+    paths.reports.mkdir()
+    paths.raw.mkdir()
+    paths.te_runner.write_bytes(b"runner-binary")
+    paths.te_library.parent.mkdir(parents=True)
+    paths.te_library.write_bytes(b"resolved-te-library")
+    calls: list[list[str]] = []
+
+    def fail_sixth(argv: list[str]) -> int:
+        if len(calls) == 5:
+            calls.append(argv)
+            return 7
+        return _fake_oracle_invoke(paths, calls, argv)
+
+    with pytest.raises(RuntimeError, match="exited with status 7"):
+        execute_oracle(
+            paths=paths,
+            device={"model": "H100", "uuid": "GPU-test", "compute_capability": "9.0"},
+            invoke=fail_sixth,
+        )
+    assert len(calls) == 6
 
 
 def test_source_manifest_binds_every_declared_byte(tmp_path: Path) -> None:

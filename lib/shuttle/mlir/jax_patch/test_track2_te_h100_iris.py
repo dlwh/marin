@@ -53,10 +53,38 @@ def test_render_emits_one_exact_batch_priority_zero_retry_h100_request(
     assert request.existing_job_policy == job_pb2.EXISTING_JOB_POLICY_ERROR
     assert request.priority_band == job_pb2.PRIORITY_BAND_BATCH
     assert list(request.environment.setup_scripts) == []
-    assert request.entrypoint.run_command.argv[-1] == "--execute"
+    assert list(request.entrypoint.run_command.argv) == [
+        "/opt/h100-evidence-runtime/bin/python",
+        "/app/lib/shuttle/mlir/jax_patch/track2_te_h100_batch.py",
+        "--workspace",
+        "/tmp/shuttle-track2-te-h100",
+        "--runner-repository",
+        "/app",
+        "--source-manifest",
+        "/app/.shuttle-track2-te-source-manifest.json",
+        "--base-image",
+        (
+            "ghcr.io/marin-community/iris-task-h100-evidence:"
+            "5238c39e7a506b919fc803046de4a9dc2c29d02f"
+            "@sha256:2efa83fbf8f2073a4175eef919a9f0c6c2db435d7c1ec9ed79017e1ea0d10cef"
+        ),
+        "--execute",
+    ]
     assert request.bundle_id == hashlib.sha256(request.bundle_blob).hexdigest()
     with zipfile.ZipFile(io.BytesIO(request.bundle_blob)) as archive:
         manifest = json.loads(archive.read(SOURCE_MANIFEST_NAME))
+        assert (
+            manifest["commit"]
+            == subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=MARIN_REPOSITORY, check=True, capture_output=True, text=True
+            ).stdout.strip()
+        )
+        assert (
+            manifest["tree"]
+            == subprocess.run(
+                ["git", "rev-parse", "HEAD^{tree}"], cwd=MARIN_REPOSITORY, check=True, capture_output=True, text=True
+            ).stdout.strip()
+        )
         members = {entry["path"] for entry in manifest["entries"]}
         assert members == set(archive.namelist()) - {SOURCE_MANIFEST_NAME}
         assert {
@@ -69,32 +97,127 @@ def test_render_emits_one_exact_batch_priority_zero_retry_h100_request(
 
 
 @pytest.mark.parametrize(
-    "mutation", ["bundle", "gpu", "image", "preemption", "failure", "task_failure", "entrypoint", "priority"]
+    "mutation",
+    [
+        "bundle",
+        "bundle_id",
+        "name",
+        "gpu",
+        "cpu",
+        "image",
+        "replicas",
+        "timeout",
+        "preemption",
+        "failure",
+        "task_failure",
+        "fail_if_exists",
+        "existing_policy",
+        "environment",
+        "entrypoint",
+        "priority",
+        "ports",
+    ],
 )
 def test_request_rejects_execution_scope_mutations(mutation: str) -> None:
     request = deepcopy(_request())
     if mutation == "bundle":
         request.bundle_blob += b"drift"
+    elif mutation == "bundle_id":
+        request.bundle_id = "0" * 64
+    elif mutation == "name":
+        request.name = "/dlwh/other"
     elif mutation == "gpu":
         request.resources.device.gpu.count = 2
+    elif mutation == "cpu":
+        request.resources.cpu = 64
     elif mutation == "image":
         request.task_image = "ghcr.io/marin-community/iris-task-h100-evidence:latest"
+    elif mutation == "replicas":
+        request.replicas = 2
+    elif mutation == "timeout":
+        request.timeout.seconds += 1
     elif mutation == "preemption":
         request.max_retries_preemption = 1
     elif mutation == "failure":
         request.max_retries_failure = 1
     elif mutation == "task_failure":
         request.max_task_failures = 1
+    elif mutation == "fail_if_exists":
+        request.fail_if_exists = False
+    elif mutation == "existing_policy":
+        request.existing_job_policy = job_pb2.EXISTING_JOB_POLICY_UNSPECIFIED
+    elif mutation == "environment":
+        request.environment.setup_scripts.append("echo drift")
     elif mutation == "entrypoint":
         request.entrypoint.run_command.argv[-1] = "--plan"
     elif mutation == "priority":
         request.priority_band = job_pb2.PRIORITY_BAND_PRODUCTION
+    elif mutation == "ports":
+        request.ports.append("1234")
 
     with pytest.raises(ValueError, match="LaunchJobRequest"):
         validate_launch_request(request, run=1)
 
 
-def test_submit_reserves_receipt_before_external_rpc(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _submit_arguments(request_path: Path, raw: bytes, receipt: Path) -> list[str]:
+    return [
+        "submit",
+        "--request",
+        str(request_path),
+        "--expected-request-sha256",
+        hashlib.sha256(raw).hexdigest(),
+        "--run",
+        "1",
+        "--config",
+        "lib/iris/config/cw-rno2a.yaml",
+        "--receipt",
+        str(receipt),
+    ]
+
+
+def test_submit_reserves_pending_receipt_before_rpc_and_finalizes_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request_path = tmp_path / "reviewed.pb"
+    raw = _request().SerializeToString(deterministic=True)
+    request_path.write_bytes(raw)
+    receipt = tmp_path / "receipt.json"
+
+    def fake_submit(*args: object, **kwargs: object) -> str:
+        pending = json.loads(receipt.read_bytes())
+        assert pending["status"] == "submission_pending"
+        assert pending["request"]["request_sha256"] == hashlib.sha256(raw).hexdigest()
+        return "/dlwh/shuttle-track2-te-h100-r1"
+
+    monkeypatch.setattr("track2_te_h100_iris._submit", fake_submit)
+    assert main(_submit_arguments(request_path, raw, receipt)) == 0
+    final = json.loads(receipt.read_bytes())
+    assert final["status"] == "submitted"
+    assert final["job_id"] == "/dlwh/shuttle-track2-te-h100-r1"
+
+
+@pytest.mark.parametrize("failure", ["rpc", "wrong_job"])
+def test_submit_preserves_pending_receipt_on_uncertain_rpc_outcome(
+    failure: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request_path = tmp_path / "reviewed.pb"
+    raw = _request().SerializeToString(deterministic=True)
+    request_path.write_bytes(raw)
+    receipt = tmp_path / "receipt.json"
+
+    def fake_submit(*args: object, **kwargs: object) -> str:
+        assert json.loads(receipt.read_bytes())["status"] == "submission_pending"
+        if failure == "rpc":
+            raise RuntimeError("transport failed after submission may have committed")
+        return "/dlwh/unexpected"
+
+    monkeypatch.setattr("track2_te_h100_iris._submit", fake_submit)
+    with pytest.raises(RuntimeError):
+        main(_submit_arguments(request_path, raw, receipt))
+    assert json.loads(receipt.read_bytes())["status"] == "submission_pending"
+
+
+def test_submit_refuses_existing_receipt_before_rpc(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     request_path = tmp_path / "reviewed.pb"
     raw = _request().SerializeToString(deterministic=True)
     request_path.write_bytes(raw)
@@ -109,21 +232,7 @@ def test_submit_reserves_receipt_before_external_rpc(tmp_path: Path, monkeypatch
 
     monkeypatch.setattr("track2_te_h100_iris._submit", fake_submit)
     with pytest.raises(FileExistsError, match="receipt"):
-        main(
-            [
-                "submit",
-                "--request",
-                str(request_path),
-                "--expected-request-sha256",
-                hashlib.sha256(raw).hexdigest(),
-                "--run",
-                "1",
-                "--config",
-                "lib/iris/config/cw-rno2a.yaml",
-                "--receipt",
-                str(receipt),
-            ]
-        )
+        main(_submit_arguments(request_path, raw, receipt))
     assert not submitted
     assert receipt.read_bytes() == b"keep"
 
