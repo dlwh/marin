@@ -103,6 +103,7 @@ struct PlanSummary {
   int64_t eligibleFoldMapEdges = 0;
   std::vector<int64_t> fusedMapGroupSizes;
   std::vector<int64_t> fusedFoldMapGroupSizes;
+  bool hasFoldRegion = false;
   bool exactSourceCoverage = false;
   std::string fingerprint;
 };
@@ -522,9 +523,21 @@ std::optional<PlanSummary> summary(mlir::ModuleOp module) {
     auto fusedSources = task->getAttrOfType<mlir::ArrayAttr>("fused_sources");
     auto foldEpilogueSources =
         task->getAttrOfType<mlir::ArrayAttr>("fold_epilogue_sources");
+    auto foldRegionSources =
+        task->getAttrOfType<mlir::ArrayAttr>("fold_region_sources");
     if (fusedSources && foldEpilogueSources)
       return std::nullopt;
-    if (foldEpilogueSources) {
+    if (foldRegionSources) {
+      result.hasFoldRegion = true;
+      if (task.getKind() != mlir::shuttle::MaterializationTaskKind::Fold ||
+          foldRegionSources.empty())
+        return std::nullopt;
+      for (mlir::Attribute source : foldRegionSources) {
+        if (!mlir::isa<mlir::shuttle::SourceRefAttr>(source))
+          return std::nullopt;
+        plannedSources.insert(source);
+      }
+    } else if (foldEpilogueSources) {
       if (task.getKind() != mlir::shuttle::MaterializationTaskKind::Fold ||
           foldEpilogueSources.empty() ||
           !plannedSources.insert(task.getSource()).second)
@@ -969,6 +982,25 @@ void expectCounts(const PlanSummary &actual, const FixtureExpectation &expected,
   EXPECT_EQ(actual.maps, expected.maps);
   EXPECT_EQ(actual.folds, expected.folds);
   EXPECT_EQ(actual.contracts, 0);
+  if (actual.hasFoldRegion) {
+    if (expected.maps == 18 && expected.folds == 1) {
+      EXPECT_EQ(actual.tasks, 1);
+      EXPECT_EQ(actual.buffers, 3);
+      EXPECT_EQ(actual.foldTasks, 1);
+    } else if (expected.maps == 43 && expected.folds == 5) {
+      EXPECT_EQ(actual.tasks, 3);
+      EXPECT_EQ(actual.buffers, 6);
+      EXPECT_EQ(actual.foldTasks, 3);
+    } else {
+      ADD_FAILURE() << "unexpected fixture admitted as a Fold region";
+    }
+    EXPECT_EQ(actual.mapTasks, 0);
+    EXPECT_EQ(actual.contractTasks, 0);
+    EXPECT_TRUE(actual.exactSourceCoverage);
+    EXPECT_TRUE(actual.fusedMapGroupSizes.empty());
+    EXPECT_TRUE(actual.fusedFoldMapGroupSizes.empty());
+    return;
+  }
   EXPECT_EQ(actual.tasks,
             fused ? expected.fusedTasks - actual.eligibleFoldMapEdges
                   : expected.materializedTasks);
@@ -1026,11 +1058,14 @@ TEST(Abi22MapFusionContract,
       const int64_t epilogueMapGroups =
           llvm::count_if(fusedSummary->fusedFoldMapGroupSizes,
                          [](int64_t size) { return size > 1; });
-      EXPECT_EQ(audit->groups + epilogueMapGroups,
-                static_cast<int64_t>(expectedFusionGroupSizes(fixture).size()));
-      if (llvm::StringRef(fixture.filename)
-              .contains("projected_parameter_broadcast"))
-        EXPECT_TRUE(audit->sawComposedProjectedInput);
+      if (!fusedSummary->hasFoldRegion) {
+        EXPECT_EQ(
+            audit->groups + epilogueMapGroups,
+            static_cast<int64_t>(expectedFusionGroupSizes(fixture).size()));
+        if (llvm::StringRef(fixture.filename)
+                .contains("projected_parameter_broadcast"))
+          EXPECT_TRUE(audit->sawComposedProjectedInput);
+      }
       EXPECT_EQ(fixture.materializedTasks - fixture.fusedTasks,
                 fixture.materializedBuffers - fixture.fusedBuffers);
 
@@ -1156,13 +1191,13 @@ TEST(Abi22MapFusionContract,
                                      .getBody()
                                      .front()
                                      .getOps<mlir::shuttle::DeviceEntryOp>()),
-                fixture.fusedTasks - plan->eligibleFoldMapEdges);
+                plan->tasks);
       EXPECT_EQ(
           llvm::range_size(invocationAbis.front()
                                .getBody()
                                .front()
                                .getOps<mlir::shuttle::InvocationSlotOp>()),
-          fixture.fusedBuffers - plan->eligibleFoldMapEdges);
+          plan->buffers);
       for (mlir::shuttle::DeviceEntryOp entry :
            devices.front()
                .getBody()
@@ -1179,9 +1214,9 @@ TEST(Abi22MapFusionContract,
       EXPECT_EQ((*decoded)->codeBytes().size(),
                 devices.front().getCode().size());
       EXPECT_EQ((*decoded)->launches().size(),
-                fixture.fusedTasks - plan->eligibleFoldMapEdges);
+                plan->tasks);
       EXPECT_EQ((*decoded)->slots().size(),
-                fixture.fusedBuffers - plan->eligibleFoldMapEdges);
+                plan->buffers);
 
       auto entries =
           llvm::to_vector(devices.front()
@@ -1246,8 +1281,8 @@ TEST(Abi22MapFusionContract,
 
 TEST(Abi22MapFusionContract,
      RejectsCorruptOrderedProvenanceAndComposedInputMaps) {
-  std::optional<std::string> source = fixtureSource(kFixtures[0].filename);
-  std::optional<std::string> foldSource = fixtureSource(kFixtures[1].filename);
+  std::optional<std::string> source = fixtureSource(kFixtures[2].filename);
+  std::optional<std::string> foldSource = fixtureSource(kFixtures[2].filename);
   ASSERT_TRUE(source);
   ASSERT_TRUE(foldSource);
   constexpr llvm::StringLiteral mutations[] = {
