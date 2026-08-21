@@ -267,7 +267,15 @@ def prototype_plan(
         },
         {
             "name": "install_wheels",
-            "argv": [str(paths.runtime / "bin/python"), "-m", "pip", "install", "--no-deps", *install_patterns],
+            "argv": [
+                str(paths.runtime / "bin/python"),
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "--no-deps",
+                *install_patterns,
+            ],
         },
         {"name": "populate", "argv": _worker_command(paths, runner_repository, "populate")},
         {"name": "reuse", "argv": _worker_command(paths, runner_repository, "reuse")},
@@ -611,7 +619,15 @@ def execute_prototype(
         log=paths.logs / "runtime.log",
     )
     _run(
-        [str(paths.runtime / "bin/python"), "-m", "pip", "install", "--no-deps", *map(str, wheels)],
+        [
+            str(paths.runtime / "bin/python"),
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--no-deps",
+            *map(str, wheels),
+        ],
         cwd=None,
         log=paths.logs / "wheel-install.log",
     )

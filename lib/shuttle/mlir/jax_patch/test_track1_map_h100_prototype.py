@@ -181,6 +181,7 @@ def test_dry_run_renders_one_network_hydration_then_offline_build_and_two_worker
     offline = phases[4]["argv"]
     assert "--bazel_options=--repository_disable_download" not in hydration
     assert "--bazel_options=--repository_disable_download" in offline
+    assert "--disable-pip-version-check" in phases[6]["argv"]
     assert phases[7]["argv"][phases[7]["argv"].index("--role") + 1] == "populate"
     assert phases[8]["argv"][phases[8]["argv"].index("--role") + 1] == "reuse"
     assert not workspace.exists()
