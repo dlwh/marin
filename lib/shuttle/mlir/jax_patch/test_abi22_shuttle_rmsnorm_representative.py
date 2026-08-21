@@ -998,6 +998,8 @@ class RepresentativeRmsNormTest(unittest.TestCase):
         test_contract_freezes_r12_inputs_role_limits_resources_and_coordinates(self.executed, self.case_root)
         test_executor_invokes_exact_matrix_and_assembles_file_backed_evidence(self.executed, self.case_root)
         test_execution_plan_is_exact_fresh_process_matrix(self.temporary_path("plan"))
+        test_execution_plan_invokes_shell_wrapper_with_explicit_gpu_test(self.temporary_path("wrapper-argv"))
+        test_shell_wrapper_bridges_bazel_runfiles_directory_for_fixture_lookup(self.temporary_path("wrapper-runfiles"))
 
     def test_process_and_raw_claim_failures(self) -> None:
         for index, failure in enumerate(FAILURE_MUTATIONS):
