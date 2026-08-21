@@ -12,6 +12,7 @@ import re
 import stat
 import tempfile
 import zipfile
+from enum import StrEnum
 from pathlib import Path
 
 from google.protobuf.message import DecodeError
@@ -45,11 +46,20 @@ SHA256 = re.compile(r"[0-9a-f]{64}")
 MAX_RETRY = 9999
 
 
-def job_name(retry: int) -> str:
+class Campaign(StrEnum):
+    MAP_PROTOTYPE = "map_prototype"
+    RMSNORM_CANARY = "rmsnorm_canary"
+
+
+def job_name(campaign: Campaign, retry: int) -> str:
     """Return the deterministic Iris job identity for one retry ordinal."""
     if type(retry) is not int or retry < 1 or retry > MAX_RETRY:
         raise ValueError(f"retry must be a positive integer no greater than {MAX_RETRY}")
-    return JobName.root("dlwh", f"shuttle-track1-map-h100-prototype-r{retry}").to_wire()
+    stem = {
+        Campaign.MAP_PROTOTYPE: "shuttle-track1-map-h100-prototype",
+        Campaign.RMSNORM_CANARY: "shuttle-track1-rmsnorm-h100-canary",
+    }[campaign]
+    return JobName.root("dlwh", f"{stem}-r{retry}").to_wire()
 
 
 def _entrypoint_command(approved_authorization_sha256: str) -> list[str]:
@@ -127,6 +137,7 @@ def build_launch_request(
     bundle_root: Path,
     authorization_path: Path,
     approved_authorization_sha256: str,
+    campaign: Campaign,
     retry: int,
 ) -> controller_pb2.Controller.LaunchJobRequest:
     """Build the real Iris request without constructing a client or issuing an RPC."""
@@ -146,7 +157,7 @@ def build_launch_request(
         device=gpu_device("H100", 1),
     ).to_proto()
     request = controller_pb2.Controller.LaunchJobRequest(
-        name=job_name(retry),
+        name=job_name(campaign, retry),
         entrypoint=entrypoint,
         resources=resources,
         environment=environment,
@@ -163,7 +174,12 @@ def build_launch_request(
     request.timeout.CopyFrom(duration_to_proto(TIMEOUT))
     request.bundle_id = content_id(blob)
     request.bundle_blob = blob
-    validate_launch_request(request, approved_authorization_sha256=approved_authorization_sha256, retry=retry)
+    validate_launch_request(
+        request,
+        approved_authorization_sha256=approved_authorization_sha256,
+        campaign=campaign,
+        retry=retry,
+    )
     return request
 
 
@@ -246,13 +262,14 @@ def validate_launch_request(
     request: controller_pb2.Controller.LaunchJobRequest,
     *,
     approved_authorization_sha256: str,
+    campaign: Campaign,
     retry: int,
 ) -> None:
     """Validate every execution-affecting field in a decoded Iris request."""
     if SHA256.fullmatch(approved_authorization_sha256) is None:
         raise ValueError("LaunchJobRequest approval SHA-256 is invalid")
     _require_no_unknown_fields(request, "root")
-    if request.name != job_name(retry):
+    if request.name != job_name(campaign, retry):
         raise ValueError("LaunchJobRequest job name differs")
     if request.task_image != BASE_IMAGE or request.bundle_init_image:
         raise ValueError("LaunchJobRequest task or staging image differs")
@@ -304,6 +321,7 @@ def decode_launch_request(
     raw: bytes,
     *,
     approved_authorization_sha256: str,
+    campaign: Campaign,
     retry: int,
 ) -> controller_pb2.Controller.LaunchJobRequest:
     """Parse canonical protobuf bytes and revalidate their complete launch scope."""
@@ -314,7 +332,12 @@ def decode_launch_request(
         raise ValueError("LaunchJobRequest protobuf is malformed") from error
     if request.SerializeToString(deterministic=True) != raw:
         raise ValueError("LaunchJobRequest protobuf is not canonical")
-    validate_launch_request(request, approved_authorization_sha256=approved_authorization_sha256, retry=retry)
+    validate_launch_request(
+        request,
+        approved_authorization_sha256=approved_authorization_sha256,
+        campaign=campaign,
+        retry=retry,
+    )
     return request
 
 
@@ -322,14 +345,21 @@ def _request_summary(
     raw: bytes,
     *,
     approved_authorization_sha256: str,
+    campaign: Campaign,
     retry: int,
 ) -> dict[str, object]:
-    request = decode_launch_request(raw, approved_authorization_sha256=approved_authorization_sha256, retry=retry)
+    request = decode_launch_request(
+        raw,
+        approved_authorization_sha256=approved_authorization_sha256,
+        campaign=campaign,
+        retry=retry,
+    )
     return {
         "authorization_sha256": approved_authorization_sha256,
         "bundle_sha256": request.bundle_id,
         "bundle_size": len(request.bundle_blob),
         "client_revision_date": request.client_revision_date,
+        "campaign": campaign.value,
         "image": request.task_image,
         "job_name": request.name,
         "request_sha256": hashlib.sha256(raw).hexdigest(),
@@ -361,6 +391,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bundle-root", type=Path)
     parser.add_argument("--authorization-file", type=Path)
     parser.add_argument("--approved-authorization-sha256")
+    parser.add_argument("--campaign", choices=tuple(Campaign))
     parser.add_argument("--retry", type=int)
     parser.add_argument("--request-output", type=Path)
     arguments = parser.parse_args(argv)
@@ -370,6 +401,7 @@ def main(argv: list[str] | None = None) -> int:
         "bundle root": arguments.bundle_root,
         "authorization file": arguments.authorization_file,
         "approved authorization SHA-256": arguments.approved_authorization_sha256,
+        "campaign": arguments.campaign,
         "retry": arguments.retry,
         "request output": arguments.request_output,
     }
@@ -380,12 +412,14 @@ def main(argv: list[str] | None = None) -> int:
         bundle_root=arguments.bundle_root,
         authorization_path=arguments.authorization_file,
         approved_authorization_sha256=arguments.approved_authorization_sha256,
+        campaign=Campaign(arguments.campaign),
         retry=arguments.retry,
     )
     raw = request.SerializeToString(deterministic=True)
     summary = _request_summary(
         raw,
         approved_authorization_sha256=arguments.approved_authorization_sha256,
+        campaign=Campaign(arguments.campaign),
         retry=arguments.retry,
     )
     _write_create_only(arguments.request_output, raw)

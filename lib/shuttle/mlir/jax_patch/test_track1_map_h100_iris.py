@@ -56,6 +56,8 @@ def test_dry_run_emits_and_decodes_the_real_fail_closed_launch_request(
                 str(AUTHORIZATION_PATH),
                 "--approved-authorization-sha256",
                 approved,
+                "--campaign",
+                Campaign.RMSNORM_CANARY.value,
                 "--retry",
                 "4",
                 "--request-output",
@@ -149,6 +151,8 @@ def test_request_bytes_are_deterministic_and_output_is_create_only(tmp_path: Pat
                 str(AUTHORIZATION_PATH),
                 "--approved-authorization-sha256",
                 approved,
+                "--campaign",
+                Campaign.RMSNORM_CANARY.value,
                 "--retry",
                 "1",
                 "--request-output",
@@ -228,7 +232,7 @@ def test_decoded_request_rejects_every_launch_scope_mutation(mutation: str) -> N
     elif mutation == "memory":
         changed.resources.memory_bytes = 127 * 1024**3
     elif mutation == "name":
-        changed.name = job_name(2)
+        changed.name = job_name(Campaign.RMSNORM_CANARY, 2)
     elif mutation == "priority":
         changed.priority_band = job_pb2.PRIORITY_BAND_INTERACTIVE
     elif mutation == "replicas":
@@ -245,4 +249,9 @@ def test_decoded_request_rejects_every_launch_scope_mutation(mutation: str) -> N
         changed.timeout.milliseconds += 1
 
     with pytest.raises(ValueError, match="LaunchJobRequest"):
-        validate_launch_request(changed, approved_authorization_sha256=approved, retry=1)
+        validate_launch_request(
+            changed,
+            approved_authorization_sha256=approved,
+            campaign=Campaign.RMSNORM_CANARY,
+            retry=1,
+        )

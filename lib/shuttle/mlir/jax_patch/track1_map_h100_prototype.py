@@ -141,6 +141,7 @@ class PrototypePaths:
     cache: Path
     populate: Path
     reuse: Path
+    rmsnorm: Path
     logs: Path
     image_identity: Path
     hydration_identity: Path
@@ -159,6 +160,7 @@ class PrototypePaths:
             cache=workspace / "cache",
             populate=workspace / "populate.json",
             reuse=workspace / "reuse.json",
+            rmsnorm=workspace / "rmsnorm.json",
             logs=workspace / "logs",
             image_identity=workspace / "base-image.identity",
             hydration_identity=workspace / "hydration-identities.json",
@@ -293,6 +295,15 @@ def _worker_command(paths: PrototypePaths, runner_repository: Path, role: str) -
     return command
 
 
+def _rmsnorm_worker_command(paths: PrototypePaths, runner_repository: Path) -> list[str]:
+    return [
+        str(paths.runtime / "bin/python"),
+        str(runner_repository / "lib/shuttle/mlir/jax_patch/track1_rmsnorm_h100_worker.py"),
+        "--output",
+        str(paths.rmsnorm),
+    ]
+
+
 def _jax_source_command(paths: PrototypePaths, runner_repository: Path, action: str) -> list[str]:
     command = [
         str(paths.runtime / "bin/python"),
@@ -385,6 +396,7 @@ def prototype_plan(
         {"name": "verify_jax_runtime", "argv": _jax_source_command(paths, runner_repository, "verify")},
         {"name": "populate", "argv": _worker_command(paths, runner_repository, "populate")},
         {"name": "reuse", "argv": _worker_command(paths, runner_repository, "reuse")},
+        {"name": "rmsnorm", "argv": _rmsnorm_worker_command(paths, runner_repository)},
     ]
     return {
         "authorization_sha256": authorization.sha256,
@@ -541,6 +553,64 @@ def validate_result_pair(populate: object, reuse: object) -> dict[str, object]:
         ):
             raise ValueError("worker result reuse differs from populate output or cache")
     return {"populate": populated, "reuse": reused}
+
+
+def validate_rmsnorm_result(document: object) -> dict[str, object]:
+    """Validate the exact 18-coordinate RMSNorm H100 canary result."""
+    if type(document) is not dict or set(document) != {
+        "coordinates",
+        "pid",
+        "schema",
+        "schema_version",
+    }:
+        raise ValueError("RMSNorm result has the wrong root schema")
+    if document["schema"] != "track1_rmsnorm_h100_result" or document["schema_version"] != 1:
+        raise ValueError("RMSNorm result has the wrong schema identity")
+    if type(document["pid"]) is not int or document["pid"] <= 0:
+        raise ValueError("RMSNorm result PID must be positive")
+    coordinates = document["coordinates"]
+    if type(coordinates) is not list or len(coordinates) != 18:
+        raise ValueError("RMSNorm result must cover 18 coordinates")
+    shapes = ((2, 7, 19), (3, 2, 5, 11, 263))
+    boundaries = (
+        ("forward", ("result",)),
+        ("backward", ("input_cotangent", "weight_cotangent")),
+        ("composed", ("result", "input_cotangent", "weight_cotangent")),
+    )
+    expected = [
+        (shape, boundary, roles, mode) for shape in shapes for boundary, roles in boundaries for mode in WORKER_MODES
+    ]
+    baselines: dict[tuple[tuple[int, ...], str], dict[str, str]] = {}
+    for item, (shape, boundary, roles, mode) in zip(coordinates, expected, strict=True):
+        if type(item) is not dict or set(item) != {"boundary", "mode", "observer", "results", "shape"}:
+            raise ValueError("RMSNorm result coordinate has the wrong schema")
+        if item["shape"] != list(shape) or item["boundary"] != boundary or item["mode"] != mode:
+            raise ValueError("RMSNorm result coordinate order differs")
+        results = item["results"]
+        if type(results) is not dict or tuple(results) != roles:
+            raise ValueError("RMSNorm result output roles differ")
+        for role in roles:
+            _sha(results[role], f"RMSNorm {role}")
+        key = (shape, boundary)
+        if mode == "disabled":
+            baselines[key] = results
+        elif results != baselines[key]:
+            raise ValueError("RMSNorm enabled result differs from its disabled baseline")
+        observer = item["observer"]
+        if mode == "disabled":
+            if observer is not None:
+                raise ValueError("RMSNorm disabled result has an observer")
+        elif (
+            type(observer) is not dict
+            or set(observer) != {"final_module_sha256", "generated_bundle_sha256", "invocation_id"}
+            or type(observer["invocation_id"]) is not int
+            or observer["invocation_id"] <= 0
+        ):
+            raise ValueError("RMSNorm enabled result has an invalid observer")
+        else:
+            _sha(observer["final_module_sha256"], "RMSNorm final module")
+            _sha(observer["generated_bundle_sha256"], "RMSNorm generated bundle")
+    return document
 
 
 def _load_canonical_document(path: Path, name: str) -> dict[str, object]:
@@ -883,10 +953,18 @@ def execute_prototype(
         phase="reuse",
         environment=environment,
     )
+    _run(
+        _rmsnorm_worker_command(paths, runner_repository),
+        cwd=runner_repository,
+        log=paths.logs / "rmsnorm.log",
+        phase="rmsnorm",
+        environment=environment,
+    )
     workers = validate_result_pair(
         _load_canonical_document(paths.populate, "populate result"),
         _load_canonical_document(paths.reuse, "reuse result"),
     )
+    rmsnorm = validate_rmsnorm_result(_load_canonical_document(paths.rmsnorm, "RMSNorm result"))
     return {
         "attempt": 1,
         "authorization_sha256": authorization.sha256,
@@ -899,4 +977,5 @@ def execute_prototype(
             {"name": wheel.name, "sha256": _sha256_file(wheel), "size": wheel.stat().st_size} for wheel in wheels
         ],
         "workers": workers,
+        "rmsnorm": rmsnorm,
     }

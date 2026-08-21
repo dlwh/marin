@@ -308,8 +308,7 @@ def _rmsnorm_document() -> dict[str, object]:
                             }
                         ),
                         "results": {
-                            role: hashlib.sha256(f"{shape}:{boundary}:{mode}:{role}".encode()).hexdigest()
-                            for role in roles
+                            role: hashlib.sha256(f"{shape}:{boundary}:{role}".encode()).hexdigest() for role in roles
                         },
                         "shape": list(shape),
                     }
