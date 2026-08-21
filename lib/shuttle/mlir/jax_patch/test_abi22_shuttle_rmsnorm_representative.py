@@ -491,7 +491,11 @@ def test_executor_invokes_exact_matrix_and_assembles_file_backed_evidence(
         )
         == evidence
     )
-    assert json.loads((reports_root / "shuttle-policy-raw-v1.json").read_text()) == evidence
+    raw_evidence = json.loads((reports_root / "shuttle-policy-raw-v1.json").read_text())
+    assert raw_evidence["schema"] == "shuttle_abi22_rmsnorm_representative_prevalidation_raw_v1"
+    assert raw_evidence["status"] == "unvalidated_numerical_evidence"
+    assert "accepted" not in raw_evidence["status"]
+    assert raw_evidence["cells"] == evidence["cells"]
     for cell in evidence["cells"]:
         raw_cell = json.loads(
             (raw_root / cell["policy"] / cell["boundary"] / f"repeat-{cell['repeat']}" / "cell.json").read_text()
@@ -596,6 +600,9 @@ def test_executor_persists_raw_outputs_and_diagnostics_before_numerical_rejectio
     assert diagnostics_path.is_file()
     raw = json.loads(raw_path.read_text())
     diagnostics = json.loads(diagnostics_path.read_text())
+    assert raw["schema"] == "shuttle_abi22_rmsnorm_representative_prevalidation_raw_v1"
+    assert raw["status"] == "unvalidated_numerical_evidence"
+    assert "accepted" not in raw["status"]
     failed = raw["cells"][0]["outputs"][0]
     assert failed["max_absolute_error"] > EXPECTED_LIMITS["y"]["max_absolute_error_below_floor"]
     assert Path(failed["artifact"]["path"]).is_file()
