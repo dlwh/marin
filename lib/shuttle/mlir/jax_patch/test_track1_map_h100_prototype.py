@@ -75,6 +75,14 @@ def _document() -> dict[str, object]:
                 "offline_downloads": False,
                 "physical_tools_root": "/usr/local/cuda-13.2",
             },
+            "python_package": {
+                "dependency_resolution": False,
+                "distribution": "jax",
+                "expected_base_version": "0.10.1",
+                "install_method": "site-packages-pth",
+                "network": False,
+                "source": "pinned_hydrated_checkout",
+            },
             "python": "3.12",
         },
     }
@@ -112,6 +120,11 @@ def _authorization(tmp_path: Path) -> tuple[Path, str, Authorization]:
         (("toolchain", "cuda", "hydration_downloads"), False),
         (("toolchain", "cuda", "offline_downloads"), True),
         (("toolchain", "cuda", "physical_tools_root"), "/usr/local/cuda"),
+        (("toolchain", "python_package", "dependency_resolution"), True),
+        (("toolchain", "python_package", "expected_base_version"), "0.10.0"),
+        (("toolchain", "python_package", "install_method"), "registry-wheel"),
+        (("toolchain", "python_package", "network"), True),
+        (("toolchain", "python_package", "source"), "registry"),
         (("toolchain", "python"), "3.13"),
     ],
 )
@@ -193,6 +206,8 @@ def test_dry_run_renders_one_network_hydration_then_offline_build_and_two_worker
         "offline_wheel_build",
         "create_runtime",
         "install_wheels",
+        "install_jax_source",
+        "verify_jax_runtime",
         "populate",
         "reuse",
     ]
@@ -207,8 +222,13 @@ def test_dry_run_renders_one_network_hydration_then_offline_build_and_two_worker
     assert "--bazel_options=--repository_disable_download" not in hydration
     assert "--bazel_options=--repository_disable_download" in offline
     assert "--disable-pip-version-check" in phases[6]["argv"]
-    assert phases[7]["argv"][phases[7]["argv"].index("--role") + 1] == "populate"
-    assert phases[8]["argv"][phases[8]["argv"].index("--role") + 1] == "reuse"
+    assert "--no-deps" in phases[6]["argv"]
+    assert "--no-index" in phases[6]["argv"]
+    assert phases[7]["argv"][-2:] == ["install", str(workspace / "jax")]
+    assert phases[8]["argv"][-2:] == ["verify", str(workspace / "jax")]
+    assert all("pip" not in argument and "http" not in argument for argument in phases[7]["argv"])
+    assert phases[9]["argv"][phases[9]["argv"].index("--role") + 1] == "populate"
+    assert phases[10]["argv"][phases[10]["argv"].index("--role") + 1] == "reuse"
     assert not workspace.exists()
 
     workspace.mkdir()

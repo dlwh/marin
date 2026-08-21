@@ -55,7 +55,7 @@ def test_dry_run_emits_and_decodes_the_real_fail_closed_launch_request(
                 "--approved-authorization-sha256",
                 approved,
                 "--retry",
-                "3",
+                "4",
                 "--request-output",
                 str(output),
             ]
@@ -66,17 +66,17 @@ def test_dry_run_emits_and_decodes_the_real_fail_closed_launch_request(
     raw = output.read_bytes()
     request = controller_pb2.Controller.LaunchJobRequest()
     request.ParseFromString(raw)
-    decoded = decode_launch_request(raw, approved_authorization_sha256=approved, retry=3)
+    decoded = decode_launch_request(raw, approved_authorization_sha256=approved, retry=4)
     summary = json.loads(capsys.readouterr().out)
 
     assert request == decoded
     assert summary["request_sha256"] == hashlib.sha256(raw).hexdigest()
     assert summary["bundle_sha256"] == request.bundle_id
     assert summary["authorization_sha256"] == approved
-    assert summary["job_name"] == job_name(3)
-    assert summary["retry"] == 3
+    assert summary["job_name"] == job_name(4)
+    assert summary["retry"] == 4
 
-    assert request.name == "/dlwh/shuttle-track1-map-h100-prototype-r3"
+    assert request.name == "/dlwh/shuttle-track1-map-h100-prototype-r4"
     assert request.client_revision_date == CLIENT_REVISION_DATE
     assert request.task_image == BASE_IMAGE
     assert request.bundle_init_image == ""
@@ -125,8 +125,8 @@ def test_request_bytes_are_deterministic_and_output_is_create_only(tmp_path: Pat
     first = _request().SerializeToString(deterministic=True)
     second = _request().SerializeToString(deterministic=True)
     assert first == second
-    assert _request(3).name == "/dlwh/shuttle-track1-map-h100-prototype-r3"
-    assert _request(3).SerializeToString(deterministic=True) != first
+    assert _request(4).name == "/dlwh/shuttle-track1-map-h100-prototype-r4"
+    assert _request(4).SerializeToString(deterministic=True) != first
     with pytest.raises(ValueError, match="protobuf is malformed"):
         decode_launch_request(b"\xff", approved_authorization_sha256=approved, retry=1)
     with pytest.raises(ValueError, match="positive integer"):
