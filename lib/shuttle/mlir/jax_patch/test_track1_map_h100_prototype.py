@@ -424,6 +424,9 @@ def test_execute_rejects_bazel_or_hydration_failure_before_offline_build(
                         "import sys; "
                         "print('x' * 20000); "
                         "print('API_TOKEN=do-not-leak'); "
+                        "print('Authorization: Bearer bearer-secret'); "
+                        "print('AUTHORIZATION=Basic basic-secret'); "
+                        'print(\'{"client_secret":"json-secret"}\'); '
                         "print('https://user:password@example.invalid/private'); "
                         "print('final useful failure'); "
                         "sys.exit(23)"
@@ -480,6 +483,9 @@ def test_execute_rejects_bazel_or_hydration_failure_before_offline_build(
     assert not offline_started
     if fail_hydration:
         assert "do-not-leak" not in str(raised.value)
+        assert "bearer-secret" not in str(raised.value)
+        assert "basic-secret" not in str(raised.value)
+        assert "json-secret" not in str(raised.value)
         assert "user:password" not in str(raised.value)
         assert "[REDACTED]" in str(raised.value)
         assert len(str(raised.value)) <= 9_000
