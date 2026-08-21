@@ -152,6 +152,50 @@ def test_validate_coordinate_rejects_repeat_nonfinite_role_and_threshold_drift()
         subject.validate_coordinate(coordinate, tuple(exceeded), tuple(exceeded), snapshot)
 
 
+def test_threshold_failure_reports_every_role_before_rejecting_the_coordinate() -> None:
+    coordinate = Coordinate((5, 19, 7), Boundary.COMPOSED, Mode.DISABLED)
+    roles = subject.result_roles(coordinate.boundary)
+    oracle = binary64_oracle(coordinate.shape)
+    arrays = tuple(oracle[role].astype(ml_dtypes.bfloat16) for role in roles)
+    exceeded = list(value.copy() for value in arrays)
+    exceeded[1].flat[3] = ml_dtypes.bfloat16(1024.0)
+    reports: list[dict[str, object]] = []
+
+    with pytest.raises(RuntimeError, match="input_cotangent exceeds"):
+        subject.validate_coordinate(
+            coordinate,
+            tuple(exceeded),
+            tuple(value.copy() for value in exceeded),
+            (),
+            report_cell=reports.append,
+        )
+
+    assert [report["role"] for report in reports] == list(roles)
+    failing = reports[1]
+    assert failing["schema"] == "track1_rmsnorm_contract_h100_cell"
+    assert failing["schema_version"] == 1
+    assert failing["shape"] == [5, 19, 7]
+    assert failing["boundary"] == "composed"
+    assert failing["mode"] == "disabled"
+    assert failing["threshold_exceeded"]
+    assert failing["first_mismatch"]["index"] == [0, 3]
+    assert failing["first_mismatch"]["actual_value"] == 1024.0
+    assert failing["worst_absolute"]["index"] == [0, 3]
+    assert failing["worst_bf16_ulp"]["index"] == [0, 3]
+    assert failing["maximum_raw_bf16_code_distance"] >= 0
+    assert failing["maximum_magnitude_masked_bf16_code_distance"] >= 0
+    assert failing["metrics"]["maximum_absolute_error"] > 0.0625
+    assert set(failing["output_digests"]) == {
+        "actual",
+        "analytic_rounded",
+        "disabled_jax",
+        "repeat",
+    }
+    assert all(len(digest.split(":")) == 8 for digest in failing["output_digests"].values())
+    encoded = json.dumps(failing, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    assert len(encoded) < subject.MAX_CELL_REPORT_BYTES
+
+
 def test_disabled_jax_comparison_is_labeled_diagnostic_not_the_acceptance_oracle() -> None:
     coordinate = Coordinate((5, 19, 7), Boundary.PRIMAL, Mode.SOURCE_ORDERED)
     expected = subject.emitted_primal_oracle(coordinate.shape, fast=False)
