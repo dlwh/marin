@@ -5024,6 +5024,125 @@ TEST(Abi22MapFusionContract,
 }
 
 TEST(Abi22MapFusionContract,
+     ComposedVjpReusesOneSpecializedPrimalBoundary) {
+  struct Boundary {
+    const char *filename;
+    int64_t columns;
+  };
+  constexpr Boundary boundaries[] = {
+      {"jax-0.10.1-bf16-rmsnorm_contract-5x19x7-composed.mlir", 7},
+      {"jax-0.10.1-bf16-rmsnorm_contract-5x19x257-composed.mlir", 257},
+  };
+  for (const Boundary &boundary : boundaries) {
+    SCOPED_TRACE(boundary.filename);
+    std::optional<std::string> source = fixtureSource(boundary.filename);
+    ASSERT_TRUE(source);
+    for (mlir::shuttle::NumericalPolicy policy :
+         {mlir::shuttle::NumericalPolicy::SourceOrdered,
+          mlir::shuttle::NumericalPolicy::Fast}) {
+      SCOPED_TRACE(mlir::shuttle::stringifyNumericalPolicy(policy).str());
+      std::unique_ptr<BuiltModule> built =
+          build(*source, policy, kFusionTuning, false, false);
+      ASSERT_TRUE(built);
+      std::optional<PlanSummary> planSummary = summary(*built->module);
+      ASSERT_TRUE(planSummary);
+      EXPECT_TRUE(planSummary->hasContractRegion);
+      EXPECT_TRUE(planSummary->exactSourceCoverage);
+
+      auto plan = *built->module->getOps<mlir::shuttle::MaterializationPlanOp>()
+                       .begin();
+      auto tasks = llvm::to_vector(
+          plan.getBody()
+              .front()
+              .getOps<mlir::shuttle::MaterializationTaskOp>());
+      auto buffers = llvm::to_vector(
+          plan.getBody()
+              .front()
+              .getOps<mlir::shuttle::MaterializationBufferOp>());
+      auto specialized = llvm::find_if(tasks, [](auto task) {
+        return static_cast<bool>(task->template getAttrOfType<mlir::ArrayAttr>(
+            "contract_region_sources"));
+      });
+      ASSERT_NE(specialized, tasks.end());
+      EXPECT_EQ(llvm::count_if(tasks, [](auto task) {
+                  return static_cast<bool>(
+                      task->template getAttrOfType<mlir::ArrayAttr>(
+                          "contract_region_sources"));
+                }),
+                1);
+      mlir::shuttle::MaterializationTaskOp specializedTask = *specialized;
+      EXPECT_EQ(specializedTask.getKind(),
+                mlir::shuttle::MaterializationTaskKind::Contract);
+      auto sources = specializedTask->getAttrOfType<mlir::ArrayAttr>(
+          "contract_region_sources");
+      ASSERT_TRUE(sources);
+      llvm::SmallVector<int64_t> expectedPrimalSources;
+      for (int64_t ordinal = 0; ordinal <= 24; ++ordinal)
+        expectedPrimalSources.push_back(ordinal);
+      EXPECT_EQ(sourceOperationOrdinals(sources), expectedPrimalSources);
+      auto foldSource =
+          specializedTask->getAttrOfType<mlir::shuttle::SourceRefAttr>(
+              "contract_region_fold_source");
+      auto contractSource =
+          specializedTask->getAttrOfType<mlir::shuttle::SourceRefAttr>(
+              "contract_region_contract_source");
+      auto boundarySource =
+          specializedTask->getAttrOfType<mlir::shuttle::SourceRefAttr>(
+              "contract_region_bf16_boundary_source");
+      auto epilogueSources = specializedTask->getAttrOfType<mlir::ArrayAttr>(
+          "contract_region_epilogue_sources");
+      ASSERT_TRUE(foldSource);
+      ASSERT_TRUE(contractSource);
+      ASSERT_TRUE(boundarySource);
+      ASSERT_TRUE(epilogueSources);
+      EXPECT_EQ(foldSource.getOperationOrdinal(), 3);
+      EXPECT_EQ(boundarySource.getOperationOrdinal(), 22);
+      EXPECT_EQ(contractSource.getOperationOrdinal(), 23);
+      EXPECT_EQ(sourceOperationOrdinals(epilogueSources),
+                llvm::ArrayRef<int64_t>({24}));
+
+      std::optional<mlir::shuttle::MaterializationBufferOp> normalized;
+      std::optional<mlir::shuttle::MaterializationBufferOp> primalResult;
+      for (int64_t output : specializedTask.getOutputBuffers()) {
+        auto found = llvm::find_if(buffers, [&](auto buffer) {
+          return buffer.getOrdinal() == output;
+        });
+        ASSERT_NE(found, buffers.end());
+        auto type =
+            mlir::dyn_cast<mlir::RankedTensorType>(found->getTensorType());
+        ASSERT_TRUE(type);
+        if (type.getShape() == llvm::ArrayRef<int64_t>({5, 19}) &&
+            type.getElementType().isBF16() && !found->getLiveOut()) {
+          ASSERT_FALSE(normalized);
+          normalized = *found;
+        }
+        if (type.getShape() ==
+                llvm::ArrayRef<int64_t>({5, boundary.columns}) &&
+            type.getElementType().isBF16() && found->getLiveOut()) {
+          ASSERT_FALSE(primalResult);
+          primalResult = *found;
+        }
+      }
+      ASSERT_TRUE(normalized);
+      ASSERT_TRUE(primalResult);
+      EXPECT_EQ(specializedTask.getOutputBuffers().size(), 2);
+      EXPECT_EQ(normalized->getStorage(),
+                mlir::shuttle::MaterializationStorage::Temporary);
+      ASSERT_TRUE(normalized->getProducer());
+      EXPECT_EQ(*normalized->getProducer(), specializedTask.getOrdinal());
+      EXPECT_FALSE(normalized->getConsumers().empty());
+      EXPECT_EQ(llvm::count_if(tasks, [&](auto task) {
+                  return task.getKind() ==
+                             mlir::shuttle::MaterializationTaskKind::Contract &&
+                         llvm::is_contained(task.getInputBuffers(),
+                                            normalized->getOrdinal());
+                }),
+                1);
+    }
+  }
+}
+
+TEST(Abi22MapFusionContract,
      RejectsCorruptNormContractSchemaBuffersAndInternalSsaEdges) {
   struct Mutation {
     const char *name;
