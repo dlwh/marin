@@ -120,8 +120,12 @@ class LayerNormForwardNumericalContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "qualification"):
             validate_contract(changed)
         changed = copy.deepcopy(contract)
-        changed["cells"][0]["binary64_output_digest"] = "0" * 63
-        with self.assertRaisesRegex(ValueError, "digest"):
+        changed["cells"][0]["binary64_output_digest"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "evidence"):
+            validate_contract(changed)
+        changed = copy.deepcopy(contract)
+        changed["cells"][0]["schedule_metrics"]["mean_absolute_error"] = 1.0e-12
+        with self.assertRaisesRegex(ValueError, "evidence"):
             validate_contract(changed)
 
     def test_rejects_invalid_metric_fields(self) -> None:

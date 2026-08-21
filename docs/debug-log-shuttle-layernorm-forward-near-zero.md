@@ -20,8 +20,8 @@ is not an infrastructure, binding, nonfinite, poisoned-output, or request error.
 
 The sealed request SHA-256 was
 `9534f59f22cdd4f4dd28112de1185ffe40d72618a8933bb6ba5f3edbae73271b`.
-The Iris terminal summary is preserved in
-`scratch/20260821-0709_monitoring_state.json`.
+The terminal outcome and exact numerical observation are recorded above; the
+local Iris monitoring-state file is not part of this contract change.
 
 ## Read-only audit conclusion for r3
 
@@ -108,21 +108,43 @@ emitter is unchanged.
 
 ## Local verification
 
-- Direct Python contract: 7 tests passed in 0.808 seconds.
-- Fresh-root Bazel contract target: passed in 2.1 seconds after 21 actions.
-- Fresh-root Bazel GPU transport target: the sealed host model passed and the
-  H100-only test skipped locally; compilation and execution completed after
-  3804 actions in 231.756 seconds.
-- Full GPU transport binary: 48 tests ran in 2.061 seconds; 42 host tests
+- Direct Python contract: 7 tests passed in 0.875 seconds.
+- Fresh-root Bazel contract target: passed in 1.7 seconds after 21 actions.
+- Fresh-root focused GPU transport target: the epsilon, sealed-evidence, and
+  matrix mutation gates passed; the H100-only test skipped locally. Compilation
+  and execution completed after 4045 actions in 176.292 seconds.
+- Full GPU transport binary: 50 tests ran in 1.985 seconds; 44 host tests
   passed and the six hardware-only tests skipped.
 - Full non-manual native census from a fresh Bazel root: 69 of 70 targets
-  passed after 5558 actions. The sole failure was the established ABI19
+  passed. An incremental exact-source recheck rebuilt six actions and retained
+  the same result. The sole failure was the established ABI19
   libdevice red in
   `DefaultExpProducesDeterministicClosedPtxForBothPolicies`; its other three
   tests passed.
 
 The contract still requires independent review before any r4 request is
 rendered or submitted.
+
+## Independent-review repair
+
+Review of the first contract commit rejected three acceptance gaps before any
+hardware request was prepared. Red-first mutations showed that the validator
+accepted a syntactically valid substituted digest and an in-limit metric
+change. The validator now regenerates every sealed input, binary64 output,
+scheduled output, and schedule metric before accepting the JSON evidence; both
+mutations are rejected.
+
+The C++ binary64 model initially added the binary64 literal `1e-5`, while the
+Python model promotes the public f32 epsilon. A focused host assertion failed
+with `1e-5` versus `9.9999997473787516e-06`. The C++ model now explicitly uses
+`static_cast<double>(1.0e-5f)`, matching the declared public operation.
+
+Finally, the H100 test now requires exactly the two sealed fixture boundaries,
+four unique case-and-shape cells, and the two numerical policies. The resulting
+eight execution coordinates are checked as an exact set after execution.
+Removal and duplication mutations for a boundary, cell, or policy are rejected.
+This repair changes only contract and test code; the compiler emitter remains
+unchanged.
 
 ## Future work
 

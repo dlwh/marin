@@ -3,10 +3,11 @@
 
 """Prospective ABI22 LayerNorm-forward numerical contract."""
 
+import functools
 import hashlib
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -267,6 +268,14 @@ def validate_contract(document: object) -> None:
         }:
             raise ValueError("contract schedule metrics differ")
         require_accepted(ErrorMetrics(**schedule_metrics), case)
+        sealed = _sealed_cell_evidence()[(case, shape)]
+        if (
+            input_digests != sealed["input_digests"]
+            or cell["binary64_output_digest"] != sealed["binary64_output_digest"]
+            or cell["schedule_output_digest"] != sealed["schedule_output_digest"]
+            or schedule_metrics != sealed["schedule_metrics"]
+        ):
+            raise ValueError("contract cell evidence differs")
     if coordinates != expected_coordinates:
         raise ValueError("contract cell coverage differs")
     qualification = document["qualification_only"]
@@ -306,3 +315,20 @@ def _ordered_bf16(value: np.ndarray) -> np.ndarray:
 
 def _is_sha256(value: object) -> bool:
     return type(value) is str and len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
+@functools.cache
+def _sealed_cell_evidence() -> dict[tuple[str, tuple[int, int]], dict[str, object]]:
+    evidence = {}
+    for case in CASES:
+        for shape in SHAPES:
+            inputs = fixed_inputs(*shape, case)
+            binary64 = binary64_reference(*inputs)
+            scheduled = scheduled_reference(*inputs)
+            evidence[(case, shape)] = {
+                "input_digests": dict(zip(("x", "gamma", "beta"), map(array_digest, inputs), strict=True)),
+                "binary64_output_digest": array_digest(binary64),
+                "schedule_output_digest": array_digest(scheduled),
+                "schedule_metrics": asdict(error_metrics(scheduled, binary64)),
+            }
+    return evidence

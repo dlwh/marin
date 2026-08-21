@@ -4397,6 +4397,12 @@ struct ProspectiveLayerNormCell {
   int32_t scheduleMaxBf16UlpError;
 };
 
+struct ProspectiveLayerNormBoundary {
+  llvm::StringLiteral fixture;
+  int64_t rows;
+  int64_t features;
+};
+
 constexpr ProspectiveLayerNormCell prospectiveLayerNormCells[] = {
     {ProspectiveLayerNormCase::Balanced, 7, 13,
      "2e43a818f671624fccb9795c962c5ebcafc27ea1e9e8de51f99a9037aabae0f2",
@@ -4427,6 +4433,87 @@ constexpr ProspectiveLayerNormCell prospectiveLayerNormCells[] = {
      "8410a8e6435fdd1dd953cc0056770b8ccc909149a705172344411a8d753d2068", 0.0625,
      3.725290298461914e-08, 0.005376344086021506, 1},
 };
+
+constexpr ProspectiveLayerNormBoundary prospectiveLayerNormBoundaries[] = {
+    {"jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-forward.mlir", 7, 13},
+    {"jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-forward.mlir", 2048, 4096},
+};
+
+constexpr mlir::shuttle::NumericalPolicy prospectiveLayerNormPolicies[] = {
+    mlir::shuttle::NumericalPolicy::SourceOrdered,
+    mlir::shuttle::NumericalPolicy::Fast,
+};
+
+bool prospectiveLayerNormMatrixIsExact(
+    llvm::ArrayRef<ProspectiveLayerNormBoundary> boundaries,
+    llvm::ArrayRef<ProspectiveLayerNormCell> cells,
+    llvm::ArrayRef<mlir::shuttle::NumericalPolicy> policies) {
+  if (boundaries.size() != 2 || cells.size() != 4 || policies.size() != 2)
+    return false;
+  struct ExpectedBoundary {
+    int64_t rows;
+    int64_t features;
+    llvm::StringLiteral fixture;
+  };
+  constexpr ExpectedBoundary expectedBoundaries[] = {
+      {7, 13, "jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-forward.mlir"},
+      {2048, 4096,
+       "jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-forward.mlir"},
+  };
+  for (const ExpectedBoundary &expected : expectedBoundaries) {
+    if (llvm::count_if(boundaries, [&](const auto &boundary) {
+          return boundary.rows == expected.rows &&
+                 boundary.features == expected.features &&
+                 boundary.fixture == expected.fixture;
+        }) != 1)
+      return false;
+  }
+  struct ExpectedCell {
+    int64_t rows;
+    int64_t features;
+    ProspectiveLayerNormCase testCase;
+  };
+  constexpr ExpectedCell expectedCells[] = {
+      {7, 13, ProspectiveLayerNormCase::Balanced},
+      {2048, 4096, ProspectiveLayerNormCase::Balanced},
+      {7, 13, ProspectiveLayerNormCase::PositiveOffset},
+      {2048, 4096, ProspectiveLayerNormCase::PositiveOffset},
+  };
+  for (const ExpectedCell &expected : expectedCells) {
+    if (llvm::count_if(cells, [&](const auto &cell) {
+          return cell.rows == expected.rows &&
+                 cell.features == expected.features &&
+                 cell.testCase == expected.testCase;
+        }) != 1)
+      return false;
+  }
+  for (mlir::shuttle::NumericalPolicy expected :
+       {mlir::shuttle::NumericalPolicy::SourceOrdered,
+        mlir::shuttle::NumericalPolicy::Fast}) {
+    if (std::count(policies.begin(), policies.end(), expected) != 1)
+      return false;
+  }
+  int64_t executions = 0;
+  for (const auto &boundary : boundaries)
+    for (const auto &cell : cells)
+      if (cell.rows == boundary.rows && cell.features == boundary.features)
+        executions += policies.size();
+  return executions == 8;
+}
+
+std::string prospectiveLayerNormCoordinate(
+    const ProspectiveLayerNormCell &cell,
+    mlir::shuttle::NumericalPolicy policy) {
+  return llvm::formatv(
+             "{0}x{1}_{2}_{3}", cell.rows, cell.features,
+             cell.testCase == ProspectiveLayerNormCase::Balanced
+                 ? "balanced"
+                 : "positive_offset",
+             policy == mlir::shuttle::NumericalPolicy::SourceOrdered
+                 ? "source_ordered"
+                 : "fast")
+      .str();
+}
 
 uint32_t prospectiveLayerNormMix32(uint32_t index, uint32_t stream) {
   uint32_t value = index + UINT32_C(0x6A09E667) + stream * UINT32_C(0x9E3779B9);
@@ -4591,6 +4678,10 @@ prospectiveScheduledLayerNorm(const LayerNormInputs &inputs, int64_t rows,
   return output;
 }
 
+double prospectiveBinary64Epsilon() {
+  return static_cast<double>(1.0e-5f);
+}
+
 std::vector<uint16_t>
 prospectiveBinary64LayerNorm(const LayerNormInputs &inputs, int64_t rows,
                              int64_t features) {
@@ -4607,8 +4698,8 @@ prospectiveBinary64LayerNorm(const LayerNormInputs &inputs, int64_t rows,
           mean;
       squaredSum += centered * centered;
     }
-    double inverse =
-        1.0 / std::sqrt(squaredSum / static_cast<double>(features) + 1.0e-5);
+    double inverse = 1.0 / std::sqrt(squaredSum / static_cast<double>(features) +
+                                     prospectiveBinary64Epsilon());
     for (int64_t feature = 0; feature < features; ++feature) {
       const int64_t element = row * features + feature;
       double centered =
@@ -4674,6 +4765,55 @@ void expectProspectiveLayerNormMetrics(
   EXPECT_LE(metrics.relativeLinfError, 0.0078125);
   EXPECT_LE(metrics.maxBf16UlpError, balanced ? 16 : 1)
       << "element " << metrics.maxUlpElement;
+}
+
+TEST(GpuTransportV2Test,
+     ProspectiveLayerNormBinary64OraclePromotesPublicF32Epsilon) {
+  EXPECT_NE(1.0e-5, static_cast<double>(1.0e-5f));
+  EXPECT_EQ(prospectiveBinary64Epsilon(), static_cast<double>(1.0e-5f));
+}
+
+TEST(GpuTransportV2Test,
+     ProspectiveLayerNormMatrixRejectsRemovalAndDuplication) {
+  EXPECT_TRUE(prospectiveLayerNormMatrixIsExact(
+      prospectiveLayerNormBoundaries, prospectiveLayerNormCells,
+      prospectiveLayerNormPolicies));
+
+  std::vector<ProspectiveLayerNormBoundary> boundaries(
+      std::begin(prospectiveLayerNormBoundaries),
+      std::end(prospectiveLayerNormBoundaries));
+  boundaries.pop_back();
+  EXPECT_FALSE(prospectiveLayerNormMatrixIsExact(
+      boundaries, prospectiveLayerNormCells, prospectiveLayerNormPolicies));
+  boundaries.assign(std::begin(prospectiveLayerNormBoundaries),
+                    std::end(prospectiveLayerNormBoundaries));
+  boundaries[1] = boundaries[0];
+  EXPECT_FALSE(prospectiveLayerNormMatrixIsExact(
+      boundaries, prospectiveLayerNormCells, prospectiveLayerNormPolicies));
+
+  std::vector<ProspectiveLayerNormCell> cells(
+      std::begin(prospectiveLayerNormCells),
+      std::end(prospectiveLayerNormCells));
+  cells.pop_back();
+  EXPECT_FALSE(prospectiveLayerNormMatrixIsExact(
+      prospectiveLayerNormBoundaries, cells, prospectiveLayerNormPolicies));
+  cells.assign(std::begin(prospectiveLayerNormCells),
+               std::end(prospectiveLayerNormCells));
+  cells[3] = cells[0];
+  EXPECT_FALSE(prospectiveLayerNormMatrixIsExact(
+      prospectiveLayerNormBoundaries, cells, prospectiveLayerNormPolicies));
+
+  std::vector<mlir::shuttle::NumericalPolicy> policies(
+      std::begin(prospectiveLayerNormPolicies),
+      std::end(prospectiveLayerNormPolicies));
+  policies.pop_back();
+  EXPECT_FALSE(prospectiveLayerNormMatrixIsExact(
+      prospectiveLayerNormBoundaries, prospectiveLayerNormCells, policies));
+  policies.assign(std::begin(prospectiveLayerNormPolicies),
+                  std::end(prospectiveLayerNormPolicies));
+  policies[1] = policies[0];
+  EXPECT_FALSE(prospectiveLayerNormMatrixIsExact(
+      prospectiveLayerNormBoundaries, prospectiveLayerNormCells, policies));
 }
 
 TEST(GpuTransportV2Test,
@@ -4966,20 +5106,15 @@ TEST(GpuTransportV2Test,
       R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
   constexpr llvm::StringLiteral tuning =
       R"json({"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json";
-  struct Boundary {
-    llvm::StringLiteral fixture;
-    int64_t rows;
-    int64_t features;
-  };
-  constexpr Boundary boundaries[] = {
-      {"jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-forward.mlir", 7, 13},
-      {"jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-forward.mlir", 2048, 4096},
-  };
-  for (const Boundary &boundary : boundaries) {
+  ASSERT_TRUE(prospectiveLayerNormMatrixIsExact(
+      prospectiveLayerNormBoundaries, prospectiveLayerNormCells,
+      prospectiveLayerNormPolicies));
+  std::vector<std::string> executedCoordinates;
+  for (const ProspectiveLayerNormBoundary &boundary :
+       prospectiveLayerNormBoundaries) {
     SCOPED_TRACE(boundary.fixture.str());
     for (mlir::shuttle::NumericalPolicy policy :
-         {mlir::shuttle::NumericalPolicy::SourceOrdered,
-          mlir::shuttle::NumericalPolicy::Fast}) {
+         prospectiveLayerNormPolicies) {
       const llvm::StringRef policyName =
           policy == mlir::shuttle::NumericalPolicy::SourceOrdered
               ? "source_ordered"
@@ -5122,6 +5257,8 @@ TEST(GpuTransportV2Test,
         ASSERT_TRUE(metrics)
             << "all actual and reference outputs must be finite";
         expectProspectiveLayerNormMetrics(*metrics, cell);
+        executedCoordinates.push_back(prospectiveLayerNormCoordinate(cell,
+                                                                      policy));
         RecordProperty(
             llvm::formatv("metrics_{0}x{1}_{2}_{3}", cell.rows, cell.features,
                           caseName, policyName)
@@ -5142,6 +5279,18 @@ TEST(GpuTransportV2Test,
       runner->reset();
     }
   }
+  std::sort(executedCoordinates.begin(), executedCoordinates.end());
+  const std::vector<std::string> expectedCoordinates = {
+      "2048x4096_balanced_fast",
+      "2048x4096_balanced_source_ordered",
+      "2048x4096_positive_offset_fast",
+      "2048x4096_positive_offset_source_ordered",
+      "7x13_balanced_fast",
+      "7x13_balanced_source_ordered",
+      "7x13_positive_offset_fast",
+      "7x13_positive_offset_source_ordered",
+  };
+  EXPECT_EQ(executedCoordinates, expectedCoordinates);
 }
 
 std::vector<uint16_t> rmsNormForwardReference(
