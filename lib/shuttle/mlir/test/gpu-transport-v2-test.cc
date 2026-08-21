@@ -6270,7 +6270,7 @@ TEST(GpuTransportV2Test,
             "composed.mlir";
   auto source = fixtureSource(fixture);
   ASSERT_TRUE(source)
-      << "representative fixture unavailable: " << fixture
+      << "representative fixture unavailable: " << fixture.str()
       << " RUNFILES_DIR="
       << (std::getenv("RUNFILES_DIR") == nullptr
               ? "<unset>"
