@@ -447,6 +447,14 @@ sh_test(
     ],
 )
 
+sh_binary(
+    name = "run_h100_shuttle_rmsnorm_representative",
+    srcs = ["test/run-h100-shuttle-rmsnorm-representative.sh"],
+    args = ["$(rootpath :gpu_transport_v2_test)"],
+    data = [":gpu_transport_v2_test"],
+    testonly = True,
+)
+
 sh_test(
     name = "abi22_h100_xla_baseline_test",
     srcs = ["test/run-h100-xla-baseline.sh"],
