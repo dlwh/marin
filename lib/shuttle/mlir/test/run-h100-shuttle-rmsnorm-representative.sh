@@ -55,6 +55,15 @@ case "$repeat" in
   *) echo "unsupported repeat: $repeat" >&2; exit 2 ;;
 esac
 
+if [ -z "${TEST_SRCDIR:-}" ] && [ -n "${RUNFILES_DIR:-}" ]; then
+  if [ ! -d "$RUNFILES_DIR" ]; then
+    echo "RUNFILES_DIR is not a directory: $RUNFILES_DIR" >&2
+    exit 2
+  fi
+  TEST_SRCDIR=$RUNFILES_DIR
+  export TEST_SRCDIR
+fi
+
 SHUTTLE_RUN_H100_REPRESENTATIVE=1 \
 SHUTTLE_REP_CASE_ROOT="$case_root" \
 SHUTTLE_REP_RAW_ROOT="$raw_root" \
