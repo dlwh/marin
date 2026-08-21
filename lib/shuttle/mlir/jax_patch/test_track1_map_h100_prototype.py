@@ -481,7 +481,16 @@ def test_rmsnorm_contract_result_requires_oracle_roles_repeatability_and_topolog
     document = _rmsnorm_contract_document()
     assert validate_rmsnorm_contract_result(document) == document
 
-    for mutation in ("role", "repeat", "threshold", "observer", "primal_topology", "composed_topology"):
+    for mutation in (
+        "role",
+        "repeat",
+        "threshold",
+        "observer",
+        "primal_topology",
+        "primal_topology_type",
+        "composed_topology",
+        "composed_topology_type",
+    ):
         changed = deepcopy(document)
         if mutation == "role":
             changed["coordinates"][6]["results"].pop("projection_cotangent")
@@ -493,8 +502,12 @@ def test_rmsnorm_contract_result_requires_oracle_roles_repeatability_and_topolog
             changed["coordinates"][1]["observer"] = None
         elif mutation == "primal_topology":
             changed["coordinates"][1]["observer"]["launch_count"] = 2
-        else:
+        elif mutation == "primal_topology_type":
+            changed["coordinates"][1]["observer"]["launch_count"] = 1.0
+        elif mutation == "composed_topology":
             changed["coordinates"][7]["observer"]["launch_count"] = 42
+        else:
+            changed["coordinates"][7]["observer"]["temporary_count"] = 36.0
         with pytest.raises(ValueError, match="RMSNorm Contract"):
             validate_rmsnorm_contract_result(changed)
 
