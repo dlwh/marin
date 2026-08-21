@@ -289,6 +289,11 @@ class PerformanceProtocolTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "complete case/policy matrix"):
             build_exploratory(shuttle, incomplete_xla, _te_unavailable())
 
+        inaccurate_xla = copy.deepcopy(xla)
+        inaccurate_xla["cells"][0]["output"]["max_bf16_ulp"] = 65535
+        with self.assertRaisesRegex(ValueError, "independent-oracle bound"):
+            build_exploratory(shuttle, inaccurate_xla, _te_unavailable())
+
         with self.assertRaisesRegex(ValueError, "TE exploratory blocker"):
             build_exploratory(shuttle, xla, None)
 
