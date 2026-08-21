@@ -7099,9 +7099,7 @@ FailureOr<std::string> emitFoldRegionPtx(
   auto phaseAttributes =
       materializationTask->getAttrOfType<ArrayAttr>("fold_region_phases");
   if (!sourceAttributes || !phaseAttributes || phaseAttributes.empty() ||
-      materializationTask.getOutputBuffers().size() != 1 ||
-      task.getScratchBytes() !=
-          task.getWorkgroupThreads() * static_cast<int64_t>(sizeof(float)))
+      materializationTask.getOutputBuffers().size() != 1)
     return failure();
   SmallVector<Operation *> sources;
   llvm::SmallDenseSet<Operation *> sourceSet;
@@ -7144,6 +7142,9 @@ FailureOr<std::string> emitFoldRegionPtx(
       fullPrefix ? scheduleElementCount(domain.getShape().drop_back())
                  : FailureOr<int64_t>(domain.getShape().back());
   if (failed(reductionExtent))
+    return failure();
+  if (task.getScratchBytes() !=
+      task.getWorkgroupThreads() * static_cast<int64_t>(sizeof(float)))
     return failure();
 
   PtxEmitter ptx(materializationTask.getInputBuffers().size() + 1);
@@ -7191,20 +7192,14 @@ FailureOr<std::string> emitFoldRegionPtx(
                 "  add.u64 %rd2, %rd3, %rd2;\n"
                 "  st.shared.f32 [%rd2], %f"
              << accumulator << ";\n  bar.sync 0;\n";
-  int64_t sharedWidth = 1;
-  while (sharedWidth <
-         std::min<int64_t>(*reductionExtent, task.getWorkgroupThreads()))
-    sharedWidth *= 2;
-  for (int64_t step = sharedWidth / 2; step >= 1; step /= 2) {
-    int64_t activeThreads =
-        std::min<int64_t>(step, task.getWorkgroupThreads() - step);
-    if (activeThreads <= 0)
-      continue;
+  for (int64_t active = task.getWorkgroupThreads(); active > 1;
+       active = (active + 1) / 2) {
+    int64_t pairs = active / 2;
     int64_t left = ptx.nextF32();
     int64_t right = ptx.nextF32();
     int64_t sum = ptx.nextF32();
-    ptx.stream << "  setp.ge.u32 %p2, %r0, " << activeThreads
-               << ";\n  @%p2 bra $fold_region_skip" << step
+    ptx.stream << "  setp.ge.u32 %p2, %r0, " << pairs
+               << ";\n  @%p2 bra $fold_region_skip_pairs" << active
                << ";\n  mul.lo.u32 %r5, %r0, 2;\n"
                   "  cvt.u64.u32 %rd4, %r5;\n"
                   "  mul.lo.u64 %rd4, %rd4, 4;\n"
@@ -7217,7 +7212,18 @@ FailureOr<std::string> emitFoldRegionPtx(
                   "  mul.lo.u64 %rd5, %rd5, 4;\n"
                   "  add.u64 %rd5, %rd3, %rd5;\n"
                   "  st.shared.f32 [%rd5], %f"
-               << sum << ";\n$fold_region_skip" << step << ":\n  bar.sync 0;\n";
+               << sum << ";\n$fold_region_skip_pairs" << active << ":\n";
+    if (active % 2 != 0) {
+      int64_t carry = ptx.nextF32();
+      ptx.stream << "  setp.ne.u32 %p3, %r0, " << pairs
+                 << ";\n  @%p3 bra $fold_region_skip_carry" << active
+                 << ";\n  ld.shared.f32 %f" << carry << ", [%rd3+"
+                 << (active - 1) * static_cast<int64_t>(sizeof(float))
+                 << "];\n  st.shared.f32 [%rd3+"
+                 << pairs * static_cast<int64_t>(sizeof(float)) << "], %f"
+                 << carry << ";\n$fold_region_skip_carry" << active << ":\n";
+    }
+    ptx.stream << "  bar.sync 0;\n";
   }
   int64_t primaryValue = ptx.nextF32();
   ptx.stream << "  ld.shared.f32 %f" << primaryValue << ", [%rd3];\n";
