@@ -17,7 +17,9 @@ from track2_te_h100_batch import BASE_IMAGE, SOURCE_MANIFEST_NAME
 from track2_te_h100_iris import (
     _require_clean_source_closure,
     build_launch_request,
+    build_launch_request_v3,
     decode_launch_request,
+    decode_launch_request_v3,
     job_name,
     main,
     validate_launch_request,
@@ -94,6 +96,24 @@ def test_render_emits_one_exact_batch_priority_zero_retry_h100_request(
             "lib/shuttle/mlir/jax_patch/abi22_te_rmsnorm_oracle_runner_v2.cpp",
             "lib/shuttle/mlir/jax_patch/abi22-te-rmsnorm-oracle-runner-build-v2.json",
         }.issubset(members)
+
+
+def test_v3_request_selects_only_the_versioned_batch_entrypoint() -> None:
+    request = build_launch_request_v3(bundle_root=MARIN_REPOSITORY, run=11)
+    raw = request.SerializeToString(deterministic=True)
+    self_checked = decode_launch_request_v3(raw, run=11)
+    assert self_checked.name == "/dlwh/shuttle-track2-te-h100-r11"
+    assert list(self_checked.entrypoint.run_command.argv)[-1] == "--execute-v3"
+    assert (
+        list(build_launch_request(bundle_root=MARIN_REPOSITORY, run=11).entrypoint.run_command.argv)[-1] == "--execute"
+    )
+    with pytest.raises(ValueError, match="entrypoint"):
+        decode_launch_request(raw, run=11)
+
+    corrupted = deepcopy(self_checked)
+    corrupted.entrypoint.run_command.argv[-1] = "--execute"
+    with pytest.raises(ValueError, match="entrypoint"):
+        decode_launch_request_v3(corrupted.SerializeToString(deterministic=True), run=11)
 
 
 @pytest.mark.parametrize(

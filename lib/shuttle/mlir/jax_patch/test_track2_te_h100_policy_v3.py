@@ -11,6 +11,7 @@ import statistics
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import abi22_te_rmsnorm_oracle_v2 as oracle
 import ml_dtypes
@@ -127,6 +128,46 @@ def _fake_invoke(paths: BatchPaths, calls: list[list[str]], argv: list[str]) -> 
 
 
 class Track2TeH100PolicyV3Test(unittest.TestCase):
+    def test_batch_plan_and_cli_select_v3_explicitly(self) -> None:
+        batch_plan_v3 = getattr(batch, "batch_plan_v3", None)
+        self.assertTrue(callable(batch_plan_v3), "versioned v3 batch-plan API is missing")
+        plan = batch_plan_v3(workspace=Path("/tmp/v3"), runner_repository=Path("/app"))
+        self.assertEqual(plan["schema"], "shuttle_track2_te_h100_batch_plan_v3")
+        self.assertEqual(plan["qualification"], {**oracle.NUMERICAL_POLICY_V3, "run_count": 48})
+        self.assertEqual(
+            batch.batch_plan(workspace=Path("/tmp/v2"), runner_repository=Path("/app"))["qualification"]["run_count"], 36
+        )
+
+        expected = {"schema": "v3-result"}
+        stdout = io.StringIO()
+        with (
+            patch.object(batch, "execute_batch_v3", return_value=expected) as execute,
+            contextlib.redirect_stdout(stdout),
+        ):
+            self.assertEqual(
+                batch.main(
+                    [
+                        "--workspace",
+                        "/tmp/v3",
+                        "--runner-repository",
+                        "/app",
+                        "--source-manifest",
+                        "/app/source.json",
+                        "--base-image",
+                        batch.BASE_IMAGE,
+                        "--execute-v3",
+                    ]
+                ),
+                0,
+            )
+        execute.assert_called_once_with(
+            workspace=Path("/tmp/v3"),
+            runner_repository=Path("/app"),
+            manifest_path=Path("/app/source.json"),
+            observed_base_image=batch.BASE_IMAGE,
+        )
+        self.assertEqual(json.loads(stdout.getvalue().split("=", 1)[1]), expected)
+
     def test_worker_persists_raw_outputs_and_repeat_diagnostics_before_rejection(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
