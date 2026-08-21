@@ -21,6 +21,7 @@ from abi22_te_rmsnorm_oracle_v2 import (
 )
 from track2_te_h100_batch import (
     BASE_IMAGE,
+    NVTE_CUDA_INCLUDE_DIR,
     RUNTIME_LIBRARY_PATHS,
     SHUTTLE_BLOCKER,
     TE_SOURCE_COMMIT,
@@ -30,6 +31,7 @@ from track2_te_h100_batch import (
     BatchPaths,
     _invoke_oracle,
     _validate_link_closure,
+    _validated_cuda_include,
     _validated_runtime_libraries,
     _validated_xla_raw_cell,
     batch_plan,
@@ -59,6 +61,11 @@ RUNTIME_LIBRARY_IDENTITIES = {
         "soname": path.name,
     }
     for role, path in RUNTIME_LIBRARY_PATHS.items()
+}
+CUDA_HEADER_IDENTITY = {
+    "include_directory": str(NVTE_CUDA_INCLUDE_DIR),
+    "header_path": str(NVTE_CUDA_INCLUDE_DIR / "cuda_runtime_api.h"),
+    "header_sha256": hashlib.sha256(b"cuda-runtime-header").hexdigest(),
 }
 
 
@@ -203,6 +210,9 @@ def test_hydration_binds_source_tree_wheel_and_resolved_library(tmp_path: Path, 
     environment = runtime_environment(paths)
     assert environment["LD_LIBRARY_PATH"].split(":")[0] == str(paths.te_library.parent)
     assert "LD_BIND_NOW" not in environment
+    assert environment["NVTE_CUDA_INCLUDE_DIR"] == (
+        "/opt/h100-evidence-runtime/lib/python3.12/site-packages/nvidia/cuda_runtime/include"
+    )
     for field, value in (("commit", "0" * 40), ("tree", "0" * 40), ("status", "dirty")):
         mutated = dict(observed)
         mutated[field] = value
@@ -261,6 +271,28 @@ def test_runtime_libraries_bind_resolved_paths_sonames_and_bytes(tmp_path: Path)
             approved_roots=(root,),
             soname_reader=lambda path: path.name,
         )
+
+
+def test_cuda_runtime_headers_are_bound_to_the_nvrtc_package_generation(tmp_path: Path) -> None:
+    include = tmp_path / "nvidia/cuda_runtime/include"
+    include.mkdir(parents=True)
+    header = include / "cuda_runtime_api.h"
+    header.write_bytes(b"sealed cuda runtime header")
+
+    identity = _validated_cuda_include(include, approved_root=tmp_path / "nvidia")
+
+    assert identity == {
+        "include_directory": str(include),
+        "header_path": str(header),
+        "header_sha256": hashlib.sha256(header.read_bytes()).hexdigest(),
+    }
+    assert NVTE_CUDA_INCLUDE_DIR.name == "include"
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "cuda_runtime_api.h").write_bytes(b"outside")
+    with pytest.raises(RuntimeError, match="approved runtime root"):
+        _validated_cuda_include(outside, approved_root=tmp_path / "nvidia")
 
 
 def test_link_closure_rejects_any_unresolved_or_substituted_dependency(tmp_path: Path) -> None:
@@ -498,6 +530,7 @@ def test_execute_batch_drives_validated_oracle_and_writes_closed_result(
                 "library_sha256": hashlib.sha256(b"resolved-te-library").hexdigest(),
             },
             "runtime_libraries": RUNTIME_LIBRARY_IDENTITIES,
+            "cuda_runtime_headers": CUDA_HEADER_IDENTITY,
         }
 
     monkeypatch.setattr("track2_te_h100_batch.platform.system", lambda: "Linux")
@@ -525,6 +558,7 @@ def test_execute_batch_drives_validated_oracle_and_writes_closed_result(
         "library_sha256": hashlib.sha256(b"resolved-te-library").hexdigest(),
     }
     assert result["tools"]["runtime_libraries"] == RUNTIME_LIBRARY_IDENTITIES
+    assert result["tools"]["cuda_runtime_headers"] == CUDA_HEADER_IDENTITY
     assert result["evidence"]["acceptance"]["accepted_shape"] == [2048, 4096]
     assert result["evidence"]["shuttle"] == {"status": "pending", "blocker": SHUTTLE_BLOCKER}
     assert len(calls) == 12
