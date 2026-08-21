@@ -4335,6 +4335,17 @@ TEST(GpuTransportV2Test,
     auto transport =
         mlir::shuttle::serializeGpuExecutableBundle(*built->module);
     ASSERT_TRUE(mlir::succeeded(transport));
+    auto executable = mlir::shuttle::GpuExecutable::Load(*transport);
+    ASSERT_TRUE(executable.ok()) << executable.status();
+    llvm::SmallVector<int64_t> resultBytes;
+    for (const auto &binding : (*executable)->externalBindings())
+      if (binding.kind == mlir::shuttle::ExecutableBindingKind::Result)
+        resultBytes.push_back(binding.requiredBytes);
+    llvm::SmallVector<int64_t> expectedResultBytes;
+    if (backward)
+      expectedResultBytes.push_back(weight.size() * sizeof(uint16_t));
+    expectedResultBytes.push_back(x.size() * sizeof(uint16_t));
+    ASSERT_EQ(resultBytes, expectedResultBytes);
     auto runner = mlir::shuttle::GpuRunner::Create(
         *transport, &allocator, 0, stream->get(), &capability);
     ASSERT_TRUE(runner.ok()) << runner.status();
@@ -4344,9 +4355,12 @@ TEST(GpuTransportV2Test,
     if (backward)
       hostOperands.push_back(cotangent);
     std::vector<std::vector<uint16_t>> hostResults;
-    hostResults.emplace_back(x.size());
-    if (backward)
+    if (backward) {
       hostResults.emplace_back(weight.size());
+      hostResults.emplace_back(x.size());
+    } else {
+      hostResults.emplace_back(x.size());
+    }
     std::vector<stream_executor::DeviceAddressBase> deviceOperands;
     std::vector<stream_executor::DeviceAddressBase> deviceResults;
     llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> operands;
@@ -4389,7 +4403,7 @@ TEST(GpuTransportV2Test,
     if (backward) {
       auto [dx, dw] = rmsNormBackwardReference(x, weight, cotangent, rows,
                                                features);
-      expected = {std::move(dx), std::move(dw)};
+      expected = {std::move(dw), std::move(dx)};
     } else {
       expected = {rmsNormForwardReference(x, weight, rows, features)};
     }
@@ -4754,7 +4768,7 @@ TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
           cell.hostOperands.push_back(normCotangent);
           auto [dx, dw] = rmsNormBackwardReference(
               normX, normWeight, normCotangent, normRows, normFeatures);
-          cell.expected = {std::move(dx), std::move(dw)};
+          cell.expected = {std::move(dw), std::move(dx)};
         } else {
           cell.expected = {rmsNormForwardReference(normX, normWeight, normRows,
                                                    normFeatures)};
@@ -4782,6 +4796,17 @@ TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
             x, weight, projection, rows, reduction, spec.columns,
             policy == mlir::shuttle::NumericalPolicy::Fast)};
       }
+      size_t resultBindingIndex = 0;
+      for (const auto &binding : cell.executable->externalBindings()) {
+        if (binding.kind != mlir::shuttle::ExecutableBindingKind::Result)
+          continue;
+        ASSERT_LT(resultBindingIndex, cell.expected.size());
+        EXPECT_EQ(binding.requiredBytes,
+                  static_cast<int64_t>(cell.expected[resultBindingIndex].size() *
+                                       sizeof(uint16_t)));
+        ++resultBindingIndex;
+      }
+      ASSERT_EQ(resultBindingIndex, cell.expected.size());
       for (const auto &expected : cell.expected)
         cell.actual.emplace_back(expected.size());
       for (const auto &host : cell.hostOperands) {
