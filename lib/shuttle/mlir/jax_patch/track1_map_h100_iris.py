@@ -153,8 +153,8 @@ def build_launch_request(
         client_revision_date=CLIENT_REVISION_DATE,
     )
     request.timeout.CopyFrom(duration_to_proto(TIMEOUT))
-    request.exact_bundle_upload.bundle_id = content_id(blob)
-    request.exact_bundle_upload.blob = blob
+    request.bundle_id = content_id(blob)
+    request.bundle_blob = blob
     validate_launch_request(request, approved_authorization_sha256=approved_authorization_sha256)
     return request
 
@@ -272,9 +272,7 @@ def validate_launch_request(
     if request.entrypoint != expected_entrypoint:
         raise ValueError("LaunchJobRequest entrypoint differs")
     if (
-        request.bundle_id
-        or request.bundle_blob
-        or request.ports
+        request.ports
         or request.constraints
         or request.HasField("coscheduling")
         or request.preemption_policy != job_pb2.JOB_PREEMPTION_POLICY_UNSPECIFIED
@@ -286,12 +284,11 @@ def validate_launch_request(
         raise ValueError("LaunchJobRequest contains an unauthorized launch option")
     if request.client_revision_date != CLIENT_REVISION_DATE:
         raise ValueError("LaunchJobRequest client revision date differs")
-    if not request.HasField("exact_bundle_upload"):
-        raise ValueError("LaunchJobRequest exact bundle is missing")
-    _require_no_unknown_fields(request.exact_bundle_upload, "exact bundle")
-    bundle_sha256 = _validated_bundle(request.exact_bundle_upload.blob, approved_authorization_sha256)
-    if request.exact_bundle_upload.bundle_id != bundle_sha256:
-        raise ValueError("LaunchJobRequest exact bundle content ID differs")
+    if request.HasField("exact_bundle_upload"):
+        raise ValueError("LaunchJobRequest integration-only exact bundle field is present")
+    bundle_sha256 = _validated_bundle(request.bundle_blob, approved_authorization_sha256)
+    if request.bundle_id != bundle_sha256:
+        raise ValueError("LaunchJobRequest bundle content ID differs")
 
 
 def decode_launch_request(
@@ -319,8 +316,8 @@ def _request_summary(
     request = decode_launch_request(raw, approved_authorization_sha256=approved_authorization_sha256)
     return {
         "authorization_sha256": approved_authorization_sha256,
-        "bundle_sha256": request.exact_bundle_upload.bundle_id,
-        "bundle_size": len(request.exact_bundle_upload.blob),
+        "bundle_sha256": request.bundle_id,
+        "bundle_size": len(request.bundle_blob),
         "client_revision_date": request.client_revision_date,
         "image": request.task_image,
         "job_name": request.name,

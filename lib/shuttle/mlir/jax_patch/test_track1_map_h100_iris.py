@@ -68,7 +68,7 @@ def test_dry_run_emits_and_decodes_the_real_fail_closed_launch_request(
 
     assert request == decoded
     assert summary["request_sha256"] == hashlib.sha256(raw).hexdigest()
-    assert summary["bundle_sha256"] == request.exact_bundle_upload.bundle_id
+    assert summary["bundle_sha256"] == request.bundle_id
     assert summary["authorization_sha256"] == approved
     assert summary["job_name"] == JOB_NAME
 
@@ -95,9 +95,9 @@ def test_dry_run_emits_and_decodes_the_real_fail_closed_launch_request(
     command = list(request.entrypoint.run_command.argv)
     assert command.count(approved) == 1
     assert command[-1] == "--execute"
-    assert request.bundle_id == ""
-    assert request.bundle_blob == b""
-    assert request.exact_bundle_upload.bundle_id == hashlib.sha256(request.exact_bundle_upload.blob).hexdigest()
+    assert request.bundle_id == hashlib.sha256(request.bundle_blob).hexdigest()
+    assert request.bundle_blob
+    assert not request.HasField("exact_bundle_upload")
 
     manifest = json.loads(SOURCE_MANIFEST_PATH.read_bytes())
     expected_paths = {entry["path"] for entry in manifest["entries"]}
@@ -107,7 +107,7 @@ def test_dry_run_emits_and_decodes_the_real_fail_closed_launch_request(
             "scripts/shuttle/track1_map_h100_source_manifest.json",
         }
     )
-    with zipfile.ZipFile(io.BytesIO(request.exact_bundle_upload.blob)) as archive:
+    with zipfile.ZipFile(io.BytesIO(request.bundle_blob)) as archive:
         assert set(archive.namelist()) == expected_paths
         assert archive.read("scripts/shuttle/track1_map_h100_prototype_authorization.json") == (
             AUTHORIZATION_PATH.read_bytes()
@@ -154,6 +154,7 @@ def test_default_is_unsealed_before_bundle_or_request_output(tmp_path: Path) -> 
         "authorization",
         "bundle_hash",
         "bundle_image",
+        "bundle_integration_field",
         "bundle_zip",
         "client_revision",
         "cpu",
@@ -180,15 +181,18 @@ def test_decoded_request_rejects_every_launch_scope_mutation(mutation: str) -> N
     if mutation == "authorization":
         command[list(command).index(approved)] = "f" * 64
     elif mutation == "bundle_hash":
-        changed.exact_bundle_upload.bundle_id = "f" * 64
+        changed.bundle_id = "f" * 64
     elif mutation == "bundle_image":
         changed.bundle_init_image = BASE_IMAGE
+    elif mutation == "bundle_integration_field":
+        changed.exact_bundle_upload.bundle_id = changed.bundle_id
+        changed.exact_bundle_upload.blob = changed.bundle_blob
     elif mutation == "bundle_zip":
-        stream = io.BytesIO(changed.exact_bundle_upload.blob)
+        stream = io.BytesIO(changed.bundle_blob)
         with zipfile.ZipFile(stream, "a") as archive:
             archive.comment = b"alternate ZIP bytes"
-        changed.exact_bundle_upload.blob = stream.getvalue()
-        changed.exact_bundle_upload.bundle_id = hashlib.sha256(stream.getvalue()).hexdigest()
+        changed.bundle_blob = stream.getvalue()
+        changed.bundle_id = hashlib.sha256(stream.getvalue()).hexdigest()
     elif mutation == "client_revision":
         changed.client_revision_date = "2099-12-31"
     elif mutation == "cpu":
