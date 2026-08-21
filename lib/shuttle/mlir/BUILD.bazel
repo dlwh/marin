@@ -427,6 +427,18 @@ sh_test(
 )
 
 sh_test(
+    name = "gpu_transport_v2_h100_layernorm_bc_test",
+    srcs = ["test/run-h100-layernorm-bc-numerics.sh"],
+    args = ["$(rootpath :gpu_transport_v2_test)"],
+    data = [":gpu_transport_v2_test"],
+    tags = [
+        "h100",
+        "manual",
+        "requires-gpu-nvidia",
+    ],
+)
+
+sh_test(
     name = "gpu_transport_v2_h100_performance_test",
     srcs = ["test/run-h100-performance.sh"],
     args = [
@@ -497,6 +509,26 @@ py_test(
     ],
     imports = ["jax_patch"],
     main = "jax_patch/test_abi22_layernorm_forward_numerical_contract.py",
+)
+
+py_test(
+    name = "abi22_layernorm_bc_numerical_contract_test",
+    srcs = [
+        "jax_patch/abi22_layernorm_bc_numerical_contract.py",
+        "jax_patch/test_abi22_layernorm_bc_numerical_contract.py",
+    ],
+    data = [
+        "jax_patch/abi22-layernorm-bc-numerical-contract-v1.json",
+        "jax_patch/abi22-layernorm-forward-numerical-contract-v1.json",
+        "jax_patch/target1-rowwise-bf16-numerical-oracle-v1.json",
+        "jax_patch/track1-rmsnorm-h100-numerical-policy-v1.json",
+    ],
+    deps = [
+        "@pypi//ml_dtypes",
+        "@pypi//numpy",
+    ],
+    imports = ["jax_patch"],
+    main = "jax_patch/test_abi22_layernorm_bc_numerical_contract.py",
 )
 
 py_test(
