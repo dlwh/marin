@@ -93,7 +93,7 @@ def _fake_invoke(paths: BatchPaths, calls: list[list[str]], argv: list[str]) -> 
                 **error_metrics(actual, reference, role=role),
             }
         )
-    if ACCEPTANCE_PATTERN in argv and boundary == "composed" and "repeat1" in output.name:
+    if any(ACCEPTANCE_PATTERN in argument for argument in argv) and boundary == "composed" and "repeat1" in output.name:
         actual_path = Path(output_files["y"])
         payload = bytearray(actual_path.read_bytes())
         payload[:2] = (int.from_bytes(payload[:2], "little") + 1).to_bytes(2, "little")
