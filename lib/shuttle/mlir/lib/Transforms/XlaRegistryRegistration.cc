@@ -3,31 +3,25 @@
 
 #include "shuttle/Transforms/XlaRegistration.h"
 
-#include <string>
+#include <mutex>
 
 #include "absl/status/status.h"
-#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "xla/pjrt/stablehlo_module_transform.h"
-#include "llvm/Support/ErrorHandling.h"
 
-namespace {
+namespace mlir::shuttle {
 
-[[maybe_unused]] const bool kShuttleXlaTransformRegistered = [] {
-  absl::Status status =
-      xla::StablehloModuleTransformRegistry::Global().Register(
-          "shuttle",
-          [](mlir::ModuleOp module, absl::string_view serializedOptions) {
-            return mlir::shuttle::runShuttleXlaTransform(module,
-                                                         serializedOptions);
-          });
-  if (!status.ok()) {
-    std::string diagnostic =
-        absl::StrCat("failed to register the Shuttle XLA StableHLO transform: ",
-                     status.message());
-    llvm::report_fatal_error(diagnostic.c_str());
-  }
-  return true;
-}();
+absl::Status registerShuttleXlaTransform() {
+  static std::once_flag once;
+  static absl::Status status;
+  std::call_once(once, [] {
+    status = xla::StablehloModuleTransformRegistry::Global().Register(
+        "shuttle",
+        [](mlir::ModuleOp module, absl::string_view serializedOptions) {
+          return runShuttleXlaTransform(module, serializedOptions);
+        });
+  });
+  return status;
+}
 
-} // namespace
+} // namespace mlir::shuttle

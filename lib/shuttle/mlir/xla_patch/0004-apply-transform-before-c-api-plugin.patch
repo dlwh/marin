@@ -1,0 +1,126 @@
+--- a/xla/pjrt/mlir_to_hlo.h
++++ b/xla/pjrt/mlir_to_hlo.h
+@@ -36,6 +36,11 @@
+
+ struct CompileOptions;
+
++// Applies a registered StableHLO module transform selected by PJRT options and
++// consumes its option overrides after a successful transform.
++absl::Status ApplyStablehloModuleTransform(mlir::ModuleOp module,
++                                           CompileOptions& compile_options);
++
+ // Registers all MLIR dialects that are necessary for using MLIR HLO modules.
+ void RegisterAllHloDialects(mlir::DialectRegistry& registry);
+
+--- a/xla/pjrt/mlir_to_hlo.cc
++++ b/xla/pjrt/mlir_to_hlo.cc
+@@ -15,6 +15,7 @@
+
+ #include "xla/pjrt/mlir_to_hlo.h"
+
++#include <algorithm>
+ #include <memory>
+ #include <optional>
+ #include <string>
+@@ -96,6 +97,27 @@
+   return absl::OkStatus();
+ }
+ }  // namespace
++
++absl::Status ApplyStablehloModuleTransform(
++    mlir::ModuleOp module, CompileOptions& compile_options) {
++  TF_RETURN_IF_ERROR(ApplyStablehloTransformOptionOverrides(compile_options));
++  auto* debug_options =
++      compile_options.executable_build_options.mutable_debug_options();
++  if (!debug_options->xla_shuttle_enable()) {
++    return absl::OkStatus();
++  }
++  TF_RETURN_IF_ERROR(StablehloModuleTransformRegistry::Global().Run(
++      module, debug_options->xla_shuttle_options(),
++      /*required_transform=*/"shuttle"));
++  debug_options->set_xla_shuttle_enable(false);
++  auto& overrides = compile_options.env_option_overrides;
++  overrides.erase(
++      std::remove_if(overrides.begin(), overrides.end(), [](const auto& item) {
++        return item.first == kShuttleEnableOption;
++      }),
++      overrides.end());
++  return absl::OkStatus();
++}
+
+ void RegisterAllHloDialects(mlir::DialectRegistry& registry) {
+   registry.insert<mlir::arith::ArithDialect>();
+@@ -184,13 +206,6 @@
+     use_tuple_args = false;
+   }
+
+-  if (exec_build_options && exec_build_options->has_debug_options() &&
+-      exec_build_options->debug_options().xla_shuttle_enable()) {
+-    TF_RETURN_IF_ERROR(StablehloModuleTransformRegistry::Global().Run(
+-        module, exec_build_options->debug_options().xla_shuttle_options(),
+-        /*required_transform=*/"shuttle"));
+-  }
+-
+   TF_ASSIGN_OR_RETURN(std::unique_ptr<HloModule> hlo_module,
+                       xla::ConvertStablehloToHloWithOptions(
+                           module, use_tuple_args, return_tuple));
+@@ -203,7 +218,8 @@
+     mlir::ModuleOp module, XlaComputation& xla_computation, bool use_tuple_args,
+     bool return_tuple, CompileOptions& compile_options,
+     const ChloLegalizeToHighLevelMhloPassOptions& chlo_opts) {
+-  TF_RETURN_IF_ERROR(ApplyStablehloTransformOptionOverrides(compile_options));
++  TF_RETURN_IF_ERROR(
++      ApplyStablehloModuleTransform(module, compile_options));
+   return MlirToXlaComputation(
+       module, xla_computation, use_tuple_args, return_tuple,
+       &compile_options.executable_build_options, chlo_opts);
+--- a/xla/pjrt/c_api_client/pjrt_c_api_client.cc
++++ b/xla/pjrt/c_api_client/pjrt_c_api_client.cc
+@@ -593,6 +593,16 @@
+ // forward compatibility.
+ using ProgramVariant =
+     std::variant<xla::MaybeOwningMlirModule, const xla::XlaComputation*>;
++
++absl::Status ApplyClientStablehloTransform(ProgramVariant& program,
++                                           CompileOptions& options) {
++  auto* module = std::get_if<xla::MaybeOwningMlirModule>(&program);
++  if (module == nullptr) {
++    return absl::OkStatus();
++  }
++  return ApplyStablehloModuleTransform(module->mlir_module(), options);
++}
++
+ absl::StatusOr<std::pair<std::string, std::string>> SerializeProgram(
+     PjRtClient* client, ProgramVariant program, const CompileOptions& options) {
+   tsl::profiler::TraceMe traceme("PjRtCApiClient::SerializeProgram");
+@@ -629,13 +639,15 @@
+ static absl::StatusOr<std::unique_ptr<PjRtLoadedExecutable>>
+ InitializeArgsAndCompile(PjRtCApiClient* api_client, const PJRT_Api* c_api,
+                          PJRT_Client* client, ProgramVariant module,
+-                         const CompileOptions& options) {
++                         CompileOptions options) {
+   PJRT_Client_Compile_Args args;
+   args.struct_size = PJRT_Client_Compile_Args_STRUCT_SIZE;
+   PJRT_Profiler_Extension profiler_extension =
+       pjrt::CreatePjrtProfilerExtension("PJRT_Client_Compile linkage");
+   args.extension_start = &profiler_extension.base;
+   args.client = client;
++
++  TF_RETURN_IF_ERROR(ApplyClientStablehloTransform(module, options));
+
+   // Serialize compile options.
+   std::string compile_options_str;
+@@ -685,11 +697,12 @@
+ static absl::StatusOr<std::unique_ptr<PjRtExecutable>>
+ InitializeArgsAndCompileAot(const PJRT_Api* c_api, PjRtClient* client,
+                             ProgramVariant module,
+-                            const CompileOptions& options,
++                            CompileOptions options,
+                             const PjRtTopologyDescription& topology) {
+   PJRT_Compile_Args args;
+   args.struct_size = PJRT_Compile_Args_STRUCT_SIZE;
+   args.extension_start = nullptr;
++  TF_RETURN_IF_ERROR(ApplyClientStablehloTransform(module, options));
+   if (client == nullptr) {
+     args.client = nullptr;
+   } else {

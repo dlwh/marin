@@ -18,21 +18,25 @@ PATCH_NAMES = (
     "0001-link-shuttle-xla-registry-adapter.patch",
     "0002-add-acceptance-observer-bridge.patch",
     "0003-link-shuttle-cuda-ffi.patch",
+    "0004-register-shuttle-at-module-init.patch",
 )
 JAX_PATCH_SHA256 = (
     "1e8b1400ee05bf8c8037277046113e1f1b1fae5ef56077899b7e853855e3424e",
     "c4d5bc4aaa4b72ee7e2ecb44d28719be99da8defcf01ebd107308df41cb71942",
     "a98f04ac7afc6e5d8df63f2679cf89bc7cd0b29509a393da86f352cb6ba2ec9f",
+    "8802afac71dc689433e06385c373b9ab97292db483448565382250e592d1665f",
 )
 XLA_PATCH_NAMES = (
     "0001-add-stablehlo-module-transform-hook.patch",
     "0002-anchor-lit-labels-to-xla-repository.patch",
     "0003-test-c-api-transform-boundary.patch",
+    "0004-apply-transform-before-c-api-plugin.patch",
 )
 XLA_PATCH_SHA256 = (
     "8e50020606758a431f7e96b80e2720ef5ca40986746449cc6a20ab6ae9c7bb1e",
     "e4f3121f3123d7e2ee781cc5ee92f1ddeb0df662b6702d37615bcae821ecbc99",
-    "a0aa22a0c4189be6a76c3ad4969b2983ea3c6f84cc277ab7ecfbd786581c0151",
+    "6af43c3a04066723f5ae97def637a039e52218a97b286f4246e8c564c5e09d4b",
+    "47d7fae5254b2968deecdfbc692f74c15bec843559b8a2411008fd1f7c1ec34e",
 )
 HERMETIC_CUDA_VERSION = "13.0.0"
 HERMETIC_CUDA_COMPUTE_CAPABILITIES = ("9.0",)

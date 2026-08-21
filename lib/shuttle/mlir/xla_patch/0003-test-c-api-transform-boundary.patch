@@ -1,11 +1,27 @@
 --- a/xla/pjrt/c_api_client/pjrt_c_api_client_test.cc
 +++ b/xla/pjrt/c_api_client/pjrt_c_api_client_test.cc
-@@ -34,0 +35 @@
+@@ -32,6 +32,7 @@
+ #include "absl/synchronization/blocking_counter.h"
+ #include "absl/types/span.h"
+ #include "llvm/ADT/StringRef.h"
 +#include "mlir/IR/BuiltinAttributes.h"
-@@ -59,0 +61,2 @@
+ #include "mlir/IR/BuiltinOps.h"
+ #include "mlir/IR/MLIRContext.h"
+ #include "mlir/IR/OwningOpRef.h"
+@@ -57,6 +58,8 @@
+ #include "xla/pjrt/pjrt_device_description.h"
+ #include "xla/pjrt/pjrt_executable.h"
+ #include "xla/pjrt/pjrt_layout.h"
 +#include "xla/pjrt/proto/compile_options.pb.h"
 +#include "xla/pjrt/stablehlo_module_transform.h"
-@@ -481,0 +485,68 @@
+ #include "xla/service/computation_placer.h"
+ #include "xla/shape.h"
+ #include "xla/shape_util.h"
+@@ -478,7 +481,79 @@
+           CompileOptions()));
+   const_cast<PJRT_Api*>(c_api)->PJRT_Client_Compile = PJRT_Client_Compile_Orig;
+ }
++
 +TEST(PjRtClientTest, AppliesRegisteredStableHloTransformBeforePluginBoundary) {
 +  SetUpCpuPjRtApi();
 +  TF_ASSERT_OK_AND_ASSIGN(const PJRT_Api* c_api, pjrt::PjrtApi("cpu"));
@@ -20,7 +36,7 @@
 +                        mlir::UnitAttr::get(module.getContext()));
 +        return absl::OkStatus();
 +      }));
-+
+
 +  static auto PJRT_Client_Compile_Orig = c_api->PJRT_Client_Compile;
 +  static bool saw_transformed_module = false;
 +  static bool saw_consumed_options = false;
@@ -38,16 +54,20 @@
 +    CompileOptionsProto options_proto;
 +    if (options_proto.ParseFromArray(args->compile_options,
 +                                     args->compile_options_size)) {
-+      bool has_shuttle_override = false;
++      bool has_enable_override = false;
++      bool has_options_override = false;
 +      for (const auto& entry : options_proto.env_option_overrides()) {
-+        has_shuttle_override |= entry.first == "xla_shuttle_enable" ||
-+                                entry.first == "xla_shuttle_options";
++        has_enable_override |= entry.first == "xla_shuttle_enable";
++        has_options_override |= entry.first == "xla_shuttle_options";
 +      }
 +      saw_consumed_options =
 +          !options_proto.executable_build_options()
 +               .debug_options()
 +               .xla_shuttle_enable() &&
-+          !has_shuttle_override;
++          options_proto.executable_build_options()
++                  .debug_options()
++                  .xla_shuttle_options() == "test-options" &&
++          !has_enable_override && has_options_override;
 +    }
 +    return PJRT_Client_Compile_Orig(args);
 +  };
@@ -74,10 +94,52 @@
 +  EXPECT_TRUE(saw_consumed_options);
 +}
 +
+ TEST(PjRtClientTest, CompileWorksInplace) {
+   SetUpCpuPjRtApi();
+   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<PjRtClient> client,
 --- a/xla/pjrt/c_api_client/BUILD
 +++ b/xla/pjrt/c_api_client/BUILD
-@@ -175,0 +176,2 @@
+@@ -173,6 +173,8 @@
+         "//xla/pjrt:pjrt_device_description",
+         "//xla/pjrt:pjrt_executable",
+         "//xla/pjrt:pjrt_layout",
 +        "//xla/pjrt:stablehlo_module_transform",
 +        "//xla/pjrt/proto:compile_options_proto",
-@@ -186,0 +189 @@
+         "//xla/pjrt/c:pjrt_c_api_cpu_internal",
+         "//xla/pjrt/c:pjrt_c_api_hdrs",
+         "//xla/pjrt/cpu:cpu_pjrt_compiler",
+@@ -184,6 +186,7 @@
+         "//xla/tsl/platform:errors",
+         "//xla/tsl/platform:statusor",
+         "//xla/tsl/platform:test",
 +        "@com_google_absl//absl/cleanup",
+         "@com_google_absl//absl/status",
+         "@com_google_absl//absl/status:status_matchers",
+         "@com_google_absl//absl/status:statusor",
+--- a/xla/pjrt/mlir_to_hlo_test.cc
++++ b/xla/pjrt/mlir_to_hlo_test.cc
+@@ -138,7 +138,24 @@
+               ElementsAre("{\"numerics\":\"source_ordered\"}"));
+   EXPECT_TRUE(compile_options.executable_build_options.debug_options()
+                   .xla_cpu_enable_fast_math());
++  EXPECT_FALSE(compile_options.executable_build_options.debug_options()
++                   .xla_shuttle_enable());
++  EXPECT_EQ(compile_options.executable_build_options.debug_options()
++                .xla_shuttle_options(),
++            "{\"numerics\":\"source_ordered\"}");
++  int enable_overrides = 0;
++  int option_overrides = 0;
++  for (const auto& entry : compile_options.env_option_overrides) {
++    enable_overrides += entry.first == "xla_shuttle_enable";
++    option_overrides += entry.first == "xla_shuttle_options";
++  }
++  EXPECT_EQ(enable_overrides, 0);
++  EXPECT_EQ(option_overrides, 1);
+
++  TF_EXPECT_OK(ApplyStablehloModuleTransform(*module, compile_options));
++  EXPECT_THAT(observer.ForwardedOptions(),
++              ElementsAre("{\"numerics\":\"source_ordered\"}"));
++
+   TF_EXPECT_OK(compile_options.ApplyAllOptionOverrides());
+   EXPECT_FALSE(compile_options.executable_build_options.debug_options()
+                    .xla_cpu_enable_fast_math());

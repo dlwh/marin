@@ -88,6 +88,7 @@ std::string moduleText(mlir::ModuleOp module) {
 TEST(ShuttleXlaRegistryAdapterTest,
      RegistersAndRunsTheExactObservedPipelineTransactionally) {
   ASSERT_TRUE(mlir::shuttle::registerShuttleXlaTransform().ok());
+  ASSERT_TRUE(mlir::shuttle::registerShuttleXlaTransform().ok());
   auto observer = std::make_shared<RecordingObserver>();
   auto subscription = mlir::shuttle::subscribeShuttlePipelineObserver(observer);
   mlir::MLIRContext context;

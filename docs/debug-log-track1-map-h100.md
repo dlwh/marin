@@ -31,8 +31,10 @@ consulted by the GPU plugin is empty. `alwayslink` cannot bridge that DSO-local
 state.
 
 The transform must run on the C API client side before program and options are
-serialized into the plugin. The client must then consume the Shuttle option
-overrides so the plugin does not attempt a second transform. Explicit `_jax`
+serialized into the plugin. The client consumes only the enable override so the
+plugin does not attempt a second transform; it preserves the canonical options
+in both debug options and environment overrides so SO/FAST and ABI policy bytes
+remain part of downstream cache identity. Explicit `_jax`
 module initialization must register the adapter in the same DSO as the Python
 observer, avoiding static-initializer retention and load-order ambiguity.
 
@@ -64,6 +66,21 @@ the exact patched XLA checkout. A local build of that larger target stopped in
 analysis because the offline cache lacks the `shardy` repository; no download
 was allowed. The serialized-boundary expectations remain behavior-bearing and
 will be compiled by the pinned online hydration followed by offline wheel build.
+
+## Repair
+
+The adapter now exposes an idempotent registration function. The pinned JAX
+patch calls it during `_jax` module initialization, which gives the linker a
+direct symbol reference and registers in the DSO that also owns the Python
+observer.
+
+The XLA client applies enabled StableHLO transforms to MLIR programs before
+serializing `PJRT_Client_Compile` or `PJRT_Compile` arguments. On success it
+clears the debug enable bit and removes only the enable override. The canonical
+options string remains in the debug options and environment overrides, so
+numerics and ABI policy remain part of downstream compile/cache identity. The
+direct MLIR-to-HLO path uses the same helper; a second call observes the cleared
+enable bit and cannot double-transform.
 
 ## Future work
 

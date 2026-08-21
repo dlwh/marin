@@ -13,6 +13,10 @@
 
 namespace mlir::shuttle {
 
+// Registers Shuttle's generic StableHLO transform with the process-local XLA
+// registry. Repeated calls are idempotent.
+absl::Status registerShuttleXlaTransform();
+
 // Parses the canonical, closed-schema value transported by
 // xla_shuttle_options into the native pipeline configuration.
 absl::StatusOr<ShuttlePipelineOptions>

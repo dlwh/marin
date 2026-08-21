@@ -213,17 +213,14 @@ cc_library(
     ],
 )
 
-# Link this target into the final _jax module. Keeping static
-# registration in a separate alwayslink library preserves XLA's generic hook.
+# Link this target into the final _jax module. The explicit module-init call
+# keeps registration and the Python observer in the same shared object.
 cc_library(
     name = "ShuttleXlaRegistryAdapter",
     srcs = ["lib/Transforms/XlaRegistryRegistration.cc"],
-    alwayslink = True,
     deps = [
         ":ShuttleXlaRegistration",
         "@com_google_absl//absl/status",
-        "@com_google_absl//absl/strings",
-        "@llvm-project//llvm:Support",
         "@xla//xla/pjrt:stablehlo_module_transform",
     ],
 )
