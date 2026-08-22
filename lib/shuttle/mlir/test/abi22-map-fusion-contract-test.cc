@@ -848,7 +848,7 @@ std::unique_ptr<BuiltModule> build(llvm::StringRef source,
 
 std::unique_ptr<BuiltModule>
 buildAlgebra(llvm::StringRef source, mlir::shuttle::NumericalPolicy policy,
-             bool executable = true) {
+             bool executable = true, bool renamed = false) {
   mlir::DialectRegistry registry;
   registry.insert<mlir::arith::ArithDialect, mlir::func::FuncDialect,
                   mlir::math::MathDialect, mlir::shuttle::ShuttleDialect>();
@@ -858,6 +858,8 @@ buildAlgebra(llvm::StringRef source, mlir::shuttle::NumericalPolicy policy,
       mlir::parseSourceString<mlir::ModuleOp>(source, result->context.get());
   if (!result->module)
     return {};
+  if (renamed)
+    renameSymbols(*result->module);
   result->module->walk(
       [&](mlir::shuttle::RegionOp region) { region.setPolicy(policy); });
   mlir::PassManager manager(result->context.get());
@@ -1527,6 +1529,102 @@ bool mutateHybridNormalizedOutput(mlir::ModuleOp module,
     return true;
   }
   return false;
+}
+
+bool mutateGenericContractFoldComposition(mlir::ModuleOp module,
+                                          llvm::StringRef mutation) {
+  auto plans =
+      llvm::to_vector(module.getOps<mlir::shuttle::MaterializationPlanOp>());
+  if (plans.size() != 1)
+    return false;
+  auto tasks =
+      llvm::to_vector(plans.front()
+                          .getBody()
+                          .front()
+                          .getOps<mlir::shuttle::MaterializationTaskOp>());
+  auto buffers =
+      llvm::to_vector(plans.front()
+                          .getBody()
+                          .front()
+                          .getOps<mlir::shuttle::MaterializationBufferOp>());
+  auto byKind = [&](llvm::StringRef kind) {
+    return llvm::find_if(tasks, [&](auto task) {
+      auto value =
+          task->template getAttrOfType<mlir::StringAttr>("composition_kind");
+      return value && value.getValue() == kind;
+    });
+  };
+  auto first = byKind("contract_fold");
+  auto second = byKind("map_contract");
+  if (first == tasks.end() || second == tasks.end() ||
+      first->getOutputBuffers().size() != 2)
+    return false;
+  auto bufferByOrdinal = [&](int64_t ordinal) {
+    return llvm::find_if(
+        buffers, [&](auto buffer) { return buffer.getOrdinal() == ordinal; });
+  };
+  auto full = bufferByOrdinal(first->getOutputBuffers().front());
+  auto compact = bufferByOrdinal(first->getOutputBuffers().back());
+  if (full == buffers.end() || compact == buffers.end())
+    return false;
+  mlir::Builder builder(module.getContext());
+  if (mutation == "output-order") {
+    llvm::SmallVector<int64_t> outputs(first->getOutputBuffers());
+    std::swap(outputs[0], outputs[1]);
+    (*first)->setAttr("output_buffers", builder.getDenseI64ArrayAttr(outputs));
+  } else if (mutation == "missing-output") {
+    (*first)->setAttr(
+        "output_buffers",
+        builder.getDenseI64ArrayAttr(first->getOutputBuffers().drop_back()));
+  } else if (mutation == "compact-type") {
+    (*compact)->setAttr("tensor_type",
+                        mlir::TypeAttr::get(full->getTensorType()));
+  } else if (mutation == "extra-public-result") {
+    (*compact)->setAttr("live_out", builder.getBoolAttr(true));
+  } else if (mutation == "lifetime") {
+    (*compact)->setAttr("lifetime_end",
+                        builder.getI64IntegerAttr(first->getOrdinal()));
+  } else if (mutation == "missing-consumer") {
+    (*compact)->setAttr("consumers", builder.getDenseI64ArrayAttr({}));
+  } else if (mutation == "missing-second-input") {
+    llvm::SmallVector<int64_t> inputs;
+    llvm::copy_if(
+        second->getInputBuffers(), std::back_inserter(inputs),
+        [&](int64_t ordinal) { return ordinal != compact->getOrdinal(); });
+    (*second)->setAttr("input_buffers", builder.getDenseI64ArrayAttr(inputs));
+  } else if (mutation == "source-ownership") {
+    auto sources =
+        (*second)->getAttrOfType<mlir::ArrayAttr>("composition_sources");
+    if (!sources || sources.size() < 2)
+      return false;
+    (*second)->setAttr("composition_sources",
+                       builder.getArrayAttr(sources.getValue().drop_back()));
+  } else if (mutation == "cost") {
+    auto cost =
+        (*second)->getAttrOfType<mlir::DictionaryAttr>("composition_cost");
+    if (!cost)
+      return false;
+    llvm::SmallVector<mlir::NamedAttribute> fields(cost.begin(), cost.end());
+    auto baseline = llvm::find_if(fields, [](mlir::NamedAttribute field) {
+      return field.getName() == "baseline_temporary_bytes";
+    });
+    auto candidate = llvm::find_if(fields, [](mlir::NamedAttribute field) {
+      return field.getName() == "candidate_temporary_bytes";
+    });
+    if (baseline == fields.end() || candidate == fields.end())
+      return false;
+    const int64_t baselineBytes =
+        mlir::cast<mlir::IntegerAttr>(baseline->getValue()).getInt();
+    *candidate =
+        builder.getNamedAttr("candidate_temporary_bytes",
+                             builder.getI64IntegerAttr(baselineBytes + 1));
+    (*second)->setAttr("composition_cost", builder.getDictionaryAttr(fields));
+  } else {
+    return false;
+  }
+  plans.front().setFingerprint(
+      mlir::shuttle::materializationPlanFingerprint(plans.front()));
+  return true;
 }
 
 bool verifyMaterializationPlan(mlir::ModuleOp module) {
@@ -5411,6 +5509,257 @@ TEST(Abi22MapFusionContract,
 }
 
 TEST(Abi22MapFusionContract,
+     AnonymousContractFoldCompositionOwnsTheFullAndCompactSsaCut) {
+  struct Fixture {
+    const char *filename;
+    llvm::SmallVector<int64_t> firstSources;
+    llvm::SmallVector<int64_t> secondSources;
+    llvm::SmallVector<int64_t> compactShape;
+    llvm::SmallVector<int64_t> fullContractShape;
+    llvm::SmallVector<int64_t> publicShape;
+  };
+  const Fixture fixtures[] = {
+      {"abi22-generic-contract-fold-composition-rank2.mlir",
+       {0, 1},
+       {2, 3},
+       {2},
+       {2, 5},
+       {2, 7}},
+      {"abi22-generic-contract-fold-composition-rank3.mlir",
+       {4, 6},
+       {9, 13},
+       {2, 3},
+       {2, 3, 11},
+       {2, 3, 13}},
+  };
+  for (const Fixture &fixture : fixtures) {
+    SCOPED_TRACE(fixture.filename);
+    std::optional<std::string> source = fixtureSource(fixture.filename);
+    ASSERT_TRUE(source);
+    for (mlir::shuttle::NumericalPolicy policy :
+         {mlir::shuttle::NumericalPolicy::SourceOrdered,
+          mlir::shuttle::NumericalPolicy::Fast}) {
+      SCOPED_TRACE(mlir::shuttle::stringifyNumericalPolicy(policy).str());
+      for (bool renamed : {false, true}) {
+        SCOPED_TRACE(renamed ? "renamed" : "original");
+        std::unique_ptr<BuiltModule> built =
+            buildAlgebra(*source, policy, false, renamed);
+        ASSERT_TRUE(built);
+
+        auto plans = llvm::to_vector(
+            built->module->getOps<mlir::shuttle::MaterializationPlanOp>());
+        ASSERT_EQ(plans.size(), 1u);
+        auto tasks = llvm::to_vector(
+            plans.front()
+                .getBody()
+                .front()
+                .getOps<mlir::shuttle::MaterializationTaskOp>());
+        auto buffers = llvm::to_vector(
+            plans.front()
+                .getBody()
+                .front()
+                .getOps<mlir::shuttle::MaterializationBufferOp>());
+        auto first = llvm::find_if(tasks, [](auto task) {
+          auto kind = task->template getAttrOfType<mlir::StringAttr>(
+              "composition_kind");
+          return kind && kind.getValue() == "contract_fold";
+        });
+        auto second = llvm::find_if(tasks, [](auto task) {
+          auto kind = task->template getAttrOfType<mlir::StringAttr>(
+              "composition_kind");
+          return kind && kind.getValue() == "map_contract";
+        });
+        ASSERT_NE(first, tasks.end());
+        ASSERT_NE(second, tasks.end());
+        EXPECT_EQ(
+            llvm::count_if(tasks,
+                           [](auto task) {
+                             return static_cast<bool>(
+                                 task->template getAttrOfType<mlir::StringAttr>(
+                                     "composition_kind"));
+                           }),
+            2);
+        EXPECT_EQ(first->getKind(),
+                  mlir::shuttle::MaterializationTaskKind::Fold);
+        EXPECT_EQ(second->getKind(),
+                  mlir::shuttle::MaterializationTaskKind::Contract);
+
+        auto requireSources = [&](auto task, llvm::StringRef name,
+                                  llvm::ArrayRef<int64_t> expected) {
+          auto sources = task->template getAttrOfType<mlir::ArrayAttr>(name);
+          ASSERT_TRUE(sources) << name.str();
+          EXPECT_EQ(sourceOperationOrdinals(sources), expected) << name.str();
+        };
+        requireSources(*first, "composition_sources", fixture.firstSources);
+        requireSources(*second, "composition_sources", fixture.secondSources);
+
+        auto hasShape = [](mlir::shuttle::MaterializationBufferOp buffer,
+                           llvm::ArrayRef<int64_t> shape) {
+          auto type =
+              mlir::dyn_cast<mlir::RankedTensorType>(buffer.getTensorType());
+          return type && type.getShape() == shape &&
+                 type.getElementType().isF32();
+        };
+        auto compact = llvm::find_if(buffers, [&](auto buffer) {
+          return hasShape(buffer, fixture.compactShape) &&
+                 buffer.getStorage() ==
+                     mlir::shuttle::MaterializationStorage::Temporary;
+        });
+        ASSERT_NE(compact, buffers.end());
+        auto fullContract = llvm::find_if(buffers, [&](auto buffer) {
+          return hasShape(buffer, fixture.fullContractShape) &&
+                 buffer.getStorage() ==
+                     mlir::shuttle::MaterializationStorage::Temporary;
+        });
+        ASSERT_NE(fullContract, buffers.end());
+        EXPECT_EQ(llvm::count_if(
+                      buffers,
+                      [&](auto buffer) {
+                        return buffer.getStorage() ==
+                               mlir::shuttle::MaterializationStorage::Temporary;
+                      }),
+                  2);
+        for (auto boundary : {*fullContract, *compact}) {
+          EXPECT_FALSE(boundary.getLiveIn());
+          EXPECT_FALSE(boundary.getLiveOut());
+          EXPECT_EQ(boundary.getProducer(), first->getOrdinal());
+          EXPECT_EQ(boundary.getConsumers(),
+                    llvm::ArrayRef<int64_t>(
+                        {static_cast<int64_t>(second->getOrdinal())}));
+          EXPECT_EQ(boundary.getLifetimeStart(), first->getOrdinal());
+          EXPECT_EQ(boundary.getLifetimeEnd(), second->getOrdinal());
+          EXPECT_TRUE(llvm::is_contained(first->getOutputBuffers(),
+                                         boundary.getOrdinal()));
+          EXPECT_TRUE(llvm::is_contained(second->getInputBuffers(),
+                                         boundary.getOrdinal()));
+        }
+        ASSERT_EQ(first->getOutputBuffers().size(), 2u);
+        EXPECT_EQ(first->getOutputBuffers().front(),
+                  fullContract->getOrdinal());
+        EXPECT_EQ(first->getOutputBuffers().back(), compact->getOrdinal());
+
+        auto publicResult = llvm::find_if(buffers, [&](auto buffer) {
+          return hasShape(buffer, fixture.publicShape) && buffer.getLiveOut();
+        });
+        ASSERT_NE(publicResult, buffers.end());
+        EXPECT_FALSE(publicResult->getLiveIn());
+        EXPECT_EQ(publicResult->getStorage(),
+                  mlir::shuttle::MaterializationStorage::External);
+        EXPECT_EQ(publicResult->getProducer(), second->getOrdinal());
+        EXPECT_TRUE(llvm::is_contained(second->getOutputBuffers(),
+                                       publicResult->getOrdinal()));
+        EXPECT_EQ(llvm::count_if(
+                      buffers, [](auto buffer) { return buffer.getLiveIn(); }),
+                  4);
+        EXPECT_EQ(llvm::count_if(
+                      buffers, [](auto buffer) { return buffer.getLiveOut(); }),
+                  1);
+
+        auto cost =
+            (*second)->getAttrOfType<mlir::DictionaryAttr>("composition_cost");
+        ASSERT_TRUE(cost);
+        auto integer = [&](llvm::StringRef name) {
+          auto value = cost.getAs<mlir::IntegerAttr>(name);
+          EXPECT_TRUE(value) << name.str();
+          return value ? value.getInt() : int64_t{-1};
+        };
+        const int64_t baselineLaunches = integer("baseline_launches");
+        const int64_t candidateLaunches = integer("candidate_launches");
+        const int64_t baselineTemporaryBytes =
+            integer("baseline_temporary_bytes");
+        const int64_t candidateTemporaryBytes =
+            integer("candidate_temporary_bytes");
+        const int64_t baselineTemporaryTraffic =
+            integer("baseline_temporary_traffic_bytes");
+        const int64_t candidateTemporaryTraffic =
+            integer("candidate_temporary_traffic_bytes");
+        EXPECT_LE(candidateLaunches, baselineLaunches);
+        EXPECT_LE(candidateTemporaryBytes, baselineTemporaryBytes);
+        EXPECT_LE(candidateTemporaryTraffic, baselineTemporaryTraffic);
+        EXPECT_TRUE(candidateLaunches < baselineLaunches ||
+                    candidateTemporaryBytes < baselineTemporaryBytes ||
+                    candidateTemporaryTraffic < baselineTemporaryTraffic);
+        EXPECT_EQ(integer("contract_evaluations"), 1);
+
+        std::unique_ptr<BuiltModule> executableBuilt =
+            buildAlgebra(*source, policy, true, renamed);
+        ASSERT_TRUE(executableBuilt);
+        mlir::FailureOr<llvm::SmallVector<uint8_t>> transport =
+            mlir::shuttle::serializeGpuExecutableBundle(
+                *executableBuilt->module);
+        ASSERT_TRUE(mlir::succeeded(transport));
+        auto executable = mlir::shuttle::GpuExecutable::Load(*transport);
+        ASSERT_TRUE(executable.ok()) << executable.status();
+        ASSERT_GT((*executable)->launches().size(),
+                  static_cast<size_t>(second->getOrdinal()));
+        auto transportedCompact = llvm::find_if(
+            (*executable)->slots(), [&](const mlir::shuttle::GpuSlot &slot) {
+              auto type =
+                  mlir::dyn_cast<mlir::RankedTensorType>(slot.tensorType);
+              return slot.storage ==
+                         mlir::shuttle::MaterializationStorage::Temporary &&
+                     type &&
+                     type.getShape() ==
+                         llvm::ArrayRef<int64_t>(fixture.compactShape) &&
+                     type.getElementType().isF32();
+            });
+        ASSERT_NE(transportedCompact, (*executable)->slots().end());
+        auto transportedFull = llvm::find_if(
+            (*executable)->slots(), [&](const mlir::shuttle::GpuSlot &slot) {
+              auto type =
+                  mlir::dyn_cast<mlir::RankedTensorType>(slot.tensorType);
+              return slot.storage ==
+                         mlir::shuttle::MaterializationStorage::Temporary &&
+                     type &&
+                     type.getShape() ==
+                         llvm::ArrayRef<int64_t>(fixture.fullContractShape) &&
+                     type.getElementType().isF32();
+            });
+        ASSERT_NE(transportedFull, (*executable)->slots().end());
+        for (int64_t ordinal :
+             {transportedFull->ordinal, transportedCompact->ordinal}) {
+          EXPECT_TRUE(llvm::is_contained(
+              (*executable)->launches()[first->getOrdinal()].outputSlots,
+              ordinal));
+          EXPECT_TRUE(llvm::is_contained(
+              (*executable)->launches()[second->getOrdinal()].inputSlots,
+              ordinal));
+        }
+        EXPECT_TRUE(llvm::is_contained(
+            (*executable)->launches()[second->getOrdinal()].dependencies,
+            first->getOrdinal()));
+      }
+    }
+  }
+}
+
+TEST(Abi22MapFusionContract,
+     GenericContractFoldCompositionRejectsBoundaryAndOwnershipCorruption) {
+  std::optional<std::string> source =
+      fixtureSource("abi22-generic-contract-fold-composition-rank2.mlir");
+  ASSERT_TRUE(source);
+  for (llvm::StringRef mutation : {
+           "output-order",
+           "missing-output",
+           "compact-type",
+           "extra-public-result",
+           "lifetime",
+           "missing-consumer",
+           "missing-second-input",
+           "source-ownership",
+           "cost",
+       }) {
+    SCOPED_TRACE(mutation.str());
+    std::unique_ptr<BuiltModule> built =
+        buildAlgebra(*source, mlir::shuttle::NumericalPolicy::SourceOrdered,
+                     /*executable=*/false);
+    ASSERT_TRUE(built);
+    ASSERT_TRUE(mutateGenericContractFoldComposition(*built->module, mutation));
+    EXPECT_FALSE(verifyMaterializationPlan(*built->module));
+  }
+}
+
+TEST(Abi22MapFusionContract,
      HigherRankHybridPreservesTheNormalizedBoundaryShape) {
   std::optional<std::string> source = fixtureSource(
       "jax-0.10.1-bf16-rmsnorm_contract-2x5x19x7-boundary-consumer.mlir");
@@ -5428,12 +5777,10 @@ TEST(Abi22MapFusionContract,
     EXPECT_FALSE(planSummary->hasFoldRegion);
     EXPECT_TRUE(planSummary->exactSourceCoverage);
 
-    auto plan = *built->module->getOps<mlir::shuttle::MaterializationPlanOp>()
-                     .begin();
+    auto plan =
+        *built->module->getOps<mlir::shuttle::MaterializationPlanOp>().begin();
     auto tasks = llvm::to_vector(
-        plan.getBody()
-            .front()
-            .getOps<mlir::shuttle::MaterializationTaskOp>());
+        plan.getBody().front().getOps<mlir::shuttle::MaterializationTaskOp>());
     auto buffers = llvm::to_vector(
         plan.getBody()
             .front()
