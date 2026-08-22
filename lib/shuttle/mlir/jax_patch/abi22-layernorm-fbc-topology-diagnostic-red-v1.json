@@ -122,6 +122,7 @@
     "device_limits_source": "contract_pinned_h100_properties",
     "h100_device_limits": {
       "max_threads_per_block": 1024,
+      "max_block_dimensions": [1024, 1024, 64],
       "max_grid_dimensions": [2147483647, 65535, 65535],
       "max_dynamic_shared_bytes": 227328
     }

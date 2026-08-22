@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import functools
 import hashlib
 import importlib
@@ -66,7 +67,7 @@ HOST_CLOCK = "host_block_until_ready"
 TE_UNAVAILABLE_BLOCKER = "te_2_17_runner_lacks_required_shapes_epsilon_and_norm_contract"
 EXPLORATORY_MAX_BF16_ULP = 4
 
-_LAYERNORM_FBC_CONTRACT_DIGEST = "ec148234b552b2480b23f63a47f533c81a00c58af7abed3359ecbb427f0de420"
+_LAYERNORM_FBC_CONTRACT_DIGEST = "0eb03e11d004ec9fd2f687645b2edf1a804d94798b1aa8b54203e7ad18c5f373"
 _LAYERNORM_FBC_CONTRACT_ID = "abi22_layernorm_fbc_topology_diagnostic_red_v1"
 _LAYERNORM_FBC_REPORT_SCHEMA = "shuttle_abi22_layernorm_fbc_observed_result_v1"
 _LAYERNORM_PUBLIC_ROLES = {
@@ -614,15 +615,22 @@ def _layernorm_artifact(value: object, label: str) -> tuple[bytes, tuple[int, in
         try:
             opened = os.fstat(descriptor)
             chunks = []
-            while chunk := os.read(descriptor, 1 << 20):
+            remaining = byte_count + 1
+            while remaining > 0 and (chunk := os.read(descriptor, min(1 << 20, remaining))):
                 chunks.append(chunk)
+                remaining -= len(chunk)
             after = os.fstat(descriptor)
         finally:
             os.close(descriptor)
+        after_path = os.lstat(path)
     except OSError as error:
         raise ValueError(f"{label}.path cannot be read safely") from error
+
+    def metadata(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+        return (value.st_dev, value.st_ino, value.st_mode, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+
     identity = (opened.st_dev, opened.st_ino)
-    if identity != (before.st_dev, before.st_ino) or identity != (after.st_dev, after.st_ino):
+    if len({metadata(before), metadata(opened), metadata(after), metadata(after_path)}) != 1:
         raise ValueError(f"{label}.path changed while it was read")
     payload = b"".join(chunks)
     if len(payload) != byte_count or hashlib.sha256(payload).hexdigest() != expected_digest:
@@ -828,11 +836,37 @@ def _layernorm_validate_runtime(
 
     limits = _mapping(runtime.get("device_limits"), "LayerNorm runtime.device_limits")
     expected_limits = _mapping(contract["execution"]["h100_device_limits"], "LayerNorm contract device limits")
-    if limits != expected_limits:
+    _layernorm_exact_keys(
+        limits,
+        {"max_threads_per_block", "max_block_dimensions", "max_grid_dimensions", "max_dynamic_shared_bytes"},
+        "LayerNorm runtime.device_limits",
+    )
+    max_block_dimensions = _list(limits.get("max_block_dimensions"), "LayerNorm maximum block dimensions")
+    max_grid_dimensions = _list(limits.get("max_grid_dimensions"), "LayerNorm maximum grid dimensions")
+    if len(max_block_dimensions) != 3 or len(max_grid_dimensions) != 3:
+        raise ValueError("LayerNorm device dimension limits must be three-dimensional")
+    validated_limits = {
+        "max_threads_per_block": _integer(
+            limits.get("max_threads_per_block"), "LayerNorm maximum threads per block", positive=True
+        ),
+        "max_block_dimensions": [
+            _integer(extent, "LayerNorm maximum block dimension", positive=True) for extent in max_block_dimensions
+        ],
+        "max_grid_dimensions": [
+            _integer(extent, "LayerNorm maximum grid dimension", positive=True) for extent in max_grid_dimensions
+        ],
+        "max_dynamic_shared_bytes": _integer(
+            limits.get("max_dynamic_shared_bytes"), "LayerNorm maximum dynamic shared bytes", positive=True
+        ),
+    }
+    if validated_limits != expected_limits:
         raise ValueError("LayerNorm runtime device limits do not match the pinned H100 properties")
-    if runtime.get("bridge_created_streams") != 0 or runtime.get("bridge_created_allocations") != 0:
+    bridge_streams = _integer(runtime.get("bridge_created_streams"), "LayerNorm bridge-created streams")
+    bridge_allocations = _integer(runtime.get("bridge_created_allocations"), "LayerNorm bridge-created allocations")
+    host_round_trips = _integer(runtime.get("host_round_trips"), "LayerNorm host round trips")
+    if bridge_streams != 0 or bridge_allocations != 0:
         raise ValueError("LayerNorm provider bridge created a stream or allocation")
-    if runtime.get("fallback_targets") != [] or runtime.get("host_round_trips") != 0:
+    if runtime.get("fallback_targets") != [] or host_round_trips != 0:
         raise ValueError("LayerNorm execution used a fallback or host round trip")
     return runtime, spans
 
@@ -904,6 +938,7 @@ def _layernorm_validate_topology(
     producer: dict[int, int] = {}
     dependency_graph: dict[int, set[int]] = {}
     max_grid = device_limits["max_grid_dimensions"]
+    max_block = device_limits["max_block_dimensions"]
     for index, raw_launch in enumerate(launches):
         launch = _mapping(raw_launch, f"LayerNorm launch[{index}]")
         _layernorm_exact_keys(
@@ -948,6 +983,8 @@ def _layernorm_validate_topology(
         parsed_block = [_integer(value, "LayerNorm launch block extent", positive=True) for value in block]
         if any(extent > limit for extent, limit in zip(parsed_grid, max_grid, strict=True)):
             raise ValueError("LayerNorm launch grid exceeds the pinned H100 limit")
+        if any(extent > limit for extent, limit in zip(parsed_block, max_block, strict=True)):
+            raise ValueError("LayerNorm launch block dimension exceeds the pinned H100 limit")
         if math.prod(parsed_block) > device_limits["max_threads_per_block"]:
             raise ValueError("LayerNorm launch block exceeds the pinned H100 limit")
         shared = _integer(launch.get("dynamic_shared_bytes"), "LayerNorm dynamic shared bytes")
@@ -1061,7 +1098,8 @@ def _layernorm_validate_captures(
     for index, (raw_capture, (subject, capture_index)) in enumerate(zip(captures, expected_coordinates, strict=True)):
         capture = _mapping(raw_capture, f"LayerNorm captures[{index}]")
         _layernorm_exact_keys(capture, {"subject", "capture_index", "outputs"}, "LayerNorm capture")
-        if capture.get("subject") != subject or capture.get("capture_index") != capture_index:
+        observed_capture_index = _integer(capture.get("capture_index"), "LayerNorm capture index")
+        if capture.get("subject") != subject or observed_capture_index != capture_index:
             raise ValueError("LayerNorm capture coordinate is invalid")
         outputs = _list(capture.get("outputs"), f"LayerNorm {subject} capture outputs")
         if len(outputs) != len(roles):
@@ -1088,7 +1126,10 @@ def _layernorm_validate_captures(
                 raise ValueError("LayerNorm captured public output role or dtype is invalid")
             if byte_count != _layernorm_role_bytes(role, shape):
                 raise ValueError("LayerNorm captured public output byte extent is invalid")
-            if output.get("fully_written") is not True or output.get("unwritten_sentinel_count") != 0:
+            sentinel_count = _integer(
+                output.get("unwritten_sentinel_count"), f"LayerNorm captured {role} unwritten sentinel count"
+            )
+            if output.get("fully_written") is not True or sentinel_count != 0:
                 raise ValueError("LayerNorm captured public output is not fully written")
             payload, identity = _layernorm_artifact(
                 output.get("raw_bf16_artifact"), f"LayerNorm {subject} capture {capture_index} {role}"
@@ -1154,7 +1195,8 @@ def _layernorm_validate_timing(value: object, contract: dict[str, Any]) -> list[
         for block_index, raw_block in enumerate(blocks):
             block = _mapping(raw_block, f"LayerNorm timing.{field}[{block_index}]")
             _layernorm_exact_keys(block, {"block_index", "order", "invocations"}, "LayerNorm timing block")
-            if block.get("block_index") != block_index:
+            observed_block_index = _integer(block.get("block_index"), "LayerNorm timing block index")
+            if observed_block_index != block_index:
                 raise ValueError("LayerNorm timing block indices must be contiguous")
             order = block.get("order")
             if order not in {"STTS", "TSST"}:
@@ -1178,10 +1220,14 @@ def _layernorm_validate_timing(value: object, contract: dict[str, Any]) -> list[
                 if measured:
                     expected_keys |= {"duration_nanoseconds", "timer"}
                 _layernorm_exact_keys(invocation, expected_keys, "LayerNorm timing invocation")
+                observed_position = _integer(invocation.get("position"), "LayerNorm timing invocation position")
+                observed_subject_invocation = _integer(
+                    invocation.get("subject_invocation"), "LayerNorm timing subject invocation ordinal"
+                )
                 if (
-                    invocation.get("position") != position
+                    observed_position != position
                     or invocation.get("subject") != subject
-                    or invocation.get("subject_invocation") != subject_ordinals[subject]
+                    or observed_subject_invocation != subject_ordinals[subject]
                 ):
                     raise ValueError("LayerNorm timing invocation order or ordinal is invalid")
                 subject_ordinals[subject] += 1
@@ -1196,11 +1242,15 @@ def _layernorm_validate_timing(value: object, contract: dict[str, Any]) -> list[
                     expected_source = (
                         "gpu_runner_execute_timed" if subject == "shuttle" else "stream_executor_event_based_timer"
                     )
+                    event_handles = _integer(
+                        timer.get("cuda_event_handle_count"), "LayerNorm invocation CUDA event handle count"
+                    )
+                    timer_layers = _integer(timer.get("timer_layer_count"), "LayerNorm invocation timer layer count")
                     if (
                         timer.get("source") != expected_source
                         or timer.get("use_delay_kernel") is not False
-                        or timer.get("cuda_event_handle_count") != 2
-                        or timer.get("timer_layer_count") != 1
+                        or event_handles != 2
+                        or timer_layers != 1
                     ):
                         raise ValueError("LayerNorm invocation timer mechanism is invalid")
         first_orders.append(first_order)
@@ -1251,9 +1301,9 @@ def validate_layernorm_fbc_observed_result(report: object, contract: object) -> 
     return {
         "verdict": "pass",
         "topology_admission_role": "diagnostic_only",
-        "observed_topology": topology,
+        "observed_topology": copy.deepcopy(topology),
         "observed_schedule_digest": schedule_digest,
-        "timing_blocks": timing_blocks,
+        "timing_blocks": copy.deepcopy(timing_blocks),
     }
 
 

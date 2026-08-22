@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import abi22_h100_performance as performance
 import abi22_layernorm_bc_numerical_contract as numerics
@@ -568,6 +569,7 @@ def _report(
             ],
             "device_limits": {
                 "max_threads_per_block": 1024,
+                "max_block_dimensions": [1024, 1024, 64],
                 "max_grid_dimensions": [2147483647, 65535, 65535],
                 "max_dynamic_shared_bytes": 227328,
             },
@@ -718,6 +720,10 @@ class LayerNormFbcTopologyDiagnosticRedTest(unittest.TestCase):
                 self.assertEqual(accepted["observed_topology"], report["observed_topology"])
                 self.assertEqual(accepted["observed_schedule_digest"], report["observed_schedule_digest"])
                 self.assertEqual(accepted["timing_blocks"], report["timing"]["measured_blocks"])
+                report["observed_topology"]["launches"][0]["block"][0] = 0
+                report["timing"]["measured_blocks"][0]["invocations"][0]["duration_nanoseconds"] = 0
+                self.assertNotEqual(accepted["observed_topology"], report["observed_topology"])
+                self.assertNotEqual(accepted["timing_blocks"], report["timing"]["measured_blocks"])
 
     def test_rejects_public_numerical_and_repeatability_failures(self) -> None:
         baseline = _report(
@@ -757,6 +763,12 @@ class LayerNormFbcTopologyDiagnosticRedTest(unittest.TestCase):
         changed["captures"][0]["outputs"][0]["fully_written"] = False
         changed["captures"][0]["outputs"][0]["unwritten_sentinel_count"] = 1
         mutations.append(("full write", changed))
+        changed = copy.deepcopy(baseline)
+        changed["captures"][0]["capture_index"] = False
+        mutations.append(("capture index boolean", changed))
+        changed = copy.deepcopy(baseline)
+        changed["captures"][0]["outputs"][0]["unwritten_sentinel_count"] = 0.0
+        mutations.append(("sentinel count float", changed))
         changed = copy.deepcopy(baseline)
         changed["captures"][0]["outputs"][1]["metrics"]["max_absolute_error"] = 1.0
         mutations.append(("binary64 limit", changed))
@@ -855,6 +867,15 @@ class LayerNormFbcTopologyDiagnosticRedTest(unittest.TestCase):
         changed["runtime"]["bridge_created_allocations"] = 1
         mutations.append(("bridge allocation", changed))
         changed = copy.deepcopy(baseline)
+        changed["runtime"]["bridge_created_streams"] = False
+        mutations.append(("bridge stream boolean", changed))
+        changed = copy.deepcopy(baseline)
+        changed["runtime"]["host_round_trips"] = 0.0
+        mutations.append(("host round trip float", changed))
+        changed = copy.deepcopy(baseline)
+        changed["runtime"]["device_limits"]["max_threads_per_block"] = 1024.0
+        mutations.append(("device limit float", changed))
+        changed = copy.deepcopy(baseline)
         changed["observed_topology"]["scratch_allocations"][0]["address"] = changed["runtime"]["outputs"][0]["address"]
         mutations.append(("scratch output alias", changed))
         changed = copy.deepcopy(baseline)
@@ -917,6 +938,9 @@ class LayerNormFbcTopologyDiagnosticRedTest(unittest.TestCase):
         changed["observed_topology"]["launches"][0]["block"][0] = 1025
         mutations.append(("block exceeds H100 limit", changed))
         changed = copy.deepcopy(baseline)
+        changed["observed_topology"]["launches"][0]["block"] = [1, 1, 65]
+        mutations.append(("block z dimension exceeds H100 limit", changed))
+        changed = copy.deepcopy(baseline)
         changed["observed_topology"]["launches"][0]["grid"][0] = 2147483648
         mutations.append(("grid exceeds H100 limit", changed))
         changed = copy.deepcopy(baseline)
@@ -964,6 +988,30 @@ class LayerNormFbcTopologyDiagnosticRedTest(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(ValueError):
                 validator(changed, self.contract)
 
+        race_report = copy.deepcopy(baseline)
+        code_artifact = race_report["observed_topology"]["launches"][0]["code_artifact"]
+        code_path = Path(code_artifact["path"])
+        original_bytes = code_path.read_bytes()
+        replacement = bytes([original_bytes[0] ^ 1]) + original_bytes[1:]
+        target_identity = (code_path.stat().st_dev, code_path.stat().st_ino)
+        original_read = performance.os.read
+        rewritten = False
+
+        def rewrite_after_eof(descriptor: int, byte_count: int) -> bytes:
+            nonlocal rewritten
+            payload = original_read(descriptor, byte_count)
+            opened = performance.os.fstat(descriptor)
+            if not payload and not rewritten and (opened.st_dev, opened.st_ino) == target_identity:
+                code_path.write_bytes(replacement)
+                rewritten = True
+            return payload
+
+        try:
+            with mock.patch.object(performance.os, "read", side_effect=rewrite_after_eof), self.assertRaises(ValueError):
+                validator(race_report, self.contract)
+        finally:
+            code_path.write_bytes(original_bytes)
+
     def test_rejects_timing_protocol_failures(self) -> None:
         baseline = _report(
             "backward",
@@ -985,6 +1033,15 @@ class LayerNormFbcTopologyDiagnosticRedTest(unittest.TestCase):
         changed = copy.deepcopy(baseline)
         changed["timing"]["warmup_blocks"][9]["invocations"][3]["subject_invocation"] = 0
         mutations.append(("late warmup subject invocation ordinal", changed))
+        changed = copy.deepcopy(baseline)
+        changed["timing"]["warmup_blocks"][0]["block_index"] = 0.0
+        mutations.append(("warmup block index float", changed))
+        changed = copy.deepcopy(baseline)
+        changed["timing"]["warmup_blocks"][0]["invocations"][0]["position"] = False
+        mutations.append(("warmup position boolean", changed))
+        changed = copy.deepcopy(baseline)
+        changed["timing"]["warmup_blocks"][0]["invocations"][0]["subject_invocation"] = 0.0
+        mutations.append(("warmup subject ordinal float", changed))
         changed = copy.deepcopy(baseline)
         changed["timing"]["measured_blocks"].pop()
         mutations.append(("measured count", changed))
@@ -1013,8 +1070,14 @@ class LayerNormFbcTopologyDiagnosticRedTest(unittest.TestCase):
         changed["timing"]["measured_blocks"][49]["invocations"][3]["timer"]["cuda_event_handle_count"] = 4
         mutations.append(("event handle count", changed))
         changed = copy.deepcopy(baseline)
+        changed["timing"]["measured_blocks"][0]["invocations"][0]["timer"]["cuda_event_handle_count"] = 2.0
+        mutations.append(("event handle count float", changed))
+        changed = copy.deepcopy(baseline)
         changed["timing"]["measured_blocks"][49]["invocations"][3]["timer"]["timer_layer_count"] = 2
         mutations.append(("timer layer count", changed))
+        changed = copy.deepcopy(baseline)
+        changed["timing"]["measured_blocks"][0]["invocations"][0]["timer"]["timer_layer_count"] = True
+        mutations.append(("timer layer count boolean", changed))
         for name, changed in mutations:
             with self.subTest(name=name), self.assertRaises(ValueError):
                 validator(changed, self.contract)
