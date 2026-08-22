@@ -5860,8 +5860,19 @@ TEST(Abi22MapFusionContract,
         PtxDataflow mapContractFlow = ptxDataflow(mapContractPtx);
         ASSERT_EQ(contractFoldFlow.stores.size(), 2u);
         ASSERT_EQ(mapContractFlow.stores.size(), 1u);
+        std::set<std::string> fullPointerClosure = ptxDependencyClosure(
+            contractFoldFlow, contractFoldFlow.stores.front().pointer);
+        std::set<std::string> fullValueClosure = ptxDependencyClosure(
+            contractFoldFlow, contractFoldFlow.stores.front().value);
+        EXPECT_TRUE(fullPointerClosure.count("p3"));
+        EXPECT_TRUE(fullValueClosure.count("p0"));
+        EXPECT_TRUE(fullValueClosure.count("p1"));
+        EXPECT_TRUE(fullValueClosure.count("$op:fma.rn.f32"));
+        std::set<std::string> compactPointerClosure = ptxDependencyClosure(
+            contractFoldFlow, contractFoldFlow.stores.back().pointer);
         std::set<std::string> compactClosure = ptxDependencyClosure(
             contractFoldFlow, contractFoldFlow.stores.back().value);
+        EXPECT_TRUE(compactPointerClosure.count("p4"));
         EXPECT_TRUE(compactClosure.count("p0"));
         EXPECT_TRUE(compactClosure.count("p1"));
         EXPECT_TRUE(compactClosure.count("p2"));
@@ -5869,6 +5880,9 @@ TEST(Abi22MapFusionContract,
         EXPECT_TRUE(compactClosure.count("$op:fma.rn.f32"));
         std::set<std::string> resultClosure = ptxDependencyClosure(
             mapContractFlow, mapContractFlow.stores.front().value);
+        std::set<std::string> resultPointerClosure = ptxDependencyClosure(
+            mapContractFlow, mapContractFlow.stores.front().pointer);
+        EXPECT_TRUE(resultPointerClosure.count("p3"));
         EXPECT_TRUE(resultClosure.count("p0"));
         EXPECT_TRUE(resultClosure.count("p1"));
         EXPECT_TRUE(resultClosure.count("p2"));
