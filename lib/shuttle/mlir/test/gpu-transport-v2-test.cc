@@ -4197,7 +4197,7 @@ TEST(GpuTransportV2Test,
         EXPECT_EQ(binding.requiredBytes, 4);
       }
     }
-    ASSERT_GE(scalarOperand, 0);
+    ASSERT_EQ(scalarOperand, 3);
 
     const std::string digest =
         mlir::shuttle::gpuExecutableBundleDigest(*transport);
@@ -4284,6 +4284,11 @@ TEST(GpuTransportV2Test,
     EXPECT_EQ(trace->launchAttempts.load(), decoded->launches.size() * 2);
     llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> wrongOperands(operands);
     wrongOperands[scalarOperand].sizeBytes = 2;
+    EXPECT_FALSE((*runner)->Execute(wrongOperands, results).ok());
+    EXPECT_EQ(trace->launchAttempts.load(), decoded->launches.size() * 2);
+    wrongOperands = operands;
+    wrongOperands[scalarOperand].data = reinterpret_cast<void *>(
+        reinterpret_cast<uintptr_t>(wrongOperands[scalarOperand].data) + 2);
     EXPECT_FALSE((*runner)->Execute(wrongOperands, results).ok());
     EXPECT_EQ(trace->launchAttempts.load(), decoded->launches.size() * 2);
   }
