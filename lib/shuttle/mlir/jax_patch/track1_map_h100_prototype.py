@@ -15,6 +15,7 @@ import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import track1_generic_composition_numerical_policy as composition_policy
 import track1_rmsnorm_contract_numerical_policy as contract_policy
 from track1_map_h100_build import (
     HERMETIC_CUDA_COMPUTE_CAPABILITIES,
@@ -153,6 +154,7 @@ class PrototypePaths:
     rmsnorm: Path
     rmsnorm_contract: Path
     rmsnorm_contract_primal_checkpoint: Path
+    generic_composition: Path
     logs: Path
     image_identity: Path
     hydration_identity: Path
@@ -174,6 +176,7 @@ class PrototypePaths:
             rmsnorm=workspace / "rmsnorm.json",
             rmsnorm_contract=workspace / "rmsnorm-contract.json",
             rmsnorm_contract_primal_checkpoint=workspace / "rmsnorm-contract-primal.json",
+            generic_composition=workspace / "generic-composition.json",
             logs=workspace / "logs",
             image_identity=workspace / "base-image.identity",
             hydration_identity=workspace / "hydration-identities.json",
@@ -253,6 +256,19 @@ def _expected_authorization(source_manifest_sha256: str) -> dict[str, object]:
                 "raw_full_range_bf16_ulp": "diagnostic_only",
                 "repeat_bitwise_required": True,
                 "shapes": [list(shape) for shape in contract_policy.SHAPES],
+            },
+            "generic_composition": {
+                "disabled_jax_role": "ordinary_source_and_diagnostic",
+                "host_oracle": "independent_binary64_contract_fold_map_contract",
+                "modes": ["disabled", "source_ordered", "fast"],
+                "numerical_policy": {
+                    "path": f"lib/shuttle/mlir/jax_patch/{composition_policy.POLICY_FILENAME}",
+                    "sha256": composition_policy.POLICY_SHA256,
+                },
+                "public_abi": ["a:f32", "b:f32", "p:f32", "init:scalar_f32", "y:f32"],
+                "repeat_bitwise_required": True,
+                "semantic_contract": composition_policy.SEMANTIC_CONTRACT,
+                "topology_telemetry": "non_normative",
             },
         },
         "sources": {
@@ -372,6 +388,15 @@ def _rmsnorm_contract_worker_command(paths: PrototypePaths, runner_repository: P
     ]
 
 
+def _generic_composition_worker_command(paths: PrototypePaths, runner_repository: Path) -> list[str]:
+    return [
+        str(paths.runtime / "bin/python"),
+        str(runner_repository / "lib/shuttle/mlir/jax_patch/track1_generic_composition_h100_worker.py"),
+        "--output",
+        str(paths.generic_composition),
+    ]
+
+
 def _jax_source_command(paths: PrototypePaths, runner_repository: Path, action: str) -> list[str]:
     command = [
         str(paths.runtime / "bin/python"),
@@ -466,6 +491,10 @@ def prototype_plan(
         {"name": "reuse", "argv": _worker_command(paths, runner_repository, "reuse")},
         {"name": "rmsnorm", "argv": _rmsnorm_worker_command(paths, runner_repository)},
         {"name": "rmsnorm_contract", "argv": _rmsnorm_contract_worker_command(paths, runner_repository)},
+        {
+            "name": "generic_composition",
+            "argv": _generic_composition_worker_command(paths, runner_repository),
+        },
     ]
     return {
         "authorization_sha256": authorization.sha256,
@@ -901,6 +930,95 @@ def validate_rmsnorm_contract_result(document: object) -> dict[str, object]:
                 raise ValueError("RMSNorm Contract composed bundle topology differs")
     if len(invocation_ids) != 8:
         raise ValueError("RMSNorm Contract observer invocation coverage differs")
+    return document
+
+
+def validate_generic_composition_result(document: object) -> dict[str, object]:
+    """Validate the six-coordinate anonymous composition H100 result."""
+    if type(document) is not dict or set(document) != {
+        "coordinates",
+        "numerical_policy_sha256",
+        "pid",
+        "schema",
+        "schema_version",
+        "semantic_contract",
+    }:
+        raise ValueError("generic composition result has the wrong root schema")
+    if (
+        document["schema"] != "track1_generic_composition_h100_result"
+        or document["schema_version"] != 1
+        or document["numerical_policy_sha256"] != composition_policy.POLICY_SHA256
+        or document["semantic_contract"] != composition_policy.SEMANTIC_CONTRACT
+    ):
+        raise ValueError("generic composition result identity differs")
+    if type(document["pid"]) is not int or document["pid"] <= 0:
+        raise ValueError("generic composition result PID must be positive")
+    coordinates = document["coordinates"]
+    expected = [(case, mode) for case in composition_policy.CASES for mode in WORKER_MODES]
+    if type(coordinates) is not list or len(coordinates) != len(expected):
+        raise ValueError("generic composition result coordinate coverage differs")
+    invocation_ids: set[int] = set()
+    stablehlo_by_case: dict[str, str] = {}
+    for item, (case, mode) in zip(coordinates, expected, strict=True):
+        if type(item) is not dict or set(item) != {
+            "case_id",
+            "full_write",
+            "metrics",
+            "mode",
+            "observer",
+            "repeat_sha256",
+            "result_sha256",
+            "stablehlo_sha256",
+        }:
+            raise ValueError("generic composition coordinate schema differs")
+        if item["case_id"] != case.case_id or item["mode"] != mode or item["full_write"] is not True:
+            raise ValueError("generic composition coordinate identity or full-write evidence differs")
+        result_sha256 = _sha(item["result_sha256"], "generic composition result")
+        if _sha(item["repeat_sha256"], "generic composition repeat") != result_sha256:
+            raise ValueError("generic composition repeat result differs")
+        stablehlo_sha256 = _sha(item["stablehlo_sha256"], "generic composition StableHLO")
+        if stablehlo_sha256 != case.stablehlo_sha256:
+            raise ValueError("generic composition StableHLO source differs")
+        stablehlo_by_case.setdefault(case.case_id, stablehlo_sha256)
+        if stablehlo_by_case[case.case_id] != stablehlo_sha256:
+            raise ValueError("generic composition StableHLO source drifted across modes")
+        metrics = item["metrics"]
+        if type(metrics) is not dict or set(metrics) != set(case.limits):
+            raise ValueError("generic composition numerical metric schema differs")
+        for name, limit in case.limits.items():
+            value = metrics[name]
+            if type(value) is not float or not math.isfinite(value) or value < 0 or value > limit:
+                raise ValueError(f"generic composition result exceeds {name}")
+        observer = item["observer"]
+        if mode == "disabled":
+            if observer is not None:
+                raise ValueError("generic composition disabled result has an observer")
+            continue
+        if type(observer) is not dict or set(observer) != {
+            "final_module_sha256",
+            "generated_bundle_sha256",
+            "invocation_id",
+            "launch_count_telemetry",
+            "membership_sha256",
+            "temporary_count_telemetry",
+        }:
+            raise ValueError("generic composition observer schema differs")
+        invocation = observer["invocation_id"]
+        if type(invocation) is not int or invocation <= 0 or invocation in invocation_ids:
+            raise ValueError("generic composition observer invocation attribution differs")
+        invocation_ids.add(invocation)
+        _sha(observer["final_module_sha256"], "generic composition final module")
+        _sha(observer["generated_bundle_sha256"], "generic composition generated bundle")
+        _sha(observer["membership_sha256"], "generic composition membership")
+        if (
+            type(observer["launch_count_telemetry"]) is not int
+            or observer["launch_count_telemetry"] <= 0
+            or type(observer["temporary_count_telemetry"]) is not int
+            or observer["temporary_count_telemetry"] < 0
+        ):
+            raise ValueError("generic composition resource telemetry is invalid")
+    if len(invocation_ids) != 4:
+        raise ValueError("generic composition observer coverage differs")
     return document
 
 
@@ -1361,6 +1479,13 @@ def execute_prototype(
         environment=environment,
         failure_evidence=paths.rmsnorm_contract_primal_checkpoint,
     )
+    _run(
+        _generic_composition_worker_command(paths, runner_repository),
+        cwd=runner_repository,
+        log=paths.logs / "generic-composition.log",
+        phase="generic_composition",
+        environment=environment,
+    )
     workers = validate_result_pair(
         _load_canonical_document(paths.populate, "populate result"),
         _load_canonical_document(paths.reuse, "reuse result"),
@@ -1368,6 +1493,9 @@ def execute_prototype(
     rmsnorm = validate_rmsnorm_result(_load_canonical_document(paths.rmsnorm, "RMSNorm result"))
     rmsnorm_contract = validate_rmsnorm_contract_result(
         _load_canonical_document(paths.rmsnorm_contract, "RMSNorm Contract result")
+    )
+    generic_composition = validate_generic_composition_result(
+        _load_canonical_document(paths.generic_composition, "generic composition result")
     )
     return {
         "attempt": 1,
@@ -1383,4 +1511,5 @@ def execute_prototype(
         "workers": workers,
         "rmsnorm": rmsnorm,
         "rmsnorm_contract": rmsnorm_contract,
+        "generic_composition": generic_composition,
     }

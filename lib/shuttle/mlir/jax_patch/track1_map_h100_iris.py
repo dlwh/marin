@@ -50,6 +50,7 @@ class Campaign(StrEnum):
     MAP_PROTOTYPE = "map_prototype"
     RMSNORM_CANARY = "rmsnorm_canary"
     RMSNORM_CONTRACT_CANARY = "rmsnorm_contract_canary"
+    GENERIC_COMPOSITION_CANARY = "generic_composition_canary"
 
 
 def job_name(campaign: Campaign, retry: int) -> str:
@@ -60,6 +61,7 @@ def job_name(campaign: Campaign, retry: int) -> str:
         Campaign.MAP_PROTOTYPE: "shuttle-track1-map-h100-prototype",
         Campaign.RMSNORM_CANARY: "shuttle-track1-rmsnorm-h100-canary",
         Campaign.RMSNORM_CONTRACT_CANARY: "shuttle-track1-rmsnorm-contract-h100-canary",
+        Campaign.GENERIC_COMPOSITION_CANARY: "shuttle-track1-generic-composition-h100-canary",
     }[campaign]
     return JobName.root("dlwh", f"{stem}-r{retry}").to_wire()
 
