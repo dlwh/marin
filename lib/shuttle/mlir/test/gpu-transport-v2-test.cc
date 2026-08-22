@@ -660,7 +660,7 @@ decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes,
       ++externalSlots;
       if (reuseGroup != ordinal || binding == 0 || !hasBindingIndex ||
           (binding == 1 && access != 0) || (binding == 2 && access != 1) ||
-          elementType != 0 || rank == 0 || rank > 8)
+          rank > 8 || (elementType == 0 && rank == 0))
         return std::nullopt;
     }
   }
@@ -1354,7 +1354,10 @@ std::string bf16ArithmeticMapModule() {
   return source;
 }
 
-std::unique_ptr<BuiltBundle> buildAlgebraFixture(llvm::StringRef source) {
+std::unique_ptr<BuiltBundle> buildAlgebraFixture(
+    llvm::StringRef source,
+    llvm::StringRef tuning =
+        R"json({"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json") {
   mlir::DialectRegistry registry;
   registry.insert<mlir::arith::ArithDialect, mlir::func::FuncDialect,
                   mlir::math::MathDialect, mlir::shuttle::ShuttleDialect>();
@@ -1369,8 +1372,7 @@ std::unique_ptr<BuiltBundle> buildAlgebraFixture(llvm::StringRef source) {
       "shuttle.coverage_manifest",
       builder.getDictionaryAttr(builder.getNamedAttr(
           "canonical_tuning",
-          builder.getStringAttr(
-              R"json({"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json"))));
+          builder.getStringAttr(tuning))));
   mlir::PassManager manager(result->context.get());
   manager.addPass(mlir::shuttle::createPlanRowFoldMaterializationPass());
   manager.addPass(mlir::shuttle::createPlanSimt32RowFoldSchedulePass());
@@ -3751,7 +3753,8 @@ struct DynamicFrame {
 std::optional<DynamicFrame>
 dynamicCallFrame(const mlir::shuttle::GpuExecutable &executable,
                  llvm::ArrayRef<uint8_t> transport,
-                 llvm::StringRef transportDigest) {
+                 llvm::StringRef transportDigest,
+                 std::optional<int64_t> mismatchedOperand = std::nullopt) {
   llvm::SmallVector<const mlir::shuttle::GpuExternalBinding *> operands;
   llvm::SmallVector<const mlir::shuttle::GpuExternalBinding *> results;
   for (const auto &binding : executable.externalBindings()) {
@@ -3773,19 +3776,28 @@ dynamicCallFrame(const mlir::shuttle::GpuExecutable &executable,
   auto add = [&](const mlir::shuttle::GpuExternalBinding &binding,
                  bool result) {
     auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(binding.tensorType);
-    if (!tensor || !tensor.getElementType().isBF16())
+    if (!tensor)
       return false;
+    xla::PrimitiveType primitive;
+    if (tensor.getElementType().isBF16())
+      primitive = xla::PrimitiveType::BF16;
+    else if (tensor.getElementType().isF32())
+      primitive = xla::PrimitiveType::F32;
+    else
+      return false;
+    if (!result && mismatchedOperand == binding.index)
+      primitive = primitive == xla::PrimitiveType::F32
+                      ? xla::PrimitiveType::BF16
+                      : xla::PrimitiveType::F32;
     uintptr_t address =
         UINT64_C(0x100000000) +
         static_cast<uintptr_t>(binding.slotOrdinal) * UINT64_C(0x10000000);
     stream_executor::DeviceAddressBase deviceAddress(
         reinterpret_cast<void *>(address), binding.requiredBytes);
     if (result)
-      builder.AddBufferRet(deviceAddress, xla::PrimitiveType::BF16,
-                           tensor.getShape());
+      builder.AddBufferRet(deviceAddress, primitive, tensor.getShape());
     else
-      builder.AddBufferArg(deviceAddress, xla::PrimitiveType::BF16,
-                           tensor.getShape());
+      builder.AddBufferArg(deviceAddress, primitive, tensor.getShape());
     externalSlots[binding.slotOrdinal] = address;
     return true;
   };
@@ -4147,6 +4159,134 @@ TEST(GpuTransportV2Test, ExportedFfiBundleOwnsEveryLifecycleStage) {
                    .ok());
   EXPECT_EQ(failingAllocator.sizes.size(), 2);
   EXPECT_EQ(failingAllocator.deallocations, 2);
+}
+
+TEST(GpuTransportV2Test,
+     GenericF32ScalarCrossesExportedFfiAndStandaloneRunner) {
+  constexpr llvm::StringLiteral fusionTuning =
+      R"json({"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json";
+  for (llvm::StringRef filename : {
+           "abi22-generic-contract-fold-composition-rank2.mlir",
+           "abi22-generic-contract-fold-composition-rank3.mlir",
+       }) {
+    SCOPED_TRACE(filename.str());
+    auto source = fixtureSource(filename);
+    ASSERT_TRUE(source);
+    auto built = buildAlgebraFixture(*source, fusionTuning);
+    ASSERT_TRUE(built);
+    auto transport =
+        mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+    ASSERT_TRUE(mlir::succeeded(transport));
+    auto executable = mlir::shuttle::GpuExecutable::Load(*transport);
+    ASSERT_TRUE(executable.ok()) << executable.status();
+    auto decoded = decodeInlineSchema2(*transport);
+    ASSERT_TRUE(decoded);
+    ASSERT_EQ(decoded->launches.size(), 2u);
+
+    int64_t scalarOperand = -1;
+    for (const mlir::shuttle::GpuExternalBinding &binding :
+         (*executable)->externalBindings()) {
+      auto type = mlir::dyn_cast<mlir::RankedTensorType>(binding.tensorType);
+      ASSERT_TRUE(type);
+      EXPECT_TRUE(type.getElementType().isF32());
+      EXPECT_EQ(binding.alignment, 4);
+      if (binding.kind == mlir::shuttle::ExecutableBindingKind::Operand &&
+          type.getRank() == 0) {
+        ASSERT_EQ(scalarOperand, -1);
+        scalarOperand = binding.index;
+        EXPECT_EQ(binding.requiredBytes, 4);
+      }
+    }
+    ASSERT_GE(scalarOperand, 0);
+
+    const std::string digest =
+        mlir::shuttle::gpuExecutableBundleDigest(*transport);
+    auto frame = dynamicCallFrame(**executable, *transport, digest);
+    ASSERT_TRUE(frame);
+    auto mismatched = dynamicCallFrame(**executable, *transport, digest,
+                                       scalarOperand);
+    ASSERT_TRUE(mismatched);
+    XLA_FFI_Handler_Bundle handlers =
+        mlir::shuttle::gpuExecutableBundleFfiHandlerBundle();
+
+    SyntheticAllocator allocator;
+    stream_executor::MockStreamExecutor executor;
+    stream_executor::MockStream stream;
+    stream_executor::GpuComputeCapability capability{
+        stream_executor::CudaComputeCapability{9, 0}};
+    auto trace = std::make_shared<ExecutionTrace>();
+    EXPECT_CALL(stream, parent()).WillRepeatedly(testing::Return(&executor));
+    EXPECT_CALL(stream, BlockHostUntilDone())
+        .WillOnce(testing::Return(absl::OkStatus()));
+    EXPECT_CALL(executor, LoadKernel(testing::_))
+        .Times(decoded->launches.size() * 2)
+        .WillRepeatedly([trace](
+                            const stream_executor::KernelLoaderSpec &spec) {
+          return recordLoadedKernel(spec, trace);
+        });
+
+    xla::ffi::ExecutionState instantiateState;
+    xla::ffi::ExecutionState prepareState;
+    xla::ffi::ExecutionState initializeState;
+    xla::ffi::InvokeContext context;
+    context.device_ordinal = 0;
+    context.backend_context = xla::ffi::InvokeContext::GpuContext{
+        &stream, &allocator, nullptr, nullptr, nullptr, nullptr, nullptr,
+        &capability};
+    context.state_context = {&instantiateState, &prepareState,
+                             &initializeState};
+    ASSERT_TRUE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(),
+                                 handlers.instantiate, frame->frame, context,
+                                 XLA_FFI_ExecutionStage_INSTANTIATE)
+                    .ok());
+    ASSERT_TRUE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(), handlers.prepare,
+                                 frame->frame, context,
+                                 XLA_FFI_ExecutionStage_PREPARE)
+                    .ok());
+    ASSERT_TRUE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(),
+                                 handlers.initialize, frame->frame, context,
+                                 XLA_FFI_ExecutionStage_INITIALIZE)
+                    .ok());
+    ASSERT_TRUE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(), handlers.execute,
+                                 frame->frame, context,
+                                 XLA_FFI_ExecutionStage_EXECUTE)
+                    .ok());
+    EXPECT_EQ(trace->launchAttempts.load(), decoded->launches.size());
+    EXPECT_FALSE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(), handlers.execute,
+                                  mismatched->frame, context,
+                                  XLA_FFI_ExecutionStage_EXECUTE)
+                     .ok());
+    EXPECT_EQ(trace->launchAttempts.load(), decoded->launches.size());
+
+    auto runner = mlir::shuttle::GpuRunner::Create(
+        *transport, &allocator, 0, &stream, &capability);
+    ASSERT_TRUE(runner.ok()) << runner.status();
+    llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> operands;
+    llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> results;
+    for (const mlir::shuttle::GpuExternalBinding &binding :
+         (*executable)->externalBindings()) {
+      uintptr_t address = UINT64_C(0x200000000) +
+                          static_cast<uintptr_t>(binding.slotOrdinal) *
+                              UINT64_C(0x10000000);
+      mlir::shuttle::GpuRunnerBuffer buffer{
+          reinterpret_cast<void *>(address), binding.requiredBytes};
+      if (binding.kind == mlir::shuttle::ExecutableBindingKind::Operand) {
+        ASSERT_EQ(binding.index, static_cast<int64_t>(operands.size()));
+        operands.push_back(buffer);
+      } else {
+        ASSERT_EQ(binding.kind,
+                  mlir::shuttle::ExecutableBindingKind::Result);
+        ASSERT_EQ(binding.index, static_cast<int64_t>(results.size()));
+        results.push_back(buffer);
+      }
+    }
+    ASSERT_TRUE((*runner)->Execute(operands, results).ok());
+    EXPECT_EQ(trace->launchAttempts.load(), decoded->launches.size() * 2);
+    llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> wrongOperands(operands);
+    wrongOperands[scalarOperand].sizeBytes = 2;
+    EXPECT_FALSE((*runner)->Execute(wrongOperands, results).ok());
+    EXPECT_EQ(trace->launchAttempts.load(), decoded->launches.size() * 2);
+  }
 }
 
 TEST(GpuTransportV2Test,

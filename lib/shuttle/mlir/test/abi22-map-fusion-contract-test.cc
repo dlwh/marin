@@ -6107,6 +6107,27 @@ TEST(Abi22MapFusionContract,
         EXPECT_TRUE(llvm::is_contained(
             (*executable)->launches()[second->getOrdinal()].dependencies,
             first->getOrdinal()));
+
+        mlir::PassManager replace(executableBuilt->context.get());
+        replace.addPass(
+            mlir::shuttle::createReplaceWithGpuExecutableBundlePass());
+        ASSERT_TRUE(mlir::succeeded(replace.run(*executableBuilt->module)));
+        int64_t remainingRegions = 0;
+        llvm::SmallVector<mlir::Operation *> customCalls;
+        executableBuilt->module->walk([&](mlir::Operation *operation) {
+          remainingRegions += mlir::isa<mlir::shuttle::RegionOp>(operation);
+          if (operation->getName().getStringRef() == "stablehlo.custom_call")
+            customCalls.push_back(operation);
+        });
+        EXPECT_EQ(remainingRegions, 0);
+        ASSERT_EQ(customCalls.size(), 1u);
+        EXPECT_EQ(customCalls.front()->getNumOperands(), 4u);
+        EXPECT_EQ(customCalls.front()->getNumResults(), 1u);
+        auto scalarType = mlir::dyn_cast<mlir::RankedTensorType>(
+            customCalls.front()->getOperand(3).getType());
+        ASSERT_TRUE(scalarType);
+        EXPECT_EQ(scalarType.getRank(), 0);
+        EXPECT_TRUE(scalarType.getElementType().isF32());
       }
     }
   }
