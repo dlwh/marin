@@ -982,10 +982,13 @@ std::unique_ptr<BuiltModule>
 buildAlgebra(llvm::StringRef source, mlir::shuttle::NumericalPolicy policy,
              bool executable = true, bool renamed = false) {
   mlir::DialectRegistry registry;
+  mlir::stablehlo::registerAllDialects(registry);
   registry.insert<mlir::arith::ArithDialect, mlir::func::FuncDialect,
                   mlir::math::MathDialect, mlir::shuttle::ShuttleDialect>();
   auto result = std::make_unique<BuiltModule>();
   result->context = std::make_unique<mlir::MLIRContext>(registry);
+  if (!result->context->getOrLoadDialect("stablehlo"))
+    return {};
   result->module =
       mlir::parseSourceString<mlir::ModuleOp>(source, result->context.get());
   if (!result->module)
