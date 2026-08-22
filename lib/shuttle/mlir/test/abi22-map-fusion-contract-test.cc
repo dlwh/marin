@@ -1629,6 +1629,32 @@ bool mutateGenericContractFoldComposition(mlir::ModuleOp module,
       return false;
     std::swap(inputs[publicPositions[0]], inputs[publicPositions[1]]);
     (*first)->setAttr("input_buffers", builder.getDenseI64ArrayAttr(inputs));
+  } else if (mutation == "missing-second-public-input" ||
+             mutation == "rebound-second-public-input" ||
+             mutation == "second-input-order") {
+    llvm::SmallVector<int64_t> inputs(second->getInputBuffers());
+    auto publicInput = llvm::find_if(inputs, [&](int64_t ordinal) {
+      auto buffer = bufferByOrdinal(ordinal);
+      return buffer != buffers.end() && buffer->getLiveIn();
+    });
+    if (publicInput == inputs.end())
+      return false;
+    if (mutation == "missing-second-public-input") {
+      inputs.erase(publicInput);
+    } else if (mutation == "rebound-second-public-input") {
+      auto replacement = llvm::find_if(buffers, [&](auto buffer) {
+        return buffer.getLiveIn() && buffer.getOrdinal() != *publicInput;
+      });
+      if (replacement == buffers.end())
+        return false;
+      *publicInput = replacement->getOrdinal();
+    } else {
+      auto privateInput = llvm::find(inputs, compact->getOrdinal());
+      if (privateInput == inputs.end())
+        return false;
+      std::iter_swap(publicInput, privateInput);
+    }
+    (*second)->setAttr("input_buffers", builder.getDenseI64ArrayAttr(inputs));
   } else if (mutation == "missing-public-result" ||
              mutation == "rebound-public-result") {
     auto publicResult =
@@ -5882,6 +5908,9 @@ TEST(Abi22MapFusionContract,
            "missing-second-input",
            "missing-public-input",
            "rebound-public-input",
+           "missing-second-public-input",
+           "rebound-second-public-input",
+           "second-input-order",
            "missing-public-result",
            "rebound-public-result",
            "source-ownership",
