@@ -1690,7 +1690,7 @@ bool mutateGenericContractFoldComposition(mlir::ModuleOp module,
     if (!firstSources || firstSources.empty() || !secondSources)
       return false;
     llvm::SmallVector<mlir::Attribute> sources(secondSources.getValue());
-    sources.push_back(firstSources[0]);
+    sources[0] = firstSources[0];
     (*second)->setAttr("composition_sources", builder.getArrayAttr(sources));
   } else if (mutation == "cost" || mutation == "underreported-cost" ||
              mutation == "missing-cost-field" ||
@@ -6006,6 +6006,114 @@ TEST(Abi22MapFusionContract,
     ASSERT_TRUE(built);
     ASSERT_TRUE(mutateGenericContractFoldComposition(*built->module, mutation));
     EXPECT_FALSE(verifyMaterializationPlan(*built->module));
+  }
+}
+
+TEST(Abi22MapFusionContract,
+     GenericContractFoldCompositionFallsBackForStructuralNearMisses) {
+  std::optional<std::string> source =
+      fixtureSource("abi22-generic-contract-fold-composition-rank2.mlir");
+  ASSERT_TRUE(source);
+  auto replaceAll = [](std::string changed, llvm::StringRef oldText,
+                       llvm::StringRef newText) {
+    size_t position = 0;
+    while ((position = changed.find(oldText.str(), position)) !=
+           std::string::npos) {
+      changed.replace(position, oldText.size(), newText.str());
+      position += newText.size();
+    }
+    return changed;
+  };
+
+  std::string extraMapInput =
+      replaceAll(*source, "%z = \"shuttle.map\"(%h, %s)",
+                 "%z = \"shuttle.map\"(%h, %s, %s)");
+  extraMapInput =
+      replaceAll(std::move(extraMapInput),
+                 "^bb0(%element: f32, %scale: f32):",
+                 "^bb0(%element: f32, %scale: f32, %scale_again: f32):");
+  extraMapInput = replaceAll(
+      std::move(extraMapInput),
+      "%scaled = arith.mulf %element, %scale : f32\n"
+      "        \"shuttle.yield\"(%scaled) : (f32) -> ()",
+      "%scaled = arith.mulf %element, %scale : f32\n"
+      "        %combined = arith.addf %scaled, %scale_again : f32\n"
+      "        \"shuttle.yield\"(%combined) : (f32) -> ()");
+  extraMapInput =
+      replaceAll(std::move(extraMapInput),
+                 "indexing_maps = [#identity, #row, #identity]",
+                 "indexing_maps = [#identity, #row, #row, #identity]");
+  extraMapInput = replaceAll(
+      std::move(extraMapInput),
+      "(tensor<2x5xf32>, tensor<2xf32>) -> tensor<2x5xf32>",
+      "(tensor<2x5xf32>, tensor<2xf32>, tensor<2xf32>) -> tensor<2x5xf32>");
+  std::string extraFullConsumer = replaceAll(
+      *source, "#shuttle.source_ref<0, 0, 3, 0>",
+      "#shuttle.source_ref<0, 0, 4, 0>");
+  constexpr llvm::StringLiteral dependentMap =
+      "      %z = \"shuttle.map\"(%h, %s) ({";
+  size_t mapPosition = extraFullConsumer.find(dependentMap.str());
+  ASSERT_NE(mapPosition, std::string::npos);
+  extraFullConsumer.insert(
+      mapPosition,
+      R"mlir(      %unused_h = "shuttle.map"(%h) ({
+      ^bb0(%value: f32):
+        "shuttle.yield"(%value) : (f32) -> ()
+      }) {
+        indexing_maps = [#identity, #identity],
+        source = #shuttle.source_ref<0, 0, 3, 0>
+      } : (tensor<2x5xf32>) -> tensor<2x5xf32>
+)mlir");
+  extraFullConsumer =
+      replaceAll(std::move(extraFullConsumer),
+                 "%z = \"shuttle.map\"(%h, %s)",
+                 "%z = \"shuttle.map\"(%h, %s, %unused_h)");
+  extraFullConsumer = replaceAll(
+      std::move(extraFullConsumer), "^bb0(%element: f32, %scale: f32):",
+      "^bb0(%element: f32, %scale: f32, %extra: f32):");
+  extraFullConsumer = replaceAll(
+      std::move(extraFullConsumer),
+      "%scaled = arith.mulf %element, %scale : f32\n"
+      "        \"shuttle.yield\"(%scaled) : (f32) -> ()",
+      "%scaled = arith.mulf %element, %scale : f32\n"
+      "        %combined = arith.addf %scaled, %extra : f32\n"
+      "        \"shuttle.yield\"(%combined) : (f32) -> ()");
+  extraFullConsumer = replaceAll(
+      std::move(extraFullConsumer),
+      "indexing_maps = [#identity, #row, #identity]",
+      "indexing_maps = [#identity, #row, #identity, #identity]");
+  extraFullConsumer = replaceAll(
+      std::move(extraFullConsumer),
+      "(tensor<2x5xf32>, tensor<2xf32>) -> tensor<2x5xf32>",
+      "(tensor<2x5xf32>, tensor<2xf32>, tensor<2x5xf32>) -> "
+      "tensor<2x5xf32>");
+  constexpr llvm::StringLiteral finalSource =
+      "                     #shuttle.source_ref<0, 0, 4, 0>]";
+  size_t finalSourcePosition = extraFullConsumer.find(finalSource.str());
+  ASSERT_NE(finalSourcePosition, std::string::npos);
+  extraFullConsumer.insert(
+      finalSourcePosition,
+      "                     #shuttle.source_ref<0, 0, 3, 0>,\n");
+
+  for (const auto &[name, mutation] :
+       std::array<std::pair<llvm::StringRef, std::string>, 2>{
+           std::pair<llvm::StringRef, std::string>{"extra-map-input",
+                                                   std::move(extraMapInput)},
+           {"extra-full-consumer", std::move(extraFullConsumer)}}) {
+    SCOPED_TRACE(name.str());
+    std::unique_ptr<BuiltModule> built =
+        buildAlgebra(mutation,
+                     mlir::shuttle::NumericalPolicy::SourceOrdered,
+                     /*executable=*/false);
+    ASSERT_TRUE(built);
+    std::optional<PlanSummary> plan = summary(*built->module);
+    ASSERT_TRUE(plan);
+    EXPECT_TRUE(plan->exactSourceCoverage);
+    built->module->walk([&](mlir::shuttle::MaterializationTaskOp task) {
+      EXPECT_FALSE(task->hasAttr("composition_kind"));
+      EXPECT_FALSE(task->hasAttr("composition_sources"));
+      EXPECT_FALSE(task->hasAttr("composition_cost"));
+    });
   }
 }
 
