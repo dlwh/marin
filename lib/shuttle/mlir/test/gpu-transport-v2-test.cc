@@ -3795,7 +3795,7 @@ dynamicCallFrame(const mlir::shuttle::GpuExecutable &executable,
     bool mutate = !result && mutation && mutation->operand == binding.index;
     if (mutate && mutation->kind == CallFrameMutationKind::Primitive)
       primitive = primitive == xla::PrimitiveType::F32
-                      ? xla::PrimitiveType::BF16
+                      ? xla::PrimitiveType::S32
                       : xla::PrimitiveType::F32;
     uintptr_t address =
         UINT64_C(0x100000000) +

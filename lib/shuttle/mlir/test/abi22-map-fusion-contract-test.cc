@@ -6287,6 +6287,100 @@ TEST(Abi22MapFusionContract,
 }
 
 TEST(Abi22MapFusionContract,
+     ProjectedGenericCompositionRejectsProjectionNearMissesAndLostOwnership) {
+  std::optional<std::string> source = fixtureSource(
+      "abi22-generic-contract-fold-projected-composition-rank2.mlir");
+  ASSERT_TRUE(source);
+
+  std::unique_ptr<BuiltModule> built =
+      buildAlgebra(*source, mlir::shuttle::NumericalPolicy::SourceOrdered,
+                   /*executable=*/false);
+  ASSERT_TRUE(built);
+  auto plan = *built->module->getOps<mlir::shuttle::MaterializationPlanOp>()
+                   .begin();
+  auto tasks = llvm::to_vector(
+      plan.getBody()
+          .front()
+          .getOps<mlir::shuttle::MaterializationTaskOp>());
+  auto projectedTask = llvm::find_if(tasks, [](auto task) {
+    auto kind =
+        task->template getAttrOfType<mlir::StringAttr>("composition_kind");
+    return kind && kind.getValue() == "map_contract";
+  });
+  ASSERT_NE(projectedTask, tasks.end());
+  auto sources = (*projectedTask)->getAttrOfType<mlir::ArrayAttr>(
+      "composition_sources");
+  ASSERT_TRUE(sources);
+  ASSERT_EQ(sources.size(), 3u);
+  (*projectedTask)->setAttr(
+      "composition_sources",
+      mlir::Builder(built->context.get())
+          .getArrayAttr(sources.getValue().drop_front()));
+  plan.setFingerprint(mlir::shuttle::materializationPlanFingerprint(plan));
+  EXPECT_FALSE(verifyMaterializationPlan(*built->module));
+
+  auto replace = [](std::string changed, llvm::StringRef oldText,
+                    llvm::StringRef newText) {
+    size_t position = changed.find(oldText.str());
+    EXPECT_NE(position, std::string::npos);
+    if (position != std::string::npos)
+      changed.replace(position, oldText.size(), newText.str());
+    return changed;
+  };
+  std::string wrongProjectionSemantics = replace(
+      *source, "semantics = #shuttle.map_semantics<broadcast_in_dim>",
+      "semantics = #shuttle.map_semantics<pointwise>");
+  std::string extraProjectionConsumer = replace(
+      *source, "%z = \"shuttle.map\"(%h, %projected)",
+      "%z = \"shuttle.map\"(%h, %projected, %projected)");
+  extraProjectionConsumer = replace(
+      std::move(extraProjectionConsumer),
+      "^bb0(%element: f32, %scale: f32):",
+      "^bb0(%element: f32, %scale: f32, %scale_again: f32):");
+  extraProjectionConsumer = replace(
+      std::move(extraProjectionConsumer),
+      "%scaled = arith.mulf %element, %scale : f32\n"
+      "        \"shuttle.yield\"(%scaled) : (f32) -> ()",
+      "%scaled = arith.mulf %element, %scale : f32\n"
+      "        %combined = arith.addf %scaled, %scale_again : f32\n"
+      "        \"shuttle.yield\"(%combined) : (f32) -> ()");
+  extraProjectionConsumer = replace(
+      std::move(extraProjectionConsumer),
+      "indexing_maps = [#identity, #identity, #identity]",
+      "indexing_maps = [#identity, #identity, #identity, #identity]");
+  extraProjectionConsumer = replace(
+      std::move(extraProjectionConsumer),
+      "(tensor<2x5xf32>, tensor<2x5xf32>) -> tensor<2x5xf32>",
+      "(tensor<2x5xf32>, tensor<2x5xf32>, tensor<2x5xf32>) -> "
+      "tensor<2x5xf32>");
+  std::string missingFullConsumer = replace(
+      *source, "%z = \"shuttle.map\"(%h, %projected)",
+      "%z = \"shuttle.map\"(%projected, %projected)");
+
+  for (const auto &[name, mutation] :
+       std::array<std::pair<llvm::StringRef, std::string>, 3>{
+           std::pair<llvm::StringRef, std::string>{
+               "wrong-projection-semantics", wrongProjectionSemantics},
+           {"extra-projection-consumer", extraProjectionConsumer},
+           {"missing-full-consumer", missingFullConsumer}}) {
+    SCOPED_TRACE(name.str());
+    std::unique_ptr<BuiltModule> nearMiss =
+        buildAlgebra(mutation,
+                     mlir::shuttle::NumericalPolicy::SourceOrdered,
+                     /*executable=*/false);
+    ASSERT_TRUE(nearMiss);
+    std::optional<PlanSummary> nearMissPlan = summary(*nearMiss->module);
+    ASSERT_TRUE(nearMissPlan);
+    EXPECT_TRUE(nearMissPlan->exactSourceCoverage);
+    nearMiss->module->walk([&](mlir::shuttle::MaterializationTaskOp task) {
+      EXPECT_FALSE(task->hasAttr("composition_kind"));
+      EXPECT_FALSE(task->hasAttr("composition_sources"));
+      EXPECT_FALSE(task->hasAttr("composition_cost"));
+    });
+  }
+}
+
+TEST(Abi22MapFusionContract,
      HigherRankHybridPreservesTheNormalizedBoundaryShape) {
   std::optional<std::string> source = fixtureSource(
       "jax-0.10.1-bf16-rmsnorm_contract-2x5x19x7-boundary-consumer.mlir");
