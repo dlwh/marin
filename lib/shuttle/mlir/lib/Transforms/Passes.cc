@@ -9179,23 +9179,38 @@ FailureOr<std::string> emitContractFoldCompositionPtx(
     return failure();
 
   const int64_t reduction = full.getShape().back();
+  const int64_t serialTiles = task.getSerialTiles();
+  if (serialTiles <= 0)
+    return failure();
+  const int64_t activeThreads = ceilDivPositive(reduction, serialTiles);
+  if (activeThreads <= 0 || activeThreads > task.getWorkgroupThreads())
+    return failure();
   PtxEmitter ptx(materializationTask.getInputBuffers().size() +
                  materializationTask.getOutputBuffers().size());
   ptx.header(task.getSemanticFingerprint(), /*usesDynamicSharedMemory=*/true);
   int64_t local = ptx.nextF32();
+  int64_t leaf = ptx.nextU64();
+  int64_t leafEnd = ptx.nextU64();
+  int64_t row = ptx.nextU64();
   ptx.stream << "  mov.u32 %r0, %tid.x;\n"
                 "  mov.u32 %r1, %ctaid.x;\n"
                 "  mov.u32 %r2, %ntid.x;\n"
                 "  setp.ge.u32 %p0, %r1, "
              << *outputElements
-             << ";\n  @%p0 bra $done;\n  mov.u32 %r4, %r0;\n  mov.f32 %f"
-             << local
-             << ", 0f00000000;\n$composition_fold_load:\n"
-                "  setp.ge.u32 %p1, %r4, "
-             << reduction
+             << ";\n  @%p0 bra $done;\n  cvt.u64.u32 %rd" << row
+             << ", %r1;\n  cvt.u64.u32 %rd" << leaf
+             << ", %r0;\n  mul.lo.u64 %rd" << leaf << ", %rd" << leaf
+             << ", " << serialTiles << ";\n  add.u64 %rd" << leafEnd
+             << ", %rd" << leaf << ", " << serialTiles
+             << ";\n  mov.u32 %r4, 1;\n$composition_fold_load:\n"
+                "  setp.ge.u64 %p1, %rd"
+             << leaf << ", " << reduction
              << ";\n  @%p1 bra $composition_fold_loaded;\n"
-                "  mad.lo.u32 %r5, %r1, "
-             << reduction << ", %r4;\n  cvt.u64.u32 %rd0, %r5;\n";
+                "  setp.ge.u64 %p2, %rd"
+             << leaf << ", %rd" << leafEnd
+             << ";\n  @%p2 bra $composition_fold_loaded;\n"
+                "  mad.lo.u64 %rd0, %rd"
+             << row << ", " << reduction << ", %rd" << leaf << ";\n";
   FailureOr<SmallVector<int64_t>> fullCoordinates =
       emitOutputCoordinates(ptx, full);
   if (failed(fullCoordinates))
@@ -9209,24 +9224,34 @@ FailureOr<std::string> emitContractFoldCompositionPtx(
   ptx.stream << "  ld.param.u64 %rd" << fullPointer
              << ", [p3];\n  mad.lo.u64 %rd" << fullPointer << ", %rd0, 4, %rd"
              << fullPointer << ";\n  st.global.f32 [%rd" << fullPointer
-             << "], %f" << *value << ";\n  add.rn.f32 %f" << combined << ", %f"
-             << local << ", %f" << *value << ";\n  mov.f32 %f" << local
-             << ", %f" << combined
-             << ";\n  add.u32 %r4, %r4, %r2;\n"
+             << "], %f" << *value
+             << ";\n  setp.ne.u32 %p3, %r4, 0;\n  @%p3 bra "
+                "$composition_fold_first_leaf;\n  add.rn.f32 %f"
+             << combined << ", %f" << local << ", %f" << *value
+             << ";\n  mov.f32 %f" << local << ", %f" << combined
+             << ";\n  bra $composition_fold_leaf_combined;\n"
+                "$composition_fold_first_leaf:\n  mov.f32 %f"
+             << local << ", %f" << *value
+             << ";\n  mov.u32 %r4, 0;\n$composition_fold_leaf_combined:\n"
+                "  add.u64 %rd"
+             << leaf << ", %rd" << leaf << ", 1;\n"
                 "  bra $composition_fold_load;\n"
                 "$composition_fold_loaded:\n";
   int64_t threadOffset = ptx.nextU64();
   int64_t sharedBase = ptx.nextU64();
   int64_t threadPointer = ptx.nextU64();
-  ptx.stream << "  cvt.u64.u32 %rd" << threadOffset
+  ptx.stream << "  setp.ge.u32 %p1, %r0, " << activeThreads
+             << ";\n  @%p1 bra $composition_fold_skip_initial_store;\n"
+                "  cvt.u64.u32 %rd"
+             << threadOffset
              << ", %r0;\n  mul.lo.u64 %rd" << threadOffset << ", %rd"
              << threadOffset << ", 4;\n  mov.u64 %rd" << sharedBase
              << ", shuttle_smem;\n  cvta.to.shared.u64 %rd" << sharedBase
              << ", %rd" << sharedBase << ";\n  add.u64 %rd" << threadPointer
              << ", %rd" << sharedBase << ", %rd" << threadOffset
              << ";\n  st.shared.f32 [%rd" << threadPointer << "], %f" << local
-             << ";\n  bar.sync 0;\n";
-  for (int64_t active = task.getWorkgroupThreads(); active > 1;
+             << ";\n$composition_fold_skip_initial_store:\n  bar.sync 0;\n";
+  for (int64_t active = activeThreads; active > 1;
        active = (active + 1) / 2) {
     const int64_t pairs = active / 2;
     int64_t pairIndex = ptx.nextU64();
