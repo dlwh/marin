@@ -4395,6 +4395,7 @@ bool isProjectedFoldStatistic(MapOp map, unsigned operand,
                               RankedTensorType full, RankedTensorType compact) {
   if (operand >= map.getInputs().size() ||
       map.getInputs()[operand].getType() != compact ||
+      map.getResult(0).getType() != full ||
       compact.getShape() != full.getShape().drop_back())
     return false;
   auto indexing = dyn_cast<AffineMapAttr>(map.getIndexingMaps()[operand]);
@@ -4417,12 +4418,12 @@ deriveGenericContractFoldCompositionPlan(RegionOp region,
   SmallVector<Operation *> algebra;
   for (Operation &operation : region.getBody().front().without_terminator())
     algebra.push_back(&operation);
-  if (algebra.size() != 4)
+  if (algebra.size() < 4 || algebra.size() > 5)
     return failure();
 
   SmallVector<ContractOp> contracts;
   FoldOp fold;
-  MapOp map;
+  SmallVector<MapOp> maps;
   for (Operation *operation : algebra) {
     if (auto contract = dyn_cast<ContractOp>(operation))
       contracts.push_back(contract);
@@ -4431,15 +4432,12 @@ deriveGenericContractFoldCompositionPlan(RegionOp region,
         return failure();
       fold = candidate;
     } else if (auto candidate = dyn_cast<MapOp>(operation)) {
-      if (map)
-        return failure();
-      map = candidate;
+      maps.push_back(candidate);
     } else {
       return failure();
     }
   }
-  if (contracts.size() != 2 || !fold || !map || map.getInputs().size() != 2 ||
-      map.getNumResults() != 1 || !isEligibleF32Map(map) ||
+  if (contracts.size() != 2 || !fold || maps.empty() || maps.size() > 2 ||
       !isClosedAdditivePlanningFold(fold) || fold.getInputs().size() != 1 ||
       fold.getInitializers().size() != 1 || fold.getNumResults() != 1)
     return failure();
@@ -4450,6 +4448,22 @@ deriveGenericContractFoldCompositionPlan(RegionOp region,
     return failure();
   Value fullValue = first.getResult(0);
   Value compactValue = fold.getResult(0);
+  MapOp map = maps.back();
+  MapOp projectedStatistic;
+  if (maps.size() == 2) {
+    projectedStatistic = maps.front();
+    if (projectedStatistic.getSemantics() != MapSemantics::BroadcastInDim ||
+        !isEligibleF32Map(projectedStatistic) ||
+        projectedStatistic.getInputs().size() != 1 ||
+        projectedStatistic.getInputs().front() != compactValue ||
+        projectedStatistic.getNumResults() != 1 ||
+        !projectedStatistic.getResult(0).hasOneUse() ||
+        projectedStatistic.getResult(0).getUses().begin()->getOwner() != map)
+      return failure();
+  }
+  if (map.getInputs().size() != 2 || map.getNumResults() != 1 ||
+      !isEligibleF32Map(map))
+    return failure();
   unsigned fullOperand = 0;
   unsigned compactOperand = 0;
   bool sawFull = false;
@@ -4458,7 +4472,9 @@ deriveGenericContractFoldCompositionPlan(RegionOp region,
     if (value == fullValue) {
       fullOperand = operand;
       sawFull = true;
-    } else if (value == compactValue) {
+    } else if (value == compactValue ||
+               (projectedStatistic &&
+                value == projectedStatistic.getResult(0))) {
       compactOperand = operand;
       sawCompact = true;
     }
@@ -4480,7 +4496,9 @@ deriveGenericContractFoldCompositionPlan(RegionOp region,
           ArrayRef<int64_t>({full.getRank() - 1}) ||
       compact.getShape() != full.getShape().drop_back() || !fullIndexing ||
       !isIdentityMap(fullIndexing.getValue()) ||
-      !isProjectedFoldStatistic(map, compactOperand, full, compact))
+      !(projectedStatistic
+            ? isProjectedFoldStatistic(projectedStatistic, 0, full, compact)
+            : isProjectedFoldStatistic(map, compactOperand, full, compact)))
     return failure();
 
   ContractOp second =
@@ -4630,7 +4648,10 @@ deriveGenericContractFoldCompositionPlan(RegionOp region,
   secondTask.outputs = {resultBuffer};
   secondTask.dependencies = {0};
   secondTask.compositionKind = "map_contract";
-  secondTask.compositionSources = {map, second};
+  if (projectedStatistic)
+    secondTask.compositionSources = {projectedStatistic, map, second};
+  else
+    secondTask.compositionSources = {map, second};
   secondTask.compositionCost = {baselineLaunches,
                                 candidateLaunches,
                                 baselineTemporaryBytes,
@@ -6825,8 +6846,8 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
     auto compositionCost =
         task->getAttrOfType<DictionaryAttr>("composition_cost");
     if (compositionKind || compositionSources || compositionCost) {
-      if (!compositionKind || !compositionSources ||
-          compositionSources.size() != 2 || fusedSources || composedMaps ||
+      if (!compositionKind || !compositionSources || fusedSources ||
+          composedMaps ||
           epilogueSources || epilogueMaps || foldRegionSources ||
           foldRegionOutputSources || contractRegionSources)
         return task.emitOpError(
@@ -6834,6 +6855,9 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
       const bool contractFold = compositionKind.getValue() == "contract_fold";
       const bool mapContract = compositionKind.getValue() == "map_contract";
       if ((!contractFold && !mapContract) ||
+          (contractFold && compositionSources.size() != 2) ||
+          (mapContract && compositionSources.size() != 2 &&
+           compositionSources.size() != 3) ||
           (contractFold && task.getKind() != MaterializationTaskKind::Fold) ||
           (mapContract &&
            task.getKind() != MaterializationTaskKind::Contract) ||
@@ -6855,9 +6879,13 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
       if ((contractFold &&
            (!isa<ContractOp>(operations[0]) || !isa<FoldOp>(operations[1]) ||
             sourceOperations.lookup(task.getSource()) != operations[1])) ||
-          (mapContract &&
+          (mapContract && operations.size() == 2 &&
            (!isa<MapOp>(operations[0]) || !isa<ContractOp>(operations[1]) ||
             sourceOperations.lookup(task.getSource()) != operations[1])) ||
+          (mapContract && operations.size() == 3 &&
+           (!isa<MapOp>(operations[0]) || !isa<MapOp>(operations[1]) ||
+            !isa<ContractOp>(operations[2]) ||
+            sourceOperations.lookup(task.getSource()) != operations[2])) ||
           task.getSemanticFingerprint() !=
               compositionFingerprint(compositionKind.getValue(), operations))
         return task.emitOpError(
@@ -9064,17 +9092,31 @@ emitMappedCoordinates(PtxEmitter &ptx, AffineMap map,
   return result;
 }
 
-FailureOr<std::pair<Operation *, Operation *>> compositionSourcePair(
+FailureOr<SmallVector<Operation *>> compositionSourceOperations(
     MaterializationTaskOp task,
     const llvm::SmallDenseMap<Attribute, Operation *> &sourceOperations) {
   auto sources = task->getAttrOfType<ArrayAttr>("composition_sources");
-  if (!sources || sources.size() != 2)
+  if (!sources)
     return failure();
-  Operation *first = sourceOperations.lookup(sources[0]);
-  Operation *second = sourceOperations.lookup(sources[1]);
-  if (!first || !second)
+  SmallVector<Operation *> result;
+  for (Attribute source : sources) {
+    Operation *operation = sourceOperations.lookup(source);
+    if (!operation)
+      return failure();
+    result.push_back(operation);
+  }
+  return result;
+}
+
+FailureOr<std::pair<Operation *, Operation *>> compositionSourcePair(
+    MaterializationTaskOp task,
+    const llvm::SmallDenseMap<Attribute, Operation *> &sourceOperations) {
+  FailureOr<SmallVector<Operation *>> sources =
+      compositionSourceOperations(task, sourceOperations);
+  if (failed(sources) || sources->size() != 2)
     return failure();
-  return std::pair<Operation *, Operation *>{first, second};
+  return std::pair<Operation *, Operation *>{sources->front(),
+                                             sources->back()};
 }
 
 RankedTensorType
@@ -9324,7 +9366,8 @@ struct MapContractLeaf {
 };
 
 FailureOr<MapContractLeaf>
-emitMapContractLeaf(PtxEmitter &ptx, MapOp map, ContractOp contract,
+emitMapContractLeaf(PtxEmitter &ptx, MapOp map, MapOp projectedStatistic,
+                    ContractOp contract,
                     ArrayRef<int64_t> contractCoordinates,
                     int64_t mapContractOperand) {
   if (mapContractOperand < 0 || mapContractOperand > 1 ||
@@ -9340,13 +9383,28 @@ emitMapContractLeaf(PtxEmitter &ptx, MapOp map, ContractOp contract,
     return failure();
   SmallVector<int64_t> mapArguments;
   for (auto [operand, value] : llvm::enumerate(map.getInputs())) {
-    const int64_t parameter = value.getDefiningOp<ContractOp>() ? 0 : 1;
     auto indexing = dyn_cast<AffineMapAttr>(map.getIndexingMaps()[operand]);
     auto type = dyn_cast<RankedTensorType>(value.getType());
     if (!indexing || !type)
       return failure();
-    FailureOr<int64_t> loaded = emitMapInput(
-        ptx, parameter, type, indexing.getValue(), *mapCoordinates);
+    FailureOr<int64_t> loaded = failure();
+    if (value.getDefiningOp<ContractOp>()) {
+      loaded = emitMapInput(ptx, 0, type, indexing.getValue(), *mapCoordinates);
+    } else if (projectedStatistic &&
+               value == projectedStatistic.getResult(0)) {
+      auto projectionIndexing =
+          dyn_cast<AffineMapAttr>(projectedStatistic.getIndexingMaps()[0]);
+      auto compact = dyn_cast<RankedTensorType>(
+          projectedStatistic.getInputs().front().getType());
+      FailureOr<SmallVector<int64_t>> projectedCoordinates =
+          emitMappedCoordinates(ptx, indexing.getValue(), *mapCoordinates);
+      if (!projectionIndexing || !compact || failed(projectedCoordinates))
+        return failure();
+      loaded = emitMapInput(ptx, 1, compact, projectionIndexing.getValue(),
+                            *projectedCoordinates);
+    } else {
+      loaded = emitMapInput(ptx, 1, type, indexing.getValue(), *mapCoordinates);
+    }
     if (failed(loaded))
       return failure();
     mapArguments.push_back(*loaded);
@@ -9374,12 +9432,20 @@ FailureOr<std::string> emitMapContractCompositionPtx(
     const llvm::SmallDenseMap<Attribute, Operation *> &sourceOperations) {
   auto kind =
       materializationTask->getAttrOfType<StringAttr>("composition_kind");
-  FailureOr<std::pair<Operation *, Operation *>> sources =
-      compositionSourcePair(materializationTask, sourceOperations);
-  if (!kind || kind.getValue() != "map_contract" || failed(sources))
+  FailureOr<SmallVector<Operation *>> sources =
+      compositionSourceOperations(materializationTask, sourceOperations);
+  if (!kind || kind.getValue() != "map_contract" || failed(sources) ||
+      (sources->size() != 2 && sources->size() != 3))
     return failure();
-  auto map = dyn_cast<MapOp>(sources->first);
-  auto contract = dyn_cast<ContractOp>(sources->second);
+  MapOp projectedStatistic;
+  MapOp map;
+  if (sources->size() == 3) {
+    projectedStatistic = dyn_cast<MapOp>((*sources)[0]);
+    map = dyn_cast<MapOp>((*sources)[1]);
+  } else {
+    map = dyn_cast<MapOp>((*sources)[0]);
+  }
+  auto contract = dyn_cast<ContractOp>(sources->back());
   if (!map || !contract || map.getInputs().size() != 2 ||
       map.getNumResults() != 1 ||
       materializationTask.getInputBuffers().size() != 3 ||
@@ -9397,6 +9463,9 @@ FailureOr<std::string> emitMapContractCompositionPtx(
       fullValue = value;
     else if (value.getDefiningOp<FoldOp>())
       compactValue = value;
+    else if (projectedStatistic &&
+             value == projectedStatistic.getResult(0))
+      compactValue = projectedStatistic.getInputs().front();
   }
   auto mapUse = llvm::find(contract.getInputs(), map.getResult(0));
   if (!full || !compact || !projection || !result || !fullValue ||
@@ -9463,7 +9532,8 @@ FailureOr<std::string> emitMapContractCompositionPtx(
     SmallVector<int64_t> contractCoordinates(*outputCoordinates);
     contractCoordinates.push_back(reductionCoordinate);
     FailureOr<MapContractLeaf> leaf = emitMapContractLeaf(
-        ptx, map, contract, contractCoordinates, mapContractOperand);
+        ptx, map, projectedStatistic, contract, contractCoordinates,
+        mapContractOperand);
     if (failed(leaf))
       return failure();
     ptx.stream << "  fma.rn.f32 %f" << accumulator << ", %f" << leaf->lhs
@@ -9520,7 +9590,8 @@ FailureOr<std::string> emitMapContractCompositionPtx(
   SmallVector<int64_t> contractCoordinates(*outputCoordinates);
   contractCoordinates.push_back(reductionCoordinate);
   FailureOr<MapContractLeaf> leaf = emitMapContractLeaf(
-      ptx, map, contract, contractCoordinates, mapContractOperand);
+      ptx, map, projectedStatistic, contract, contractCoordinates,
+      mapContractOperand);
   if (failed(leaf))
     return failure();
   int64_t outputPointer = ptx.nextU64();

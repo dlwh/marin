@@ -973,6 +973,10 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
           "Contract-region provenance requires a Contract task");
     }
     if (hasComposition) {
+      const bool contractFold =
+          compositionKind && compositionKind.getValue() == "contract_fold";
+      const bool mapContract =
+          compositionKind && compositionKind.getValue() == "map_contract";
       const bool legacyMetadata =
           task->hasAttr("fused_sources") ||
           task->hasAttr("composed_input_maps") ||
@@ -986,18 +990,16 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
           hasContractRegionOperand || hasContractRegionCost ||
           hasContractRegionRecomputed;
       if (getSchemaVersion() != 2 || !compositionKind || !compositionSources ||
-          compositionSources.size() != 2 || legacyMetadata ||
+          (contractFold && compositionSources.size() != 2) ||
+          (mapContract && compositionSources.size() != 2 &&
+           compositionSources.size() != 3) ||
+          (!contractFold && !mapContract) || legacyMetadata ||
           llvm::any_of(compositionSources, [](Attribute source) {
             return !isa<SourceRefAttr>(source);
           })) {
         return task.emitOpError(
             "schema-v2 generic composition provenance must be complete and "
             "exclusive");
-      }
-      const bool contractFold = compositionKind.getValue() == "contract_fold";
-      const bool mapContract = compositionKind.getValue() == "map_contract";
-      if (!contractFold && !mapContract) {
-        return task.emitOpError("has an unknown generic composition kind");
       }
       if (contractFold) {
         if (contractFoldCompositionTask >= 0 || compositionCost ||
