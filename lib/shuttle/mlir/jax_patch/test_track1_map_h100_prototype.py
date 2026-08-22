@@ -274,7 +274,7 @@ def test_checked_in_source_manifest_matches_the_live_iris_bundle_closure(tmp_pat
         load_authorization(changed_path, approved_sha256)
 
 
-def test_dry_run_renders_one_network_hydration_then_offline_build_and_four_workers(tmp_path: Path) -> None:
+def test_dry_run_renders_one_network_hydration_then_offline_build_and_five_workers(tmp_path: Path) -> None:
     _, _, authorization = _authorization(tmp_path)
     workspace = tmp_path / "fresh"
 
@@ -304,6 +304,7 @@ def test_dry_run_renders_one_network_hydration_then_offline_build_and_four_worke
         "reuse",
         "rmsnorm",
         "rmsnorm_contract",
+        "generic_composition",
     ]
     hydration = phases[3]["argv"]
     offline = phases[4]["argv"]
