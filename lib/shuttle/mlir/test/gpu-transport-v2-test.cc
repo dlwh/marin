@@ -3750,11 +3750,18 @@ struct DynamicFrame {
   llvm::DenseMap<int64_t, uintptr_t> externalSlots;
 };
 
+enum class CallFrameMutationKind { Primitive, Alignment };
+
+struct CallFrameMutation {
+  int64_t operand;
+  CallFrameMutationKind kind;
+};
+
 std::optional<DynamicFrame>
 dynamicCallFrame(const mlir::shuttle::GpuExecutable &executable,
                  llvm::ArrayRef<uint8_t> transport,
                  llvm::StringRef transportDigest,
-                 std::optional<int64_t> mismatchedOperand = std::nullopt) {
+                 std::optional<CallFrameMutation> mutation = std::nullopt) {
   llvm::SmallVector<const mlir::shuttle::GpuExternalBinding *> operands;
   llvm::SmallVector<const mlir::shuttle::GpuExternalBinding *> results;
   for (const auto &binding : executable.externalBindings()) {
@@ -3785,13 +3792,16 @@ dynamicCallFrame(const mlir::shuttle::GpuExecutable &executable,
       primitive = xla::PrimitiveType::F32;
     else
       return false;
-    if (!result && mismatchedOperand == binding.index)
+    bool mutate = !result && mutation && mutation->operand == binding.index;
+    if (mutate && mutation->kind == CallFrameMutationKind::Primitive)
       primitive = primitive == xla::PrimitiveType::F32
                       ? xla::PrimitiveType::BF16
                       : xla::PrimitiveType::F32;
     uintptr_t address =
         UINT64_C(0x100000000) +
         static_cast<uintptr_t>(binding.slotOrdinal) * UINT64_C(0x10000000);
+    if (mutate && mutation->kind == CallFrameMutationKind::Alignment)
+      address += 2;
     stream_executor::DeviceAddressBase deviceAddress(
         reinterpret_cast<void *>(address), binding.requiredBytes);
     if (result)
@@ -4203,9 +4213,14 @@ TEST(GpuTransportV2Test,
         mlir::shuttle::gpuExecutableBundleDigest(*transport);
     auto frame = dynamicCallFrame(**executable, *transport, digest);
     ASSERT_TRUE(frame);
-    auto mismatched = dynamicCallFrame(**executable, *transport, digest,
-                                       scalarOperand);
-    ASSERT_TRUE(mismatched);
+    auto primitiveMismatch = dynamicCallFrame(
+        **executable, *transport, digest,
+        CallFrameMutation{scalarOperand, CallFrameMutationKind::Primitive});
+    ASSERT_TRUE(primitiveMismatch);
+    auto alignmentMismatch = dynamicCallFrame(
+        **executable, *transport, digest,
+        CallFrameMutation{scalarOperand, CallFrameMutationKind::Alignment});
+    ASSERT_TRUE(alignmentMismatch);
     XLA_FFI_Handler_Bundle handlers =
         mlir::shuttle::gpuExecutableBundleFfiHandlerBundle();
 
@@ -4252,11 +4267,16 @@ TEST(GpuTransportV2Test,
                                  XLA_FFI_ExecutionStage_EXECUTE)
                     .ok());
     EXPECT_EQ(trace->launchAttempts.load(), decoded->launches.size());
-    EXPECT_FALSE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(), handlers.execute,
-                                  mismatched->frame, context,
-                                  XLA_FFI_ExecutionStage_EXECUTE)
-                     .ok());
-    EXPECT_EQ(trace->launchAttempts.load(), decoded->launches.size());
+    for (DynamicFrame *mismatch : {
+             &*primitiveMismatch,
+             &*alignmentMismatch,
+         }) {
+      EXPECT_FALSE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(),
+                                    handlers.execute, mismatch->frame, context,
+                                    XLA_FFI_ExecutionStage_EXECUTE)
+                       .ok());
+      EXPECT_EQ(trace->launchAttempts.load(), decoded->launches.size());
+    }
 
     auto runner = mlir::shuttle::GpuRunner::Create(
         *transport, &allocator, 0, &stream, &capability);
