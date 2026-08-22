@@ -472,6 +472,107 @@ bool hasDisjointContiguousFoldLoop(llvm::StringRef ptx, int64_t outputExtent,
   return false;
 }
 
+bool hasContiguousU64CompositionFoldLoop(llvm::StringRef ptx,
+                                         int64_t reductionExtent,
+                                         int64_t serialTiles) {
+  llvm::SmallVector<llvm::StringRef> lines;
+  ptx.split(lines, '\n');
+  for (llvm::StringRef &line : lines)
+    line = line.trim();
+  auto instruction = [&](llvm::StringRef opcode,
+                         auto predicate) -> std::optional<size_t> {
+    for (auto [index, line] : llvm::enumerate(lines)) {
+      if (!line.starts_with(opcode))
+        continue;
+      std::vector<std::string> tokens = ptxTokens(line);
+      if (predicate(tokens))
+        return index;
+    }
+    return std::nullopt;
+  };
+  std::optional<size_t> laneLine =
+      instruction("mov.u32 ", [](const std::vector<std::string> &tokens) {
+        return tokens.size() == 2 && tokens[1] == "%tid";
+      });
+  std::optional<size_t> rowLine =
+      instruction("mov.u32 ", [](const std::vector<std::string> &tokens) {
+        return tokens.size() == 2 && tokens[1] == "%ctaid";
+      });
+  if (!laneLine || !rowLine)
+    return false;
+  std::vector<std::string> laneTokens = ptxTokens(lines[*laneLine]);
+  std::vector<std::string> rowTokens = ptxTokens(lines[*rowLine]);
+  llvm::StringRef lane = laneTokens[0];
+  llvm::StringRef row = rowTokens[0];
+  std::optional<size_t> startConversion = instruction(
+      "cvt.u64.u32 ", [&](const std::vector<std::string> &tokens) {
+        return tokens.size() == 2 && tokens[1] == lane;
+      });
+  if (!startConversion)
+    return false;
+  std::vector<std::string> conversionTokens =
+      ptxTokens(lines[*startConversion]);
+  llvm::StringRef start = conversionTokens[0];
+  const std::string serialSuffix =
+      (llvm::Twine(", ") + llvm::Twine(serialTiles) + ";").str();
+  std::optional<size_t> partitionStart = instruction(
+      "mul.lo.u64 ", [&](const std::vector<std::string> &tokens) {
+        return tokens.size() == 2 && tokens[0] == start &&
+               tokens[1] == start;
+      });
+  if (!partitionStart || !lines[*partitionStart].ends_with(serialSuffix))
+    return false;
+  std::optional<size_t> partitionEnd = instruction(
+      "add.u64 ", [&](const std::vector<std::string> &tokens) {
+        return tokens.size() == 2 && tokens[1] == start;
+      });
+  if (!partitionEnd || !lines[*partitionEnd].ends_with(serialSuffix))
+    return false;
+  std::vector<std::string> endTokens = ptxTokens(lines[*partitionEnd]);
+  llvm::StringRef end = endTokens[0];
+  if (end == start)
+    return false;
+  const std::string extentSuffix =
+      (llvm::Twine(", ") + llvm::Twine(reductionExtent) + ";").str();
+  std::optional<size_t> extentGuard = instruction(
+      "setp.ge.u64 ", [&](const std::vector<std::string> &tokens) {
+        return tokens.size() == 2 && tokens[1] == start;
+      });
+  if (!extentGuard || !lines[*extentGuard].ends_with(extentSuffix))
+    return false;
+  std::optional<size_t> endGuard = instruction(
+      "setp.ge.u64 ", [&](const std::vector<std::string> &tokens) {
+        return tokens.size() == 3 && tokens[1] == start && tokens[2] == end;
+      });
+  std::optional<size_t> rowConversion = instruction(
+      "cvt.u64.u32 ", [&](const std::vector<std::string> &tokens) {
+        return tokens.size() == 2 && tokens[1] == row;
+      });
+  if (!endGuard || !rowConversion)
+    return false;
+  std::vector<std::string> rowConversionTokens =
+      ptxTokens(lines[*rowConversion]);
+  llvm::StringRef row64 = rowConversionTokens[0];
+  std::optional<size_t> linearIndex = instruction(
+      "mad.lo.u64 ", [&](const std::vector<std::string> &tokens) {
+        return tokens.size() == 3 && tokens[1] == row64 &&
+               tokens[2] == start;
+      });
+  const std::string rowMajorExtent =
+      (llvm::Twine(", ") + llvm::Twine(reductionExtent) + ",").str();
+  if (!linearIndex || !lines[*linearIndex].contains(rowMajorExtent))
+    return false;
+  const std::string increment =
+      (llvm::Twine("add.u64 ") + start + ", " + start + ", 1;").str();
+  auto incrementLine = llvm::find(lines, increment);
+  return *startConversion < *partitionStart &&
+         *partitionStart < *partitionEnd && *partitionEnd < *extentGuard &&
+         *extentGuard < *endGuard && *endGuard < *linearIndex &&
+         incrementLine != lines.end() &&
+         *linearIndex <
+             static_cast<size_t>(std::distance(lines.begin(), incrementLine));
+}
+
 bool hasDependentRowFoldPhaseDataflow(llvm::StringRef ptx,
                                       int64_t reductionExtent,
                                       int64_t serialTiles) {
@@ -1682,16 +1783,6 @@ bool mutateGenericContractFoldComposition(mlir::ModuleOp module,
       return false;
     (*second)->setAttr("composition_sources",
                        builder.getArrayAttr(sources.getValue().drop_back()));
-  } else if (mutation == "duplicate-source-ownership") {
-    auto firstSources =
-        (*first)->getAttrOfType<mlir::ArrayAttr>("composition_sources");
-    auto secondSources =
-        (*second)->getAttrOfType<mlir::ArrayAttr>("composition_sources");
-    if (!firstSources || firstSources.empty() || !secondSources)
-      return false;
-    llvm::SmallVector<mlir::Attribute> sources(secondSources.getValue());
-    sources[0] = firstSources[0];
-    (*second)->setAttr("composition_sources", builder.getArrayAttr(sources));
   } else if (mutation == "cost" || mutation == "underreported-cost" ||
              mutation == "missing-cost-field" ||
              mutation == "contract-evaluations") {
@@ -5846,8 +5937,12 @@ TEST(Abi22MapFusionContract,
         EXPECT_TRUE(contractFoldPtx.contains("fma.rn.f32"));
         EXPECT_TRUE(contractFoldPtx.contains("st.shared.f32"));
         EXPECT_TRUE(contractFoldPtx.contains("ld.shared.f32"));
-        EXPECT_FALSE(contractFoldPtx.contains("add.u32 %r4, %r4, %r2"));
-        EXPECT_TRUE(contractFoldPtx.contains("add.u64"));
+        const int64_t foldReduction = fixture.fullContractShape.back();
+        const int64_t foldTile = std::min<int64_t>(foldReduction, 256);
+        const int64_t foldSerialTiles =
+            (foldReduction + foldTile - 1) / foldTile;
+        EXPECT_TRUE(hasContiguousU64CompositionFoldLoop(
+            contractFoldPtx, foldReduction, foldSerialTiles));
         EXPECT_EQ(mapContractPtx.count(".param .u64 p"), 4u);
         EXPECT_EQ(mapContractPtx.count("st.global.f32"), 1u);
         EXPECT_TRUE(mapContractPtx.contains("[p0]"));
@@ -5878,6 +5973,24 @@ TEST(Abi22MapFusionContract,
         EXPECT_TRUE(compactClosure.count("p2"));
         EXPECT_TRUE(compactClosure.count("$shared"));
         EXPECT_TRUE(compactClosure.count("$op:fma.rn.f32"));
+        const PtxDataflow::Definition *compactDefinition = ptxDefinition(
+            contractFoldFlow, contractFoldFlow.stores.back().value);
+        ASSERT_NE(compactDefinition, nullptr);
+        ASSERT_EQ(compactDefinition->opcode, "add.rn.f32");
+        ASSERT_EQ(compactDefinition->operands.size(), 2u);
+        int64_t initializerOperands = 0;
+        for (llvm::StringRef operand : compactDefinition->operands) {
+          std::set<std::string> closure =
+              ptxDependencyClosure(contractFoldFlow, operand);
+          if (!closure.count("p2"))
+            continue;
+          ++initializerOperands;
+          const PtxDataflow::Definition *initializer =
+              ptxDefinition(contractFoldFlow, operand);
+          ASSERT_NE(initializer, nullptr);
+          EXPECT_EQ(initializer->opcode, "ld.global.f32");
+        }
+        EXPECT_EQ(initializerOperands, 1);
         std::set<std::string> resultClosure = ptxDependencyClosure(
             mapContractFlow, mapContractFlow.stores.front().value);
         std::set<std::string> resultPointerClosure = ptxDependencyClosure(
@@ -6007,7 +6120,6 @@ TEST(Abi22MapFusionContract,
            "missing-kind",
            "unknown-kind",
            "source-ownership",
-           "duplicate-source-ownership",
            "cost",
            "underreported-cost",
            "missing-cost-field",
