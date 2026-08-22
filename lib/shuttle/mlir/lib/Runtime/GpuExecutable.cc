@@ -513,7 +513,8 @@ absl::StatusOr<Parsed> parse(ArrayRef<uint8_t> bytes) {
     }
     externalReuseGroups.insert(slot.reuseGroup);
     auto tensor = dyn_cast<RankedTensorType>(slot.tensorType);
-    if (!tensor || !tensor.getElementType().isBF16())
+    if (!tensor ||
+        (!tensor.getElementType().isBF16() && !tensor.getElementType().isF32()))
       return invalidTransport("external type");
     if (slot.bindingKind == ExecutableBindingKind::Operand) {
       if (slot.bindingIndex < 0 ||

@@ -823,6 +823,8 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
   unsigned contractCount = 0;
   unsigned foldRegionCount = 0;
   unsigned contractRegionCount = 0;
+  int64_t contractFoldCompositionTask = -1;
+  int64_t mapContractCompositionTask = -1;
   SmallVector<SmallVector<int64_t>> actualConsumers(buffers.size());
   for (auto [position, buffer] : llvm::enumerate(buffers)) {
     if (buffer.getOrdinal() != static_cast<int64_t>(position)) {
@@ -939,9 +941,15 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
     const bool hasContractRegionCost = task->hasAttr("contract_region_cost");
     const bool hasContractRegionRecomputed =
         task->hasAttr("contract_region_recomputed_sources");
+    auto compositionKind = task->getAttrOfType<StringAttr>("composition_kind");
+    auto compositionSources =
+        task->getAttrOfType<ArrayAttr>("composition_sources");
+    auto compositionCost =
+        task->getAttrOfType<DictionaryAttr>("composition_cost");
+    const bool hasComposition =
+        compositionKind || compositionSources || compositionCost;
     if ((hasFoldRegionPhases || hasFoldRegionOutputSources ||
-         hasFoldRegionBoundaryUses ||
-         hasFoldRegionRecomputedSources) &&
+         hasFoldRegionBoundaryUses || hasFoldRegionRecomputedSources) &&
         !hasFoldRegionSources) {
       return task.emitOpError(
           "Fold-region phases, boundary uses, and recomputation require "
@@ -963,6 +971,136 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
         task.getKind() != MaterializationTaskKind::Contract) {
       return task.emitOpError(
           "Contract-region provenance requires a Contract task");
+    }
+    if (hasComposition) {
+      const bool legacyMetadata =
+          task->hasAttr("fused_sources") ||
+          task->hasAttr("composed_input_maps") ||
+          task->hasAttr("fold_epilogue_sources") ||
+          task->hasAttr("epilogue_input_maps") || hasFoldRegionSources ||
+          hasFoldRegionPhases || hasFoldRegionOutputSources ||
+          hasFoldRegionBoundaryUses || hasFoldRegionRecomputedSources ||
+          hasContractRegionSources || hasContractRegionStrategy ||
+          hasContractRegionFold || hasContractRegionContract ||
+          hasContractRegionBoundary || hasContractRegionEpilogue ||
+          hasContractRegionOperand || hasContractRegionCost ||
+          hasContractRegionRecomputed;
+      if (getSchemaVersion() != 2 || !compositionKind || !compositionSources ||
+          compositionSources.size() != 2 || legacyMetadata ||
+          llvm::any_of(compositionSources, [](Attribute source) {
+            return !isa<SourceRefAttr>(source);
+          })) {
+        return task.emitOpError(
+            "schema-v2 generic composition provenance must be complete and "
+            "exclusive");
+      }
+      const bool contractFold = compositionKind.getValue() == "contract_fold";
+      const bool mapContract = compositionKind.getValue() == "map_contract";
+      if (!contractFold && !mapContract) {
+        return task.emitOpError("has an unknown generic composition kind");
+      }
+      if (contractFold) {
+        if (contractFoldCompositionTask >= 0 || compositionCost ||
+            task.getKind() != MaterializationTaskKind::Fold ||
+            task.getInputBuffers().size() != 3 ||
+            task.getOutputBuffers().size() != 2 ||
+            !task.getOrderFree().value_or(false) ||
+            task.getDomainShape().size() < 2 ||
+            task.getDomainShape().size() > 8 ||
+            task.getReductionDimensions() !=
+                ArrayRef<int64_t>(
+                    {static_cast<int64_t>(task.getDomainShape().size()) - 1})) {
+          return task.emitOpError(
+              "Contract-to-Fold composition must bind one final-axis Fold "
+              "with three inputs and the ordered full and compact outputs");
+        }
+        auto lhs = cast<RankedTensorType>(
+            buffers[task.getInputBuffers()[0]].getTensorType());
+        auto rhs = cast<RankedTensorType>(
+            buffers[task.getInputBuffers()[1]].getTensorType());
+        auto initializer = cast<RankedTensorType>(
+            buffers[task.getInputBuffers()[2]].getTensorType());
+        auto full = cast<RankedTensorType>(
+            buffers[task.getOutputBuffers()[0]].getTensorType());
+        auto compact = cast<RankedTensorType>(
+            buffers[task.getOutputBuffers()[1]].getTensorType());
+        if (!lhs.getElementType().isF32() || !rhs.getElementType().isF32() ||
+            initializer.getRank() != 0 ||
+            !initializer.getElementType().isF32() ||
+            full.getShape() != task.getDomainShape() ||
+            !full.getElementType().isF32() ||
+            compact.getShape() != full.getShape().drop_back() ||
+            !compact.getElementType().isF32()) {
+          return task.emitOpError(
+              "Contract-to-Fold buffers must preserve f32 operands, scalar "
+              "initializer, full result, and compact statistic");
+        }
+        contractFoldCompositionTask = ordinal;
+        ++foldCount;
+        continue;
+      }
+      if (mapContractCompositionTask >= 0 || !compositionCost ||
+          task.getKind() != MaterializationTaskKind::Contract ||
+          task.getInputBuffers().size() != 3 ||
+          task.getOutputBuffers().size() != 1 || task.getOrderFree() ||
+          task.getDomainShape().size() < 3 ||
+          task.getDomainShape().size() > 9 ||
+          task.getReductionDimensions() !=
+              ArrayRef<int64_t>(
+                  {static_cast<int64_t>(task.getDomainShape().size()) - 1})) {
+        return task.emitOpError(
+            "Map-to-Contract composition must bind one final-axis Contract "
+            "with the ordered full, compact, and projection inputs");
+      }
+      auto full = cast<RankedTensorType>(
+          buffers[task.getInputBuffers()[0]].getTensorType());
+      auto compact = cast<RankedTensorType>(
+          buffers[task.getInputBuffers()[1]].getTensorType());
+      auto projection = cast<RankedTensorType>(
+          buffers[task.getInputBuffers()[2]].getTensorType());
+      auto result = cast<RankedTensorType>(
+          buffers[task.getOutputBuffers()[0]].getTensorType());
+      if (!full.getElementType().isF32() ||
+          compact.getShape() != full.getShape().drop_back() ||
+          !compact.getElementType().isF32() ||
+          !projection.getElementType().isF32() ||
+          result.getShape() != task.getDomainShape().drop_back() ||
+          !result.getElementType().isF32()) {
+        return task.emitOpError(
+            "Map-to-Contract buffers must preserve the f32 full and compact "
+            "boundary and public result");
+      }
+      constexpr StringLiteral costFields[] = {
+          "baseline_launches",
+          "candidate_launches",
+          "baseline_temporary_bytes",
+          "candidate_temporary_bytes",
+          "baseline_temporary_traffic_bytes",
+          "candidate_temporary_traffic_bytes",
+          "contract_evaluations"};
+      if (compositionCost.size() != std::size(costFields)) {
+        return task.emitOpError(
+            "generic composition cost requires the closed relative fields");
+      }
+      SmallVector<int64_t> costs;
+      for (StringRef field : costFields) {
+        auto value = compositionCost.getAs<IntegerAttr>(field);
+        if (!value || value.getInt() < 0) {
+          return task.emitOpError(
+              "generic composition cost fields must be nonnegative i64");
+        }
+        costs.push_back(value.getInt());
+      }
+      if (costs[1] > costs[0] || costs[3] > costs[2] || costs[5] > costs[4] ||
+          !(costs[1] < costs[0] || costs[3] < costs[2] ||
+            costs[5] < costs[4]) ||
+          costs[6] != 1) {
+        return task.emitOpError(
+            "generic composition cost must strictly dominate its baseline");
+      }
+      mapContractCompositionTask = ordinal;
+      ++contractCount;
+      continue;
     }
     if (task.getKind() == MaterializationTaskKind::Fold) {
       ++foldCount;
@@ -1389,6 +1527,40 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
       if (task.getDomainShape().empty() == hasTensorResult) {
         return task.emitOpError(
             "empty Map domains must exactly identify scalar result tasks");
+      }
+    }
+  }
+  const bool hasCompositionTasks =
+      contractFoldCompositionTask >= 0 || mapContractCompositionTask >= 0;
+  if (hasCompositionTasks) {
+    if (contractFoldCompositionTask < 0 || mapContractCompositionTask < 0 ||
+        contractFoldCompositionTask >= mapContractCompositionTask) {
+      return emitOpError(
+          "generic composition requires the ordered Contract-to-Fold and "
+          "Map-to-Contract semantic groups");
+    }
+    MaterializationTaskOp producer = tasks[contractFoldCompositionTask];
+    MaterializationTaskOp consumer = tasks[mapContractCompositionTask];
+    ArrayRef<int64_t> boundary = producer.getOutputBuffers();
+    if (consumer.getInputBuffers().take_front(2) != boundary ||
+        consumer.getDependencies() !=
+            ArrayRef<int64_t>({contractFoldCompositionTask})) {
+      return emitOpError(
+          "generic composition must preserve the ordered full and compact "
+          "boundary edge");
+    }
+    for (int64_t bufferOrdinal : boundary) {
+      MaterializationBufferOp buffer = buffers[bufferOrdinal];
+      if (buffer.getStorage() != MaterializationStorage::Temporary ||
+          buffer.getLiveIn() || buffer.getLiveOut() ||
+          optionalIntegerAttribute(buffer, "producer") !=
+              contractFoldCompositionTask ||
+          buffer.getConsumers() !=
+              ArrayRef<int64_t>({mapContractCompositionTask}) ||
+          buffer.getLifetimeStart() != contractFoldCompositionTask ||
+          buffer.getLifetimeEnd() != mapContractCompositionTask) {
+        return buffer.emitOpError(
+            "composition boundary must be private across exactly one edge");
       }
     }
   }

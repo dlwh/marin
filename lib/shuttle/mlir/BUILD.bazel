@@ -722,6 +722,8 @@ cc_test(
     srcs = ["test/abi22-map-fusion-contract-test.cc"],
     data = [
         "test/Inputs/abi22-map-fusion-source-order.mlir",
+        "test/Inputs/abi22-generic-contract-fold-composition-rank2.mlir",
+        "test/Inputs/abi22-generic-contract-fold-composition-rank3.mlir",
         "test/Inputs/jax-0.10.1-bf16-matmul-vjp-17x33x19-composed.mlir",
         "test/Inputs/jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-backward.mlir",
         "test/Inputs/jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-composed.mlir",

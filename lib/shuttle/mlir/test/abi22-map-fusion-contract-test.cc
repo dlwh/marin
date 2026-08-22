@@ -473,6 +473,137 @@ bool hasDisjointContiguousFoldLoop(llvm::StringRef ptx, int64_t outputExtent,
   return false;
 }
 
+bool hasContiguousU64CompositionFoldLoop(llvm::StringRef ptx,
+                                         int64_t reductionExtent,
+                                         int64_t serialTiles) {
+  llvm::SmallVector<llvm::StringRef> lines;
+  ptx.split(lines, '\n');
+  for (llvm::StringRef &line : lines)
+    line = line.trim();
+  auto instruction = [&](llvm::StringRef opcode,
+                         auto predicate) -> std::optional<size_t> {
+    for (auto [index, line] : llvm::enumerate(lines)) {
+      if (!line.starts_with(opcode))
+        continue;
+      std::vector<std::string> tokens = ptxTokens(line);
+      if (predicate(tokens))
+        return index;
+    }
+    return std::nullopt;
+  };
+  std::optional<size_t> laneLine =
+      instruction("mov.u32 ", [](const std::vector<std::string> &tokens) {
+        return tokens.size() == 2 && tokens[1] == "%tid";
+      });
+  std::optional<size_t> rowLine =
+      instruction("mov.u32 ", [](const std::vector<std::string> &tokens) {
+        return tokens.size() == 2 && tokens[1] == "%ctaid";
+      });
+  if (!laneLine || !rowLine)
+    return false;
+  std::vector<std::string> laneTokens = ptxTokens(lines[*laneLine]);
+  std::vector<std::string> rowTokens = ptxTokens(lines[*rowLine]);
+  llvm::StringRef lane = laneTokens[0];
+  llvm::StringRef row = rowTokens[0];
+  std::optional<size_t> startConversion = instruction(
+      "cvt.u64.u32 ", [&](const std::vector<std::string> &tokens) {
+        return tokens.size() == 2 && tokens[1] == lane;
+      });
+  if (!startConversion)
+    return false;
+  std::vector<std::string> conversionTokens =
+      ptxTokens(lines[*startConversion]);
+  llvm::StringRef start = conversionTokens[0];
+  const std::string serialSuffix =
+      (llvm::Twine(", ") + llvm::Twine(serialTiles) + ";").str();
+  std::optional<size_t> partitionStart = instruction(
+      "mul.lo.u64 ", [&](const std::vector<std::string> &tokens) {
+        return tokens.size() == 2 && tokens[0] == start &&
+               tokens[1] == start;
+      });
+  if (!partitionStart || !lines[*partitionStart].ends_with(serialSuffix))
+    return false;
+  std::optional<size_t> partitionEnd = instruction(
+      "add.u64 ", [&](const std::vector<std::string> &tokens) {
+        return tokens.size() == 2 && tokens[1] == start;
+      });
+  if (!partitionEnd || !lines[*partitionEnd].ends_with(serialSuffix))
+    return false;
+  std::vector<std::string> endTokens = ptxTokens(lines[*partitionEnd]);
+  llvm::StringRef end = endTokens[0];
+  if (end == start)
+    return false;
+  const std::string extentSuffix =
+      (llvm::Twine(", ") + llvm::Twine(reductionExtent) + ";").str();
+  std::optional<size_t> extentGuard = instruction(
+      "setp.ge.u64 ", [&](const std::vector<std::string> &tokens) {
+        return tokens.size() == 2 && tokens[1] == start;
+      });
+  if (!extentGuard || !lines[*extentGuard].ends_with(extentSuffix))
+    return false;
+  std::optional<size_t> endGuard = instruction(
+      "setp.ge.u64 ", [&](const std::vector<std::string> &tokens) {
+        return tokens.size() == 3 && tokens[1] == start && tokens[2] == end;
+      });
+  std::optional<size_t> rowConversion = instruction(
+      "cvt.u64.u32 ", [&](const std::vector<std::string> &tokens) {
+        return tokens.size() == 2 && tokens[1] == row;
+      });
+  if (!endGuard || !rowConversion)
+    return false;
+  if (*extentGuard == 0 || !lines[*extentGuard - 1].ends_with(":"))
+    return false;
+  llvm::StringRef loopLabel = lines[*extentGuard - 1].drop_back();
+  auto branchTarget = [&](size_t guard) -> std::optional<std::string> {
+    if (guard + 1 >= lines.size())
+      return std::nullopt;
+    std::vector<std::string> guardTokens = ptxTokens(lines[guard]);
+    if (guardTokens.empty())
+      return std::nullopt;
+    const std::string prefix =
+        (llvm::Twine("@") + guardTokens[0] + " bra ").str();
+    if (!lines[guard + 1].starts_with(prefix) ||
+        !lines[guard + 1].ends_with(";"))
+      return std::nullopt;
+    return lines[guard + 1]
+        .drop_front(prefix.size())
+        .drop_back()
+        .str();
+  };
+  std::optional<std::string> extentExit = branchTarget(*extentGuard);
+  std::optional<std::string> endExit = branchTarget(*endGuard);
+  if (!extentExit || !endExit || *extentExit != *endExit)
+    return false;
+  std::vector<std::string> rowConversionTokens =
+      ptxTokens(lines[*rowConversion]);
+  llvm::StringRef row64 = rowConversionTokens[0];
+  std::optional<size_t> linearIndex = instruction(
+      "mad.lo.u64 ", [&](const std::vector<std::string> &tokens) {
+        return tokens.size() == 3 && tokens[1] == row64 &&
+               tokens[2] == start;
+      });
+  const std::string rowMajorExtent =
+      (llvm::Twine(", ") + llvm::Twine(reductionExtent) + ",").str();
+  if (!linearIndex || !lines[*linearIndex].contains(rowMajorExtent))
+    return false;
+  const std::string increment =
+      (llvm::Twine("add.u64 ") + start + ", " + start + ", 1;").str();
+  auto incrementLine = llvm::find(lines, increment);
+  if (incrementLine == lines.end())
+    return false;
+  const size_t incrementIndex =
+      static_cast<size_t>(std::distance(lines.begin(), incrementLine));
+  const std::string backedge = (llvm::Twine("bra ") + loopLabel + ";").str();
+  const std::string exitLabel = (llvm::Twine(*extentExit) + ":").str();
+  return incrementIndex + 2 < lines.size() &&
+         *startConversion < *partitionStart &&
+         *partitionStart < *partitionEnd && *partitionEnd < *extentGuard &&
+         *extentGuard < *endGuard && *endGuard < *linearIndex &&
+         *linearIndex < incrementIndex &&
+         lines[incrementIndex + 1] == backedge &&
+         lines[incrementIndex + 2] == exitLabel;
+}
+
 bool hasDependentRowFoldPhaseDataflow(llvm::StringRef ptx,
                                       int64_t reductionExtent,
                                       int64_t serialTiles) {
@@ -849,7 +980,7 @@ std::unique_ptr<BuiltModule> build(llvm::StringRef source,
 
 std::unique_ptr<BuiltModule>
 buildAlgebra(llvm::StringRef source, mlir::shuttle::NumericalPolicy policy,
-             bool executable = true) {
+             bool executable = true, bool renamed = false) {
   mlir::DialectRegistry registry;
   registry.insert<mlir::arith::ArithDialect, mlir::func::FuncDialect,
                   mlir::math::MathDialect, mlir::shuttle::ShuttleDialect>();
@@ -859,6 +990,8 @@ buildAlgebra(llvm::StringRef source, mlir::shuttle::NumericalPolicy policy,
       mlir::parseSourceString<mlir::ModuleOp>(source, result->context.get());
   if (!result->module)
     return {};
+  if (renamed)
+    renameSymbols(*result->module);
   result->module->walk(
       [&](mlir::shuttle::RegionOp region) { region.setPolicy(policy); });
   mlir::PassManager manager(result->context.get());
@@ -1528,6 +1661,203 @@ bool mutateHybridNormalizedOutput(mlir::ModuleOp module,
     return true;
   }
   return false;
+}
+
+bool mutateGenericContractFoldComposition(mlir::ModuleOp module,
+                                          llvm::StringRef mutation) {
+  auto plans =
+      llvm::to_vector(module.getOps<mlir::shuttle::MaterializationPlanOp>());
+  if (plans.size() != 1)
+    return false;
+  auto tasks =
+      llvm::to_vector(plans.front()
+                          .getBody()
+                          .front()
+                          .getOps<mlir::shuttle::MaterializationTaskOp>());
+  auto buffers =
+      llvm::to_vector(plans.front()
+                          .getBody()
+                          .front()
+                          .getOps<mlir::shuttle::MaterializationBufferOp>());
+  auto byKind = [&](llvm::StringRef kind) {
+    return llvm::find_if(tasks, [&](auto task) {
+      auto value =
+          task->template getAttrOfType<mlir::StringAttr>("composition_kind");
+      return value && value.getValue() == kind;
+    });
+  };
+  auto first = byKind("contract_fold");
+  auto second = byKind("map_contract");
+  if (first == tasks.end() || second == tasks.end() ||
+      first->getOutputBuffers().size() != 2)
+    return false;
+  auto bufferByOrdinal = [&](int64_t ordinal) {
+    return llvm::find_if(
+        buffers, [&](auto buffer) { return buffer.getOrdinal() == ordinal; });
+  };
+  auto full = bufferByOrdinal(first->getOutputBuffers().front());
+  auto compact = bufferByOrdinal(first->getOutputBuffers().back());
+  if (full == buffers.end() || compact == buffers.end())
+    return false;
+  mlir::Builder builder(module.getContext());
+  if (mutation == "output-order") {
+    llvm::SmallVector<int64_t> outputs(first->getOutputBuffers());
+    std::swap(outputs[0], outputs[1]);
+    (*first)->setAttr("output_buffers", builder.getDenseI64ArrayAttr(outputs));
+  } else if (mutation == "missing-output") {
+    (*first)->setAttr(
+        "output_buffers",
+        builder.getDenseI64ArrayAttr(first->getOutputBuffers().drop_back()));
+  } else if (mutation == "compact-type") {
+    (*compact)->setAttr("tensor_type",
+                        mlir::TypeAttr::get(full->getTensorType()));
+  } else if (mutation == "compact-element-type") {
+    auto type = mlir::cast<mlir::RankedTensorType>(compact->getTensorType());
+    (*compact)->setAttr("tensor_type",
+                        mlir::TypeAttr::get(mlir::RankedTensorType::get(
+                            type.getShape(), builder.getF16Type())));
+  } else if (mutation == "extra-public-result") {
+    (*compact)->setAttr("live_out", builder.getBoolAttr(true));
+  } else if (mutation == "full-live-out") {
+    (*full)->setAttr("live_out", builder.getBoolAttr(true));
+  } else if (mutation == "boundary-storage") {
+    (*compact)->setAttr("storage",
+                        mlir::shuttle::MaterializationStorageAttr::get(
+                            module.getContext(),
+                            mlir::shuttle::MaterializationStorage::External));
+  } else if (mutation == "boundary-producer") {
+    (*compact)->setAttr("producer",
+                        builder.getI64IntegerAttr(second->getOrdinal()));
+  } else if (mutation == "lifetime") {
+    (*compact)->setAttr("lifetime_end",
+                        builder.getI64IntegerAttr(first->getOrdinal()));
+  } else if (mutation == "missing-consumer") {
+    (*compact)->setAttr("consumers", builder.getDenseI64ArrayAttr({}));
+  } else if (mutation == "missing-second-input") {
+    llvm::SmallVector<int64_t> inputs;
+    llvm::copy_if(
+        second->getInputBuffers(), std::back_inserter(inputs),
+        [&](int64_t ordinal) { return ordinal != compact->getOrdinal(); });
+    (*second)->setAttr("input_buffers", builder.getDenseI64ArrayAttr(inputs));
+  } else if (mutation == "missing-public-input") {
+    llvm::SmallVector<int64_t> inputs(first->getInputBuffers());
+    auto publicInput = llvm::find_if(inputs, [&](int64_t ordinal) {
+      auto buffer = bufferByOrdinal(ordinal);
+      return buffer != buffers.end() && buffer->getLiveIn();
+    });
+    if (publicInput == inputs.end())
+      return false;
+    inputs.erase(publicInput);
+    (*first)->setAttr("input_buffers", builder.getDenseI64ArrayAttr(inputs));
+  } else if (mutation == "rebound-public-input") {
+    llvm::SmallVector<int64_t> inputs(first->getInputBuffers());
+    llvm::SmallVector<size_t> publicPositions;
+    for (auto [position, ordinal] : llvm::enumerate(inputs)) {
+      auto buffer = bufferByOrdinal(ordinal);
+      if (buffer != buffers.end() && buffer->getLiveIn())
+        publicPositions.push_back(position);
+    }
+    if (publicPositions.size() < 2)
+      return false;
+    std::swap(inputs[publicPositions[0]], inputs[publicPositions[1]]);
+    (*first)->setAttr("input_buffers", builder.getDenseI64ArrayAttr(inputs));
+  } else if (mutation == "missing-second-public-input" ||
+             mutation == "rebound-second-public-input" ||
+             mutation == "second-input-order") {
+    llvm::SmallVector<int64_t> inputs(second->getInputBuffers());
+    auto publicInput = llvm::find_if(inputs, [&](int64_t ordinal) {
+      auto buffer = bufferByOrdinal(ordinal);
+      return buffer != buffers.end() && buffer->getLiveIn();
+    });
+    if (publicInput == inputs.end())
+      return false;
+    if (mutation == "missing-second-public-input") {
+      inputs.erase(publicInput);
+    } else if (mutation == "rebound-second-public-input") {
+      auto replacement = llvm::find_if(buffers, [&](auto buffer) {
+        return buffer.getLiveIn() && buffer.getOrdinal() != *publicInput;
+      });
+      if (replacement == buffers.end())
+        return false;
+      *publicInput = replacement->getOrdinal();
+    } else {
+      auto privateInput = llvm::find(inputs, compact->getOrdinal());
+      if (privateInput == inputs.end())
+        return false;
+      std::iter_swap(publicInput, privateInput);
+    }
+    (*second)->setAttr("input_buffers", builder.getDenseI64ArrayAttr(inputs));
+  } else if (mutation == "missing-public-result" ||
+             mutation == "rebound-public-result") {
+    auto publicResult =
+        llvm::find_if(buffers, [](auto buffer) { return buffer.getLiveOut(); });
+    if (publicResult == buffers.end())
+      return false;
+    llvm::SmallVector<int64_t> outputs(second->getOutputBuffers());
+    auto output = llvm::find(outputs, publicResult->getOrdinal());
+    if (output == outputs.end())
+      return false;
+    if (mutation == "missing-public-result")
+      outputs.erase(output);
+    else
+      *output = compact->getOrdinal();
+    (*second)->setAttr("output_buffers", builder.getDenseI64ArrayAttr(outputs));
+  } else if (mutation == "missing-kind") {
+    (*first)->removeAttr("composition_kind");
+  } else if (mutation == "unknown-kind") {
+    (*first)->setAttr("composition_kind",
+                      builder.getStringAttr("contract_fold_unknown"));
+  } else if (mutation == "source-ownership") {
+    auto sources =
+        (*second)->getAttrOfType<mlir::ArrayAttr>("composition_sources");
+    if (!sources || sources.size() < 2)
+      return false;
+    (*second)->setAttr("composition_sources",
+                       builder.getArrayAttr(sources.getValue().drop_back()));
+  } else if (mutation == "cost" || mutation == "underreported-cost" ||
+             mutation == "missing-cost-field" ||
+             mutation == "contract-evaluations") {
+    auto cost =
+        (*second)->getAttrOfType<mlir::DictionaryAttr>("composition_cost");
+    if (!cost)
+      return false;
+    llvm::SmallVector<mlir::NamedAttribute> fields(cost.begin(), cost.end());
+    auto baseline = llvm::find_if(fields, [](mlir::NamedAttribute field) {
+      return field.getName() == "baseline_temporary_bytes";
+    });
+    auto candidate = llvm::find_if(fields, [](mlir::NamedAttribute field) {
+      return field.getName() == "candidate_temporary_bytes";
+    });
+    if (baseline == fields.end() || candidate == fields.end())
+      return false;
+    if (mutation == "missing-cost-field") {
+      fields.erase(candidate);
+      (*second)->setAttr("composition_cost", builder.getDictionaryAttr(fields));
+    } else if (mutation == "contract-evaluations") {
+      auto evaluations = llvm::find_if(fields, [](mlir::NamedAttribute field) {
+        return field.getName() == "contract_evaluations";
+      });
+      if (evaluations == fields.end())
+        return false;
+      *evaluations = builder.getNamedAttr(
+          "contract_evaluations", builder.getI64IntegerAttr(2));
+      (*second)->setAttr("composition_cost", builder.getDictionaryAttr(fields));
+    } else {
+      const int64_t baselineBytes =
+          mlir::cast<mlir::IntegerAttr>(baseline->getValue()).getInt();
+      *candidate = builder.getNamedAttr(
+          "candidate_temporary_bytes",
+          builder.getI64IntegerAttr(mutation == "cost" ? baselineBytes + 1
+                                                       : baselineBytes - 1));
+      (*second)->setAttr("composition_cost",
+                         builder.getDictionaryAttr(fields));
+    }
+  } else {
+    return false;
+  }
+  plans.front().setFingerprint(
+      mlir::shuttle::materializationPlanFingerprint(plans.front()));
+  return true;
 }
 
 bool verifyMaterializationPlan(mlir::ModuleOp module) {
@@ -5369,8 +5699,8 @@ TEST(Abi22MapFusionContract,
       mlir::shuttle::DeviceEntryOp specializedEntry =
           entries[specializedTask.getOrdinal()];
       llvm::StringRef specializedPtx(
-          reinterpret_cast<const char *>(
-              device.getCode().data() + specializedEntry.getCodeOffset()),
+          reinterpret_cast<const char *>(device.getCode().data() +
+                                         specializedEntry.getCodeOffset()),
           specializedEntry.getCodeLength());
       PtxDataflow specializedFlow = ptxDataflow(specializedPtx);
       ASSERT_EQ(specializedFlow.stores.size(), 2u);
@@ -5385,6 +5715,550 @@ TEST(Abi22MapFusionContract,
       EXPECT_EQ(specializedLaunch.outputSlots.back(),
                 primalResult->getOrdinal());
     }
+  }
+}
+
+TEST(Abi22MapFusionContract,
+     AnonymousContractFoldCompositionOwnsTheFullAndCompactSsaCut) {
+  struct Fixture {
+    const char *filename;
+    llvm::SmallVector<int64_t> firstSources;
+    llvm::SmallVector<int64_t> secondSources;
+    llvm::SmallVector<int64_t> compactShape;
+    llvm::SmallVector<int64_t> fullContractShape;
+    llvm::SmallVector<int64_t> publicShape;
+    std::array<llvm::SmallVector<int64_t>, 4> publicInputShapes;
+  };
+  const Fixture fixtures[] = {
+      {"abi22-generic-contract-fold-composition-rank2.mlir",
+       {0, 1},
+       {2, 3},
+       {2},
+       {2, 5},
+       {2, 7},
+       {{{2, 3}, {3, 5}, {5, 7}, {}}}},
+      {"abi22-generic-contract-fold-composition-rank3.mlir",
+      {4, 6},
+      {9, 13},
+      {2, 3},
+       {2, 3, 269},
+      {2, 3, 13},
+       {{{2, 3, 4}, {4, 269}, {269, 13}, {}}}},
+  };
+  for (const Fixture &fixture : fixtures) {
+    SCOPED_TRACE(fixture.filename);
+    std::optional<std::string> source = fixtureSource(fixture.filename);
+    ASSERT_TRUE(source);
+    for (mlir::shuttle::NumericalPolicy policy :
+         {mlir::shuttle::NumericalPolicy::SourceOrdered,
+          mlir::shuttle::NumericalPolicy::Fast}) {
+      SCOPED_TRACE(mlir::shuttle::stringifyNumericalPolicy(policy).str());
+      for (bool renamed : {false, true}) {
+        SCOPED_TRACE(renamed ? "renamed" : "original");
+        std::unique_ptr<BuiltModule> built =
+            buildAlgebra(*source, policy, false, renamed);
+        ASSERT_TRUE(built);
+
+        auto plans = llvm::to_vector(
+            built->module->getOps<mlir::shuttle::MaterializationPlanOp>());
+        ASSERT_EQ(plans.size(), 1u);
+        auto tasks = llvm::to_vector(
+            plans.front()
+                .getBody()
+                .front()
+                .getOps<mlir::shuttle::MaterializationTaskOp>());
+        auto buffers = llvm::to_vector(
+            plans.front()
+                .getBody()
+                .front()
+                .getOps<mlir::shuttle::MaterializationBufferOp>());
+        auto first = llvm::find_if(tasks, [](auto task) {
+          auto kind = task->template getAttrOfType<mlir::StringAttr>(
+              "composition_kind");
+          return kind && kind.getValue() == "contract_fold";
+        });
+        auto second = llvm::find_if(tasks, [](auto task) {
+          auto kind = task->template getAttrOfType<mlir::StringAttr>(
+              "composition_kind");
+          return kind && kind.getValue() == "map_contract";
+        });
+        ASSERT_NE(first, tasks.end());
+        ASSERT_NE(second, tasks.end());
+        EXPECT_EQ(
+            llvm::count_if(tasks,
+                           [](auto task) {
+                             return static_cast<bool>(
+                                 task->template getAttrOfType<mlir::StringAttr>(
+                                     "composition_kind"));
+                           }),
+            2);
+        EXPECT_EQ(first->getKind(),
+                  mlir::shuttle::MaterializationTaskKind::Fold);
+        EXPECT_EQ(second->getKind(),
+                  mlir::shuttle::MaterializationTaskKind::Contract);
+
+        auto requireSources = [&](auto task, llvm::StringRef name,
+                                  llvm::ArrayRef<int64_t> expected) {
+          auto sources = task->template getAttrOfType<mlir::ArrayAttr>(name);
+          ASSERT_TRUE(sources) << name.str();
+          EXPECT_EQ(sourceOperationOrdinals(sources), expected) << name.str();
+        };
+        requireSources(*first, "composition_sources", fixture.firstSources);
+        requireSources(*second, "composition_sources", fixture.secondSources);
+
+        auto hasShape = [](mlir::shuttle::MaterializationBufferOp buffer,
+                           llvm::ArrayRef<int64_t> shape) {
+          auto type =
+              mlir::dyn_cast<mlir::RankedTensorType>(buffer.getTensorType());
+          return type && type.getShape() == shape &&
+                 type.getElementType().isF32();
+        };
+        auto compact = llvm::find_if(buffers, [&](auto buffer) {
+          return hasShape(buffer, fixture.compactShape) &&
+                 buffer.getStorage() ==
+                     mlir::shuttle::MaterializationStorage::Temporary;
+        });
+        ASSERT_NE(compact, buffers.end());
+        auto fullContract = llvm::find_if(buffers, [&](auto buffer) {
+          return hasShape(buffer, fixture.fullContractShape) &&
+                 buffer.getStorage() ==
+                     mlir::shuttle::MaterializationStorage::Temporary;
+        });
+        ASSERT_NE(fullContract, buffers.end());
+        EXPECT_EQ(llvm::count_if(
+                      buffers,
+                      [&](auto buffer) {
+                        return buffer.getStorage() ==
+                               mlir::shuttle::MaterializationStorage::Temporary;
+                      }),
+                  2);
+        for (auto boundary : {*fullContract, *compact}) {
+          EXPECT_FALSE(boundary.getLiveIn());
+          EXPECT_FALSE(boundary.getLiveOut());
+          EXPECT_EQ(boundary.getProducer(), first->getOrdinal());
+          EXPECT_EQ(boundary.getConsumers(),
+                    llvm::ArrayRef<int64_t>(
+                        {static_cast<int64_t>(second->getOrdinal())}));
+          EXPECT_EQ(boundary.getLifetimeStart(), first->getOrdinal());
+          EXPECT_EQ(boundary.getLifetimeEnd(), second->getOrdinal());
+          EXPECT_TRUE(llvm::is_contained(first->getOutputBuffers(),
+                                         boundary.getOrdinal()));
+          EXPECT_TRUE(llvm::is_contained(second->getInputBuffers(),
+                                         boundary.getOrdinal()));
+        }
+        ASSERT_EQ(first->getOutputBuffers().size(), 2u);
+        EXPECT_EQ(first->getOutputBuffers().front(),
+                  fullContract->getOrdinal());
+        EXPECT_EQ(first->getOutputBuffers().back(), compact->getOrdinal());
+
+        auto publicResult = llvm::find_if(buffers, [&](auto buffer) {
+          return hasShape(buffer, fixture.publicShape) && buffer.getLiveOut();
+        });
+        ASSERT_NE(publicResult, buffers.end());
+        EXPECT_FALSE(publicResult->getLiveIn());
+        EXPECT_EQ(publicResult->getStorage(),
+                  mlir::shuttle::MaterializationStorage::External);
+        EXPECT_EQ(publicResult->getProducer(), second->getOrdinal());
+        EXPECT_TRUE(llvm::is_contained(second->getOutputBuffers(),
+                                       publicResult->getOrdinal()));
+        EXPECT_EQ(llvm::count_if(
+                      buffers, [](auto buffer) { return buffer.getLiveIn(); }),
+                  4);
+        EXPECT_EQ(llvm::count_if(
+                      buffers, [](auto buffer) { return buffer.getLiveOut(); }),
+                  1);
+
+        llvm::SmallVector<int64_t> publicInputBuffers;
+        for (llvm::ArrayRef<int64_t> inputShape : fixture.publicInputShapes) {
+          auto input = llvm::find_if(buffers, [&](auto buffer) {
+            return buffer.getLiveIn() && !buffer.getLiveOut() &&
+                   buffer.getStorage() ==
+                       mlir::shuttle::MaterializationStorage::External &&
+                   hasShape(buffer, inputShape);
+          });
+          ASSERT_NE(input, buffers.end());
+          publicInputBuffers.push_back(input->getOrdinal());
+        }
+        for (int64_t index : {0, 1, 3})
+          EXPECT_TRUE(llvm::is_contained(first->getInputBuffers(),
+                                         publicInputBuffers[index]));
+        EXPECT_FALSE(llvm::is_contained(first->getInputBuffers(),
+                                        publicInputBuffers[2]));
+        EXPECT_TRUE(llvm::is_contained(second->getInputBuffers(),
+                                       publicInputBuffers[2]));
+        for (int64_t index : {0, 1, 3})
+          EXPECT_FALSE(llvm::is_contained(second->getInputBuffers(),
+                                          publicInputBuffers[index]));
+
+        auto cost =
+            (*second)->getAttrOfType<mlir::DictionaryAttr>("composition_cost");
+        ASSERT_TRUE(cost);
+        auto integer = [&](llvm::StringRef name) {
+          auto value = cost.getAs<mlir::IntegerAttr>(name);
+          EXPECT_TRUE(value) << name.str();
+          return value ? value.getInt() : int64_t{-1};
+        };
+        const int64_t baselineLaunches = integer("baseline_launches");
+        const int64_t candidateLaunches = integer("candidate_launches");
+        const int64_t baselineTemporaryBytes =
+            integer("baseline_temporary_bytes");
+        const int64_t candidateTemporaryBytes =
+            integer("candidate_temporary_bytes");
+        const int64_t baselineTemporaryTraffic =
+            integer("baseline_temporary_traffic_bytes");
+        const int64_t candidateTemporaryTraffic =
+            integer("candidate_temporary_traffic_bytes");
+        EXPECT_LE(candidateLaunches, baselineLaunches);
+        EXPECT_LE(candidateTemporaryBytes, baselineTemporaryBytes);
+        EXPECT_LE(candidateTemporaryTraffic, baselineTemporaryTraffic);
+        EXPECT_TRUE(candidateLaunches < baselineLaunches ||
+                    candidateTemporaryBytes < baselineTemporaryBytes ||
+                    candidateTemporaryTraffic < baselineTemporaryTraffic);
+        EXPECT_EQ(integer("contract_evaluations"), 1);
+
+        std::unique_ptr<BuiltModule> executableBuilt =
+            buildAlgebra(*source, policy, true, renamed);
+        ASSERT_TRUE(executableBuilt);
+        auto device = *executableBuilt->module
+                           ->getOps<mlir::shuttle::DeviceModuleOp>()
+                           .begin();
+        auto entries = llvm::to_vector(
+            device.getBody().front().getOps<mlir::shuttle::DeviceEntryOp>());
+        ASSERT_GT(entries.size(),
+                  static_cast<size_t>(second->getOrdinal()));
+        auto entryPtx = [&](int64_t ordinal) {
+          mlir::shuttle::DeviceEntryOp entry = entries[ordinal];
+          return llvm::StringRef(
+              reinterpret_cast<const char *>(device.getCode().data() +
+                                               entry.getCodeOffset()),
+              entry.getCodeLength());
+        };
+        llvm::StringRef contractFoldPtx = entryPtx(first->getOrdinal());
+        llvm::StringRef mapContractPtx = entryPtx(second->getOrdinal());
+        EXPECT_EQ(contractFoldPtx.count(".param .u64 p"), 5u);
+        EXPECT_EQ(contractFoldPtx.count("st.global.f32"), 2u);
+        EXPECT_TRUE(contractFoldPtx.contains("[p0]"));
+        EXPECT_TRUE(contractFoldPtx.contains("[p1]"));
+        EXPECT_TRUE(contractFoldPtx.contains("[p2]"));
+        EXPECT_TRUE(contractFoldPtx.contains("[p3]"));
+        EXPECT_TRUE(contractFoldPtx.contains("[p4]"));
+        EXPECT_TRUE(contractFoldPtx.contains("fma.rn.f32"));
+        EXPECT_TRUE(contractFoldPtx.contains("st.shared.f32"));
+        EXPECT_TRUE(contractFoldPtx.contains("ld.shared.f32"));
+        auto schedules = llvm::to_vector(
+            executableBuilt->module
+                ->getOps<mlir::shuttle::SchedulePlanOp>());
+        ASSERT_EQ(schedules.size(), 1u);
+        auto scheduleTasks = llvm::to_vector(
+            schedules.front()
+                .getBody()
+                .front()
+                .getOps<mlir::shuttle::ScheduleTaskOp>());
+        auto firstSchedule =
+            llvm::find_if(scheduleTasks, [&](auto scheduleTask) {
+              return scheduleTask.getOrdinal() == first->getOrdinal();
+            });
+        ASSERT_NE(firstSchedule, scheduleTasks.end());
+        const int64_t foldReduction = fixture.fullContractShape.back();
+        EXPECT_TRUE(hasContiguousU64CompositionFoldLoop(
+            contractFoldPtx, foldReduction, firstSchedule->getSerialTiles()));
+        EXPECT_EQ(mapContractPtx.count(".param .u64 p"), 4u);
+        EXPECT_EQ(mapContractPtx.count("st.global.f32"), 1u);
+        EXPECT_TRUE(mapContractPtx.contains("[p0]"));
+        EXPECT_TRUE(mapContractPtx.contains("[p1]"));
+        EXPECT_TRUE(mapContractPtx.contains("[p2]"));
+        EXPECT_TRUE(mapContractPtx.contains("[p3]"));
+        EXPECT_TRUE(mapContractPtx.contains("mul.rn.f32"));
+        EXPECT_TRUE(mapContractPtx.contains("fma.rn.f32"));
+        PtxDataflow contractFoldFlow = ptxDataflow(contractFoldPtx);
+        PtxDataflow mapContractFlow = ptxDataflow(mapContractPtx);
+        ASSERT_EQ(contractFoldFlow.stores.size(), 2u);
+        ASSERT_EQ(mapContractFlow.stores.size(), 1u);
+        std::set<std::string> fullPointerClosure = ptxDependencyClosure(
+            contractFoldFlow, contractFoldFlow.stores.front().pointer);
+        std::set<std::string> fullValueClosure = ptxDependencyClosure(
+            contractFoldFlow, contractFoldFlow.stores.front().value);
+        EXPECT_TRUE(fullPointerClosure.count("p3"));
+        EXPECT_TRUE(fullValueClosure.count("p0"));
+        EXPECT_TRUE(fullValueClosure.count("p1"));
+        EXPECT_TRUE(fullValueClosure.count("$op:fma.rn.f32"));
+        std::set<std::string> compactPointerClosure = ptxDependencyClosure(
+            contractFoldFlow, contractFoldFlow.stores.back().pointer);
+        std::set<std::string> compactClosure = ptxDependencyClosure(
+            contractFoldFlow, contractFoldFlow.stores.back().value);
+        EXPECT_TRUE(compactPointerClosure.count("p4"));
+        EXPECT_TRUE(compactClosure.count("p0"));
+        EXPECT_TRUE(compactClosure.count("p1"));
+        EXPECT_TRUE(compactClosure.count("p2"));
+        EXPECT_TRUE(compactClosure.count("$shared"));
+        EXPECT_TRUE(compactClosure.count("$op:fma.rn.f32"));
+        const PtxDataflow::Definition *compactDefinition = ptxDefinition(
+            contractFoldFlow, contractFoldFlow.stores.back().value);
+        ASSERT_NE(compactDefinition, nullptr);
+        ASSERT_EQ(compactDefinition->opcode, "add.rn.f32");
+        ASSERT_EQ(compactDefinition->operands.size(), 2u);
+        int64_t initializerOperands = 0;
+        for (llvm::StringRef operand : compactDefinition->operands) {
+          std::set<std::string> closure =
+              ptxDependencyClosure(contractFoldFlow, operand);
+          if (!closure.count("p2"))
+            continue;
+          ++initializerOperands;
+          const PtxDataflow::Definition *initializer =
+              ptxDefinition(contractFoldFlow, operand);
+          ASSERT_NE(initializer, nullptr);
+          EXPECT_EQ(initializer->opcode, "ld.global.f32");
+        }
+        EXPECT_EQ(initializerOperands, 1);
+        std::set<std::string> resultClosure = ptxDependencyClosure(
+            mapContractFlow, mapContractFlow.stores.front().value);
+        std::set<std::string> resultPointerClosure = ptxDependencyClosure(
+            mapContractFlow, mapContractFlow.stores.front().pointer);
+        EXPECT_TRUE(resultPointerClosure.count("p3"));
+        EXPECT_TRUE(resultClosure.count("p0"));
+        EXPECT_TRUE(resultClosure.count("p1"));
+        EXPECT_TRUE(resultClosure.count("p2"));
+        EXPECT_TRUE(resultClosure.count("$op:mul.rn.f32"));
+        EXPECT_TRUE(resultClosure.count("$op:fma.rn.f32"));
+        mlir::FailureOr<llvm::SmallVector<uint8_t>> transport =
+            mlir::shuttle::serializeGpuExecutableBundle(
+                *executableBuilt->module);
+        ASSERT_TRUE(mlir::succeeded(transport));
+        auto executable = mlir::shuttle::GpuExecutable::Load(*transport);
+        ASSERT_TRUE(executable.ok()) << executable.status();
+        ASSERT_GT((*executable)->launches().size(),
+                  static_cast<size_t>(second->getOrdinal()));
+        auto transportedCompact = llvm::find_if(
+            (*executable)->slots(), [&](const mlir::shuttle::GpuSlot &slot) {
+              auto type =
+                  mlir::dyn_cast<mlir::RankedTensorType>(slot.tensorType);
+              return slot.storage ==
+                         mlir::shuttle::MaterializationStorage::Temporary &&
+                     type &&
+                     type.getShape() ==
+                         llvm::ArrayRef<int64_t>(fixture.compactShape) &&
+                     type.getElementType().isF32();
+            });
+        ASSERT_NE(transportedCompact, (*executable)->slots().end());
+        auto transportedFull = llvm::find_if(
+            (*executable)->slots(), [&](const mlir::shuttle::GpuSlot &slot) {
+              auto type =
+                  mlir::dyn_cast<mlir::RankedTensorType>(slot.tensorType);
+              return slot.storage ==
+                         mlir::shuttle::MaterializationStorage::Temporary &&
+                     type &&
+                     type.getShape() ==
+                         llvm::ArrayRef<int64_t>(fixture.fullContractShape) &&
+                     type.getElementType().isF32();
+            });
+        ASSERT_NE(transportedFull, (*executable)->slots().end());
+        llvm::SmallVector<int64_t> transportedInputSlots;
+        for (auto [index, inputShape] :
+             llvm::enumerate(fixture.publicInputShapes)) {
+          auto binding = llvm::find_if(
+              (*executable)->externalBindings(), [&](const auto &candidate) {
+                if (candidate.kind !=
+                        mlir::shuttle::ExecutableBindingKind::Operand ||
+                    candidate.index != static_cast<int64_t>(index))
+                  return false;
+                auto type = mlir::dyn_cast<mlir::RankedTensorType>(
+                    candidate.tensorType);
+                return type &&
+                       type.getShape() == llvm::ArrayRef<int64_t>(inputShape) &&
+                       type.getElementType().isF32();
+              });
+          ASSERT_NE(binding, (*executable)->externalBindings().end());
+          transportedInputSlots.push_back(binding->slotOrdinal);
+        }
+        auto resultBinding = llvm::find_if(
+            (*executable)->externalBindings(), [&](const auto &candidate) {
+              if (candidate.kind !=
+                      mlir::shuttle::ExecutableBindingKind::Result ||
+                  candidate.index != 0)
+                return false;
+              auto type =
+                  mlir::dyn_cast<mlir::RankedTensorType>(candidate.tensorType);
+              return type &&
+                     type.getShape() ==
+                         llvm::ArrayRef<int64_t>(fixture.publicShape) &&
+                     type.getElementType().isF32();
+            });
+        ASSERT_NE(resultBinding, (*executable)->externalBindings().end());
+        EXPECT_EQ((*executable)->externalBindings().size(), 5u);
+        for (int64_t index : {0, 1, 3})
+          EXPECT_TRUE(llvm::is_contained(
+              (*executable)->launches()[first->getOrdinal()].inputSlots,
+              transportedInputSlots[index]));
+        EXPECT_TRUE(llvm::is_contained(
+            (*executable)->launches()[second->getOrdinal()].inputSlots,
+            transportedInputSlots[2]));
+        EXPECT_TRUE(llvm::is_contained(
+            (*executable)->launches()[second->getOrdinal()].outputSlots,
+            resultBinding->slotOrdinal));
+        for (int64_t ordinal :
+             {transportedFull->ordinal, transportedCompact->ordinal}) {
+          EXPECT_TRUE(llvm::is_contained(
+              (*executable)->launches()[first->getOrdinal()].outputSlots,
+              ordinal));
+          EXPECT_TRUE(llvm::is_contained(
+              (*executable)->launches()[second->getOrdinal()].inputSlots,
+              ordinal));
+        }
+        EXPECT_TRUE(llvm::is_contained(
+            (*executable)->launches()[second->getOrdinal()].dependencies,
+            first->getOrdinal()));
+      }
+    }
+  }
+}
+
+TEST(Abi22MapFusionContract,
+     GenericContractFoldCompositionRejectsBoundaryAndOwnershipCorruption) {
+  std::optional<std::string> source =
+      fixtureSource("abi22-generic-contract-fold-composition-rank2.mlir");
+  ASSERT_TRUE(source);
+  for (llvm::StringRef mutation : {
+           "output-order",
+           "missing-output",
+           "compact-type",
+           "compact-element-type",
+           "extra-public-result",
+           "full-live-out",
+           "boundary-storage",
+           "boundary-producer",
+           "lifetime",
+           "missing-consumer",
+           "missing-second-input",
+           "missing-public-input",
+           "rebound-public-input",
+           "missing-second-public-input",
+           "rebound-second-public-input",
+           "second-input-order",
+           "missing-public-result",
+           "rebound-public-result",
+           "missing-kind",
+           "unknown-kind",
+           "source-ownership",
+           "cost",
+           "underreported-cost",
+           "missing-cost-field",
+           "contract-evaluations",
+       }) {
+    SCOPED_TRACE(mutation.str());
+    std::unique_ptr<BuiltModule> built =
+        buildAlgebra(*source, mlir::shuttle::NumericalPolicy::SourceOrdered,
+                     /*executable=*/false);
+    ASSERT_TRUE(built);
+    ASSERT_TRUE(mutateGenericContractFoldComposition(*built->module, mutation));
+    EXPECT_FALSE(verifyMaterializationPlan(*built->module));
+  }
+}
+
+TEST(Abi22MapFusionContract,
+     GenericContractFoldCompositionFallsBackForStructuralNearMisses) {
+  std::optional<std::string> source =
+      fixtureSource("abi22-generic-contract-fold-composition-rank2.mlir");
+  ASSERT_TRUE(source);
+  auto replaceAll = [](std::string changed, llvm::StringRef oldText,
+                       llvm::StringRef newText) {
+    size_t position = 0;
+    while ((position = changed.find(oldText.str(), position)) !=
+           std::string::npos) {
+      changed.replace(position, oldText.size(), newText.str());
+      position += newText.size();
+    }
+    return changed;
+  };
+
+  std::string extraMapInput =
+      replaceAll(*source, "%z = \"shuttle.map\"(%h, %s)",
+                 "%z = \"shuttle.map\"(%h, %s, %s)");
+  extraMapInput =
+      replaceAll(std::move(extraMapInput),
+                 "^bb0(%element: f32, %scale: f32):",
+                 "^bb0(%element: f32, %scale: f32, %scale_again: f32):");
+  extraMapInput = replaceAll(
+      std::move(extraMapInput),
+      "%scaled = arith.mulf %element, %scale : f32\n"
+      "        \"shuttle.yield\"(%scaled) : (f32) -> ()",
+      "%scaled = arith.mulf %element, %scale : f32\n"
+      "        %combined = arith.addf %scaled, %scale_again : f32\n"
+      "        \"shuttle.yield\"(%combined) : (f32) -> ()");
+  extraMapInput =
+      replaceAll(std::move(extraMapInput),
+                 "indexing_maps = [#identity, #row, #identity]",
+                 "indexing_maps = [#identity, #row, #row, #identity]");
+  extraMapInput = replaceAll(
+      std::move(extraMapInput),
+      "(tensor<2x5xf32>, tensor<2xf32>) -> tensor<2x5xf32>",
+      "(tensor<2x5xf32>, tensor<2xf32>, tensor<2xf32>) -> tensor<2x5xf32>");
+  std::string extraFullConsumer = replaceAll(
+      *source, "#shuttle.source_ref<0, 0, 3, 0>",
+      "#shuttle.source_ref<0, 0, 4, 0>");
+  constexpr llvm::StringLiteral dependentMap =
+      "      %z = \"shuttle.map\"(%h, %s) ({";
+  size_t mapPosition = extraFullConsumer.find(dependentMap.str());
+  ASSERT_NE(mapPosition, std::string::npos);
+  extraFullConsumer.insert(
+      mapPosition,
+      R"mlir(      %unused_h = "shuttle.map"(%h) ({
+      ^bb0(%value: f32):
+        "shuttle.yield"(%value) : (f32) -> ()
+      }) {
+        indexing_maps = [#identity, #identity],
+        source = #shuttle.source_ref<0, 0, 3, 0>
+      } : (tensor<2x5xf32>) -> tensor<2x5xf32>
+)mlir");
+  extraFullConsumer =
+      replaceAll(std::move(extraFullConsumer),
+                 "%z = \"shuttle.map\"(%h, %s)",
+                 "%z = \"shuttle.map\"(%h, %s, %unused_h)");
+  extraFullConsumer = replaceAll(
+      std::move(extraFullConsumer), "^bb0(%element: f32, %scale: f32):",
+      "^bb0(%element: f32, %scale: f32, %extra: f32):");
+  extraFullConsumer = replaceAll(
+      std::move(extraFullConsumer),
+      "%scaled = arith.mulf %element, %scale : f32\n"
+      "        \"shuttle.yield\"(%scaled) : (f32) -> ()",
+      "%scaled = arith.mulf %element, %scale : f32\n"
+      "        %combined = arith.addf %scaled, %extra : f32\n"
+      "        \"shuttle.yield\"(%combined) : (f32) -> ()");
+  extraFullConsumer = replaceAll(
+      std::move(extraFullConsumer),
+      "indexing_maps = [#identity, #row, #identity]",
+      "indexing_maps = [#identity, #row, #identity, #identity]");
+  extraFullConsumer = replaceAll(
+      std::move(extraFullConsumer),
+      "(tensor<2x5xf32>, tensor<2xf32>) -> tensor<2x5xf32>",
+      "(tensor<2x5xf32>, tensor<2xf32>, tensor<2x5xf32>) -> "
+      "tensor<2x5xf32>");
+  constexpr llvm::StringLiteral finalSource =
+      "                     #shuttle.source_ref<0, 0, 4, 0>]";
+  size_t finalSourcePosition = extraFullConsumer.find(finalSource.str());
+  ASSERT_NE(finalSourcePosition, std::string::npos);
+  extraFullConsumer.insert(
+      finalSourcePosition,
+      "                     #shuttle.source_ref<0, 0, 3, 0>,\n");
+
+  for (const auto &[name, mutation] :
+       std::array<std::pair<llvm::StringRef, std::string>, 2>{
+           std::pair<llvm::StringRef, std::string>{"extra-map-input",
+                                                   std::move(extraMapInput)},
+           {"extra-full-consumer", std::move(extraFullConsumer)}}) {
+    SCOPED_TRACE(name.str());
+    std::unique_ptr<BuiltModule> built =
+        buildAlgebra(mutation,
+                     mlir::shuttle::NumericalPolicy::SourceOrdered,
+                     /*executable=*/false);
+    ASSERT_TRUE(built);
+    std::optional<PlanSummary> plan = summary(*built->module);
+    ASSERT_TRUE(plan);
+    EXPECT_TRUE(plan->exactSourceCoverage);
+    built->module->walk([&](mlir::shuttle::MaterializationTaskOp task) {
+      EXPECT_FALSE(task->hasAttr("composition_kind"));
+      EXPECT_FALSE(task->hasAttr("composition_sources"));
+      EXPECT_FALSE(task->hasAttr("composition_cost"));
+    });
   }
 }
 
@@ -5406,16 +6280,14 @@ TEST(Abi22MapFusionContract,
     EXPECT_FALSE(planSummary->hasFoldRegion);
     EXPECT_TRUE(planSummary->exactSourceCoverage);
 
-    auto plan = *built->module->getOps<mlir::shuttle::MaterializationPlanOp>()
-                     .begin();
+    auto plan =
+        *built->module->getOps<mlir::shuttle::MaterializationPlanOp>().begin();
     auto tasks = llvm::to_vector(
-        plan.getBody()
-            .front()
-            .getOps<mlir::shuttle::MaterializationTaskOp>());
-    auto buffers = llvm::to_vector(
-        plan.getBody()
-            .front()
-            .getOps<mlir::shuttle::MaterializationBufferOp>());
+        plan.getBody().front().getOps<mlir::shuttle::MaterializationTaskOp>());
+    auto buffers =
+        llvm::to_vector(plan.getBody()
+                            .front()
+                            .getOps<mlir::shuttle::MaterializationBufferOp>());
     auto specialized = llvm::find_if(tasks, [](auto task) {
       return static_cast<bool>(task->template getAttrOfType<mlir::ArrayAttr>(
           "contract_region_sources"));
@@ -5432,9 +6304,9 @@ TEST(Abi22MapFusionContract,
     ASSERT_NE(primal, buffers.end());
     auto normalizedType =
         mlir::cast<mlir::RankedTensorType>(normalized->getTensorType());
-    auto primalType = mlir::cast<mlir::RankedTensorType>(primal->getTensorType());
-    EXPECT_EQ(normalizedType.getShape(),
-              llvm::ArrayRef<int64_t>({2, 5, 19}));
+    auto primalType =
+        mlir::cast<mlir::RankedTensorType>(primal->getTensorType());
+    EXPECT_EQ(normalizedType.getShape(), llvm::ArrayRef<int64_t>({2, 5, 19}));
     EXPECT_EQ(primalType.getShape(), llvm::ArrayRef<int64_t>({2, 5, 7}));
     EXPECT_FALSE(normalized->getLiveOut());
     EXPECT_EQ(normalized->getStorage(),
