@@ -570,6 +570,23 @@ py_test(
 )
 
 py_test(
+    name = "abi22_layernorm_fbc_topology_diagnostic_red_test",
+    srcs = [
+        "jax_patch/abi22_h100_performance.py",
+        "jax_patch/abi22_layernorm_bc_numerical_contract.py",
+        "jax_patch/abi22_layernorm_forward_numerical_contract.py",
+        "jax_patch/test_abi22_layernorm_fbc_topology_diagnostic_red.py",
+    ],
+    data = ["jax_patch/abi22-layernorm-fbc-topology-diagnostic-red-v1.json"],
+    deps = [
+        "@pypi//ml_dtypes",
+        "@pypi//numpy",
+    ],
+    imports = ["jax_patch"],
+    main = "jax_patch/test_abi22_layernorm_fbc_topology_diagnostic_red.py",
+)
+
+py_test(
     name = "abi22_te_rmsnorm_oracle_v2_test",
     srcs = [
         "jax_patch/abi22_te_rmsnorm_oracle_v2.py",

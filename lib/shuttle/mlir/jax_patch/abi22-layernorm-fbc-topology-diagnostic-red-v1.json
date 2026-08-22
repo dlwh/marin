@@ -1,0 +1,174 @@
+{
+  "schema": "shuttle_abi22_layernorm_fbc_topology_diagnostic_red_v1",
+  "contract_id": "abi22_layernorm_fbc_topology_diagnostic_red_v1",
+  "validation_scope": "post_identity_single_coordinate_observed_result_before_paired_statistics",
+  "matrix": {
+    "boundaries": ["forward", "backward", "composed"],
+    "shapes": [[7, 13], [3, 7]],
+    "shuttle_policy": "fast"
+  },
+  "public_boundaries": {
+    "forward": {
+      "inputs": ["x", "gamma", "beta"],
+      "outputs": ["y"]
+    },
+    "backward": {
+      "inputs": ["x", "gamma", "dy"],
+      "outputs": ["dx", "dgamma", "dbeta"]
+    },
+    "composed": {
+      "inputs": ["x", "gamma", "beta", "dy"],
+      "outputs": ["y", "dx", "dgamma", "dbeta"]
+    }
+  },
+  "public_tensor": {
+    "dtype": "bf16",
+    "row_major": true
+  },
+  "numerical": {
+    "reference": "independent_binary64_analytic_layernorm_fbc",
+    "epsilon_f32": {
+      "hex_bits": "0x3727c5ac",
+      "exact_decimal": "9.999999747378752e-6"
+    },
+    "input_fixtures": {
+      "7x13": {
+        "forward": "abi22_layernorm_forward_fixed_inputs_7x13_balanced",
+        "backward": "abi22_layernorm_bc_fixed_inputs_7x13",
+        "composed": "abi22_layernorm_bc_fixed_inputs_7x13"
+      },
+      "3x7": {
+        "dtype": "bf16",
+        "formula": "((index * multiplier + offset) % modulus - center) / 8",
+        "x": {"multiplier": 17, "offset": 3, "modulus": 31, "center": 15},
+        "gamma": {"multiplier": 5, "offset": 1, "modulus": 13, "center": 6},
+        "beta": {"multiplier": 3, "offset": 2, "modulus": 11, "center": 5},
+        "dy": {"multiplier": 11, "offset": 5, "modulus": 29, "center": 14}
+      }
+    },
+    "schedule_digest_is_admission": false,
+    "nonfinite": "reject",
+    "full_write": "required",
+    "repeat_captures": 2,
+    "raw_bf16_artifacts": "required",
+    "recompute_digest_and_metrics_from_raw_bf16": true,
+    "repeat_rule": "exact_raw_bf16_equality_per_subject_and_role",
+    "limits": {
+      "forward": {
+        "y": {
+          "max_absolute_error": 0.015625,
+          "mean_absolute_error": 0.000001,
+          "relative_linf_error": 0.0078125,
+          "max_bfloat16_ulp_error": 16
+        }
+      },
+      "backward": {
+        "dx": {
+          "max_absolute_error": 0.0625,
+          "mean_absolute_error": 0.00006103515625,
+          "relative_linf_error": 0.03125,
+          "max_bfloat16_ulp_error": 4
+        },
+        "dgamma": {
+          "max_absolute_error": 2.0,
+          "mean_absolute_error": 0.0625,
+          "relative_linf_error": 0.015625,
+          "max_bfloat16_ulp_error": 2
+        },
+        "dbeta": {
+          "max_absolute_error": 2.0,
+          "mean_absolute_error": 0.0625,
+          "relative_linf_error": 0.015625,
+          "max_bfloat16_ulp_error": 2
+        }
+      },
+      "composed": {
+        "y": {
+          "max_absolute_error": 0.0625,
+          "mean_absolute_error": 0.0000152587890625,
+          "relative_linf_error": 0.015625,
+          "max_bfloat16_ulp_error": 128
+        },
+        "dx": {
+          "max_absolute_error": 0.0625,
+          "mean_absolute_error": 0.00006103515625,
+          "relative_linf_error": 0.03125,
+          "max_bfloat16_ulp_error": 4
+        },
+        "dgamma": {
+          "max_absolute_error": 2.0,
+          "mean_absolute_error": 0.0625,
+          "relative_linf_error": 0.015625,
+          "max_bfloat16_ulp_error": 2
+        },
+        "dbeta": {
+          "max_absolute_error": 2.0,
+          "mean_absolute_error": 0.0625,
+          "relative_linf_error": 0.015625,
+          "max_bfloat16_ulp_error": 2
+        }
+      }
+    }
+  },
+  "execution": {
+    "same_device_context_stream": true,
+    "same_public_input_addresses": true,
+    "disjoint_output_and_private_spans": true,
+    "span_semantics": "uint64_overflow_rejected_half_open_intervals",
+    "bridge_created_streams": 0,
+    "bridge_created_allocations": 0,
+    "fallback_targets": [],
+    "host_round_trips": 0,
+    "device_limits_source": "contract_pinned_h100_properties",
+    "h100_device_limits": {
+      "max_threads_per_block": 1024,
+      "max_grid_dimensions": [2147483647, 65535, 65535],
+      "max_dynamic_shared_bytes": 227328
+    }
+  },
+  "topology": {
+    "admission_role": "diagnostic_only",
+    "accepted_launch_count_is_not_predeclared": true,
+    "accepted_slot_numbering_is_not_predeclared": true,
+    "accepted_scratch_decomposition_is_not_predeclared": true,
+    "accepted_geometry_is_not_predeclared": true,
+    "scratch_slice_lifetime": "whole_report",
+    "scratch_slice_rules": [
+      "every_scratch_slot_has_exactly_one_slice",
+      "slice_byte_count_equals_slot_byte_count",
+      "slices_exactly_cover_each_allocation",
+      "slices_are_in_bounds",
+      "simultaneously_live_slices_do_not_overlap"
+    ],
+    "observed_schedule_digest": "diagnostic_only_not_admission",
+    "code_artifact_hash_is_recomputed_from_bytes": true,
+    "required_graph_invariants": [
+      "acyclic_dependencies",
+      "every_read_is_public_or_produced",
+      "one_final_writer_per_public_result",
+      "positive_device_legal_geometry",
+      "every_producer_consumer_edge_is_declared",
+      "sealed_code_for_every_observed_launch"
+    ]
+  },
+  "timing": {
+    "process_identity": "supplied_by_unchanged_paired_protocol",
+    "initial_order": "supplied_by_unchanged_paired_protocol",
+    "clock": "cuda_event_same_stream",
+    "warmup_blocks": 10,
+    "measured_blocks": 50,
+    "block_orders": ["STTS", "TSST"],
+    "invocations_per_subject_per_block": 2,
+    "positive_duration_nanoseconds": true,
+    "use_delay_kernel": false,
+    "cuda_event_handles_per_invocation": 2,
+    "timer_layers_per_invocation": 1
+  },
+  "observed_result_return": {
+    "verdict": "pass",
+    "topology_admission_role": "diagnostic_only",
+    "preserve_observed_topology": true,
+    "preserve_observed_schedule_digest": true,
+    "timing_blocks": "validated_measured_blocks_for_unchanged_paired_statistical_protocol"
+  }
+}
