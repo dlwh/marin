@@ -1670,6 +1670,11 @@ bool mutateGenericContractFoldComposition(mlir::ModuleOp module,
     else
       *output = compact->getOrdinal();
     (*second)->setAttr("output_buffers", builder.getDenseI64ArrayAttr(outputs));
+  } else if (mutation == "missing-kind") {
+    (*first)->removeAttr("composition_kind");
+  } else if (mutation == "unknown-kind") {
+    (*first)->setAttr("composition_kind",
+                      builder.getStringAttr("contract_fold_unknown"));
   } else if (mutation == "source-ownership") {
     auto sources =
         (*second)->getAttrOfType<mlir::ArrayAttr>("composition_sources");
@@ -1687,7 +1692,9 @@ bool mutateGenericContractFoldComposition(mlir::ModuleOp module,
     llvm::SmallVector<mlir::Attribute> sources(secondSources.getValue());
     sources.push_back(firstSources[0]);
     (*second)->setAttr("composition_sources", builder.getArrayAttr(sources));
-  } else if (mutation == "cost") {
+  } else if (mutation == "cost" || mutation == "underreported-cost" ||
+             mutation == "missing-cost-field" ||
+             mutation == "contract-evaluations") {
     auto cost =
         (*second)->getAttrOfType<mlir::DictionaryAttr>("composition_cost");
     if (!cost)
@@ -1701,12 +1708,28 @@ bool mutateGenericContractFoldComposition(mlir::ModuleOp module,
     });
     if (baseline == fields.end() || candidate == fields.end())
       return false;
-    const int64_t baselineBytes =
-        mlir::cast<mlir::IntegerAttr>(baseline->getValue()).getInt();
-    *candidate =
-        builder.getNamedAttr("candidate_temporary_bytes",
-                             builder.getI64IntegerAttr(baselineBytes + 1));
-    (*second)->setAttr("composition_cost", builder.getDictionaryAttr(fields));
+    if (mutation == "missing-cost-field") {
+      fields.erase(candidate);
+      (*second)->setAttr("composition_cost", builder.getDictionaryAttr(fields));
+    } else if (mutation == "contract-evaluations") {
+      auto evaluations = llvm::find_if(fields, [](mlir::NamedAttribute field) {
+        return field.getName() == "contract_evaluations";
+      });
+      if (evaluations == fields.end())
+        return false;
+      *evaluations = builder.getNamedAttr(
+          "contract_evaluations", builder.getI64IntegerAttr(2));
+      (*second)->setAttr("composition_cost", builder.getDictionaryAttr(fields));
+    } else {
+      const int64_t baselineBytes =
+          mlir::cast<mlir::IntegerAttr>(baseline->getValue()).getInt();
+      *candidate = builder.getNamedAttr(
+          "candidate_temporary_bytes",
+          builder.getI64IntegerAttr(mutation == "cost" ? baselineBytes + 1
+                                                       : baselineBytes - 1));
+      (*second)->setAttr("composition_cost",
+                         builder.getDictionaryAttr(fields));
+    }
   } else {
     return false;
   }
@@ -5947,9 +5970,14 @@ TEST(Abi22MapFusionContract,
            "second-input-order",
            "missing-public-result",
            "rebound-public-result",
+           "missing-kind",
+           "unknown-kind",
            "source-ownership",
            "duplicate-source-ownership",
            "cost",
+           "underreported-cost",
+           "missing-cost-field",
+           "contract-evaluations",
        }) {
     SCOPED_TRACE(mutation.str());
     std::unique_ptr<BuiltModule> built =
