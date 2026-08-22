@@ -11,6 +11,13 @@ from pathlib import Path
 
 import pytest
 import track1_map_h100_prototype as prototype
+from track1_generic_composition_numerical_policy import (
+    POLICY_FILENAME as COMPOSITION_POLICY_FILENAME,
+)
+from track1_generic_composition_numerical_policy import (
+    POLICY_SHA256 as COMPOSITION_POLICY_SHA256,
+)
+from track1_generic_composition_numerical_policy import SEMANTIC_CONTRACT
 from track1_map_h100_build import JAX_COMMIT, JAX_PATCH_SHA256, JAX_TREE, XLA_COMMIT, XLA_PATCH_SHA256
 from track1_map_h100_prototype import (
     BASE_IMAGE,
@@ -64,6 +71,21 @@ def _document() -> dict[str, object]:
         "schema": "track1_map_h100_prototype_authorization",
         "schema_version": 1,
         "subjects": {
+            "generic_composition": {
+                "modes": ["disabled", "source_ordered", "fast"],
+                "numerical_policy": {
+                    "path": f"lib/shuttle/mlir/jax_patch/{COMPOSITION_POLICY_FILENAME}",
+                    "sha256": COMPOSITION_POLICY_SHA256,
+                },
+                "public_abi": {
+                    "arguments": ["a", "b", "p", "init"],
+                    "result": "y",
+                    "types": "static_f32_tensors_and_rank0_f32_init",
+                },
+                "repeat_bitwise_required": True,
+                "resource_telemetry": "typed_nonnegative_observed_only",
+                "semantic_contract": SEMANTIC_CONTRACT,
+            },
             "map": {
                 "boundaries": ["mixed_value_gradient"],
                 "modes": ["disabled", "source_ordered", "fast"],
@@ -838,7 +860,7 @@ def test_execute_rejects_bazel_or_hydration_failure_before_offline_build(
                 [
                     sys.executable,
                     "-c",
-                    ("import sys; " "print('x' * 20000); " f"{failure_output}" "sys.exit(23)"),
+                    (f"import sys; print('x' * 20000); {failure_output}sys.exit(23)"),
                 ],
                 cwd=cwd,
                 log=log,

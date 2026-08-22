@@ -57,6 +57,33 @@ constexpr llvm::StringLiteral kAbi22FoldRegionFastOptions =
 constexpr std::array<llvm::StringLiteral, 2> kAbi22FoldRegionPolicies = {
     kAbi22FoldRegionSourceOrderedOptions, kAbi22FoldRegionFastOptions};
 
+// Emitted by JAX 0.10.1 from the anonymous generic-composition subject.
+constexpr llvm::StringLiteral kRankTwoGenericCompositionProgram = R"mlir(
+module @jit_composition attributes {mhlo.num_partitions = 1 : i32, mhlo.num_replicas = 1 : i32} {
+  func.func public @main(%arg0: tensor<2x3xf32>, %arg1: tensor<3x5xf32>, %arg2: tensor<5x7xf32>, %arg3: tensor<f32>) -> (tensor<2x7xf32> {jax.result_info = "result"}) {
+    %0 = stablehlo.dot_general %arg0, %arg1, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<2x3xf32>, tensor<3x5xf32>) -> tensor<2x5xf32>
+    %1 = stablehlo.reduce(%0 init: %arg3) applies stablehlo.add across dimensions = [1] : (tensor<2x5xf32>, tensor<f32>) -> tensor<2xf32>
+    %2 = stablehlo.broadcast_in_dim %1, dims = [0] : (tensor<2xf32>) -> tensor<2x5xf32>
+    %3 = stablehlo.multiply %0, %2 : tensor<2x5xf32>
+    %4 = stablehlo.dot_general %3, %arg2, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<2x5xf32>, tensor<5x7xf32>) -> tensor<2x7xf32>
+    return %4 : tensor<2x7xf32>
+  }
+}
+)mlir";
+
+constexpr llvm::StringLiteral kRankThreeGenericCompositionProgram = R"mlir(
+module @jit_composition attributes {mhlo.num_partitions = 1 : i32, mhlo.num_replicas = 1 : i32} {
+  func.func public @main(%arg0: tensor<2x3x4xf32>, %arg1: tensor<4x269xf32>, %arg2: tensor<269x13xf32>, %arg3: tensor<f32>) -> (tensor<2x3x13xf32> {jax.result_info = "result"}) {
+    %0 = stablehlo.dot_general %arg0, %arg1, contracting_dims = [2] x [0], precision = [DEFAULT, DEFAULT] : (tensor<2x3x4xf32>, tensor<4x269xf32>) -> tensor<2x3x269xf32>
+    %1 = stablehlo.reduce(%0 init: %arg3) applies stablehlo.add across dimensions = [2] : (tensor<2x3x269xf32>, tensor<f32>) -> tensor<2x3xf32>
+    %2 = stablehlo.broadcast_in_dim %1, dims = [0, 1] : (tensor<2x3xf32>) -> tensor<2x3x269xf32>
+    %3 = stablehlo.multiply %0, %2 : tensor<2x3x269xf32>
+    %4 = stablehlo.dot_general %3, %arg2, contracting_dims = [2] x [0], precision = [DEFAULT, DEFAULT] : (tensor<2x3x269xf32>, tensor<269x13xf32>) -> tensor<2x3x13xf32>
+    return %4 : tensor<2x3x13xf32>
+  }
+}
+)mlir";
+
 // Emitted by JAX 0.10.1 from:
 // jax.jit(lambda x: jnp.abs((-x.astype(jnp.float32)).astype(jnp.bfloat16)))
 constexpr llvm::StringLiteral kRankTwoMixedMapProgram = R"mlir(
@@ -714,6 +741,107 @@ TEST(TrackOneMapWiringTest,
       EXPECT_EQ(events[1].bundleTemporaryCount(), temporaryCount);
       EXPECT_TRUE(events[2].noShuttleSemantics());
       EXPECT_TRUE(events[2].regionMembership().empty());
+    }
+  }
+}
+
+TEST(TrackOneMapWiringTest,
+     BundlesAnonymousContractFoldCompositionThroughRegisteredFfi) {
+  struct Fixture {
+    llvm::StringRef source;
+    llvm::SmallVector<int64_t> fullShape;
+    llvm::SmallVector<int64_t> compactShape;
+    llvm::SmallVector<int64_t> resultShape;
+  };
+  const Fixture fixtures[] = {
+      {kRankTwoGenericCompositionProgram, {2, 5}, {2}, {2, 7}},
+      {kRankThreeGenericCompositionProgram,
+       {2, 3, 269},
+       {2, 3},
+       {2, 3, 13}},
+  };
+  for (const Fixture &fixture : fixtures) {
+    for (llvm::StringRef policy : kAbi22FoldRegionPolicies) {
+      SCOPED_TRACE(policy.str());
+      auto observer = std::make_shared<RecordingObserver>();
+      auto subscription =
+          mlir::shuttle::subscribeShuttlePipelineObserver(observer);
+      mlir::MLIRContext context;
+      mlir::OwningOpRef<mlir::ModuleOp> module =
+          parseModule(context, fixture.source);
+      ASSERT_TRUE(module);
+      absl::Status status = runRegisteredShuttleTransform(*module, policy);
+      ASSERT_TRUE(status.ok()) << status;
+
+      llvm::SmallVector<mlir::Operation *> customCalls;
+      mlir::func::ReturnOp functionReturn;
+      module->walk([&](mlir::Operation *operation) {
+        if (operation->getName().getStringRef() == "stablehlo.custom_call")
+          customCalls.push_back(operation);
+        if (auto returned = mlir::dyn_cast<mlir::func::ReturnOp>(operation))
+          functionReturn = returned;
+      });
+      ASSERT_EQ(customCalls.size(), 1);
+      ASSERT_TRUE(functionReturn);
+      mlir::Operation *customCall = customCalls.front();
+      EXPECT_EQ(customCall->getNumOperands(), 4);
+      ASSERT_EQ(customCall->getNumResults(), 1);
+      ASSERT_EQ(functionReturn.getNumOperands(), 1);
+      EXPECT_EQ(functionReturn.getOperand(0), customCall->getResult(0));
+      auto resultType = mlir::dyn_cast<mlir::RankedTensorType>(
+          customCall->getResult(0).getType());
+      ASSERT_TRUE(resultType);
+      EXPECT_EQ(resultType.getShape(),
+                llvm::ArrayRef<int64_t>(fixture.resultShape));
+      EXPECT_TRUE(resultType.getElementType().isF32());
+
+      auto backendConfig =
+          customCall->getAttrOfType<mlir::DictionaryAttr>("backend_config");
+      ASSERT_TRUE(backendConfig);
+      expectFfiInstantiationAccepts(backendConfig);
+      auto bundleBytes = backendConfig.getAs<mlir::StringAttr>("bundle_bytes");
+      ASSERT_TRUE(bundleBytes);
+      llvm::StringRef serialized = bundleBytes.getValue();
+      auto loaded = mlir::shuttle::GpuExecutable::Load(
+          llvm::ArrayRef<uint8_t>(
+              reinterpret_cast<const uint8_t *>(serialized.data()),
+              serialized.size()));
+      ASSERT_TRUE(loaded.ok()) << loaded.status();
+      auto hasPrivateShape = [&](llvm::ArrayRef<int64_t> shape) {
+        return llvm::count_if((*loaded)->slots(), [&](const auto &slot) {
+          auto tensorType =
+              mlir::dyn_cast<mlir::RankedTensorType>(slot.tensorType);
+          return slot.storage ==
+                     mlir::shuttle::MaterializationStorage::Temporary &&
+                 tensorType && tensorType.getShape() == shape &&
+                 tensorType.getElementType().isF32();
+        });
+      };
+      EXPECT_EQ(hasPrivateShape(fixture.fullShape), 1);
+      EXPECT_EQ(hasPrivateShape(fixture.compactShape), 1);
+
+      std::string transformed = moduleText(*module);
+      EXPECT_EQ(transformed.find("shuttle.region"), std::string::npos);
+      EXPECT_EQ(transformed.find("stablehlo.dot_general"),
+                std::string::npos);
+      EXPECT_EQ(transformed.find("stablehlo.reduce"), std::string::npos);
+      EXPECT_EQ(transformed.find("stablehlo.multiply"), std::string::npos);
+      auto events = observer->snapshot();
+      ASSERT_EQ(events.size(), 3);
+      EXPECT_EQ(events[0].phase(),
+                mlir::shuttle::ShuttlePipelinePhase::AlgebraCoverage);
+      EXPECT_EQ(events[1].phase(),
+                mlir::shuttle::ShuttlePipelinePhase::GeneratedBundle);
+      EXPECT_EQ(events[2].phase(),
+                mlir::shuttle::ShuttlePipelinePhase::FinalErasure);
+      EXPECT_GT(events[0].invocationId(), 0);
+      EXPECT_EQ(events[0].invocationId(), events[1].invocationId());
+      EXPECT_EQ(events[0].invocationId(), events[2].invocationId());
+      EXPECT_EQ(countOccurrences(events[0].regionMembership(),
+                                 "#shuttle.source_ref<"),
+                6);
+      EXPECT_EQ(events[0].regionMembership(), events[1].regionMembership());
+      EXPECT_TRUE(events[2].noShuttleSemantics());
     }
   }
 }

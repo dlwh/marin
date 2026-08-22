@@ -135,6 +135,9 @@ def test_request_bytes_are_deterministic_and_output_is_create_only(tmp_path: Pat
     assert _request(4).name == "/dlwh/shuttle-track1-rmsnorm-h100-canary-r4"
     assert _request(4).SerializeToString(deterministic=True) != first
     assert job_name(Campaign.RMSNORM_CONTRACT_CANARY, 1) == "/dlwh/shuttle-track1-rmsnorm-contract-h100-canary-r1"
+    assert job_name(Campaign.GENERIC_COMPOSITION_CANARY, 1) == (
+        "/dlwh/shuttle-track1-generic-composition-h100-canary-r1"
+    )
     with pytest.raises(ValueError, match="protobuf is malformed"):
         decode_launch_request(b"\xff", approved_authorization_sha256=approved, campaign=Campaign.RMSNORM_CANARY, retry=1)
     with pytest.raises(ValueError, match="positive integer"):
@@ -161,6 +164,34 @@ def test_request_bytes_are_deterministic_and_output_is_create_only(tmp_path: Pat
             ]
         )
     assert output.read_bytes() == b"do not replace"
+
+
+def test_generic_composition_campaign_is_bound_in_the_real_request() -> None:
+    approved = _approved_authorization_sha256()
+    request = build_launch_request(
+        bundle_root=MARIN_REPOSITORY,
+        authorization_path=AUTHORIZATION_PATH,
+        approved_authorization_sha256=approved,
+        campaign=Campaign.GENERIC_COMPOSITION_CANARY,
+        retry=1,
+    )
+
+    assert request.name == "/dlwh/shuttle-track1-generic-composition-h100-canary-r1"
+    assert request.priority_band == job_pb2.PRIORITY_BAND_BATCH
+    assert request.resources.device.gpu.variant == "H100"
+    assert request.resources.device.gpu.count == 1
+    assert request.max_retries_failure == 0
+    assert request.max_retries_preemption == 0
+    assert request.max_task_failures == 0
+    assert (
+        decode_launch_request(
+            request.SerializeToString(deterministic=True),
+            approved_authorization_sha256=approved,
+            campaign=Campaign.GENERIC_COMPOSITION_CANARY,
+            retry=1,
+        )
+        == request
+    )
 
 
 def test_default_is_unsealed_before_bundle_or_request_output(tmp_path: Path) -> None:
