@@ -550,6 +550,29 @@ bool hasContiguousU64CompositionFoldLoop(llvm::StringRef ptx,
       });
   if (!endGuard || !rowConversion)
     return false;
+  if (*extentGuard == 0 || !lines[*extentGuard - 1].ends_with(":"))
+    return false;
+  llvm::StringRef loopLabel = lines[*extentGuard - 1].drop_back();
+  auto branchTarget = [&](size_t guard) -> std::optional<std::string> {
+    if (guard + 1 >= lines.size())
+      return std::nullopt;
+    std::vector<std::string> guardTokens = ptxTokens(lines[guard]);
+    if (guardTokens.empty())
+      return std::nullopt;
+    const std::string prefix =
+        (llvm::Twine("@") + guardTokens[0] + " bra ").str();
+    if (!lines[guard + 1].starts_with(prefix) ||
+        !lines[guard + 1].ends_with(";"))
+      return std::nullopt;
+    return lines[guard + 1]
+        .drop_front(prefix.size())
+        .drop_back()
+        .str();
+  };
+  std::optional<std::string> extentExit = branchTarget(*extentGuard);
+  std::optional<std::string> endExit = branchTarget(*endGuard);
+  if (!extentExit || !endExit || *extentExit != *endExit)
+    return false;
   std::vector<std::string> rowConversionTokens =
       ptxTokens(lines[*rowConversion]);
   llvm::StringRef row64 = rowConversionTokens[0];
@@ -565,12 +588,19 @@ bool hasContiguousU64CompositionFoldLoop(llvm::StringRef ptx,
   const std::string increment =
       (llvm::Twine("add.u64 ") + start + ", " + start + ", 1;").str();
   auto incrementLine = llvm::find(lines, increment);
-  return *startConversion < *partitionStart &&
+  if (incrementLine == lines.end())
+    return false;
+  const size_t incrementIndex =
+      static_cast<size_t>(std::distance(lines.begin(), incrementLine));
+  const std::string backedge = (llvm::Twine("bra ") + loopLabel + ";").str();
+  const std::string exitLabel = (llvm::Twine(*extentExit) + ":").str();
+  return incrementIndex + 2 < lines.size() &&
+         *startConversion < *partitionStart &&
          *partitionStart < *partitionEnd && *partitionEnd < *extentGuard &&
          *extentGuard < *endGuard && *endGuard < *linearIndex &&
-         incrementLine != lines.end() &&
-         *linearIndex <
-             static_cast<size_t>(std::distance(lines.begin(), incrementLine));
+         *linearIndex < incrementIndex &&
+         lines[incrementIndex + 1] == backedge &&
+         lines[incrementIndex + 2] == exitLabel;
 }
 
 bool hasDependentRowFoldPhaseDataflow(llvm::StringRef ptx,
@@ -5937,12 +5967,23 @@ TEST(Abi22MapFusionContract,
         EXPECT_TRUE(contractFoldPtx.contains("fma.rn.f32"));
         EXPECT_TRUE(contractFoldPtx.contains("st.shared.f32"));
         EXPECT_TRUE(contractFoldPtx.contains("ld.shared.f32"));
+        auto schedules = llvm::to_vector(
+            executableBuilt->module
+                ->getOps<mlir::shuttle::SchedulePlanOp>());
+        ASSERT_EQ(schedules.size(), 1u);
+        auto scheduleTasks = llvm::to_vector(
+            schedules.front()
+                .getBody()
+                .front()
+                .getOps<mlir::shuttle::ScheduleTaskOp>());
+        auto firstSchedule =
+            llvm::find_if(scheduleTasks, [&](auto scheduleTask) {
+              return scheduleTask.getOrdinal() == first->getOrdinal();
+            });
+        ASSERT_NE(firstSchedule, scheduleTasks.end());
         const int64_t foldReduction = fixture.fullContractShape.back();
-        const int64_t foldTile = std::min<int64_t>(foldReduction, 256);
-        const int64_t foldSerialTiles =
-            (foldReduction + foldTile - 1) / foldTile;
         EXPECT_TRUE(hasContiguousU64CompositionFoldLoop(
-            contractFoldPtx, foldReduction, foldSerialTiles));
+            contractFoldPtx, foldReduction, firstSchedule->getSerialTiles()));
         EXPECT_EQ(mapContractPtx.count(".param .u64 p"), 4u);
         EXPECT_EQ(mapContractPtx.count("st.global.f32"), 1u);
         EXPECT_TRUE(mapContractPtx.contains("[p0]"));
