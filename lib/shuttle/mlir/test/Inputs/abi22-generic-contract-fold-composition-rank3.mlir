@@ -29,7 +29,7 @@ module @different_anonymous_graph attributes {
         indexing_maps = [#contract0_lhs, #contract0_rhs, #contract0_out],
         iterator_kinds = ["parallel", "parallel", "parallel", "reduction"],
         precision = ["DEFAULT", "DEFAULT"],
-        source = #shuttle.source_ref<0, 0, 0, 4>
+        source = #shuttle.source_ref<0, 0, 4, 0>
       } : (tensor<2x3x4xf32>, tensor<4x11xf32>) -> tensor<2x3x11xf32>
       %s = "shuttle.fold"(%h, %region_zero) ({
       ^bb0(%element: f32, %accumulator: f32):
@@ -39,7 +39,7 @@ module @different_anonymous_graph attributes {
         accumulator_types = [f32],
         operandSegmentSizes = array<i32: 1, 1>, order_free = true,
         reduction_dimensions = array<i64: 2>,
-        source = #shuttle.source_ref<0, 0, 0, 6>
+        source = #shuttle.source_ref<0, 0, 6, 0>
       } : (tensor<2x3x11xf32>, tensor<f32>) -> tensor<2x3xf32>
       %z = "shuttle.map"(%h, %s) ({
       ^bb0(%element: f32, %scale: f32):
@@ -47,22 +47,22 @@ module @different_anonymous_graph attributes {
         "shuttle.yield"(%scaled) : (f32) -> ()
       }) {
         indexing_maps = [#identity, #prefix, #identity],
-        source = #shuttle.source_ref<0, 0, 0, 9>
+        source = #shuttle.source_ref<0, 0, 9, 0>
       } : (tensor<2x3x11xf32>, tensor<2x3xf32>) -> tensor<2x3x11xf32>
       %y = "shuttle.contract"(%z, %region_projection) {
         accumulator_types = [f32], algorithm = "dot_general",
         indexing_maps = [#contract1_lhs, #contract1_rhs, #contract1_out],
         iterator_kinds = ["parallel", "parallel", "parallel", "reduction"],
         precision = ["DEFAULT", "DEFAULT"],
-        source = #shuttle.source_ref<0, 0, 0, 13>
+        source = #shuttle.source_ref<0, 0, 13, 0>
       } : (tensor<2x3x11xf32>, tensor<11x13xf32>) -> tensor<2x3x13xf32>
       "shuttle.yield"(%y) : (tensor<2x3x13xf32>) -> ()
     }) {
       policy = #shuttle.policy<source_ordered>,
-      source_refs = [#shuttle.source_ref<0, 0, 0, 4>,
-                     #shuttle.source_ref<0, 0, 0, 6>,
-                     #shuttle.source_ref<0, 0, 0, 9>,
-                     #shuttle.source_ref<0, 0, 0, 13>]
+      source_refs = [#shuttle.source_ref<0, 0, 4, 0>,
+                     #shuttle.source_ref<0, 0, 6, 0>,
+                     #shuttle.source_ref<0, 0, 9, 0>,
+                     #shuttle.source_ref<0, 0, 13, 0>]
     } : (tensor<2x3x4xf32>, tensor<4x11xf32>, tensor<11x13xf32>, tensor<f32>)
         -> tensor<2x3x13xf32>
     return %result : tensor<2x3x13xf32>

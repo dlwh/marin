@@ -61,9 +61,11 @@ and operation attributes:
 - `Contract0` has exactly the two internal users `Fold` and `Map`. Its result is
   private and crosses only from partition 0 to partition 1. An extra user or
   live-out rejects this composition.
-- `Fold` is closed additive FP32 reduction with exact positive-zero initializer
-  and the declared numerical order. Its result is static FP32 and has fewer
-  elements than `Contract0`'s result.
+- `Fold` is a closed additive FP32 reduction with one public scalar FP32
+  initializer and the declared numerical order. The initializer's external
+  binding is preserved and its value is added exactly once after the reduced
+  `Contract0` leaves. The Fold result is static FP32 and has fewer elements
+  than `Contract0`'s result.
 - `Map` is a closed scalar map. One input is `Contract0`; another is the Fold
   result through a legal projected or broadcast indexing map. The Map result
   is consumed by `Contract1` and has no external use.

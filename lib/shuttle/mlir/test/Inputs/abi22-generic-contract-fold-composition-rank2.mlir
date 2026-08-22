@@ -38,7 +38,7 @@ module @anonymous_graph_a attributes {
         accumulator_types = [f32],
         operandSegmentSizes = array<i32: 1, 1>, order_free = true,
         reduction_dimensions = array<i64: 1>,
-        source = #shuttle.source_ref<0, 0, 0, 1>
+        source = #shuttle.source_ref<0, 0, 1, 0>
       } : (tensor<2x5xf32>, tensor<f32>) -> tensor<2xf32>
       %z = "shuttle.map"(%h, %s) ({
       ^bb0(%element: f32, %scale: f32):
@@ -46,22 +46,22 @@ module @anonymous_graph_a attributes {
         "shuttle.yield"(%scaled) : (f32) -> ()
       }) {
         indexing_maps = [#identity, #row, #identity],
-        source = #shuttle.source_ref<0, 0, 0, 2>
+        source = #shuttle.source_ref<0, 0, 2, 0>
       } : (tensor<2x5xf32>, tensor<2xf32>) -> tensor<2x5xf32>
       %y = "shuttle.contract"(%z, %region_p) {
         accumulator_types = [f32], algorithm = "dot_general",
         indexing_maps = [#contract1_lhs, #contract1_rhs, #contract1_out],
         iterator_kinds = ["parallel", "parallel", "reduction"],
         precision = ["DEFAULT", "DEFAULT"],
-        source = #shuttle.source_ref<0, 0, 0, 3>
+        source = #shuttle.source_ref<0, 0, 3, 0>
       } : (tensor<2x5xf32>, tensor<5x7xf32>) -> tensor<2x7xf32>
       "shuttle.yield"(%y) : (tensor<2x7xf32>) -> ()
     }) {
       policy = #shuttle.policy<source_ordered>,
       source_refs = [#shuttle.source_ref<0, 0, 0, 0>,
-                     #shuttle.source_ref<0, 0, 0, 1>,
-                     #shuttle.source_ref<0, 0, 0, 2>,
-                     #shuttle.source_ref<0, 0, 0, 3>]
+                     #shuttle.source_ref<0, 0, 1, 0>,
+                     #shuttle.source_ref<0, 0, 2, 0>,
+                     #shuttle.source_ref<0, 0, 3, 0>]
     } : (tensor<2x3xf32>, tensor<3x5xf32>, tensor<5x7xf32>, tensor<f32>)
         -> tensor<2x7xf32>
     return %result : tensor<2x7xf32>

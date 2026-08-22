@@ -5797,6 +5797,40 @@ TEST(Abi22MapFusionContract,
         std::unique_ptr<BuiltModule> executableBuilt =
             buildAlgebra(*source, policy, true, renamed);
         ASSERT_TRUE(executableBuilt);
+        auto device = *executableBuilt->module
+                           ->getOps<mlir::shuttle::DeviceModuleOp>()
+                           .begin();
+        auto entries = llvm::to_vector(
+            device.getBody().front().getOps<mlir::shuttle::DeviceEntryOp>());
+        ASSERT_GT(entries.size(),
+                  static_cast<size_t>(second->getOrdinal()));
+        auto entryPtx = [&](int64_t ordinal) {
+          mlir::shuttle::DeviceEntryOp entry = entries[ordinal];
+          return llvm::StringRef(
+              reinterpret_cast<const char *>(device.getCode().data() +
+                                               entry.getCodeOffset()),
+              entry.getCodeLength());
+        };
+        llvm::StringRef contractFoldPtx = entryPtx(first->getOrdinal());
+        llvm::StringRef mapContractPtx = entryPtx(second->getOrdinal());
+        EXPECT_EQ(contractFoldPtx.count(".param .u64 p"), 5u);
+        EXPECT_EQ(contractFoldPtx.count("st.global.f32"), 2u);
+        EXPECT_TRUE(contractFoldPtx.contains("[p0]"));
+        EXPECT_TRUE(contractFoldPtx.contains("[p1]"));
+        EXPECT_TRUE(contractFoldPtx.contains("[p2]"));
+        EXPECT_TRUE(contractFoldPtx.contains("[p3]"));
+        EXPECT_TRUE(contractFoldPtx.contains("[p4]"));
+        EXPECT_TRUE(contractFoldPtx.contains("fma.rn.f32"));
+        EXPECT_TRUE(contractFoldPtx.contains("st.shared.f32"));
+        EXPECT_TRUE(contractFoldPtx.contains("ld.shared.f32"));
+        EXPECT_EQ(mapContractPtx.count(".param .u64 p"), 4u);
+        EXPECT_EQ(mapContractPtx.count("st.global.f32"), 1u);
+        EXPECT_TRUE(mapContractPtx.contains("[p0]"));
+        EXPECT_TRUE(mapContractPtx.contains("[p1]"));
+        EXPECT_TRUE(mapContractPtx.contains("[p2]"));
+        EXPECT_TRUE(mapContractPtx.contains("[p3]"));
+        EXPECT_TRUE(mapContractPtx.contains("mul.rn.f32"));
+        EXPECT_TRUE(mapContractPtx.contains("fma.rn.f32"));
         mlir::FailureOr<llvm::SmallVector<uint8_t>> transport =
             mlir::shuttle::serializeGpuExecutableBundle(
                 *executableBuilt->module);
