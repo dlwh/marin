@@ -8,6 +8,7 @@
 #include <exception>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -40,6 +41,16 @@ namespace se = stream_executor;
 
 absl::Status invalid(llvm::StringRef message) {
   return absl::InvalidArgumentError(message.str());
+}
+
+std::optional<xla::PrimitiveType> externalPrimitive(RankedTensorType type) {
+  if (!type || !type.hasStaticShape() || type.getRank() > 8)
+    return std::nullopt;
+  if (type.getElementType().isBF16() && type.getRank() >= 1)
+    return xla::PrimitiveType::BF16;
+  if (type.getElementType().isF32())
+    return xla::PrimitiveType::F32;
+  return std::nullopt;
 }
 
 struct ExternalProjection {
@@ -102,17 +113,15 @@ absl::Status addBuffer(ffi::CallFrameBuilder &builder,
                        const GpuExternalBinding &binding,
                        const GpuRunnerBuffer &buffer, bool result) {
   auto tensor = dyn_cast<RankedTensorType>(binding.tensorType);
-  if (!tensor || !tensor.hasStaticShape() ||
-      !tensor.getElementType().isBF16() || buffer.sizeBytes <= 0 ||
+  std::optional<xla::PrimitiveType> primitive = externalPrimitive(tensor);
+  if (!primitive || buffer.sizeBytes <= 0 ||
       buffer.sizeBytes != binding.requiredBytes)
     return invalid("GPU runner buffer does not match the executable ABI");
   se::DeviceAddressBase address(buffer.data, buffer.sizeBytes);
   if (result)
-    builder.AddBufferRet(address, xla::PrimitiveType::BF16,
-                         tensor.getShape());
+    builder.AddBufferRet(address, *primitive, tensor.getShape());
   else
-    builder.AddBufferArg(address, xla::PrimitiveType::BF16,
-                         tensor.getShape());
+    builder.AddBufferArg(address, *primitive, tensor.getShape());
   return absl::OkStatus();
 }
 

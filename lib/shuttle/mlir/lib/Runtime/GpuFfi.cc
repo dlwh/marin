@@ -9,6 +9,7 @@
 #include <limits>
 #include <memory>
 #include <new>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -59,6 +60,21 @@ absl::Status invalid(StringRef message) {
   return absl::InvalidArgumentError(message.str());
 }
 
+struct ExternalElement {
+  xla::PrimitiveType primitive;
+  int64_t width;
+};
+
+std::optional<ExternalElement> externalElement(RankedTensorType type) {
+  if (!type || !type.hasStaticShape() || type.getRank() > 8)
+    return std::nullopt;
+  if (type.getElementType().isBF16() && type.getRank() >= 1)
+    return ExternalElement{xla::PrimitiveType::BF16, 2};
+  if (type.getElementType().isF32())
+    return ExternalElement{xla::PrimitiveType::F32, 4};
+  return std::nullopt;
+}
+
 absl::Status projectBindings(ArrayRef<GpuExternalBinding> bindings,
                              std::vector<GpuExternalBinding> &operands,
                              std::vector<GpuExternalBinding> &results) {
@@ -74,10 +90,11 @@ absl::Status projectBindings(ArrayRef<GpuExternalBinding> bindings,
     if (binding.index < 0)
       return invalid("GPU executable external projection index is invalid");
     auto type = dyn_cast<RankedTensorType>(binding.tensorType);
+    std::optional<ExternalElement> element = externalElement(type);
     int64_t elements = 1;
-    if (!type || !type.getElementType().isBF16() || !type.hasStaticShape() ||
-        type.getRank() < 1 || type.getRank() > 8 || binding.slotOrdinal < 0 ||
-        !slots.insert(binding.slotOrdinal).second || binding.alignment != 2)
+    if (!element || binding.slotOrdinal < 0 ||
+        !slots.insert(binding.slotOrdinal).second ||
+        binding.alignment != element->width)
       return invalid("GPU executable external projection type is invalid");
     for (int64_t extent : type.getShape()) {
       if (extent <= 0 ||
@@ -85,8 +102,8 @@ absl::Status projectBindings(ArrayRef<GpuExternalBinding> bindings,
         return invalid("GPU executable external projection shape is invalid");
       elements *= extent;
     }
-    if (elements > std::numeric_limits<int64_t>::max() / 2 ||
-        binding.requiredBytes != elements * 2)
+    if (elements > std::numeric_limits<int64_t>::max() / element->width ||
+        binding.requiredBytes != elements * element->width)
       return invalid("GPU executable external projection bytes are invalid");
     projection->push_back(binding);
   }
@@ -111,7 +128,8 @@ absl::Status projectBindings(ArrayRef<GpuExternalBinding> bindings,
 absl::Status bufferMatches(const GpuExternalBinding &binding,
                            const ffi::AnyBuffer &buffer, bool requireData) {
   auto type = dyn_cast<RankedTensorType>(binding.tensorType);
-  if (!type || buffer.element_type() != xla::PrimitiveType::BF16 ||
+  std::optional<ExternalElement> element = externalElement(type);
+  if (!element || buffer.element_type() != element->primitive ||
       buffer.dimensions().size() != static_cast<size_t>(type.getRank()) ||
       !std::equal(buffer.dimensions().begin(), buffer.dimensions().end(),
                   type.getShape().begin(), type.getShape().end()) ||

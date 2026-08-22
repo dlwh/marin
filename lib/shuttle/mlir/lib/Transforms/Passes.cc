@@ -11103,8 +11103,10 @@ FailureOr<PreparedGpuCall> prepareGpuCall(ModuleOp module, RegionOp region,
     return failure();
   auto closedExternalType = [](Value value) {
     auto tensor = dyn_cast<RankedTensorType>(value.getType());
-    return tensor && tensor.hasStaticShape() && tensor.getRank() >= 1 &&
-           tensor.getRank() <= 8 && tensor.getElementType().isBF16();
+    if (!tensor || !tensor.hasStaticShape() || tensor.getRank() > 8)
+      return false;
+    return tensor.getElementType().isF32() ||
+           (tensor.getElementType().isBF16() && tensor.getRank() >= 1);
   };
   if (!llvm::all_of(region.getInputs(), closedExternalType) ||
       !llvm::all_of(region.getResults(), closedExternalType))
