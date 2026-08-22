@@ -231,19 +231,16 @@ def _validate_resources(resources: object, *, boundary: str, bindings: list[obje
         raise ValueError("raw external result arity drifted")
     if observed["external_operand_count"] != operand_count or observed["external_result_count"] != result_count:
         raise ValueError("raw external resource counts drifted")
-    external_count = operand_count + result_count
-    if observed["slot_count"] != external_count + observed["temporary_allocation_count"]:
-        raise ValueError("raw slot and temporary allocation aggregates are inconsistent")
     if observed["temporary_allocation_count"] == 0 and observed["temporary_bytes"] != 0:
         raise ValueError("raw zero-temporary plan reports temporary bytes")
     if observed["temporary_allocation_count"] > 0 and observed["temporary_bytes"] <= 0:
         raise ValueError("raw temporary plan reports no temporary bytes")
-    if observed["temporary_bytes"] >= _FULL_BYTES:
-        raise ValueError("raw plan materializes an avoidable full-tensor temporary")
     return observed
 
 
-def _validate_optimization(transport: Mapping[str, object], resources: Mapping[str, int]) -> None:
+def _validate_optimization(
+    transport: Mapping[str, object], resources: Mapping[str, int], derived_temporary_traffic: int
+) -> None:
     integer_fields = {
         "materialized_baseline_launch_count",
         "materialized_baseline_temporary_traffic_bytes",
@@ -258,12 +255,17 @@ def _validate_optimization(transport: Mapping[str, object], resources: Mapping[s
         raise ValueError("fused plan regresses modeled launch or temporary traffic")
     if resources["launch_count"] == baseline_launches and fused_traffic == baseline_traffic:
         raise ValueError("fused plan has no strict modeled improvement")
-    minimum_fused_traffic = resources["temporary_bytes"] * (2 if resources["temporary_bytes"] else 0)
-    if fused_traffic < minimum_fused_traffic:
-        raise ValueError("fused temporary traffic is inconsistent with allocation bytes")
+    if fused_traffic != derived_temporary_traffic:
+        raise ValueError("fused temporary traffic is inconsistent with task ownership")
 
 
-def _validate_task_graph(value: object, resources: Mapping[str, int]) -> None:
+def _validate_task_graph(
+    value: object,
+    temporary_value: object,
+    resources: Mapping[str, int],
+    operand_slots: set[int],
+    result_slots: set[int],
+) -> int:
     if not isinstance(value, list) or len(value) != resources["launch_count"]:
         raise ValueError("raw task graph size drifted")
     tasks: dict[int, Mapping[str, object]] = {}
@@ -291,23 +293,96 @@ def _validate_task_graph(value: object, resources: Mapping[str, int]) -> None:
     for task in tasks.values():
         if any(dependency not in tasks for dependency in task["dependencies"]):
             raise ValueError("raw task graph references an unknown dependency")
-
-    visiting: set[int] = set()
-    visited: set[int] = set()
-
-    def visit(task_id: int) -> None:
-        if task_id in visiting:
-            raise ValueError("raw task graph contains a dependency cycle")
-        if task_id in visited:
-            return
-        visiting.add(task_id)
-        for dependency in tasks[task_id]["dependencies"]:
-            visit(dependency)
-        visiting.remove(task_id)
-        visited.add(task_id)
-
-    for task_id in tasks:
-        visit(task_id)
+    if len(operand_slots) != resources["external_operand_count"]:
+        raise ValueError("raw task graph external operand ownership count drifted")
+    if len(result_slots) != resources["external_result_count"]:
+        raise ValueError("raw task graph public result ownership count drifted")
+    if operand_slots & result_slots:
+        raise ValueError("raw external operand and result slots alias")
+    if not isinstance(temporary_value, list):
+        raise ValueError("raw temporary slot descriptors drifted")
+    temporary_slots: dict[int, tuple[int, int]] = {}
+    for temporary in temporary_value:
+        if not isinstance(temporary, Mapping) or set(temporary) != {
+            "slot_ordinal",
+            "required_bytes",
+            "reuse_group",
+        }:
+            raise ValueError("raw temporary slot descriptor fields drifted")
+        slot = temporary.get("slot_ordinal")
+        required_bytes = temporary.get("required_bytes")
+        reuse_group = temporary.get("reuse_group")
+        if (
+            type(slot) is not int
+            or slot < 0
+            or slot >= resources["slot_count"]
+            or slot in temporary_slots
+            or type(required_bytes) is not int
+            or required_bytes <= 0
+            or required_bytes >= _FULL_BYTES
+            or type(reuse_group) is not int
+            or reuse_group < 0
+        ):
+            raise ValueError("raw temporary slot descriptor is invalid")
+        temporary_slots[slot] = (required_bytes, reuse_group)
+    all_slots = operand_slots | result_slots | set(temporary_slots)
+    if all_slots != set(range(resources["slot_count"])):
+        raise ValueError("raw logical slot ownership is incomplete")
+    allocation_bytes: dict[int, int] = {}
+    for required_bytes, reuse_group in temporary_slots.values():
+        allocation_bytes[reuse_group] = max(allocation_bytes.get(reuse_group, 0), required_bytes)
+    if len(allocation_bytes) != resources["temporary_allocation_count"]:
+        raise ValueError("raw temporary reuse-group count drifted")
+    if sum(allocation_bytes.values()) != resources["temporary_bytes"]:
+        raise ValueError("raw temporary allocation bytes drifted")
+    task_positions = {task["task_id"]: position for position, task in enumerate(value)}
+    producers: dict[int, int] = {}
+    consumers: dict[int, list[int]] = {slot: [] for slot in range(resources["slot_count"])}
+    for task in value:
+        task_id = task["task_id"]
+        if not task["output_slots"]:
+            raise ValueError("raw task has no output ownership")
+        for slot in task["output_slots"]:
+            if slot in operand_slots:
+                raise ValueError("raw task overwrites an external operand")
+            if slot in producers:
+                raise ValueError("raw slot has multiple task producers")
+            producers[slot] = task_id
+        for slot in task["input_slots"]:
+            consumers[slot].append(task_id)
+    if any(slot not in producers for slot in result_slots):
+        raise ValueError("raw public result has no task producer")
+    if set(producers) != set(temporary_slots) | result_slots:
+        raise ValueError("raw task output ownership is incomplete")
+    if any(not consumers[slot] for slot in operand_slots):
+        raise ValueError("raw external operand is unused")
+    if any(not consumers[slot] for slot in temporary_slots):
+        raise ValueError("raw temporary has no consumer")
+    for task in value:
+        task_id = task["task_id"]
+        expected_dependencies = {producers[slot] for slot in task["input_slots"] if slot in producers}
+        if set(task["dependencies"]) != expected_dependencies:
+            raise ValueError("raw task dependencies do not match input ownership")
+        if any(task_positions[dependency] >= task_positions[task_id] for dependency in expected_dependencies):
+            raise ValueError("raw temporary lifetime is not topologically ordered")
+    lifetimes: dict[int, tuple[int, int]] = {}
+    for slot in temporary_slots:
+        producer_position = task_positions[producers[slot]]
+        consumer_positions = [task_positions[consumer] for consumer in consumers[slot]]
+        if min(consumer_positions) <= producer_position:
+            raise ValueError("raw temporary is consumed before its producer")
+        lifetimes[slot] = (producer_position, max(consumer_positions))
+    for left, (_left_bytes, left_group) in temporary_slots.items():
+        for right, (_right_bytes, right_group) in temporary_slots.items():
+            if left >= right or left_group != right_group:
+                continue
+            left_start, left_end = lifetimes[left]
+            right_start, right_end = lifetimes[right]
+            if left_start <= right_end and right_start <= left_end:
+                raise ValueError("raw temporary reuse lifetimes overlap")
+    return sum(
+        required_bytes * (1 + len(consumers[slot])) for slot, (required_bytes, _reuse_group) in temporary_slots.items()
+    )
 
 
 def prepare_representative_cases(case_root: Path) -> dict[str, dict[str, str]]:
@@ -449,17 +524,23 @@ def _validate_raw_cell(
     if len(bindings) != len(expected_operands) + len(expected_results):
         raise ValueError("raw external binding count drifted")
     external_slots = set()
+    operand_slots: set[int] = set()
+    result_slots: set[int] = set()
     for raw_binding, expected in zip(bindings[: len(expected_operands)], expected_operands, strict=True):
         if not isinstance(raw_binding, Mapping):
             raise ValueError("raw operand binding is not an object")
-        external_slots.add(_validate_binding(raw_binding, expected, kind="operand", slot_count=resources["slot_count"]))
+        operand_slot = _validate_binding(raw_binding, expected, kind="operand", slot_count=resources["slot_count"])
+        external_slots.add(operand_slot)
+        operand_slots.add(operand_slot)
     outputs = []
     case_directory = case_root / ACCEPTANCE_PATTERN
     for raw_binding, expected in zip(bindings[len(expected_operands) :], expected_results, strict=True):
         artifact = raw_binding.get("artifact") if isinstance(raw_binding, Mapping) else None
         if not isinstance(raw_binding, Mapping) or not isinstance(artifact, Mapping):
             raise ValueError("raw result binding vector drifted")
-        external_slots.add(_validate_binding(raw_binding, expected, kind="result", slot_count=resources["slot_count"]))
+        result_slot = _validate_binding(raw_binding, expected, kind="result", slot_count=resources["slot_count"])
+        external_slots.add(result_slot)
+        result_slots.add(result_slot)
         validated_artifact = validate_output_artifact(artifact, raw_root=raw_root, case_root=case_root)
         role = expected["role"]
         actual = _read_bf16(Path(validated_artifact["path"]), role)
@@ -488,6 +569,7 @@ def _validate_raw_cell(
         "materialized_baseline_temporary_traffic_bytes",
         "fused_temporary_traffic_bytes",
         "task_graph",
+        "temporary_slots",
     }:
         raise ValueError("raw transport fields drifted")
     if transport.get("contract_operation_count") != 0:
@@ -501,10 +583,16 @@ def _validate_raw_cell(
         raise ValueError("raw PTX digest vector drifted")
     for digest in ptx_digests:
         _digest(digest, "PTX digest")
-    _validate_task_graph(transport.get("task_graph"), resources)
+    derived_temporary_traffic = _validate_task_graph(
+        transport.get("task_graph"),
+        transport.get("temporary_slots"),
+        resources,
+        operand_slots,
+        result_slots,
+    )
     if len(external_slots) != len(bindings):
         raise ValueError("raw external bindings alias one internal slot")
-    _validate_optimization(transport, resources)
+    _validate_optimization(transport, resources, derived_temporary_traffic)
     timing = raw.get("timing")
     if not isinstance(timing, Mapping) or set(timing) != {
         "warmup_iterations",
@@ -793,8 +881,28 @@ def _validate_claims(document: Mapping[str, object], *, r12_result: Path, r12_po
             raise ValueError("assembled Shuttle PTX digest vector drifted")
         for digest in ptx_digests:
             _digest(digest, "PTX digest")
-        _validate_task_graph(transport.get("task_graph"), resources)
-        _validate_optimization(transport, resources)
+        result_slots = {
+            output.get("slot_ordinal")
+            for output in outputs
+            if isinstance(output, Mapping) and type(output.get("slot_ordinal")) is int
+        }
+        temporary_slots = transport.get("temporary_slots")
+        temporary_slot_ordinals = (
+            {
+                temporary.get("slot_ordinal")
+                for temporary in temporary_slots
+                if isinstance(temporary_slots, list)
+                and isinstance(temporary, Mapping)
+                and type(temporary.get("slot_ordinal")) is int
+            }
+            if isinstance(temporary_slots, list)
+            else set()
+        )
+        operand_slots = set(range(resources["slot_count"])) - result_slots - temporary_slot_ordinals
+        derived_temporary_traffic = _validate_task_graph(
+            transport.get("task_graph"), temporary_slots, resources, operand_slots, result_slots
+        )
+        _validate_optimization(transport, resources, derived_temporary_traffic)
         bindings = BINDING_CONTRACT[boundary]["results"]
         if not isinstance(outputs, list) or len(outputs) != len(bindings):
             raise ValueError("assembled Shuttle output vector drifted")

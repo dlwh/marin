@@ -7384,6 +7384,16 @@ TEST(GpuTransportV2Test,
   llvm::json::Array ptxDigests;
   for (const auto &launch : (*executable)->launches())
     ptxDigests.push_back(launch.codeDigest);
+  llvm::json::Array temporarySlots;
+  for (const mlir::shuttle::GpuSlot &slot : (*executable)->slots()) {
+    if (slot.storage != mlir::shuttle::MaterializationStorage::Temporary)
+      continue;
+    temporarySlots.push_back(llvm::json::Object{
+        {"slot_ordinal", slot.ordinal},
+        {"required_bytes", slot.requiredBytes},
+        {"reuse_group", slot.reuseGroup},
+    });
+  }
   llvm::json::Array taskGraph;
   for (const auto &launch : (*executable)->launches()) {
     llvm::json::Array dependencies;
@@ -7431,6 +7441,7 @@ TEST(GpuTransportV2Test,
             temporaryTraffic(**materializedExecutable)},
            {"fused_temporary_traffic_bytes", temporaryTraffic(**executable)},
            {"task_graph", std::move(taskGraph)},
+           {"temporary_slots", std::move(temporarySlots)},
            {"code_bytes",
             static_cast<int64_t>((*executable)->codeBytes().size())},
            {"executable_digest",

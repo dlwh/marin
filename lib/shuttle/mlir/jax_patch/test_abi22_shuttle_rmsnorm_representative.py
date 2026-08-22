@@ -355,7 +355,20 @@ def _fake_runner(
         )
         next(binding for binding in external_bindings if binding["kind"] == "result")["slot_ordinal"] = 3
         cell["transport"]["ptx_digests"].append(_sha(f"ptx/{policy}/{boundary}/split"))
-    elif topology_variant not in (None, "split_forward", "renumbered_tasks"):
+    elif topology_variant == "reused_temporaries" and boundary == "backward_recompute":
+        cell["resources"].update(
+            {
+                "launch_count": 4,
+                "slot_count": 7,
+                "temporary_allocation_count": 1,
+                "temporary_bytes": 2048 * 4,
+            }
+        )
+        results = [binding for binding in external_bindings if binding["kind"] == "result"]
+        results[0]["slot_ordinal"] = 3
+        results[1]["slot_ordinal"] = 4
+        cell["transport"]["ptx_digests"].append(_sha(f"ptx/{policy}/{boundary}/reuse"))
+    elif topology_variant not in (None, "split_forward", "renumbered_tasks", "reused_temporaries"):
         raise AssertionError(topology_variant)
     operand_slots = [binding["slot_ordinal"] for binding in external_bindings if binding["kind"] == "operand"]
     result_slots = [binding["slot_ordinal"] for binding in external_bindings if binding["kind"] == "result"]
@@ -365,23 +378,48 @@ def _fake_runner(
     if topology_variant == "renumbered_tasks":
         task_ids = [100 + 7 * (launch_count - ordinal) for ordinal in range(launch_count)]
     task_graph = []
-    for ordinal, task_id in enumerate(task_ids):
-        if temporary_slots and ordinal == 0:
-            outputs = [temporary_slots[0]]
-        else:
-            result_ordinal = ordinal - (1 if temporary_slots else 0)
-            outputs = [result_slots[result_ordinal]]
-        task_graph.append(
-            {
-                "task_id": task_id,
-                "dependencies": [] if ordinal == 0 else [task_ids[0]],
-                "input_slots": operand_slots + ([] if ordinal == 0 else temporary_slots),
-                "output_slots": outputs,
-            }
-        )
+    if topology_variant == "reused_temporaries" and boundary == "backward_recompute":
+        for ordinal, task_id in enumerate(task_ids):
+            chain = ordinal // 2
+            input_slots = operand_slots if ordinal % 2 == 0 else [*operand_slots, temporary_slots[chain]]
+            output_slots = [temporary_slots[chain]] if ordinal % 2 == 0 else [result_slots[chain]]
+            task_graph.append(
+                {
+                    "task_id": task_id,
+                    "dependencies": [] if ordinal % 2 == 0 else [task_ids[ordinal - 1]],
+                    "input_slots": input_slots,
+                    "output_slots": output_slots,
+                }
+            )
+    else:
+        for ordinal, task_id in enumerate(task_ids):
+            if temporary_slots and ordinal == 0:
+                outputs = [temporary_slots[0]]
+            else:
+                result_ordinal = ordinal - (1 if temporary_slots else 0)
+                outputs = [result_slots[result_ordinal]]
+            task_graph.append(
+                {
+                    "task_id": task_id,
+                    "dependencies": [] if ordinal == 0 else [task_ids[0]],
+                    "input_slots": operand_slots + ([] if ordinal == 0 else temporary_slots),
+                    "output_slots": outputs,
+                }
+            )
     cell["transport"]["task_graph"] = task_graph
-    temporary_bytes = cell["resources"]["temporary_bytes"]
-    fused_temporary_traffic = temporary_bytes * (2 if temporary_bytes else 0)
+    cell["transport"]["temporary_slots"] = [
+        {
+            "slot_ordinal": slot,
+            "required_bytes": 2048 * 4,
+            "reuse_group": 0 if topology_variant == "reused_temporaries" else slot,
+        }
+        for slot in temporary_slots
+    ]
+    fused_temporary_traffic = sum(
+        temporary["required_bytes"]
+        * (1 + sum(temporary["slot_ordinal"] in task["input_slots"] for task in cell["transport"]["task_graph"]))
+        for temporary in cell["transport"]["temporary_slots"]
+    )
     cell["transport"].update(
         {
             "materialized_baseline_launch_count": cell["resources"]["launch_count"] + 1,
@@ -396,7 +434,20 @@ def _fake_runner(
             results[1]["runner_index"],
             results[0]["runner_index"],
         )
-    elif first_coordinate and raw_mutation not in (None, "backward_runner_index"):
+    elif raw_mutation == "missing_producer_dependency" and coordinate == (
+        "source_ordered",
+        "backward_recompute",
+        0,
+    ):
+        cell["transport"]["task_graph"][1]["dependencies"] = []
+    elif raw_mutation == "temporary_traffic" and coordinate == ("source_ordered", "backward_recompute", 0):
+        cell["transport"]["fused_temporary_traffic_bytes"] -= 1
+    elif first_coordinate and raw_mutation not in (
+        None,
+        "backward_runner_index",
+        "missing_producer_dependency",
+        "temporary_traffic",
+    ):
         operand = next(binding for binding in external_bindings if binding["kind"] == "operand")
         result = next(binding for binding in external_bindings if binding["kind"] == "result")
         if raw_mutation == "operand_bytes":
@@ -423,6 +474,7 @@ def _fake_runner(
             cell["resources"]["slot_count"] += 1
         elif raw_mutation == "full_tensor_temporary":
             cell["resources"].update({"slot_count": 4, "temporary_allocation_count": 1, "temporary_bytes": FULL_BYTES})
+            cell["transport"]["temporary_slots"] = [{"slot_ordinal": 3, "required_bytes": FULL_BYTES, "reuse_group": 3}]
             cell["transport"]["fused_temporary_traffic_bytes"] = FULL_BYTES * 2
             cell["transport"]["materialized_baseline_temporary_traffic_bytes"] = FULL_BYTES * 2
         elif raw_mutation == "modeled_regression":
@@ -431,6 +483,10 @@ def _fake_runner(
             cell["transport"]["task_graph"][0]["dependencies"] = [cell["transport"]["task_graph"][-1]["task_id"]]
         elif raw_mutation == "task_slot":
             cell["transport"]["task_graph"][0]["input_slots"][0] = cell["resources"]["slot_count"]
+        elif raw_mutation == "missing_result_owner":
+            cell["transport"]["task_graph"][0]["output_slots"] = []
+        elif raw_mutation == "operand_producer":
+            cell["transport"]["task_graph"][0]["output_slots"].append(operand["slot_ordinal"])
         elif raw_mutation == "contract_transport":
             cell["transport"]["contract_operation_count"] = 1
         elif raw_mutation == "warmup_iterations":
@@ -643,6 +699,10 @@ FAILURE_MUTATIONS = (
     "modeled_regression",
     "task_cycle",
     "task_slot",
+    "missing_result_owner",
+    "missing_producer_dependency",
+    "operand_producer",
+    "temporary_traffic",
     "contract_transport",
     "warmup_iterations",
     "measured_iterations",
@@ -1199,7 +1259,7 @@ class RepresentativeRmsNormTest(unittest.TestCase):
         test_shell_wrapper_rejects_missing_or_ambiguous_derived_runfiles_root(
             self.temporary_path("wrapper-runfiles-invalid")
         )
-        for topology_variant in ("renumbered_slots", "renumbered_tasks", "split_forward"):
+        for topology_variant in ("renumbered_slots", "renumbered_tasks", "split_forward", "reused_temporaries"):
             with self.subTest(topology_variant=topology_variant):
                 test_executor_accepts_semantically_equivalent_resource_topologies(
                     self.temporary_path(f"topology-{topology_variant}"), self.case_root, topology_variant
