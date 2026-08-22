@@ -5922,3 +5922,42 @@ author: dlwh
   representative-shape and performance qualification. The composed path still
   has 36 or 37 temporaries and needs a separately reviewed optimization target
   before a performance claim.
+
+### 2026-08-21 - TLTC-ABI22-007 anonymous composition r1 numerical failure
+
+- Hypothesis: the registered ABI22 plugin can execute the anonymous ordinary-JAX
+  `Contract0 -> Fold / Map(h,s) -> Contract1` source at rank 2 and rank 3,
+  preserve the private `{h,s}` boundary and public `y`, repeat deterministically,
+  and satisfy the prospectively sealed independent binary64 numerical policy.
+- Executed source: reviewed commit
+  `977e678edb2c9fccb4b1c00f3b38b4fec1d9946e`, tree
+  `221e99f0943eba6ebd7cbd42ba1658a428b53e4a`, source-manifest SHA-256
+  `59fa929094d9f9b8563d2dd613d400ded559be0f0e0d3e137e3f170d0f5c8ca0`,
+  authorization SHA-256
+  `02375f1148b537b7672636f9bafe261167a6c215cb8d1252e8aed228535cec2c`,
+  and numerical-policy SHA-256
+  `202413163a8c78067b88043db7207eafdeb5b58116341e186398572280466a21`.
+- Config: `/dlwh/shuttle-track1-generic-composition-h100-canary-r1` ran on one
+  batch-priority H100 in `cw-us-east-02a`, with one replica and zero failure,
+  preemption, and task-failure budgets. The 20,464,855-byte request has SHA-256
+  `d5c2dab82ffd2e3b28859c0572b0b0c510c50219f61907f5bf53712a4059ec90`;
+  its 20,463,844-byte bundle has SHA-256
+  `f65cd22ddc26fd9c12d682ef11968504403dee336286c900508cb6a4444a3e2b`.
+- Result: Iris recorded one failed task, zero preemptions, and a 15 minute 40.43
+  second duration. The H100 worker reached generic composition coordinate
+  validation and rejected `maximum_absolute_error`. Sealed case-then-mode order
+  localizes the immediate abort to `rank2-a/disabled`. Both executions passed
+  f32 ABI, exact shape, finiteness, bitwise repeatability, and empty-observer
+  checks first. No enabled generic-composition coordinate ran.
+- Evidence limit: r1 serialized its canonical result only after all six
+  coordinates passed. The terminal tail does not contain the measured error,
+  output digest, or wheel hashes. The run proves a disabled ordinary-JAX
+  numerical gate failure but does not establish an enabled topology result or
+  identify a compiler cause.
+- Artifacts:
+  `lib/shuttle/mlir/artifacts/track1-generic-composition-h100-r1-failure-20260821/`
+  records the source, authorization, policy, request, bundle, job, and terminal
+  identities. The request bytes remain external.
+- Next action: emit one bounded canonical record before each unchanged
+  coordinate threshold check, then prepare one diagnostic-only r2 request for
+  review without submitting it.

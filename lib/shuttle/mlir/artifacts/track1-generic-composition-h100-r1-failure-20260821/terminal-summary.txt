@@ -1,0 +1,15 @@
+Job: /dlwh/shuttle-track1-generic-composition-h100-canary-r1
+Cluster: cw-us-east-02a
+State: failed
+Task attempts: 1
+Failures: 1
+Preemptions: 0
+Duration: 15 minutes and 40.43 seconds
+Terminal cause: prototype phase generic_composition exited with status 1
+Worker cause: generic composition result exceeds maximum_absolute_error
+Worker boundary: track1_generic_composition_h100_subject.validate_coordinate
+Canonical result: absent because the worker failed before final result serialization
+Coordinate attribution: rank2-a/disabled, derived from sealed case-then-mode order and immediate validation abort
+Checks passed before threshold: f32 ABI, exact shape, finiteness, bitwise repeat, disabled observer empty
+Enabled generic-composition coordinates executed: 0
+Automatic resubmit: disabled

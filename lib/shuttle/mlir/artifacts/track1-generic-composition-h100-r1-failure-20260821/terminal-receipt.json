@@ -1,0 +1,18 @@
+{
+  "authorization_sha256": "02375f1148b537b7672636f9bafe261167a6c215cb8d1252e8aed228535cec2c",
+  "automatic_resubmit": false,
+  "bundle_sha256": "f65cd22ddc26fd9c12d682ef11968504403dee336286c900508cb6a4444a3e2b",
+  "bundle_size": 20463844,
+  "campaign": "generic_composition_canary",
+  "config": "lib/iris/config/cw-us-east-02a.yaml",
+  "failures": 1,
+  "job_id": "/dlwh/shuttle-track1-generic-composition-h100-canary-r1",
+  "preemptions": 0,
+  "request_sha256": "d5c2dab82ffd2e3b28859c0572b0b0c510c50219f61907f5bf53712a4059ec90",
+  "request_size": 20464855,
+  "reviewed_source_commit": "977e678edb2c9fccb4b1c00f3b38b4fec1d9946e",
+  "reviewed_source_tree": "221e99f0943eba6ebd7cbd42ba1658a428b53e4a",
+  "state": "FAILED",
+  "task_duration": "15m40.43s",
+  "terminal_cause": "prototype phase generic_composition exited with status 1: generic composition result exceeds maximum_absolute_error"
+}
