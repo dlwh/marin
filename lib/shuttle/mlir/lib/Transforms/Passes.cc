@@ -4080,6 +4080,17 @@ struct PlannedTask {
     int64_t compactStatBytes;
   } contractRegionCost{};
   SmallVector<Operation *> contractRegionRecomputedSources;
+  std::string compositionKind;
+  SmallVector<Operation *> compositionSources;
+  struct CompositionCost {
+    int64_t baselineLaunches;
+    int64_t candidateLaunches;
+    int64_t baselineTemporaryBytes;
+    int64_t candidateTemporaryBytes;
+    int64_t baselineTemporaryTrafficBytes;
+    int64_t candidateTemporaryTrafficBytes;
+    int64_t contractEvaluations;
+  } compositionCost{};
 };
 
 struct PlannedBuffer {
@@ -4096,6 +4107,7 @@ struct DerivedPlan {
   bool hasRankNFold = false;
   bool hasFoldRegion = false;
   bool hasContractRegion = false;
+  bool hasContractFoldComposition = false;
 };
 
 bool hasIdentityResultMap(MapOp map) {
@@ -4247,6 +4259,12 @@ std::string contractRegionFingerprint(ArrayRef<Operation *> operations) {
   return closedRegionFingerprint("contract-region-v2", operations);
 }
 
+std::string compositionFingerprint(StringRef kind,
+                                   ArrayRef<Operation *> operations) {
+  return closedRegionFingerprint((llvm::Twine("composition-") + kind).str(),
+                                 operations);
+}
+
 bool isClosedFoldRegionMap(MapOp map) {
   if (!hasIdentityResultMap(map) || map.getNumResults() != 1)
     return false;
@@ -4360,6 +4378,273 @@ FailureOr<int64_t> checkedShapeElements(ArrayRef<int64_t> shape) {
     elements *= extent;
   }
   return elements;
+}
+
+FailureOr<int64_t> checkedTensorBytes(RankedTensorType type) {
+  FailureOr<int64_t> elements = checkedShapeElements(type.getShape());
+  if (!type.getElementType().isBF16() && !type.getElementType().isF32())
+    return failure();
+  const int64_t elementBytes = type.getElementType().isBF16() ? 2 : 4;
+  if (failed(elements) ||
+      *elements > std::numeric_limits<int64_t>::max() / elementBytes)
+    return failure();
+  return *elements * elementBytes;
+}
+
+bool isProjectedFoldStatistic(MapOp map, unsigned operand,
+                              RankedTensorType full, RankedTensorType compact) {
+  if (operand >= map.getInputs().size() ||
+      map.getInputs()[operand].getType() != compact ||
+      compact.getShape() != full.getShape().drop_back())
+    return false;
+  auto indexing = dyn_cast<AffineMapAttr>(map.getIndexingMaps()[operand]);
+  if (!indexing || indexing.getValue().getNumDims() != full.getRank() ||
+      indexing.getValue().getNumSymbols() != 0 ||
+      indexing.getValue().getNumResults() != compact.getRank())
+    return false;
+  for (auto [axis, expression] :
+       llvm::enumerate(indexing.getValue().getResults())) {
+    auto dimension = dyn_cast<AffineDimExpr>(expression);
+    if (!dimension || dimension.getPosition() != axis)
+      return false;
+  }
+  return true;
+}
+
+FailureOr<DerivedPlan>
+deriveGenericContractFoldCompositionPlan(RegionOp region,
+                                         const DerivedPlan &materialized) {
+  SmallVector<Operation *> algebra;
+  for (Operation &operation : region.getBody().front().without_terminator())
+    algebra.push_back(&operation);
+  if (algebra.size() != 4)
+    return failure();
+
+  SmallVector<ContractOp> contracts;
+  FoldOp fold;
+  MapOp map;
+  for (Operation *operation : algebra) {
+    if (auto contract = dyn_cast<ContractOp>(operation))
+      contracts.push_back(contract);
+    else if (auto candidate = dyn_cast<FoldOp>(operation)) {
+      if (fold)
+        return failure();
+      fold = candidate;
+    } else if (auto candidate = dyn_cast<MapOp>(operation)) {
+      if (map)
+        return failure();
+      map = candidate;
+    } else {
+      return failure();
+    }
+  }
+  if (contracts.size() != 2 || !fold || !map || map.getInputs().size() != 2 ||
+      map.getNumResults() != 1 || !isEligibleF32Map(map) ||
+      !isClosedAdditivePlanningFold(fold) || fold.getInputs().size() != 1 ||
+      fold.getInitializers().size() != 1 || fold.getNumResults() != 1)
+    return failure();
+
+  ContractOp first = fold.getInputs().front().getDefiningOp<ContractOp>();
+  if (!first || !llvm::is_contained(contracts, first) ||
+      !isClosedProjectedContract(first))
+    return failure();
+  Value fullValue = first.getResult(0);
+  Value compactValue = fold.getResult(0);
+  unsigned fullOperand = 0;
+  unsigned compactOperand = 0;
+  bool sawFull = false;
+  bool sawCompact = false;
+  for (auto [operand, value] : llvm::enumerate(map.getInputs())) {
+    if (value == fullValue) {
+      fullOperand = operand;
+      sawFull = true;
+    } else if (value == compactValue) {
+      compactOperand = operand;
+      sawCompact = true;
+    }
+  }
+  if (!sawFull || !sawCompact || fullOperand == compactOperand ||
+      std::distance(fullValue.getUses().begin(), fullValue.getUses().end()) !=
+          2 ||
+      !compactValue.hasOneUse() || !map.getResult(0).hasOneUse())
+    return failure();
+  auto full = dyn_cast<RankedTensorType>(fullValue.getType());
+  auto compact = dyn_cast<RankedTensorType>(compactValue.getType());
+  auto mapped = dyn_cast<RankedTensorType>(map.getResult(0).getType());
+  auto fullIndexing =
+      dyn_cast<AffineMapAttr>(map.getIndexingMaps()[fullOperand]);
+  if (!full || !compact || !mapped || full.getRank() < 2 ||
+      full.getRank() > 8 || full != mapped || !full.getElementType().isF32() ||
+      !compact.getElementType().isF32() ||
+      fold.getReductionDimensions() !=
+          ArrayRef<int64_t>({full.getRank() - 1}) ||
+      compact.getShape() != full.getShape().drop_back() || !fullIndexing ||
+      !isIdentityMap(fullIndexing.getValue()) ||
+      !isProjectedFoldStatistic(map, compactOperand, full, compact))
+    return failure();
+
+  ContractOp second =
+      dyn_cast<ContractOp>(map.getResult(0).getUses().begin()->getOwner());
+  if (!second || second == first || !llvm::is_contained(contracts, second) ||
+      !isClosedProjectedContract(second) || !second.getResult(0).hasOneUse())
+    return failure();
+  auto mapUse = llvm::find(second.getInputs(), map.getResult(0));
+  if (mapUse == second.getInputs().end())
+    return failure();
+  const unsigned mappedContractOperand =
+      std::distance(second.getInputs().begin(), mapUse);
+  if (mappedContractOperand > 1)
+    return failure();
+  Value projection = second.getInputs()[1 - mappedContractOperand];
+  auto projectionArgument = dyn_cast<BlockArgument>(projection);
+  auto initializerArgument =
+      dyn_cast<BlockArgument>(fold.getInitializers().front());
+  auto initializerType =
+      dyn_cast<RankedTensorType>(fold.getInitializers().front().getType());
+  auto firstLhs = dyn_cast<BlockArgument>(first.getInputs()[0]);
+  auto firstRhs = dyn_cast<BlockArgument>(first.getInputs()[1]);
+  if (!projectionArgument || !initializerArgument || !initializerType ||
+      initializerType.getRank() != 0 ||
+      !initializerType.getElementType().isF32() || !firstLhs || !firstRhs ||
+      projectionArgument.getOwner() != &region.getBody().front() ||
+      initializerArgument.getOwner() != &region.getBody().front() ||
+      firstLhs.getOwner() != &region.getBody().front() ||
+      firstRhs.getOwner() != &region.getBody().front())
+    return failure();
+  llvm::SmallDenseSet<Value> publicInputs{
+      firstLhs, firstRhs, projectionArgument, initializerArgument};
+  if (region.getInputs().size() != 4 || publicInputs.size() != 4 ||
+      !llvm::all_of(region.getBody().front().getArguments(),
+                    [&](BlockArgument argument) {
+                      return publicInputs.contains(argument);
+                    }))
+    return failure();
+  auto regionYield =
+      dyn_cast<YieldOp>(region.getBody().front().getTerminator());
+  if (!regionYield || regionYield.getValues().size() != 1 ||
+      regionYield.getValues().front() != second.getResult(0))
+    return failure();
+  if (llvm::any_of(
+          llvm::concat<Type>(first.getOperandTypes(), first.getResultTypes(),
+                             second.getOperandTypes(), second.getResultTypes()),
+          [](Type type) {
+            auto tensor = dyn_cast<RankedTensorType>(type);
+            return !tensor || !tensor.getElementType().isF32();
+          }))
+    return failure();
+
+  FailureOr<SmallVector<int64_t>> secondDomain = contractDomainShape(second);
+  FailureOr<int64_t> fullElements = checkedShapeElements(full.getShape());
+  FailureOr<int64_t> compactElements =
+      checkedShapeElements(compact.getShape());
+  FailureOr<int64_t> resultElements = checkedShapeElements(
+      cast<RankedTensorType>(second.getResult(0).getType()).getShape());
+  FailureOr<int64_t> fullBytes = checkedTensorBytes(full);
+  FailureOr<int64_t> compactBytes = checkedTensorBytes(compact);
+  if (failed(secondDomain) || failed(fullElements) ||
+      failed(compactElements) || failed(resultElements) ||
+      *fullElements > UINT32_MAX || *compactElements > UINT32_MAX ||
+      *resultElements > UINT32_MAX || failed(fullBytes) ||
+      failed(compactBytes))
+    return failure();
+  int64_t baselineTemporaryBytes = 0;
+  int64_t baselineTemporaryTrafficBytes = 0;
+  for (const PlannedBuffer &buffer : materialized.buffers) {
+    if (!buffer.producer || buffer.liveOut)
+      continue;
+    auto type = dyn_cast<RankedTensorType>(buffer.value.getType());
+    if (!type)
+      return failure();
+    FailureOr<int64_t> bytes = checkedTensorBytes(type);
+    const int64_t uses = static_cast<int64_t>(buffer.consumers.size()) + 1;
+    if (failed(bytes) ||
+        baselineTemporaryBytes > std::numeric_limits<int64_t>::max() - *bytes ||
+        uses > std::numeric_limits<int64_t>::max() / *bytes ||
+        baselineTemporaryTrafficBytes >
+            std::numeric_limits<int64_t>::max() - *bytes * uses)
+      return failure();
+    baselineTemporaryBytes += *bytes;
+    baselineTemporaryTrafficBytes += *bytes * uses;
+  }
+  if (*fullBytes > std::numeric_limits<int64_t>::max() - *compactBytes)
+    return failure();
+  const int64_t candidateTemporaryBytes = *fullBytes + *compactBytes;
+  if (candidateTemporaryBytes > std::numeric_limits<int64_t>::max() / 2)
+    return failure();
+  const int64_t candidateTemporaryTrafficBytes = 2 * candidateTemporaryBytes;
+  if (materialized.tasks.size() >
+      static_cast<size_t>(std::numeric_limits<int64_t>::max()))
+    return failure();
+  const int64_t baselineLaunches =
+      static_cast<int64_t>(materialized.tasks.size());
+  constexpr int64_t candidateLaunches = 2;
+  if (candidateLaunches > baselineLaunches ||
+      candidateTemporaryBytes > baselineTemporaryBytes ||
+      candidateTemporaryTrafficBytes > baselineTemporaryTrafficBytes ||
+      !(candidateLaunches < baselineLaunches ||
+        candidateTemporaryBytes < baselineTemporaryBytes ||
+        candidateTemporaryTrafficBytes < baselineTemporaryTrafficBytes))
+    return failure();
+
+  DerivedPlan result;
+  result.hasContract = true;
+  result.hasRankNFold = full.getRank() > 2;
+  result.hasContractFoldComposition = true;
+  llvm::SmallDenseMap<Value, int64_t> bufferForValue;
+  for (BlockArgument argument : region.getBody().front().getArguments()) {
+    bufferForValue.try_emplace(argument, result.buffers.size());
+    result.buffers.push_back({argument, std::nullopt, {}, false});
+  }
+  auto addBuffer = [&](Value value, int64_t producer, bool liveOut) {
+    int64_t ordinal = result.buffers.size();
+    bufferForValue.try_emplace(value, ordinal);
+    result.buffers.push_back({value, producer, {}, liveOut});
+    return ordinal;
+  };
+  const int64_t fullBuffer = addBuffer(fullValue, 0, false);
+  const int64_t compactBuffer = addBuffer(compactValue, 0, false);
+  const int64_t resultBuffer = addBuffer(second.getResult(0), 1, true);
+
+  PlannedTask firstTask;
+  firstTask.operation = fold;
+  firstTask.kind = MaterializationTaskKind::Fold;
+  firstTask.domain.assign(full.getShape().begin(), full.getShape().end());
+  firstTask.reductionDimensions.assign(fold.getReductionDimensions().begin(),
+                                       fold.getReductionDimensions().end());
+  firstTask.orderFree = fold.getOrderFree();
+  firstTask.inputs = {bufferForValue.lookup(firstLhs),
+                      bufferForValue.lookup(firstRhs),
+                      bufferForValue.lookup(initializerArgument)};
+  firstTask.outputs = {fullBuffer, compactBuffer};
+  firstTask.compositionKind = "contract_fold";
+  firstTask.compositionSources = {first, fold};
+
+  PlannedTask secondTask;
+  secondTask.operation = second;
+  secondTask.kind = MaterializationTaskKind::Contract;
+  secondTask.domain = std::move(*secondDomain);
+  secondTask.reductionDimensions = {
+      static_cast<int64_t>(secondTask.domain.size()) - 1};
+  secondTask.inputs = {fullBuffer, compactBuffer,
+                       bufferForValue.lookup(projectionArgument)};
+  secondTask.outputs = {resultBuffer};
+  secondTask.dependencies = {0};
+  secondTask.compositionKind = "map_contract";
+  secondTask.compositionSources = {map, second};
+  secondTask.compositionCost = {baselineLaunches,
+                                candidateLaunches,
+                                baselineTemporaryBytes,
+                                candidateTemporaryBytes,
+                                baselineTemporaryTrafficBytes,
+                                candidateTemporaryTrafficBytes,
+                                1};
+  result.tasks = {std::move(firstTask), std::move(secondTask)};
+  result.buffers[fullBuffer].consumers = {1};
+  result.buffers[compactBuffer].consumers = {1};
+  for (int64_t input : result.tasks[0].inputs)
+    result.buffers[input].consumers.push_back(0);
+  result.buffers[result.tasks[1].inputs.back()].consumers.push_back(1);
+  return result;
 }
 
 FailureOr<DerivedPlan> deriveNormContractSubplan(RegionOp region,
@@ -6047,10 +6332,14 @@ FailureOr<DerivedPlan> deriveGpuPlan(RegionOp region,
   if (connected.size() != algebra.size() && !preferFusion) {
     return failure();
   }
-  DerivedPlan result{std::move(tasks), std::move(buffers),
-                     contractCount != 0, containsRankNFold};
+  DerivedPlan result{std::move(tasks), std::move(buffers), contractCount != 0,
+                     containsRankNFold};
   if (!preferFusion)
     return result;
+  FailureOr<DerivedPlan> composition =
+      deriveGenericContractFoldCompositionPlan(region, result);
+  if (succeeded(composition))
+    return composition;
   FailureOr<DerivedPlan> foldRegion = deriveFoldRegionPlan(region);
   if (succeeded(foldRegion))
     return foldRegion;
@@ -6137,11 +6426,14 @@ public:
       return signalPassFailure();
     }
     const bool mixesContractAndRankNFold =
-        llvm::any_of(
-            selected,
-            [](const auto &entry) { return entry.second.hasContract; }) &&
+        llvm::any_of(selected,
+                     [](const auto &entry) {
+                       return entry.second.hasContract &&
+                              !entry.second.hasContractFoldComposition;
+                     }) &&
         llvm::any_of(selected, [](const auto &entry) {
-          return entry.second.hasRankNFold;
+          return entry.second.hasRankNFold &&
+                 !entry.second.hasContractFoldComposition;
         });
     if (mixesContractAndRankNFold) {
       module.emitError(
@@ -6209,6 +6501,7 @@ public:
         const bool fusedMap = !fusedFoldMap && task.fusedOperations.size() > 1;
         const bool foldRegion = !task.foldRegionSources.empty();
         const bool contractRegion = !task.contractRegionSources.empty();
+        const bool composition = !task.compositionKind.empty();
         auto source = isa<MapOp>(task.operation)
                           ? cast<MapOp>(task.operation).getSource()
                       : isa<FoldOp>(task.operation)
@@ -6237,7 +6530,10 @@ public:
             builder.getNamedAttr(
                 "semantic_fingerprint",
                 builder.getStringAttr(
-                    contractRegion
+                    composition
+                        ? compositionFingerprint(task.compositionKind,
+                                                 task.compositionSources)
+                    : contractRegion
                         ? contractRegionFingerprint(task.contractRegionSources)
                     : foldRegion ? foldRegionFingerprint(task.foldRegionSources)
                     : fusedFoldMap
@@ -6246,7 +6542,50 @@ public:
                     : fusedMap ? fusedMapFingerprint(task.fusedOperations)
                                : semanticTaskFingerprint(task.operation))),
             builder.getNamedAttr("source", source)};
-        if (contractRegion) {
+        if (composition) {
+          SmallVector<Attribute> sources;
+          for (Operation *operation : task.compositionSources) {
+            if (auto map = dyn_cast<MapOp>(operation))
+              sources.push_back(map.getSource());
+            else if (auto fold = dyn_cast<FoldOp>(operation))
+              sources.push_back(fold.getSource());
+            else
+              sources.push_back(cast<ContractOp>(operation).getSource());
+          }
+          attrs.push_back(builder.getNamedAttr(
+              "composition_kind", builder.getStringAttr(task.compositionKind)));
+          attrs.push_back(builder.getNamedAttr("composition_sources",
+                                               builder.getArrayAttr(sources)));
+          if (task.compositionKind == "map_contract") {
+            auto cost = task.compositionCost;
+            attrs.push_back(builder.getNamedAttr(
+                "composition_cost",
+                builder.getDictionaryAttr(
+                    {builder.getNamedAttr(
+                         "baseline_launches",
+                         builder.getI64IntegerAttr(cost.baselineLaunches)),
+                     builder.getNamedAttr(
+                         "candidate_launches",
+                         builder.getI64IntegerAttr(cost.candidateLaunches)),
+                     builder.getNamedAttr("baseline_temporary_bytes",
+                                          builder.getI64IntegerAttr(
+                                              cost.baselineTemporaryBytes)),
+                     builder.getNamedAttr("candidate_temporary_bytes",
+                                          builder.getI64IntegerAttr(
+                                              cost.candidateTemporaryBytes)),
+                     builder.getNamedAttr(
+                         "baseline_temporary_traffic_bytes",
+                         builder.getI64IntegerAttr(
+                             cost.baselineTemporaryTrafficBytes)),
+                     builder.getNamedAttr(
+                         "candidate_temporary_traffic_bytes",
+                         builder.getI64IntegerAttr(
+                             cost.candidateTemporaryTrafficBytes)),
+                     builder.getNamedAttr("contract_evaluations",
+                                          builder.getI64IntegerAttr(
+                                              cost.contractEvaluations))})));
+          }
+        } else if (contractRegion) {
           SmallVector<Attribute> sources;
           for (Operation *operation : task.contractRegionSources) {
             if (auto map = dyn_cast<MapOp>(operation))
@@ -6470,18 +6809,88 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
   bool sawContractRegion = false;
   for (MaterializationTaskOp task : tasks) {
     auto fusedSources = task->getAttrOfType<ArrayAttr>("fused_sources");
-    auto composedMaps =
-        task->getAttrOfType<ArrayAttr>("composed_input_maps");
+    auto composedMaps = task->getAttrOfType<ArrayAttr>("composed_input_maps");
     auto epilogueSources =
         task->getAttrOfType<ArrayAttr>("fold_epilogue_sources");
-    auto epilogueMaps =
-        task->getAttrOfType<ArrayAttr>("epilogue_input_maps");
+    auto epilogueMaps = task->getAttrOfType<ArrayAttr>("epilogue_input_maps");
     auto foldRegionSources =
         task->getAttrOfType<ArrayAttr>("fold_region_sources");
     auto foldRegionOutputSources =
         task->getAttrOfType<ArrayAttr>("fold_region_output_sources");
     auto contractRegionSources =
         task->getAttrOfType<ArrayAttr>("contract_region_sources");
+    auto compositionKind = task->getAttrOfType<StringAttr>("composition_kind");
+    auto compositionSources =
+        task->getAttrOfType<ArrayAttr>("composition_sources");
+    auto compositionCost =
+        task->getAttrOfType<DictionaryAttr>("composition_cost");
+    if (compositionKind || compositionSources || compositionCost) {
+      if (!compositionKind || !compositionSources ||
+          compositionSources.size() != 2 || fusedSources || composedMaps ||
+          epilogueSources || epilogueMaps || foldRegionSources ||
+          foldRegionOutputSources || contractRegionSources)
+        return task.emitOpError(
+            "generic composition metadata must be complete and exclusive");
+      const bool contractFold = compositionKind.getValue() == "contract_fold";
+      const bool mapContract = compositionKind.getValue() == "map_contract";
+      if ((!contractFold && !mapContract) ||
+          (contractFold && task.getKind() != MaterializationTaskKind::Fold) ||
+          (mapContract &&
+           task.getKind() != MaterializationTaskKind::Contract) ||
+          (contractFold && compositionCost) ||
+          (mapContract && !compositionCost))
+        return task.emitOpError(
+            "generic composition kind must bind its task family and cost");
+      SmallVector<Operation *> operations;
+      for (Attribute source : compositionSources) {
+        auto found = sourceOperations.find(source);
+        if (!isa<SourceRefAttr>(source) || found == sourceOperations.end() ||
+            duplicateSources.contains(source) ||
+            !bound.insert(found->second).second)
+          return task.emitOpError(
+              "composition sources must uniquely partition algebra");
+        operations.push_back(found->second);
+        ++sourceOccurrences[found->second];
+      }
+      if ((contractFold &&
+           (!isa<ContractOp>(operations[0]) || !isa<FoldOp>(operations[1]) ||
+            sourceOperations.lookup(task.getSource()) != operations[1])) ||
+          (mapContract &&
+           (!isa<MapOp>(operations[0]) || !isa<ContractOp>(operations[1]) ||
+            sourceOperations.lookup(task.getSource()) != operations[1])) ||
+          task.getSemanticFingerprint() !=
+              compositionFingerprint(compositionKind.getValue(), operations))
+        return task.emitOpError(
+            "composition sources must bind ordered Contract/Fold roles");
+      if (mapContract) {
+        constexpr StringLiteral fields[] = {"baseline_launches",
+                                            "candidate_launches",
+                                            "baseline_temporary_bytes",
+                                            "candidate_temporary_bytes",
+                                            "baseline_temporary_traffic_bytes",
+                                            "candidate_temporary_traffic_bytes",
+                                            "contract_evaluations"};
+        if (compositionCost.size() != std::size(fields))
+          return task.emitOpError(
+              "composition cost requires the closed relative fields");
+        SmallVector<int64_t> values;
+        for (StringRef field : fields) {
+          auto value = compositionCost.getAs<IntegerAttr>(field);
+          if (!value || value.getInt() < 0)
+            return task.emitOpError(
+                "composition cost fields must be nonnegative i64");
+          values.push_back(value.getInt());
+        }
+        if (values[1] > values[0] || values[3] > values[2] ||
+            values[5] > values[4] ||
+            !(values[1] < values[0] || values[3] < values[2] ||
+              values[5] < values[4]) ||
+            values[6] != 1)
+          return task.emitOpError(
+              "composition cost must dominate the materialized baseline");
+      }
+      continue;
+    }
     if (contractRegionSources) {
       sawContractRegion = true;
       if (fusedSources || composedMaps || epilogueSources || epilogueMaps ||
@@ -6840,10 +7249,76 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
   }
   for (auto [ordinal, expectedTask] : llvm::enumerate(expected->tasks)) {
     MaterializationTaskOp actual = tasks[ordinal];
+    auto actualCompositionKind =
+        actual->getAttrOfType<StringAttr>("composition_kind");
+    auto actualCompositionSources =
+        actual->getAttrOfType<ArrayAttr>("composition_sources");
+    auto actualCompositionCost =
+        actual->getAttrOfType<DictionaryAttr>("composition_cost");
     auto actualFoldRegionSources =
         actual->getAttrOfType<ArrayAttr>("fold_region_sources");
     auto actualContractRegionSources =
         actual->getAttrOfType<ArrayAttr>("contract_region_sources");
+    const bool expectedComposition = !expectedTask.compositionKind.empty();
+    if (expectedComposition) {
+      SmallVector<Attribute> expectedSources;
+      for (Operation *operation : expectedTask.compositionSources) {
+        if (auto map = dyn_cast<MapOp>(operation))
+          expectedSources.push_back(map.getSource());
+        else if (auto fold = dyn_cast<FoldOp>(operation))
+          expectedSources.push_back(fold.getSource());
+        else
+          expectedSources.push_back(cast<ContractOp>(operation).getSource());
+      }
+      auto costMatches = [&](StringRef field, int64_t expectedValue) {
+        auto value = actualCompositionCost
+                         ? actualCompositionCost.getAs<IntegerAttr>(field)
+                         : IntegerAttr{};
+        return value && value.getInt() == expectedValue;
+      };
+      const bool expectsCost = expectedTask.compositionKind == "map_contract";
+      const auto cost = expectedTask.compositionCost;
+      const bool matches =
+          actualCompositionKind && actualCompositionSources &&
+          actualCompositionKind.getValue() == expectedTask.compositionKind &&
+          actualCompositionSources.getValue() ==
+              ArrayRef<Attribute>(expectedSources) &&
+          (expectsCost == static_cast<bool>(actualCompositionCost)) &&
+          (!expectsCost ||
+           (costMatches("baseline_launches", cost.baselineLaunches) &&
+            costMatches("candidate_launches", cost.candidateLaunches) &&
+            costMatches("baseline_temporary_bytes",
+                        cost.baselineTemporaryBytes) &&
+            costMatches("candidate_temporary_bytes",
+                        cost.candidateTemporaryBytes) &&
+            costMatches("baseline_temporary_traffic_bytes",
+                        cost.baselineTemporaryTrafficBytes) &&
+            costMatches("candidate_temporary_traffic_bytes",
+                        cost.candidateTemporaryTrafficBytes) &&
+            costMatches("contract_evaluations", cost.contractEvaluations))) &&
+          expectedTask.operation ==
+              sourceOperations.lookup(actual.getSource()) &&
+          actual.getDomainShape() == ArrayRef<int64_t>(expectedTask.domain) &&
+          actual.getReductionDimensions() ==
+              ArrayRef<int64_t>(expectedTask.reductionDimensions) &&
+          actual.getOrderFree().value_or(false) == expectedTask.orderFree &&
+          actual.getInputBuffers() == ArrayRef<int64_t>(expectedTask.inputs) &&
+          actual.getOutputBuffers() ==
+              ArrayRef<int64_t>(expectedTask.outputs) &&
+          actual.getDependencies() ==
+              ArrayRef<int64_t>(expectedTask.dependencies);
+      if (!matches) {
+        actual.emitOpError(
+            "generic composition must equal structural SSA derivation");
+        return failure();
+      }
+      continue;
+    }
+    if (actualCompositionKind || actualCompositionSources ||
+        actualCompositionCost) {
+      actual.emitOpError("unexpected generic composition metadata");
+      return failure();
+    }
     const bool expectedContractRegion =
         !expectedTask.contractRegionSources.empty();
     if (expectedContractRegion) {
@@ -8589,6 +9064,456 @@ emitMappedCoordinates(PtxEmitter &ptx, AffineMap map,
   return result;
 }
 
+FailureOr<std::pair<Operation *, Operation *>> compositionSourcePair(
+    MaterializationTaskOp task,
+    const llvm::SmallDenseMap<Attribute, Operation *> &sourceOperations) {
+  auto sources = task->getAttrOfType<ArrayAttr>("composition_sources");
+  if (!sources || sources.size() != 2)
+    return failure();
+  Operation *first = sourceOperations.lookup(sources[0]);
+  Operation *second = sourceOperations.lookup(sources[1]);
+  if (!first || !second)
+    return failure();
+  return std::pair<Operation *, Operation *>{first, second};
+}
+
+RankedTensorType
+compositionBufferType(MaterializationTaskOp task,
+                      SmallVectorImpl<MaterializationBufferOp> &buffers,
+                      bool output, unsigned position) {
+  ArrayRef<int64_t> ordinals =
+      output ? task.getOutputBuffers() : task.getInputBuffers();
+  if (position >= ordinals.size() || ordinals[position] < 0 ||
+      ordinals[position] >= static_cast<int64_t>(buffers.size()))
+    return {};
+  return dyn_cast<RankedTensorType>(
+      buffers[ordinals[position]].getTensorType());
+}
+
+FailureOr<int64_t>
+emitSerialContractElement(PtxEmitter &ptx, ContractOp contract,
+                          int64_t lhsParameter, int64_t rhsParameter,
+                          ArrayRef<int64_t> outputCoordinates,
+                          StringRef label) {
+  FailureOr<SmallVector<int64_t>> domain = contractDomainShape(contract);
+  if (!isClosedProjectedContract(contract) || failed(domain) ||
+      outputCoordinates.size() + 1 != domain->size())
+    return failure();
+  auto lhsMap = dyn_cast<AffineMapAttr>(contract.getIndexingMaps()[0]);
+  auto rhsMap = dyn_cast<AffineMapAttr>(contract.getIndexingMaps()[1]);
+  auto lhsType = dyn_cast<RankedTensorType>(contract.getInputs()[0].getType());
+  auto rhsType = dyn_cast<RankedTensorType>(contract.getInputs()[1].getType());
+  if (!lhsMap || !rhsMap || !lhsType || !rhsType)
+    return failure();
+  int64_t accumulator = ptx.nextF32();
+  int64_t reductionCoordinate = ptx.nextU64();
+  ptx.stream << "  mov.f32 %f" << accumulator << ", 0f00000000;\n  mov.u64 %rd"
+             << reductionCoordinate << ", 0;\n$" << label
+             << "_loop:\n  setp.ge.u64 %p4, %rd" << reductionCoordinate << ", "
+             << domain->back() << ";\n  @%p4 bra $" << label << "_done;\n";
+  SmallVector<int64_t> coordinates(outputCoordinates);
+  coordinates.push_back(reductionCoordinate);
+  FailureOr<int64_t> lhs =
+      emitMapInput(ptx, lhsParameter, lhsType, lhsMap.getValue(), coordinates);
+  FailureOr<int64_t> rhs =
+      emitMapInput(ptx, rhsParameter, rhsType, rhsMap.getValue(), coordinates);
+  if (failed(lhs) || failed(rhs))
+    return failure();
+  ptx.stream << "  fma.rn.f32 %f" << accumulator << ", %f" << *lhs << ", %f"
+             << *rhs << ", %f" << accumulator << ";\n  add.u64 %rd"
+             << reductionCoordinate << ", %rd" << reductionCoordinate
+             << ", 1;\n  bra $" << label << "_loop;\n$" << label << "_done:\n";
+  return accumulator;
+}
+
+FailureOr<std::string> emitContractFoldCompositionPtx(
+    MaterializationTaskOp materializationTask,
+    SmallVectorImpl<MaterializationBufferOp> &buffers, ScheduleTaskOp task,
+    const llvm::SmallDenseMap<Attribute, Operation *> &sourceOperations) {
+  auto kind =
+      materializationTask->getAttrOfType<StringAttr>("composition_kind");
+  FailureOr<std::pair<Operation *, Operation *>> sources =
+      compositionSourcePair(materializationTask, sourceOperations);
+  if (!kind || kind.getValue() != "contract_fold" || failed(sources))
+    return failure();
+  auto contract = dyn_cast<ContractOp>(sources->first);
+  auto fold = dyn_cast<FoldOp>(sources->second);
+  if (!contract || !fold || fold.getInputs().size() != 1 ||
+      fold.getInitializers().size() != 1 || fold.getNumResults() != 1 ||
+      fold.getInputs().front() != contract.getResult(0) ||
+      materializationTask.getInputBuffers().size() != 3 ||
+      materializationTask.getOutputBuffers().size() != 2)
+    return failure();
+  auto lhs = compositionBufferType(materializationTask, buffers, false, 0);
+  auto rhs = compositionBufferType(materializationTask, buffers, false, 1);
+  auto initializer =
+      compositionBufferType(materializationTask, buffers, false, 2);
+  auto full = compositionBufferType(materializationTask, buffers, true, 0);
+  auto compact = compositionBufferType(materializationTask, buffers, true, 1);
+  if (!lhs || !rhs || !initializer || !full || !compact ||
+      lhs != contract.getInputs()[0].getType() ||
+      rhs != contract.getInputs()[1].getType() ||
+      initializer != fold.getInitializers().front().getType() ||
+      full != contract.getResult(0).getType() ||
+      compact != fold.getResult(0).getType() || full.getRank() < 2 ||
+      full.getRank() > 8 || !full.getElementType().isF32() ||
+      compact.getShape() != full.getShape().drop_back() ||
+      !compact.getElementType().isF32())
+    return failure();
+  FailureOr<ScheduledGeometry> geometry =
+      deriveSimt32Geometry(ScheduleTaskKind::RowFold, full.getShape(),
+                           NumericalPolicy::SourceOrdered);
+  FailureOr<int64_t> outputElements = staticElementCount(compact);
+  if (failed(geometry) || failed(outputElements) ||
+      task.getKind() != ScheduleTaskKind::RowFold ||
+      task.getDomainShape() != full.getShape() ||
+      task.getGridShape() != ArrayRef<int64_t>(geometry->grid) ||
+      task.getTileShape() != ArrayRef<int64_t>(geometry->tile) ||
+      task.getSerialTiles() != geometry->serialTiles ||
+      task.getWorkgroupThreads() != geometry->workgroupThreads ||
+      task.getSubgroupSize() != geometry->subgroupSize ||
+      task.getScratchBytes() != geometry->scratchBytes ||
+      task.getReductionAxis() != geometry->reductionAxis ||
+      task.getReductionOrder() !=
+          ScheduleReductionOrder::TreeAssociationFreeLeafOrderFixed)
+    return failure();
+
+  const int64_t reduction = full.getShape().back();
+  PtxEmitter ptx(materializationTask.getInputBuffers().size() +
+                 materializationTask.getOutputBuffers().size());
+  ptx.header(task.getSemanticFingerprint(), /*usesDynamicSharedMemory=*/true);
+  int64_t local = ptx.nextF32();
+  ptx.stream << "  mov.u32 %r0, %tid.x;\n"
+                "  mov.u32 %r1, %ctaid.x;\n"
+                "  mov.u32 %r2, %ntid.x;\n"
+                "  setp.ge.u32 %p0, %r1, "
+             << *outputElements
+             << ";\n  @%p0 bra $done;\n  mov.u32 %r4, %r0;\n  mov.f32 %f"
+             << local
+             << ", 0f00000000;\n$composition_fold_load:\n"
+                "  setp.ge.u32 %p1, %r4, "
+             << reduction
+             << ";\n  @%p1 bra $composition_fold_loaded;\n"
+                "  mad.lo.u32 %r5, %r1, "
+             << reduction << ", %r4;\n  cvt.u64.u32 %rd0, %r5;\n";
+  FailureOr<SmallVector<int64_t>> fullCoordinates =
+      emitOutputCoordinates(ptx, full);
+  if (failed(fullCoordinates))
+    return failure();
+  FailureOr<int64_t> value = emitSerialContractElement(
+      ptx, contract, 0, 1, *fullCoordinates, "composition_inner_contract");
+  if (failed(value))
+    return failure();
+  int64_t fullPointer = ptx.nextU64();
+  int64_t combined = ptx.nextF32();
+  ptx.stream << "  ld.param.u64 %rd" << fullPointer
+             << ", [p3];\n  mad.lo.u64 %rd" << fullPointer << ", %rd0, 4, %rd"
+             << fullPointer << ";\n  st.global.f32 [%rd" << fullPointer
+             << "], %f" << *value << ";\n  add.rn.f32 %f" << combined << ", %f"
+             << local << ", %f" << *value << ";\n  mov.f32 %f" << local
+             << ", %f" << combined
+             << ";\n  add.u32 %r4, %r4, %r2;\n"
+                "  bra $composition_fold_load;\n"
+                "$composition_fold_loaded:\n";
+  int64_t threadOffset = ptx.nextU64();
+  int64_t sharedBase = ptx.nextU64();
+  int64_t threadPointer = ptx.nextU64();
+  ptx.stream << "  cvt.u64.u32 %rd" << threadOffset
+             << ", %r0;\n  mul.lo.u64 %rd" << threadOffset << ", %rd"
+             << threadOffset << ", 4;\n  mov.u64 %rd" << sharedBase
+             << ", shuttle_smem;\n  cvta.to.shared.u64 %rd" << sharedBase
+             << ", %rd" << sharedBase << ";\n  add.u64 %rd" << threadPointer
+             << ", %rd" << sharedBase << ", %rd" << threadOffset
+             << ";\n  st.shared.f32 [%rd" << threadPointer << "], %f" << local
+             << ";\n  bar.sync 0;\n";
+  for (int64_t active = task.getWorkgroupThreads(); active > 1;
+       active = (active + 1) / 2) {
+    const int64_t pairs = active / 2;
+    int64_t pairIndex = ptx.nextU64();
+    int64_t pairPointer = ptx.nextU64();
+    int64_t left = ptx.nextF32();
+    int64_t right = ptx.nextF32();
+    int64_t sum = ptx.nextF32();
+    ptx.stream << "  setp.ge.u32 %p2, %r0, " << pairs
+               << ";\n  @%p2 bra $composition_fold_skip_pair_read_" << active
+               << ";\n  mul.lo.u32 %r6, %r0, 2;\n  cvt.u64.u32 %rd" << pairIndex
+               << ", %r6;\n  mul.lo.u64 %rd" << pairIndex << ", %rd"
+               << pairIndex << ", 4;\n  add.u64 %rd" << pairPointer << ", %rd"
+               << sharedBase << ", %rd" << pairIndex << ";\n  ld.shared.f32 %f"
+               << left << ", [%rd" << pairPointer << "];\n  ld.shared.f32 %f"
+               << right << ", [%rd" << pairPointer << "+4];\n  add.rn.f32 %f"
+               << sum << ", %f" << left << ", %f" << right
+               << ";\n$composition_fold_skip_pair_read_" << active << ":\n";
+    std::optional<int64_t> carry;
+    if (active % 2 != 0) {
+      carry = ptx.nextF32();
+      ptx.stream << "  setp.ne.u32 %p3, %r0, " << pairs
+                 << ";\n  @%p3 bra $composition_fold_skip_carry_read_" << active
+                 << ";\n  ld.shared.f32 %f" << *carry << ", [%rd" << sharedBase
+                 << "+" << (active - 1) * 4
+                 << "];\n$composition_fold_skip_carry_read_" << active << ":\n";
+    }
+    ptx.stream << "  bar.sync 0;\n  @%p2 bra "
+                  "$composition_fold_skip_pair_write_"
+               << active << ";\n  cvt.u64.u32 %rd" << threadOffset
+               << ", %r0;\n  mul.lo.u64 %rd" << threadOffset << ", %rd"
+               << threadOffset << ", 4;\n  add.u64 %rd" << threadPointer
+               << ", %rd" << sharedBase << ", %rd" << threadOffset
+               << ";\n  st.shared.f32 [%rd" << threadPointer << "], %f" << sum
+               << ";\n$composition_fold_skip_pair_write_" << active << ":\n";
+    if (carry) {
+      ptx.stream << "  @%p3 bra $composition_fold_skip_carry_write_" << active
+                 << ";\n  st.shared.f32 [%rd" << sharedBase << "+" << pairs * 4
+                 << "], %f" << *carry
+                 << ";\n$composition_fold_skip_carry_write_" << active << ":\n";
+    }
+    ptx.stream << "  bar.sync 0;\n";
+  }
+  int64_t reduced = ptx.nextF32();
+  int64_t initializerPointer = ptx.nextU64();
+  int64_t initializerValue = ptx.nextF32();
+  int64_t finalValue = ptx.nextF32();
+  int64_t compactPointer = ptx.nextU64();
+  ptx.stream << "  setp.ne.u32 %p2, %r0, 0;\n"
+                "  @%p2 bra $done;\n"
+                "  ld.shared.f32 %f"
+             << reduced << ", [%rd" << sharedBase << "];\n  ld.param.u64 %rd"
+             << initializerPointer << ", [p2];\n  ld.global.f32 %f"
+             << initializerValue << ", [%rd" << initializerPointer
+             << "];\n  add.rn.f32 %f" << finalValue << ", %f" << reduced
+             << ", %f" << initializerValue << ";\n  ld.param.u64 %rd"
+             << compactPointer
+             << ", [p4];\n  cvt.u64.u32 %rd0, %r1;\n  mad.lo.u64 %rd"
+             << compactPointer << ", %rd0, 4, %rd" << compactPointer
+             << ";\n  st.global.f32 [%rd" << compactPointer << "], %f"
+             << finalValue << ";\n";
+  if (ptx.f32 > 128 || ptx.u64 > 128 || ptx.bf16 > 16)
+    return failure();
+  ptx.finish();
+  return ptx.text;
+}
+
+struct MapContractLeaf {
+  int64_t lhs;
+  int64_t rhs;
+};
+
+FailureOr<MapContractLeaf>
+emitMapContractLeaf(PtxEmitter &ptx, MapOp map, ContractOp contract,
+                    ArrayRef<int64_t> contractCoordinates,
+                    int64_t mapContractOperand) {
+  if (mapContractOperand < 0 || mapContractOperand > 1 ||
+      contract.getInputs()[mapContractOperand] != map.getResult(0))
+    return failure();
+  auto contractMap =
+      dyn_cast<AffineMapAttr>(contract.getIndexingMaps()[mapContractOperand]);
+  if (!contractMap)
+    return failure();
+  FailureOr<SmallVector<int64_t>> mapCoordinates =
+      emitMappedCoordinates(ptx, contractMap.getValue(), contractCoordinates);
+  if (failed(mapCoordinates))
+    return failure();
+  SmallVector<int64_t> mapArguments;
+  for (auto [operand, value] : llvm::enumerate(map.getInputs())) {
+    const int64_t parameter = value.getDefiningOp<ContractOp>() ? 0 : 1;
+    auto indexing = dyn_cast<AffineMapAttr>(map.getIndexingMaps()[operand]);
+    auto type = dyn_cast<RankedTensorType>(value.getType());
+    if (!indexing || !type)
+      return failure();
+    FailureOr<int64_t> loaded = emitMapInput(
+        ptx, parameter, type, indexing.getValue(), *mapCoordinates);
+    if (failed(loaded))
+      return failure();
+    mapArguments.push_back(*loaded);
+  }
+  FailureOr<int64_t> mapped =
+      emitScalarBody(ptx, map.getBody().front(), mapArguments);
+  const int64_t projectionOperand = 1 - mapContractOperand;
+  auto projectionMap =
+      dyn_cast<AffineMapAttr>(contract.getIndexingMaps()[projectionOperand]);
+  auto projectionType = dyn_cast<RankedTensorType>(
+      contract.getInputs()[projectionOperand].getType());
+  if (!projectionMap || !projectionType)
+    return failure();
+  FailureOr<int64_t> projection = emitMapInput(
+      ptx, 2, projectionType, projectionMap.getValue(), contractCoordinates);
+  if (failed(mapped) || failed(projection))
+    return failure();
+  return mapContractOperand == 0 ? MapContractLeaf{*mapped, *projection}
+                                 : MapContractLeaf{*projection, *mapped};
+}
+
+FailureOr<std::string> emitMapContractCompositionPtx(
+    MaterializationTaskOp materializationTask,
+    SmallVectorImpl<MaterializationBufferOp> &buffers, ScheduleTaskOp task,
+    const llvm::SmallDenseMap<Attribute, Operation *> &sourceOperations) {
+  auto kind =
+      materializationTask->getAttrOfType<StringAttr>("composition_kind");
+  FailureOr<std::pair<Operation *, Operation *>> sources =
+      compositionSourcePair(materializationTask, sourceOperations);
+  if (!kind || kind.getValue() != "map_contract" || failed(sources))
+    return failure();
+  auto map = dyn_cast<MapOp>(sources->first);
+  auto contract = dyn_cast<ContractOp>(sources->second);
+  if (!map || !contract || map.getInputs().size() != 2 ||
+      map.getNumResults() != 1 ||
+      materializationTask.getInputBuffers().size() != 3 ||
+      materializationTask.getOutputBuffers().size() != 1)
+    return failure();
+  auto full = compositionBufferType(materializationTask, buffers, false, 0);
+  auto compact = compositionBufferType(materializationTask, buffers, false, 1);
+  auto projection =
+      compositionBufferType(materializationTask, buffers, false, 2);
+  auto result = compositionBufferType(materializationTask, buffers, true, 0);
+  Value fullValue;
+  Value compactValue;
+  for (Value value : map.getInputs()) {
+    if (value.getDefiningOp<ContractOp>())
+      fullValue = value;
+    else if (value.getDefiningOp<FoldOp>())
+      compactValue = value;
+  }
+  auto mapUse = llvm::find(contract.getInputs(), map.getResult(0));
+  if (!full || !compact || !projection || !result || !fullValue ||
+      !compactValue || full != fullValue.getType() ||
+      compact != compactValue.getType() ||
+      mapUse == contract.getInputs().end() ||
+      result != contract.getResult(0).getType())
+    return failure();
+  const int64_t mapContractOperand =
+      std::distance(contract.getInputs().begin(), mapUse);
+  Value projectionValue = contract.getInputs()[1 - mapContractOperand];
+  if (projection != projectionValue.getType())
+    return failure();
+  FailureOr<SmallVector<int64_t>> domain = contractDomainShape(contract);
+  if (!isClosedProjectedContract(contract) || failed(domain) ||
+      task.getKind() != ScheduleTaskKind::Contract ||
+      task.getDomainShape() != ArrayRef<int64_t>(*domain) ||
+      task.getReductionAxis() != static_cast<int64_t>(domain->size()) - 1 ||
+      task.getInputBuffers().size() != 3 ||
+      task.getOutputBuffers().size() != 1 || task.getScratchBytes() != 0)
+    return failure();
+  const bool fast =
+      task.getReductionOrder() == ScheduleReductionOrder::LeafOrderFree;
+  if (!fast && task.getReductionOrder() !=
+                   ScheduleReductionOrder::SerialAscendingFmaRnF32)
+    return failure();
+  FailureOr<int64_t> outputCount =
+      scheduleElementCount(task.getDomainShape().drop_back());
+  if (failed(outputCount) || *outputCount > UINT32_MAX)
+    return failure();
+  const int64_t outputs = *outputCount;
+  const int64_t reduction = task.getDomainShape().back();
+  if (fast) {
+    const int64_t outputsPerBlock = std::min<int64_t>(outputs, 8);
+    if (task.getGridShape() !=
+            ArrayRef<int64_t>({ceilDivPositive(outputs, outputsPerBlock)}) ||
+        task.getTileShape() != ArrayRef<int64_t>({outputsPerBlock}) ||
+        task.getWorkgroupThreads() != outputsPerBlock * 32 ||
+        task.getSubgroupSize() != 32 ||
+        task.getSerialTiles() != ceilDivPositive(reduction, 32))
+      return failure();
+    PtxEmitter ptx(/*arity=*/4);
+    ptx.header(task.getSemanticFingerprint());
+    ptx.stream << "  mov.u32 %r0, %tid.x;\n"
+                  "  shr.u32 %r1, %r0, 5;\n"
+                  "  and.b32 %r2, %r0, 31;\n"
+                  "  mov.u32 %r3, %ctaid.x;\n"
+                  "  mad.lo.u32 %r4, %r3, "
+               << outputsPerBlock << ", %r1;\n  setp.ge.u32 %p0, %r4, "
+               << outputs << ";\n  @%p0 bra $done;\n  cvt.u64.u32 %rd0, %r4;\n";
+    FailureOr<SmallVector<int64_t>> outputCoordinates =
+        emitOutputCoordinates(ptx, result);
+    if (failed(outputCoordinates) ||
+        outputCoordinates->size() + 1 != domain->size())
+      return failure();
+    int64_t accumulator = ptx.nextF32();
+    int64_t reductionCoordinate = ptx.nextU64();
+    ptx.stream << "  mov.f32 %f" << accumulator
+               << ", 0f00000000;\n  cvt.u64.u32 %rd" << reductionCoordinate
+               << ", %r2;\n$composition_contract_fast_loop:\n"
+                  "  setp.ge.u64 %p1, %rd"
+               << reductionCoordinate << ", " << reduction
+               << ";\n  @%p1 bra $composition_contract_fast_reduce;\n";
+    SmallVector<int64_t> contractCoordinates(*outputCoordinates);
+    contractCoordinates.push_back(reductionCoordinate);
+    FailureOr<MapContractLeaf> leaf = emitMapContractLeaf(
+        ptx, map, contract, contractCoordinates, mapContractOperand);
+    if (failed(leaf))
+      return failure();
+    ptx.stream << "  fma.rn.f32 %f" << accumulator << ", %f" << leaf->lhs
+               << ", %f" << leaf->rhs << ", %f" << accumulator
+               << ";\n  add.u64 %rd" << reductionCoordinate << ", %rd"
+               << reductionCoordinate
+               << ", 32;\n  bra $composition_contract_fast_loop;\n"
+                  "$composition_contract_fast_reduce:\n  mov.b32 %r5, %f"
+               << accumulator << ";\n";
+    int64_t shuffled = ptx.nextF32();
+    for (int64_t offset : {16, 8, 4, 2, 1}) {
+      ptx.stream << "  shfl.sync.down.b32 %r6, %r5, " << offset
+                 << ", 31, 0xffffffff;\n  mov.b32 %f" << shuffled
+                 << ", %r6;\n  add.rn.f32 %f" << accumulator << ", %f"
+                 << accumulator << ", %f" << shuffled << ";\n  mov.b32 %r5, %f"
+                 << accumulator << ";\n";
+    }
+    int64_t outputPointer = ptx.nextU64();
+    ptx.stream << "  setp.ne.u32 %p2, %r2, 0;\n  @%p2 bra $done;\n"
+                  "  ld.param.u64 %rd"
+               << outputPointer << ", [p3];\n  mad.lo.u64 %rd" << outputPointer
+               << ", %rd0, 4, %rd" << outputPointer << ";\n  st.global.f32 [%rd"
+               << outputPointer << "], %f" << accumulator << ";\n";
+    if (ptx.f32 > 128 || ptx.u64 > 128 || ptx.bf16 > 16)
+      return failure();
+    ptx.finish();
+    return ptx.text;
+  }
+
+  const int64_t tile = std::min<int64_t>(outputs, 256);
+  if (task.getGridShape() !=
+          ArrayRef<int64_t>({ceilDivPositive(outputs, tile)}) ||
+      task.getTileShape() != ArrayRef<int64_t>({tile}) ||
+      task.getWorkgroupThreads() != scheduleThreads(tile) ||
+      task.getSubgroupSize() != 32 || task.getSerialTiles() != reduction)
+    return failure();
+  PtxEmitter ptx(/*arity=*/4);
+  ptx.header(task.getSemanticFingerprint());
+  if (failed(emitLinearThread(ptx, outputs)))
+    return failure();
+  FailureOr<SmallVector<int64_t>> outputCoordinates =
+      emitOutputCoordinates(ptx, result);
+  if (failed(outputCoordinates) ||
+      outputCoordinates->size() + 1 != domain->size())
+    return failure();
+  int64_t accumulator = ptx.nextF32();
+  int64_t reductionCoordinate = ptx.nextU64();
+  ptx.stream << "  mov.f32 %f" << accumulator << ", 0f00000000;\n  mov.u64 %rd"
+             << reductionCoordinate
+             << ", 0;\n$composition_contract_loop:\n"
+                "  setp.ge.u64 %p1, %rd"
+             << reductionCoordinate << ", " << reduction
+             << ";\n  @%p1 bra $composition_contract_done;\n";
+  SmallVector<int64_t> contractCoordinates(*outputCoordinates);
+  contractCoordinates.push_back(reductionCoordinate);
+  FailureOr<MapContractLeaf> leaf = emitMapContractLeaf(
+      ptx, map, contract, contractCoordinates, mapContractOperand);
+  if (failed(leaf))
+    return failure();
+  int64_t outputPointer = ptx.nextU64();
+  ptx.stream << "  fma.rn.f32 %f" << accumulator << ", %f" << leaf->lhs
+             << ", %f" << leaf->rhs << ", %f" << accumulator
+             << ";\n  add.u64 %rd" << reductionCoordinate << ", %rd"
+             << reductionCoordinate
+             << ", 1;\n  bra $composition_contract_loop;\n"
+                "$composition_contract_done:\n  ld.param.u64 %rd"
+             << outputPointer << ", [p3];\n  mad.lo.u64 %rd" << outputPointer
+             << ", %rd0, 4, %rd" << outputPointer << ";\n  st.global.f32 [%rd"
+             << outputPointer << "], %f" << accumulator << ";\n";
+  if (ptx.f32 > 128 || ptx.u64 > 128 || ptx.bf16 > 16)
+    return failure();
+  ptx.finish();
+  return ptx.text;
+}
+
 FailureOr<int64_t> emitFoldRegionValue(FoldRegionPtxContext &context,
                                        Value value,
                                        ArrayRef<int64_t> coordinates) {
@@ -9474,18 +10399,20 @@ deriveGpuExecutable(RegionOp region, MaterializationPlanOp materialization,
   if (failed(reuseGroups))
     return failure();
   spec.reuseGroups = std::move(*reuseGroups);
-  auto manifest = region->getParentOfType<ModuleOp>()->getAttrOfType<DictionaryAttr>(
-      kCoverageManifestAttribute);
-  auto tuning = manifest ? manifest.getAs<StringAttr>("canonical_tuning")
-                         : StringAttr{};
-  FailureOr<DerivedPlan> derived =
-      deriveGpuPlan(region,
-                    tuning && tuning.getValue() == kFusionCanonicalTuning);
+  auto manifest =
+      region->getParentOfType<ModuleOp>()->getAttrOfType<DictionaryAttr>(
+          kCoverageManifestAttribute);
+  auto tuning =
+      manifest ? manifest.getAs<StringAttr>("canonical_tuning") : StringAttr{};
+  FailureOr<DerivedPlan> derived = deriveGpuPlan(
+      region, tuning && tuning.getValue() == kFusionCanonicalTuning);
   auto regionYield = cast<YieldOp>(region.getBody().front().getTerminator());
   SmallVector<int64_t> resultBindings = publicRegionResultBindings(region);
   if (failed(derived) || derived->buffers.size() != spec.slots.size())
     return failure();
   spec.bindingIndices.resize(spec.slots.size());
+  llvm::SmallDenseSet<int64_t> seenOperandBindings;
+  llvm::SmallDenseSet<int64_t> seenResultBindings;
   for (auto [ordinal, buffer, slot] :
        llvm::enumerate(derived->buffers, spec.slots)) {
     if (slot.storage != MaterializationStorage::External)
@@ -9493,6 +10420,8 @@ deriveGpuExecutable(RegionOp region, MaterializationPlanOp materialization,
     if (!buffer.producer) {
       auto argument = dyn_cast<BlockArgument>(buffer.value);
       if (!argument || argument.getOwner() != &region.getBody().front())
+        return failure();
+      if (!seenOperandBindings.insert(argument.getArgNumber()).second)
         return failure();
       spec.bindingIndices[ordinal] = argument.getArgNumber();
       continue;
@@ -9504,8 +10433,15 @@ deriveGpuExecutable(RegionOp region, MaterializationPlanOp materialization,
       return failure();
     int64_t resultIndex =
         std::distance(regionYield.getValues().begin(), yielded);
-    spec.bindingIndices[ordinal] = resultBindings[resultIndex];
+    const int64_t binding = resultBindings[resultIndex];
+    if (!seenResultBindings.insert(binding).second)
+      return failure();
+    spec.bindingIndices[ordinal] = binding;
   }
+  if (seenOperandBindings.size() !=
+          region.getBody().front().getNumArguments() ||
+      seenResultBindings.size() != regionYield.getValues().size())
+    return failure();
   for (auto [ordinal, materializationTask, task] :
        llvm::enumerate(materializationTasks, tasks)) {
     Operation *operation =
@@ -9513,7 +10449,18 @@ deriveGpuExecutable(RegionOp region, MaterializationPlanOp materialization,
     if (!operation)
       return failure();
     FailureOr<std::string> ptx = failure();
-    if (materializationTask->getAttr("contract_region_sources")) {
+    auto compositionKind =
+        materializationTask->getAttrOfType<StringAttr>("composition_kind");
+    if (compositionKind && compositionKind.getValue() == "contract_fold") {
+      ptx = emitContractFoldCompositionPtx(
+          materializationTask, materializationBuffers, task, sourceOperations);
+    } else if (compositionKind &&
+               compositionKind.getValue() == "map_contract") {
+      ptx = emitMapContractCompositionPtx(
+          materializationTask, materializationBuffers, task, sourceOperations);
+    } else if (compositionKind) {
+      return failure();
+    } else if (materializationTask->getAttr("contract_region_sources")) {
       ptx = emitContractRegionPtx(materializationTask, materializationBuffers,
                                   task, sourceOperations);
     } else if (materializationTask->getAttr("fold_region_sources")) {

@@ -133,7 +133,10 @@ def Shuttle_MaterializationTaskOp
       OptionalAttr<ArrayAttr>:$contract_region_epilogue_sources,
       OptionalAttr<I64Attr>:$contract_region_normalized_operand,
       OptionalAttr<DictionaryAttr>:$contract_region_cost,
-      OptionalAttr<ArrayAttr>:$contract_region_recomputed_sources);
+      OptionalAttr<ArrayAttr>:$contract_region_recomputed_sources,
+      OptionalAttr<StrAttr>:$composition_kind,
+      OptionalAttr<ArrayAttr>:$composition_sources,
+      OptionalAttr<DictionaryAttr>:$composition_cost);
 }
 
 def Shuttle_MaterializationPlanYieldOp
