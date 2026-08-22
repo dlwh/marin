@@ -72,19 +72,17 @@ def _document() -> dict[str, object]:
         "schema_version": 1,
         "subjects": {
             "generic_composition": {
+                "disabled_jax_role": "ordinary_source_and_diagnostic",
+                "host_oracle": "independent_binary64_contract_fold_map_contract",
                 "modes": ["disabled", "source_ordered", "fast"],
                 "numerical_policy": {
                     "path": f"lib/shuttle/mlir/jax_patch/{COMPOSITION_POLICY_FILENAME}",
                     "sha256": COMPOSITION_POLICY_SHA256,
                 },
-                "public_abi": {
-                    "arguments": ["a", "b", "p", "init"],
-                    "result": "y",
-                    "types": "static_f32_tensors_and_rank0_f32_init",
-                },
+                "public_abi": ["a:f32", "b:f32", "p:f32", "init:scalar_f32", "y:f32"],
                 "repeat_bitwise_required": True,
-                "resource_telemetry": "typed_nonnegative_observed_only",
                 "semantic_contract": SEMANTIC_CONTRACT,
+                "topology_telemetry": "non_normative",
             },
             "map": {
                 "boundaries": ["mixed_value_gradient"],
