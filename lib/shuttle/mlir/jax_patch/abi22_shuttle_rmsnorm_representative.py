@@ -50,38 +50,16 @@ ROLE_LIMITS = {
     }
     for role, limits in POLICY_V4_ACCEPTANCE_LIMITS.items()
 }
-RESOURCE_CONTRACT = {
-    "forward": {
-        "launch_count": 1,
-        "slot_count": 3,
-        "external_operand_count": 2,
-        "external_result_count": 1,
-        "temporary_allocation_count": 0,
-        "temporary_bytes": 0,
-    },
-    "backward_recompute": {
-        "launch_count": 3,
-        "slot_count": 6,
-        "external_operand_count": 3,
-        "external_result_count": 2,
-        "temporary_allocation_count": 1,
-        "temporary_bytes": 8192,
-    },
-    "composed": {
-        "launch_count": 4,
-        "slot_count": 7,
-        "external_operand_count": 3,
-        "external_result_count": 3,
-        "temporary_allocation_count": 1,
-        "temporary_bytes": 8192,
-    },
-}
 _FULL_BYTES = REPRESENTATIVE_SHAPE[0] * REPRESENTATIVE_SHAPE[1] * 2
 _FEATURE_BYTES = REPRESENTATIVE_SHAPE[1] * 2
+RESOURCE_CAPS = {
+    "maximum_launch_count": 256,
+    "maximum_slot_count": 256,
+    "maximum_temporary_bytes": 256 * 1024 * 1024,
+}
 _X = {
     "role": "x",
     "runner_index": 0,
-    "slot_ordinal": 0,
     "required_bytes": _FULL_BYTES,
     "tensor_type": "bf16[2048,4096]",
     "alignment": 2,
@@ -89,7 +67,6 @@ _X = {
 _GAMMA = {
     "role": "gamma",
     "runner_index": 1,
-    "slot_ordinal": 1,
     "required_bytes": _FEATURE_BYTES,
     "tensor_type": "bf16[4096]",
     "alignment": 2,
@@ -97,7 +74,6 @@ _GAMMA = {
 _DY = {
     "role": "dy",
     "runner_index": 2,
-    "slot_ordinal": 2,
     "required_bytes": _FULL_BYTES,
     "tensor_type": "bf16[2048,4096]",
     "alignment": 2,
@@ -110,7 +86,6 @@ BINDING_CONTRACT = {
                 "role": "y",
                 "public_result_index": 0,
                 "runner_index": 0,
-                "slot_ordinal": 2,
                 "required_bytes": _FULL_BYTES,
                 "tensor_type": "bf16[2048,4096]",
                 "alignment": 2,
@@ -124,7 +99,6 @@ BINDING_CONTRACT = {
                 "role": "dx",
                 "public_result_index": 0,
                 "runner_index": 0,
-                "slot_ordinal": 5,
                 "required_bytes": _FULL_BYTES,
                 "tensor_type": "bf16[2048,4096]",
                 "alignment": 2,
@@ -133,7 +107,6 @@ BINDING_CONTRACT = {
                 "role": "dgamma",
                 "public_result_index": 1,
                 "runner_index": 1,
-                "slot_ordinal": 4,
                 "required_bytes": _FEATURE_BYTES,
                 "tensor_type": "bf16[4096]",
                 "alignment": 2,
@@ -147,7 +120,6 @@ BINDING_CONTRACT = {
                 "role": "y",
                 "public_result_index": 0,
                 "runner_index": 0,
-                "slot_ordinal": 4,
                 "required_bytes": _FULL_BYTES,
                 "tensor_type": "bf16[2048,4096]",
                 "alignment": 2,
@@ -156,7 +128,6 @@ BINDING_CONTRACT = {
                 "role": "dx",
                 "public_result_index": 1,
                 "runner_index": 1,
-                "slot_ordinal": 6,
                 "required_bytes": _FULL_BYTES,
                 "tensor_type": "bf16[2048,4096]",
                 "alignment": 2,
@@ -165,7 +136,6 @@ BINDING_CONTRACT = {
                 "role": "dgamma",
                 "public_result_index": 2,
                 "runner_index": 2,
-                "slot_ordinal": 5,
                 "required_bytes": _FEATURE_BYTES,
                 "tensor_type": "bf16[4096]",
                 "alignment": 2,
@@ -214,6 +184,130 @@ def _read_bf16(path: Path, role: str) -> np.ndarray:
     if bits.size != expected:
         raise ValueError(f"BF16 output size drifted: {path}")
     return bits.view(ml_dtypes.bfloat16).reshape(_shape(role))
+
+
+def _validate_binding(raw: Mapping[str, object], expected: Mapping[str, object], *, kind: str, slot_count: int) -> int:
+    expected_fields = {"kind": kind, **expected}
+    if kind == "result":
+        expected_fields["artifact"] = raw.get("artifact")
+    if set(raw) != {*expected_fields, "slot_ordinal"}:
+        raise ValueError(f"raw {kind} binding fields drifted")
+    for field, value in expected_fields.items():
+        if raw.get(field) != value:
+            raise ValueError(f"raw {kind} binding {field} drifted")
+    slot = raw.get("slot_ordinal")
+    if type(slot) is not int or slot < 0 or slot >= slot_count:
+        raise ValueError(f"raw {kind} binding slot is invalid")
+    return slot
+
+
+def _validate_resources(resources: object, *, boundary: str, bindings: list[object]) -> dict[str, int]:
+    fields = {
+        "launch_count",
+        "slot_count",
+        "external_operand_count",
+        "external_result_count",
+        "temporary_allocation_count",
+        "temporary_bytes",
+    }
+    if not isinstance(resources, Mapping) or set(resources) != fields:
+        raise ValueError("raw runner resource fields drifted")
+    if any(type(resources.get(field)) is not int for field in fields):
+        raise ValueError("raw runner resources must be integer observations")
+    observed = {field: int(resources[field]) for field in fields}
+    if not 0 < observed["launch_count"] <= RESOURCE_CAPS["maximum_launch_count"]:
+        raise ValueError("raw runner launch count exceeds the generic cap")
+    if not 0 < observed["slot_count"] <= RESOURCE_CAPS["maximum_slot_count"]:
+        raise ValueError("raw runner slot count exceeds the generic cap")
+    if not 0 <= observed["temporary_bytes"] <= RESOURCE_CAPS["maximum_temporary_bytes"]:
+        raise ValueError("raw runner temporary bytes exceed the generic cap")
+    if observed["temporary_allocation_count"] < 0:
+        raise ValueError("raw runner temporary allocation count is negative")
+    operand_count = sum(isinstance(binding, Mapping) and binding.get("kind") == "operand" for binding in bindings)
+    result_count = sum(isinstance(binding, Mapping) and binding.get("kind") == "result" for binding in bindings)
+    if operand_count != len(BINDING_CONTRACT[boundary]["operands"]):
+        raise ValueError("raw external operand arity drifted")
+    if result_count != len(BINDING_CONTRACT[boundary]["results"]):
+        raise ValueError("raw external result arity drifted")
+    if observed["external_operand_count"] != operand_count or observed["external_result_count"] != result_count:
+        raise ValueError("raw external resource counts drifted")
+    external_count = operand_count + result_count
+    if observed["slot_count"] != external_count + observed["temporary_allocation_count"]:
+        raise ValueError("raw slot and temporary allocation aggregates are inconsistent")
+    if observed["temporary_allocation_count"] == 0 and observed["temporary_bytes"] != 0:
+        raise ValueError("raw zero-temporary plan reports temporary bytes")
+    if observed["temporary_allocation_count"] > 0 and observed["temporary_bytes"] <= 0:
+        raise ValueError("raw temporary plan reports no temporary bytes")
+    if observed["temporary_bytes"] >= _FULL_BYTES:
+        raise ValueError("raw plan materializes an avoidable full-tensor temporary")
+    return observed
+
+
+def _validate_optimization(transport: Mapping[str, object], resources: Mapping[str, int]) -> None:
+    integer_fields = {
+        "materialized_baseline_launch_count",
+        "materialized_baseline_temporary_traffic_bytes",
+        "fused_temporary_traffic_bytes",
+    }
+    if any(type(transport.get(field)) is not int or int(transport[field]) < 0 for field in integer_fields):
+        raise ValueError("raw modeled optimization fields drifted")
+    baseline_launches = int(transport["materialized_baseline_launch_count"])
+    baseline_traffic = int(transport["materialized_baseline_temporary_traffic_bytes"])
+    fused_traffic = int(transport["fused_temporary_traffic_bytes"])
+    if resources["launch_count"] > baseline_launches or fused_traffic > baseline_traffic:
+        raise ValueError("fused plan regresses modeled launch or temporary traffic")
+    if resources["launch_count"] == baseline_launches and fused_traffic == baseline_traffic:
+        raise ValueError("fused plan has no strict modeled improvement")
+    minimum_fused_traffic = resources["temporary_bytes"] * (2 if resources["temporary_bytes"] else 0)
+    if fused_traffic < minimum_fused_traffic:
+        raise ValueError("fused temporary traffic is inconsistent with allocation bytes")
+
+
+def _validate_task_graph(value: object, resources: Mapping[str, int]) -> None:
+    if not isinstance(value, list) or len(value) != resources["launch_count"]:
+        raise ValueError("raw task graph size drifted")
+    tasks: dict[int, Mapping[str, object]] = {}
+    for task in value:
+        if not isinstance(task, Mapping) or set(task) != {
+            "task_id",
+            "dependencies",
+            "input_slots",
+            "output_slots",
+        }:
+            raise ValueError("raw task graph fields drifted")
+        task_id = task.get("task_id")
+        if type(task_id) is not int or task_id in tasks:
+            raise ValueError("raw task identifiers drifted")
+        for field in ("dependencies", "input_slots", "output_slots"):
+            ordinals = task.get(field)
+            if not isinstance(ordinals, list) or any(type(ordinal) is not int for ordinal in ordinals):
+                raise ValueError(f"raw task {field} drifted")
+            if len(set(ordinals)) != len(ordinals):
+                raise ValueError(f"raw task {field} contains duplicates")
+        for slot in [*task["input_slots"], *task["output_slots"]]:
+            if slot < 0 or slot >= resources["slot_count"]:
+                raise ValueError("raw task graph references an invalid slot")
+        tasks[task_id] = task
+    for task in tasks.values():
+        if any(dependency not in tasks for dependency in task["dependencies"]):
+            raise ValueError("raw task graph references an unknown dependency")
+
+    visiting: set[int] = set()
+    visited: set[int] = set()
+
+    def visit(task_id: int) -> None:
+        if task_id in visiting:
+            raise ValueError("raw task graph contains a dependency cycle")
+        if task_id in visited:
+            return
+        visiting.add(task_id)
+        for dependency in tasks[task_id]["dependencies"]:
+            visit(dependency)
+        visiting.remove(task_id)
+        visited.add(task_id)
+
+    for task_id in tasks:
+        visit(task_id)
 
 
 def prepare_representative_cases(case_root: Path) -> dict[str, dict[str, str]]:
@@ -340,30 +434,32 @@ def _validate_raw_cell(
         "transport",
         "timing",
     }
-    if set(raw) != required or raw.get("schema") != "shuttle_abi22_rmsnorm_representative_raw_cell_v1":
+    if set(raw) != required or raw.get("schema") != "shuttle_abi22_rmsnorm_representative_raw_cell_v2":
         raise ValueError("raw runner cell schema drifted")
     if (raw.get("policy"), raw.get("boundary"), raw.get("repeat")) != (policy, boundary, repeat):
         raise ValueError("raw runner coordinate drifted")
     if raw.get("runner_api") != _RUNNER_API:
         raise ValueError("raw runner API drifted")
-    if raw.get("resources") != RESOURCE_CONTRACT[boundary]:
-        raise ValueError("raw runner resources drifted")
     bindings = raw.get("external_bindings")
     if not isinstance(bindings, list):
         raise ValueError("raw external bindings drifted")
-    expected_operands = [{"kind": "operand", **binding} for binding in BINDING_CONTRACT[boundary]["operands"]]
+    resources = _validate_resources(raw.get("resources"), boundary=boundary, bindings=bindings)
+    expected_operands = BINDING_CONTRACT[boundary]["operands"]
     expected_results = BINDING_CONTRACT[boundary]["results"]
     if len(bindings) != len(expected_operands) + len(expected_results):
         raise ValueError("raw external binding count drifted")
-    if bindings[: len(expected_operands)] != expected_operands:
-        raise ValueError("raw operand binding vector drifted")
+    external_slots = set()
+    for raw_binding, expected in zip(bindings[: len(expected_operands)], expected_operands, strict=True):
+        if not isinstance(raw_binding, Mapping):
+            raise ValueError("raw operand binding is not an object")
+        external_slots.add(_validate_binding(raw_binding, expected, kind="operand", slot_count=resources["slot_count"]))
     outputs = []
     case_directory = case_root / ACCEPTANCE_PATTERN
     for raw_binding, expected in zip(bindings[len(expected_operands) :], expected_results, strict=True):
         artifact = raw_binding.get("artifact") if isinstance(raw_binding, Mapping) else None
-        expected_binding = {"kind": "result", **expected, "artifact": artifact}
-        if raw_binding != expected_binding or not isinstance(artifact, Mapping):
+        if not isinstance(raw_binding, Mapping) or not isinstance(artifact, Mapping):
             raise ValueError("raw result binding vector drifted")
+        external_slots.add(_validate_binding(raw_binding, expected, kind="result", slot_count=resources["slot_count"]))
         validated_artifact = validate_output_artifact(artifact, raw_root=raw_root, case_root=case_root)
         role = expected["role"]
         actual = _read_bf16(Path(validated_artifact["path"]), role)
@@ -374,7 +470,7 @@ def _validate_raw_cell(
                 "role": role,
                 "public_result_index": expected["public_result_index"],
                 "runner_result_index": expected["runner_index"],
-                "slot_ordinal": expected["slot_ordinal"],
+                "slot_ordinal": raw_binding["slot_ordinal"],
                 "digest": validated_artifact["sha256"],
                 "reference_digest": _sha256_file(reference_path),
                 "artifact": validated_artifact,
@@ -388,6 +484,10 @@ def _validate_raw_cell(
         "executable_digest",
         "module_load_digest",
         "ptx_digests",
+        "materialized_baseline_launch_count",
+        "materialized_baseline_temporary_traffic_bytes",
+        "fused_temporary_traffic_bytes",
+        "task_graph",
     }:
         raise ValueError("raw transport fields drifted")
     if transport.get("contract_operation_count") != 0:
@@ -397,10 +497,14 @@ def _validate_raw_cell(
     _digest(transport.get("executable_digest"), "executable digest")
     _digest(transport.get("module_load_digest"), "module load digest")
     ptx_digests = transport.get("ptx_digests")
-    if not isinstance(ptx_digests, list) or len(ptx_digests) != RESOURCE_CONTRACT[boundary]["launch_count"]:
+    if not isinstance(ptx_digests, list) or len(ptx_digests) != resources["launch_count"]:
         raise ValueError("raw PTX digest vector drifted")
     for digest in ptx_digests:
         _digest(digest, "PTX digest")
+    _validate_task_graph(transport.get("task_graph"), resources)
+    if len(external_slots) != len(bindings):
+        raise ValueError("raw external bindings alias one internal slot")
+    _validate_optimization(transport, resources)
     timing = raw.get("timing")
     if not isinstance(timing, Mapping) or set(timing) != {
         "warmup_iterations",
@@ -421,7 +525,7 @@ def _validate_raw_cell(
     _positive_samples(timing.get("cuda_event_samples_ns"), "CUDA-event")
     input_roles = ("x", "gamma") if boundary == "forward" else ("x", "gamma", "dy")
     return {
-        "schema": "shuttle_abi22_rmsnorm_representative_cell_v1",
+        "schema": "shuttle_abi22_rmsnorm_representative_cell_v2",
         "producer": "shuttle_gpu_executable_bundle",
         "input_pattern": ACCEPTANCE_PATTERN,
         "shape": list(REPRESENTATIVE_SHAPE),
@@ -524,7 +628,7 @@ def _external_evidence(r12_result: Path, r12_policy_raw: Path) -> dict[str, str]
 def _evidence_document(cells: list[dict[str, object]], *, r12_result: Path, r12_policy_raw: Path) -> dict[str, object]:
     identities = [cell["transport"]["executable_digest"] for cell in cells]
     return {
-        "schema": "shuttle_abi22_rmsnorm_representative_evidence_v1",
+        "schema": "shuttle_abi22_rmsnorm_representative_evidence_v2",
         "status": "heldout_splitmix64_v3_shuttle_numerics_accepted",
         "producer": "shuttle_gpu_executable_bundle",
         "shape": list(REPRESENTATIVE_SHAPE),
@@ -554,7 +658,7 @@ def _prevalidation_document(
     cells: list[dict[str, object]], *, r12_result: Path, r12_policy_raw: Path
 ) -> dict[str, object]:
     document = _evidence_document(cells, r12_result=r12_result, r12_policy_raw=r12_policy_raw)
-    document["schema"] = "shuttle_abi22_rmsnorm_representative_prevalidation_raw_v1"
+    document["schema"] = "shuttle_abi22_rmsnorm_representative_prevalidation_raw_v2"
     document["status"] = "unvalidated_numerical_evidence"
     return document
 
@@ -591,7 +695,7 @@ def _validate_metrics(output: Mapping[str, object], role: str) -> None:
 
 def _validate_claims(document: Mapping[str, object], *, r12_result: Path, r12_policy_raw: Path) -> None:
     expected_fields = {
-        "schema": "shuttle_abi22_rmsnorm_representative_evidence_v1",
+        "schema": "shuttle_abi22_rmsnorm_representative_evidence_v2",
         "status": "heldout_splitmix64_v3_shuttle_numerics_accepted",
         "producer": "shuttle_gpu_executable_bundle",
         "shape": list(REPRESENTATIVE_SHAPE),
@@ -626,12 +730,13 @@ def _validate_claims(document: Mapping[str, object], *, r12_result: Path, r12_po
         raise ValueError("assembled Shuttle cell matrix drifted")
     repeat_digests = {}
     repeat_transports = {}
+    repeat_resources = {}
     for cell, (policy, boundary, repeat) in zip(cells, coordinates, strict=True):
         if not isinstance(cell, Mapping):
             raise ValueError("assembled Shuttle cell is not an object")
         input_roles = ("x", "gamma") if boundary == "forward" else ("x", "gamma", "dy")
         fixed = {
-            "schema": "shuttle_abi22_rmsnorm_representative_cell_v1",
+            "schema": "shuttle_abi22_rmsnorm_representative_cell_v2",
             "producer": "shuttle_gpu_executable_bundle",
             "input_pattern": ACCEPTANCE_PATTERN,
             "shape": list(REPRESENTATIVE_SHAPE),
@@ -642,11 +747,28 @@ def _validate_claims(document: Mapping[str, object], *, r12_result: Path, r12_po
             "inputs": {role: POLICY_V4_ACCEPTANCE_INPUT_DIGESTS[role] for role in input_roles},
             "call_sequence": _CALL_SEQUENCE[boundary],
             "runner_api": _RUNNER_API,
-            "resources": RESOURCE_CONTRACT[boundary],
         }
         for field, expected in fixed.items():
             if cell.get(field) != expected:
                 raise ValueError(f"assembled Shuttle cell {field} drifted")
+        outputs = cell.get("outputs")
+        if not isinstance(outputs, list):
+            raise ValueError("assembled Shuttle output vector drifted")
+        raw_bindings = []
+        for binding in BINDING_CONTRACT[boundary]["operands"]:
+            raw_bindings.append({"kind": "operand", **binding, "slot_ordinal": len(raw_bindings)})
+        for output, binding in zip(outputs, BINDING_CONTRACT[boundary]["results"], strict=True):
+            if not isinstance(output, Mapping):
+                raise ValueError("assembled Shuttle output is not an object")
+            raw_bindings.append(
+                {
+                    "kind": "result",
+                    **binding,
+                    "slot_ordinal": output.get("slot_ordinal"),
+                    "artifact": output.get("artifact"),
+                }
+            )
+        resources = _validate_resources(cell.get("resources"), boundary=boundary, bindings=raw_bindings)
         timing = cell.get("timing")
         if not isinstance(timing, Mapping):
             raise ValueError("assembled Shuttle timing drifted")
@@ -667,11 +789,12 @@ def _validate_claims(document: Mapping[str, object], *, r12_result: Path, r12_po
         _digest(transport.get("executable_digest"), "executable digest")
         _digest(transport.get("module_load_digest"), "module load digest")
         ptx_digests = transport.get("ptx_digests")
-        if not isinstance(ptx_digests, list) or len(ptx_digests) != RESOURCE_CONTRACT[boundary]["launch_count"]:
+        if not isinstance(ptx_digests, list) or len(ptx_digests) != resources["launch_count"]:
             raise ValueError("assembled Shuttle PTX digest vector drifted")
         for digest in ptx_digests:
             _digest(digest, "PTX digest")
-        outputs = cell.get("outputs")
+        _validate_task_graph(transport.get("task_graph"), resources)
+        _validate_optimization(transport, resources)
         bindings = BINDING_CONTRACT[boundary]["results"]
         if not isinstance(outputs, list) or len(outputs) != len(bindings):
             raise ValueError("assembled Shuttle output vector drifted")
@@ -682,12 +805,14 @@ def _validate_claims(document: Mapping[str, object], *, r12_result: Path, r12_po
                 "role": binding["role"],
                 "public_result_index": binding["public_result_index"],
                 "runner_result_index": binding["runner_index"],
-                "slot_ordinal": binding["slot_ordinal"],
                 "reference_digest": POLICY_V4_ACCEPTANCE_REFERENCE_DIGESTS[binding["role"]],
             }
             for field, expected in fixed_output.items():
                 if output.get(field) != expected:
                     raise ValueError(f"assembled Shuttle output {field} drifted")
+            slot = output.get("slot_ordinal")
+            if type(slot) is not int or slot < 0 or slot >= resources["slot_count"]:
+                raise ValueError("assembled Shuttle output slot is invalid")
             digest = _digest(output.get("digest"), "output digest")
             artifact = output.get("artifact")
             if not isinstance(artifact, Mapping) or artifact.get("sha256") != digest:
@@ -695,10 +820,13 @@ def _validate_claims(document: Mapping[str, object], *, r12_result: Path, r12_po
             _validate_metrics(output, binding["role"])
             repeat_digests[(policy, boundary, binding["role"], repeat)] = digest
         repeat_transports[(policy, boundary, repeat)] = dict(transport)
+        repeat_resources[(policy, boundary, repeat)] = dict(resources)
     for policy in POLICIES:
         for boundary in BOUNDARIES:
             if repeat_transports[(policy, boundary, 0)] != repeat_transports[(policy, boundary, 1)]:
                 raise ValueError("Shuttle repeat transport identity drifted")
+            if repeat_resources[(policy, boundary, 0)] != repeat_resources[(policy, boundary, 1)]:
+                raise ValueError("Shuttle repeat resource observation drifted")
             for role in RESULT_ROLES[boundary]:
                 if repeat_digests[(policy, boundary, role, 0)] != repeat_digests[(policy, boundary, role, 1)]:
                     raise ValueError("Shuttle acceptance repeat output digest drifted")

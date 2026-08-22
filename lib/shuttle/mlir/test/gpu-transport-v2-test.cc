@@ -4174,7 +4174,6 @@ TEST(GpuTransportV2Test,
       R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
   constexpr llvm::StringLiteral tuning =
       R"json({"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json";
-
   for (const Boundary &boundary : boundaries) {
     SCOPED_TRACE(boundary.filename);
     auto source = fixtureSource(boundary.filename);
@@ -7175,6 +7174,12 @@ TEST(GpuTransportV2Test,
       R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
   constexpr llvm::StringLiteral tuning =
       R"json({"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json";
+  constexpr llvm::StringLiteral sourceOrderedMaterializedOptions =
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_materialization","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+  constexpr llvm::StringLiteral fastMaterializedOptions =
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_materialization","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+  constexpr llvm::StringLiteral materializedTuning =
+      R"json({"cluster_shape":[],"materialization":"prefer_materialization","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json";
   mlir::shuttle::NumericalPolicy policy =
       policyName == "source_ordered"
           ? mlir::shuttle::NumericalPolicy::SourceOrdered
@@ -7188,6 +7193,31 @@ TEST(GpuTransportV2Test,
   ASSERT_TRUE(mlir::succeeded(serialized));
   auto executable = mlir::shuttle::GpuExecutable::Load(*serialized);
   ASSERT_TRUE(executable.ok()) << executable.status();
+  auto materialized = buildFixture(*source, policy,
+                                   policyName == "source_ordered"
+                                       ? sourceOrderedMaterializedOptions
+                                       : fastMaterializedOptions,
+                                   materializedTuning);
+  ASSERT_TRUE(materialized);
+  auto materializedSerialized =
+      mlir::shuttle::serializeGpuExecutableBundle(*materialized->module);
+  ASSERT_TRUE(mlir::succeeded(materializedSerialized));
+  auto materializedExecutable =
+      mlir::shuttle::GpuExecutable::Load(*materializedSerialized);
+  ASSERT_TRUE(materializedExecutable.ok()) << materializedExecutable.status();
+  auto temporaryTraffic = [](const mlir::shuttle::GpuExecutable &value) {
+    int64_t bytes = 0;
+    for (const mlir::shuttle::GpuSlot &slot : value.slots()) {
+      if (slot.storage != mlir::shuttle::MaterializationStorage::Temporary)
+        continue;
+      int64_t consumers = llvm::count_if(
+          value.launches(), [&](const mlir::shuttle::GpuLaunch &launch) {
+            return llvm::is_contained(launch.inputSlots, slot.ordinal);
+          });
+      bytes += slot.requiredBytes * (1 + consumers);
+    }
+    return bytes;
+  };
 
   auto platform = stream_executor::PlatformManager::PlatformWithName("CUDA");
   ASSERT_TRUE(platform.ok()) << platform.status();
@@ -7354,8 +7384,26 @@ TEST(GpuTransportV2Test,
   llvm::json::Array ptxDigests;
   for (const auto &launch : (*executable)->launches())
     ptxDigests.push_back(launch.codeDigest);
+  llvm::json::Array taskGraph;
+  for (const auto &launch : (*executable)->launches()) {
+    llvm::json::Array dependencies;
+    llvm::json::Array inputSlots;
+    llvm::json::Array outputSlots;
+    for (int64_t dependency : launch.dependencies)
+      dependencies.push_back(dependency);
+    for (int64_t slot : launch.inputSlots)
+      inputSlots.push_back(slot);
+    for (int64_t slot : launch.outputSlots)
+      outputSlots.push_back(slot);
+    taskGraph.push_back(llvm::json::Object{
+        {"task_id", launch.taskOrdinal},
+        {"dependencies", std::move(dependencies)},
+        {"input_slots", std::move(inputSlots)},
+        {"output_slots", std::move(outputSlots)},
+    });
+  }
   llvm::json::Object raw{
-      {"schema", "shuttle_abi22_rmsnorm_representative_raw_cell_v1"},
+      {"schema", "shuttle_abi22_rmsnorm_representative_raw_cell_v2"},
       {"policy", policyName},
       {"boundary", boundary},
       {"repeat", repeat},
@@ -7377,6 +7425,12 @@ TEST(GpuTransportV2Test,
       {"transport",
        llvm::json::Object{
            {"contract_operation_count", 0},
+           {"materialized_baseline_launch_count",
+            static_cast<int64_t>((*materializedExecutable)->launches().size())},
+           {"materialized_baseline_temporary_traffic_bytes",
+            temporaryTraffic(**materializedExecutable)},
+           {"fused_temporary_traffic_bytes", temporaryTraffic(**executable)},
+           {"task_graph", std::move(taskGraph)},
            {"code_bytes",
             static_cast<int64_t>((*executable)->codeBytes().size())},
            {"executable_digest",

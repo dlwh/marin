@@ -22,7 +22,7 @@ from abi22_shuttle_rmsnorm_representative import (
     BOUNDARIES,
     POLICIES,
     REPRESENTATIVE_SHAPE,
-    RESOURCE_CONTRACT,
+    RESOURCE_CAPS,
     RESULT_ROLES,
     ROLE_LIMITS,
     execute_representative,
@@ -79,7 +79,9 @@ EXPECTED_LIMITS = {
         "max_bfloat16_ulp_above_floor": 8,
     },
 }
-EXPECTED_RESOURCES = {
+# Observed r5 topology seeds the ordinary fake; positive variants below prove
+# that these values are provenance rather than acceptance requirements.
+OBSERVED_R5_RESOURCES = {
     "forward": {
         "launch_count": 1,
         "slot_count": 3,
@@ -309,7 +311,7 @@ def _fake_runner(
         external_bindings.append({"kind": "result", **binding, "artifact": artifact})
     coordinate_number = POLICIES.index(policy) * len(BOUNDARIES) * 2 + BOUNDARIES.index(boundary) * 2 + repeat
     cell = {
-        "schema": "shuttle_abi22_rmsnorm_representative_raw_cell_v1",
+        "schema": "shuttle_abi22_rmsnorm_representative_raw_cell_v2",
         "policy": policy,
         "boundary": boundary,
         "repeat": repeat,
@@ -318,7 +320,7 @@ def _fake_runner(
             "cuda_event": "GpuRunner::ExecuteTimed",
         },
         "external_bindings": external_bindings,
-        "resources": copy.deepcopy(EXPECTED_RESOURCES[boundary]),
+        "resources": copy.deepcopy(OBSERVED_R5_RESOURCES[boundary]),
         "transport": {
             "contract_operation_count": 0,
             "code_bytes": 4096 + POLICIES.index(policy) * len(BOUNDARIES) + BOUNDARIES.index(boundary),
@@ -326,7 +328,7 @@ def _fake_runner(
             "module_load_digest": _sha(f"module/{policy}/{boundary}"),
             "ptx_digests": [
                 _sha(f"ptx/{policy}/{boundary}/{launch}")
-                for launch in range(EXPECTED_RESOURCES[boundary]["launch_count"])
+                for launch in range(OBSERVED_R5_RESOURCES[boundary]["launch_count"])
             ],
         },
         "timing": {
@@ -351,9 +353,42 @@ def _fake_runner(
                 "temporary_bytes": 2048 * 4,
             }
         )
+        next(binding for binding in external_bindings if binding["kind"] == "result")["slot_ordinal"] = 3
         cell["transport"]["ptx_digests"].append(_sha(f"ptx/{policy}/{boundary}/split"))
-    elif topology_variant is not None and topology_variant != "split_forward":
+    elif topology_variant not in (None, "split_forward", "renumbered_tasks"):
         raise AssertionError(topology_variant)
+    operand_slots = [binding["slot_ordinal"] for binding in external_bindings if binding["kind"] == "operand"]
+    result_slots = [binding["slot_ordinal"] for binding in external_bindings if binding["kind"] == "result"]
+    temporary_slots = sorted(set(range(cell["resources"]["slot_count"])) - set(operand_slots) - set(result_slots))
+    launch_count = cell["resources"]["launch_count"]
+    task_ids = list(range(launch_count))
+    if topology_variant == "renumbered_tasks":
+        task_ids = [100 + 7 * (launch_count - ordinal) for ordinal in range(launch_count)]
+    task_graph = []
+    for ordinal, task_id in enumerate(task_ids):
+        if temporary_slots and ordinal == 0:
+            outputs = [temporary_slots[0]]
+        else:
+            result_ordinal = ordinal - (1 if temporary_slots else 0)
+            outputs = [result_slots[result_ordinal]]
+        task_graph.append(
+            {
+                "task_id": task_id,
+                "dependencies": [] if ordinal == 0 else [task_ids[0]],
+                "input_slots": operand_slots + ([] if ordinal == 0 else temporary_slots),
+                "output_slots": outputs,
+            }
+        )
+    cell["transport"]["task_graph"] = task_graph
+    temporary_bytes = cell["resources"]["temporary_bytes"]
+    fused_temporary_traffic = temporary_bytes * (2 if temporary_bytes else 0)
+    cell["transport"].update(
+        {
+            "materialized_baseline_launch_count": cell["resources"]["launch_count"] + 1,
+            "materialized_baseline_temporary_traffic_bytes": max(FULL_BYTES, fused_temporary_traffic),
+            "fused_temporary_traffic_bytes": fused_temporary_traffic,
+        }
+    )
     first_coordinate = coordinate == ("source_ordered", "forward", 0)
     if raw_mutation == "backward_runner_index" and coordinate == ("source_ordered", "backward_recompute", 0):
         results = [binding for binding in external_bindings if binding["kind"] == "result"]
@@ -361,13 +396,7 @@ def _fake_runner(
             results[1]["runner_index"],
             results[0]["runner_index"],
         )
-    elif raw_mutation == "composed_slot" and coordinate == ("source_ordered", "composed", 0):
-        results = [binding for binding in external_bindings if binding["kind"] == "result"]
-        results[0]["slot_ordinal"], results[1]["slot_ordinal"] = (
-            results[1]["slot_ordinal"],
-            results[0]["slot_ordinal"],
-        )
-    elif first_coordinate and raw_mutation not in (None, "backward_runner_index", "composed_slot"):
+    elif first_coordinate and raw_mutation not in (None, "backward_runner_index"):
         operand = next(binding for binding in external_bindings if binding["kind"] == "operand")
         result = next(binding for binding in external_bindings if binding["kind"] == "result")
         if raw_mutation == "operand_bytes":
@@ -386,6 +415,22 @@ def _fake_runner(
             cell["runner_api"]["host"] = "wall_clock_without_stream_fence"
         elif raw_mutation == "resource":
             cell["resources"]["launch_count"] += 1
+        elif raw_mutation == "resource_cap":
+            cell["resources"]["launch_count"] = RESOURCE_CAPS["maximum_launch_count"] + 1
+            cell["transport"]["ptx_digests"] = ["0" * 64] * cell["resources"]["launch_count"]
+            cell["transport"]["materialized_baseline_launch_count"] = cell["resources"]["launch_count"] + 1
+        elif raw_mutation == "resource_aggregate":
+            cell["resources"]["slot_count"] += 1
+        elif raw_mutation == "full_tensor_temporary":
+            cell["resources"].update({"slot_count": 4, "temporary_allocation_count": 1, "temporary_bytes": FULL_BYTES})
+            cell["transport"]["fused_temporary_traffic_bytes"] = FULL_BYTES * 2
+            cell["transport"]["materialized_baseline_temporary_traffic_bytes"] = FULL_BYTES * 2
+        elif raw_mutation == "modeled_regression":
+            cell["transport"]["materialized_baseline_launch_count"] = cell["resources"]["launch_count"] - 1
+        elif raw_mutation == "task_cycle":
+            cell["transport"]["task_graph"][0]["dependencies"] = [cell["transport"]["task_graph"][-1]["task_id"]]
+        elif raw_mutation == "task_slot":
+            cell["transport"]["task_graph"][0]["input_slots"][0] = cell["resources"]["slot_count"]
         elif raw_mutation == "contract_transport":
             cell["transport"]["contract_operation_count"] = 1
         elif raw_mutation == "warmup_iterations":
@@ -484,8 +529,16 @@ def test_contract_freezes_r12_inputs_role_limits_resources_and_coordinates(
         "composed": ("y", "dx", "dgamma"),
     }
     assert ROLE_LIMITS == EXPECTED_LIMITS
-    assert RESOURCE_CONTRACT == EXPECTED_RESOURCES
-    assert BINDING_CONTRACT == EXPECTED_BINDINGS
+    assert RESOURCE_CAPS == {
+        "maximum_launch_count": 256,
+        "maximum_slot_count": 256,
+        "maximum_temporary_bytes": 256 * 1024 * 1024,
+    }
+    semantic_bindings = copy.deepcopy(EXPECTED_BINDINGS)
+    for boundary in semantic_bindings.values():
+        for binding in (*boundary["operands"], *boundary["results"]):
+            binding.pop("slot_ordinal")
+    assert BINDING_CONTRACT == semantic_bindings
     assert hashlib.sha256(R12_RESULT.read_bytes()).hexdigest() == SHA256["r12_result"]
     assert hashlib.sha256(R12_RAW.read_bytes()).hexdigest() == SHA256["r12_raw"]
 
@@ -517,7 +570,7 @@ def test_executor_invokes_exact_matrix_and_assembles_file_backed_evidence(
         == evidence
     )
     raw_evidence = json.loads((reports_root / "shuttle-policy-raw-v1.json").read_text())
-    assert raw_evidence["schema"] == "shuttle_abi22_rmsnorm_representative_prevalidation_raw_v1"
+    assert raw_evidence["schema"] == "shuttle_abi22_rmsnorm_representative_prevalidation_raw_v2"
     assert raw_evidence["status"] == "unvalidated_numerical_evidence"
     assert "accepted" not in raw_evidence["status"]
     assert raw_evidence["cells"] == evidence["cells"]
@@ -576,7 +629,6 @@ FAILURE_MUTATIONS = (
     "artifact_size",
     "artifact_sha",
     "backward_runner_index",
-    "composed_slot",
     "operand_bytes",
     "operand_type",
     "operand_alignment",
@@ -585,6 +637,12 @@ FAILURE_MUTATIONS = (
     "result_alignment",
     "runner_api",
     "resource",
+    "resource_cap",
+    "resource_aggregate",
+    "full_tensor_temporary",
+    "modeled_regression",
+    "task_cycle",
+    "task_slot",
     "contract_transport",
     "warmup_iterations",
     "measured_iterations",
@@ -648,7 +706,7 @@ def test_executor_persists_raw_outputs_and_diagnostics_before_numerical_rejectio
     assert diagnostics_path.is_file()
     raw = json.loads(raw_path.read_text())
     diagnostics = json.loads(diagnostics_path.read_text())
-    assert raw["schema"] == "shuttle_abi22_rmsnorm_representative_prevalidation_raw_v1"
+    assert raw["schema"] == "shuttle_abi22_rmsnorm_representative_prevalidation_raw_v2"
     assert raw["status"] == "unvalidated_numerical_evidence"
     assert "accepted" not in raw["status"]
     failed = raw["cells"][0]["outputs"][0]
@@ -957,12 +1015,6 @@ def test_every_acceptance_cell_enforces_metrics_roles_and_resources(
         with _raises(ValueError):
             _validate(changed, executed_evidence, prepared_case_root)
 
-    for field in EXPECTED_RESOURCES[boundary]:
-        changed = copy.deepcopy(baseline)
-        changed["cells"][index]["resources"][field] += 1
-        with _raises(ValueError):
-            _validate(changed, executed_evidence, prepared_case_root)
-
 
 STRUCTURAL_MUTATIONS = (
     "missing_cell",
@@ -975,7 +1027,6 @@ STRUCTURAL_MUTATIONS = (
     "wrong_role_order",
     "wrong_public_index",
     "wrong_runner_index",
-    "wrong_slot_ordinal",
     "wrong_runner_api",
     "repeat_drift",
     "contract_fusion",
@@ -1022,12 +1073,6 @@ def test_structural_transport_repeat_and_external_evidence_mutations_reject(
         backward["outputs"][0]["runner_result_index"], backward["outputs"][1]["runner_result_index"] = (
             backward["outputs"][1]["runner_result_index"],
             backward["outputs"][0]["runner_result_index"],
-        )
-    elif mutation == "wrong_slot_ordinal":
-        composed = next(entry for entry in changed["cells"] if entry["boundary"] == "composed")
-        composed["outputs"][0]["slot_ordinal"], composed["outputs"][1]["slot_ordinal"] = (
-            composed["outputs"][1]["slot_ordinal"],
-            composed["outputs"][0]["slot_ordinal"],
         )
     elif mutation == "wrong_runner_api":
         cell["runner_api"]["host"] = "stream_ordered_without_fence"
@@ -1154,7 +1199,7 @@ class RepresentativeRmsNormTest(unittest.TestCase):
         test_shell_wrapper_rejects_missing_or_ambiguous_derived_runfiles_root(
             self.temporary_path("wrapper-runfiles-invalid")
         )
-        for topology_variant in ("renumbered_slots", "split_forward"):
+        for topology_variant in ("renumbered_slots", "renumbered_tasks", "split_forward"):
             with self.subTest(topology_variant=topology_variant):
                 test_executor_accepts_semantically_equivalent_resource_topologies(
                     self.temporary_path(f"topology-{topology_variant}"), self.case_root, topology_variant
