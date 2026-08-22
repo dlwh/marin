@@ -5639,12 +5639,12 @@ TEST(Abi22MapFusionContract,
        {2, 7},
        {{{2, 3}, {3, 5}, {5, 7}, {}}}},
       {"abi22-generic-contract-fold-composition-rank3.mlir",
-       {4, 6},
-       {9, 13},
-       {2, 3},
-       {2, 3, 11},
-       {2, 3, 13},
-       {{{2, 3, 4}, {4, 11}, {11, 13}, {}}}},
+      {4, 6},
+      {9, 13},
+      {2, 3},
+       {2, 3, 269},
+      {2, 3, 13},
+       {{{2, 3, 4}, {4, 269}, {269, 13}, {}}}},
   };
   for (const Fixture &fixture : fixtures) {
     SCOPED_TRACE(fixture.filename);
@@ -5846,6 +5846,8 @@ TEST(Abi22MapFusionContract,
         EXPECT_TRUE(contractFoldPtx.contains("fma.rn.f32"));
         EXPECT_TRUE(contractFoldPtx.contains("st.shared.f32"));
         EXPECT_TRUE(contractFoldPtx.contains("ld.shared.f32"));
+        EXPECT_FALSE(contractFoldPtx.contains("add.u32 %r4, %r4, %r2"));
+        EXPECT_TRUE(contractFoldPtx.contains("add.u64"));
         EXPECT_EQ(mapContractPtx.count(".param .u64 p"), 4u);
         EXPECT_EQ(mapContractPtx.count("st.global.f32"), 1u);
         EXPECT_TRUE(mapContractPtx.contains("[p0]"));
@@ -5854,6 +5856,24 @@ TEST(Abi22MapFusionContract,
         EXPECT_TRUE(mapContractPtx.contains("[p3]"));
         EXPECT_TRUE(mapContractPtx.contains("mul.rn.f32"));
         EXPECT_TRUE(mapContractPtx.contains("fma.rn.f32"));
+        PtxDataflow contractFoldFlow = ptxDataflow(contractFoldPtx);
+        PtxDataflow mapContractFlow = ptxDataflow(mapContractPtx);
+        ASSERT_EQ(contractFoldFlow.stores.size(), 2u);
+        ASSERT_EQ(mapContractFlow.stores.size(), 1u);
+        std::set<std::string> compactClosure = ptxDependencyClosure(
+            contractFoldFlow, contractFoldFlow.stores.back().value);
+        EXPECT_TRUE(compactClosure.count("p0"));
+        EXPECT_TRUE(compactClosure.count("p1"));
+        EXPECT_TRUE(compactClosure.count("p2"));
+        EXPECT_TRUE(compactClosure.count("$shared"));
+        EXPECT_TRUE(compactClosure.count("$op:fma.rn.f32"));
+        std::set<std::string> resultClosure = ptxDependencyClosure(
+            mapContractFlow, mapContractFlow.stores.front().value);
+        EXPECT_TRUE(resultClosure.count("p0"));
+        EXPECT_TRUE(resultClosure.count("p1"));
+        EXPECT_TRUE(resultClosure.count("p2"));
+        EXPECT_TRUE(resultClosure.count("$op:mul.rn.f32"));
+        EXPECT_TRUE(resultClosure.count("$op:fma.rn.f32"));
         mlir::FailureOr<llvm::SmallVector<uint8_t>> transport =
             mlir::shuttle::serializeGpuExecutableBundle(
                 *executableBuilt->module);
