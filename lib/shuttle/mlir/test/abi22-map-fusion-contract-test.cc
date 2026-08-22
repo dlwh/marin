@@ -1579,8 +1579,23 @@ bool mutateGenericContractFoldComposition(mlir::ModuleOp module,
   } else if (mutation == "compact-type") {
     (*compact)->setAttr("tensor_type",
                         mlir::TypeAttr::get(full->getTensorType()));
+  } else if (mutation == "compact-element-type") {
+    auto type = mlir::cast<mlir::RankedTensorType>(compact->getTensorType());
+    (*compact)->setAttr("tensor_type",
+                        mlir::TypeAttr::get(mlir::RankedTensorType::get(
+                            type.getShape(), builder.getF16Type())));
   } else if (mutation == "extra-public-result") {
     (*compact)->setAttr("live_out", builder.getBoolAttr(true));
+  } else if (mutation == "full-live-out") {
+    (*full)->setAttr("live_out", builder.getBoolAttr(true));
+  } else if (mutation == "boundary-storage") {
+    (*compact)->setAttr("storage",
+                        mlir::shuttle::MaterializationStorageAttr::get(
+                            module.getContext(),
+                            mlir::shuttle::MaterializationStorage::External));
+  } else if (mutation == "boundary-producer") {
+    (*compact)->setAttr("producer",
+                        builder.getI64IntegerAttr(second->getOrdinal()));
   } else if (mutation == "lifetime") {
     (*compact)->setAttr("lifetime_end",
                         builder.getI64IntegerAttr(first->getOrdinal()));
@@ -1592,6 +1607,43 @@ bool mutateGenericContractFoldComposition(mlir::ModuleOp module,
         second->getInputBuffers(), std::back_inserter(inputs),
         [&](int64_t ordinal) { return ordinal != compact->getOrdinal(); });
     (*second)->setAttr("input_buffers", builder.getDenseI64ArrayAttr(inputs));
+  } else if (mutation == "missing-public-input") {
+    llvm::SmallVector<int64_t> inputs(first->getInputBuffers());
+    auto publicInput = llvm::find_if(inputs, [&](int64_t ordinal) {
+      auto buffer = bufferByOrdinal(ordinal);
+      return buffer != buffers.end() && buffer->getLiveIn();
+    });
+    if (publicInput == inputs.end())
+      return false;
+    inputs.erase(publicInput);
+    (*first)->setAttr("input_buffers", builder.getDenseI64ArrayAttr(inputs));
+  } else if (mutation == "rebound-public-input") {
+    llvm::SmallVector<int64_t> inputs(first->getInputBuffers());
+    llvm::SmallVector<size_t> publicPositions;
+    for (auto [position, ordinal] : llvm::enumerate(inputs)) {
+      auto buffer = bufferByOrdinal(ordinal);
+      if (buffer != buffers.end() && buffer->getLiveIn())
+        publicPositions.push_back(position);
+    }
+    if (publicPositions.size() < 2)
+      return false;
+    std::swap(inputs[publicPositions[0]], inputs[publicPositions[1]]);
+    (*first)->setAttr("input_buffers", builder.getDenseI64ArrayAttr(inputs));
+  } else if (mutation == "missing-public-result" ||
+             mutation == "rebound-public-result") {
+    auto publicResult =
+        llvm::find_if(buffers, [](auto buffer) { return buffer.getLiveOut(); });
+    if (publicResult == buffers.end())
+      return false;
+    llvm::SmallVector<int64_t> outputs(second->getOutputBuffers());
+    auto output = llvm::find(outputs, publicResult->getOrdinal());
+    if (output == outputs.end())
+      return false;
+    if (mutation == "missing-public-result")
+      outputs.erase(output);
+    else
+      *output = compact->getOrdinal();
+    (*second)->setAttr("output_buffers", builder.getDenseI64ArrayAttr(outputs));
   } else if (mutation == "source-ownership") {
     auto sources =
         (*second)->getAttrOfType<mlir::ArrayAttr>("composition_sources");
@@ -1599,6 +1651,16 @@ bool mutateGenericContractFoldComposition(mlir::ModuleOp module,
       return false;
     (*second)->setAttr("composition_sources",
                        builder.getArrayAttr(sources.getValue().drop_back()));
+  } else if (mutation == "duplicate-source-ownership") {
+    auto firstSources =
+        (*first)->getAttrOfType<mlir::ArrayAttr>("composition_sources");
+    auto secondSources =
+        (*second)->getAttrOfType<mlir::ArrayAttr>("composition_sources");
+    if (!firstSources || firstSources.empty() || !secondSources)
+      return false;
+    llvm::SmallVector<mlir::Attribute> sources(secondSources.getValue());
+    sources.push_back(firstSources[0]);
+    (*second)->setAttr("composition_sources", builder.getArrayAttr(sources));
   } else if (mutation == "cost") {
     auto cost =
         (*second)->getAttrOfType<mlir::DictionaryAttr>("composition_cost");
@@ -5489,8 +5551,8 @@ TEST(Abi22MapFusionContract,
       mlir::shuttle::DeviceEntryOp specializedEntry =
           entries[specializedTask.getOrdinal()];
       llvm::StringRef specializedPtx(
-          reinterpret_cast<const char *>(
-              device.getCode().data() + specializedEntry.getCodeOffset()),
+          reinterpret_cast<const char *>(device.getCode().data() +
+                                         specializedEntry.getCodeOffset()),
           specializedEntry.getCodeLength());
       PtxDataflow specializedFlow = ptxDataflow(specializedPtx);
       ASSERT_EQ(specializedFlow.stores.size(), 2u);
@@ -5517,6 +5579,7 @@ TEST(Abi22MapFusionContract,
     llvm::SmallVector<int64_t> compactShape;
     llvm::SmallVector<int64_t> fullContractShape;
     llvm::SmallVector<int64_t> publicShape;
+    std::array<llvm::SmallVector<int64_t>, 4> publicInputShapes;
   };
   const Fixture fixtures[] = {
       {"abi22-generic-contract-fold-composition-rank2.mlir",
@@ -5524,13 +5587,15 @@ TEST(Abi22MapFusionContract,
        {2, 3},
        {2},
        {2, 5},
-       {2, 7}},
+       {2, 7},
+       {{{2, 3}, {3, 5}, {5, 7}, {}}}},
       {"abi22-generic-contract-fold-composition-rank3.mlir",
        {4, 6},
        {9, 13},
        {2, 3},
        {2, 3, 11},
-       {2, 3, 13}},
+       {2, 3, 13},
+       {{{2, 3, 4}, {4, 11}, {11, 13}, {}}}},
   };
   for (const Fixture &fixture : fixtures) {
     SCOPED_TRACE(fixture.filename);
@@ -5655,6 +5720,28 @@ TEST(Abi22MapFusionContract,
                       buffers, [](auto buffer) { return buffer.getLiveOut(); }),
                   1);
 
+        llvm::SmallVector<int64_t> publicInputBuffers;
+        for (llvm::ArrayRef<int64_t> inputShape : fixture.publicInputShapes) {
+          auto input = llvm::find_if(buffers, [&](auto buffer) {
+            return buffer.getLiveIn() && !buffer.getLiveOut() &&
+                   buffer.getStorage() ==
+                       mlir::shuttle::MaterializationStorage::External &&
+                   hasShape(buffer, inputShape);
+          });
+          ASSERT_NE(input, buffers.end());
+          publicInputBuffers.push_back(input->getOrdinal());
+        }
+        for (int64_t index : {0, 1, 3})
+          EXPECT_TRUE(llvm::is_contained(first->getInputBuffers(),
+                                         publicInputBuffers[index]));
+        EXPECT_FALSE(llvm::is_contained(first->getInputBuffers(),
+                                        publicInputBuffers[2]));
+        EXPECT_TRUE(llvm::is_contained(second->getInputBuffers(),
+                                       publicInputBuffers[2]));
+        for (int64_t index : {0, 1, 3})
+          EXPECT_FALSE(llvm::is_contained(second->getInputBuffers(),
+                                          publicInputBuffers[index]));
+
         auto cost =
             (*second)->getAttrOfType<mlir::DictionaryAttr>("composition_cost");
         ASSERT_TRUE(cost);
@@ -5716,6 +5803,49 @@ TEST(Abi22MapFusionContract,
                      type.getElementType().isF32();
             });
         ASSERT_NE(transportedFull, (*executable)->slots().end());
+        llvm::SmallVector<int64_t> transportedInputSlots;
+        for (auto [index, inputShape] :
+             llvm::enumerate(fixture.publicInputShapes)) {
+          auto binding = llvm::find_if(
+              (*executable)->externalBindings(), [&](const auto &candidate) {
+                if (candidate.kind !=
+                        mlir::shuttle::ExecutableBindingKind::Operand ||
+                    candidate.index != static_cast<int64_t>(index))
+                  return false;
+                auto type = mlir::dyn_cast<mlir::RankedTensorType>(
+                    candidate.tensorType);
+                return type &&
+                       type.getShape() == llvm::ArrayRef<int64_t>(inputShape) &&
+                       type.getElementType().isF32();
+              });
+          ASSERT_NE(binding, (*executable)->externalBindings().end());
+          transportedInputSlots.push_back(binding->slotOrdinal);
+        }
+        auto resultBinding = llvm::find_if(
+            (*executable)->externalBindings(), [&](const auto &candidate) {
+              if (candidate.kind !=
+                      mlir::shuttle::ExecutableBindingKind::Result ||
+                  candidate.index != 0)
+                return false;
+              auto type =
+                  mlir::dyn_cast<mlir::RankedTensorType>(candidate.tensorType);
+              return type &&
+                     type.getShape() ==
+                         llvm::ArrayRef<int64_t>(fixture.publicShape) &&
+                     type.getElementType().isF32();
+            });
+        ASSERT_NE(resultBinding, (*executable)->externalBindings().end());
+        EXPECT_EQ((*executable)->externalBindings().size(), 5u);
+        for (int64_t index : {0, 1, 3})
+          EXPECT_TRUE(llvm::is_contained(
+              (*executable)->launches()[first->getOrdinal()].inputSlots,
+              transportedInputSlots[index]));
+        EXPECT_TRUE(llvm::is_contained(
+            (*executable)->launches()[second->getOrdinal()].inputSlots,
+            transportedInputSlots[2]));
+        EXPECT_TRUE(llvm::is_contained(
+            (*executable)->launches()[second->getOrdinal()].outputSlots,
+            resultBinding->slotOrdinal));
         for (int64_t ordinal :
              {transportedFull->ordinal, transportedCompact->ordinal}) {
           EXPECT_TRUE(llvm::is_contained(
@@ -5742,11 +5872,20 @@ TEST(Abi22MapFusionContract,
            "output-order",
            "missing-output",
            "compact-type",
+           "compact-element-type",
            "extra-public-result",
+           "full-live-out",
+           "boundary-storage",
+           "boundary-producer",
            "lifetime",
            "missing-consumer",
            "missing-second-input",
+           "missing-public-input",
+           "rebound-public-input",
+           "missing-public-result",
+           "rebound-public-result",
            "source-ownership",
+           "duplicate-source-ownership",
            "cost",
        }) {
     SCOPED_TRACE(mutation.str());
@@ -5781,10 +5920,10 @@ TEST(Abi22MapFusionContract,
         *built->module->getOps<mlir::shuttle::MaterializationPlanOp>().begin();
     auto tasks = llvm::to_vector(
         plan.getBody().front().getOps<mlir::shuttle::MaterializationTaskOp>());
-    auto buffers = llvm::to_vector(
-        plan.getBody()
-            .front()
-            .getOps<mlir::shuttle::MaterializationBufferOp>());
+    auto buffers =
+        llvm::to_vector(plan.getBody()
+                            .front()
+                            .getOps<mlir::shuttle::MaterializationBufferOp>());
     auto specialized = llvm::find_if(tasks, [](auto task) {
       return static_cast<bool>(task->template getAttrOfType<mlir::ArrayAttr>(
           "contract_region_sources"));
@@ -5801,9 +5940,9 @@ TEST(Abi22MapFusionContract,
     ASSERT_NE(primal, buffers.end());
     auto normalizedType =
         mlir::cast<mlir::RankedTensorType>(normalized->getTensorType());
-    auto primalType = mlir::cast<mlir::RankedTensorType>(primal->getTensorType());
-    EXPECT_EQ(normalizedType.getShape(),
-              llvm::ArrayRef<int64_t>({2, 5, 19}));
+    auto primalType =
+        mlir::cast<mlir::RankedTensorType>(primal->getTensorType());
+    EXPECT_EQ(normalizedType.getShape(), llvm::ArrayRef<int64_t>({2, 5, 19}));
     EXPECT_EQ(primalType.getShape(), llvm::ArrayRef<int64_t>({2, 5, 7}));
     EXPECT_FALSE(normalized->getLiveOut());
     EXPECT_EQ(normalized->getStorage(),

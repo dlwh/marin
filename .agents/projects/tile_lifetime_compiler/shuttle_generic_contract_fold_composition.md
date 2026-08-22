@@ -121,15 +121,19 @@ or exact task attribute serialization.
 
 The red mutations cover:
 
-- public or additional use of `h` or `s`;
+- a public `h` or `s` boundary;
 - a nonshrinking or non-FP32 Fold boundary;
 - lost or swapped `h` and `s` outputs;
 - wrong boundary storage, producer, consumer, or lifetime;
-- an unsupported Contract or Map;
 - missing, duplicated, or incorrectly owned source provenance;
-- materialization of the Map result `z`;
-- public result reordering or loss;
+- missing or rebound public inputs;
+- missing, rebound, or additional public results;
 - a candidate whose relative cost does not improve on the materialized plan.
+
+The positive contract rejects materialization of the Map result `z` by allowing
+only the required `h` and `s` private cut. Existing closed Contract, Fold, and
+Map admission tests remain authoritative for unsupported source operations;
+this checkpoint does not duplicate those source-level matrices.
 
 The green implementation must also serialize and load through public
 `GpuExecutable::Load`. A later reviewed H100 gate will run each policy twice,
