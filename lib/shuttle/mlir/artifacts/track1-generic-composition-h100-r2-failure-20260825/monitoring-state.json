@@ -1,0 +1,17 @@
+{
+  "config": "lib/iris/config/cw-us-east-02a.yaml",
+  "job_id": "/dlwh/shuttle-track1-generic-composition-h100-canary-r2",
+  "diagnostics_path": "scratch/20260825-1617_generic_composition_r2_diagnostics.ndjson",
+  "diagnostics_sha256": "8421688a7ad70023c3592659fa7dac0ff9566ca68edefcd68de030dd01ed3a49",
+  "last_check": "2026-08-25T23:40:24Z",
+  "last_state": "failed",
+  "request_path": "/private/tmp/shuttle-generic-composition-r2-final.LoPX3F/launch.pb",
+  "request_sha256": "1ae4f0034dba969126c8a5d187dc9dceeef8f9b07ed38363ea15569f49aca454",
+  "restart_count": 0,
+  "resubmit_command": null,
+  "submission_time": "2026-08-25T23:17:46.056000+00:00",
+  "terminal_log_path": "scratch/20260825-1617_generic_composition_r2_terminal.log",
+  "terminal_log_sha256": "326aa07ecbd4045511e94994f177fd6bd1407bb4f3f6850d200678113d520ea0",
+  "terminal_summary_path": "scratch/20260825-1617_generic_composition_r2_terminal.json",
+  "ts": 1787701304000
+}

@@ -5961,3 +5961,57 @@ author: dlwh
 - Next action: emit one bounded canonical record before each unchanged
   coordinate threshold check, then prepare one diagnostic-only r2 request for
   review without submitting it.
+
+### 2026-08-25 - TLTC-ABI22-008 anonymous composition r2 qualification failure
+
+- Hypothesis: durable per-coordinate evidence would localize the r1 threshold
+  failure and distinguish an ordinary-XLA diagnostic miss from enabled Shuttle
+  composition behavior without changing the compiler, corpus, oracle, or v1
+  thresholds.
+- Executed source: reviewed commit
+  `d56ed83856b99bed6e4da79fa42e5c2f42ef263f`, tree
+  `ffb7ade45a3680fdaee988c2890afb2c629f1a60`, source-manifest SHA-256
+  `cf8e39a495b76ea350cb3a50cdaf305d6ee381681c51a84537b572e5ea7b5dd6`,
+  authorization SHA-256
+  `4dcecb73e706c7c36c318809c01edb42d696cfbd2374ea97b256d9bc6fa92af2`,
+  and unchanged v1 numerical-policy SHA-256
+  `202413163a8c78067b88043db7207eafdeb5b58116341e186398572280466a21`.
+- Config: `/dlwh/shuttle-track1-generic-composition-h100-canary-r2` ran
+  batch-priority on one H100 in `cw-us-east-02a`, with one replica and all
+  failure/retry budgets zero. Request SHA-256 was
+  `1ae4f0034dba969126c8a5d187dc9dceeef8f9b07ed38363ea15569f49aca454`
+  at 20,672,154 bytes; bundle SHA-256 was
+  `ad72fbada96f1534350a9116e18e3a9033760fba5f8c19cc71a825a0b5b2a2fe`
+  at 20,671,143 bytes.
+- Result: Iris recorded one failed task, no preemption, and 983.18 seconds
+  runtime. All six coordinates passed f32 ABI, exact shape, finiteness,
+  full-write, and bitwise-repeat checks. Four enabled cells passed every v1
+  maximum, mean, and relative-error limit, had zero raw/masked BF16 ULP
+  distance, and used unique observer invocation IDs 1 through 4.
+  `rank3-b/disabled` alone exceeded maximum absolute error
+  (`0.0006204024596327962 > 0.0005`) and mean absolute error
+  (`0.00011096225522005224 > 0.00005`); its relative Linf error was
+  `0.00021940363857290523`, and raw/masked BF16 ULP distance was 1.
+- Interpretation: r2 is a failed v1 qualification campaign with a positive
+  enabled subset. It does not accept the full campaign and does not identify a
+  Shuttle compiler failure. The semantic-group and `{h,s}` boundary fields in
+  the records are policy/harness assertions, not independent device topology
+  measurements.
+- Correction: r2 supersedes the r1 coordinate attribution in TLTC-ABI22-007.
+  The r1 exception did not include case or mode, so fail-fast execution order
+  could not identify `rank2-a/disabled`; r1 remains unlocalized. r2
+  independently localizes its own failure to `rank3-b/disabled`.
+- Evidence limit: the v1 `reference_binary64` digest is BLAS-dependent. Linux
+  recorded `582b07be...` and `60746e38...`; macOS recomputation differs in low
+  binary64 bits. The sealed input and rounded-f32 oracle digests remain stable.
+  No launch/temp or wheel identities survived in the result.
+- Artifacts:
+  `lib/shuttle/mlir/artifacts/track1-generic-composition-h100-r2-failure-20260825/`
+  preserves all six exact canonical records, the sanitized terminal log,
+  terminal/submission/monitor metadata, authorization, source manifest, v1
+  policy, source lineage, request identity, and checksums. The request bytes
+  remain external.
+- Next action: prospectively version the policy so disabled ordinary-XLA cells
+  remain required diagnostics but cannot reject enabled Shuttle numerical
+  acceptance, and replace raw binary64 bytes with a platform-stable oracle
+  identity before rendering r3.

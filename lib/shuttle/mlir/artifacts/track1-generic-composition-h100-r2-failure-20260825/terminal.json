@@ -1,0 +1,43 @@
+{
+  "diagnostics": {
+    "coordinate_count": 6,
+    "path": "scratch/20260825-1617_generic_composition_r2_diagnostics.ndjson",
+    "sha256": "8421688a7ad70023c3592659fa7dac0ff9566ca68edefcd68de030dd01ed3a49",
+    "size": 18146
+  },
+  "duration_seconds": 983.18,
+  "failed_coordinate": {
+    "case_id": "rank3-b",
+    "maximum_absolute_error": 0.0006204024596327962,
+    "maximum_masked_bf16_ulp_error": 1,
+    "maximum_raw_bf16_ulp_error": 1,
+    "mean_absolute_error": 0.00011096225522005224,
+    "mode": "disabled",
+    "relative_linf_error": 0.00021940363857290523,
+    "threshold_exceeded": [
+      "maximum_absolute_error",
+      "mean_absolute_error"
+    ]
+  },
+  "failures": 1,
+  "job_id": "/dlwh/shuttle-track1-generic-composition-h100-canary-r2",
+  "observer_invocation_ids": [
+    1,
+    2,
+    3,
+    4
+  ],
+  "preemptions": 0,
+  "request_sha256": "1ae4f0034dba969126c8a5d187dc9dceeef8f9b07ed38363ea15569f49aca454",
+  "schema": "track1_generic_composition_h100_r2_terminal",
+  "schema_version": 1,
+  "state": "failed",
+  "task_exit_code": 1,
+  "terminal_log": {
+    "path": "scratch/20260825-1617_generic_composition_r2_terminal.log",
+    "sha256": "326aa07ecbd4045511e94994f177fd6bd1407bb4f3f6850d200678113d520ea0",
+    "size": 29619
+  },
+  "threshold_result": "rank3-b/disabled exceeded the unchanged maximum and mean absolute limits; all four enabled coordinates passed",
+  "validator_residual": "The Linux binary64 reference digests are platform-specific because the oracle uses BLAS matrix multiplication. The prospective rounded-f32 oracle digests match the sealed policy, but the macOS validator cannot recompute the Linux binary64 digest byte-for-byte."
+}

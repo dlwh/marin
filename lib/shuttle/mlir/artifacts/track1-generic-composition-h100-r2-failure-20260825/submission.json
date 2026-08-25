@@ -1,0 +1,13 @@
+{
+  "authorization_sha256": "4dcecb73e706c7c36c318809c01edb42d696cfbd2374ea97b256d9bc6fa92af2",
+  "bundle_sha256": "ad72fbada96f1534350a9116e18e3a9033760fba5f8c19cc71a825a0b5b2a2fe",
+  "bundle_size": 20671143,
+  "cluster": "cw-us-east-02a",
+  "job_id": "/dlwh/shuttle-track1-generic-composition-h100-canary-r2",
+  "request_path": "/private/tmp/shuttle-generic-composition-r2-final.LoPX3F/launch.pb",
+  "request_sha256": "1ae4f0034dba969126c8a5d187dc9dceeef8f9b07ed38363ea15569f49aca454",
+  "request_size": 20672154,
+  "schema": "track1_generic_composition_h100_r2_submission_receipt",
+  "schema_version": 1,
+  "submitted_at": "2026-08-25T23:17:46.056000+00:00"
+}
