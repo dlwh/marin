@@ -10,6 +10,7 @@ from copy import deepcopy
 from pathlib import Path
 
 import pytest
+import track1_generic_composition_h100_subject as composition_subject
 import track1_map_h100_prototype as prototype
 from track1_generic_composition_numerical_policy import (
     POLICY_FILENAME as COMPOSITION_POLICY_FILENAME,
@@ -54,6 +55,25 @@ AUTHORIZATION_PATH = MARIN_REPOSITORY / "scripts/shuttle/track1_map_h100_prototy
 SOURCE_MANIFEST_PATH = MARIN_REPOSITORY / "scripts/shuttle/track1_map_h100_source_manifest.json"
 EXPECTED_BAZEL_SHA256 = "fe7e799cbc9140f986b063e06800a3d4c790525075c877d00a7112669824acbf"
 MISMATCHED_BAZEL_SHA256 = "f" * 64
+
+
+def _composition_snapshot(mode: composition_subject.Mode, invocation: int) -> tuple[tuple[object, ...], ...]:
+    options_sha256, tuning_sha256 = composition_subject.observer_identity(mode)
+    membership = (
+        "[[#shuttle.source_ref<0, 0, 0, 0>, "
+        "#shuttle.source_ref<0, 0, 1, 0>, "
+        "#shuttle.source_ref<0, 0, 2, 0>, "
+        "#shuttle.source_ref<0, 0, 3, 0>, "
+        "#shuttle.source_ref<0, 0, 4, 0>, "
+        "#shuttle.source_ref<0, 0, 5, 0>]]"
+    )
+    manifest = f"selected_regions = {membership}"
+    common = (mode.value, options_sha256, tuning_sha256)
+    return (
+        (invocation, "algebra_coverage", *common, membership, manifest, "a" * 64, "", False, "", 0, 0),
+        (invocation, "generated_bundle", *common, membership, manifest, "a" * 64, "b" * 64, False, "", 2, 2),
+        (invocation, "final_erasure", *common, "", "", "", "c" * 64, True, "", 0, 0),
+    )
 
 
 def _document() -> dict[str, object]:
@@ -599,6 +619,46 @@ def test_failed_rmsnorm_contract_phase_surfaces_the_complete_primal_checkpoint_l
     changed["coordinates"][1]["disabled_jax_equal"] = not changed["coordinates"][1]["disabled_jax_equal"]
     with pytest.raises(ValueError, match="disabled diagnostic differs"):
         prototype.validate_rmsnorm_contract_primal_checkpoint(changed)
+
+
+def test_failed_generic_composition_phase_surfaces_every_validated_coordinate_record(tmp_path: Path) -> None:
+    records: list[dict[str, object]] = []
+    invocation = 1
+    device = composition_subject.DeviceEvidence(backend="gpu", count=1, kind="NVIDIA H100")
+    for case in composition_subject.CASES:
+        actual = composition_subject.binary64_oracle(*composition_subject.deterministic_inputs(case)).astype("float32")
+        for mode in composition_subject.Mode:
+            snapshot = () if mode is composition_subject.Mode.DISABLED else _composition_snapshot(mode, invocation)
+            if snapshot:
+                invocation += 1
+            composition_subject.validate_coordinate(
+                case,
+                mode,
+                actual,
+                actual.copy(),
+                snapshot,
+                case.stablehlo_sha256,
+                device=device,
+                report_cell=records.append,
+            )
+    lines = "".join(prototype.GENERIC_COMPOSITION_CELL_PREFIX + canonical_json(record).decode() for record in records)
+    command = [sys.executable, "-c", f"import sys; sys.stdout.write({lines!r}); sys.exit(19)"]
+
+    with pytest.raises(RuntimeError, match="canonical generic composition coordinate records") as raised:
+        prototype._run(
+            command,
+            cwd=None,
+            log=tmp_path / "generic-composition.log",
+            phase="generic_composition",
+            failure_records=prototype.GENERIC_COMPOSITION_FAILURE_RECORDS,
+        )
+
+    marker = "canonical generic composition coordinate records:\n"
+    surfaced = str(raised.value).rsplit(marker, 1)[1].splitlines()
+    assert len(surfaced) == 6
+    recovered = [json.loads(line) for line in surfaced]
+    assert recovered == records
+    assert all(prototype.validate_generic_composition_cell_report(record) == record for record in recovered)
 
 
 def test_rmsnorm_result_requires_exact_coordinate_output_and_observer_closure() -> None:

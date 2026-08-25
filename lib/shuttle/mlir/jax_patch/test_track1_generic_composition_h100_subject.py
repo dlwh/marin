@@ -1,6 +1,7 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 from copy import deepcopy
 
 import jax
@@ -181,6 +182,109 @@ def test_coordinate_rejects_public_abi_repeat_full_write_and_observer_drift() ->
             subject.Mode.SOURCE_ORDERED,
             tuple((*event[:5], "one source", *event[6:]) for event in snapshot),
         )
+
+
+def test_threshold_failure_reports_bounded_coordinate_before_rejection() -> None:
+    case = CASES[0]
+    actual = binary64_oracle(*deterministic_inputs(case)).astype(np.float32)
+    actual.flat[0] += np.float32(0.01)
+    reports: list[dict[str, object]] = []
+
+    with pytest.raises(subject.CoordinateThresholdError, match="maximum_absolute_error"):
+        subject.validate_coordinate(
+            case,
+            subject.Mode.SOURCE_ORDERED,
+            actual,
+            actual.copy(),
+            _snapshot(subject.Mode.SOURCE_ORDERED, 17),
+            case.stablehlo_sha256,
+            device=subject.DeviceEvidence(backend="gpu", count=1, kind="NVIDIA H100"),
+            report_cell=reports.append,
+        )
+
+    assert len(reports) == 1
+    report = reports[0]
+    assert report["schema"] == "track1_generic_composition_h100_cell"
+    assert report["schema_version"] == 1
+    assert report["case_id"] == "rank2-a"
+    assert report["mode"] == "source_ordered"
+    assert report["result_shape"] == [2, 7]
+    assert report["semantic_groups"] == SEMANTIC_CONTRACT["groups"]
+    assert report["private_boundary"] == [
+        {
+            "consumer": "map_contract",
+            "dtype": "f32",
+            "name": "h",
+            "producer": "contract_fold",
+            "shape": [2, 5],
+        },
+        {
+            "consumer": "map_contract",
+            "dtype": "f32",
+            "name": "s",
+            "producer": "contract_fold",
+            "shape": [2],
+        },
+    ]
+    assert report["threshold_exceeded"] == ["maximum_absolute_error", "mean_absolute_error"]
+    assert set(report["metrics"]) == {
+        "masked_bf16_absolute_floor",
+        "maximum_absolute_error",
+        "maximum_masked_bf16_ulp_error",
+        "maximum_raw_bf16_ulp_error",
+        "mean_absolute_error",
+        "relative_linf_error",
+    }
+    assert report["first_mismatch"]["index"] == [0, 0]
+    assert report["worst_absolute"]["index"] == [0, 0]
+    assert set(report["worst_bf16_ulp"]) == set(report["worst_absolute"])
+    assert set(report["output_digests"]) == {"actual", "reference_binary64", "reference_f32", "repeat"}
+    assert all(len(digest.split(":")) == 8 for digest in report["output_digests"].values())
+    assert report["observer"]["status"] == "selected"
+    assert report["observer"]["invocation_id"] == 17
+    assert report["device"] == {
+        "backend": "gpu",
+        "count": 1,
+        "execution_completed": True,
+        "kind": "NVIDIA H100",
+    }
+    payload = json.dumps(report, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    assert len(payload) < subject.MAX_CELL_REPORT_BYTES
+
+
+def test_run_matrix_reports_every_coordinate_before_aggregate_threshold_failure(monkeypatch) -> None:
+    observed: list[tuple[str, subject.Mode]] = []
+    reports: list[dict[str, object]] = []
+    next_invocation = 1
+
+    def execute(case, mode):
+        nonlocal next_invocation
+        observed.append((case.case_id, mode))
+        actual = binary64_oracle(*deterministic_inputs(case)).astype(np.float32)
+        if case is CASES[0] and mode is subject.Mode.DISABLED:
+            actual.flat[0] += np.float32(0.01)
+        snapshot = () if mode is subject.Mode.DISABLED else _snapshot(mode, next_invocation)
+        if snapshot:
+            next_invocation += 1
+        return actual, actual.copy(), snapshot, case.stablehlo_sha256
+
+    monkeypatch.setattr(
+        subject,
+        "require_h100",
+        lambda: subject.DeviceEvidence(backend="gpu", count=1, kind="NVIDIA H100"),
+    )
+    monkeypatch.setattr(subject, "load_numerical_policy", lambda: None)
+    monkeypatch.setattr(subject, "_execute", execute)
+
+    with pytest.raises(RuntimeError, match="rank2-a/disabled:maximum_absolute_error"):
+        subject.run_matrix(report_cell=reports.append)
+
+    assert observed == [(case.case_id, mode) for case in CASES for mode in subject.Mode]
+    assert [(report["case_id"], report["mode"]) for report in reports] == [
+        (case.case_id, mode.value) for case in CASES for mode in subject.Mode
+    ]
+    assert reports[0]["threshold_exceeded"]
+    assert all(not report["threshold_exceeded"] for report in reports[1:])
 
 
 @pytest.mark.parametrize(
