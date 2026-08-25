@@ -417,7 +417,7 @@ def _coordinate_report(
             flat_index=int(np.argmax(ordered_distance)),
         ),
     }
-    encoded = json.dumps(report, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    encoded = (json.dumps(report, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode()
     if len(encoded) >= MAX_CELL_REPORT_BYTES:
         raise RuntimeError("generic composition cell report exceeds its bounded diagnostic size")
     return report

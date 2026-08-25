@@ -1237,7 +1237,7 @@ def validate_generic_composition_cell_report(document: object) -> dict[str, obje
             raise ValueError("generic composition selected diagnostic observer differs")
         for field in ("final_module_sha256", "generated_bundle_sha256", "membership_sha256"):
             _ungrouped_sha(observer[field], f"generic composition observer {field}")
-    if len(canonical_json(document)) > MAX_GENERIC_COMPOSITION_CELL_BYTES:
+    if len(canonical_json(document)) >= MAX_GENERIC_COMPOSITION_CELL_BYTES:
         raise ValueError("generic composition diagnostic cell exceeds its bounded size")
     return document
 
@@ -1245,7 +1245,7 @@ def validate_generic_composition_cell_report(document: object) -> dict[str, obje
 def validate_generic_composition_diagnostics(raw: bytes) -> tuple[dict[str, object], ...]:
     """Validate the complete create-only canonical NDJSON coordinate evidence."""
     expected = [(case.case_id, mode) for case in composition_policy.CASES for mode in WORKER_MODES]
-    if not raw.endswith(b"\n") or len(raw) > len(expected) * MAX_GENERIC_COMPOSITION_CELL_BYTES:
+    if not raw.endswith(b"\n") or len(raw) >= len(expected) * MAX_GENERIC_COMPOSITION_CELL_BYTES:
         raise ValueError("generic composition diagnostic file framing differs")
     lines = raw.splitlines(keepends=True)
     if len(lines) != len(expected):
@@ -1253,7 +1253,7 @@ def validate_generic_composition_diagnostics(raw: bytes) -> tuple[dict[str, obje
     records = []
     invocation_ids: set[int] = set()
     for line, coordinate in zip(lines, expected, strict=True):
-        if len(line) > MAX_GENERIC_COMPOSITION_CELL_BYTES:
+        if len(line) >= MAX_GENERIC_COMPOSITION_CELL_BYTES:
             raise ValueError("generic composition diagnostic line exceeds its bounded size")
         try:
             record = validate_generic_composition_cell_report(json.loads(line))
