@@ -13,6 +13,8 @@ import numpy as np
 POLICY_FILENAME = "track1-generic-composition-h100-numerical-policy-v1.json"
 POLICY_PATH = Path(__file__).with_name(POLICY_FILENAME)
 POLICY_SHA256 = "202413163a8c78067b88043db7207eafdeb5b58116341e186398572280466a21"
+CELL_REPORT_PREFIX = "GENERIC_COMPOSITION_CELL "
+MAX_CELL_REPORT_BYTES = 4096
 
 
 @dataclass(frozen=True)

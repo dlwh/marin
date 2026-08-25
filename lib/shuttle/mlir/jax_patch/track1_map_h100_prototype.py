@@ -12,6 +12,7 @@ import platform
 import re
 import stat
 import subprocess
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -67,6 +68,8 @@ JAX_PYTHON_VERSION = "0.10.1"
 JAX_SOURCE_HELPER_RELATIVE = Path("lib/shuttle/mlir/jax_patch/track1_map_h100_jax_source.py")
 BASE_RUNTIME_SITE_PACKAGES = Path("/opt/h100-evidence-runtime/lib/python3.12/site-packages")
 WORKER_MODES = ("disabled", "source_ordered", "fast")
+GENERIC_COMPOSITION_CELL_PREFIX = composition_policy.CELL_REPORT_PREFIX
+MAX_GENERIC_COMPOSITION_CELL_BYTES = composition_policy.MAX_CELL_REPORT_BYTES
 SOURCE_MANIFEST_RELATIVE = Path("scripts/shuttle/track1_map_h100_source_manifest.json")
 SOURCE_ROOTS = (Path("lib/shuttle/mlir"), Path("lib/shuttle/src/shuttle"))
 IGNORED_SOURCE_PARTS = frozenset({"__pycache__", ".pytest_cache"})
@@ -139,6 +142,14 @@ class Authorization:
 
 
 @dataclass(frozen=True)
+class FailureRecordEvidence:
+    path: Path
+    description: str
+    maximum_bytes: int
+    validator: Callable[[bytes], tuple[dict[str, object], ...]]
+
+
+@dataclass(frozen=True)
 class PrototypePaths:
     workspace: Path
     jax: Path
@@ -155,6 +166,7 @@ class PrototypePaths:
     rmsnorm_contract: Path
     rmsnorm_contract_primal_checkpoint: Path
     generic_composition: Path
+    generic_composition_diagnostics: Path
     logs: Path
     image_identity: Path
     hydration_identity: Path
@@ -177,6 +189,7 @@ class PrototypePaths:
             rmsnorm_contract=workspace / "rmsnorm-contract.json",
             rmsnorm_contract_primal_checkpoint=workspace / "rmsnorm-contract-primal.json",
             generic_composition=workspace / "generic-composition.json",
+            generic_composition_diagnostics=workspace / "generic-composition.ndjson",
             logs=workspace / "logs",
             image_identity=workspace / "base-image.identity",
             hydration_identity=workspace / "hydration-identities.json",
@@ -394,6 +407,8 @@ def _generic_composition_worker_command(paths: PrototypePaths, runner_repository
         str(runner_repository / "lib/shuttle/mlir/jax_patch/track1_generic_composition_h100_worker.py"),
         "--output",
         str(paths.generic_composition),
+        "--diagnostics",
+        str(paths.generic_composition_diagnostics),
     ]
 
 
@@ -1022,6 +1037,244 @@ def validate_generic_composition_result(document: object) -> dict[str, object]:
     return document
 
 
+def _ungrouped_sha(value: object, name: str) -> str:
+    if type(value) is not str or not re.fullmatch(r"[0-9a-f]{8}(?::[0-9a-f]{8}){7}", value):
+        raise ValueError(f"{name} is not a grouped SHA-256")
+    return value.replace(":", "")
+
+
+def _validate_generic_composition_point(value: object, shape: tuple[int, ...], name: str) -> None:
+    keys = {
+        "absolute_error",
+        "actual_bf16_bits",
+        "actual_f32_bits",
+        "actual_value",
+        "index",
+        "ordered_bf16_ulp_error",
+        "reference_bf16_bits",
+        "reference_f32_bits",
+        "reference_f32_value",
+        "reference_value",
+    }
+    if type(value) is not dict or set(value) != keys:
+        raise ValueError(f"generic composition {name} schema differs")
+    index = value["index"]
+    if (
+        type(index) is not list
+        or len(index) != len(shape)
+        or any(type(item) is not int or item < 0 or item >= extent for item, extent in zip(index, shape, strict=True))
+    ):
+        raise ValueError(f"generic composition {name} index differs")
+    for field in ("absolute_error", "actual_value", "reference_f32_value", "reference_value"):
+        number = value[field]
+        if type(number) is not float or not math.isfinite(number):
+            raise ValueError(f"generic composition {name} numeric value differs")
+    if value["absolute_error"] < 0:
+        raise ValueError(f"generic composition {name} absolute error is negative")
+    if type(value["ordered_bf16_ulp_error"]) is not int or value["ordered_bf16_ulp_error"] < 0:
+        raise ValueError(f"generic composition {name} BF16 ULP differs")
+    for field in ("actual_bf16_bits", "reference_bf16_bits"):
+        if type(value[field]) is not str or not re.fullmatch(r"0x[0-9a-f]{4}", value[field]):
+            raise ValueError(f"generic composition {name} BF16 bits differ")
+    for field in ("actual_f32_bits", "reference_f32_bits"):
+        if type(value[field]) is not str or not re.fullmatch(r"0x[0-9a-f]{8}", value[field]):
+            raise ValueError(f"generic composition {name} f32 bits differ")
+
+
+def validate_generic_composition_cell_report(document: object) -> dict[str, object]:
+    """Validate one bounded, closed generic-composition coordinate record."""
+    keys = {
+        "case_id",
+        "device",
+        "first_mismatch",
+        "full_write",
+        "metrics",
+        "mode",
+        "numerical_policy_sha256",
+        "observer",
+        "output_digests",
+        "private_boundary",
+        "repeat_bitwise_equal",
+        "schema",
+        "schema_version",
+        "semantic_groups",
+        "shapes",
+        "stablehlo_sha256",
+        "threshold_exceeded",
+        "thresholds",
+        "worst_absolute",
+        "worst_bf16_ulp",
+    }
+    if type(document) is not dict or set(document) != keys:
+        raise ValueError("generic composition diagnostic cell has the wrong root schema")
+    cases = {case.case_id: case for case in composition_policy.CASES}
+    case = cases.get(document["case_id"])
+    if (
+        case is None
+        or document["mode"] not in WORKER_MODES
+        or document["schema"] != "track1_generic_composition_h100_cell"
+        or document["schema_version"] != 1
+        or document["semantic_groups"] != composition_policy.SEMANTIC_CONTRACT["groups"]
+        or document["full_write"] is not True
+        or document["repeat_bitwise_equal"] is not True
+    ):
+        raise ValueError("generic composition diagnostic cell identity differs")
+    if (
+        _ungrouped_sha(document["numerical_policy_sha256"], "generic composition policy")
+        != composition_policy.POLICY_SHA256
+    ):
+        raise ValueError("generic composition diagnostic policy differs")
+    if _ungrouped_sha(document["stablehlo_sha256"], "generic composition StableHLO") != case.stablehlo_sha256:
+        raise ValueError("generic composition diagnostic StableHLO differs")
+    shapes = {
+        "a": list(case.a_shape),
+        "b": list(case.b_shape),
+        "init": [],
+        "p": list(case.p_shape),
+        "y": list(case.result_shape),
+    }
+    if document["shapes"] != shapes:
+        raise ValueError("generic composition diagnostic public ABI shapes differ")
+    h_shape = (*case.a_shape[:-1], case.b_shape[-1])
+    boundary = [
+        {"consumer": "map_contract", "dtype": "f32", "name": "h", "producer": "contract_fold", "shape": list(h_shape)},
+        {
+            "consumer": "map_contract",
+            "dtype": "f32",
+            "name": "s",
+            "producer": "contract_fold",
+            "shape": list(h_shape[:-1]),
+        },
+    ]
+    if document["private_boundary"] != boundary:
+        raise ValueError("generic composition diagnostic private boundary differs")
+    device = document["device"]
+    if device != {
+        "actual_complete": True,
+        "backend": "gpu",
+        "h100": True,
+        "repeat_complete": True,
+        "visible_count": 1,
+    }:
+        raise ValueError("generic composition diagnostic device evidence differs")
+    thresholds = document["thresholds"]
+    if thresholds != case.limits:
+        raise ValueError("generic composition diagnostic thresholds differ")
+    metrics = document["metrics"]
+    metric_keys = set(case.limits) | {
+        "masked_bf16_absolute_floor",
+        "maximum_masked_bf16_ulp_error",
+        "maximum_raw_bf16_ulp_error",
+    }
+    if type(metrics) is not dict or set(metrics) != metric_keys:
+        raise ValueError("generic composition diagnostic metric schema differs")
+    for name in case.limits:
+        metric = metrics[name]
+        if type(metric) is not float or not math.isfinite(metric) or metric < 0:
+            raise ValueError("generic composition diagnostic metric differs")
+    if metrics["masked_bf16_absolute_floor"] != case.limits["maximum_absolute_error"]:
+        raise ValueError("generic composition diagnostic ULP mask floor differs")
+    for name in ("maximum_masked_bf16_ulp_error", "maximum_raw_bf16_ulp_error"):
+        if type(metrics[name]) is not int or metrics[name] < 0:
+            raise ValueError("generic composition diagnostic BF16 ULP metric differs")
+    exceeded = [name for name, limit in case.limits.items() if metrics[name] > limit]
+    if document["threshold_exceeded"] != exceeded:
+        raise ValueError("generic composition diagnostic threshold classification differs")
+    digests = document["output_digests"]
+    if type(digests) is not dict or set(digests) != {
+        "actual",
+        "reference_binary64",
+        "reference_f32",
+        "repeat",
+    }:
+        raise ValueError("generic composition diagnostic digest schema differs")
+    digest_values = {name: _ungrouped_sha(value, f"generic composition {name}") for name, value in digests.items()}
+    if digest_values["actual"] != digest_values["repeat"]:
+        raise ValueError("generic composition diagnostic repeat digest differs")
+    reference = composition_policy.binary64_oracle(*composition_policy.deterministic_inputs(case))
+    if (
+        digest_values["reference_binary64"] != composition_policy.array_sha256(reference)
+        or digest_values["reference_f32"] != case.oracle_f32_sha256
+    ):
+        raise ValueError("generic composition diagnostic oracle digest differs")
+    first_mismatch = document["first_mismatch"]
+    if first_mismatch is not None:
+        _validate_generic_composition_point(first_mismatch, case.result_shape, "first mismatch")
+    _validate_generic_composition_point(document["worst_absolute"], case.result_shape, "worst absolute")
+    _validate_generic_composition_point(document["worst_bf16_ulp"], case.result_shape, "worst BF16 ULP")
+    observer = document["observer"]
+    observer_keys = {
+        "event_count",
+        "final_erasure",
+        "final_module_sha256",
+        "generated_bundle_sha256",
+        "invocation_id",
+        "membership_sha256",
+        "status",
+    }
+    if type(observer) is not dict or set(observer) != observer_keys:
+        raise ValueError("generic composition diagnostic observer schema differs")
+    if document["mode"] == "disabled":
+        if observer != {
+            "event_count": 0,
+            "final_erasure": False,
+            "final_module_sha256": None,
+            "generated_bundle_sha256": None,
+            "invocation_id": None,
+            "membership_sha256": None,
+            "status": "disabled",
+        }:
+            raise ValueError("generic composition disabled diagnostic observer differs")
+    else:
+        invocation = observer["invocation_id"]
+        if (
+            observer["status"] != "selected"
+            or observer["event_count"] != 3
+            or observer["final_erasure"] is not True
+            or type(invocation) is not int
+            or invocation <= 0
+        ):
+            raise ValueError("generic composition selected diagnostic observer differs")
+        for field in ("final_module_sha256", "generated_bundle_sha256", "membership_sha256"):
+            _ungrouped_sha(observer[field], f"generic composition observer {field}")
+    if len(canonical_json(document)) > MAX_GENERIC_COMPOSITION_CELL_BYTES:
+        raise ValueError("generic composition diagnostic cell exceeds its bounded size")
+    return document
+
+
+def validate_generic_composition_diagnostics(raw: bytes) -> tuple[dict[str, object], ...]:
+    """Validate the complete create-only canonical NDJSON coordinate evidence."""
+    expected = [(case.case_id, mode) for case in composition_policy.CASES for mode in WORKER_MODES]
+    if not raw.endswith(b"\n") or len(raw) > len(expected) * MAX_GENERIC_COMPOSITION_CELL_BYTES:
+        raise ValueError("generic composition diagnostic file framing differs")
+    lines = raw.splitlines(keepends=True)
+    if len(lines) != len(expected):
+        raise ValueError("generic composition diagnostic coordinate coverage differs")
+    records = []
+    invocation_ids: set[int] = set()
+    for line, coordinate in zip(lines, expected, strict=True):
+        if len(line) > MAX_GENERIC_COMPOSITION_CELL_BYTES:
+            raise ValueError("generic composition diagnostic line exceeds its bounded size")
+        try:
+            record = validate_generic_composition_cell_report(json.loads(line))
+        except (json.JSONDecodeError, TypeError) as error:
+            raise ValueError("generic composition diagnostic JSON differs") from error
+        if canonical_json(record) != line:
+            raise ValueError("generic composition diagnostic line is not canonical")
+        if (record["case_id"], record["mode"]) != coordinate:
+            raise ValueError("generic composition diagnostic coordinate order differs")
+        observer = record["observer"]
+        if record["mode"] != "disabled":
+            invocation = observer["invocation_id"]
+            if invocation in invocation_ids:
+                raise ValueError("generic composition diagnostic observer invocation was reused")
+            invocation_ids.add(invocation)
+        records.append(record)
+    if len(invocation_ids) != 4:
+        raise ValueError("generic composition diagnostic observer coverage differs")
+    return tuple(records)
+
+
 def validate_rmsnorm_contract_primal_checkpoint(document: object) -> dict[str, object]:
     """Validate the bounded six-coordinate checkpoint surfaced on later failure."""
     if type(document) is not dict or set(document) != {
@@ -1200,6 +1453,7 @@ def _run(
     phase: str,
     environment: dict[str, str] | None = None,
     failure_evidence: Path | None = None,
+    failure_records: FailureRecordEvidence | None = None,
 ) -> None:
     with log.open("wb") as stream:
         result = subprocess.run(command, cwd=cwd, env=environment, stdout=stream, stderr=subprocess.STDOUT, check=False)
@@ -1215,6 +1469,16 @@ def _run(
             evidence = (
                 "\nprimal checkpoint follows phase tail; canonical RMSNorm Contract primal checkpoint:\n"
                 + payload.decode().rstrip("\n")
+            )
+        if failure_records is not None and failure_records.path.exists():
+            if failure_records.path.is_symlink() or not failure_records.path.is_file():
+                raise RuntimeError(f"{failure_records.description} evidence must be one regular file")
+            raw = failure_records.path.read_bytes()
+            if len(raw) > failure_records.maximum_bytes:
+                raise RuntimeError(f"{failure_records.description} evidence exceeds its bounded size")
+            records = failure_records.validator(raw)
+            evidence += f"\ncanonical {failure_records.description} records:\n" + "\n".join(
+                canonical_json(record).decode().rstrip("\n") for record in records
             )
         raise RuntimeError(
             f"prototype phase {phase} exited with status {result.returncode}; sanitized log tail:\n"
@@ -1485,6 +1749,12 @@ def execute_prototype(
         log=paths.logs / "generic-composition.log",
         phase="generic_composition",
         environment=environment,
+        failure_records=FailureRecordEvidence(
+            path=paths.generic_composition_diagnostics,
+            description="generic composition coordinate",
+            maximum_bytes=len(composition_policy.CASES) * len(WORKER_MODES) * MAX_GENERIC_COMPOSITION_CELL_BYTES,
+            validator=validate_generic_composition_diagnostics,
+        ),
     )
     workers = validate_result_pair(
         _load_canonical_document(paths.populate, "populate result"),
@@ -1496,6 +1766,11 @@ def execute_prototype(
     )
     generic_composition = validate_generic_composition_result(
         _load_canonical_document(paths.generic_composition, "generic composition result")
+    )
+    if paths.generic_composition_diagnostics.is_symlink() or not paths.generic_composition_diagnostics.is_file():
+        raise RuntimeError("generic composition diagnostics must be one regular file")
+    generic_composition_diagnostics = validate_generic_composition_diagnostics(
+        paths.generic_composition_diagnostics.read_bytes()
     )
     return {
         "attempt": 1,
@@ -1512,4 +1787,5 @@ def execute_prototype(
         "rmsnorm": rmsnorm,
         "rmsnorm_contract": rmsnorm_contract,
         "generic_composition": generic_composition,
+        "generic_composition_diagnostics": list(generic_composition_diagnostics),
     }

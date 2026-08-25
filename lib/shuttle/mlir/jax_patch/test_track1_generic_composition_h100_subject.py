@@ -226,7 +226,11 @@ def test_threshold_failure_reports_bounded_coordinate_before_rejection() -> None
             "shape": [2],
         },
     ]
-    assert report["threshold_exceeded"] == ["maximum_absolute_error", "mean_absolute_error"]
+    assert report["threshold_exceeded"] == [
+        "maximum_absolute_error",
+        "mean_absolute_error",
+        "relative_linf_error",
+    ]
     assert set(report["metrics"]) == {
         "masked_bf16_absolute_floor",
         "maximum_absolute_error",

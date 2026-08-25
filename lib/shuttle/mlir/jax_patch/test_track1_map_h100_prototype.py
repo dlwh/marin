@@ -647,8 +647,8 @@ def test_failed_generic_composition_phase_surfaces_every_validated_coordinate_re
         sys.executable,
         "-c",
         "import sys; "
+        "sys.stdout.write('late failure noise ' * 5000 + '\\n'); "
         "print('API_TOKEN=do-not-leak'); "
-        "sys.stdout.write('late failure noise ' * 5000); "
         "sys.exit(19)",
     ]
 

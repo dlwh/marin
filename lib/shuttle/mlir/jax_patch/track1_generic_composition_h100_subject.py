@@ -6,16 +6,19 @@
 import hashlib
 import json
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
 import jax
 import jax.numpy as jnp
+import ml_dtypes
 import numpy as np
 from jaxlib import _jax
 from track1_generic_composition_numerical_policy import (
     CASES,
+    MAX_CELL_REPORT_BYTES,
     POLICY_SHA256,
     SEMANTIC_CONTRACT,
     Case,
@@ -45,6 +48,13 @@ class ObserverEvidence:
 
 
 @dataclass(frozen=True)
+class DeviceEvidence:
+    backend: str
+    count: int
+    kind: str
+
+
+@dataclass(frozen=True)
 class CoordinateResult:
     case: Case
     mode: Mode
@@ -53,6 +63,15 @@ class CoordinateResult:
     stablehlo_sha256: str
     metrics: dict[str, float]
     observer: ObserverEvidence | None
+
+
+class CoordinateThresholdError(RuntimeError):
+    """One coordinate exceeded its unchanged prospective numerical limits."""
+
+    def __init__(self, result: CoordinateResult, exceeded: tuple[str, ...]):
+        self.result = result
+        self.exceeded = exceeded
+        super().__init__(f"{result.case.case_id}/{result.mode.value} exceeds {','.join(exceeded)}")
 
 
 def tuning() -> Tuning:
@@ -97,12 +116,13 @@ def _bridge() -> Any:
     return bridge
 
 
-def require_h100() -> None:
+def require_h100() -> DeviceEvidence:
     if jax.default_backend() != "gpu":
         raise RuntimeError("generic composition subject requires the GPU backend")
     devices = jax.devices("gpu")
     if len(devices) != 1 or "H100" not in devices[0].device_kind.upper():
         raise RuntimeError("generic composition subject requires one visible H100")
+    return DeviceEvidence(backend="gpu", count=1, kind=devices[0].device_kind)
 
 
 def _sha(value: object, name: str) -> str:
@@ -217,6 +237,192 @@ def _execute(
     return actual, repeated, snapshot, stablehlo_sha256
 
 
+def _grouped_sha256(value: np.ndarray) -> str:
+    digest = array_sha256(value)
+    return ":".join(digest[offset : offset + 8] for offset in range(0, len(digest), 8))
+
+
+def _grouped_digest(digest: str) -> str:
+    return ":".join(digest[offset : offset + 8] for offset in range(0, len(digest), 8))
+
+
+def _ordered_bf16(bits: np.ndarray) -> np.ndarray:
+    return np.where(
+        bits & np.uint16(0x8000),
+        bits ^ np.uint16(0xFFFF),
+        bits ^ np.uint16(0x8000),
+    ).astype(np.int32)
+
+
+def _index_document(flat_index: int, shape: tuple[int, ...]) -> list[int]:
+    return [int(index) for index in np.unravel_index(flat_index, shape)]
+
+
+def _scalar_diagnostic(
+    actual: np.ndarray,
+    reference: np.ndarray,
+    reference_f32: np.ndarray,
+    actual_bf16: np.ndarray,
+    reference_bf16: np.ndarray,
+    *,
+    flat_index: int,
+) -> dict[str, object]:
+    actual_flat = actual.reshape(-1)
+    reference_flat = reference.reshape(-1)
+    reference_f32_flat = reference_f32.reshape(-1)
+    actual_f32_bits = int(actual_flat.view(np.uint32)[flat_index])
+    reference_f32_bits = int(reference_f32_flat.view(np.uint32)[flat_index])
+    actual_bf16_bits = int(actual_bf16.reshape(-1).view(np.uint16)[flat_index])
+    reference_bf16_bits = int(reference_bf16.reshape(-1).view(np.uint16)[flat_index])
+    actual_ordered = int(_ordered_bf16(np.asarray([actual_bf16_bits], dtype=np.uint16))[0])
+    reference_ordered = int(_ordered_bf16(np.asarray([reference_bf16_bits], dtype=np.uint16))[0])
+    return {
+        "absolute_error": abs(float(actual_flat[flat_index]) - float(reference_flat[flat_index])),
+        "actual_bf16_bits": f"0x{actual_bf16_bits:04x}",
+        "actual_f32_bits": f"0x{actual_f32_bits:08x}",
+        "actual_value": float(actual_flat[flat_index]),
+        "index": _index_document(flat_index, actual.shape),
+        "ordered_bf16_ulp_error": abs(actual_ordered - reference_ordered),
+        "reference_bf16_bits": f"0x{reference_bf16_bits:04x}",
+        "reference_f32_bits": f"0x{reference_f32_bits:08x}",
+        "reference_f32_value": float(reference_f32_flat[flat_index]),
+        "reference_value": float(reference_flat[flat_index]),
+    }
+
+
+def _observer_document(observer: ObserverEvidence | None) -> dict[str, object]:
+    if observer is None:
+        return {
+            "event_count": 0,
+            "final_erasure": False,
+            "final_module_sha256": None,
+            "generated_bundle_sha256": None,
+            "invocation_id": None,
+            "membership_sha256": None,
+            "status": "disabled",
+        }
+    return {
+        "event_count": 3,
+        "final_erasure": True,
+        "final_module_sha256": _grouped_digest(observer.final_module_sha256),
+        "generated_bundle_sha256": _grouped_digest(observer.generated_bundle_sha256),
+        "invocation_id": observer.invocation_id,
+        "membership_sha256": _grouped_digest(observer.membership_sha256),
+        "status": "selected",
+    }
+
+
+def _coordinate_report(
+    result: CoordinateResult,
+    actual: np.ndarray,
+    repeated: np.ndarray,
+    reference: np.ndarray,
+    device: DeviceEvidence,
+) -> dict[str, object]:
+    reference_f32 = reference.astype(np.float32)
+    actual_bf16 = actual.astype(ml_dtypes.bfloat16)
+    reference_bf16 = reference.astype(ml_dtypes.bfloat16)
+    actual_bf16_bits = actual_bf16.view(np.uint16)
+    reference_bf16_bits = reference_bf16.view(np.uint16)
+    ordered_distance = np.abs(_ordered_bf16(actual_bf16_bits) - _ordered_bf16(reference_bf16_bits))
+    absolute = np.abs(actual.astype(np.float64) - reference)
+    mismatches = np.flatnonzero(actual.view(np.uint32).reshape(-1) != reference_f32.view(np.uint32).reshape(-1))
+    first_mismatch = None
+    if mismatches.size:
+        first_mismatch = _scalar_diagnostic(
+            actual,
+            reference,
+            reference_f32,
+            actual_bf16,
+            reference_bf16,
+            flat_index=int(mismatches[0]),
+        )
+    floor = result.case.limits["maximum_absolute_error"]
+    mask = np.abs(reference) >= floor
+    masked_distance = ordered_distance[mask]
+    exceeded = tuple(name for name, limit in result.case.limits.items() if result.metrics[name] > limit)
+    h_shape = (*result.case.a_shape[:-1], result.case.b_shape[-1])
+    if device.backend != "gpu" or device.count != 1 or "H100" not in device.kind.upper():
+        raise RuntimeError("generic composition diagnostic device evidence differs")
+    report = {
+        "case_id": result.case.case_id,
+        "device": {
+            "actual_complete": True,
+            "backend": device.backend,
+            "h100": True,
+            "repeat_complete": True,
+            "visible_count": device.count,
+        },
+        "first_mismatch": first_mismatch,
+        "full_write": True,
+        "metrics": {
+            **result.metrics,
+            "masked_bf16_absolute_floor": floor,
+            "maximum_masked_bf16_ulp_error": int(np.max(masked_distance, initial=0)),
+            "maximum_raw_bf16_ulp_error": int(np.max(ordered_distance, initial=0)),
+        },
+        "mode": result.mode.value,
+        "numerical_policy_sha256": _grouped_digest(POLICY_SHA256),
+        "observer": _observer_document(result.observer),
+        "output_digests": {
+            "actual": _grouped_sha256(actual),
+            "reference_binary64": _grouped_sha256(reference),
+            "reference_f32": _grouped_sha256(reference_f32),
+            "repeat": _grouped_sha256(repeated),
+        },
+        "private_boundary": [
+            {
+                "consumer": "map_contract",
+                "dtype": "f32",
+                "name": "h",
+                "producer": "contract_fold",
+                "shape": list(h_shape),
+            },
+            {
+                "consumer": "map_contract",
+                "dtype": "f32",
+                "name": "s",
+                "producer": "contract_fold",
+                "shape": list(h_shape[:-1]),
+            },
+        ],
+        "repeat_bitwise_equal": True,
+        "schema": "track1_generic_composition_h100_cell",
+        "schema_version": 1,
+        "semantic_groups": SEMANTIC_CONTRACT["groups"],
+        "shapes": {
+            "a": list(result.case.a_shape),
+            "b": list(result.case.b_shape),
+            "init": [],
+            "p": list(result.case.p_shape),
+            "y": list(result.case.result_shape),
+        },
+        "stablehlo_sha256": _grouped_digest(result.stablehlo_sha256),
+        "threshold_exceeded": list(exceeded),
+        "thresholds": result.case.limits,
+        "worst_absolute": _scalar_diagnostic(
+            actual,
+            reference,
+            reference_f32,
+            actual_bf16,
+            reference_bf16,
+            flat_index=int(np.argmax(absolute)),
+        ),
+        "worst_bf16_ulp": _scalar_diagnostic(
+            actual,
+            reference,
+            reference_f32,
+            actual_bf16,
+            reference_bf16,
+            flat_index=int(np.argmax(ordered_distance)),
+        ),
+    }
+    encoded = json.dumps(report, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    if len(encoded) >= MAX_CELL_REPORT_BYTES:
+        raise RuntimeError("generic composition cell report exceeds its bounded diagnostic size")
+    return report
+
+
 def validate_coordinate(
     case: Case,
     mode: Mode,
@@ -224,6 +430,9 @@ def validate_coordinate(
     repeated: np.ndarray,
     snapshot: tuple[tuple[object, ...], ...],
     stablehlo_sha256: str,
+    *,
+    device: DeviceEvidence | None = None,
+    report_cell: Callable[[dict[str, object]], None] | None = None,
 ) -> CoordinateResult:
     """Validate one complete public f32 output against the independent oracle."""
     observer = validate_observer_snapshot(mode, snapshot)
@@ -245,12 +454,9 @@ def validate_coordinate(
         "mean_absolute_error": mean,
         "relative_linf_error": relative,
     }
-    for name, limit in case.limits.items():
-        if metrics[name] > limit:
-            raise RuntimeError(f"generic composition result exceeds {name}")
     if np.any(oracle.astype(np.float32) == 0):
         raise RuntimeError("generic composition full-write oracle contains zero")
-    return CoordinateResult(
+    result = CoordinateResult(
         case=case,
         mode=mode,
         result_sha256=array_sha256(actual),
@@ -259,23 +465,49 @@ def validate_coordinate(
         metrics=metrics,
         observer=observer,
     )
+    if report_cell is not None:
+        if device is None:
+            raise RuntimeError("generic composition diagnostic requires device evidence")
+        report_cell(_coordinate_report(result, actual, repeated, oracle, device))
+    exceeded = tuple(name for name, limit in case.limits.items() if metrics[name] > limit)
+    if exceeded:
+        raise CoordinateThresholdError(result, exceeded)
+    return result
 
 
-def run_matrix() -> tuple[CoordinateResult, ...]:
+def run_matrix(
+    report_cell: Callable[[dict[str, object]], None] | None = None,
+) -> tuple[CoordinateResult, ...]:
     """Execute all six ordinary-JAX coordinates on one H100."""
-    require_h100()
+    device = require_h100()
     load_numerical_policy()
     results = []
     invocation_ids = set()
+    threshold_failures: list[str] = []
     for case in CASES:
         for mode in Mode:
             actual, repeated, snapshot, stablehlo_sha256 = _execute(case, mode)
-            result = validate_coordinate(case, mode, actual, repeated, snapshot, stablehlo_sha256)
+            try:
+                result = validate_coordinate(
+                    case,
+                    mode,
+                    actual,
+                    repeated,
+                    snapshot,
+                    stablehlo_sha256,
+                    device=device,
+                    report_cell=report_cell,
+                )
+            except CoordinateThresholdError as error:
+                result = error.result
+                threshold_failures.append(f"{case.case_id}/{mode.value}:{','.join(error.exceeded)}")
             if result.observer is not None:
                 if result.observer.invocation_id in invocation_ids:
                     raise RuntimeError("generic composition observer invocation was reused")
                 invocation_ids.add(result.observer.invocation_id)
             results.append(result)
+    if threshold_failures:
+        raise RuntimeError("generic composition campaign exceeded unchanged thresholds: " + ";".join(threshold_failures))
     return tuple(results)
 
 

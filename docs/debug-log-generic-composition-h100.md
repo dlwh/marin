@@ -38,7 +38,24 @@ r1 is preserved under
 The exact mechanism and error values remain unknown. The failing coordinate is
 `rank2-a/disabled`, so r1 does not implicate generated composition codegen.
 
+## Diagnostic successor
+
+r2 retains the r1 compiler, corpus, binary64 oracle, thresholds, and semantic
+topology contract. Each structurally valid coordinate now writes one closed,
+canonical NDJSON record to a create-only file and calls `fsync` before applying
+the unchanged numerical thresholds. A threshold miss is recorded and deferred
+until all six coordinates have run; ABI, finiteness, repeatability, source,
+observer, and device failures remain immediate.
+
+The prototype validates the complete six-record file, including coordinate
+order, policy and source hashes, public shapes, declared `{h,s}` ownership,
+observer uniqueness, numerical metrics, diagnostic BF16 ULP distances, and
+record size. On a failed phase it appends those validated records after the
+bounded sanitized log tail. On success it carries them in the canonical job
+result. This avoids both the 8 KiB tail limit and redaction of ordinary SHA-256
+text without allowing arbitrary worker log bytes past the sanitizer.
+
 ## Future work
 
-- [ ] Run one reviewed diagnostic-only r2 canary.
+- [ ] Review and run one diagnostic-only r2 canary.
 - [ ] Change compiler semantics only after r2 localizes a contract violation.
