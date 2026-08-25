@@ -32,8 +32,10 @@ the temporary path is durable.
 Iris recorded one failed task, zero preemptions, and 983.18 seconds runtime.
 All six canonical diagnostic records were fsynced before aggregate threshold
 validation. Every coordinate passed the f32 public ABI, exact shape,
-finiteness, full-write, and bitwise-repeat checks. Disabled coordinates had no
-observer events. Enabled observer invocation IDs were 1 through 4. Each record
+finiteness, and bitwise-repeat checks. The `full_write` record field is a
+harness assertion derived from the sealed nonzero oracle and whole-output
+comparison, not an independent device-write measurement. Disabled coordinates
+had no observer events. Enabled observer invocation IDs were 1 through 4. Each record
 retained the policy-declared `contract_fold` and `map_contract` semantic groups;
 those record fields are harness assertions, not an independent device topology
 measurement. No launch-count, temporary-count, or wheel identity survived in
