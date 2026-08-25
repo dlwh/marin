@@ -90,3 +90,23 @@ disabled coordinate to satisfy source, ABI, finiteness, repeatability, and
 empty-observer checks without letting its numerical threshold classification
 reject otherwise valid enabled SOURCE_ORDERED and FAST coordinates. Enabled
 coordinates retain the existing thresholds and observer/semantic contract.
+
+## v2 prospective contract
+
+The policy keeps the two sealed cases, deterministic inputs, binary64 oracle
+computation, StableHLO source, and maximum/mean/relative limits unchanged.
+Disabled ordinary-XLA coordinates remain mandatory and durable. Their public
+f32 ABI, exact shape, finiteness, bitwise repeat, GPU completion, source digest,
+and empty observer are rejection gates; their numerical limit classification is
+diagnostic. SOURCE_ORDERED and FAST coordinates retain the three v1 numerical
+gates plus observer and semantic-group closure.
+
+Raw and masked BF16 ULP distances remain validated diagnostic telemetry. The v1
+policy did not impose a ULP magnitude limit, so v2 does not create one. Reports
+separate measured `limit_exceeded` from mode-dependent `acceptance_failures`.
+
+The platform-stable oracle identity binds the normalized `binary64_oracle`
+source SHA-256, every deterministic input SHA-256, and the rounded-f32 oracle
+SHA-256. Runtime binary64 values still define the three measured metrics, but
+their exact byte digest is removed. Low binary64 bits may vary across BLAS
+implementations only when the sealed rounded-f32 identity still matches.

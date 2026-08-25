@@ -10,6 +10,7 @@ import pytest
 import track1_generic_composition_h100_subject as subject
 from track1_generic_composition_numerical_policy import (
     CASES,
+    POLICY_FILENAME,
     POLICY_SHA256,
     SEMANTIC_CONTRACT,
     array_sha256,
@@ -17,7 +18,7 @@ from track1_generic_composition_numerical_policy import (
     deterministic_inputs,
     load_numerical_policy,
 )
-from track1_map_h100_prototype import validate_generic_composition_result
+from track1_map_h100_prototype import validate_generic_composition_cell_report, validate_generic_composition_result
 
 
 def _snapshot(mode: subject.Mode, invocation: int) -> tuple[tuple[object, ...], ...]:
@@ -80,6 +81,10 @@ def _snapshot(mode: subject.Mode, invocation: int) -> tuple[tuple[object, ...], 
     )
 
 
+def _grouped(digest: str) -> str:
+    return ":".join(digest[offset : offset + 8] for offset in range(0, len(digest), 8))
+
+
 def _result_document() -> dict[str, object]:
     results = []
     invocation = 1
@@ -106,6 +111,20 @@ def _result_document() -> dict[str, object]:
 def test_policy_binds_two_ordinary_jax_shapes_and_independent_binary64_oracle() -> None:
     document, cases = load_numerical_policy()
 
+    assert POLICY_FILENAME == "track1-generic-composition-h100-numerical-policy-v2.json"
+    assert document["schema_version"] == 2
+    assert document["version"] == "prospective-v2"
+    assert document["acceptance"] == {
+        "disabled_jax": "required_diagnostic_never_numerical_gate",
+        "enabled_modes": ["source_ordered", "fast"],
+        "enabled_thresholds": "case_limits",
+        "nonfinite_action": "reject_all_modes",
+        "raw_and_masked_bf16_ulp": "validated_diagnostic_only_no_magnitude_gate",
+        "repeat_bitwise_required": True,
+    }
+    assert document["oracle_contract"]["source_sha256"] == (
+        "493b1766f36b197fb0189df5a3e82631bb66526670f72ec21f0e9e675c0a8d65"
+    )
     assert document["semantic_contract"] == SEMANTIC_CONTRACT
     assert [case.case_id for case in cases] == ["rank2-a", "rank3-b"]
     for case in cases:
@@ -184,7 +203,7 @@ def test_coordinate_rejects_public_abi_repeat_full_write_and_observer_drift() ->
         )
 
 
-def test_threshold_failure_reports_bounded_coordinate_before_rejection() -> None:
+def test_enabled_threshold_failure_reports_bounded_coordinate_before_rejection() -> None:
     case = CASES[0]
     actual = binary64_oracle(*deterministic_inputs(case)).astype(np.float32)
     actual.flat[0] += np.float32(0.01)
@@ -205,7 +224,7 @@ def test_threshold_failure_reports_bounded_coordinate_before_rejection() -> None
     assert len(reports) == 1
     report = reports[0]
     assert report["schema"] == "track1_generic_composition_h100_cell"
-    assert report["schema_version"] == 1
+    assert report["schema_version"] == 2
     assert report["case_id"] == "rank2-a"
     assert report["mode"] == "source_ordered"
     assert report["shapes"] == {"a": [2, 3], "b": [3, 5], "init": [], "p": [5, 7], "y": [2, 7]}
@@ -226,11 +245,13 @@ def test_threshold_failure_reports_bounded_coordinate_before_rejection() -> None
             "shape": [2],
         },
     ]
-    assert report["threshold_exceeded"] == [
+    assert report["limit_exceeded"] == [
         "maximum_absolute_error",
         "mean_absolute_error",
         "relative_linf_error",
     ]
+    assert report["acceptance_failures"] == report["limit_exceeded"]
+    assert report["acceptance_role"] == "enabled_gate"
     assert set(report["metrics"]) == {
         "masked_bf16_absolute_floor",
         "maximum_absolute_error",
@@ -242,8 +263,13 @@ def test_threshold_failure_reports_bounded_coordinate_before_rejection() -> None
     assert report["first_mismatch"]["index"] == [0, 0]
     assert report["worst_absolute"]["index"] == [0, 0]
     assert set(report["worst_bf16_ulp"]) == set(report["worst_absolute"])
-    assert set(report["output_digests"]) == {"actual", "reference_binary64", "reference_f32", "repeat"}
+    assert set(report["output_digests"]) == {"actual", "repeat"}
     assert all(len(digest.split(":")) == 8 for digest in report["output_digests"].values())
+    assert report["oracle_identity"] == {
+        "input_sha256": {name: _grouped(value) for name, value in case.input_sha256.items()},
+        "rounded_f32_sha256": _grouped(case.rounded_f32_oracle_sha256),
+        "source_sha256": _grouped("493b1766f36b197fb0189df5a3e82631bb66526670f72ec21f0e9e675c0a8d65"),
+    }
     assert report["observer"]["status"] == "selected"
     assert report["observer"]["invocation_id"] == 17
     assert report["device"] == {
@@ -257,7 +283,7 @@ def test_threshold_failure_reports_bounded_coordinate_before_rejection() -> None
     assert len(payload) < subject.MAX_CELL_REPORT_BYTES
 
 
-def test_run_matrix_reports_every_coordinate_before_aggregate_threshold_failure(monkeypatch) -> None:
+def test_disabled_threshold_diagnostic_does_not_reject_enabled_campaign(monkeypatch) -> None:
     observed: list[tuple[str, subject.Mode]] = []
     reports: list[dict[str, object]] = []
     next_invocation = 1
@@ -266,7 +292,7 @@ def test_run_matrix_reports_every_coordinate_before_aggregate_threshold_failure(
         nonlocal next_invocation
         observed.append((case.case_id, mode))
         actual = binary64_oracle(*deterministic_inputs(case)).astype(np.float32)
-        if case is CASES[0] and mode is subject.Mode.DISABLED:
+        if case is CASES[1] and mode is subject.Mode.DISABLED:
             actual.flat[0] += np.float32(0.01)
         snapshot = () if mode is subject.Mode.DISABLED else _snapshot(mode, next_invocation)
         if snapshot:
@@ -281,15 +307,103 @@ def test_run_matrix_reports_every_coordinate_before_aggregate_threshold_failure(
     monkeypatch.setattr(subject, "load_numerical_policy", lambda: None)
     monkeypatch.setattr(subject, "_execute", execute)
 
-    with pytest.raises(RuntimeError, match="rank2-a/disabled:maximum_absolute_error"):
-        subject.run_matrix(report_cell=reports.append)
+    results = subject.run_matrix(report_cell=reports.append)
 
     assert observed == [(case.case_id, mode) for case in CASES for mode in subject.Mode]
+    assert len(results) == 6
     assert [(report["case_id"], report["mode"]) for report in reports] == [
         (case.case_id, mode.value) for case in CASES for mode in subject.Mode
     ]
-    assert reports[0]["threshold_exceeded"]
-    assert all(not report["threshold_exceeded"] for report in reports[1:])
+    disabled_failure = reports[3]
+    assert disabled_failure["limit_exceeded"]
+    assert disabled_failure["acceptance_role"] == "required_diagnostic"
+    assert disabled_failure["acceptance_failures"] == []
+    assert all(report["acceptance_failures"] == [] for report in reports)
+    assert validate_generic_composition_result(subject.result_document(results)) == subject.result_document(results)
+
+
+def test_enabled_threshold_failure_still_rejects_after_all_coordinates(monkeypatch) -> None:
+    reports: list[dict[str, object]] = []
+    next_invocation = 1
+
+    def execute(case, mode):
+        nonlocal next_invocation
+        actual = binary64_oracle(*deterministic_inputs(case)).astype(np.float32)
+        if case is CASES[1] and mode is subject.Mode.SOURCE_ORDERED:
+            actual.flat[0] += np.float32(0.01)
+        snapshot = () if mode is subject.Mode.DISABLED else _snapshot(mode, next_invocation)
+        if snapshot:
+            next_invocation += 1
+        return actual, actual.copy(), snapshot, case.stablehlo_sha256
+
+    monkeypatch.setattr(
+        subject,
+        "require_h100",
+        lambda: subject.DeviceEvidence(backend="gpu", count=1, kind="NVIDIA H100"),
+    )
+    monkeypatch.setattr(subject, "load_numerical_policy", lambda: None)
+    monkeypatch.setattr(subject, "_execute", execute)
+
+    with pytest.raises(RuntimeError, match="rank3-b/source_ordered:maximum_absolute_error"):
+        subject.run_matrix(report_cell=reports.append)
+
+    assert len(reports) == 6
+    assert reports[4]["acceptance_failures"] == reports[4]["limit_exceeded"]
+
+
+def test_binary64_low_bits_do_not_change_platform_stable_oracle_identity(monkeypatch) -> None:
+    case = CASES[0]
+    reference = binary64_oracle(*deterministic_inputs(case))
+    changed_reference = reference.copy()
+    changed_reference.flat[0] = np.nextafter(changed_reference.flat[0], np.float64(np.inf))
+    assert array_sha256(changed_reference) != array_sha256(reference)
+    assert array_sha256(changed_reference.astype(np.float32)) == case.rounded_f32_oracle_sha256
+    actual = reference.astype(np.float32)
+    reports: list[dict[str, object]] = []
+
+    for value in (reference, changed_reference):
+        monkeypatch.setattr(subject, "binary64_oracle", lambda *_inputs, value=value: value)
+        subject.validate_coordinate(
+            case,
+            subject.Mode.DISABLED,
+            actual,
+            actual.copy(),
+            (),
+            case.stablehlo_sha256,
+            device=subject.DeviceEvidence(backend="gpu", count=1, kind="NVIDIA H100"),
+            report_cell=reports.append,
+        )
+
+    assert reports[0]["oracle_identity"] == reports[1]["oracle_identity"]
+    assert reports[0]["output_digests"] == reports[1]["output_digests"]
+    assert validate_generic_composition_cell_report(reports[0]) == reports[0]
+    assert validate_generic_composition_cell_report(reports[1]) == reports[1]
+
+
+def test_bf16_ulp_remains_diagnostic_when_enabled_float_limits_pass() -> None:
+    case = CASES[1]
+    reference = binary64_oracle(*deterministic_inputs(case))
+    actual = reference.astype(np.float32)
+    index = int(np.argmin(np.abs(reference)))
+    bits = actual.astype(subject.ml_dtypes.bfloat16).view(np.uint16).reshape(-1)
+    changed_bits = bits[index] + np.uint16(10)
+    actual.flat[index] = np.asarray(changed_bits, dtype=np.uint16).view(subject.ml_dtypes.bfloat16).astype(np.float32)
+    reports: list[dict[str, object]] = []
+
+    result = subject.validate_coordinate(
+        case,
+        subject.Mode.SOURCE_ORDERED,
+        actual,
+        actual.copy(),
+        _snapshot(subject.Mode.SOURCE_ORDERED, 41),
+        case.stablehlo_sha256,
+        device=subject.DeviceEvidence(backend="gpu", count=1, kind="NVIDIA H100"),
+        report_cell=reports.append,
+    )
+
+    assert all(result.metrics[name] <= limit for name, limit in case.limits.items())
+    assert reports[0]["metrics"]["maximum_raw_bf16_ulp_error"] >= 10
+    assert reports[0]["acceptance_failures"] == []
 
 
 def test_structural_failure_remains_fail_fast_without_partial_threshold_recovery(monkeypatch) -> None:
