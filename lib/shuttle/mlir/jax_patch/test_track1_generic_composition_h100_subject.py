@@ -208,7 +208,7 @@ def test_threshold_failure_reports_bounded_coordinate_before_rejection() -> None
     assert report["schema_version"] == 1
     assert report["case_id"] == "rank2-a"
     assert report["mode"] == "source_ordered"
-    assert report["result_shape"] == [2, 7]
+    assert report["shapes"] == {"a": [2, 3], "b": [3, 5], "init": [], "p": [5, 7], "y": [2, 7]}
     assert report["semantic_groups"] == SEMANTIC_CONTRACT["groups"]
     assert report["private_boundary"] == [
         {
@@ -243,10 +243,11 @@ def test_threshold_failure_reports_bounded_coordinate_before_rejection() -> None
     assert report["observer"]["status"] == "selected"
     assert report["observer"]["invocation_id"] == 17
     assert report["device"] == {
+        "actual_complete": True,
         "backend": "gpu",
-        "count": 1,
-        "execution_completed": True,
-        "kind": "NVIDIA H100",
+        "h100": True,
+        "repeat_complete": True,
+        "visible_count": 1,
     }
     payload = json.dumps(report, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
     assert len(payload) < subject.MAX_CELL_REPORT_BYTES
@@ -285,6 +286,32 @@ def test_run_matrix_reports_every_coordinate_before_aggregate_threshold_failure(
     ]
     assert reports[0]["threshold_exceeded"]
     assert all(not report["threshold_exceeded"] for report in reports[1:])
+
+
+def test_structural_failure_remains_fail_fast_without_partial_threshold_recovery(monkeypatch) -> None:
+    observed: list[tuple[str, subject.Mode]] = []
+    reports: list[dict[str, object]] = []
+
+    def execute(case, mode):
+        observed.append((case.case_id, mode))
+        actual = binary64_oracle(*deterministic_inputs(case)).astype(np.float32)
+        repeated = actual.copy()
+        repeated.flat[0] = np.nextafter(repeated.flat[0], np.float32(np.inf))
+        return actual, repeated, (), case.stablehlo_sha256
+
+    monkeypatch.setattr(
+        subject,
+        "require_h100",
+        lambda: subject.DeviceEvidence(backend="gpu", count=1, kind="NVIDIA H100"),
+    )
+    monkeypatch.setattr(subject, "load_numerical_policy", lambda: None)
+    monkeypatch.setattr(subject, "_execute", execute)
+
+    with pytest.raises(RuntimeError, match="repeat result drift"):
+        subject.run_matrix(report_cell=reports.append)
+
+    assert observed == [("rank2-a", subject.Mode.DISABLED)]
+    assert reports == []
 
 
 @pytest.mark.parametrize(

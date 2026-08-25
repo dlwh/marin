@@ -641,8 +641,16 @@ def test_failed_generic_composition_phase_surfaces_every_validated_coordinate_re
                 device=device,
                 report_cell=records.append,
             )
-    lines = "".join(prototype.GENERIC_COMPOSITION_CELL_PREFIX + canonical_json(record).decode() for record in records)
-    command = [sys.executable, "-c", f"import sys; sys.stdout.write({lines!r}); sys.exit(19)"]
+    diagnostics = tmp_path / "generic-composition.ndjson"
+    diagnostics.write_bytes(b"".join(canonical_json(record) for record in records))
+    command = [
+        sys.executable,
+        "-c",
+        "import sys; "
+        "print('API_TOKEN=do-not-leak'); "
+        "sys.stdout.write('late failure noise ' * 5000); "
+        "sys.exit(19)",
+    ]
 
     with pytest.raises(RuntimeError, match="canonical generic composition coordinate records") as raised:
         prototype._run(
@@ -650,7 +658,12 @@ def test_failed_generic_composition_phase_surfaces_every_validated_coordinate_re
             cwd=None,
             log=tmp_path / "generic-composition.log",
             phase="generic_composition",
-            failure_records=prototype.GENERIC_COMPOSITION_FAILURE_RECORDS,
+            failure_records=prototype.FailureRecordEvidence(
+                path=diagnostics,
+                description="generic composition coordinate",
+                maximum_bytes=6 * prototype.MAX_GENERIC_COMPOSITION_CELL_BYTES,
+                validator=prototype.validate_generic_composition_diagnostics,
+            ),
         )
 
     marker = "canonical generic composition coordinate records:\n"
@@ -659,6 +672,47 @@ def test_failed_generic_composition_phase_surfaces_every_validated_coordinate_re
     recovered = [json.loads(line) for line in surfaced]
     assert recovered == records
     assert all(prototype.validate_generic_composition_cell_report(record) == record for record in recovered)
+    assert "do-not-leak" not in str(raised.value)
+    assert "[REDACTED]" in str(raised.value)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "reordered", "open", "noncanonical"])
+def test_generic_composition_diagnostic_decoder_rejects_incomplete_or_mutated_evidence(mutation: str) -> None:
+    records: list[dict[str, object]] = []
+    invocation = 1
+    device = composition_subject.DeviceEvidence(backend="gpu", count=1, kind="NVIDIA H100")
+    for case in composition_subject.CASES:
+        actual = composition_subject.binary64_oracle(*composition_subject.deterministic_inputs(case)).astype("float32")
+        for mode in composition_subject.Mode:
+            snapshot = () if mode is composition_subject.Mode.DISABLED else _composition_snapshot(mode, invocation)
+            if snapshot:
+                invocation += 1
+            composition_subject.validate_coordinate(
+                case,
+                mode,
+                actual,
+                actual.copy(),
+                snapshot,
+                case.stablehlo_sha256,
+                device=device,
+                report_cell=records.append,
+            )
+    if mutation == "missing":
+        records.pop()
+    elif mutation == "reordered":
+        records[0], records[1] = records[1], records[0]
+    elif mutation == "open":
+        records[0]["extra"] = True
+    elif mutation == "noncanonical":
+        raw = b"\n".join(json.dumps(record).encode() for record in records) + b"\n"
+        with pytest.raises(ValueError, match="canonical"):
+            prototype.validate_generic_composition_diagnostics(raw)
+        return
+    else:
+        raise AssertionError(mutation)
+
+    with pytest.raises(ValueError, match="generic composition diagnostic"):
+        prototype.validate_generic_composition_diagnostics(b"".join(canonical_json(record) for record in records))
 
 
 def test_rmsnorm_result_requires_exact_coordinate_output_and_observer_closure() -> None:
