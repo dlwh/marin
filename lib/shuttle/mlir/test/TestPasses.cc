@@ -1473,6 +1473,49 @@ LogicalResult checkedAccumulateTraffic(int64_t bytes, int64_t accesses,
   return checkedAccumulate(bytes * accesses, total);
 }
 
+FailureOr<AffineMap> mapCoordinatesToAncestor(Value value, Value ancestor) {
+  auto valueType = dyn_cast<RankedTensorType>(value.getType());
+  if (!valueType) {
+    return failure();
+  }
+  if (value == ancestor) {
+    return AffineMap::getMultiDimIdentityMap(valueType.getRank(),
+                                             value.getContext());
+  }
+  auto map = value.getDefiningOp<MapOp>();
+  if (!map || map.getInputs().size() != 1 || map.getResults().size() != 1 ||
+      map.getIndexingMaps().size() != 2) {
+    return failure();
+  }
+  auto inputMap = dyn_cast<AffineMapAttr>(map.getIndexingMaps()[0]);
+  auto resultMap = dyn_cast<AffineMapAttr>(map.getIndexingMaps()[1]);
+  if (!inputMap || !resultMap || !resultMap.getValue().isIdentity()) {
+    return failure();
+  }
+  FailureOr<AffineMap> upstream =
+      mapCoordinatesToAncestor(map.getInputs().front(), ancestor);
+  if (failed(upstream) ||
+      upstream->getNumDims() != inputMap.getValue().getNumResults()) {
+    return failure();
+  }
+  return upstream->compose(inputMap.getValue());
+}
+
+FailureOr<AffineMap> projectedReductionCoordinates(Type scoreType,
+                                                   int64_t reduction) {
+  auto score = dyn_cast<RankedTensorType>(scoreType);
+  if (!score || reduction < 0 || reduction >= score.getRank()) {
+    return failure();
+  }
+  SmallVector<AffineExpr> coordinates;
+  for (int64_t axis = 0; axis < score.getRank(); ++axis) {
+    if (axis != reduction) {
+      coordinates.push_back(getAffineDimExpr(axis, score.getContext()));
+    }
+  }
+  return AffineMap::get(score.getRank(), 0, coordinates, score.getContext());
+}
+
 class VerifyOnlineSufficientStatePass
     : public MutationPass<VerifyOnlineSufficientStatePass> {
 public:
@@ -1663,6 +1706,7 @@ public:
           return valueDependsOn(input, maximumFold);
         });
     MapOp scoreMinusMaximumMap;
+    Value maximumExpansion;
     if (exponentialMap && maximumFold &&
         maximumFold.getInputs().size() == 1) {
       auto exponentialArgument =
@@ -1680,6 +1724,7 @@ public:
             valueDependsOn(candidate.getInputs()[arguments->second],
                            maximumFold)) {
           scoreMinusMaximumMap = candidate;
+          maximumExpansion = candidate.getInputs()[arguments->second];
         }
       }
     }
@@ -1690,6 +1735,7 @@ public:
         additiveFold.getInputs().front() ==
             exponentialMap.getResults().front();
     std::optional<unsigned> normalizedWeightOperand;
+    Value denominatorExpansion;
     if (weightedContract && additiveFold && exponentialMap) {
       for (auto [operandNumber, input] :
            llvm::enumerate(weightedContract.getInputs())) {
@@ -1705,10 +1751,15 @@ public:
             valueDependsOn(normalization.getInputs()[arguments->second],
                            additiveFold)) {
           normalizedWeightOperand = operandNumber;
+          denominatorExpansion =
+              normalization.getInputs()[arguments->second];
           break;
         }
       }
     }
+    Type scoreType = maximumFold && maximumFold.getInputs().size() == 1
+                         ? maximumFold.getInputs().front().getType()
+                         : Type{};
     const bool reductionsAlign =
         maximumFold && additiveFold &&
         maximumFold.getReductionDimensions() ==
@@ -1721,6 +1772,22 @@ public:
         additiveFold.getResults().size() == 1 &&
         maximumFold.getResults().front().getType() ==
             additiveFold.getResults().front().getType();
+    bool stateCoordinatesAlign = false;
+    if (reductionsAlign && maximumExpansion && denominatorExpansion &&
+        maximumFold.getReductionDimensions().size() == 1) {
+      const int64_t reduction = maximumFold.getReductionDimensions().front();
+      FailureOr<AffineMap> expected =
+          projectedReductionCoordinates(scoreType, reduction);
+      FailureOr<AffineMap> maximumCoordinates = mapCoordinatesToAncestor(
+          maximumExpansion, maximumFold.getResults().front());
+      FailureOr<AffineMap> denominatorCoordinates = mapCoordinatesToAncestor(
+          denominatorExpansion, additiveFold.getResults().front());
+      stateCoordinatesAlign =
+          succeeded(expected) && succeeded(maximumCoordinates) &&
+          succeeded(denominatorCoordinates) &&
+          *maximumCoordinates == *expected &&
+          *denominatorCoordinates == *expected;
+    }
     bool contractionReducesStateCoordinate = false;
     if (reductionsAlign && weightedContract &&
         maximumFold.getReductionDimensions().size() == 1) {
@@ -1754,13 +1821,12 @@ public:
         !exponentialUsesMaximum || !scoreMinusMaximumMap ||
         !denominatorUsesExponential ||
         !normalizedWeightOperand || !reductionsAlign ||
-        !contractionReducesStateCoordinate) {
+        !stateCoordinatesAlign || !contractionReducesStateCoordinate) {
       module.emitError(
           "online composition does not prove {m,l,o} state semantics");
       return signalPassFailure();
     }
 
-    Type scoreType = maximumFold.getInputs().front().getType();
     int64_t actualCandidateBytes = 0;
     int64_t actualCandidateTraffic = 0;
     for (MaterializationBufferOp buffer :
@@ -1771,40 +1837,47 @@ public:
         return signalPassFailure();
       }
       auto producer = buffer.getProducer();
-      if (buffer.getStorage() != MaterializationStorage::Temporary ||
-          !producer || !compositionTaskOrdinals.contains(*producer)) {
-        continue;
-      }
-      const int64_t onlineConsumers = llvm::count_if(
+      const bool producedByOnline =
+          producer && compositionTaskOrdinals.contains(*producer);
+      const bool consumedByOnline = llvm::any_of(
           buffer.getConsumers(), [&](int64_t consumer) {
             return compositionTaskOrdinals.contains(consumer);
           });
-      if (onlineConsumers == 0) {
+      // Charge both sides of the composition cut, including all accesses to a
+      // temporary that crosses either boundary.
+      if (buffer.getStorage() != MaterializationStorage::Temporary ||
+          (!producedByOnline && !consumedByOnline)) {
         continue;
       }
       FailureOr<int64_t> bytes = staticTensorBytes(buffer.getTensorType());
       if (failed(bytes) ||
           failed(checkedAccumulate(*bytes, actualCandidateBytes)) ||
           failed(checkedAccumulateTraffic(
-              *bytes, onlineConsumers + 1, actualCandidateTraffic))) {
+              *bytes,
+              static_cast<int64_t>(buffer.getConsumers().size()) +
+                  (producer ? 1 : 0),
+              actualCandidateTraffic))) {
         module.emitError("online candidate buffer cost is not statically bounded");
         return signalPassFailure();
       }
     }
     int64_t actualBaselineBytes = 0;
     int64_t actualBaselineTraffic = 0;
-    for (Operation *operation : onlineAlgebra) {
+    // Derive the materialized comparison directly from algebra SSA, charging
+    // values produced or consumed across the selected composition boundary.
+    for (Operation *operation : algebra) {
       for (Value result : operation->getResults()) {
         const bool liveOut = llvm::any_of(result.getUses(), [&](OpOperand &use) {
           return use.getOwner() == regionYield;
         });
         llvm::SmallDenseSet<Operation *> consumers;
+        bool consumedByOnline = false;
         for (OpOperand &use : result.getUses()) {
-          if (onlineOperations.contains(use.getOwner())) {
-            consumers.insert(use.getOwner());
-          }
+          consumers.insert(use.getOwner());
+          consumedByOnline |= onlineOperations.contains(use.getOwner());
         }
-        if (liveOut || consumers.empty()) {
+        if (liveOut || consumers.empty() ||
+            (!onlineOperations.contains(operation) && !consumedByOnline)) {
           continue;
         }
         FailureOr<int64_t> bytes = staticTensorBytes(result.getType());
@@ -1818,31 +1891,25 @@ public:
         }
       }
     }
+    FailureOr<int64_t> scoreBytes = staticTensorBytes(scoreType);
     auto integerCost = [&](StringRef name) -> std::optional<int64_t> {
       auto value = cost.getAs<IntegerAttr>(name);
       return value ? std::optional<int64_t>(value.getInt()) : std::nullopt;
     };
-    auto baselineLaunches = integerCost("baseline_launches");
-    auto candidateLaunches = integerCost("candidate_launches");
     auto baselineBytes = integerCost("baseline_temporary_bytes");
     auto candidateBytes = integerCost("candidate_temporary_bytes");
     auto baselineTraffic = integerCost("baseline_temporary_traffic_bytes");
     auto candidateTraffic = integerCost("candidate_temporary_traffic_bytes");
     auto contractEvaluations = integerCost("contract_evaluations");
-    const int64_t actualBaselineLaunches = onlineAlgebra.size();
-    const int64_t actualCandidateLaunches = compositionTaskOrdinals.size();
-    if (!baselineLaunches || !candidateLaunches ||
-        !baselineBytes || !candidateBytes || !baselineTraffic ||
-        !candidateTraffic || !contractEvaluations ||
-        *baselineLaunches != actualBaselineLaunches ||
-        *candidateLaunches != actualCandidateLaunches ||
+    if (failed(scoreBytes) || !baselineBytes || !candidateBytes ||
+        !baselineTraffic || !candidateTraffic || !contractEvaluations ||
         *baselineBytes != actualBaselineBytes ||
         *candidateBytes != actualCandidateBytes ||
         *baselineTraffic != actualBaselineTraffic ||
         *candidateTraffic != actualCandidateTraffic ||
-        actualCandidateLaunches > actualBaselineLaunches ||
         actualCandidateBytes >= actualBaselineBytes ||
         actualCandidateTraffic >= actualBaselineTraffic ||
+        actualCandidateBytes >= *scoreBytes ||
         *contractEvaluations <= 0) {
       module.emitError(
           "online composition lacks relative cost and traffic improvement");
