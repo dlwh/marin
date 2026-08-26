@@ -1996,6 +1996,7 @@ struct OnlinePtxInstruction {
   int64_t ordinal = -1;
   int64_t block = -1;
   std::string role;
+  std::string sourceRef;
   std::string predicate;
   bool negatedPredicate = false;
   std::string opcode;
@@ -2016,7 +2017,16 @@ struct OnlinePtxCfg {
   std::vector<std::vector<int64_t>> predecessors;
   std::vector<OnlineDefinitionState> before;
   std::map<std::string, int64_t> roles;
+  std::map<std::string, int64_t> sources;
 };
+
+std::string onlineSourceKey(SourceRefAttr source) {
+  return (Twine(source.getFunctionOrdinal()) + ":" +
+          Twine(source.getBlockOrdinal()) + ":" +
+          Twine(source.getOperationOrdinal()) + ":" +
+          Twine(source.getResultOrdinal()))
+      .str();
+}
 
 std::vector<std::string> onlinePtxTokens(StringRef text) {
   std::vector<std::string> tokens;
@@ -2071,6 +2081,7 @@ FailureOr<OnlinePtxCfg> onlinePtxCfg(StringRef ptx) {
   cfg.blocks.emplace_back();
   int64_t block = 0;
   std::string pendingRole;
+  std::string pendingSource;
   while (!ptx.empty()) {
     auto [line, remainder] = ptx.split('\n');
     ptx = remainder;
@@ -2078,6 +2089,12 @@ FailureOr<OnlinePtxCfg> onlinePtxCfg(StringRef ptx) {
     if (line.starts_with("// shuttle.online.role ")) {
       pendingRole =
           line.drop_front(StringRef("// shuttle.online.role ").size()).str();
+      continue;
+    }
+    if (line.starts_with("// shuttle.online.source_ref ")) {
+      pendingSource =
+          line.drop_front(StringRef("// shuttle.online.source_ref ").size())
+              .str();
       continue;
     }
     if (line.empty() || line.starts_with("//") || line.starts_with(".") ||
@@ -2095,7 +2112,9 @@ FailureOr<OnlinePtxCfg> onlinePtxCfg(StringRef ptx) {
     instruction.ordinal = cfg.instructions.size();
     instruction.block = block;
     instruction.role = std::move(pendingRole);
+    instruction.sourceRef = std::move(pendingSource);
     pendingRole.clear();
+    pendingSource.clear();
     if (line.starts_with("@")) {
       auto [guard, body] = line.split(' ');
       instruction.negatedPredicate = guard.starts_with("@!");
@@ -2117,6 +2136,11 @@ FailureOr<OnlinePtxCfg> onlinePtxCfg(StringRef ptx) {
     }
     if (!instruction.role.empty() &&
         !cfg.roles.try_emplace(instruction.role, instruction.ordinal).second)
+      return failure();
+    if (!instruction.sourceRef.empty() &&
+        !cfg.sources
+             .try_emplace(instruction.sourceRef, instruction.ordinal)
+             .second)
       return failure();
     cfg.blocks[block].push_back(instruction.ordinal);
     cfg.instructions.push_back(std::move(instruction));
@@ -2257,6 +2281,18 @@ bool onlineRoleOperandIs(const OnlinePtxCfg &cfg, StringRef consumerRole,
          std::set<int64_t>{producer->second};
 }
 
+bool onlineSourceOperandIs(const OnlinePtxCfg &cfg, int64_t consumer,
+                           size_t operandIndex, StringRef source) {
+  auto producer = cfg.sources.find(source.str());
+  if (producer == cfg.sources.end() ||
+      operandIndex >= cfg.instructions[consumer].operands.size())
+    return false;
+  return onlineReachingDefinitions(
+             cfg, consumer,
+             cfg.instructions[consumer].operands[operandIndex]) ==
+         std::set<int64_t>{producer->second};
+}
+
 bool onlineRoleIs(const OnlinePtxCfg &cfg, StringRef role,
                   ArrayRef<StringRef> opcodes,
                   ArrayRef<StringRef> dependencies = {}) {
@@ -2275,18 +2311,110 @@ bool onlineRoleIs(const OnlinePtxCfg &cfg, StringRef role,
   });
 }
 
+FailureOr<std::string> onlineComparisonOpcode(RelationOp relation);
+
+bool onlineRelationSourceClosure(const OnlinePtxCfg &cfg,
+                                 ArrayRef<RelationOp> relations) {
+  for (RelationOp relation : relations) {
+    SourceRefAttr source = relation->getAttrOfType<SourceRefAttr>("source");
+    auto instruction = cfg.sources.find(onlineSourceKey(source));
+    if (!source || instruction == cfg.sources.end())
+      return false;
+    const OnlinePtxInstruction &ptx = cfg.instructions[instruction->second];
+    if (!ptx.predicate.empty())
+      return false;
+    auto relationOperandSource = [&](size_t index, size_t ptxIndex) {
+      if (index >= relation.getInputs().size())
+        return false;
+      auto producer = relation.getInputs()[index].getDefiningOp<RelationOp>();
+      SourceRefAttr operandSource =
+          producer ? producer->getAttrOfType<SourceRefAttr>("source")
+                   : SourceRefAttr();
+      return operandSource &&
+             onlineSourceOperandIs(cfg, instruction->second, ptxIndex,
+                                   onlineSourceKey(operandSource));
+    };
+    switch (relation.getSemantics()) {
+    case RelationSemantics::Iota:
+      if (!StringRef(ptx.opcode).starts_with("mov.u32") &&
+          !StringRef(ptx.opcode).starts_with("mov.s32"))
+        return false;
+      break;
+    case RelationSemantics::Constant: {
+      if (!StringRef(ptx.opcode).starts_with("mov.") ||
+          relation.getParameters().size() != 1)
+        return false;
+      auto value = dyn_cast<IntegerAttr>(relation.getParameters()[0]);
+      if (!value || !llvm::is_contained(ptx.operands,
+                                        Twine(value.getInt()).str()))
+        return false;
+      break;
+    }
+    case RelationSemantics::Reshape:
+    case RelationSemantics::BroadcastInDim:
+      if (!StringRef(ptx.opcode).starts_with("mov.") ||
+          !relationOperandSource(0, 1))
+        return false;
+      break;
+    case RelationSemantics::Add:
+      if ((!StringRef(ptx.opcode).starts_with("add.s32") &&
+           !StringRef(ptx.opcode).starts_with("add.u32")) ||
+          !relationOperandSource(0, 1) || !relationOperandSource(1, 2))
+        return false;
+      break;
+    case RelationSemantics::Compare: {
+      FailureOr<std::string> opcode = onlineComparisonOpcode(relation);
+      if (failed(opcode) || !StringRef(ptx.opcode).starts_with(*opcode) ||
+          !relationOperandSource(0, 1) || !relationOperandSource(1, 2))
+        return false;
+      auto role = cfg.roles.find("relation_compare");
+      if (role == cfg.roles.end() || role->second != instruction->second)
+        return false;
+      break;
+    }
+    case RelationSemantics::Convert:
+      if ((!StringRef(ptx.opcode).starts_with("cvt.") &&
+           !StringRef(ptx.opcode).starts_with("selp.f32")) ||
+          !relationOperandSource(0, 1))
+        return false;
+      break;
+    case RelationSemantics::Select: {
+      if (!StringRef(ptx.opcode).starts_with("selp.f32"))
+        return false;
+      auto role = cfg.roles.find("mask_select");
+      if (role == cfg.roles.end() || role->second != instruction->second)
+        return false;
+      auto predicate = relation.getInputs().front().getDefiningOp<RelationOp>();
+      SourceRefAttr predicateSource =
+          predicate ? predicate->getAttrOfType<SourceRefAttr>("source")
+                    : SourceRefAttr();
+      if (!predicateSource ||
+          !onlineSourceOperandIs(cfg, instruction->second, 3,
+                                 onlineSourceKey(predicateSource)))
+        return false;
+      break;
+    }
+    }
+  }
+  return true;
+}
+
+struct OnlinePointerAlternative {
+  std::optional<std::string> base;
+};
+
 struct OnlinePointerAlternatives {
   bool valid = true;
-  std::vector<std::set<std::string>> parameters;
+  std::vector<OnlinePointerAlternative> values;
 };
 
 OnlinePointerAlternatives onlinePointerAlternatives(
     const OnlinePtxCfg &cfg, int64_t instruction, StringRef value,
     std::set<std::pair<int64_t, std::string>> &active) {
   if (value.starts_with("p"))
-    return {true, {{value.str()}}};
+    return {true, {{{value.str()}}}};
   if (!value.starts_with("%"))
-    return {true, {{}}};
+    return {true, {{{std::nullopt}}}};
   if (!active.insert({instruction, value.str()}).second)
     return {false, {}};
   std::set<int64_t> definitions =
@@ -2297,8 +2425,9 @@ OnlinePointerAlternatives onlinePointerAlternatives(
                          value.starts_with("%ntid") ||
                          value.starts_with("%laneid");
     active.erase({instruction, value.str()});
-    return {builtin, builtin ? std::vector<std::set<std::string>>{{}}
-                             : std::vector<std::set<std::string>>{}};
+    return {builtin, builtin
+                         ? std::vector<OnlinePointerAlternative>{{std::nullopt}}
+                         : std::vector<OnlinePointerAlternative>{}};
   }
   OnlinePointerAlternatives result;
   for (int64_t definition : definitions) {
@@ -2307,40 +2436,77 @@ OnlinePointerAlternatives onlinePointerAlternatives(
       continue;
     }
     const OnlinePtxInstruction &producer = cfg.instructions[definition];
-    StringRef opcode = producer.opcode;
-    const bool allowed = opcode.starts_with("ld.param.u64") ||
-                         opcode.starts_with("mov.u") ||
-                         opcode.starts_with("cvt.u") ||
-                         opcode.starts_with("add.u") ||
-                         opcode.starts_with("mul.lo.u") ||
-                         opcode.starts_with("mad.lo.u") ||
-                         opcode.starts_with("shl.b") ||
-                         opcode.starts_with("and.b") ||
-                         opcode.starts_with("or.b") ||
-                         opcode.starts_with("cvta.to.global.u64");
-    if (!allowed || !producer.predicate.empty()) {
+    if (!producer.predicate.empty()) {
       result.valid = false;
       continue;
     }
-    std::vector<std::set<std::string>> alternatives{{}};
+    std::vector<std::vector<OnlinePointerAlternative>> operandAlternatives;
     for (const std::string &operand : llvm::drop_begin(producer.operands)) {
       OnlinePointerAlternatives child =
           onlinePointerAlternatives(cfg, definition, operand, active);
       if (!child.valid) {
         result.valid = false;
-        alternatives.clear();
+        operandAlternatives.clear();
         break;
       }
-      std::vector<std::set<std::string>> combined;
-      for (const std::set<std::string> &left : alternatives)
-        for (const std::set<std::string> &right : child.parameters) {
-          std::set<std::string> merged = left;
-          merged.insert(right.begin(), right.end());
-          combined.push_back(std::move(merged));
-        }
-      alternatives = std::move(combined);
+      operandAlternatives.push_back(std::move(child.values));
     }
-    llvm::append_range(result.parameters, alternatives);
+    if (operandAlternatives.empty())
+      continue;
+    std::vector<std::vector<OnlinePointerAlternative>> combinations{{}};
+    for (const auto &alternatives : operandAlternatives) {
+      std::vector<std::vector<OnlinePointerAlternative>> next;
+      for (const auto &combination : combinations)
+        for (const OnlinePointerAlternative &alternative : alternatives) {
+          auto joined = combination;
+          joined.push_back(alternative);
+          next.push_back(std::move(joined));
+        }
+      combinations = std::move(next);
+    }
+    StringRef opcode = producer.opcode;
+    for (const auto &combination : combinations) {
+      SmallVector<StringRef> bases;
+      for (const OnlinePointerAlternative &operand : combination)
+        if (operand.base)
+          bases.push_back(*operand.base);
+      std::optional<std::string> outputBase;
+      if (opcode.starts_with("ld.param.u64")) {
+        if (combination.size() != 1 || bases.size() != 1)
+          result.valid = false;
+        else
+          outputBase = bases.front().str();
+      } else if (opcode.starts_with("mov.u64") ||
+                 opcode.starts_with("cvta.to.global.u64")) {
+        if (combination.size() != 1)
+          result.valid = false;
+        else
+          outputBase = combination.front().base;
+      } else if (opcode.starts_with("add.u64") ||
+                 opcode.starts_with("add.s64")) {
+        if (bases.size() > 1)
+          result.valid = false;
+        else if (bases.size() == 1)
+          outputBase = bases.front().str();
+      } else if (opcode.starts_with("mov.u32") ||
+                 opcode.starts_with("cvt.u64.u32") ||
+                 opcode.starts_with("cvt.u32.") ||
+                 opcode.starts_with("add.u32") ||
+                 opcode.starts_with("add.s32") ||
+                 opcode.starts_with("mul.lo.u32") ||
+                 opcode.starts_with("mad.lo.u32") ||
+                 opcode.starts_with("mad.wide.u32") ||
+                 opcode.starts_with("shl.b32") ||
+                 opcode.starts_with("and.b32") ||
+                 opcode.starts_with("or.b32")) {
+        if (!bases.empty())
+          result.valid = false;
+      } else {
+        result.valid = false;
+      }
+      if (result.valid)
+        result.values.push_back({std::move(outputBase)});
+    }
   }
   active.erase({instruction, value.str()});
   return result;
@@ -2352,12 +2518,11 @@ bool onlinePointerIsOutputParameter(const OnlinePtxCfg &cfg,
   std::set<std::pair<int64_t, std::string>> active;
   OnlinePointerAlternatives alternatives =
       onlinePointerAlternatives(cfg, instruction, pointer, active);
-  const std::set<std::string> expected{
-      (Twine("p") + Twine(parameterIndex)).str()};
-  return alternatives.valid && !alternatives.parameters.empty() &&
-         llvm::all_of(alternatives.parameters,
-                      [&](const std::set<std::string> &parameters) {
-                        return parameters == expected;
+  const std::string expected = (Twine("p") + Twine(parameterIndex)).str();
+  return alternatives.valid && !alternatives.values.empty() &&
+         llvm::all_of(alternatives.values,
+                      [&](const OnlinePointerAlternative &alternative) {
+                        return alternative.base == expected;
                       });
 }
 
@@ -2447,6 +2612,9 @@ bool onlineSharedPairIsClosed(const OnlinePtxCfg &cfg, StringRef storeRole,
   if (!StringRef(storeInstruction.opcode).starts_with("st.shared.") ||
       !synchronizingBarrier ||
       !StringRef(loadInstruction.opcode).starts_with("ld.shared.") ||
+      !storeInstruction.predicate.empty() ||
+      !barrierInstruction.predicate.empty() ||
+      !loadInstruction.predicate.empty() ||
       storeInstruction.operands.size() < 2 ||
       loadInstruction.operands.size() < 2 ||
       !onlineRoleOperandIs(cfg, storeRole, 1, producerRole))
@@ -2494,7 +2662,7 @@ bool onlineRoleStoresToOutput(const OnlinePtxCfg &cfg, StringRef role,
     return false;
   const OnlinePtxInstruction &store = cfg.instructions[found->second];
   if (!StringRef(store.opcode).starts_with("st.global.") ||
-      store.operands.size() < 2)
+      store.operands.size() < 2 || !store.predicate.empty())
     return false;
   return onlinePointerIsOutputParameter(cfg, found->second, store.operands[0],
                                         parameterIndex);
@@ -2733,6 +2901,20 @@ setp.eq.u32 %p0, 0, 0;
 st.global.f32 [%rd0], %f0;
 ret;
 )ptx");
+    FailureOr<OnlinePtxCfg> transformedPointer = parse(R"ptx(
+ld.param.u64 %rd0, [p0];
+and.b64 %rd1, %rd0, 0;
+// shuttle.online.role store
+st.global.f32 [%rd1], %f0;
+ret;
+)ptx");
+    FailureOr<OnlinePtxCfg> predicatedStore = parse(R"ptx(
+ld.param.u64 %rd0, [p0];
+setp.eq.u32 %p0, 0, 0;
+// shuttle.online.role store
+@%p0 st.global.f32 [%rd0], %f0;
+ret;
+)ptx");
     FailureOr<OnlinePtxCfg> shared = parse(R"ptx(
 mov.u64 %rd0, 0;
 // shuttle.online.role expected
@@ -2748,7 +2930,8 @@ ld.shared.f32 %f2, [%rd0];
 ret;
 )ptx");
     if (failed(predicated) || failed(branch) || failed(correctFma) ||
-        failed(wrongFma) || failed(pointer) || failed(shared))
+        failed(wrongFma) || failed(pointer) || failed(transformedPointer) ||
+        failed(predicatedStore) || failed(shared))
       return signalPassFailure();
     if (onlineRoleDirectlyReaches(*predicated, "maybe_value",
                                   predicated->roles.at("use")) ||
@@ -2759,6 +2942,8 @@ ret;
         onlineScaledUpdate(*wrongFma, "unused", "update", "scale",
                            "state", "term") ||
         onlineRoleStoresToOutput(*pointer, "store", 0) ||
+        onlineRoleStoresToOutput(*transformedPointer, "store", 0) ||
+        onlineRoleStoresToOutput(*predicatedStore, "store", 0) ||
         !onlineSharedPairIsClosed(*shared, "shared_store", "expected",
                                   "barrier", "shared_load") ||
         onlineSharedPairIsClosed(*shared, "shared_store", "wrong", "barrier",
@@ -2816,6 +3001,7 @@ public:
     RegionOp region;
     Type representativeScoreType;
     llvm::SmallDenseSet<Attribute> relationSources;
+    SmallVector<RelationOp> relationOperations;
     std::optional<std::string> comparisonOpcode;
     module.walk([&](RegionOp candidate) {
       for (Operation &operation :
@@ -2830,6 +3016,7 @@ public:
         }
         if (auto relation = dyn_cast<RelationOp>(operation)) {
           relationSources.insert(source);
+          relationOperations.push_back(relation);
           if (relation.getSemantics() == RelationSemantics::Compare) {
             FailureOr<std::string> opcode = onlineComparisonOpcode(relation);
             if (failed(opcode) ||
@@ -2916,6 +3103,10 @@ public:
       FailureOr<OnlinePtxCfg> cfg = onlinePtxCfg(ptx);
       if (failed(cfg)) {
         module.emitError("online GPU entry has malformed control flow");
+        return signalPassFailure();
+      }
+      if (!onlineRelationSourceClosure(*cfg, relationOperations)) {
+        module.emitError("online GPU Relation index dataflow is not source-bound");
         return signalPassFailure();
       }
       bool entryHasSemanticOutput = false;
@@ -3040,6 +3231,7 @@ public:
     StringRef role;
     StringRef needle;
     StringRef replacement;
+    std::string sourceMarker;
     if (kind == "maximum") {
       phaseRole = "compact_store";
       role = "max_update";
@@ -3080,6 +3272,22 @@ public:
       role = "public_store";
       needle = "global";
       replacement = "shared";
+    } else if (kind == "relation-offset" || kind == "relation-iota") {
+      RelationSemantics target = kind == "relation-offset"
+                                     ? RelationSemantics::Add
+                                     : RelationSemantics::Iota;
+      getOperation().walk([&](RelationOp relation) {
+        if (!sourceMarker.empty() || relation.getSemantics() != target)
+          return;
+        SourceRefAttr source =
+            relation->getAttrOfType<SourceRefAttr>("source");
+        if (source)
+          sourceMarker = (Twine("// shuttle.online.source_ref ") +
+                          onlineSourceKey(source))
+                             .str();
+      });
+      needle = kind == "relation-offset" ? "add" : "mov";
+      replacement = kind == "relation-offset" ? "sub" : "xor";
     } else if (kind == "finalize") {
       role = "finalize";
       needle = "div";
@@ -3094,8 +3302,10 @@ public:
     SmallVector<std::pair<size_t, std::string>> mutations;
     const std::string phaseMarker =
         (Twine("// shuttle.online.role ") + phaseRole).str();
-    const std::string roleMarker =
-        (Twine("// shuttle.online.role ") + role).str();
+    const std::string roleMarker = sourceMarker.empty()
+                                       ? (Twine("// shuttle.online.role ") + role)
+                                             .str()
+                                       : sourceMarker;
     for (DeviceEntryOp entry :
          device.getBody().front().getOps<DeviceEntryOp>()) {
       StringRef slice = bytes.slice(entry.getCodeOffset(),
