@@ -1957,6 +1957,16 @@ public:
     auto baselineTraffic = integerCost("baseline_temporary_traffic_bytes");
     auto candidateTraffic = integerCost("candidate_temporary_traffic_bytes");
     auto contractEvaluations = integerCost("contract_evaluations");
+    const int64_t expectedContractEvaluations =
+        llvm::count_if(onlineAlgebra, [](Operation *operation) {
+          return isa<ContractOp>(operation);
+        }) +
+        llvm::count_if(plannedRecomputedSources, [&](Attribute source) {
+          return llvm::any_of(algebra, [&](Operation *operation) {
+            return operation->getAttr("source") == source &&
+                   isa<ContractOp>(operation);
+          });
+        });
     if (failed(scoreBytes) || !baselineLaunches || !candidateLaunches ||
         !baselineBytes || !candidateBytes || !baselineTraffic ||
         !candidateTraffic || !contractEvaluations ||
@@ -1968,7 +1978,7 @@ public:
         actualCandidateBytes >= actualBaselineBytes ||
         actualCandidateTraffic >= actualBaselineTraffic ||
         actualCandidateBytes >= *scoreBytes ||
-        *contractEvaluations <= 0) {
+        *contractEvaluations != expectedContractEvaluations) {
       module.emitError(
           "online composition lacks relative cost and traffic improvement");
       return signalPassFailure();
