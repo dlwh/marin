@@ -2043,7 +2043,7 @@ struct OnlinePtxCfg {
   std::vector<std::vector<int64_t>> predecessors;
   std::vector<OnlineDefinitionState> before;
   std::map<std::string, int64_t> roles;
-  std::map<std::string, int64_t> sources;
+  std::map<std::string, std::vector<int64_t>> sources;
 };
 
 std::string onlineSourceKey(SourceRefAttr source) {
@@ -2177,11 +2177,8 @@ FailureOr<OnlinePtxCfg> onlinePtxCfg(StringRef ptx) {
     if (!instruction.role.empty() &&
         !cfg.roles.try_emplace(instruction.role, instruction.ordinal).second)
       return failure();
-    if (!instruction.sourceRef.empty() &&
-        !cfg.sources
-             .try_emplace(instruction.sourceRef, instruction.ordinal)
-             .second)
-      return failure();
+    if (!instruction.sourceRef.empty())
+      cfg.sources[instruction.sourceRef].push_back(instruction.ordinal);
     cfg.blocks[block].push_back(instruction.ordinal);
     cfg.instructions.push_back(std::move(instruction));
     if (StringRef(cfg.instructions.back().opcode).starts_with("bra") ||
@@ -2264,14 +2261,26 @@ FailureOr<OnlinePtxCfg> onlinePtxCfg(StringRef ptx) {
   return cfg;
 }
 
+bool onlineInstructionDominates(const OnlinePtxCfg &cfg, int64_t dominator,
+                                int64_t dominated);
+
 std::set<int64_t> onlineReachingDefinitions(const OnlinePtxCfg &cfg,
                                             int64_t instruction,
                                             StringRef operand) {
   if (!operand.starts_with("%"))
     return {};
   auto found = cfg.before[instruction].find(operand.str());
-  return found == cfg.before[instruction].end() ? std::set<int64_t>()
-                                                : found->second;
+  if (found == cfg.before[instruction].end())
+    return {};
+  std::set<int64_t> definitions = found->second;
+  if (definitions.count(kOnlineUndefinedDefinition) != 0 &&
+      llvm::any_of(definitions, [&](int64_t definition) {
+        return definition != kOnlineUndefinedDefinition &&
+               cfg.instructions[definition].predicate.empty() &&
+               onlineInstructionDominates(cfg, definition, instruction);
+      }))
+    definitions.erase(kOnlineUndefinedDefinition);
+  return definitions;
 }
 
 bool onlineBlockReachable(const OnlinePtxCfg &cfg, int64_t from,
@@ -2308,6 +2317,103 @@ bool onlineRoleDirectlyReaches(const OnlinePtxCfg &cfg, StringRef role,
       });
 }
 
+bool onlineInstructionTransitivelyDependsOn(
+    const OnlinePtxCfg &cfg, int64_t consumer, int64_t producer,
+    std::set<std::pair<int64_t, int64_t>> &active) {
+  if (consumer == producer)
+    return true;
+  if (!active.insert({consumer, producer}).second)
+    return false;
+  const OnlinePtxInstruction &instruction = cfg.instructions[consumer];
+  SmallVector<std::string> dependencies(
+      llvm::drop_begin(instruction.operands));
+  if (!instruction.predicate.empty())
+    dependencies.push_back(instruction.predicate);
+  for (const std::string &dependency : dependencies) {
+    std::set<int64_t> definitions =
+        onlineReachingDefinitions(cfg, consumer, dependency);
+    if (definitions.empty() ||
+        definitions.count(kOnlineUndefinedDefinition) != 0)
+      continue;
+    for (int64_t definition : definitions)
+      if (onlineInstructionTransitivelyDependsOn(cfg, definition, producer,
+                                                 active)) {
+        active.erase({consumer, producer});
+        return true;
+      }
+  }
+  active.erase({consumer, producer});
+  return false;
+}
+
+bool onlineRoleTransitivelyDependsOn(const OnlinePtxCfg &cfg,
+                                     StringRef consumerRole,
+                                     StringRef producerRole) {
+  auto consumer = cfg.roles.find(consumerRole.str());
+  auto producer = cfg.roles.find(producerRole.str());
+  if (consumer == cfg.roles.end() || producer == cfg.roles.end())
+    return false;
+  std::set<std::pair<int64_t, int64_t>> active;
+  return onlineInstructionTransitivelyDependsOn(
+      cfg, consumer->second, producer->second, active);
+}
+
+bool onlineDefinitionDependsOnSource(
+    const OnlinePtxCfg &cfg, int64_t definition, int64_t source,
+    std::set<std::pair<int64_t, int64_t>> &active) {
+  if (definition == source)
+    return true;
+  if (definition == kOnlineUndefinedDefinition ||
+      !active.insert({definition, source}).second)
+    return false;
+  const OnlinePtxInstruction &instruction = cfg.instructions[definition];
+  for (const std::string &operand : llvm::drop_begin(instruction.operands)) {
+    std::set<int64_t> reaching =
+        onlineReachingDefinitions(cfg, definition, operand);
+    if (reaching.empty() || reaching.count(kOnlineUndefinedDefinition) != 0)
+      continue;
+    if (llvm::all_of(reaching, [&](int64_t candidate) {
+          return onlineDefinitionDependsOnSource(cfg, candidate, source,
+                                                 active);
+        })) {
+      active.erase({definition, source});
+      return true;
+    }
+  }
+  active.erase({definition, source});
+  return false;
+}
+
+bool onlineRoleHasSourceBoundOperand(const OnlinePtxCfg &cfg, StringRef role,
+                                     StringRef source) {
+  auto consumer = cfg.roles.find(role.str());
+  auto producer = cfg.sources.find(source.str());
+  if (consumer == cfg.roles.end() || producer == cfg.sources.end() ||
+      producer->second.size() != 1)
+    return false;
+  const int64_t sourceInstruction = producer->second.front();
+  const StringRef sourceOpcode = cfg.instructions[sourceInstruction].opcode;
+  if (sourceOpcode != "fma.rn.f32" && sourceOpcode != "add.rn.f32" &&
+      sourceOpcode != "mul.rn.f32")
+    return false;
+  if (consumer->second == sourceInstruction)
+    return true;
+  for (const std::string &operand :
+       llvm::drop_begin(cfg.instructions[consumer->second].operands)) {
+    std::set<int64_t> reaching =
+        onlineReachingDefinitions(cfg, consumer->second, operand);
+    if (reaching.empty() || reaching.count(kOnlineUndefinedDefinition) != 0)
+      continue;
+    std::set<std::pair<int64_t, int64_t>> active;
+    if (llvm::all_of(reaching, [&](int64_t definition) {
+          return onlineDefinitionDependsOnSource(cfg, definition,
+                                                 sourceInstruction, active);
+        }))
+      return true;
+  }
+  return false;
+}
+
 bool onlineRoleOperandIs(const OnlinePtxCfg &cfg, StringRef consumerRole,
                          size_t operandIndex, StringRef producerRole) {
   auto consumer = cfg.roles.find(consumerRole.str());
@@ -2324,13 +2430,13 @@ bool onlineRoleOperandIs(const OnlinePtxCfg &cfg, StringRef consumerRole,
 bool onlineSourceOperandIs(const OnlinePtxCfg &cfg, int64_t consumer,
                            size_t operandIndex, StringRef source) {
   auto producer = cfg.sources.find(source.str());
-  if (producer == cfg.sources.end() ||
+  if (producer == cfg.sources.end() || producer->second.size() != 1 ||
       operandIndex >= cfg.instructions[consumer].operands.size())
     return false;
   return onlineReachingDefinitions(
              cfg, consumer,
              cfg.instructions[consumer].operands[operandIndex]) ==
-         std::set<int64_t>{producer->second};
+         std::set<int64_t>{producer->second.front()};
 }
 
 FailureOr<int64_t> onlineIotaLogicalDimension(RelationOp iota) {
@@ -2731,13 +2837,36 @@ bool onlineRelationSourceClosure(
     const OnlinePtxCfg &cfg, ArrayRef<RelationOp> relations,
     ArrayRef<AffineExpr> logicalCoordinates,
     ArrayRef<int64_t> launchExtents,
-    ArrayRef<int64_t> relationDomainAxes, MLIRContext *context) {
+    ArrayRef<int64_t> relationDomainAxes, MLIRContext *context,
+    DictionaryAttr reductionCertificate = DictionaryAttr(),
+    std::optional<int64_t> reductionDimension = std::nullopt) {
+  llvm::SmallDenseSet<int64_t> certifiedLoopCoordinates;
+  if (reductionCertificate) {
+    if (auto nodes = reductionCertificate.getAs<ArrayAttr>("nodes"))
+      for (Attribute attribute : nodes) {
+        auto node = dyn_cast<DictionaryAttr>(attribute);
+        auto realization =
+            node ? node.getAs<DictionaryAttr>("realization")
+                 : DictionaryAttr();
+        auto coordinate =
+            realization
+                ? realization.getAs<StringAttr>("coordinate_role")
+                : StringAttr();
+        auto found = coordinate
+                         ? cfg.roles.find(coordinate.getValue().str())
+                         : cfg.roles.end();
+        if (found != cfg.roles.end())
+          certifiedLoopCoordinates.insert(found->second);
+      }
+  }
   for (RelationOp relation : relations) {
     SourceRefAttr source = relation->getAttrOfType<SourceRefAttr>("source");
     auto instruction = cfg.sources.find(onlineSourceKey(source));
-    if (!source || instruction == cfg.sources.end())
+    if (!source || instruction == cfg.sources.end() ||
+        instruction->second.size() != 1)
       return false;
-    const OnlinePtxInstruction &ptx = cfg.instructions[instruction->second];
+    const int64_t sourceInstruction = instruction->second.front();
+    const OnlinePtxInstruction &ptx = cfg.instructions[sourceInstruction];
     if (!ptx.predicate.empty())
       return false;
     auto relationOperandSource = [&](size_t index, size_t ptxIndex) {
@@ -2748,7 +2877,7 @@ bool onlineRelationSourceClosure(
           producer ? producer->getAttrOfType<SourceRefAttr>("source")
                    : SourceRefAttr();
       return operandSource &&
-             onlineSourceOperandIs(cfg, instruction->second, ptxIndex,
+             onlineSourceOperandIs(cfg, sourceInstruction, ptxIndex,
                                    onlineSourceKey(operandSource));
     };
     switch (relation.getSemantics()) {
@@ -2767,19 +2896,23 @@ bool onlineRelationSourceClosure(
         return false;
       std::set<std::pair<int64_t, std::string>> active;
       OnlineIndexAlternatives alternatives = onlineIndexAlternatives(
-          cfg, instruction->second, ptx.operands[1], context, active);
+          cfg, sourceInstruction, ptx.operands[1], context, active);
       AffineExpr expected =
           logicalCoordinates[relationDomainAxes[*logicalDimension]];
-      if (!alternatives.valid || alternatives.values.empty() ||
-          llvm::any_of(alternatives.values,
-                       [&](AffineExpr value) {
-                         return value != expected ||
-                                !onlineIndexExprFitsLaunchDomain(
-                                    value, launchExtents);
-                       }) ||
-          llvm::any_of(alternatives.intermediates, [&](AffineExpr value) {
-            return !onlineIndexExprFitsLaunchDomain(value, launchExtents);
-          }))
+      const bool physicalCoordinate =
+          alternatives.valid && !alternatives.values.empty() &&
+          llvm::all_of(alternatives.values, [&](AffineExpr value) {
+            return value == expected &&
+                   onlineIndexExprFitsLaunchDomain(value, launchExtents);
+          }) &&
+          llvm::all_of(alternatives.intermediates, [&](AffineExpr value) {
+            return onlineIndexExprFitsLaunchDomain(value, launchExtents);
+          });
+      const bool loopCoordinate =
+          reductionDimension &&
+          relationDomainAxes[*logicalDimension] == *reductionDimension &&
+          certifiedLoopCoordinates.contains(sourceInstruction);
+      if (!physicalCoordinate && !loopCoordinate)
         return false;
       break;
     }
@@ -2811,7 +2944,7 @@ bool onlineRelationSourceClosure(
           !relationOperandSource(0, 1) || !relationOperandSource(1, 2))
         return false;
       auto role = cfg.roles.find("relation_compare");
-      if (role == cfg.roles.end() || role->second != instruction->second)
+      if (role == cfg.roles.end() || role->second != sourceInstruction)
         return false;
       break;
     }
@@ -2830,14 +2963,14 @@ bool onlineRelationSourceClosure(
       if (!StringRef(ptx.opcode).starts_with("selp.f32"))
         return false;
       auto role = cfg.roles.find("mask_select");
-      if (role == cfg.roles.end() || role->second != instruction->second)
+      if (role == cfg.roles.end() || role->second != sourceInstruction)
         return false;
       auto predicate = relation.getInputs().front().getDefiningOp<RelationOp>();
       SourceRefAttr predicateSource =
           predicate ? predicate->getAttrOfType<SourceRefAttr>("source")
                     : SourceRefAttr();
       if (!predicateSource ||
-          !onlineSourceOperandIs(cfg, instruction->second, 3,
+          !onlineSourceOperandIs(cfg, sourceInstruction, 3,
                                  onlineSourceKey(predicateSource)))
         return false;
       break;
@@ -3164,17 +3297,688 @@ bool onlineMaskedScoreProtocol(const OnlinePtxCfg &cfg,
          onlineRoleOperandIs(cfg, "mask_select", 3, "relation_compare");
 }
 
+bool onlineCompactOutputAddressIsProjected(
+    const OnlinePtxCfg &cfg, int64_t outputParameter,
+    ArrayRef<AffineExpr> logicalCoordinates, ArrayRef<int64_t> launchExtents,
+    ArrayRef<int64_t> scoreShape, int64_t reductionDimension,
+    MLIRContext *context) {
+  auto linear = cfg.roles.find("compact_output_linear_index");
+  auto byteOffset = cfg.roles.find("compact_output_byte_offset");
+  auto pointer = cfg.roles.find("compact_output_pointer");
+  auto store = cfg.roles.find("compact_store");
+  if (linear == cfg.roles.end() || byteOffset == cfg.roles.end() ||
+      pointer == cfg.roles.end() || store == cfg.roles.end() ||
+      logicalCoordinates.size() != scoreShape.size() ||
+      reductionDimension < 0 ||
+      reductionDimension >= static_cast<int64_t>(scoreShape.size()))
+    return false;
+  const OnlinePtxInstruction &byteOffsetInstruction =
+      cfg.instructions[byteOffset->second];
+  const OnlinePtxInstruction &pointerInstruction =
+      cfg.instructions[pointer->second];
+  const OnlinePtxInstruction &storeInstruction = cfg.instructions[store->second];
+  if (byteOffsetInstruction.opcode != "mul.wide.u32" ||
+      byteOffsetInstruction.operands.size() != 3 ||
+      byteOffsetInstruction.operands[2] != "4" ||
+      !onlineRoleOperandIs(cfg, "compact_output_byte_offset", 1,
+                           "compact_output_linear_index") ||
+      pointerInstruction.opcode != "add.u64" ||
+      pointerInstruction.operands.size() != 3 ||
+      storeInstruction.operands.size() < 2 ||
+      !onlineRoleOperandIs(cfg, "compact_store", 0,
+                           "compact_output_pointer"))
+    return false;
+  const bool baseThenOffset =
+      onlinePointerIsOutputParameter(cfg, pointer->second,
+                                     pointerInstruction.operands[1],
+                                     outputParameter) &&
+      onlineRoleOperandIs(cfg, "compact_output_pointer", 2,
+                          "compact_output_byte_offset");
+  const bool offsetThenBase =
+      onlinePointerIsOutputParameter(cfg, pointer->second,
+                                     pointerInstruction.operands[2],
+                                     outputParameter) &&
+      onlineRoleOperandIs(cfg, "compact_output_pointer", 1,
+                          "compact_output_byte_offset");
+  if (!baseThenOffset && !offsetThenBase)
+    return false;
+  std::set<std::pair<int64_t, std::string>> active;
+  OnlineIndexAlternatives alternatives = onlineIndexAlternatives(
+      cfg, byteOffset->second, byteOffsetInstruction.operands[1], context,
+      active);
+  AffineExpr expected = getAffineConstantExpr(0, context);
+  for (auto [dimension, extent] : llvm::enumerate(scoreShape)) {
+    if (static_cast<int64_t>(dimension) == reductionDimension)
+      continue;
+    if (extent <= 0)
+      return false;
+    expected = expected * extent + logicalCoordinates[dimension];
+  }
+  return alternatives.valid && !alternatives.values.empty() &&
+         llvm::all_of(alternatives.values, [&](AffineExpr value) {
+           return value == expected &&
+                  onlineIndexExprFitsLaunchDomain(value, launchExtents);
+         }) &&
+         llvm::all_of(alternatives.intermediates, [&](AffineExpr value) {
+           return onlineIndexExprFitsLaunchDomain(value, launchExtents);
+         });
+}
+
+bool onlineCompactWriterIsUnique(
+    const OnlinePtxCfg &cfg, ArrayRef<AffineExpr> logicalCoordinates,
+    ArrayRef<int64_t> launchExtents, ArrayRef<int64_t> scoreShape,
+    int64_t reductionDimension, MLIRContext *context) {
+  auto store = cfg.roles.find("compact_store");
+  if (store == cfg.roles.end() || logicalCoordinates.size() != scoreShape.size())
+    return false;
+  const OnlinePtxInstruction &storeInstruction = cfg.instructions[store->second];
+  std::optional<AffineExpr> selector;
+  if (!storeInstruction.predicate.empty()) {
+    auto predicate = cfg.roles.find("compact_writer_predicate");
+    auto selectorRole = cfg.roles.find("compact_writer_selector");
+    if (predicate == cfg.roles.end() || selectorRole == cfg.roles.end() ||
+        storeInstruction.negatedPredicate ||
+        onlineReachingDefinitions(cfg, store->second,
+                                  storeInstruction.predicate) !=
+            std::set<int64_t>{predicate->second})
+      return false;
+    const OnlinePtxInstruction &predicateInstruction =
+        cfg.instructions[predicate->second];
+    if ((predicateInstruction.opcode != "setp.eq.u32" &&
+         predicateInstruction.opcode != "setp.eq.s32") ||
+        predicateInstruction.operands.size() != 3 ||
+        predicateInstruction.operands[2] != "0" ||
+        !onlineRoleOperandIs(cfg, "compact_writer_predicate", 1,
+                             "compact_writer_selector"))
+      return false;
+    std::set<std::pair<int64_t, std::string>> active;
+    OnlineIndexAlternatives alternatives = onlineIndexAlternatives(
+        cfg, predicate->second, predicateInstruction.operands[1], context,
+        active);
+    if (!alternatives.valid || alternatives.values.size() != 1 ||
+        llvm::any_of(alternatives.intermediates, [&](AffineExpr expression) {
+          return !onlineIndexExprFitsLaunchDomain(expression, launchExtents);
+        }))
+      return false;
+    selector = alternatives.values.front();
+  }
+
+  int64_t launchInstances = 1;
+  for (int64_t extent : launchExtents) {
+    if (extent <= 0 || launchInstances > 1000000 / extent)
+      return false;
+    launchInstances *= extent;
+  }
+  std::map<std::vector<int64_t>, std::pair<int64_t, int64_t>> fibers;
+  for (int64_t linear = 0; linear < launchInstances; ++linear) {
+    int64_t remainder = linear;
+    SmallVector<int64_t> physical(launchExtents.size());
+    for (int64_t axis = launchExtents.size() - 1; axis >= 0; --axis) {
+      physical[axis] = remainder % launchExtents[axis];
+      remainder /= launchExtents[axis];
+    }
+    std::vector<int64_t> output;
+    for (auto [dimension, expression] : llvm::enumerate(logicalCoordinates)) {
+      if (static_cast<int64_t>(dimension) == reductionDimension)
+        continue;
+      FailureOr<int64_t> coordinate =
+          evaluateOnlineAffineExpr(expression, physical);
+      if (failed(coordinate) || *coordinate < 0 ||
+          *coordinate >= scoreShape[dimension])
+        return false;
+      output.push_back(*coordinate);
+    }
+    auto &fiber = fibers[output];
+    ++fiber.first;
+    if (!selector) {
+      ++fiber.second;
+      continue;
+    }
+    FailureOr<int64_t> selected =
+        evaluateOnlineIndexExpr(*selector, physical);
+    if (failed(selected))
+      return false;
+    if (*selected == 0)
+      ++fiber.second;
+  }
+  int64_t expectedOutputs = 1;
+  for (auto [dimension, extent] : llvm::enumerate(scoreShape)) {
+    if (static_cast<int64_t>(dimension) == reductionDimension)
+      continue;
+    if (extent <= 0 || expectedOutputs > 1000000 / extent)
+      return false;
+    expectedOutputs *= extent;
+  }
+  return fibers.size() == static_cast<size_t>(expectedOutputs) &&
+         llvm::all_of(fibers, [](const auto &item) {
+           return item.second.first > 0 && item.second.second == 1;
+         });
+}
+
+struct OnlineMaxReductionNode {
+  int64_t id = -1;
+  std::string kind;
+  std::string role;
+  llvm::SmallDenseSet<int64_t> coverage;
+  SmallVector<int64_t> children;
+  DictionaryAttr realization;
+};
+
+FailureOr<SmallVector<OnlineMaxReductionNode>> onlineMaxReductionNodes(
+    DictionaryAttr certificate, int64_t reductionDimension,
+    int64_t reductionExtent, ArrayRef<Attribute> expectedSources) {
+  auto version = certificate.getAs<IntegerAttr>("version");
+  auto dimension = certificate.getAs<IntegerAttr>("reduction_dimension");
+  auto extent = certificate.getAs<IntegerAttr>("reduction_extent");
+  auto nodes = certificate.getAs<ArrayAttr>("nodes");
+  auto root = certificate.getAs<IntegerAttr>("root");
+  auto sources = certificate.getAs<ArrayAttr>("source_refs");
+  if (!version || version.getInt() != 1 || !dimension ||
+      dimension.getInt() != reductionDimension || !extent ||
+      extent.getInt() != reductionExtent || reductionExtent <= 0 || !nodes ||
+      !root || !sources || sources.size() != expectedSources.size())
+    return failure();
+  llvm::SmallDenseSet<Attribute> expectedSourceSet(expectedSources.begin(),
+                                                   expectedSources.end());
+  llvm::SmallDenseSet<Attribute> certificateSourceSet(sources.begin(),
+                                                      sources.end());
+  if (expectedSourceSet.size() != expectedSources.size() ||
+      certificateSourceSet.size() != sources.size() ||
+      certificateSourceSet != expectedSourceSet)
+    return failure();
+
+  SmallVector<OnlineMaxReductionNode> result;
+  llvm::SmallDenseMap<int64_t, size_t> positions;
+  for (Attribute attribute : nodes) {
+    auto node = dyn_cast<DictionaryAttr>(attribute);
+    auto id = node ? node.getAs<IntegerAttr>("id") : IntegerAttr();
+    auto role = node ? node.getAs<StringAttr>("role") : StringAttr();
+    auto kind = node ? node.getAs<StringAttr>("kind") : StringAttr();
+    auto children =
+        node ? node.getAs<DenseI64ArrayAttr>("children")
+             : DenseI64ArrayAttr();
+    if (!id || id.getInt() < 0 || !kind ||
+        (kind.getValue() != "leaf_family" && kind.getValue() != "merge") ||
+        !role || role.getValue().empty() || !children ||
+        positions.contains(id.getInt()))
+      return failure();
+    OnlineMaxReductionNode parsed;
+    parsed.id = id.getInt();
+    parsed.kind = kind.getValue().str();
+    parsed.role = role.getValue().str();
+    parsed.realization = node.getAs<DictionaryAttr>("realization");
+    llvm::append_range(parsed.children, children.asArrayRef());
+    positions.try_emplace(parsed.id, result.size());
+    result.push_back(std::move(parsed));
+  }
+  if (!positions.contains(root.getInt()))
+    return failure();
+
+  for (OnlineMaxReductionNode &node : result) {
+    if (node.children.empty()) {
+      if (node.kind != "leaf_family" || !node.realization)
+        return failure();
+      auto partition = node.realization.getAs<DictionaryAttr>("partition");
+      auto offset =
+          partition ? partition.getAs<IntegerAttr>("offset") : IntegerAttr();
+      auto stride =
+          partition ? partition.getAs<IntegerAttr>("stride") : IntegerAttr();
+      auto count =
+          partition ? partition.getAs<IntegerAttr>("count") : IntegerAttr();
+      if (!offset || !stride || !count || offset.getInt() < 0 ||
+          stride.getInt() <= 0 || count.getInt() <= 0)
+        return failure();
+      for (int64_t ordinal = 0; ordinal < count.getInt(); ++ordinal) {
+        if (ordinal >
+            (std::numeric_limits<int64_t>::max() - offset.getInt()) /
+                stride.getInt())
+          return failure();
+        int64_t coordinate = offset.getInt() + ordinal * stride.getInt();
+        if (coordinate < 0 || coordinate >= reductionExtent ||
+            !node.coverage.insert(coordinate).second)
+          return failure();
+      }
+      continue;
+    }
+    if (node.kind != "merge")
+      return failure();
+    if (node.children.size() < 2)
+      return failure();
+    llvm::SmallDenseSet<int64_t> childIds;
+    for (int64_t childId : node.children) {
+      auto child = positions.find(childId);
+      if (child == positions.end() || child->second >= positions.lookup(node.id) ||
+          !childIds.insert(childId).second)
+        return failure();
+      for (int64_t coordinate : result[child->second].coverage)
+        if (!node.coverage.insert(coordinate).second)
+          return failure();
+    }
+  }
+  const OnlineMaxReductionNode &rootNode = result[positions.lookup(root.getInt())];
+  if (rootNode.coverage.size() != static_cast<size_t>(reductionExtent))
+    return failure();
+  for (int64_t coordinate = 0; coordinate < reductionExtent; ++coordinate)
+    if (!rootNode.coverage.contains(coordinate))
+      return failure();
+  llvm::SmallDenseSet<int64_t> reachable;
+  std::function<void(int64_t)> visit = [&](int64_t id) {
+    if (!reachable.insert(id).second)
+      return;
+    for (int64_t child : result[positions.lookup(id)].children)
+      visit(child);
+  };
+  visit(root.getInt());
+  if (reachable.size() != result.size())
+    return failure();
+  return result;
+}
+
+bool onlineCanonicalLeafFamilyBindings(const OnlinePtxCfg &cfg,
+                                       const OnlineMaxReductionNode &node,
+                                       StringRef scoreSource) {
+  auto kind = node.realization.getAs<StringAttr>("kind");
+  auto role = [&](StringRef name) -> std::optional<int64_t> {
+    auto attribute = node.realization.getAs<StringAttr>(name);
+    if (!attribute)
+      return std::nullopt;
+    auto found = cfg.roles.find(attribute.getValue().str());
+    return found == cfg.roles.end() ? std::nullopt
+                                    : std::optional<int64_t>(found->second);
+  };
+  auto indexInit = role("index_init_role");
+  auto indexGuard = role("index_guard_role");
+  auto indexStep = role("index_step_role");
+  auto exitBranch = role("exit_branch_role");
+  auto backedge = role("backedge_role");
+  auto accumulatorInit = role("accumulator_init_role");
+  auto accumulatorUpdate = role("accumulator_update_role");
+  auto coordinate = role("coordinate_role");
+  auto lhsLoad = role("score_lhs_load_role");
+  auto rhsLoad = role("score_rhs_load_role");
+  auto lhsOffset = role("score_lhs_offset_role");
+  auto rhsOffset = role("score_rhs_offset_role");
+  auto lhsPointer = role("score_lhs_pointer_role");
+  auto rhsPointer = role("score_rhs_pointer_role");
+  auto scoreZero = role("score_zero_role");
+  auto scoreValue = role("score_value_role");
+  auto relationCompare = role("relation_compare_role");
+  auto maskSelect = role("mask_select_role");
+  auto result = cfg.roles.find(node.role);
+  if (!kind || kind.getValue() != "canonical_loop" || !indexInit ||
+      !indexGuard || !indexStep || !exitBranch || !backedge ||
+      !accumulatorInit || !accumulatorUpdate || !coordinate ||
+      !lhsLoad || !rhsLoad || !lhsOffset || !rhsOffset || !lhsPointer ||
+      !rhsPointer || !scoreZero || !scoreValue || !relationCompare ||
+      !maskSelect ||
+      result == cfg.roles.end())
+    return false;
+  SmallVector<int64_t> ordered(node.coverage.begin(), node.coverage.end());
+  llvm::sort(ordered);
+  auto declaredStep = node.realization.getAs<IntegerAttr>("step");
+  const int64_t step = ordered.size() > 1 ? ordered[1] - ordered[0]
+                                         : declaredStep
+                                               ? declaredStep.getInt()
+                                               : 1;
+  if (step <= 0 || (declaredStep && declaredStep.getInt() != step))
+    return false;
+  const std::string lower = Twine(ordered.front()).str();
+  const std::string upper = Twine(ordered.back() + 1).str();
+  const std::string stepText = Twine(step).str();
+  const OnlinePtxInstruction &initInstruction = cfg.instructions[*indexInit];
+  const OnlinePtxInstruction &guardInstruction = cfg.instructions[*indexGuard];
+  const OnlinePtxInstruction &stepInstruction = cfg.instructions[*indexStep];
+  const OnlinePtxInstruction &exitInstruction = cfg.instructions[*exitBranch];
+  const OnlinePtxInstruction &backedgeInstruction = cfg.instructions[*backedge];
+  const OnlinePtxInstruction &coordinateInstruction =
+      cfg.instructions[*coordinate];
+  const OnlinePtxInstruction &accumulatorInitInstruction =
+      cfg.instructions[*accumulatorInit];
+  const OnlinePtxInstruction &accumulatorInstruction =
+      cfg.instructions[*accumulatorUpdate];
+  const OnlinePtxInstruction &resultInstruction =
+      cfg.instructions[result->second];
+  auto reachesEitherIteration = [&](int64_t consumer, StringRef operand) {
+    std::set<int64_t> definitions =
+        onlineReachingDefinitions(cfg, consumer, operand);
+    return definitions == std::set<int64_t>{*indexInit, *indexStep};
+  };
+  auto reachesEitherAccumulator = [&](int64_t consumer, StringRef operand) {
+    std::set<int64_t> definitions =
+        onlineReachingDefinitions(cfg, consumer, operand);
+    return definitions ==
+           std::set<int64_t>{*accumulatorInit, *accumulatorUpdate};
+  };
+  auto scoreSourceInstructions = cfg.sources.find(scoreSource.str());
+  std::set<std::pair<int64_t, int64_t>> scoreCoordinateActive;
+  if (accumulatorInitInstruction.opcode != "mov.f32" ||
+      !accumulatorInitInstruction.predicate.empty() ||
+      !llvm::is_contained(accumulatorInitInstruction.operands,
+                          "0fFF800000") ||
+      (initInstruction.opcode != "mov.u32" &&
+       initInstruction.opcode != "mov.s32") ||
+      !initInstruction.predicate.empty() ||
+      !llvm::is_contained(initInstruction.operands, lower) ||
+      (guardInstruction.opcode != "setp.ge.u32" &&
+       guardInstruction.opcode != "setp.ge.s32") ||
+      guardInstruction.operands.size() != 3 ||
+      !guardInstruction.predicate.empty() ||
+      !reachesEitherIteration(*indexGuard, guardInstruction.operands[1]) ||
+      guardInstruction.operands[2] != upper ||
+      !StringRef(exitInstruction.opcode).starts_with("bra") ||
+      exitInstruction.predicate.empty() || exitInstruction.negatedPredicate ||
+      onlineReachingDefinitions(cfg, *exitBranch,
+                                exitInstruction.predicate) !=
+          std::set<int64_t>{*indexGuard} ||
+      (stepInstruction.opcode != "add.u32" &&
+       stepInstruction.opcode != "add.s32") ||
+      !stepInstruction.predicate.empty() ||
+      stepInstruction.operands.size() != 3 ||
+      !reachesEitherIteration(*indexStep, stepInstruction.operands[1]) ||
+      stepInstruction.operands[2] != stepText ||
+      !StringRef(backedgeInstruction.opcode).starts_with("bra") ||
+      !backedgeInstruction.predicate.empty() ||
+      !coordinateInstruction.predicate.empty() ||
+      coordinateInstruction.operands.size() != 2 ||
+      !reachesEitherIteration(*coordinate,
+                              coordinateInstruction.operands[1]) ||
+      !onlineRoleTransitivelyDependsOn(
+          cfg,
+          node.realization.getAs<StringAttr>("relation_compare_role")
+              .getValue(),
+          node.realization.getAs<StringAttr>("coordinate_role").getValue()) ||
+      scoreSourceInstructions == cfg.sources.end() ||
+      !llvm::is_contained(scoreSourceInstructions->second, *scoreValue) ||
+      !cfg.instructions[*scoreValue].predicate.empty() ||
+      cfg.instructions[*scoreValue].opcode !=
+          "fma.rn.f32" ||
+      !onlineRoleOperandIs(cfg,
+                           node.realization
+                               .getAs<StringAttr>("score_value_role")
+                               .getValue(),
+                           1,
+                           node.realization
+                               .getAs<StringAttr>("score_lhs_load_role")
+                               .getValue()) ||
+      !onlineRoleOperandIs(cfg,
+                           node.realization
+                               .getAs<StringAttr>("score_value_role")
+                               .getValue(),
+                           2,
+                           node.realization
+                               .getAs<StringAttr>("score_rhs_load_role")
+                               .getValue()) ||
+      !onlineRoleOperandIs(cfg,
+                           node.realization
+                               .getAs<StringAttr>("score_value_role")
+                               .getValue(),
+                           3,
+                           node.realization
+                               .getAs<StringAttr>("score_zero_role")
+                               .getValue()) ||
+      accumulatorInstruction.opcode != "max.f32" ||
+      !accumulatorInstruction.predicate.empty() ||
+      accumulatorInstruction.operands.size() != 3 ||
+      !reachesEitherAccumulator(*accumulatorUpdate,
+                                accumulatorInstruction.operands[1]) ||
+      !onlineRoleOperandIs(
+          cfg,
+          node.realization.getAs<StringAttr>("accumulator_update_role")
+              .getValue(),
+          2,
+          node.realization.getAs<StringAttr>("mask_select_role").getValue()) ||
+      resultInstruction.opcode != "mov.f32" ||
+      !resultInstruction.predicate.empty() ||
+      resultInstruction.operands.size() != 2 ||
+      !reachesEitherAccumulator(result->second,
+                                resultInstruction.operands[1]))
+    return false;
+  auto loadIsCoordinateBound = [&](int64_t load, int64_t pointer,
+                                   int64_t offset, int64_t parameter) {
+    const OnlinePtxInstruction &loadInstruction = cfg.instructions[load];
+    const OnlinePtxInstruction &pointerInstruction =
+        cfg.instructions[pointer];
+    const OnlinePtxInstruction &offsetInstruction = cfg.instructions[offset];
+    if (loadInstruction.opcode != "ld.global.f32" ||
+        !loadInstruction.predicate.empty() ||
+        loadInstruction.operands.size() != 2 ||
+        onlineReachingDefinitions(cfg, load,
+                                  loadInstruction.operands[1]) !=
+            std::set<int64_t>{pointer} ||
+        pointerInstruction.opcode != "add.u64" ||
+        !pointerInstruction.predicate.empty() ||
+        pointerInstruction.operands.size() != 3 ||
+        offsetInstruction.opcode != "mul.wide.u32" ||
+        !offsetInstruction.predicate.empty() ||
+        offsetInstruction.operands.size() != 3 ||
+        onlineReachingDefinitions(cfg, offset,
+                                  offsetInstruction.operands[1]) !=
+            std::set<int64_t>{*coordinate})
+      return false;
+    int64_t stride = 0;
+    if (StringRef(offsetInstruction.operands[2]).getAsInteger(10, stride) ||
+        stride <= 0)
+      return false;
+    const bool baseFirst =
+        onlinePointerIsOutputParameter(cfg, pointer,
+                                       pointerInstruction.operands[1],
+                                       parameter) &&
+        onlineReachingDefinitions(cfg, pointer,
+                                  pointerInstruction.operands[2]) ==
+            std::set<int64_t>{offset};
+    const bool baseSecond =
+        onlinePointerIsOutputParameter(cfg, pointer,
+                                       pointerInstruction.operands[2],
+                                       parameter) &&
+        onlineReachingDefinitions(cfg, pointer,
+                                  pointerInstruction.operands[1]) ==
+            std::set<int64_t>{offset};
+    return baseFirst || baseSecond;
+  };
+  auto lhsParameter =
+      node.realization.getAs<IntegerAttr>("score_lhs_parameter");
+  auto rhsParameter =
+      node.realization.getAs<IntegerAttr>("score_rhs_parameter");
+  if (!lhsParameter || !rhsParameter ||
+      !loadIsCoordinateBound(*lhsLoad, *lhsPointer, *lhsOffset,
+                             lhsParameter.getInt()) ||
+      !loadIsCoordinateBound(*rhsLoad, *rhsPointer, *rhsOffset,
+                             rhsParameter.getInt()) ||
+      cfg.instructions[*scoreZero].opcode != "mov.f32" ||
+      !llvm::is_contained(cfg.instructions[*scoreZero].operands,
+                          "0f00000000"))
+    return false;
+  auto exitTarget = cfg.labels.find(exitInstruction.branchTarget);
+  auto backedgeTarget = cfg.labels.find(backedgeInstruction.branchTarget);
+  if (exitTarget == cfg.labels.end() ||
+      exitTarget->second != resultInstruction.block ||
+      backedgeTarget == cfg.labels.end() ||
+      backedgeTarget->second != guardInstruction.block)
+    return false;
+  const int64_t bodyBlock = accumulatorInstruction.block;
+  llvm::SmallDenseSet<int64_t> guardSuccessors(
+      cfg.successors[guardInstruction.block].begin(),
+      cfg.successors[guardInstruction.block].end());
+  if (guardSuccessors !=
+      llvm::SmallDenseSet<int64_t>{bodyBlock, resultInstruction.block})
+    return false;
+  llvm::SmallDenseSet<int64_t> loopBodyBlocks;
+  SmallVector<int64_t> worklist{bodyBlock};
+  while (!worklist.empty()) {
+    int64_t block = worklist.pop_back_val();
+    if (block == guardInstruction.block || block == resultInstruction.block ||
+        !loopBodyBlocks.insert(block).second)
+      continue;
+    for (int64_t successor : cfg.successors[block])
+      if (successor != guardInstruction.block &&
+          successor != resultInstruction.block)
+        worklist.push_back(successor);
+  }
+  for (int64_t block : loopBodyBlocks)
+    for (int64_t successor : cfg.successors[block])
+      if (successor == resultInstruction.block)
+        return false;
+  if (cfg.successors[backedgeInstruction.block] !=
+      std::vector<int64_t>{guardInstruction.block})
+    return false;
+  if (!onlineInstructionDominates(cfg, *indexInit, *indexGuard) ||
+      !onlineInstructionDominates(cfg, *indexGuard, *accumulatorUpdate) ||
+      !onlineInstructionDominates(cfg, *accumulatorUpdate, *indexStep) ||
+      !onlineInstructionDominates(cfg, *indexStep, *backedge) ||
+      !onlineInstructionDominates(cfg, *exitBranch, result->second))
+    return false;
+  return true;
+}
+
+bool onlineCollectMaxLeaves(const OnlinePtxCfg &cfg, int64_t instruction,
+                            const llvm::SmallDenseSet<int64_t> &expected,
+                            llvm::SmallDenseSet<int64_t> &found,
+                            llvm::SmallDenseSet<int64_t> &active) {
+  if (expected.contains(instruction))
+    return found.insert(instruction).second;
+  if (!active.insert(instruction).second)
+    return false;
+  const OnlinePtxInstruction &candidate = cfg.instructions[instruction];
+  if (candidate.opcode != "max.f32" || candidate.operands.size() != 3) {
+    active.erase(instruction);
+    return false;
+  }
+  for (size_t operand = 1; operand <= 2; ++operand) {
+    std::set<int64_t> definitions = onlineReachingDefinitions(
+        cfg, instruction, candidate.operands[operand]);
+    if (definitions.size() != 1 ||
+        !onlineCollectMaxLeaves(cfg, *definitions.begin(), expected, found,
+                               active)) {
+      active.erase(instruction);
+      return false;
+    }
+  }
+  active.erase(instruction);
+  return true;
+}
+
+FailureOr<int64_t> onlineTransportedChild(
+    const OnlinePtxCfg &cfg, const OnlineMaxReductionNode &child,
+    DictionaryAttr transport) {
+  auto kind = transport.getAs<StringAttr>("kind");
+  auto role = transport.getAs<StringAttr>("role");
+  auto childId = transport.getAs<IntegerAttr>("child");
+  if (!kind || !role || !childId || childId.getInt() != child.id)
+    return failure();
+  auto transported = cfg.roles.find(role.getValue().str());
+  if (transported == cfg.roles.end())
+    return failure();
+  if (kind.getValue() == "register") {
+    if (!onlineRoleIs(cfg, role.getValue(), {"mov.f32"}, {child.role}) ||
+        !onlineRoleOperandIs(cfg, role.getValue(), 1, child.role))
+      return failure();
+    return transported->second;
+  }
+  // Cross-instance transports need an ownership proof that composes the
+  // producer and consumer partitions with the shared address or lane map.
+  // Until that certificate exists, only same-instance register transport is
+  // admitted here.
+  return failure();
+}
+
+bool onlineMaxReductionBindings(
+    const OnlinePtxCfg &cfg, ArrayRef<OnlineMaxReductionNode> nodes,
+    DictionaryAttr certificate, StringRef scoreSource) {
+  auto root = certificate.getAs<IntegerAttr>("root");
+  if (!root)
+    return false;
+  const OnlineMaxReductionNode *rootNode = nullptr;
+  llvm::SmallDenseMap<int64_t, const OnlineMaxReductionNode *> byId;
+  for (const OnlineMaxReductionNode &node : nodes) {
+    byId.try_emplace(node.id, &node);
+    if (node.id == root.getInt())
+      rootNode = &node;
+    auto role = cfg.roles.find(node.role);
+    if (role == cfg.roles.end())
+      return false;
+    if (node.children.empty()) {
+      if (node.kind == "leaf_family") {
+        if (!onlineCanonicalLeafFamilyBindings(cfg, node, scoreSource))
+          return false;
+        continue;
+      }
+      if (!onlineRoleIs(cfg, node.role, {"max.f32"},
+                        {"max_init", "mask_select"}))
+        return false;
+      continue;
+    }
+    llvm::SmallDenseMap<int64_t, DictionaryAttr> transports;
+    if (node.realization)
+      if (auto attributes = node.realization.getAs<ArrayAttr>("transports"))
+        for (Attribute attribute : attributes) {
+          auto transport = dyn_cast<DictionaryAttr>(attribute);
+          auto child =
+              transport ? transport.getAs<IntegerAttr>("child")
+                        : IntegerAttr();
+          if (!child || !transports.try_emplace(child.getInt(), transport).second)
+            return false;
+        }
+    llvm::SmallDenseSet<int64_t> expectedLeaves;
+    for (int64_t childId : node.children) {
+      const OnlineMaxReductionNode *child = byId.lookup(childId);
+      if (!child)
+        return false;
+      auto childRole = cfg.roles.find(child->role);
+      if (childRole == cfg.roles.end())
+        return false;
+      int64_t leaf = childRole->second;
+      if (DictionaryAttr transport = transports.lookup(childId)) {
+        FailureOr<int64_t> transported =
+            onlineTransportedChild(cfg, *child, transport);
+        if (failed(transported))
+          return false;
+        leaf = *transported;
+      }
+      if (leaf < 0 || !expectedLeaves.insert(leaf).second)
+        return false;
+    }
+    if (transports.size() > node.children.size())
+      return false;
+    llvm::SmallDenseSet<int64_t> foundLeaves;
+    llvm::SmallDenseSet<int64_t> active;
+    if (!onlineCollectMaxLeaves(cfg, role->second, expectedLeaves, foundLeaves,
+                               active) ||
+        foundLeaves != expectedLeaves)
+      return false;
+  }
+  return rootNode &&
+         onlineRoleIs(cfg, "compact_store", {"st.global."},
+                      {rootNode->role}) &&
+         onlineRoleOperandIs(cfg, "compact_store", 1, rootNode->role);
+}
+
 bool onlineMaximumProtocol(const OnlinePtxCfg &cfg, int64_t outputParameter,
-                           StringRef comparisonOpcode) {
+                           StringRef comparisonOpcode,
+                           DictionaryAttr reductionCertificate,
+                           int64_t reductionDimension,
+                           int64_t reductionExtent,
+                           ArrayRef<Attribute> expectedSources,
+                           StringRef scoreSource,
+                           ArrayRef<AffineExpr> logicalCoordinates,
+                           ArrayRef<int64_t> launchExtents,
+                           ArrayRef<int64_t> scoreShape,
+                           MLIRContext *context) {
+  FailureOr<SmallVector<OnlineMaxReductionNode>> nodes =
+      onlineMaxReductionNodes(reductionCertificate, reductionDimension,
+                              reductionExtent, expectedSources);
   return onlineMaskedScoreProtocol(cfg, comparisonOpcode) &&
          onlineRoleIs(cfg, "max_init", {"mov.f32"}) &&
          llvm::is_contained(
              cfg.instructions[cfg.roles.at("max_init")].operands,
              "0fFF800000") &&
-         onlineRoleIs(cfg, "max_update", {"max.f32"},
-                      {"mask_select", "max_init"}) &&
-         onlineRoleIs(cfg, "compact_store", {"st.global."},
-                      {"max_update"}) &&
+         succeeded(nodes) &&
+         onlineMaxReductionBindings(cfg, *nodes, reductionCertificate,
+                                    scoreSource) &&
+         onlineCompactOutputAddressIsProjected(
+             cfg, outputParameter, logicalCoordinates, launchExtents,
+             scoreShape, reductionDimension, context) &&
+         onlineCompactWriterIsUnique(cfg, logicalCoordinates, launchExtents,
+                                     scoreShape, reductionDimension, context) &&
          onlineRoleStoresToOutput(cfg, "compact_store", outputParameter);
 }
 
@@ -3297,6 +4101,215 @@ public:
     return "shuttle-test-verify-online-ptx-oracle";
   }
   void runOnOperation() override {
+    MLIRContext *context = getOperation().getContext();
+    Builder builder(context);
+    auto reductionNode = [&](int64_t id, StringRef role,
+                             ArrayRef<int64_t> coverage,
+                             ArrayRef<int64_t> children) -> Attribute {
+      const int64_t stride = coverage.size() > 1 ? coverage[1] - coverage[0] : 1;
+      DictionaryAttr partition = DictionaryAttr::get(
+          context,
+          {builder.getNamedAttr("offset",
+                                builder.getI64IntegerAttr(coverage.front())),
+           builder.getNamedAttr("stride", builder.getI64IntegerAttr(stride)),
+           builder.getNamedAttr(
+               "count", builder.getI64IntegerAttr(coverage.size()))});
+      DictionaryAttr syntheticLeafRealization = DictionaryAttr::get(
+          context,
+          {builder.getNamedAttr("kind",
+                                builder.getStringAttr("canonical_loop")),
+           builder.getNamedAttr("partition", partition)});
+      SmallVector<NamedAttribute> attributes{
+          builder.getNamedAttr("id", builder.getI64IntegerAttr(id)),
+          builder.getNamedAttr("kind", builder.getStringAttr(
+                                           children.empty() ? "leaf_family"
+                                                            : "merge")),
+          builder.getNamedAttr("role", builder.getStringAttr(role)),
+          builder.getNamedAttr(
+              "children", DenseI64ArrayAttr::get(context, children))};
+      if (children.empty())
+        attributes.push_back(builder.getNamedAttr(
+            "realization", syntheticLeafRealization));
+      return DictionaryAttr::get(
+          context, attributes);
+    };
+    auto reductionLeafFamily =
+        [&](int64_t id, StringRef role, ArrayRef<int64_t> coverage,
+            DictionaryAttr realization) -> Attribute {
+      return DictionaryAttr::get(
+          context,
+          {builder.getNamedAttr("id", builder.getI64IntegerAttr(id)),
+           builder.getNamedAttr("kind", builder.getStringAttr("leaf_family")),
+           builder.getNamedAttr("role", builder.getStringAttr(role)),
+           builder.getNamedAttr("children",
+                                DenseI64ArrayAttr::get(context, {})),
+           builder.getNamedAttr("realization", realization)});
+    };
+    auto reductionCertificate =
+        [&](ArrayRef<Attribute> nodes, int64_t root,
+            int64_t extent) -> DictionaryAttr {
+      ArrayAttr sources = builder.getArrayAttr(
+          {builder.getStringAttr("synthetic-source-bound-score-and-relation")});
+      return DictionaryAttr::get(
+          context,
+          {builder.getNamedAttr("version", builder.getI64IntegerAttr(1)),
+           builder.getNamedAttr("reduction_dimension",
+                                builder.getI64IntegerAttr(4)),
+           builder.getNamedAttr("reduction_extent",
+                                builder.getI64IntegerAttr(extent)),
+           builder.getNamedAttr("nodes", builder.getArrayAttr(nodes)),
+           builder.getNamedAttr("source_refs", sources),
+           builder.getNamedAttr("root", builder.getI64IntegerAttr(root))});
+    };
+    SmallVector<Attribute> syntheticSources{
+        builder.getStringAttr("synthetic-source-bound-score-and-relation")};
+    SmallVector<Attribute> leftDeepNodes{
+        reductionNode(0, "leaf0", {0}, {}),
+        reductionNode(1, "leaf1", {1}, {}),
+        reductionNode(2, "merge01", {0, 1}, {0, 1}),
+        reductionNode(3, "leaf2", {2}, {}),
+        reductionNode(4, "root", {0, 1, 2}, {2, 3})};
+    SmallVector<Attribute> balancedNodes{
+        reductionNode(0, "leaf0", {0}, {}),
+        reductionNode(1, "leaf1", {1}, {}),
+        reductionNode(2, "leaf2", {2}, {}),
+        reductionNode(3, "leaf3", {3}, {}),
+        reductionNode(4, "left", {0, 1}, {0, 1}),
+        reductionNode(5, "right", {2, 3}, {2, 3}),
+        reductionNode(6, "root", {0, 1, 2, 3}, {4, 5})};
+    SmallVector<Attribute> stridedRegisterNodes{
+        reductionNode(0, "even_partial", {0, 2}, {}),
+        reductionNode(1, "odd_partial", {1, 3}, {}),
+        reductionNode(2, "register_root", {0, 1, 2, 3}, {0, 1})};
+    SmallVector<Attribute> naryNodes{
+        reductionNode(0, "leaf0", {0}, {}),
+        reductionNode(1, "leaf1", {1}, {}),
+        reductionNode(2, "leaf2", {2}, {}),
+        reductionNode(3, "leaf3", {3}, {}),
+        reductionNode(4, "nary_root", {0, 1, 2, 3}, {0, 1, 2, 3})};
+    auto canonicalLoopRealization =
+        [&](StringRef prefix, int64_t offset, int64_t stride,
+            int64_t count) -> DictionaryAttr {
+      auto roleName = [&](StringRef role) {
+        return builder.getStringAttr(
+            prefix.empty() ? role.str() : (Twine(prefix) + "_" + role).str());
+      };
+      return DictionaryAttr::get(
+        context,
+        {builder.getNamedAttr("kind", builder.getStringAttr("canonical_loop")),
+         builder.getNamedAttr(
+             "partition",
+             DictionaryAttr::get(
+                 context,
+                 {builder.getNamedAttr("offset", builder.getI64IntegerAttr(offset)),
+                  builder.getNamedAttr("stride", builder.getI64IntegerAttr(stride)),
+                  builder.getNamedAttr("count", builder.getI64IntegerAttr(count))})),
+         builder.getNamedAttr("index_init_role",
+                              roleName("loop_index_init")),
+         builder.getNamedAttr("index_guard_role",
+                              roleName("loop_index_guard")),
+         builder.getNamedAttr("index_step_role",
+                              roleName("loop_index_step")),
+         builder.getNamedAttr("exit_branch_role",
+                              roleName("loop_exit_branch")),
+         builder.getNamedAttr("backedge_role",
+                              roleName("loop_backedge")),
+         builder.getNamedAttr("accumulator_init_role",
+                              roleName("max_init")),
+         builder.getNamedAttr("accumulator_update_role",
+                              roleName("loop_max_update")),
+         builder.getNamedAttr("coordinate_role",
+                              roleName("reduction_coordinate")),
+         builder.getNamedAttr("score_lhs_load_role",
+                              roleName("score_lhs_load")),
+         builder.getNamedAttr("score_rhs_load_role",
+                              roleName("score_rhs_load")),
+         builder.getNamedAttr("score_lhs_offset_role",
+                              roleName("score_lhs_offset")),
+         builder.getNamedAttr("score_rhs_offset_role",
+                              roleName("score_rhs_offset")),
+         builder.getNamedAttr("score_lhs_pointer_role",
+                              roleName("score_lhs_pointer")),
+         builder.getNamedAttr("score_rhs_pointer_role",
+                              roleName("score_rhs_pointer")),
+         builder.getNamedAttr("score_zero_role",
+                              roleName("score_zero")),
+         builder.getNamedAttr("score_value_role",
+                              roleName("score_value")),
+         builder.getNamedAttr("relation_compare_role",
+                              roleName("relation_compare")),
+         builder.getNamedAttr("mask_select_role",
+                              roleName("mask_select")),
+         builder.getNamedAttr("score_lhs_parameter",
+                              builder.getI64IntegerAttr(1)),
+         builder.getNamedAttr("score_rhs_parameter",
+                              builder.getI64IntegerAttr(2))});
+    };
+    DictionaryAttr canonicalLoop =
+        canonicalLoopRealization("", 0, 1, 4);
+    SmallVector<Attribute> loopNodes{reductionLeafFamily(
+        0, "loop_result", {0, 1, 2, 3}, canonicalLoop)};
+    DictionaryAttr evenLoop =
+        canonicalLoopRealization("even", 0, 2, 2);
+    DictionaryAttr oddLoop =
+        canonicalLoopRealization("odd", 1, 2, 2);
+    DictionaryAttr registerMerge = DictionaryAttr::get(context, {});
+    SmallVector<Attribute> executableStridedNodes{
+        reductionLeafFamily(0, "even_loop_result", {0, 2}, evenLoop),
+        reductionLeafFamily(1, "odd_loop_result", {1, 3}, oddLoop),
+        DictionaryAttr::get(
+            context,
+            {builder.getNamedAttr("id", builder.getI64IntegerAttr(2)),
+             builder.getNamedAttr("kind", builder.getStringAttr("merge")),
+             builder.getNamedAttr("role",
+                                  builder.getStringAttr("strided_root")),
+             builder.getNamedAttr(
+                 "children", DenseI64ArrayAttr::get(context, {0, 1})),
+             builder.getNamedAttr("realization", registerMerge)})};
+    SmallVector<Attribute> missingLeafNodes(leftDeepNodes);
+    missingLeafNodes.erase(missingLeafNodes.begin() + 3);
+    SmallVector<Attribute> duplicateLeafNodes(leftDeepNodes);
+    duplicateLeafNodes[1] = reductionNode(1, "leaf1", {0}, {});
+    SmallVector<Attribute> wrongCoordinateNodes(leftDeepNodes);
+    wrongCoordinateNodes[3] = reductionNode(3, "leaf2", {3}, {});
+    SmallVector<Attribute> lostMergeNodes(leftDeepNodes);
+    lostMergeNodes.back() = reductionNode(4, "root", {0, 1, 2}, {0, 3});
+    SmallVector<Attribute> partialRootNodes(leftDeepNodes);
+    partialRootNodes.back() = reductionNode(4, "root", {0, 1}, {0, 1});
+    if (failed(onlineMaxReductionNodes(
+            reductionCertificate(leftDeepNodes, 4, 3), 4, 3,
+            syntheticSources)) ||
+        failed(onlineMaxReductionNodes(
+            reductionCertificate(balancedNodes, 6, 4), 4, 4,
+            syntheticSources)) ||
+        failed(onlineMaxReductionNodes(
+            reductionCertificate(loopNodes, 0, 4), 4, 4,
+            syntheticSources)) ||
+        failed(onlineMaxReductionNodes(
+            reductionCertificate(stridedRegisterNodes, 2, 4), 4, 4,
+            syntheticSources)) ||
+        failed(onlineMaxReductionNodes(
+            reductionCertificate(naryNodes, 4, 4), 4, 4,
+            syntheticSources)) ||
+        succeeded(onlineMaxReductionNodes(
+            reductionCertificate(missingLeafNodes, 4, 3), 4, 3,
+            syntheticSources)) ||
+        succeeded(onlineMaxReductionNodes(
+            reductionCertificate(duplicateLeafNodes, 4, 3), 4, 3,
+            syntheticSources)) ||
+        succeeded(onlineMaxReductionNodes(
+            reductionCertificate(wrongCoordinateNodes, 4, 3), 4, 3,
+            syntheticSources)) ||
+        succeeded(onlineMaxReductionNodes(
+            reductionCertificate(lostMergeNodes, 4, 3), 4, 3,
+            syntheticSources)) ||
+        succeeded(onlineMaxReductionNodes(
+            reductionCertificate(partialRootNodes, 4, 3), 4, 3,
+            syntheticSources))) {
+      getOperation().emitError(
+          "online max-reduction coverage accepted a partition near miss");
+      return signalPassFailure();
+    }
     auto parse = [&](StringRef ptx) -> FailureOr<OnlinePtxCfg> {
       FailureOr<OnlinePtxCfg> cfg = onlinePtxCfg(ptx);
       if (failed(cfg))
@@ -3415,13 +4428,280 @@ bar.sync 0;
 ld.shared.f32 %f2, [%rd0];
 ret;
 )ptx");
+    const std::string canonicalReductionPtx = R"ptx(
+// shuttle.online.role max_init
+mov.f32 %f0, 0fFF800000;
+// shuttle.online.role loop_index_init
+mov.u32 %r0, 0;
+LOOP:
+// shuttle.online.role loop_index_guard
+setp.ge.u32 %p0, %r0, 4;
+// shuttle.online.role loop_exit_branch
+@%p0 bra.uni DONE;
+// shuttle.online.role reduction_coordinate
+mov.u32 %r1, %r0;
+// shuttle.online.role relation_rhs
+mov.u32 %r2, 3;
+// shuttle.online.role relation_compare
+setp.le.u32 %p1, %r1, %r2;
+ld.param.u64 %rd1, [p1];
+// shuttle.online.role score_lhs_offset
+mul.wide.u32 %rd2, %r1, 4;
+// shuttle.online.role score_lhs_pointer
+add.u64 %rd3, %rd1, %rd2;
+// shuttle.online.role score_lhs_load
+ld.global.f32 %f5, [%rd3];
+ld.param.u64 %rd7, [p2];
+// shuttle.online.role score_rhs_offset
+mul.wide.u32 %rd8, %r1, 4;
+// shuttle.online.role score_rhs_pointer
+add.u64 %rd9, %rd7, %rd8;
+// shuttle.online.role score_rhs_load
+ld.global.f32 %f6, [%rd9];
+// shuttle.online.role score_zero
+mov.f32 %f7, 0f00000000;
+// shuttle.online.role score_value
+// shuttle.online.source_ref synthetic-source-bound-score-and-relation
+fma.rn.f32 %f1, %f5, %f6, %f7;
+// shuttle.online.role negative_infinity
+mov.f32 %f2, 0fFF800000;
+// shuttle.online.role mask_select
+selp.f32 %f3, %f1, %f2, %p1;
+// shuttle.online.role loop_max_update
+max.f32 %f0, %f0, %f3;
+// shuttle.online.role loop_index_step
+add.u32 %r0, %r0, 1;
+// shuttle.online.role loop_backedge
+bra.uni LOOP;
+DONE:
+// shuttle.online.role loop_result
+mov.f32 %f4, %f0;
+ld.param.u64 %rd5, [p0];
+// shuttle.online.role compact_output_linear_index
+mov.u32 %r10, %ctaid.x;
+// shuttle.online.role compact_output_byte_offset
+mul.wide.u32 %rd6, %r10, 4;
+// shuttle.online.role compact_output_pointer
+add.u64 %rd0, %rd5, %rd6;
+// shuttle.online.role compact_store
+st.global.f32 [%rd0], %f4;
+ret;
+)ptx";
+    FailureOr<OnlinePtxCfg> canonicalReduction = parse(canonicalReductionPtx);
+    FailureOr<OnlinePtxCfg> stridedRegisterReduction = parse(R"ptx(
+// shuttle.online.role even_max_init
+mov.f32 %f0, 0fFF800000;
+// shuttle.online.role even_loop_index_init
+mov.u32 %r0, 0;
+EVEN_LOOP:
+// shuttle.online.role even_loop_index_guard
+setp.ge.u32 %p0, %r0, 3;
+// shuttle.online.role even_loop_exit_branch
+@%p0 bra.uni EVEN_DONE;
+// shuttle.online.role even_reduction_coordinate
+mov.u32 %r1, %r0;
+mov.u32 %r2, 3;
+// shuttle.online.role even_relation_compare
+setp.le.u32 %p1, %r1, %r2;
+ld.param.u64 %rd1, [p1];
+// shuttle.online.role even_score_lhs_offset
+mul.wide.u32 %rd2, %r1, 4;
+// shuttle.online.role even_score_lhs_pointer
+add.u64 %rd3, %rd1, %rd2;
+// shuttle.online.role even_score_lhs_load
+ld.global.f32 %f1, [%rd3];
+ld.param.u64 %rd4, [p2];
+// shuttle.online.role even_score_rhs_offset
+mul.wide.u32 %rd5, %r1, 4;
+// shuttle.online.role even_score_rhs_pointer
+add.u64 %rd6, %rd4, %rd5;
+// shuttle.online.role even_score_rhs_load
+ld.global.f32 %f2, [%rd6];
+// shuttle.online.role even_score_zero
+mov.f32 %f3, 0f00000000;
+// shuttle.online.role even_score_value
+// shuttle.online.source_ref synthetic-source-bound-score-and-relation
+fma.rn.f32 %f4, %f1, %f2, %f3;
+mov.f32 %f5, 0fFF800000;
+// shuttle.online.role even_mask_select
+selp.f32 %f6, %f4, %f5, %p1;
+// shuttle.online.role even_loop_max_update
+max.f32 %f0, %f0, %f6;
+// shuttle.online.role even_loop_index_step
+add.u32 %r0, %r0, 2;
+// shuttle.online.role even_loop_backedge
+bra.uni EVEN_LOOP;
+EVEN_DONE:
+// shuttle.online.role even_loop_result
+mov.f32 %f7, %f0;
+// shuttle.online.role odd_max_init
+mov.f32 %f8, 0fFF800000;
+// shuttle.online.role odd_loop_index_init
+mov.u32 %r3, 1;
+ODD_LOOP:
+// shuttle.online.role odd_loop_index_guard
+setp.ge.u32 %p2, %r3, 4;
+// shuttle.online.role odd_loop_exit_branch
+@%p2 bra.uni ODD_DONE;
+// shuttle.online.role odd_reduction_coordinate
+mov.u32 %r4, %r3;
+mov.u32 %r5, 3;
+// shuttle.online.role odd_relation_compare
+setp.le.u32 %p3, %r4, %r5;
+ld.param.u64 %rd7, [p1];
+// shuttle.online.role odd_score_lhs_offset
+mul.wide.u32 %rd8, %r4, 4;
+// shuttle.online.role odd_score_lhs_pointer
+add.u64 %rd9, %rd7, %rd8;
+// shuttle.online.role odd_score_lhs_load
+ld.global.f32 %f9, [%rd9];
+ld.param.u64 %rd10, [p2];
+// shuttle.online.role odd_score_rhs_offset
+mul.wide.u32 %rd11, %r4, 4;
+// shuttle.online.role odd_score_rhs_pointer
+add.u64 %rd12, %rd10, %rd11;
+// shuttle.online.role odd_score_rhs_load
+ld.global.f32 %f10, [%rd12];
+// shuttle.online.role odd_score_zero
+mov.f32 %f11, 0f00000000;
+// shuttle.online.role odd_score_value
+// shuttle.online.source_ref synthetic-source-bound-score-and-relation
+fma.rn.f32 %f12, %f9, %f10, %f11;
+mov.f32 %f13, 0fFF800000;
+// shuttle.online.role odd_mask_select
+selp.f32 %f14, %f12, %f13, %p3;
+// shuttle.online.role odd_loop_max_update
+max.f32 %f8, %f8, %f14;
+// shuttle.online.role odd_loop_index_step
+add.u32 %r3, %r3, 2;
+// shuttle.online.role odd_loop_backedge
+bra.uni ODD_LOOP;
+ODD_DONE:
+// shuttle.online.role odd_loop_result
+mov.f32 %f15, %f8;
+// shuttle.online.role strided_root
+max.f32 %f18, %f7, %f15;
+ld.param.u64 %rd13, [p0];
+// shuttle.online.role compact_store
+st.global.f32 [%rd13], %f18;
+ret;
+)ptx");
+    std::string wrongLoopPolarityPtx = canonicalReductionPtx;
+    size_t loopPolarity = wrongLoopPolarityPtx.find("@%p0 bra.uni DONE");
+    if (loopPolarity != std::string::npos)
+      wrongLoopPolarityPtx.replace(loopPolarity, 1, "@!");
+    FailureOr<OnlinePtxCfg> wrongLoopPolarity = parse(wrongLoopPolarityPtx);
+    std::string wrongLoopTargetPtx = canonicalReductionPtx;
+    size_t loopTarget = wrongLoopTargetPtx.find("@%p0 bra.uni DONE");
+    if (loopTarget != std::string::npos)
+      wrongLoopTargetPtx.replace(
+          loopTarget, StringRef("@%p0 bra.uni DONE").size(),
+          "@%p0 bra.uni LOOP");
+    FailureOr<OnlinePtxCfg> wrongLoopTarget = parse(wrongLoopTargetPtx);
+    std::string wrongLoopBoundPtx = canonicalReductionPtx;
+    size_t loopBound =
+        wrongLoopBoundPtx.find("setp.ge.u32 %p0, %r0, 4");
+    if (loopBound != std::string::npos)
+      wrongLoopBoundPtx.replace(
+          loopBound, StringRef("setp.ge.u32 %p0, %r0, 4").size(),
+          "setp.ge.u32 %p0, %r0, 3");
+    FailureOr<OnlinePtxCfg> wrongLoopBound = parse(wrongLoopBoundPtx);
+    std::string wrongLoopStepPtx = canonicalReductionPtx;
+    size_t loopStep = wrongLoopStepPtx.find("add.u32 %r0, %r0, 1");
+    if (loopStep != std::string::npos)
+      wrongLoopStepPtx.replace(
+          loopStep, StringRef("add.u32 %r0, %r0, 1").size(),
+          "add.u32 %r0, %r0, 2");
+    FailureOr<OnlinePtxCfg> wrongLoopStep = parse(wrongLoopStepPtx);
+    std::string predicatedUpdatePtx = canonicalReductionPtx;
+    size_t predicatedUpdate =
+        predicatedUpdatePtx.find("max.f32 %f0, %f0, %f3");
+    if (predicatedUpdate != std::string::npos)
+      predicatedUpdatePtx.insert(predicatedUpdate, "@%p1 ");
+    FailureOr<OnlinePtxCfg> predicatedUpdateValue =
+        parse(predicatedUpdatePtx);
+    std::string predicatedStepPtx = canonicalReductionPtx;
+    size_t predicatedStep = predicatedStepPtx.find("add.u32 %r0, %r0, 1");
+    if (predicatedStep != std::string::npos)
+      predicatedStepPtx.insert(predicatedStep, "@%p1 ");
+    FailureOr<OnlinePtxCfg> predicatedStepValue = parse(predicatedStepPtx);
+    std::string wrongInitializerPtx = canonicalReductionPtx;
+    size_t wrongInitializer =
+        wrongInitializerPtx.find("mov.f32 %f0, 0fFF800000");
+    if (wrongInitializer != std::string::npos)
+      wrongInitializerPtx.replace(
+          wrongInitializer, StringRef("mov.f32 %f0, 0fFF800000").size(),
+          "mov.f32 %f0, 0f00000000");
+    FailureOr<OnlinePtxCfg> wrongInitializerValue =
+        parse(wrongInitializerPtx);
+    std::string constantScorePtx = canonicalReductionPtx;
+    size_t scoreFma = constantScorePtx.find(
+        "fma.rn.f32 %f1, %f5, %f6, %f7");
+    if (scoreFma != std::string::npos)
+      constantScorePtx.replace(scoreFma,
+                               StringRef("fma.rn.f32 %f1, %f5, %f6, %f7").size(),
+                               "mov.f32 %f1, 0f40000000           ");
+    FailureOr<OnlinePtxCfg> constantScore = parse(constantScorePtx);
+    std::string annihilatedScorePtx = canonicalReductionPtx;
+    size_t annihilatedScore = annihilatedScorePtx.find(
+        "fma.rn.f32 %f1, %f5, %f6, %f7");
+    if (annihilatedScore != std::string::npos)
+      annihilatedScorePtx.replace(
+          annihilatedScore,
+          StringRef("fma.rn.f32 %f1, %f5, %f6, %f7").size(),
+          "fma.rn.f32 %f1, %f5, %f7, %f7");
+    FailureOr<OnlinePtxCfg> annihilatedScoreValue =
+        parse(annihilatedScorePtx);
+    std::string staleScorePtx = canonicalReductionPtx;
+    size_t staleScore = staleScorePtx.find("mul.wide.u32 %rd2, %r1, 4");
+    if (staleScore != std::string::npos)
+      staleScorePtx.replace(
+          staleScore, StringRef("mul.wide.u32 %rd2, %r1, 4").size(),
+          "mul.wide.u32 %rd2, %r2, 4");
+    FailureOr<OnlinePtxCfg> staleScoreValue = parse(staleScorePtx);
+    std::string wrongRootValuePtx = canonicalReductionPtx;
+    size_t rootValue = wrongRootValuePtx.find("[%rd0], %f4");
+    if (rootValue != std::string::npos)
+      wrongRootValuePtx.replace(rootValue, StringRef("[%rd0], %f4").size(),
+                                "[%rd0], %f1");
+    FailureOr<OnlinePtxCfg> wrongRootValue = parse(wrongRootValuePtx);
+    std::string wrongOutputCoordinatePtx = canonicalReductionPtx;
+    size_t outputCoordinate =
+        wrongOutputCoordinatePtx.find("mov.u32 %r10, %ctaid.x");
+    if (outputCoordinate != std::string::npos)
+      wrongOutputCoordinatePtx.replace(
+          outputCoordinate, StringRef("mov.u32 %r10, %ctaid.x").size(),
+          "mov.u32 %r10, 0       ");
+    FailureOr<OnlinePtxCfg> wrongOutputCoordinate =
+        parse(wrongOutputCoordinatePtx);
     if (failed(predicated) || failed(branch) || failed(correctFma) ||
         failed(wrongFma) || failed(pointer) || failed(transformedPointer) ||
         failed(predicatedStore) || failed(coordinate) ||
         failed(zeroedCoordinate) || failed(alternateCoordinate) ||
         failed(typeChangedCoordinate) || failed(floatingAddCoordinate) ||
-        failed(overflowingCoordinate) || failed(shared))
+        failed(overflowingCoordinate) || failed(shared) ||
+        failed(canonicalReduction) || failed(stridedRegisterReduction) ||
+        failed(wrongLoopPolarity) ||
+        failed(wrongLoopTarget) || failed(wrongLoopBound) ||
+        failed(wrongLoopStep) || failed(predicatedUpdateValue) ||
+        failed(predicatedStepValue) || failed(wrongInitializerValue) ||
+        failed(constantScore) ||
+        failed(annihilatedScoreValue) ||
+        failed(staleScoreValue) || failed(wrongRootValue) ||
+        failed(wrongOutputCoordinate))
       return signalPassFailure();
+    FailureOr<SmallVector<OnlineMaxReductionNode>> loopCertificateNodes =
+        onlineMaxReductionNodes(reductionCertificate(loopNodes, 0, 4), 4, 4,
+                                syntheticSources);
+    FailureOr<SmallVector<OnlineMaxReductionNode>> stridedCertificateNodes =
+        onlineMaxReductionNodes(
+            reductionCertificate(executableStridedNodes, 2, 4), 4, 4,
+            syntheticSources);
+    SmallVector<AffineExpr> syntheticLogicalCoordinates{
+        getAffineDimExpr(0, context), getAffineDimExpr(6, context)};
+    SmallVector<int64_t> syntheticLaunchExtents{3, 1, 1, 1, 1, 1, 1};
+    SmallVector<int64_t> duplicateWriterLaunchExtents{3, 1, 1, 1, 1, 1, 2};
+    SmallVector<int64_t> syntheticScoreShape{3, 4};
     auto indexMatches = [&](const OnlinePtxCfg &cfg, AffineExpr expected) {
       int64_t iota = cfg.roles.at("iota");
       std::set<std::pair<int64_t, std::string>> active;
@@ -3438,6 +4718,67 @@ ret;
                return onlineIndexExprFitsLaunchDomain(value, launchExtents);
              });
     };
+    if (succeeded(stridedCertificateNodes) &&
+        !onlineCanonicalLeafFamilyBindings(
+            *stridedRegisterReduction, (*stridedCertificateNodes)[0],
+            "synthetic-source-bound-score-and-relation")) {
+      getOperation().emitError("even strided leaf is not executable");
+      return signalPassFailure();
+    }
+    if (succeeded(stridedCertificateNodes)) {
+      llvm::SmallDenseSet<int64_t> expected{
+          stridedRegisterReduction->roles.at("even_loop_result"),
+          stridedRegisterReduction->roles.at("odd_loop_result")};
+      llvm::SmallDenseSet<int64_t> found;
+      llvm::SmallDenseSet<int64_t> active;
+      bool collected = onlineCollectMaxLeaves(
+          *stridedRegisterReduction,
+          stridedRegisterReduction->roles.at("strided_root"), expected, found,
+          active);
+      bool storeClosed = onlineRoleIs(*stridedRegisterReduction,
+                                      "compact_store", {"st.global."},
+                                      {"strided_root"});
+      bool storedRoot = onlineRoleOperandIs(
+          *stridedRegisterReduction, "compact_store", 1, "strided_root");
+      if (!collected || found != expected || !storeClosed || !storedRoot) {
+        const auto &rootInstruction = stridedRegisterReduction->instructions[
+            stridedRegisterReduction->roles.at("strided_root")];
+        std::set<int64_t> leftDefs = onlineReachingDefinitions(
+            *stridedRegisterReduction,
+            stridedRegisterReduction->roles.at("strided_root"),
+            rootInstruction.operands[1]);
+        std::set<int64_t> rightDefs = onlineReachingDefinitions(
+            *stridedRegisterReduction,
+            stridedRegisterReduction->roles.at("strided_root"),
+            rootInstruction.operands[2]);
+        getOperation().emitError()
+            << "strided register merge is not executable: collect="
+            << collected << " coverage=" << (found == expected)
+            << " store=" << storeClosed << " value=" << storedRoot
+            << " left_defs=" << leftDefs.size()
+            << " left_first=" << (leftDefs.empty() ? -2 : *leftDefs.begin())
+            << " right_defs=" << rightDefs.size()
+            << " right_first="
+            << (rightDefs.empty() ? -2 : *rightDefs.begin());
+        return signalPassFailure();
+      }
+    }
+    if (succeeded(stridedCertificateNodes) &&
+        !onlineCanonicalLeafFamilyBindings(
+            *stridedRegisterReduction, (*stridedCertificateNodes)[1],
+            "synthetic-source-bound-score-and-relation")) {
+      getOperation().emitError("odd strided leaf is not executable");
+      return signalPassFailure();
+    }
+    if (failed(stridedCertificateNodes) ||
+        !onlineMaxReductionBindings(
+            *stridedRegisterReduction, *stridedCertificateNodes,
+            reductionCertificate(executableStridedNodes, 2, 4),
+            "synthetic-source-bound-score-and-relation")) {
+      getOperation().emitError(
+          "strided register max-reduction certificate is not executable");
+      return signalPassFailure();
+    }
     if (onlineRoleDirectlyReaches(*predicated, "maybe_value",
                                   predicated->roles.at("use")) ||
         onlineRoleIs(*branch, "dead", {"mov.f32"}) ||
@@ -3450,21 +4791,76 @@ ret;
         onlineRoleStoresToOutput(*transformedPointer, "store", 0) ||
         onlineRoleStoresToOutput(*predicatedStore, "store", 0) ||
         !indexMatches(*coordinate,
-                      getAffineDimExpr(3, getOperation().getContext())) ||
+          getAffineDimExpr(3, context)) ||
         indexMatches(*zeroedCoordinate,
-                     getAffineDimExpr(3, getOperation().getContext())) ||
+                     getAffineDimExpr(3, context)) ||
         indexMatches(*alternateCoordinate,
-                     getAffineDimExpr(3, getOperation().getContext())) ||
+                     getAffineDimExpr(3, context)) ||
         indexMatches(*typeChangedCoordinate,
-                     getAffineDimExpr(3, getOperation().getContext())) ||
+                     getAffineDimExpr(3, context)) ||
         indexMatches(*floatingAddCoordinate,
-                     getAffineDimExpr(3, getOperation().getContext())) ||
+                     getAffineDimExpr(3, context)) ||
         indexMatches(*overflowingCoordinate,
-                     getAffineDimExpr(3, getOperation().getContext())) ||
+                     getAffineDimExpr(3, context)) ||
         !onlineSharedPairIsClosed(*shared, "shared_store", "expected",
                                   "barrier", "shared_load") ||
         onlineSharedPairIsClosed(*shared, "shared_store", "wrong", "barrier",
-                                 "shared_load")) {
+                                 "shared_load") ||
+        failed(loopCertificateNodes) ||
+        !onlineMaxReductionBindings(*canonicalReduction,
+                                    *loopCertificateNodes,
+                                    reductionCertificate(loopNodes, 0, 4),
+                                    "synthetic-source-bound-score-and-relation") ||
+        onlineMaxReductionBindings(*wrongLoopPolarity,
+                                   *loopCertificateNodes,
+                                   reductionCertificate(loopNodes, 0, 4),
+                                   "synthetic-source-bound-score-and-relation") ||
+        onlineMaxReductionBindings(*wrongLoopTarget, *loopCertificateNodes,
+                                   reductionCertificate(loopNodes, 0, 4),
+                                   "synthetic-source-bound-score-and-relation") ||
+        onlineMaxReductionBindings(*wrongLoopBound, *loopCertificateNodes,
+                                   reductionCertificate(loopNodes, 0, 4),
+                                   "synthetic-source-bound-score-and-relation") ||
+        onlineMaxReductionBindings(*wrongLoopStep, *loopCertificateNodes,
+                                   reductionCertificate(loopNodes, 0, 4),
+                                   "synthetic-source-bound-score-and-relation") ||
+        onlineMaxReductionBindings(
+            *predicatedUpdateValue, *loopCertificateNodes,
+            reductionCertificate(loopNodes, 0, 4),
+            "synthetic-source-bound-score-and-relation") ||
+        onlineMaxReductionBindings(
+            *predicatedStepValue, *loopCertificateNodes,
+            reductionCertificate(loopNodes, 0, 4),
+            "synthetic-source-bound-score-and-relation") ||
+        onlineMaxReductionBindings(
+            *wrongInitializerValue, *loopCertificateNodes,
+            reductionCertificate(loopNodes, 0, 4),
+            "synthetic-source-bound-score-and-relation") ||
+        onlineMaxReductionBindings(*constantScore, *loopCertificateNodes,
+                                   reductionCertificate(loopNodes, 0, 4),
+                                   "synthetic-source-bound-score-and-relation") ||
+        onlineMaxReductionBindings(
+            *annihilatedScoreValue, *loopCertificateNodes,
+            reductionCertificate(loopNodes, 0, 4),
+            "synthetic-source-bound-score-and-relation") ||
+        onlineMaxReductionBindings(*staleScoreValue, *loopCertificateNodes,
+                                   reductionCertificate(loopNodes, 0, 4),
+                                   "synthetic-source-bound-score-and-relation") ||
+        onlineMaxReductionBindings(*wrongRootValue, *loopCertificateNodes,
+                                   reductionCertificate(loopNodes, 0, 4),
+                                   "synthetic-source-bound-score-and-relation") ||
+        !onlineCompactOutputAddressIsProjected(
+            *canonicalReduction, 0, syntheticLogicalCoordinates,
+            syntheticLaunchExtents, syntheticScoreShape, 1, context) ||
+        !onlineCompactWriterIsUnique(
+            *canonicalReduction, syntheticLogicalCoordinates,
+            syntheticLaunchExtents, syntheticScoreShape, 1, context) ||
+        onlineCompactWriterIsUnique(
+            *canonicalReduction, syntheticLogicalCoordinates,
+            duplicateWriterLaunchExtents, syntheticScoreShape, 1, context) ||
+        onlineCompactOutputAddressIsProjected(
+            *wrongOutputCoordinate, 0, syntheticLogicalCoordinates,
+            syntheticLaunchExtents, syntheticScoreShape, 1, context)) {
       getOperation().emitError(
           "online PTX oracle accepted a control/dataflow near miss");
       return signalPassFailure();
@@ -3516,6 +4912,7 @@ public:
     }
 
     RegionOp region;
+    FoldOp maximumFold;
     Type representativeScoreType;
     llvm::SmallDenseSet<Attribute> relationSources;
     SmallVector<RelationOp> relationOperations;
@@ -3529,6 +4926,7 @@ public:
         if (auto fold = dyn_cast<FoldOp>(operation);
             fold && foldYieldIs(fold, arith::MaximumFOp::getOperationName())) {
           region = candidate;
+          maximumFold = fold;
           representativeScoreType = fold.getInputs().front().getType();
         }
         if (auto relation = dyn_cast<RelationOp>(operation)) {
@@ -3546,7 +4944,25 @@ public:
         }
       }
     });
-    if (!region || !representativeScoreType || relationSources.empty() ||
+    SmallVector<ContractOp> scoreContracts;
+    llvm::SmallDenseSet<Operation *> scoreAncestors;
+    std::function<void(Value)> collectScoreContracts = [&](Value value) {
+      Operation *definition = value.getDefiningOp();
+      if (!definition || !scoreAncestors.insert(definition).second)
+        return;
+      if (auto contract = dyn_cast<ContractOp>(definition))
+        scoreContracts.push_back(contract);
+      for (Value operand : definition->getOperands())
+        collectScoreContracts(operand);
+    };
+    if (maximumFold)
+      collectScoreContracts(maximumFold.getInputs().front());
+    SourceRefAttr scoreContractSource =
+        scoreContracts.size() == 1
+            ? scoreContracts.front()->getAttrOfType<SourceRefAttr>("source")
+            : SourceRefAttr();
+    if (!region || !maximumFold || !representativeScoreType ||
+        !scoreContractSource || relationSources.empty() ||
         !comparisonOpcode ||
         llvm::any_of(relationSources, [&](Attribute source) {
           return !certifiedSources.contains(source);
@@ -3635,12 +5051,23 @@ public:
       FailureOr<SmallVector<int64_t>> relationAxes =
           onlineRelationDomainAxes(materialization->second, region,
                                    relationOperations, relationRank);
+      auto entryReductionCertificate =
+          entry->getAttrOfType<DictionaryAttr>(
+              "online_max_reduction_certificate");
+      ArrayRef<int64_t> maximumReductionDimensions =
+          maximumFold.getReductionDimensions();
+      std::optional<int64_t> maximumReductionDimension =
+          maximumReductionDimensions.size() == 1
+              ? std::optional<int64_t>(maximumReductionDimensions.front())
+              : std::nullopt;
       if (failed(logicalCoordinates) || failed(relationAxes) ||
           !onlineRelationSourceClosure(*cfg, relationOperations,
                                        logicalCoordinates->coordinates,
                                        logicalCoordinates->launchExtents,
                                        *relationAxes,
-                                       module.getContext())) {
+                                       module.getContext(),
+                                       entryReductionCertificate,
+                                       maximumReductionDimension)) {
         module.emitError("online GPU Relation index dataflow is not source-bound");
         return signalPassFailure();
       }
@@ -3655,8 +5082,25 @@ public:
             entry.getInputBuffers().size() + outputIndex;
         if (buffer->second.getStorage() == MaterializationStorage::Temporary) {
           entryHasSemanticOutput = true;
+          ArrayRef<int64_t> reductionDimensions =
+              maximumFold.getReductionDimensions();
+          auto scoreType = cast<RankedTensorType>(
+              maximumFold.getInputs().front().getType());
+          DictionaryAttr certificate = entryReductionCertificate;
+          SmallVector<Attribute> expectedSources;
+          if (auto sources = materialization->second.getCompositionSources())
+            llvm::append_range(expectedSources, *sources);
           const bool valid =
-              onlineMaximumProtocol(*cfg, parameter, *comparisonOpcode);
+              reductionDimensions.size() == 1 && certificate &&
+              !expectedSources.empty() &&
+              onlineMaximumProtocol(
+                  *cfg, parameter, *comparisonOpcode, certificate,
+                  reductionDimensions.front(),
+                  scoreType.getDimSize(reductionDimensions.front()),
+                  expectedSources, onlineSourceKey(scoreContractSource),
+                  logicalCoordinates->coordinates,
+                  logicalCoordinates->launchExtents, scoreType.getShape(),
+                  module.getContext());
           compactState |= valid;
           entryClosed &= valid;
         }
@@ -3762,6 +5206,149 @@ public:
       return signalPassFailure();
     }
 
+    if (kind == "max-leaf-drop" || kind == "max-leaf-duplicate" ||
+        kind == "max-leaf-coordinate" || kind == "max-merge-lost" ||
+        kind == "max-root-partial") {
+      bool changed = false;
+      for (DeviceEntryOp entry :
+           device.getBody().front().getOps<DeviceEntryOp>()) {
+        auto certificate = entry->getAttrOfType<DictionaryAttr>(
+            "online_max_reduction_certificate");
+        auto nodes = certificate
+                         ? certificate.getAs<ArrayAttr>("nodes")
+                         : ArrayAttr();
+        auto root = certificate
+                        ? certificate.getAs<IntegerAttr>("root")
+                        : IntegerAttr();
+        if (!nodes || !root)
+          continue;
+        SmallVector<Attribute> mutated(nodes.begin(), nodes.end());
+        auto replaceNode = [&](size_t index, DictionaryAttr node,
+                               StringRef name, Attribute value) {
+          SmallVector<NamedAttribute> attributes(node.begin(), node.end());
+          llvm::erase_if(attributes, [&](NamedAttribute attribute) {
+            return attribute.getName() == name;
+          });
+          attributes.emplace_back(StringAttr::get(entry.getContext(), name),
+                                  value);
+          mutated[index] = DictionaryAttr::get(entry.getContext(), attributes);
+        };
+        auto replacePartition = [&](size_t index, DictionaryAttr node,
+                                    DictionaryAttr partition) {
+          auto realization = node.getAs<DictionaryAttr>("realization");
+          SmallVector<NamedAttribute> realizationAttributes(
+              realization.begin(), realization.end());
+          llvm::erase_if(realizationAttributes, [](NamedAttribute attribute) {
+            return attribute.getName() == "partition";
+          });
+          realizationAttributes.emplace_back(
+              StringAttr::get(entry.getContext(), "partition"), partition);
+          replaceNode(index, node, "realization",
+                      DictionaryAttr::get(entry.getContext(),
+                                          realizationAttributes));
+        };
+        if (kind == "max-leaf-drop") {
+          auto leaf = llvm::find_if(mutated, [](Attribute attribute) {
+            auto node = cast<DictionaryAttr>(attribute);
+            auto children = node.getAs<DenseI64ArrayAttr>("children");
+            return children && children.empty();
+          });
+          if (leaf != mutated.end()) {
+            mutated.erase(leaf);
+            changed = true;
+          }
+        } else if (kind == "max-leaf-duplicate") {
+          DictionaryAttr firstPartition;
+          for (auto [index, attribute] : llvm::enumerate(mutated)) {
+            auto node = cast<DictionaryAttr>(attribute);
+            auto children = node.getAs<DenseI64ArrayAttr>("children");
+            auto realization = node.getAs<DictionaryAttr>("realization");
+            auto partition = realization
+                                 ? realization.getAs<DictionaryAttr>("partition")
+                                 : DictionaryAttr();
+            if (!children || !children.empty() || !partition)
+              continue;
+            if (!firstPartition) {
+              firstPartition = partition;
+              continue;
+            }
+            replacePartition(index, node, firstPartition);
+            changed = true;
+            break;
+          }
+        } else if (kind == "max-leaf-coordinate") {
+          auto extent = certificate.getAs<IntegerAttr>("reduction_extent");
+          for (auto [index, attribute] : llvm::enumerate(mutated)) {
+            auto node = cast<DictionaryAttr>(attribute);
+            auto children = node.getAs<DenseI64ArrayAttr>("children");
+            auto realization = node.getAs<DictionaryAttr>("realization");
+            auto partition = realization
+                                 ? realization.getAs<DictionaryAttr>("partition")
+                                 : DictionaryAttr();
+            if (!children || !children.empty() || !extent || !partition)
+              continue;
+            SmallVector<NamedAttribute> partitionAttributes(partition.begin(),
+                                                            partition.end());
+            llvm::erase_if(partitionAttributes, [](NamedAttribute attribute) {
+              return attribute.getName() == "offset";
+            });
+            partitionAttributes.emplace_back(
+                StringAttr::get(entry.getContext(), "offset"), extent);
+            replacePartition(
+                index, node,
+                DictionaryAttr::get(entry.getContext(), partitionAttributes));
+            changed = true;
+            break;
+          }
+        } else if (kind == "max-merge-lost") {
+          for (auto [index, attribute] : llvm::enumerate(mutated)) {
+            auto node = cast<DictionaryAttr>(attribute);
+            auto children = node.getAs<DenseI64ArrayAttr>("children");
+            if (!children || children.size() != 2)
+              continue;
+            replaceNode(index, node, "children",
+                        DenseI64ArrayAttr::get(entry.getContext(),
+                                               {children[0], children[0]}));
+            changed = true;
+            break;
+          }
+        } else {
+          for (auto [index, attribute] : llvm::enumerate(mutated)) {
+            auto node = cast<DictionaryAttr>(attribute);
+            auto id = node.getAs<IntegerAttr>("id");
+            auto children = node.getAs<DenseI64ArrayAttr>("children");
+            if (!id || id.getInt() != root.getInt() || !children ||
+                children.empty())
+              continue;
+            SmallVector<int64_t> partial(children.asArrayRef().drop_back());
+            replaceNode(index, node, "children",
+                        DenseI64ArrayAttr::get(entry.getContext(), partial));
+            changed = true;
+            break;
+          }
+        }
+        if (!changed)
+          continue;
+        SmallVector<NamedAttribute> attributes(certificate.begin(),
+                                               certificate.end());
+        llvm::erase_if(attributes, [](NamedAttribute attribute) {
+          return attribute.getName() == "nodes";
+        });
+        attributes.emplace_back(StringAttr::get(entry.getContext(), "nodes"),
+                                ArrayAttr::get(entry.getContext(), mutated));
+        entry->setAttr("online_max_reduction_certificate",
+                       DictionaryAttr::get(entry.getContext(), attributes));
+        break;
+      }
+      if (!changed) {
+        getOperation().emitError(
+            "online GPU entry has no max-reduction certificate target");
+        return signalPassFailure();
+      }
+      refreshExecutableBundle(getOperation(), /*refreshCodeDigest=*/false);
+      return;
+    }
+
     if (kind == "relation-axis-map") {
       bool changed = false;
       for (DeviceEntryOp entry :
@@ -3784,20 +5371,129 @@ public:
     }
 
     StringRef phaseRole = "public_store";
+    std::string roleStorage;
     StringRef role;
     StringRef needle;
     StringRef replacement;
     std::string sourceMarker;
+    auto reductionRealizationRole = [&](StringRef field) -> std::string {
+      for (DeviceEntryOp entry :
+           device.getBody().front().getOps<DeviceEntryOp>()) {
+        auto certificate = entry->getAttrOfType<DictionaryAttr>(
+            "online_max_reduction_certificate");
+        auto nodes = certificate
+                         ? certificate.getAs<ArrayAttr>("nodes")
+                         : ArrayAttr();
+        if (!nodes)
+          continue;
+        for (Attribute attribute : nodes) {
+          auto realization =
+              cast<DictionaryAttr>(attribute).getAs<DictionaryAttr>(
+                  "realization");
+          auto found = realization
+                           ? realization.getAs<StringAttr>(field)
+                           : StringAttr();
+          if (found)
+            return found.getValue().str();
+        }
+      }
+      return {};
+    };
     if (kind == "maximum") {
       phaseRole = "compact_store";
-      role = "max_update";
       needle = "max";
       replacement = "add";
+      for (DeviceEntryOp entry :
+           device.getBody().front().getOps<DeviceEntryOp>()) {
+        auto certificate = entry->getAttrOfType<DictionaryAttr>(
+            "online_max_reduction_certificate");
+        auto nodes = certificate
+                         ? certificate.getAs<ArrayAttr>("nodes")
+                         : ArrayAttr();
+        if (!nodes)
+          continue;
+        for (Attribute attribute : nodes) {
+          auto node = cast<DictionaryAttr>(attribute);
+          auto children = node.getAs<DenseI64ArrayAttr>("children");
+          auto nodeRole = node.getAs<StringAttr>("role");
+          if (children && !children.empty() && nodeRole) {
+            roleStorage = nodeRole.getValue().str();
+            role = roleStorage;
+            break;
+          }
+          auto realization = node.getAs<DictionaryAttr>("realization");
+          auto update = realization
+                            ? realization.getAs<StringAttr>(
+                                  "accumulator_update_role")
+                            : StringAttr();
+          if (update) {
+            roleStorage = update.getValue().str();
+            role = roleStorage;
+          }
+        }
+        if (!role.empty())
+          break;
+      }
+      if (role.empty()) {
+        getOperation().emitError(
+            "online GPU entry has no maximum reduction role");
+        return signalPassFailure();
+      }
     } else if (kind == "max-init") {
       phaseRole = "compact_store";
       role = "max_init";
       needle = "0fFF800000";
       replacement = "0f00000000";
+    } else if (kind == "loop-polarity") {
+      phaseRole = "compact_store";
+      roleStorage = reductionRealizationRole("index_guard_role");
+      role = roleStorage;
+      needle = ".ge.";
+      replacement = ".lt.";
+    } else if (kind == "loop-bound") {
+      phaseRole = "compact_store";
+      roleStorage = reductionRealizationRole("index_guard_role");
+      role = roleStorage;
+    } else if (kind == "loop-step") {
+      phaseRole = "compact_store";
+      roleStorage = reductionRealizationRole("index_step_role");
+      role = roleStorage;
+    } else if (kind == "loop-backedge") {
+      phaseRole = "compact_store";
+      roleStorage = reductionRealizationRole("backedge_role");
+      role = roleStorage;
+      needle = "bra";
+      replacement = "brx";
+    } else if (kind == "leaf-source") {
+      phaseRole = "compact_store";
+      RegionOp region;
+      getOperation().walk([&](RegionOp candidate) {
+        if (!region)
+          region = candidate;
+      });
+      if (region) {
+        for (Operation &operation :
+             region.getBody().front().without_terminator()) {
+          auto contract = dyn_cast<ContractOp>(operation);
+          SourceRefAttr source =
+              contract ? contract->getAttrOfType<SourceRefAttr>("source")
+                       : SourceRefAttr();
+          if (source) {
+            sourceMarker = (Twine("// shuttle.online.source_ref ") +
+                            onlineSourceKey(source))
+                               .str();
+            break;
+          }
+        }
+      }
+      needle = "fma";
+      replacement = "mov";
+    } else if (kind == "root-value") {
+      phaseRole = "compact_store";
+      role = "compact_store";
+    } else if (kind == "output-coordinate") {
+      phaseRole = "compact_store";
+      role = "compact_output_linear_index";
     } else if (kind == "zero-init") {
       role = "zero_init";
       needle = "0f00000000";
@@ -3889,14 +5585,23 @@ public:
       StringRef localNeedleText = needle;
       StringRef localReplacement = replacement;
       size_t localNeedle = instruction.find(localNeedleText);
-      if (kind == "shared-value" || kind == "relation-iota") {
+      if (kind == "shared-value" || kind == "relation-iota" ||
+          kind == "loop-bound" || kind == "loop-step" ||
+          kind == "root-value" || kind == "output-coordinate") {
         std::vector<std::string> tokens = onlinePtxTokens(instruction);
-        if (tokens.size() < 2 || tokens[1].empty() ||
-            (!llvm::isDigit(tokens[1].back()) &&
-             !StringRef(tokens[1]).ends_with(".x")))
+        if (tokens.empty())
           continue;
-        localNeedleText = tokens[1];
-        std::string changed = tokens[1];
+        size_t tokenIndex =
+            kind == "root-value" ? 1
+            : (kind == "loop-bound" || kind == "loop-step")
+                ? tokens.size() - 1
+                : 1;
+        if (tokens.size() <= tokenIndex || tokens[tokenIndex].empty() ||
+            (!llvm::isDigit(tokens[tokenIndex].back()) &&
+             !StringRef(tokens[tokenIndex]).ends_with(".x")))
+          continue;
+        localNeedleText = tokens[tokenIndex];
+        std::string changed = tokens[tokenIndex];
         changed.back() = llvm::isDigit(changed.back())
                              ? (changed.back() == '0' ? '1' : '0')
                              : 'y';
