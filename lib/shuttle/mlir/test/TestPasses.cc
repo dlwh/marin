@@ -2055,15 +2055,17 @@ std::string onlineSourceKey(SourceRefAttr source) {
 
 std::vector<std::string> onlinePtxTokens(StringRef text) {
   std::vector<std::string> tokens;
+  auto isIdentifierContinuation = [](char character) {
+    return llvm::isAlnum(character) || character == '_' || character == '.' ||
+           character == '$';
+  };
   for (size_t index = 0; index < text.size();) {
     const bool registerToken = text[index] == '%';
     const bool parameterToken = text[index] == 'p' && index + 1 < text.size() &&
                                 llvm::isDigit(text[index + 1]);
     const bool sharedSymbolToken =
         text.substr(index).starts_with("shuttle_smem") &&
-        (index == 0 ||
-         (!llvm::isAlnum(text[index - 1]) && text[index - 1] != '_' &&
-          text[index - 1] != '.'));
+        (index == 0 || !isIdentifierContinuation(text[index - 1]));
     const bool constantToken =
         (text[index] == '0' && index + 2 < text.size() &&
          text[index + 1] == 'f' && llvm::isHexDigit(text[index + 2])) ||
@@ -2077,9 +2079,7 @@ std::vector<std::string> onlinePtxTokens(StringRef text) {
                                   text[index + 1] == 'f'
                               ? 2
                               : 1);
-    while (end < text.size() &&
-           (llvm::isAlnum(text[end]) || text[end] == '_' ||
-            text[end] == '.'))
+    while (end < text.size() && isIdentifierContinuation(text[end]))
       ++end;
     tokens.push_back(text.slice(index, end).str());
     index = end;
@@ -5573,9 +5573,12 @@ public:
         onlinePtxTokens("%rd0, evilshuttle_smem");
     const std::vector<std::string> dottedSharedSymbol =
         onlinePtxTokens("%rd0, evil.shuttle_smem");
+    const std::vector<std::string> dollarSharedSymbol =
+        onlinePtxTokens("%rd0, evil$shuttle_smem");
     if (!llvm::is_contained(sharedSymbol, "shuttle_smem") ||
         llvm::is_contained(prefixedSharedSymbol, "shuttle_smem") ||
-        llvm::is_contained(dottedSharedSymbol, "shuttle_smem")) {
+        llvm::is_contained(dottedSharedSymbol, "shuttle_smem") ||
+        llvm::is_contained(dollarSharedSymbol, "shuttle_smem")) {
       getOperation().emitError(
           "online PTX shared-memory symbol tokenization is not exact");
       return signalPassFailure();
