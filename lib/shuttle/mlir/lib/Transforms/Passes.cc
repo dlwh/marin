@@ -1832,9 +1832,7 @@ LogicalResult convertReduceOperation(Operation *operation) {
   state.addAttribute("accumulator_types",
                      ArrayAttr::get(operation->getContext(),
                                     {TypeAttr::get(builder.getF32Type())}));
-  const bool orderFree = sourceCombiner.getName().getStringRef() ==
-                         stablehlo::AddOp::getOperationName();
-  state.addAttribute("order_free", builder.getBoolAttr(orderFree));
+  state.addAttribute("order_free", builder.getBoolAttr(true));
   state.addAttribute("source", source);
   state.addAttribute(kOperationRefAttribute, ownerRef);
   state.addRegion();
@@ -1846,8 +1844,10 @@ LogicalResult convertReduceOperation(Operation *operation) {
   body->addArgument(builder.getF32Type(), sourceBody.getArgument(1).getLoc());
   builder.setInsertionPointToEnd(body);
   StringRef scalarName =
-      orderFree ? arith::AddFOp::getOperationName()
-                : arith::MaximumFOp::getOperationName();
+      sourceCombiner.getName().getStringRef() ==
+              stablehlo::AddOp::getOperationName()
+          ? arith::AddFOp::getOperationName()
+          : arith::MaximumFOp::getOperationName();
   OperationState combinerState(sourceCombiner.getLoc(), scalarName);
   combinerState.addOperands(body->getArguments());
   combinerState.addTypes(builder.getF32Type());
@@ -2842,6 +2842,13 @@ FailureOr<stablehlo::Precision> stablehloPrecision(Attribute attribute) {
 
 FailureOr<OperationState> lowerRelationState(RelationOp relation,
                                              ValueRange operands) {
+  if (llvm::any_of(
+          relation->getDiscardableAttrs(), [](NamedAttribute attribute) {
+            return attribute.getName().strref() != kOperationRefAttribute;
+          })) {
+    relation.emitOpError("has an unsupported discardable Relation attribute");
+    return failure();
+  }
   StringRef stablehloName =
       llvm::StringSwitch<StringRef>(stringifyRelationSemantics(
           relation.getSemantics()))
@@ -3033,7 +3040,7 @@ FailureOr<Operation *> lowerFold(OpBuilder &builder, FoldOp fold,
       yield.getValues()[0] != combiner->getResult(0) ||
       !body.getArgument(0).getType().isF32() ||
       !body.getArgument(1).getType().isF32() ||
-      (add && !fold.getOrderFree()) || (maximum && fold.getOrderFree()) ||
+      !fold.getOrderFree() ||
       (fastMath && fastMath.getValue() != arith::FastMathFlags::none) ||
       llvm::any_of(combiner->getAttrs(),
                    [](NamedAttribute attribute) {
@@ -3046,7 +3053,7 @@ FailureOr<Operation *> lowerFold(OpBuilder &builder, FoldOp fold,
         return attribute.getName().strref() != kOperationRefAttribute;
       })) {
     fold.emitOpError(
-        "requires a closed scalar f32 add or source-ordered maximum combiner");
+        "requires a closed order-free scalar f32 add or maximum combiner");
     return failure();
   }
   ArrayAttr combinerRefs = sourceRefs(combiner);

@@ -27,7 +27,7 @@
 // OWNER-DUPLICATE: has an operation reference that differs from its source results
 // VERSION: malformed Shuttle coverage manifest
 // REWIRE: zero-result or function-result source anchors changed
-// FASTMATH: requires a closed scalar f32 add or source-ordered maximum combiner
+// FASTMATH: requires a closed order-free scalar f32 add or maximum combiner
 // YIELD-ATTRIBUTE: zero-result or function-result source anchors changed
 // FOLD-ATTRIBUTE: has an unsupported discardable Fold attribute
 // NESTED-EXCLUDED: excluded operation fingerprint or operand anchors changed

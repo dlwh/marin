@@ -29,7 +29,7 @@ module attributes {shuttle.coverage_manifest = {}} {
       -> tensor<2xf32> {
     %0 = "shuttle.region"(%arg0, %init) ({
     ^bb0(%input: tensor<2x4xf32>, %initial: tensor<f32>):
-      // expected-error @+1 {{requires a closed scalar f32 add or source-ordered maximum combiner}}
+      // expected-error @+1 {{requires a closed order-free scalar f32 add or maximum combiner}}
       %1 = "shuttle.fold"(%input, %initial) ({
       ^bb0(%element: f32, %accumulator: f32):
         %sum = arith.addf %element, %accumulator : f32
@@ -38,6 +38,26 @@ module attributes {shuttle.coverage_manifest = {}} {
       "shuttle.yield"(%1) : (tensor<2xf32>) -> ()
     }) {policy = #shuttle.policy<source_ordered>, source_refs = [#shuttle.source_ref<0, 0, 0, 0>]} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
     return %0 : tensor<2xf32>
+  }
+}
+
+// -----
+
+module attributes {shuttle.coverage_manifest = {}} {
+  func.func @relation_unknown_attribute(%arg0: tensor<2xi32>)
+      -> tensor<2xi32> {
+    %0 = "shuttle.region"(%arg0) ({
+    ^bb0(%arg1: tensor<2xi32>):
+      // expected-error @+1 {{has an unsupported discardable Relation attribute}}
+      %1 = "shuttle.relation"(%arg1) {
+        parameters = [],
+        semantics = #shuttle.relation_semantics<reshape>,
+        source = #shuttle.source_ref<0, 0, 0, 0>,
+        test.semantic = "must_preserve"
+      } : (tensor<2xi32>) -> tensor<2xi32>
+      "shuttle.yield"(%1) : (tensor<2xi32>) -> ()
+    }) {policy = #shuttle.policy<source_ordered>, source_refs = [#shuttle.source_ref<0, 0, 0, 0>]} : (tensor<2xi32>) -> tensor<2xi32>
+    return %0 : tensor<2xi32>
   }
 }
 
