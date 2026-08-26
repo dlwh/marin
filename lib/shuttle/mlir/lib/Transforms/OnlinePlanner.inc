@@ -71,3 +71,20 @@ bool isClosedScalarPlanningFold(FoldOp fold) {
   return additive ? hasExactPositiveZeroInitializer(fold)
                   : hasExactNegativeInfinityInitializer(fold);
 }
+
+bool isLosslessScalarPlanningFold(FoldOp fold) {
+  if (fold.getInputs().size() != 1 || fold.getInitializers().size() != 1 ||
+      fold.getNumResults() != 1 || fold.getReductionDimensions().size() != 1)
+    return false;
+  auto input = dyn_cast<RankedTensorType>(fold.getInputs().front().getType());
+  auto result = dyn_cast<RankedTensorType>(fold.getResult(0).getType());
+  if (!input || !result || !input.hasStaticShape() ||
+      !result.hasStaticShape() || input.getRank() < 1 || input.getRank() > 8)
+    return false;
+  const int64_t reduction = fold.getReductionDimensions().front();
+  if (reduction < 0 || reduction >= input.getRank())
+    return false;
+  SmallVector<int64_t> expected(input.getShape());
+  expected.erase(expected.begin() + reduction);
+  return result.getShape() == ArrayRef<int64_t>(expected);
+}

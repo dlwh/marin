@@ -1,6 +1,13 @@
 // Copyright The Marin Authors
 // SPDX-License-Identifier: Apache-2.0
 
+bool isSupportedSingleAxisReduce(Operation *operation) {
+  auto dimensions =
+      operation->getAttrOfType<DenseI64ArrayAttr>("dimensions");
+  return isSupportedStablehloReduce(operation) && dimensions &&
+         dimensions.size() == 1;
+}
+
 bool isExpansionDrivenByScalarFold(
     Operation *expansion,
     const llvm::SmallPtrSetImpl<Operation *> &componentOperations) {
@@ -16,7 +23,7 @@ bool isExpansionDrivenByScalarFold(
       return false;
     if (!visited.insert(producer).second)
       continue;
-    if (isSupportedStablehloReduce(producer)) {
+    if (isSupportedSingleAxisReduce(producer)) {
       if (scalarFold && scalarFold != producer)
         return false;
       scalarFold = producer;
@@ -44,7 +51,7 @@ bool hasRankNExpansionWithoutClosedAnchor(const CandidateComponent &component) {
   llvm::SmallPtrSet<Operation *, 16> componentOperations(
       component.operations.begin(), component.operations.end());
   const bool hasScalarFold =
-      llvm::any_of(component.operations, isSupportedStablehloReduce);
+      llvm::any_of(component.operations, isSupportedSingleAxisReduce);
   return llvm::any_of(component.operations, [&](Operation *operation) {
     unsigned expansions = rankNExpandingSingletonBroadcasts(operation);
     if (expansions == 0)

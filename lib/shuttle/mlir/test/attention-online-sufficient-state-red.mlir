@@ -19,6 +19,10 @@
 // Scale and softcap change semantic identity but not generic eligibility.
 // RUN: shuttle-test-opt %S/Inputs/jax-0.10.1-f32-offset-softcap-gqa-online-axis1-mutation.mlir --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-verify-source-coverage --shuttle-verify-semantic-erasure --shuttle-test-verify-output-dependency-coverage --shuttle-test-set-fast-region-policy --shuttle-test-set-prefer-fusion-tuning --shuttle-plan-row-fold-materialization --shuttle-verify-materialization-plan --shuttle-test-verify-online-sufficient-state -o /dev/null | FileCheck %s --check-prefix=ONLINE
 
+// Online certificates remain planner-only until Relation-aware executable
+// lowering exists. Scheduling must fail closed before GPU emission.
+// RUN: not shuttle-test-opt %S/Inputs/jax-0.10.1-f32-causal-gqa-online-axis4.mlir --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-test-set-fast-region-policy --shuttle-test-set-prefer-fusion-tuning --shuttle-plan-row-fold-materialization --shuttle-verify-materialization-plan --shuttle-plan-simt32-row-fold-schedule -o /dev/null 2>&1 | FileCheck %s --check-prefix=PLANNER-ONLY
+
 // A public representative-score result is an unsupported near miss. It must
 // remain on a complete materialized fallback instead of being misclassified.
 // RUN: shuttle-test-opt %S/Inputs/jax-0.10.1-f32-causal-gqa-public-score-near-miss.mlir --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-verify-source-coverage --shuttle-verify-semantic-erasure --shuttle-test-verify-output-dependency-coverage --shuttle-test-set-fast-region-policy --shuttle-test-set-prefer-fusion-tuning --shuttle-plan-row-fold-materialization --shuttle-verify-materialization-plan --shuttle-test-verify-online-fallback -o /dev/null | FileCheck %s --check-prefix=FALLBACK
@@ -50,3 +54,4 @@
 // COVERAGE: output_dependency_coverage = complete
 // ONLINE: online_state = {m,l,o}; source_cut = complete; representative_score_materialized = false; temporary_bytes = improved; temporary_traffic = improved
 // FALLBACK: online_state = fallback
+// PLANNER-ONLY: requires one source-bound executable materialization plan per GPU region

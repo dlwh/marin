@@ -1104,6 +1104,10 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
           compositionKind && compositionKind.getValue() == "contract_fold";
       const bool mapContract =
           compositionKind && compositionKind.getValue() == "map_contract";
+      const bool online =
+          compositionKind &&
+          compositionKind.getValue() ==
+              "online_normalized_exponential_weighted_contract";
       const bool legacyMetadata =
           task->hasAttr("fused_sources") ||
           task->hasAttr("composed_input_maps") ||
@@ -1120,13 +1124,49 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
           (contractFold && compositionSources.size() != 2) ||
           (mapContract && compositionSources.size() != 2 &&
            compositionSources.size() != 3) ||
-          (!contractFold && !mapContract) || legacyMetadata ||
+          (online && compositionSources.empty()) ||
+          (!contractFold && !mapContract && !online) || legacyMetadata ||
           llvm::any_of(compositionSources, [](Attribute source) {
             return !isa<SourceRefAttr>(source);
           })) {
         return task.emitOpError(
             "schema-v2 generic composition provenance must be complete and "
             "exclusive");
+      }
+      if (online) {
+        constexpr StringLiteral costFields[] = {
+            "baseline_launches",
+            "candidate_launches",
+            "baseline_temporary_bytes",
+            "candidate_temporary_bytes",
+            "baseline_temporary_traffic_bytes",
+            "candidate_temporary_traffic_bytes",
+            "contract_evaluations"};
+        if (!compositionCost || compositionCost.size() != std::size(costFields) ||
+            (task.getKind() != MaterializationTaskKind::Fold &&
+             task.getKind() != MaterializationTaskKind::Contract) ||
+            task.getOutputBuffers().empty() || task.getDomainShape().size() > 9)
+          return task.emitOpError(
+              "online composition requires abstract Fold/Contract state, "
+              "outputs, and closed relative cost");
+        SmallVector<int64_t> costs;
+        for (StringRef field : costFields) {
+          auto value = compositionCost.getAs<IntegerAttr>(field);
+          if (!value || value.getInt() < 0)
+            return task.emitOpError(
+                "online composition cost fields must be nonnegative i64");
+          costs.push_back(value.getInt());
+        }
+        if (costs[1] > costs[0] || costs[3] >= costs[2] ||
+            costs[5] >= costs[4] || costs[6] <= 0)
+          return task.emitOpError(
+              "online composition must improve bytes and traffic without "
+              "increasing launch cost");
+        if (task.getKind() == MaterializationTaskKind::Fold)
+          ++foldCount;
+        else
+          ++contractCount;
+        continue;
       }
       if (contractFold) {
         if (contractFoldCompositionTask >= 0 || compositionCost ||
@@ -1361,11 +1401,9 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
       const int64_t reductionAxis = reductionDimensions.size() == 1
                                         ? reductionDimensions.front()
                                         : -1;
-      const bool rankTwoFold =
-          domainRank == 2 && reductionAxis >= 0 && reductionAxis < domainRank;
-      const bool terminalRankNFold =
-          domainRank >= 3 && domainRank <= 8 &&
-          reductionDimensions == ArrayRef<int64_t>({domainRank - 1});
+      const bool singleAxisFold =
+          domainRank >= 1 && domainRank <= 8 && reductionAxis >= 0 &&
+          reductionAxis < domainRank;
       const bool fullPrefixRankNFold =
           domainRank >= 3 && domainRank <= 8 &&
           reductionDimensions.size() == static_cast<size_t>(domainRank - 1) &&
@@ -1374,15 +1412,14 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
                          return indexedAxis.value() ==
                                 static_cast<int64_t>(indexedAxis.index());
                        });
-      if ((!rankTwoFold && !terminalRankNFold && !fullPrefixRankNFold) ||
+      if ((!singleAxisFold && !fullPrefixRankNFold) ||
           !task.getOrderFree().value_or(false) ||
           (hasEpilogue ? task.getInputBuffers().size() < 2
                        : task.getInputBuffers().size() != 2) ||
           task.getOutputBuffers().size() != 1) {
         return task.emitOpError(
-            "Fold tasks require a rank-two in-range reduction or a rank-three "
-            "through rank-eight terminal-axis or full-prefix reduction, and "
-            "order_free=true");
+            "Fold tasks require an in-range single-axis or full-prefix "
+            "reduction and order_free=true");
       }
       auto inputType = cast<RankedTensorType>(
           buffers[task.getInputBuffers()[0]].getTensorType());

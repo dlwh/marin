@@ -4571,6 +4571,8 @@ FailureOr<int64_t> checkedTensorBytes(RankedTensorType type) {
   return *elements * elementBytes;
 }
 
+#include "OnlineCompositionPlanner.inc"
+
 bool isProjectedFoldStatistic(MapOp map, unsigned operand,
                               RankedTensorType full, RankedTensorType compact) {
   if (operand >= map.getInputs().size() ||
@@ -6386,7 +6388,9 @@ FailureOr<DerivedPlan> deriveGpuPlan(RegionOp region,
                                           : MaterializationTaskKind::Map);
     if (auto fold = dyn_cast<FoldOp>(operation)) {
       const bool closedFold =
-          preferFusion ? isClosedScalarPlanningFold(fold)
+          preferFusion ? (containsRelation
+                              ? isLosslessScalarPlanningFold(fold)
+                              : isClosedAdditivePlanningFold(fold))
                        : (containsRankNFold ? isClosedRankNFold(fold)
                                             : isClosedRankTwoFold(fold));
       if (!closedFold) {
@@ -6549,6 +6553,9 @@ FailureOr<DerivedPlan> deriveGpuPlan(RegionOp region,
   result.hasLogicalRelation = containsRelation;
   if (!preferFusion)
     return result;
+  FailureOr<DerivedPlan> online = online_planner::derive(region, result);
+  if (succeeded(online))
+    return online;
   // Relation/index-domain values are losslessly represented by ordinary
   // materialization tasks. Scheduling these logical tasks remains fail-closed
   // until a Relation-aware executable lowering exists.
@@ -7050,15 +7057,20 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
             "generic composition metadata must be complete and exclusive");
       const bool contractFold = compositionKind.getValue() == "contract_fold";
       const bool mapContract = compositionKind.getValue() == "map_contract";
-      if ((!contractFold && !mapContract) ||
+      const bool online =
+          compositionKind.getValue() ==
+          "online_normalized_exponential_weighted_contract";
+      if ((!contractFold && !mapContract && !online) ||
           (contractFold && compositionSources.size() != 2) ||
           (mapContract && compositionSources.size() != 2 &&
            compositionSources.size() != 3) ||
           (contractFold && task.getKind() != MaterializationTaskKind::Fold) ||
           (mapContract &&
            task.getKind() != MaterializationTaskKind::Contract) ||
+          (online && task.getKind() != MaterializationTaskKind::Fold &&
+           task.getKind() != MaterializationTaskKind::Contract) ||
           (contractFold && compositionCost) ||
-          (mapContract && !compositionCost))
+          ((mapContract || online) && !compositionCost))
         return task.emitOpError(
             "generic composition kind must bind its task family and cost");
       SmallVector<Operation *> operations;
@@ -7082,11 +7094,14 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
            (!isa<MapOp>(operations[0]) || !isa<MapOp>(operations[1]) ||
             !isa<ContractOp>(operations[2]) ||
             sourceOperations.lookup(task.getSource()) != operations[2])) ||
+          (online &&
+           !llvm::is_contained(operations,
+                               sourceOperations.lookup(task.getSource()))) ||
           task.getSemanticFingerprint() !=
               compositionFingerprint(compositionKind.getValue(), operations))
         return task.emitOpError(
-            "composition sources must bind ordered Contract/Fold roles");
-      if (mapContract) {
+            "composition sources must bind their source-ordered algebra");
+      if (mapContract || online) {
         constexpr StringLiteral fields[] = {"baseline_launches",
                                             "candidate_launches",
                                             "baseline_temporary_bytes",
@@ -7109,7 +7124,7 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
             values[5] > values[4] ||
             !(values[1] < values[0] || values[3] < values[2] ||
               values[5] < values[4]) ||
-            values[6] != 1)
+            (mapContract ? values[6] != 1 : values[6] <= 0))
           return task.emitOpError(
               "composition cost must dominate the materialized baseline");
       }
@@ -7495,21 +7510,18 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
     const bool expectedComposition = !expectedTask.compositionKind.empty();
     if (expectedComposition) {
       SmallVector<Attribute> expectedSources;
-      for (Operation *operation : expectedTask.compositionSources) {
-        if (auto map = dyn_cast<MapOp>(operation))
-          expectedSources.push_back(map.getSource());
-        else if (auto fold = dyn_cast<FoldOp>(operation))
-          expectedSources.push_back(fold.getSource());
-        else
-          expectedSources.push_back(cast<ContractOp>(operation).getSource());
-      }
+      for (Operation *operation : expectedTask.compositionSources)
+        expectedSources.push_back(algebraSource(operation));
       auto costMatches = [&](StringRef field, int64_t expectedValue) {
         auto value = actualCompositionCost
                          ? actualCompositionCost.getAs<IntegerAttr>(field)
                          : IntegerAttr{};
         return value && value.getInt() == expectedValue;
       };
-      const bool expectsCost = expectedTask.compositionKind == "map_contract";
+      const bool expectsCost =
+          expectedTask.compositionKind == "map_contract" ||
+          expectedTask.compositionKind ==
+              "online_normalized_exponential_weighted_contract";
       const auto cost = expectedTask.compositionCost;
       const bool matches =
           actualCompositionKind && actualCompositionSources &&

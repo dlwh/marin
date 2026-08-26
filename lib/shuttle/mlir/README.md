@@ -170,3 +170,19 @@ dimensions with consistent static extents. Inputs and results are ranked
 tensors, and precision and iterator values are closed. Other element-type or
 accumulator contracts require a separate StableHLO-lowering proof before they
 can enter this matrix.
+
+`shuttle.relation` preserves index-domain operations used by ordinary JAX,
+including iota, reshape, broadcast, comparison, select, and exact scalar
+conversion. Materialization plans may carry internal i1 and i32 logical
+temporaries, but external buffers remain BF16 or f32.
+
+Under the exact FAST policy, the planner may certify a generic normalized
+exponential weighted contraction with online sufficient state `{m,l,o}`. The
+certificate is derived from scalar yields, SSA dependencies, affine
+coordinates, reduction iterators, and a closed source cut. It requires lower
+temporary bytes and traffic without increasing launch cost, and it does not
+depend on workload names, static shape tuples, or an exact algebra topology.
+Unsupported graphs retain a lossless materialized plan. Relation-aware plans
+remain planner-only: schedule construction rejects them until a separate
+executable lowering is implemented. SOURCE_ORDERED continues to use the
+lossless StableHLO-equivalent path.
