@@ -1988,17 +1988,29 @@ FailureOr<Simt32Geometry> contractRegionGeometry(ScheduleTaskOp task,
 FailureOr<Simt32Geometry> onlineStateGeometry(ScheduleTaskOp task) {
   auto protocol = task.getOnlineStateProtocolAttr();
   auto reductionAxis = task.getReductionAxis();
+  auto vectorDimensions = task.getOnlineVectorDimensions();
   ArrayRef<int64_t> domain = task.getDomainShape();
   if (!protocol ||
       protocol.getValue() !=
           "online_normalized_exponential_weighted_contract" ||
       !reductionAxis || *reductionAxis < 0 ||
       *reductionAxis >= static_cast<int64_t>(domain.size()) ||
-      domain.empty() || domain.size() > 8)
+      !vectorDimensions || vectorDimensions->empty() || domain.empty() ||
+      domain.size() > 8)
     return failure();
+  llvm::SmallDenseSet<int64_t> vectorAxes;
+  int64_t vectorElements = 1;
+  for (int64_t axis : *vectorDimensions) {
+    if (axis < 0 || axis >= static_cast<int64_t>(domain.size()) ||
+        axis == *reductionAxis || !vectorAxes.insert(axis).second ||
+        domain[axis] <= 0 || vectorElements > 64 / domain[axis])
+      return failure();
+    vectorElements *= domain[axis];
+  }
   SmallVector<int64_t> outputShape;
   for (auto [axis, extent] : llvm::enumerate(domain))
-    if (static_cast<int64_t>(axis) != *reductionAxis)
+    if (static_cast<int64_t>(axis) != *reductionAxis &&
+        !vectorAxes.contains(axis))
       outputShape.push_back(extent);
   FailureOr<int64_t> outputs = staticElementCount(outputShape);
   const int64_t reduction = domain[*reductionAxis];
@@ -2007,11 +2019,9 @@ FailureOr<Simt32Geometry> onlineStateGeometry(ScheduleTaskOp task) {
     return failure();
   SmallVector<int64_t> tile(domain.size(), 1);
   tile[*reductionAxis] = reduction;
-  const int64_t stateValues =
-      task.getKind() == ScheduleTaskKind::Contract ? 3 : 1;
-  return Simt32Geometry{{*outputs}, std::move(tile), 1, reduction, 32,
-                        stateValues * reduction *
-                            static_cast<int64_t>(sizeof(float)),
+  for (int64_t axis : vectorAxes)
+    tile[axis] = domain[axis];
+  return Simt32Geometry{{*outputs}, std::move(tile), 1, 1, 1, 0,
                         *reductionAxis};
 }
 

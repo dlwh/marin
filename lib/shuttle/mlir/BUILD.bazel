@@ -342,6 +342,7 @@ cc_test(
     data = [
         "test/Inputs/abi22-generic-contract-fold-composition-rank2.mlir",
         "test/Inputs/abi22-generic-contract-fold-composition-rank3.mlir",
+        "test/Inputs/jax-0.10.1-f32-causal-gqa-online-output-epilogue.mlir",
         "test/Inputs/jax-0.10.1-bf16-batched_contract-2x5x3x7x11-backward.mlir",
         "test/Inputs/jax-0.10.1-bf16-batched_contract-2x5x3x7x11-composed.mlir",
         "test/Inputs/jax-0.10.1-bf16-batched_contract-2x5x3x7x11-forward.mlir",
@@ -413,6 +414,18 @@ cc_test(
 sh_test(
     name = "gpu_transport_v2_h100_numerics_test",
     srcs = ["test/run-h100-rmsnorm-numerics.sh"],
+    args = ["$(rootpath :gpu_transport_v2_test)"],
+    data = [":gpu_transport_v2_test"],
+    tags = [
+        "h100",
+        "manual",
+        "requires-gpu-nvidia",
+    ],
+)
+
+sh_test(
+    name = "gpu_transport_v2_h100_attention_test",
+    srcs = ["test/run-h100-attention-numerics.sh"],
     args = ["$(rootpath :gpu_transport_v2_test)"],
     data = [":gpu_transport_v2_test"],
     tags = [

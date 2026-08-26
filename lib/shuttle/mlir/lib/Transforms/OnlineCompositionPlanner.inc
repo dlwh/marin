@@ -350,7 +350,13 @@ derive(RegionOp region, const DerivedPlan &materialized) {
     return failure();
   auto weightMap = dyn_cast<AffineMapAttr>(
       weightedContract.getIndexingMaps()[*normalizedOperand]);
+  auto valueMap = dyn_cast<AffineMapAttr>(
+      weightedContract.getIndexingMaps()[1 - *normalizedOperand]);
+  auto outputMap = dyn_cast<AffineMapAttr>(
+      weightedContract.getIndexingMaps()[
+          weightedContract.getIndexingMaps().size() - 1]);
   if (!weightMap || reduction < 0 ||
+      !valueMap || !outputMap ||
       reduction >= weightMap.getValue().getNumResults())
     return failure();
   auto reductionCoordinate =
@@ -362,6 +368,32 @@ derive(RegionOp region, const DerivedPlan &materialized) {
   auto iterator = dyn_cast<StringAttr>(weightedContract.getIteratorKinds()[
       reductionCoordinate.getPosition()]);
   if (!iterator || iterator.getValue() != "reduction")
+    return failure();
+  llvm::SmallDenseSet<unsigned> weightDimensions;
+  llvm::SmallDenseSet<unsigned> valueDimensions;
+  for (AffineExpr expression : weightMap.getValue().getResults()) {
+    auto dimension = dyn_cast<AffineDimExpr>(expression);
+    if (!dimension)
+      return failure();
+    weightDimensions.insert(dimension.getPosition());
+  }
+  for (AffineExpr expression : valueMap.getValue().getResults()) {
+    auto dimension = dyn_cast<AffineDimExpr>(expression);
+    if (!dimension)
+      return failure();
+    valueDimensions.insert(dimension.getPosition());
+  }
+  SmallVector<int64_t> vectorDimensions;
+  for (AffineExpr expression : outputMap.getValue().getResults()) {
+    auto dimension = dyn_cast<AffineDimExpr>(expression);
+    if (!dimension)
+      return failure();
+    unsigned position = dimension.getPosition();
+    if (!weightDimensions.contains(position) &&
+        valueDimensions.contains(position))
+      vectorDimensions.push_back(position);
+  }
+  if (vectorDimensions.empty())
     return failure();
 
   int64_t baselineBytes = 0;
@@ -385,51 +417,11 @@ derive(RegionOp region, const DerivedPlan &materialized) {
         return failure();
     }
   }
-  FailureOr<int64_t> candidateBytes =
-      logicalTensorBytes(maximumFold.getResult(0).getType());
   FailureOr<int64_t> scoreBytes = logicalTensorBytes(scoreType);
-  if (failed(candidateBytes) || failed(scoreBytes) ||
-      *candidateBytes > std::numeric_limits<int64_t>::max() / 2 ||
-      *candidateBytes >= baselineBytes || 2 * *candidateBytes >= baselineTraffic ||
-      *candidateBytes >= *scoreBytes || materialized.tasks.size() < 2 ||
+  if (failed(scoreBytes) || baselineBytes <= 0 || baselineTraffic <= 0 ||
+      materialized.tasks.empty() ||
       materialized.tasks.size() >
           static_cast<size_t>(std::numeric_limits<int64_t>::max()))
-    return failure();
-
-  llvm::SmallDenseSet<Operation *> firstSources;
-  SmallVector<Value> worklist(maximumFold->getOperands());
-  while (!worklist.empty()) {
-    Operation *producer = worklist.pop_back_val().getDefiningOp();
-    if (!producer || producer->getParentOp() != region ||
-        !firstSources.insert(producer).second)
-      continue;
-    llvm::append_range(worklist, producer->getOperands());
-  }
-  firstSources.insert(maximumFold);
-  llvm::SmallDenseSet<Operation *> scoreSources;
-  worklist.push_back(score);
-  while (!worklist.empty()) {
-    Operation *producer = worklist.pop_back_val().getDefiningOp();
-    if (!producer || producer->getParentOp() != region ||
-        !scoreSources.insert(producer).second)
-      continue;
-    llvm::append_range(worklist, producer->getOperands());
-  }
-  SmallVector<Operation *> firstOrdered;
-  SmallVector<Operation *> secondOrdered;
-  SmallVector<Operation *> recomputedOrdered;
-  for (Operation *operation : algebra)
-    (firstSources.contains(operation) ? firstOrdered : secondOrdered)
-        .push_back(operation);
-  for (Operation *operation : algebra)
-    if (scoreSources.contains(operation))
-      recomputedOrdered.push_back(operation);
-  if (firstOrdered.empty() || secondOrdered.empty() ||
-      recomputedOrdered.empty() ||
-      !llvm::is_contained(secondOrdered, weightedContract) ||
-      llvm::any_of(recomputedOrdered, [&](Operation *operation) {
-        return !firstSources.contains(operation);
-      }))
     return failure();
   auto usedArguments = [&](ArrayRef<Operation *> sources) {
     llvm::SmallDenseSet<unsigned> used;
@@ -440,7 +432,6 @@ derive(RegionOp region, const DerivedPlan &materialized) {
           used.insert(argument.getArgNumber());
     return used;
   };
-  llvm::SmallDenseSet<unsigned> firstArguments = usedArguments(firstOrdered);
   llvm::SmallDenseSet<unsigned> secondArguments = usedArguments(algebra);
 
   DerivedPlan plan;
@@ -450,32 +441,13 @@ derive(RegionOp region, const DerivedPlan &materialized) {
   plan.hasLogicalRelation = true;
   for (BlockArgument argument : body.getArguments()) {
     SmallVector<int64_t> consumers;
-    if (firstArguments.contains(argument.getArgNumber()))
-      consumers.push_back(0);
     if (secondArguments.contains(argument.getArgNumber()))
-      consumers.push_back(1);
+      consumers.push_back(0);
     plan.buffers.push_back({argument, std::nullopt, consumers, false});
   }
-  const int64_t maximumBuffer = plan.buffers.size();
-  plan.buffers.push_back({maximumFold.getResult(0), 0, {1}, false});
   const int64_t outputBuffer = plan.buffers.size();
   plan.buffers.push_back(
-      {regionYield.getValues().front(), 1, {}, true});
-
-  PlannedTask maximumTask;
-  maximumTask.operation = maximumFold;
-  maximumTask.kind = MaterializationTaskKind::Fold;
-  maximumTask.domain.assign(scoreType.getShape().begin(),
-                            scoreType.getShape().end());
-  maximumTask.reductionDimensions.push_back(reduction);
-  maximumTask.orderFree = true;
-  for (unsigned input = 0; input < body.getNumArguments(); ++input)
-    if (firstArguments.contains(input))
-      maximumTask.inputs.push_back(input);
-  maximumTask.outputs.push_back(maximumBuffer);
-  maximumTask.compositionKind =
-      "online_normalized_exponential_weighted_contract";
-  maximumTask.compositionSources = std::move(firstOrdered);
+      {regionYield.getValues().front(), 0, {}, true});
 
   PlannedTask contractionTask;
   contractionTask.operation = weightedContract;
@@ -492,13 +464,11 @@ derive(RegionOp region, const DerivedPlan &materialized) {
   for (unsigned input = 0; input < body.getNumArguments(); ++input)
     if (secondArguments.contains(input))
       contractionTask.inputs.push_back(input);
-  contractionTask.inputs.push_back(maximumBuffer);
   contractionTask.outputs.push_back(outputBuffer);
-  contractionTask.dependencies.push_back(0);
-  contractionTask.compositionKind = maximumTask.compositionKind;
-  contractionTask.compositionSources = std::move(secondOrdered);
-  contractionTask.compositionRecomputedSources =
-      std::move(recomputedOrdered);
+  contractionTask.compositionKind =
+      "online_normalized_exponential_weighted_contract";
+  contractionTask.compositionSources = algebra;
+  contractionTask.onlineVectorDimensions = std::move(vectorDimensions);
 
   auto countContracts = [](ArrayRef<Operation *> sources) {
     return llvm::count_if(sources, [](Operation *operation) {
@@ -506,21 +476,17 @@ derive(RegionOp region, const DerivedPlan &materialized) {
     });
   };
   const int64_t contractEvaluations =
-      countContracts(maximumTask.compositionSources) +
-      countContracts(contractionTask.compositionSources) +
-      countContracts(contractionTask.compositionRecomputedSources);
+      countContracts(contractionTask.compositionSources);
 
   PlannedTask::CompositionCost cost{
       static_cast<int64_t>(materialized.tasks.size()),
-      2,
+      1,
       baselineBytes,
-      *candidateBytes,
+      0,
       baselineTraffic,
-      2 * *candidateBytes,
+      0,
       contractEvaluations};
-  maximumTask.compositionCost = cost;
   contractionTask.compositionCost = cost;
-  plan.tasks.push_back(std::move(maximumTask));
   plan.tasks.push_back(std::move(contractionTask));
   return plan;
 }

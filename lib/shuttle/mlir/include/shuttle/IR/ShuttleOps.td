@@ -148,7 +148,8 @@ def Shuttle_MaterializationTaskOp
       OptionalAttr<StrAttr>:$composition_kind,
       OptionalAttr<ArrayAttr>:$composition_sources,
       OptionalAttr<ArrayAttr>:$composition_recomputed_sources,
-      OptionalAttr<DictionaryAttr>:$composition_cost);
+      OptionalAttr<DictionaryAttr>:$composition_cost,
+      OptionalAttr<DenseI64ArrayAttr>:$online_vector_dimensions);
 }
 
 def Shuttle_MaterializationPlanYieldOp
@@ -196,6 +197,7 @@ def Shuttle_ScheduleTaskOp
       OptionalAttr<Shuttle_ScheduleReductionOrderAttr>:$reduction_order,
       StrAttr:$semantic_fingerprint,
       OptionalAttr<StrAttr>:$online_state_protocol,
+      OptionalAttr<DenseI64ArrayAttr>:$online_vector_dimensions,
       OptionalAttr<StrAttr>:$contract_region_strategy,
       OptionalAttr<DictionaryAttr>:$contract_region_cost);
 }
@@ -238,6 +240,7 @@ def Shuttle_DeviceEntryOp
       OptionalAttr<I64Attr>:$dynamic_shared_bytes,
       OptionalAttr<I64Attr>:$kernel_arity,
       OptionalAttr<StrAttr>:$online_state_protocol,
+      OptionalAttr<DenseI64ArrayAttr>:$online_vector_dimensions,
       OptionalAttr<ArrayAttr>:$logical_coordinate_maps);
 }
 

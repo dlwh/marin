@@ -6882,6 +6882,164 @@ TEST(GpuTransportV2Test,
   }
 }
 
+std::vector<float> causalGqaEpilogueReference(
+    llvm::ArrayRef<float> q, llvm::ArrayRef<float> k,
+    llvm::ArrayRef<float> v) {
+  constexpr int64_t batches = 1;
+  constexpr int64_t heads = 2;
+  constexpr int64_t groups = 2;
+  constexpr int64_t queries = 17;
+  constexpr int64_t keys = 17;
+  constexpr int64_t features = 8;
+  constexpr int64_t values = 7;
+  std::vector<float> result(batches * heads * groups * queries * values);
+  auto qIndex = [=](int64_t batch, int64_t head, int64_t group,
+                   int64_t query, int64_t feature) {
+    return ((((batch * heads + head) * groups + group) * queries + query) *
+            features) +
+           feature;
+  };
+  auto kIndex = [=](int64_t batch, int64_t head, int64_t key,
+                   int64_t feature) {
+    return (((batch * heads + head) * keys + key) * features) + feature;
+  };
+  auto vIndex = [=](int64_t batch, int64_t head, int64_t key,
+                   int64_t value) {
+    return (((batch * heads + head) * keys + key) * values) + value;
+  };
+  auto resultIndex = [=](int64_t batch, int64_t head, int64_t group,
+                        int64_t query, int64_t value) {
+    return ((((batch * heads + head) * groups + group) * queries + query) *
+            values) +
+           value;
+  };
+  for (int64_t batch = 0; batch < batches; ++batch) {
+    for (int64_t head = 0; head < heads; ++head) {
+      for (int64_t group = 0; group < groups; ++group) {
+        for (int64_t query = 0; query < queries; ++query) {
+          std::vector<double> scores(query + 1);
+          double maximum = -std::numeric_limits<double>::infinity();
+          for (int64_t key = 0; key <= query; ++key) {
+            double score = 0.0;
+            for (int64_t feature = 0; feature < features; ++feature)
+              score += static_cast<double>(
+                           q[qIndex(batch, head, group, query, feature)]) *
+                       static_cast<double>(
+                           k[kIndex(batch, head, key, feature)]);
+            scores[key] = score * 0.125;
+            maximum = std::max(maximum, scores[key]);
+          }
+          double denominator = 0.0;
+          for (double score : scores)
+            denominator += std::exp(score - maximum);
+          for (int64_t value = 0; value < values; ++value) {
+            double output = 0.0;
+            for (int64_t key = 0; key <= query; ++key) {
+              double weight = std::exp(scores[key] - maximum) / denominator;
+              output += weight * v[vIndex(batch, head, key, value)];
+            }
+            result[resultIndex(batch, head, group, query, value)] =
+                static_cast<float>(std::tanh(output * 0.5) + 0.25);
+          }
+        }
+      }
+    }
+  }
+  return result;
+}
+
+TEST(GpuTransportV2Test, H100RunnerMatchesIndependentFastAttentionOracle) {
+  if (std::getenv("SHUTTLE_RUN_H100_ATTENTION_NUMERICS") == nullptr)
+    GTEST_SKIP() << "set SHUTTLE_RUN_H100_ATTENTION_NUMERICS=1 on an H100";
+  auto platform = stream_executor::PlatformManager::PlatformWithName("CUDA");
+  ASSERT_TRUE(platform.ok()) << platform.status();
+  auto executor = (*platform)->ExecutorForDevice(0);
+  ASSERT_TRUE(executor.ok()) << executor.status();
+  ASSERT_NE((*executor)->GetDeviceDescription().name().find("H100"),
+            std::string::npos);
+  auto stream = (*executor)->CreateStream();
+  ASSERT_TRUE(stream.ok()) << stream.status();
+  stream_executor::StreamExecutorAddressAllocator allocator(*executor);
+  const auto &capability =
+      (*executor)->GetDeviceDescription().gpu_compute_capability();
+
+  auto source = fixtureSource(
+      "jax-0.10.1-f32-causal-gqa-online-output-epilogue.mlir");
+  ASSERT_TRUE(source);
+  constexpr llvm::StringLiteral options =
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+  constexpr llvm::StringLiteral tuning =
+      R"json({"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json";
+  auto built = buildFixture(*source, mlir::shuttle::NumericalPolicy::Fast,
+                            options, tuning);
+  ASSERT_TRUE(built);
+  auto transport = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+  ASSERT_TRUE(mlir::succeeded(transport));
+  auto executable = mlir::shuttle::GpuExecutable::Load(*transport);
+  ASSERT_TRUE(executable.ok()) << executable.status();
+  auto runner = mlir::shuttle::GpuRunner::Create(
+      *transport, &allocator, 0, stream->get(), &capability);
+  ASSERT_TRUE(runner.ok()) << runner.status();
+
+  std::vector<float> q(1 * 2 * 2 * 17 * 8);
+  std::vector<float> k(1 * 2 * 17 * 8);
+  std::vector<float> v(1 * 2 * 17 * 7);
+  for (size_t index = 0; index < q.size(); ++index)
+    q[index] = -0.7f + static_cast<float>((index * 17) % 101) / 71.0f;
+  for (size_t index = 0; index < k.size(); ++index)
+    k[index] = -0.6f + static_cast<float>((index * 13) % 97) / 67.0f;
+  for (size_t index = 0; index < v.size(); ++index)
+    v[index] = -0.9f + static_cast<float>((index * 19) % 109) / 59.0f;
+  std::vector<float> expected = causalGqaEpilogueReference(q, k, v);
+  std::vector<std::vector<float>> hostOperands{q, k, v};
+  std::vector<stream_executor::DeviceAddressBase> deviceOperands;
+  llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> operands;
+  for (const std::vector<float> &host : hostOperands) {
+    auto device = (*executor)->AllocateArray<float>(host.size());
+    ASSERT_TRUE(device);
+    ASSERT_TRUE((*executor)
+                    ->SynchronousMemcpyH2D(host.data(),
+                                           host.size() * sizeof(float), &device)
+                    .ok());
+    operands.push_back(
+        {device.opaque(), static_cast<int64_t>(device.size())});
+    deviceOperands.push_back(device);
+  }
+  std::vector<float> actual(expected.size(),
+                            std::numeric_limits<float>::quiet_NaN());
+  auto deviceResult = (*executor)->AllocateArray<float>(actual.size());
+  ASSERT_TRUE(deviceResult);
+  ASSERT_TRUE((*executor)
+                  ->SynchronousMemcpyH2D(actual.data(),
+                                         actual.size() * sizeof(float),
+                                         &deviceResult)
+                  .ok());
+  llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> results{{
+      deviceResult.opaque(), static_cast<int64_t>(deviceResult.size())}};
+  ASSERT_TRUE((*runner)->Execute(operands, results).ok());
+  ASSERT_TRUE((*runner)->AwaitCompletion().ok());
+  ASSERT_TRUE((*executor)
+                  ->SynchronousMemcpyD2H(deviceResult,
+                                         actual.size() * sizeof(float),
+                                         actual.data())
+                  .ok());
+  double maximumAbsoluteError = 0.0;
+  double meanAbsoluteError = 0.0;
+  for (auto [index, value] : llvm::enumerate(actual)) {
+    ASSERT_TRUE(std::isfinite(value)) << "element " << index;
+    double error = std::abs(static_cast<double>(value) - expected[index]);
+    maximumAbsoluteError = std::max(maximumAbsoluteError, error);
+    meanAbsoluteError += error;
+  }
+  meanAbsoluteError /= actual.size();
+  EXPECT_LE(maximumAbsoluteError, 3.0e-3);
+  EXPECT_LE(meanAbsoluteError, 5.0e-4);
+  runner->reset();
+  (*executor)->Deallocate(&deviceResult);
+  for (auto &device : deviceOperands)
+    (*executor)->Deallocate(&device);
+}
+
 TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
   const char *runPerformance =
       std::getenv("SHUTTLE_RUN_H100_PERFORMANCE");

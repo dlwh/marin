@@ -4252,6 +4252,7 @@ struct PlannedTask {
   std::string compositionKind;
   SmallVector<Operation *> compositionSources;
   SmallVector<Operation *> compositionRecomputedSources;
+  SmallVector<int64_t> onlineVectorDimensions;
   struct CompositionCost {
     int64_t baselineLaunches;
     int64_t candidateLaunches;
@@ -6706,6 +6707,10 @@ public:
               "composition_kind", builder.getStringAttr(task.compositionKind)));
           attrs.push_back(builder.getNamedAttr("composition_sources",
                                                builder.getArrayAttr(sources)));
+          if (!task.onlineVectorDimensions.empty())
+            attrs.push_back(builder.getNamedAttr(
+                "online_vector_dimensions",
+                builder.getDenseI64ArrayAttr(task.onlineVectorDimensions)));
           if (!task.compositionRecomputedSources.empty()) {
             SmallVector<Attribute> recomputed;
             for (Operation *operation : task.compositionRecomputedSources)
@@ -7966,15 +7971,27 @@ FailureOr<ScheduledGeometry>
 deriveOnlineStateGeometry(MaterializationTaskOp task) {
   ArrayRef<int64_t> domain = task.getDomainShape();
   ArrayRef<int64_t> reductions = task.getReductionDimensions();
+  auto vectorDimensions = task.getOnlineVectorDimensions();
   if (!isOnlineStateTask(task) || domain.empty() || domain.size() > 8 ||
       reductions.size() != 1 || reductions.front() < 0 ||
-      reductions.front() >= static_cast<int64_t>(domain.size()))
+      reductions.front() >= static_cast<int64_t>(domain.size()) ||
+      !vectorDimensions || vectorDimensions->empty())
     return failure();
   const int64_t reductionAxis = reductions.front();
   const int64_t reduction = domain[reductionAxis];
+  llvm::SmallDenseSet<int64_t> vectorAxes;
+  int64_t vectorElements = 1;
+  for (int64_t axis : *vectorDimensions) {
+    if (axis < 0 || axis >= static_cast<int64_t>(domain.size()) ||
+        axis == reductionAxis || !vectorAxes.insert(axis).second ||
+        domain[axis] <= 0 || vectorElements > 64 / domain[axis])
+      return failure();
+    vectorElements *= domain[axis];
+  }
   SmallVector<int64_t> outputShape;
   for (auto [axis, extent] : llvm::enumerate(domain))
-    if (static_cast<int64_t>(axis) != reductionAxis)
+    if (static_cast<int64_t>(axis) != reductionAxis &&
+        !vectorAxes.contains(axis))
       outputShape.push_back(extent);
   FailureOr<int64_t> outputs = scheduleElementCount(outputShape);
   if (failed(outputs) || *outputs > UINT32_MAX || reduction <= 0 ||
@@ -7982,11 +7999,9 @@ deriveOnlineStateGeometry(MaterializationTaskOp task) {
     return failure();
   SmallVector<int64_t> tile(domain.size(), 1);
   tile[reductionAxis] = reduction;
-  const int64_t stateValues =
-      task.getKind() == MaterializationTaskKind::Fold ? 1 : 3;
-  return ScheduledGeometry{{*outputs}, std::move(tile), 1, reduction, 32,
-                           stateValues * reduction *
-                               static_cast<int64_t>(sizeof(float)),
+  for (int64_t axis : vectorAxes)
+    tile[axis] = domain[axis];
+  return ScheduledGeometry{{*outputs}, std::move(tile), 1, 1, 1, 0,
                            reductionAxis};
 }
 
@@ -8210,6 +8225,9 @@ public:
           attrs.push_back(builder.getNamedAttr(
               "online_state_protocol",
               builder.getStringAttr(kOnlineStateProtocol)));
+        if (auto vectorDimensions = task.getOnlineVectorDimensionsAttr())
+          attrs.push_back(builder.getNamedAttr("online_vector_dimensions",
+                                               vectorDimensions));
         if (geometry->reductionAxis) {
           attrs.push_back(builder.getNamedAttr(
               "reduction_axis",
@@ -8310,6 +8328,10 @@ verifySchedulePlanAgainstMaterialization(MaterializationPlanOp source,
     if (actual.getOnlineStateProtocolAttr() != expectedOnlineProtocol)
       return actual.emitOpError(
           "online state protocol must equal materialization semantics");
+    if (actual.getOnlineVectorDimensionsAttr() !=
+        expected.getOnlineVectorDimensionsAttr())
+      return actual.emitOpError(
+          "online vector dimensions must equal materialization semantics");
     FailureOr<ScheduledGeometry> expectedGeometry =
         isOnlineStateTask(expected)
             ? deriveOnlineStateGeometry(expected)
@@ -11911,6 +11933,237 @@ FailureOr<std::string> emitOnlineStatePtx(
   return ptx.text;
 }
 
+FailureOr<OnlineScalarValue> emitOnlineEpilogue(
+    OnlineEvalContext &context, Value value, Value weightedResult,
+    OnlineScalarValue weightedScalar, ArrayRef<int64_t> coordinates) {
+  if (value == weightedResult)
+    return weightedScalar;
+  auto map = value.getDefiningOp<MapOp>();
+  if (!map || map.getNumResults() != 1 ||
+      map.getIndexingMaps().size() != map.getInputs().size() + 1)
+    return failure();
+  SmallVector<int64_t> arguments;
+  for (auto [operand, input] : llvm::enumerate(map.getInputs())) {
+    auto indexing = dyn_cast<AffineMapAttr>(map.getIndexingMaps()[operand]);
+    if (!indexing)
+      return failure();
+    FailureOr<SmallVector<int64_t>> inputCoordinates = emitOnlineMappedU32(
+        context.ptx, indexing.getValue(), coordinates);
+    if (failed(inputCoordinates))
+      return failure();
+    FailureOr<OnlineScalarValue> scalar =
+        input == weightedResult ||
+                valueDependsOnOperation(input, weightedResult.getDefiningOp())
+            ? emitOnlineEpilogue(context, input, weightedResult,
+                                 weightedScalar, *inputCoordinates)
+            : emitOnlineValue(context, input, *inputCoordinates);
+    if (failed(scalar) || scalar->kind != OnlineScalarKind::F32)
+      return failure();
+    arguments.push_back(scalar->reg);
+  }
+  FailureOr<int64_t> result =
+      emitScalarBody(context.ptx, map.getBody().front(), arguments);
+  if (failed(result))
+    return failure();
+  return OnlineScalarValue{OnlineScalarKind::F32, *result};
+}
+
+FailureOr<std::string> emitOnlineVectorStatePtx(
+    RegionOp region, MaterializationTaskOp materializationTask,
+    SmallVectorImpl<MaterializationBufferOp> &buffers, ScheduleTaskOp task,
+    OnlineEmissionMatch &match) {
+  (void)buffers;
+  auto vectorDimensions = materializationTask.getOnlineVectorDimensions();
+  if (materializationTask.getKind() != MaterializationTaskKind::Contract ||
+      materializationTask.getOutputBuffers().size() != 1 ||
+      !vectorDimensions || vectorDimensions->size() != 1 ||
+      !task.getReductionAxis() || task.getWorkgroupThreads() != 1)
+    return failure();
+  const int64_t vectorAxis = vectorDimensions->front();
+  const int64_t reductionAxis = *task.getReductionAxis();
+  ArrayRef<int64_t> domain = materializationTask.getDomainShape();
+  if (vectorAxis < 0 || vectorAxis >= static_cast<int64_t>(domain.size()) ||
+      reductionAxis < 0 ||
+      reductionAxis >= static_cast<int64_t>(domain.size()) ||
+      vectorAxis == reductionAxis || domain[vectorAxis] <= 0 ||
+      domain[vectorAxis] > 64 || domain[reductionAxis] <= 0 ||
+      domain[reductionAxis] > 256)
+    return failure();
+  PtxEmitter ptx(materializationTask.getInputBuffers().size() + 1);
+  ptx.header(task.getSemanticFingerprint(), /*usesDynamicSharedMemory=*/false);
+  FailureOr<OnlineEvalContext> context =
+      onlineEvalContext(ptx, region, materializationTask, task, match);
+  FailureOr<SmallVector<int64_t>> contractCoordinates =
+      emitOnlineLogicalCoordinates(ptx, task);
+  if (failed(context) || failed(contractCoordinates))
+    return failure();
+  auto normalizedMap = dyn_cast<AffineMapAttr>(
+      match.weightedContract.getIndexingMaps()[match.normalizedOperand]);
+  const unsigned valueOperand = 1 - match.normalizedOperand;
+  auto valueMap = dyn_cast<AffineMapAttr>(
+      match.weightedContract.getIndexingMaps()[valueOperand]);
+  auto weightedOutputMap = dyn_cast<AffineMapAttr>(
+      match.weightedContract.getIndexingMaps()[2]);
+  if (!normalizedMap || !valueMap || !weightedOutputMap)
+    return failure();
+
+  int64_t maxState = ptx.nextF32();
+  int64_t sumState = ptx.nextF32();
+  ptx.stream << "  mov.f32 %f" << maxState
+             << ", 0fFF800000;\n  mov.f32 %f" << sumState
+             << ", 0f00000000;\n";
+  SmallVector<int64_t> outputState;
+  for (int64_t vector = 0; vector < domain[vectorAxis]; ++vector) {
+    int64_t state = ptx.nextF32();
+    ptx.stream << "  mov.f32 %f" << state << ", 0f00000000;\n";
+    outputState.push_back(state);
+  }
+
+  int64_t key = ptx.nextU32();
+  int64_t keyDone = ptx.nextPred();
+  const int64_t loopLabel = context->label++;
+  ptx.stream << "  mov.u32 %r" << key << ", 0;\n$online_vector_"
+             << loopLabel << "_loop:\n  setp.ge.u32 %p" << keyDone << ", %r"
+             << key << ", " << domain[reductionAxis] << ";\n  @%p"
+             << keyDone << " bra $online_vector_" << loopLabel
+             << "_done;\n";
+  (*contractCoordinates)[reductionAxis] = key;
+  FailureOr<SmallVector<int64_t>> scoreCoordinates = emitOnlineMappedU32(
+      ptx, normalizedMap.getValue(), *contractCoordinates);
+  if (failed(scoreCoordinates))
+    return failure();
+  FailureOr<OnlineScalarValue> score =
+      emitOnlineValue(*context, match.score, *scoreCoordinates);
+  auto select = match.score.getDefiningOp<RelationOp>();
+  if (failed(score) || score->kind != OnlineScalarKind::F32 || !select ||
+      select.getSemantics() != RelationSemantics::Select)
+    return failure();
+  auto predicate = context->relationValues.find(select.getInputs().front());
+  if (predicate == context->relationValues.end() ||
+      predicate->second.kind != OnlineScalarKind::Predicate)
+    return failure();
+  const int64_t nextLabel = context->label++;
+  ptx.stream << "  @!%p" << predicate->second.reg << " bra $online_vector_"
+             << nextLabel << "_next;\n";
+  int64_t empty = ptx.nextPred();
+  const int64_t firstLabel = context->label++;
+  const int64_t updatedLabel = context->label++;
+  ptx.stream << "  setp.eq.f32 %p" << empty << ", %f" << sumState
+             << ", 0f00000000;\n  @%p" << empty << " bra $online_vector_"
+             << firstLabel << "_first;\n";
+
+  int64_t nextMaximum = ptx.nextF32();
+  int64_t oldDelta = ptx.nextF32();
+  int64_t scoreDelta = ptx.nextF32();
+  ptx.stream << "  max.f32 %f" << nextMaximum << ", %f" << maxState
+             << ", %f" << score->reg << ";\n  sub.rn.f32 %f" << oldDelta
+             << ", %f" << maxState << ", %f" << nextMaximum
+             << ";\n  sub.rn.f32 %f" << scoreDelta << ", %f" << score->reg
+             << ", %f" << nextMaximum << ";\n";
+  int64_t oldScale = emitOnlineExp(ptx, oldDelta);
+  int64_t scoreScale = emitOnlineExp(ptx, scoreDelta);
+  int64_t nextSum = ptx.nextF32();
+  ptx.stream << "  fma.rn.f32 %f" << nextSum << ", %f" << oldScale
+             << ", %f" << sumState << ", %f" << scoreScale << ";\n";
+  SmallVector<int64_t> nextOutput;
+  for (int64_t vector = 0; vector < domain[vectorAxis]; ++vector) {
+    int64_t vectorCoordinate = ptx.nextU32();
+    ptx.stream << "  mov.u32 %r" << vectorCoordinate << ", " << vector
+               << ";\n";
+    (*contractCoordinates)[vectorAxis] = vectorCoordinate;
+    FailureOr<SmallVector<int64_t>> valueCoordinates = emitOnlineMappedU32(
+        ptx, valueMap.getValue(), *contractCoordinates);
+    FailureOr<OnlineScalarValue> value =
+        failed(valueCoordinates)
+            ? FailureOr<OnlineScalarValue>(failure())
+            : emitOnlineValue(*context,
+                              match.weightedContract.getInputs()[valueOperand],
+                              *valueCoordinates);
+    if (failed(value) || value->kind != OnlineScalarKind::F32)
+      return failure();
+    int64_t weighted = ptx.nextF32();
+    int64_t next = ptx.nextF32();
+    ptx.stream << "  mul.rn.f32 %f" << weighted << ", %f" << scoreScale
+               << ", %f" << value->reg << ";\n  fma.rn.f32 %f" << next
+               << ", %f" << oldScale << ", %f" << outputState[vector]
+               << ", %f" << weighted << ";\n";
+    nextOutput.push_back(next);
+  }
+  ptx.stream << "  mov.f32 %f" << maxState << ", %f" << nextMaximum
+             << ";\n  mov.f32 %f" << sumState << ", %f" << nextSum << ";\n";
+  for (auto [state, next] : llvm::zip(outputState, nextOutput))
+    ptx.stream << "  mov.f32 %f" << state << ", %f" << next << ";\n";
+  ptx.stream << "  bra $online_vector_" << updatedLabel
+             << "_updated;\n$online_vector_" << firstLabel << "_first:\n";
+
+  ptx.stream << "  mov.f32 %f" << maxState << ", %f" << score->reg
+             << ";\n  mov.f32 %f" << sumState << ", 0f3F800000;\n";
+  for (int64_t vector = 0; vector < domain[vectorAxis]; ++vector) {
+    int64_t vectorCoordinate = ptx.nextU32();
+    ptx.stream << "  mov.u32 %r" << vectorCoordinate << ", " << vector
+               << ";\n";
+    (*contractCoordinates)[vectorAxis] = vectorCoordinate;
+    FailureOr<SmallVector<int64_t>> valueCoordinates = emitOnlineMappedU32(
+        ptx, valueMap.getValue(), *contractCoordinates);
+    FailureOr<OnlineScalarValue> value =
+        failed(valueCoordinates)
+            ? FailureOr<OnlineScalarValue>(failure())
+            : emitOnlineValue(*context,
+                              match.weightedContract.getInputs()[valueOperand],
+                              *valueCoordinates);
+    if (failed(value) || value->kind != OnlineScalarKind::F32)
+      return failure();
+    ptx.stream << "  mov.f32 %f" << outputState[vector] << ", %f"
+               << value->reg << ";\n";
+  }
+  ptx.stream << "$online_vector_" << updatedLabel
+             << "_updated:\n$online_vector_" << nextLabel
+             << "_next:\n  add.u32 %r" << key << ", %r" << key
+             << ", 1;\n  bra $online_vector_" << loopLabel
+             << "_loop;\n$online_vector_" << loopLabel << "_done:\n";
+
+  auto regionYield = cast<YieldOp>(region.getBody().front().getTerminator());
+  auto publicType = dyn_cast<RankedTensorType>(
+      regionYield.getValues().front().getType());
+  if (!publicType || !publicType.getElementType().isF32())
+    return failure();
+  for (int64_t vector = 0; vector < domain[vectorAxis]; ++vector) {
+    int64_t vectorCoordinate = ptx.nextU32();
+    ptx.stream << "  mov.u32 %r" << vectorCoordinate << ", " << vector
+               << ";\n";
+    (*contractCoordinates)[vectorAxis] = vectorCoordinate;
+    FailureOr<SmallVector<int64_t>> weightedCoordinates = emitOnlineMappedU32(
+        ptx, weightedOutputMap.getValue(), *contractCoordinates);
+    FailureOr<SmallVector<int64_t>> publicCoordinates =
+        failed(weightedCoordinates)
+            ? FailureOr<SmallVector<int64_t>>(failure())
+            : onlineOutputCoordinates(match.weightedContract.getResult(0),
+                                      regionYield.getValues().front(),
+                                      *weightedCoordinates);
+    if (failed(publicCoordinates))
+      return failure();
+    int64_t normalized = ptx.nextF32();
+    ptx.stream << "  div.rn.f32 %f" << normalized << ", %f"
+               << outputState[vector] << ", %f" << sumState << ";\n";
+    FailureOr<OnlineScalarValue> epilogue = emitOnlineEpilogue(
+        *context, regionYield.getValues().front(),
+        match.weightedContract.getResult(0),
+        {OnlineScalarKind::F32, normalized}, *publicCoordinates);
+    FailureOr<int64_t> outputPointer =
+        failed(epilogue)
+            ? FailureOr<int64_t>(failure())
+            : emitOnlineGlobalStorePointer(
+                  ptx, materializationTask.getInputBuffers().size(), publicType,
+                  *publicCoordinates);
+    if (failed(epilogue) || failed(outputPointer))
+      return failure();
+    ptx.stream << "  st.global.f32 [%rd" << *outputPointer << "], %f"
+               << epilogue->reg << ";\n";
+  }
+  ptx.finish();
+  return ptx.text;
+}
+
 FailureOr<std::string> emitOnlineSufficientStatePtx(
     RegionOp region, MaterializationTaskOp materializationTask,
     SmallVectorImpl<MaterializationBufferOp> &buffers, ScheduleTaskOp task) {
@@ -11925,8 +12178,8 @@ FailureOr<std::string> emitOnlineSufficientStatePtx(
   return materializationTask.getKind() == MaterializationTaskKind::Fold
              ? emitOnlineMaximumPtx(region, materializationTask, buffers, task,
                                     *match)
-             : emitOnlineStatePtx(region, materializationTask, buffers, task,
-                                  *match);
+             : emitOnlineVectorStatePtx(region, materializationTask, buffers,
+                                        task, *match);
 }
 
 FailureOr<OnlineScalarValue>
@@ -11988,21 +12241,24 @@ emitOnlineValue(OnlineEvalContext &context, Value value,
 
 FailureOr<SmallVector<AffineMap>>
 onlineLogicalCoordinateMaps(ScheduleTaskOp task) {
-  if (!task.getOnlineStateProtocolAttr() || !task.getReductionAxis())
+  if (!task.getOnlineStateProtocolAttr() || !task.getReductionAxis() ||
+      !task.getOnlineVectorDimensions())
     return failure();
   ArrayRef<int64_t> domain = task.getDomainShape();
   const int64_t reductionAxis = *task.getReductionAxis();
+  llvm::SmallDenseSet<int64_t> vectorAxes(
+      task.getOnlineVectorDimensions()->begin(),
+      task.getOnlineVectorDimensions()->end());
   if (reductionAxis < 0 ||
       reductionAxis >= static_cast<int64_t>(domain.size()))
     return failure();
   MLIRContext *context = task.getContext();
   AffineExpr block = getAffineDimExpr(0, context);
-  AffineExpr thread = getAffineDimExpr(3, context);
   SmallVector<int64_t> strides(domain.size(), 1);
   int64_t stride = 1;
   for (int64_t axis = domain.size(); axis > 0; --axis) {
     strides[axis - 1] = stride;
-    if (axis - 1 == reductionAxis)
+    if (axis - 1 == reductionAxis || vectorAxes.contains(axis - 1))
       continue;
     if (domain[axis - 1] <= 0 ||
         stride > std::numeric_limits<int64_t>::max() / domain[axis - 1])
@@ -12012,8 +12268,9 @@ onlineLogicalCoordinateMaps(ScheduleTaskOp task) {
   SmallVector<AffineMap> maps;
   for (auto [axis, extent] : llvm::enumerate(domain)) {
     AffineExpr coordinate =
-        static_cast<int64_t>(axis) == reductionAxis
-            ? thread
+        static_cast<int64_t>(axis) == reductionAxis ||
+                vectorAxes.contains(axis)
+            ? getAffineConstantExpr(0, context)
             : block.floorDiv(strides[axis]) % extent;
     maps.push_back(AffineMap::get(7, 0, coordinate, context));
   }
