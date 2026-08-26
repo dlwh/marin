@@ -2382,6 +2382,228 @@ bool onlineOperandDependsOnCoordinateBuiltin(const OnlinePtxCfg &cfg,
   return false;
 }
 
+struct OnlineIndexAlternatives {
+  bool valid = true;
+  SmallVector<AffineExpr> values;
+};
+
+OnlineIndexAlternatives onlineIndexAlternatives(
+    const OnlinePtxCfg &cfg, int64_t instruction, StringRef value,
+    MLIRContext *context, std::set<std::pair<int64_t, std::string>> &active) {
+  auto dimension = [&](unsigned ordinal) {
+    return getAffineDimExpr(ordinal, context);
+  };
+  if (value == "%ctaid.x")
+    return {true, {dimension(0)}};
+  if (value == "%ctaid.y")
+    return {true, {dimension(1)}};
+  if (value == "%ctaid.z")
+    return {true, {dimension(2)}};
+  if (value == "%tid.x")
+    return {true, {dimension(3)}};
+  if (value == "%tid.y")
+    return {true, {dimension(4)}};
+  if (value == "%tid.z")
+    return {true, {dimension(5)}};
+  if (!value.starts_with("%")) {
+    int64_t constant = 0;
+    if (value.getAsInteger(10, constant))
+      return {false, {}};
+    return {true, {getAffineConstantExpr(constant, context)}};
+  }
+  if (!active.insert({instruction, value.str()}).second)
+    return {false, {}};
+  std::set<int64_t> definitions =
+      onlineReachingDefinitions(cfg, instruction, value);
+  OnlineIndexAlternatives result;
+  for (int64_t definition : definitions) {
+    if (definition == kOnlineUndefinedDefinition) {
+      result.valid = false;
+      continue;
+    }
+    const OnlinePtxInstruction &producer = cfg.instructions[definition];
+    if (!producer.predicate.empty() || producer.operands.size() < 2) {
+      result.valid = false;
+      continue;
+    }
+    SmallVector<OnlineIndexAlternatives> operands;
+    for (const std::string &operand : llvm::drop_begin(producer.operands))
+      operands.push_back(
+          onlineIndexAlternatives(cfg, definition, operand, context, active));
+    if (llvm::any_of(operands, [](const OnlineIndexAlternatives &operand) {
+          return !operand.valid;
+        })) {
+      result.valid = false;
+      continue;
+    }
+    StringRef opcode = producer.opcode;
+    for (AffineExpr left : operands.front().values) {
+      if (opcode.starts_with("mov.") || opcode.starts_with("cvt.")) {
+        if (operands.size() != 1)
+          result.valid = false;
+        else
+          result.values.push_back(left);
+        continue;
+      }
+      if (operands.size() != 2) {
+        result.valid = false;
+        continue;
+      }
+      for (AffineExpr right : operands[1].values) {
+        auto leftConstant = dyn_cast<AffineConstantExpr>(left);
+        auto rightConstant = dyn_cast<AffineConstantExpr>(right);
+        if (opcode.starts_with("add.")) {
+          result.values.push_back(left + right);
+        } else if (opcode.starts_with("mul.lo.") &&
+                   (leftConstant || rightConstant)) {
+          result.values.push_back(left * right);
+        } else if (opcode.starts_with("div.u32") && rightConstant &&
+                   rightConstant.getValue() > 0) {
+          result.values.push_back(left.floorDiv(rightConstant.getValue()));
+        } else if (opcode.starts_with("rem.u32") && rightConstant &&
+                   rightConstant.getValue() > 0) {
+          result.values.push_back(left % rightConstant.getValue());
+        } else {
+          result.valid = false;
+        }
+      }
+    }
+  }
+  active.erase({instruction, value.str()});
+  return result;
+}
+
+FailureOr<int64_t> evaluateOnlineAffineExpr(AffineExpr expression,
+                                            ArrayRef<int64_t> dimensions) {
+  if (auto dimension = dyn_cast<AffineDimExpr>(expression)) {
+    if (dimension.getPosition() >= dimensions.size())
+      return failure();
+    return dimensions[dimension.getPosition()];
+  }
+  if (auto constant = dyn_cast<AffineConstantExpr>(expression))
+    return constant.getValue();
+  auto binary = dyn_cast<AffineBinaryOpExpr>(expression);
+  if (!binary)
+    return failure();
+  FailureOr<int64_t> lhs =
+      evaluateOnlineAffineExpr(binary.getLHS(), dimensions);
+  FailureOr<int64_t> rhs =
+      evaluateOnlineAffineExpr(binary.getRHS(), dimensions);
+  if (failed(lhs) || failed(rhs))
+    return failure();
+  switch (binary.getKind()) {
+  case AffineExprKind::Add:
+    return *lhs + *rhs;
+  case AffineExprKind::Mul:
+    return *lhs * *rhs;
+  case AffineExprKind::FloorDiv:
+    if (*rhs <= 0)
+      return failure();
+    return *lhs / *rhs;
+  case AffineExprKind::Mod:
+    if (*rhs <= 0)
+      return failure();
+    return *lhs % *rhs;
+  default:
+    return failure();
+  }
+}
+
+FailureOr<SmallVector<AffineExpr>> onlineLogicalCoordinateMaps(
+    DeviceEntryOp entry, ScheduleTaskOp schedule) {
+  auto maps = entry->getAttrOfType<ArrayAttr>("logical_coordinate_maps");
+  if (!maps || maps.size() != schedule.getDomainShape().size())
+    return failure();
+  SmallVector<AffineExpr> coordinates;
+  for (Attribute attribute : maps) {
+    auto map = dyn_cast<AffineMapAttr>(attribute);
+    if (!map || map.getValue().getNumDims() != 7 ||
+        map.getValue().getNumSymbols() != 0 ||
+        map.getValue().getNumResults() != 1)
+      return failure();
+    coordinates.push_back(map.getValue().getResult(0));
+  }
+  SmallVector<int64_t> grid(3, 1);
+  SmallVector<int64_t> block(3, 1);
+  llvm::copy(entry.getGrid().value_or(ArrayRef<int64_t>()), grid.begin());
+  llvm::copy(entry.getBlock().value_or(ArrayRef<int64_t>()), block.begin());
+  SmallVector<int64_t> launchExtents{
+      grid[0],  grid[1],  grid[2], block[0], block[1], block[2],
+      static_cast<int64_t>(schedule.getSerialTiles())};
+  int64_t launches = 1;
+  for (int64_t extent : launchExtents) {
+    if (extent <= 0 || launches > 1000000 / extent)
+      return failure();
+    launches *= extent;
+  }
+  std::set<SmallVector<int64_t>> covered;
+  for (int64_t linear = 0; linear < launches; ++linear) {
+    int64_t remainder = linear;
+    SmallVector<int64_t> physical(7);
+    for (int64_t axis = 6; axis >= 0; --axis) {
+      physical[axis] = remainder % launchExtents[axis];
+      remainder /= launchExtents[axis];
+    }
+    SmallVector<int64_t> logical;
+    bool inBounds = true;
+    for (auto [axis, expression] : llvm::enumerate(coordinates)) {
+      FailureOr<int64_t> coordinate =
+          evaluateOnlineAffineExpr(expression, physical);
+      if (failed(coordinate))
+        return failure();
+      inBounds &= *coordinate >= 0 &&
+                  *coordinate < schedule.getDomainShape()[axis];
+      logical.push_back(*coordinate);
+    }
+    if (inBounds && !covered.insert(logical).second)
+      return failure();
+  }
+  int64_t domainElements = 1;
+  for (int64_t extent : schedule.getDomainShape()) {
+    if (extent <= 0 || domainElements > 1000000 / extent)
+      return failure();
+    domainElements *= extent;
+  }
+  if (covered.size() != static_cast<size_t>(domainElements))
+    return failure();
+  return coordinates;
+}
+
+FailureOr<SmallVector<int64_t>> onlineRelationDomainAxes(
+    MaterializationTaskOp task, RegionOp region, int64_t relationRank) {
+  Operation *anchor = nullptr;
+  for (Operation &operation : region.getBody().front().without_terminator())
+    if (operation.getAttr("source") == task.getSource())
+      anchor = &operation;
+  if (auto fold = dyn_cast_or_null<FoldOp>(anchor)) {
+    if (fold.getInputs().empty() ||
+        cast<RankedTensorType>(fold.getInputs().front().getType()).getRank() !=
+            relationRank ||
+        task.getDomainShape().size() != relationRank)
+      return failure();
+    SmallVector<int64_t> identity;
+    for (int64_t axis = 0; axis < relationRank; ++axis)
+      identity.push_back(axis);
+    return identity;
+  }
+  auto contract = dyn_cast_or_null<ContractOp>(anchor);
+  if (!contract || contract.getIndexingMaps().empty())
+    return failure();
+  AffineMap scoreMap =
+      cast<AffineMapAttr>(contract.getIndexingMaps()[0]).getValue();
+  if (scoreMap.getNumResults() != relationRank ||
+      scoreMap.getNumDims() != task.getDomainShape().size())
+    return failure();
+  SmallVector<int64_t> axes;
+  for (AffineExpr result : scoreMap.getResults()) {
+    auto dimension = dyn_cast<AffineDimExpr>(result);
+    if (!dimension)
+      return failure();
+    axes.push_back(dimension.getPosition());
+  }
+  return axes;
+}
+
 bool onlineRoleIs(const OnlinePtxCfg &cfg, StringRef role,
                   ArrayRef<StringRef> opcodes,
                   ArrayRef<StringRef> dependencies = {}) {
@@ -2402,8 +2624,10 @@ bool onlineRoleIs(const OnlinePtxCfg &cfg, StringRef role,
 
 FailureOr<std::string> onlineComparisonOpcode(RelationOp relation);
 
-bool onlineRelationSourceClosure(const OnlinePtxCfg &cfg,
-                                 ArrayRef<RelationOp> relations) {
+bool onlineRelationSourceClosure(
+    const OnlinePtxCfg &cfg, ArrayRef<RelationOp> relations,
+    ArrayRef<AffineExpr> logicalCoordinates,
+    ArrayRef<int64_t> relationDomainAxes, MLIRContext *context) {
   for (RelationOp relation : relations) {
     SourceRefAttr source = relation->getAttrOfType<SourceRefAttr>("source");
     auto instruction = cfg.sources.find(onlineSourceKey(source));
@@ -2430,12 +2654,21 @@ bool onlineRelationSourceClosure(const OnlinePtxCfg &cfg,
       if (!StringRef(ptx.opcode).starts_with("mov.u32") &&
           !StringRef(ptx.opcode).starts_with("mov.s32"))
         return false;
-      if (failed(logicalDimension) ||
-          ptx.logicalDimension != *logicalDimension ||
+      if (failed(logicalDimension) || *logicalDimension < 0 ||
+          *logicalDimension >= relationDomainAxes.size() ||
+          relationDomainAxes[*logicalDimension] < 0 ||
+          relationDomainAxes[*logicalDimension] >= logicalCoordinates.size() ||
           ptx.operands.size() != 2 ||
-          !StringRef(ptx.operands[1]).starts_with("%") ||
-          !onlineOperandDependsOnCoordinateBuiltin(
-              cfg, instruction->second, ptx.operands[1]))
+          !StringRef(ptx.operands[1]).starts_with("%"))
+        return false;
+      std::set<std::pair<int64_t, std::string>> active;
+      OnlineIndexAlternatives alternatives = onlineIndexAlternatives(
+          cfg, instruction->second, ptx.operands[1], context, active);
+      AffineExpr expected =
+          logicalCoordinates[relationDomainAxes[*logicalDimension]];
+      if (!alternatives.valid || alternatives.values.empty() ||
+          llvm::any_of(alternatives.values,
+                       [&](AffineExpr value) { return value != expected; }))
         return false;
       break;
     }
@@ -2472,15 +2705,13 @@ bool onlineRelationSourceClosure(const OnlinePtxCfg &cfg,
       break;
     }
     case RelationSemantics::Convert: {
-      const bool convert = StringRef(ptx.opcode).starts_with("cvt.") &&
-                           relationOperandSource(0, 1);
       const bool select =
           StringRef(ptx.opcode).starts_with("selp.f32") &&
           ptx.operands.size() == 4 &&
           ptx.operands[1] == "0f3F800000" &&
           ptx.operands[2] == "0f00000000" &&
           relationOperandSource(0, 3);
-      if (!convert && !select)
+      if (!select)
         return false;
       break;
     }
@@ -3021,6 +3252,25 @@ setp.eq.u32 %p0, 0, 0;
 @%p0 st.global.f32 [%rd0], %f0;
 ret;
 )ptx");
+    FailureOr<OnlinePtxCfg> coordinate = parse(R"ptx(
+// shuttle.online.role iota
+mov.u32 %r0, %tid.x;
+ret;
+)ptx");
+    FailureOr<OnlinePtxCfg> zeroedCoordinate = parse(R"ptx(
+mul.lo.u32 %r0, %tid.x, 0;
+// shuttle.online.role iota
+mov.u32 %r1, %r0;
+ret;
+)ptx");
+    FailureOr<OnlinePtxCfg> alternateCoordinate = parse(R"ptx(
+mov.u32 %r0, %tid.x;
+setp.eq.u32 %p0, 0, 0;
+@%p0 mov.u32 %r0, %ctaid.x;
+// shuttle.online.role iota
+mov.u32 %r1, %r0;
+ret;
+)ptx");
     FailureOr<OnlinePtxCfg> shared = parse(R"ptx(
 mov.u64 %rd0, 0;
 // shuttle.online.role expected
@@ -3037,8 +3287,20 @@ ret;
 )ptx");
     if (failed(predicated) || failed(branch) || failed(correctFma) ||
         failed(wrongFma) || failed(pointer) || failed(transformedPointer) ||
-        failed(predicatedStore) || failed(shared))
+        failed(predicatedStore) || failed(coordinate) ||
+        failed(zeroedCoordinate) || failed(alternateCoordinate) ||
+        failed(shared))
       return signalPassFailure();
+    auto indexMatches = [&](const OnlinePtxCfg &cfg, AffineExpr expected) {
+      int64_t iota = cfg.roles.at("iota");
+      std::set<std::pair<int64_t, std::string>> active;
+      OnlineIndexAlternatives alternatives = onlineIndexAlternatives(
+          cfg, iota, cfg.instructions[iota].operands[1],
+          getOperation().getContext(), active);
+      return alternatives.valid && !alternatives.values.empty() &&
+             llvm::all_of(alternatives.values,
+                          [&](AffineExpr value) { return value == expected; });
+    };
     if (onlineRoleDirectlyReaches(*predicated, "maybe_value",
                                   predicated->roles.at("use")) ||
         onlineRoleIs(*branch, "dead", {"mov.f32"}) ||
@@ -3050,6 +3312,12 @@ ret;
         onlineRoleStoresToOutput(*pointer, "store", 0) ||
         onlineRoleStoresToOutput(*transformedPointer, "store", 0) ||
         onlineRoleStoresToOutput(*predicatedStore, "store", 0) ||
+        !indexMatches(*coordinate,
+                      getAffineDimExpr(3, getOperation().getContext())) ||
+        indexMatches(*zeroedCoordinate,
+                     getAffineDimExpr(3, getOperation().getContext())) ||
+        indexMatches(*alternateCoordinate,
+                     getAffineDimExpr(3, getOperation().getContext())) ||
         !onlineSharedPairIsClosed(*shared, "shared_store", "expected",
                                   "barrier", "shared_load") ||
         onlineSharedPairIsClosed(*shared, "shared_store", "wrong", "barrier",
@@ -3174,9 +3442,12 @@ public:
     }
 
     llvm::SmallDenseMap<int64_t, int64_t> scheduleSources;
+    llvm::SmallDenseMap<int64_t, ScheduleTaskOp> scheduleTasks;
     for (ScheduleTaskOp task :
-         schedule.getBody().front().getOps<ScheduleTaskOp>())
+         schedule.getBody().front().getOps<ScheduleTaskOp>()) {
       scheduleSources.try_emplace(task.getOrdinal(), task.getSourceTask());
+      scheduleTasks.try_emplace(task.getOrdinal(), task);
+    }
     llvm::SmallDenseMap<int64_t, MaterializationBufferOp> planBuffers;
     for (MaterializationBufferOp buffer :
          plan.getBody().front().getOps<MaterializationBufferOp>())
@@ -3211,7 +3482,20 @@ public:
         module.emitError("online GPU entry has malformed control flow");
         return signalPassFailure();
       }
-      if (!onlineRelationSourceClosure(*cfg, relationOperations)) {
+      auto scheduled = scheduleTasks.find(entry.getSourceTask());
+      FailureOr<SmallVector<AffineExpr>> logicalCoordinates =
+          scheduled == scheduleTasks.end()
+              ? FailureOr<SmallVector<AffineExpr>>(failure())
+              : onlineLogicalCoordinateMaps(entry, scheduled->second);
+      const int64_t relationRank =
+          cast<RankedTensorType>(representativeScoreType).getRank();
+      FailureOr<SmallVector<int64_t>> relationAxes =
+          onlineRelationDomainAxes(materialization->second, region,
+                                   relationRank);
+      if (failed(logicalCoordinates) || failed(relationAxes) ||
+          !onlineRelationSourceClosure(*cfg, relationOperations,
+                                       *logicalCoordinates, *relationAxes,
+                                       module.getContext())) {
         module.emitError("online GPU Relation index dataflow is not source-bound");
         return signalPassFailure();
       }
