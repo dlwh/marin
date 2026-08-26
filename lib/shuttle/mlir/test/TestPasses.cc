@@ -1997,6 +1997,7 @@ struct OnlinePtxInstruction {
   int64_t block = -1;
   std::string role;
   std::string sourceRef;
+  std::optional<int64_t> logicalDimension;
   std::string predicate;
   bool negatedPredicate = false;
   std::string opcode;
@@ -2082,6 +2083,7 @@ FailureOr<OnlinePtxCfg> onlinePtxCfg(StringRef ptx) {
   int64_t block = 0;
   std::string pendingRole;
   std::string pendingSource;
+  std::optional<int64_t> pendingLogicalDimension;
   while (!ptx.empty()) {
     auto [line, remainder] = ptx.split('\n');
     ptx = remainder;
@@ -2095,6 +2097,17 @@ FailureOr<OnlinePtxCfg> onlinePtxCfg(StringRef ptx) {
       pendingSource =
           line.drop_front(StringRef("// shuttle.online.source_ref ").size())
               .str();
+      continue;
+    }
+    if (line.starts_with("// shuttle.online.logical_dimension ")) {
+      int64_t dimension = -1;
+      if (line
+              .drop_front(
+                  StringRef("// shuttle.online.logical_dimension ").size())
+              .getAsInteger(10, dimension) ||
+          dimension < 0)
+        return failure();
+      pendingLogicalDimension = dimension;
       continue;
     }
     if (line.empty() || line.starts_with("//") || line.starts_with(".") ||
@@ -2113,8 +2126,10 @@ FailureOr<OnlinePtxCfg> onlinePtxCfg(StringRef ptx) {
     instruction.block = block;
     instruction.role = std::move(pendingRole);
     instruction.sourceRef = std::move(pendingSource);
+    instruction.logicalDimension = pendingLogicalDimension;
     pendingRole.clear();
     pendingSource.clear();
+    pendingLogicalDimension.reset();
     if (line.starts_with("@")) {
       auto [guard, body] = line.split(' ');
       instruction.negatedPredicate = guard.starts_with("@!");
@@ -2293,6 +2308,80 @@ bool onlineSourceOperandIs(const OnlinePtxCfg &cfg, int64_t consumer,
          std::set<int64_t>{producer->second};
 }
 
+FailureOr<int64_t> onlineIotaLogicalDimension(RelationOp iota) {
+  if (iota.getParameters().size() != 1)
+    return failure();
+  auto parameter = dyn_cast<IntegerAttr>(iota.getParameters()[0]);
+  if (!parameter)
+    return failure();
+  int64_t dimension = parameter.getInt();
+  Value value = iota.getResult(0);
+  llvm::SmallDenseSet<Operation *> visited;
+  while (true) {
+    SmallVector<RelationOp> users;
+    for (Operation *user : value.getUsers())
+      if (auto relation = dyn_cast<RelationOp>(user))
+        users.push_back(relation);
+    if (users.size() != 1 || !visited.insert(users.front()).second)
+      return failure();
+    RelationOp user = users.front();
+    if (user.getSemantics() == RelationSemantics::Compare)
+      return dimension;
+    if (user.getSemantics() == RelationSemantics::Reshape) {
+      auto inputType = dyn_cast<RankedTensorType>(value.getType());
+      auto outputType =
+          dyn_cast<RankedTensorType>(user.getResult(0).getType());
+      if (!inputType || !outputType || dimension < 0 ||
+          dimension >= inputType.getRank())
+        return failure();
+      SmallVector<int64_t> candidates;
+      for (int64_t output = 0; output < outputType.getRank(); ++output)
+        if (outputType.getDimSize(output) == inputType.getDimSize(dimension) &&
+            outputType.getDimSize(output) != 1)
+          candidates.push_back(output);
+      if (candidates.size() != 1)
+        return failure();
+      dimension = candidates.front();
+    } else if (user.getSemantics() ==
+               RelationSemantics::BroadcastInDim) {
+      if (dimension < 0 || dimension >= user.getParameters().size())
+        return failure();
+      auto mapped = dyn_cast<IntegerAttr>(user.getParameters()[dimension]);
+      if (!mapped)
+        return failure();
+      dimension = mapped.getInt();
+    } else if (user.getSemantics() != RelationSemantics::Add) {
+      return failure();
+    }
+    value = user.getResult(0);
+  }
+}
+
+bool onlineOperandDependsOnCoordinateBuiltin(const OnlinePtxCfg &cfg,
+                                             int64_t instruction,
+                                             StringRef operand) {
+  std::set<std::pair<int64_t, std::string>> visited;
+  std::vector<std::pair<int64_t, std::string>> worklist{
+      {instruction, operand.str()}};
+  while (!worklist.empty()) {
+    auto [use, value] = std::move(worklist.back());
+    worklist.pop_back();
+    if (!visited.insert({use, value}).second)
+      continue;
+    if (value == "%tid.x" || value == "%ctaid.x" || value == "%ntid.x" ||
+        value == "%laneid")
+      return true;
+    for (int64_t definition : onlineReachingDefinitions(cfg, use, value)) {
+      if (definition == kOnlineUndefinedDefinition)
+        continue;
+      for (const std::string &dependency :
+           llvm::drop_begin(cfg.instructions[definition].operands))
+        worklist.emplace_back(definition, dependency);
+    }
+  }
+  return false;
+}
+
 bool onlineRoleIs(const OnlinePtxCfg &cfg, StringRef role,
                   ArrayRef<StringRef> opcodes,
                   ArrayRef<StringRef> dependencies = {}) {
@@ -2335,11 +2424,21 @@ bool onlineRelationSourceClosure(const OnlinePtxCfg &cfg,
                                    onlineSourceKey(operandSource));
     };
     switch (relation.getSemantics()) {
-    case RelationSemantics::Iota:
+    case RelationSemantics::Iota: {
+      FailureOr<int64_t> logicalDimension =
+          onlineIotaLogicalDimension(relation);
       if (!StringRef(ptx.opcode).starts_with("mov.u32") &&
           !StringRef(ptx.opcode).starts_with("mov.s32"))
         return false;
+      if (failed(logicalDimension) ||
+          ptx.logicalDimension != *logicalDimension ||
+          ptx.operands.size() != 2 ||
+          !StringRef(ptx.operands[1]).starts_with("%") ||
+          !onlineOperandDependsOnCoordinateBuiltin(
+              cfg, instruction->second, ptx.operands[1]))
+        return false;
       break;
+    }
     case RelationSemantics::Constant: {
       if (!StringRef(ptx.opcode).starts_with("mov.") ||
           relation.getParameters().size() != 1)
@@ -2372,12 +2471,19 @@ bool onlineRelationSourceClosure(const OnlinePtxCfg &cfg,
         return false;
       break;
     }
-    case RelationSemantics::Convert:
-      if ((!StringRef(ptx.opcode).starts_with("cvt.") &&
-           !StringRef(ptx.opcode).starts_with("selp.f32")) ||
-          !relationOperandSource(0, 1))
+    case RelationSemantics::Convert: {
+      const bool convert = StringRef(ptx.opcode).starts_with("cvt.") &&
+                           relationOperandSource(0, 1);
+      const bool select =
+          StringRef(ptx.opcode).starts_with("selp.f32") &&
+          ptx.operands.size() == 4 &&
+          ptx.operands[1] == "0f3F800000" &&
+          ptx.operands[2] == "0f00000000" &&
+          relationOperandSource(0, 3);
+      if (!convert && !select)
         return false;
       break;
+    }
     case RelationSemantics::Select: {
       if (!StringRef(ptx.opcode).starts_with("selp.f32"))
         return false;
@@ -3286,8 +3392,8 @@ public:
                           onlineSourceKey(source))
                              .str();
       });
-      needle = kind == "relation-offset" ? "add" : "mov";
-      replacement = kind == "relation-offset" ? "sub" : "xor";
+      needle = kind == "relation-offset" ? "add" : "";
+      replacement = kind == "relation-offset" ? "sub" : "";
     } else if (kind == "finalize") {
       role = "finalize";
       needle = "div";
@@ -3333,14 +3439,17 @@ public:
       StringRef localNeedleText = needle;
       StringRef localReplacement = replacement;
       size_t localNeedle = instruction.find(localNeedleText);
-      if (kind == "shared-value") {
+      if (kind == "shared-value" || kind == "relation-iota") {
         std::vector<std::string> tokens = onlinePtxTokens(instruction);
         if (tokens.size() < 2 || tokens[1].empty() ||
-            !llvm::isDigit(tokens[1].back()))
+            (!llvm::isDigit(tokens[1].back()) &&
+             !StringRef(tokens[1]).ends_with(".x")))
           continue;
         localNeedleText = tokens[1];
         std::string changed = tokens[1];
-        changed.back() = changed.back() == '0' ? '1' : '0';
+        changed.back() = llvm::isDigit(changed.back())
+                             ? (changed.back() == '0' ? '1' : '0')
+                             : 'y';
         localReplacement = changed;
         localNeedle = instruction.find(localNeedleText);
       }
