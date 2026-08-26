@@ -5,6 +5,11 @@
 // This compile-static oracle does not claim NVIDIA numerical execution. A
 // later hardware gate must compare transported bundles with ordinary JAX.
 
+// The test-only CFG lattice rejects predicate-false undef, unreachable
+// bra.uni blocks, swapped FMA roles, alternate output pointers, and wrong
+// shared-state store values independently of the future emitter.
+// RUN: shuttle-test-opt %s --shuttle-test-verify-online-ptx-oracle -o /dev/null | FileCheck %s --check-prefix=ORACLE
+
 // Both rank-5 GQA score domains must lower with an executable-level semantic
 // certificate for Relation predicate application and the {m,l,o}
 // update/merge/finalize protocol.
@@ -26,6 +31,7 @@
 // RUN: not shuttle-test-opt %S/Inputs/jax-0.10.1-f32-causal-gqa-online-axis4.mlir --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-test-set-fast-region-policy --shuttle-test-set-prefer-fusion-tuning --shuttle-plan-row-fold-materialization --shuttle-verify-materialization-plan --shuttle-plan-simt32-row-fold-schedule --shuttle-verify-simt32-row-fold-schedule --shuttle-build-gpu-executable-bundle --shuttle-verify-gpu-executable-bundle '--shuttle-test-corrupt-online-gpu-semantics=kind=exp' --shuttle-test-verify-online-gpu-execution -o /dev/null 2>&1 | FileCheck %s --check-prefix=SEMANTICS
 // RUN: not shuttle-test-opt %S/Inputs/jax-0.10.1-f32-causal-gqa-online-axis4.mlir --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-test-set-fast-region-policy --shuttle-test-set-prefer-fusion-tuning --shuttle-plan-row-fold-materialization --shuttle-verify-materialization-plan --shuttle-plan-simt32-row-fold-schedule --shuttle-verify-simt32-row-fold-schedule --shuttle-build-gpu-executable-bundle --shuttle-verify-gpu-executable-bundle '--shuttle-test-corrupt-online-gpu-semantics=kind=update' --shuttle-test-verify-online-gpu-execution -o /dev/null 2>&1 | FileCheck %s --check-prefix=SEMANTICS
 // RUN: not shuttle-test-opt %S/Inputs/jax-0.10.1-f32-causal-gqa-online-axis4.mlir --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-test-set-fast-region-policy --shuttle-test-set-prefer-fusion-tuning --shuttle-plan-row-fold-materialization --shuttle-verify-materialization-plan --shuttle-plan-simt32-row-fold-schedule --shuttle-verify-simt32-row-fold-schedule --shuttle-build-gpu-executable-bundle --shuttle-verify-gpu-executable-bundle '--shuttle-test-corrupt-online-gpu-semantics=kind=shared-merge' --shuttle-test-verify-online-gpu-execution -o /dev/null 2>&1 | FileCheck %s --check-prefix=SEMANTICS
+// RUN: not shuttle-test-opt %S/Inputs/jax-0.10.1-f32-causal-gqa-online-axis4.mlir --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-test-set-fast-region-policy --shuttle-test-set-prefer-fusion-tuning --shuttle-plan-row-fold-materialization --shuttle-verify-materialization-plan --shuttle-plan-simt32-row-fold-schedule --shuttle-verify-simt32-row-fold-schedule --shuttle-build-gpu-executable-bundle --shuttle-verify-gpu-executable-bundle '--shuttle-test-corrupt-online-gpu-semantics=kind=shared-value' --shuttle-test-verify-online-gpu-execution -o /dev/null 2>&1 | FileCheck %s --check-prefix=SEMANTICS
 // RUN: not shuttle-test-opt %S/Inputs/jax-0.10.1-f32-causal-gqa-online-axis4.mlir --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-test-set-fast-region-policy --shuttle-test-set-prefer-fusion-tuning --shuttle-plan-row-fold-materialization --shuttle-verify-materialization-plan --shuttle-plan-simt32-row-fold-schedule --shuttle-verify-simt32-row-fold-schedule --shuttle-build-gpu-executable-bundle --shuttle-verify-gpu-executable-bundle '--shuttle-test-corrupt-online-gpu-semantics=kind=output-store' --shuttle-test-verify-online-gpu-execution -o /dev/null 2>&1 | FileCheck %s --check-prefix=SEMANTICS
 
 // Public ABI source-buffer mutations fail the independent projection oracle.
@@ -44,3 +50,6 @@
 // ABI: online GPU operand ABI is not source-bound
 // FALLBACK: requires one source-bound executable materialization plan per GPU region
 // SOURCE-ORDERED: requires one source-bound executable materialization plan per GPU region
+// ORACLE: online_ptx_oracle_mutations = complete
+
+module {}

@@ -2006,6 +2006,7 @@ struct OnlinePtxInstruction {
 
 using OnlineDefinitionState =
     std::map<std::string, std::set<int64_t>>;
+constexpr int64_t kOnlineUndefinedDefinition = -1;
 
 struct OnlinePtxCfg {
   std::vector<OnlinePtxInstruction> instructions;
@@ -2057,8 +2058,11 @@ void onlineTransfer(const OnlinePtxInstruction &instruction,
   if (instruction.destination.empty())
     return;
   std::set<int64_t> &definitions = state[instruction.destination];
-  if (instruction.predicate.empty())
+  if (instruction.predicate.empty()) {
     definitions.clear();
+  } else if (definitions.empty()) {
+    definitions.insert(kOnlineUndefinedDefinition);
+  }
   definitions.insert(instruction.ordinal);
 }
 
@@ -2104,18 +2108,21 @@ FailureOr<OnlinePtxCfg> onlinePtxCfg(StringRef ptx) {
     instruction.operands = onlinePtxTokens(operands);
     if (onlinePtxDefinesValue(instruction.opcode, instruction.operands))
       instruction.destination = instruction.operands.front();
-    if (instruction.opcode == "bra") {
+    if (StringRef(instruction.opcode).starts_with("bra")) {
       StringRef target = operands.trim().rtrim(";");
       instruction.branchTarget = target.str();
+    } else if (StringRef(instruction.opcode).starts_with("br") ||
+               StringRef(instruction.opcode).starts_with("call")) {
+      return failure();
     }
     if (!instruction.role.empty() &&
         !cfg.roles.try_emplace(instruction.role, instruction.ordinal).second)
       return failure();
     cfg.blocks[block].push_back(instruction.ordinal);
     cfg.instructions.push_back(std::move(instruction));
-    if (cfg.instructions.back().opcode == "bra" ||
-        cfg.instructions.back().opcode == "ret" ||
-        cfg.instructions.back().opcode == "exit") {
+    if (StringRef(cfg.instructions.back().opcode).starts_with("bra") ||
+        StringRef(cfg.instructions.back().opcode).starts_with("ret") ||
+        StringRef(cfg.instructions.back().opcode).starts_with("exit")) {
       cfg.blocks.emplace_back();
       block = cfg.blocks.size() - 1;
     }
@@ -2130,14 +2137,15 @@ FailureOr<OnlinePtxCfg> onlinePtxCfg(StringRef ptx) {
     if (instructions.empty())
       continue;
     const OnlinePtxInstruction &last = cfg.instructions[instructions.back()];
-    if (last.opcode == "bra") {
+    if (StringRef(last.opcode).starts_with("bra")) {
       auto target = cfg.labels.find(last.branchTarget);
       if (target == cfg.labels.end())
         return failure();
       cfg.successors[blockOrdinal].push_back(target->second);
       if (!last.predicate.empty() && blockOrdinal + 1 < cfg.blocks.size())
         cfg.successors[blockOrdinal].push_back(blockOrdinal + 1);
-    } else if (last.opcode != "ret" && last.opcode != "exit" &&
+    } else if (!StringRef(last.opcode).starts_with("ret") &&
+               !StringRef(last.opcode).starts_with("exit") &&
                blockOrdinal + 1 < cfg.blocks.size()) {
       cfg.successors[blockOrdinal].push_back(blockOrdinal + 1);
     }
@@ -2155,9 +2163,21 @@ FailureOr<OnlinePtxCfg> onlinePtxCfg(StringRef ptx) {
          blockOrdinal < static_cast<int64_t>(cfg.blocks.size());
          ++blockOrdinal) {
       OnlineDefinitionState nextIncoming;
+      std::set<std::string> predecessorValues;
       for (int64_t predecessor : cfg.predecessors[blockOrdinal])
         for (const auto &[value, definitions] : outgoing[predecessor])
-          nextIncoming[value].insert(definitions.begin(), definitions.end());
+          predecessorValues.insert(value);
+      for (const std::string &value : predecessorValues) {
+        for (int64_t predecessor : cfg.predecessors[blockOrdinal]) {
+          auto definitions = outgoing[predecessor].find(value);
+          if (definitions == outgoing[predecessor].end()) {
+            nextIncoming[value].insert(kOnlineUndefinedDefinition);
+          } else {
+            nextIncoming[value].insert(definitions->second.begin(),
+                                       definitions->second.end());
+          }
+        }
+      }
       OnlineDefinitionState nextOutgoing = nextIncoming;
       for (int64_t instruction : cfg.blocks[blockOrdinal])
         onlineTransfer(cfg.instructions[instruction], nextOutgoing);
@@ -2255,32 +2275,90 @@ bool onlineRoleIs(const OnlinePtxCfg &cfg, StringRef role,
   });
 }
 
-std::set<std::string> onlinePointerParameters(const OnlinePtxCfg &cfg,
-                                              int64_t instruction,
-                                              StringRef pointer) {
-  std::set<std::string> parameters;
-  std::set<std::pair<int64_t, std::string>> visited;
-  std::vector<std::pair<int64_t, std::string>> worklist{
-      {instruction, pointer.str()}};
-  while (!worklist.empty()) {
-    auto [use, value] = std::move(worklist.back());
-    worklist.pop_back();
-    if (!visited.insert({use, value}).second)
-      continue;
-    if (StringRef(value).starts_with("p")) {
-      parameters.insert(value);
-      continue;
-    }
-    for (int64_t definition : onlineReachingDefinitions(cfg, use, value)) {
-      const OnlinePtxInstruction &producer = cfg.instructions[definition];
-      for (const std::string &operand :
-           llvm::drop_begin(producer.operands))
-        worklist.emplace_back(definition, operand);
-      if (!producer.predicate.empty())
-        worklist.emplace_back(definition, producer.predicate);
-    }
+struct OnlinePointerAlternatives {
+  bool valid = true;
+  std::vector<std::set<std::string>> parameters;
+};
+
+OnlinePointerAlternatives onlinePointerAlternatives(
+    const OnlinePtxCfg &cfg, int64_t instruction, StringRef value,
+    std::set<std::pair<int64_t, std::string>> &active) {
+  if (value.starts_with("p"))
+    return {true, {{value.str()}}};
+  if (!value.starts_with("%"))
+    return {true, {{}}};
+  if (!active.insert({instruction, value.str()}).second)
+    return {false, {}};
+  std::set<int64_t> definitions =
+      onlineReachingDefinitions(cfg, instruction, value);
+  if (definitions.empty()) {
+    const bool builtin = value.starts_with("%tid") ||
+                         value.starts_with("%ctaid") ||
+                         value.starts_with("%ntid") ||
+                         value.starts_with("%laneid");
+    active.erase({instruction, value.str()});
+    return {builtin, builtin ? std::vector<std::set<std::string>>{{}}
+                             : std::vector<std::set<std::string>>{}};
   }
-  return parameters;
+  OnlinePointerAlternatives result;
+  for (int64_t definition : definitions) {
+    if (definition == kOnlineUndefinedDefinition) {
+      result.valid = false;
+      continue;
+    }
+    const OnlinePtxInstruction &producer = cfg.instructions[definition];
+    StringRef opcode = producer.opcode;
+    const bool allowed = opcode.starts_with("ld.param.u64") ||
+                         opcode.starts_with("mov.u") ||
+                         opcode.starts_with("cvt.u") ||
+                         opcode.starts_with("add.u") ||
+                         opcode.starts_with("mul.lo.u") ||
+                         opcode.starts_with("mad.lo.u") ||
+                         opcode.starts_with("shl.b") ||
+                         opcode.starts_with("and.b") ||
+                         opcode.starts_with("or.b") ||
+                         opcode.starts_with("cvta.to.global.u64");
+    if (!allowed || !producer.predicate.empty()) {
+      result.valid = false;
+      continue;
+    }
+    std::vector<std::set<std::string>> alternatives{{}};
+    for (const std::string &operand : llvm::drop_begin(producer.operands)) {
+      OnlinePointerAlternatives child =
+          onlinePointerAlternatives(cfg, definition, operand, active);
+      if (!child.valid) {
+        result.valid = false;
+        alternatives.clear();
+        break;
+      }
+      std::vector<std::set<std::string>> combined;
+      for (const std::set<std::string> &left : alternatives)
+        for (const std::set<std::string> &right : child.parameters) {
+          std::set<std::string> merged = left;
+          merged.insert(right.begin(), right.end());
+          combined.push_back(std::move(merged));
+        }
+      alternatives = std::move(combined);
+    }
+    llvm::append_range(result.parameters, alternatives);
+  }
+  active.erase({instruction, value.str()});
+  return result;
+}
+
+bool onlinePointerIsOutputParameter(const OnlinePtxCfg &cfg,
+                                    int64_t instruction, StringRef pointer,
+                                    int64_t parameterIndex) {
+  std::set<std::pair<int64_t, std::string>> active;
+  OnlinePointerAlternatives alternatives =
+      onlinePointerAlternatives(cfg, instruction, pointer, active);
+  const std::set<std::string> expected{
+      (Twine("p") + Twine(parameterIndex)).str()};
+  return alternatives.valid && !alternatives.parameters.empty() &&
+         llvm::all_of(alternatives.parameters,
+                      [&](const std::set<std::string> &parameters) {
+                        return parameters == expected;
+                      });
 }
 
 std::string onlineAddressFingerprint(const OnlinePtxCfg &cfg,
@@ -2294,6 +2372,10 @@ std::string onlineAddressFingerprint(const OnlinePtxCfg &cfg,
   std::set<std::string> alternatives;
   for (int64_t definition :
        onlineReachingDefinitions(cfg, instruction, value)) {
+    if (definition == kOnlineUndefinedDefinition) {
+      alternatives.insert("$undef");
+      continue;
+    }
     const OnlinePtxInstruction &producer = cfg.instructions[definition];
     std::string fingerprint = producer.opcode;
     for (const std::string &operand : llvm::drop_begin(producer.operands)) {
@@ -2344,7 +2426,8 @@ bool onlineInstructionDominates(const OnlinePtxCfg &cfg, int64_t dominator,
 }
 
 bool onlineSharedPairIsClosed(const OnlinePtxCfg &cfg, StringRef storeRole,
-                              StringRef barrierRole, StringRef loadRole) {
+                              StringRef producerRole, StringRef barrierRole,
+                              StringRef loadRole) {
   auto store = cfg.roles.find(storeRole.str());
   auto barrier = cfg.roles.find(barrierRole.str());
   auto load = cfg.roles.find(loadRole.str());
@@ -2356,11 +2439,17 @@ bool onlineSharedPairIsClosed(const OnlinePtxCfg &cfg, StringRef storeRole,
   const OnlinePtxInstruction &barrierInstruction =
       cfg.instructions[barrier->second];
   const OnlinePtxInstruction &loadInstruction = cfg.instructions[load->second];
+  StringRef barrierOpcode = barrierInstruction.opcode;
+  const bool synchronizingBarrier =
+      barrierOpcode.starts_with("bar.sync") ||
+      barrierOpcode.starts_with("bar.warp.sync") ||
+      barrierOpcode.starts_with("barrier.cluster.wait");
   if (!StringRef(storeInstruction.opcode).starts_with("st.shared.") ||
-      !StringRef(barrierInstruction.opcode).starts_with("bar.") ||
+      !synchronizingBarrier ||
       !StringRef(loadInstruction.opcode).starts_with("ld.shared.") ||
       storeInstruction.operands.size() < 2 ||
-      loadInstruction.operands.size() < 2)
+      loadInstruction.operands.size() < 2 ||
+      !onlineRoleOperandIs(cfg, storeRole, 1, producerRole))
     return false;
   std::set<std::pair<int64_t, std::string>> storeActive;
   std::set<std::pair<int64_t, std::string>> loadActive;
@@ -2387,6 +2476,7 @@ bool onlineSharedPairIsClosed(const OnlinePtxCfg &cfg, StringRef storeRole,
     if (instruction.ordinal == store->second ||
         !StringRef(instruction.opcode).starts_with("st.shared.") ||
         instruction.operands.size() < 2 ||
+        !onlineInstructionReachable(cfg, store->second, instruction.ordinal) ||
         !onlineInstructionReachable(cfg, instruction.ordinal, load->second))
       continue;
     std::set<std::pair<int64_t, std::string>> active;
@@ -2406,8 +2496,8 @@ bool onlineRoleStoresToOutput(const OnlinePtxCfg &cfg, StringRef role,
   if (!StringRef(store.opcode).starts_with("st.global.") ||
       store.operands.size() < 2)
     return false;
-  return onlinePointerParameters(cfg, found->second, store.operands[0]) ==
-         std::set<std::string>{(Twine("p") + Twine(parameterIndex)).str()};
+  return onlinePointerIsOutputParameter(cfg, found->second, store.operands[0],
+                                        parameterIndex);
 }
 
 FailureOr<std::string> onlineComparisonOpcode(RelationOp relation) {
@@ -2475,12 +2565,20 @@ bool onlineMaximumProtocol(const OnlinePtxCfg &cfg, int64_t outputParameter,
 bool onlineScaledUpdate(const OnlinePtxCfg &cfg, StringRef scaledRole,
                         StringRef updateRole, StringRef scaleRole,
                         StringRef stateRole, StringRef newTermRole) {
-  return (onlineRoleIs(cfg, scaledRole, {"mul.rn.f32"},
-                       {scaleRole, stateRole}) &&
-          onlineRoleIs(cfg, updateRole, {"add.rn.f32"},
-                       {scaledRole, newTermRole})) ||
-         onlineRoleIs(cfg, updateRole, {"fma.rn.f32"},
-                      {scaleRole, stateRole, newTermRole});
+  const bool separate =
+      onlineRoleIs(cfg, scaledRole, {"mul.rn.f32"},
+                   {scaleRole, stateRole}) &&
+      onlineRoleIs(cfg, updateRole, {"add.rn.f32"},
+                   {scaledRole, newTermRole});
+  const bool orderedFmaOperands =
+      (onlineRoleOperandIs(cfg, updateRole, 1, scaleRole) &&
+       onlineRoleOperandIs(cfg, updateRole, 2, stateRole)) ||
+      (onlineRoleOperandIs(cfg, updateRole, 1, stateRole) &&
+       onlineRoleOperandIs(cfg, updateRole, 2, scaleRole));
+  const bool fused = onlineRoleIs(cfg, updateRole, {"fma.rn.f32"}) &&
+                     orderedFmaOperands &&
+                     onlineRoleOperandIs(cfg, updateRole, 3, newTermRole);
+  return separate || fused;
 }
 
 bool onlineExpOf(const OnlinePtxCfg &cfg, StringRef resultRole,
@@ -2554,12 +2652,12 @@ bool onlineStateProtocol(const OnlinePtxCfg &cfg, int64_t outputParameter,
                       {"shared_m_load", "merge_max"}) &&
          onlineExpOf(cfg, "merge_right_rescale", "merge_right_delta",
                      "merge_right_exp_argument") &&
-         onlineSharedPairIsClosed(cfg, "shared_m_store", "merge_barrier",
-                                  "shared_m_load") &&
-         onlineSharedPairIsClosed(cfg, "shared_l_store", "merge_barrier",
-                                  "shared_l_load") &&
-         onlineSharedPairIsClosed(cfg, "shared_o_store", "merge_barrier",
-                                  "shared_o_load") &&
+         onlineSharedPairIsClosed(cfg, "shared_m_store", "max_update",
+                                  "merge_barrier", "shared_m_load") &&
+         onlineSharedPairIsClosed(cfg, "shared_l_store", "l_update",
+                                  "merge_barrier", "shared_l_load") &&
+         onlineSharedPairIsClosed(cfg, "shared_o_store", "o_update",
+                                  "merge_barrier", "shared_o_load") &&
          onlineRoleIs(cfg, "merge_right_l", {"mul.rn.f32"},
                       {"merge_right_rescale", "shared_l_load"}) &&
          onlineScaledUpdate(cfg, "merge_left_l", "merge_l",
@@ -2574,6 +2672,104 @@ bool onlineStateProtocol(const OnlinePtxCfg &cfg, int64_t outputParameter,
          onlineRoleIs(cfg, "public_store", {"st.global."}, {"finalize"}) &&
          onlineRoleStoresToOutput(cfg, "public_store", outputParameter);
 }
+
+class VerifyOnlinePtxOraclePass
+    : public MutationPass<VerifyOnlinePtxOraclePass> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(VerifyOnlinePtxOraclePass)
+  StringRef getArgument() const final {
+    return "shuttle-test-verify-online-ptx-oracle";
+  }
+  void runOnOperation() override {
+    auto parse = [&](StringRef ptx) -> FailureOr<OnlinePtxCfg> {
+      FailureOr<OnlinePtxCfg> cfg = onlinePtxCfg(ptx);
+      if (failed(cfg))
+        getOperation().emitError("synthetic online PTX oracle case did not parse");
+      return cfg;
+    };
+    FailureOr<OnlinePtxCfg> predicated = parse(R"ptx(
+// shuttle.online.role maybe_value
+@%p0 mov.f32 %f0, 0f00000000;
+// shuttle.online.role use
+mov.f32 %f1, %f0;
+ret;
+)ptx");
+    FailureOr<OnlinePtxCfg> branch = parse(R"ptx(
+bra.uni LIVE;
+// shuttle.online.role dead
+mov.f32 %f0, 0f00000000;
+LIVE:
+// shuttle.online.role live
+mov.f32 %f1, 0f00000000;
+ret;
+)ptx");
+    FailureOr<OnlinePtxCfg> correctFma = parse(R"ptx(
+// shuttle.online.role scale
+mov.f32 %f0, 0f3F800000;
+// shuttle.online.role state
+mov.f32 %f1, 0f3F800000;
+// shuttle.online.role term
+mov.f32 %f2, 0f3F800000;
+// shuttle.online.role update
+fma.rn.f32 %f3, %f0, %f1, %f2;
+ret;
+)ptx");
+    FailureOr<OnlinePtxCfg> wrongFma = parse(R"ptx(
+// shuttle.online.role scale
+mov.f32 %f0, 0f3F800000;
+// shuttle.online.role state
+mov.f32 %f1, 0f3F800000;
+// shuttle.online.role term
+mov.f32 %f2, 0f3F800000;
+// shuttle.online.role update
+fma.rn.f32 %f3, %f0, %f2, %f1;
+ret;
+)ptx");
+    FailureOr<OnlinePtxCfg> pointer = parse(R"ptx(
+ld.param.u64 %rd0, [p0];
+setp.eq.u32 %p0, 0, 0;
+@%p0 mov.u64 %rd0, 0;
+// shuttle.online.role store
+st.global.f32 [%rd0], %f0;
+ret;
+)ptx");
+    FailureOr<OnlinePtxCfg> shared = parse(R"ptx(
+mov.u64 %rd0, 0;
+// shuttle.online.role expected
+mov.f32 %f0, 0f3F800000;
+// shuttle.online.role wrong
+mov.f32 %f1, 0f00000000;
+// shuttle.online.role shared_store
+st.shared.f32 [%rd0], %f0;
+// shuttle.online.role barrier
+bar.sync 0;
+// shuttle.online.role shared_load
+ld.shared.f32 %f2, [%rd0];
+ret;
+)ptx");
+    if (failed(predicated) || failed(branch) || failed(correctFma) ||
+        failed(wrongFma) || failed(pointer) || failed(shared))
+      return signalPassFailure();
+    if (onlineRoleDirectlyReaches(*predicated, "maybe_value",
+                                  predicated->roles.at("use")) ||
+        onlineRoleIs(*branch, "dead", {"mov.f32"}) ||
+        !onlineRoleIs(*branch, "live", {"mov.f32"}) ||
+        !onlineScaledUpdate(*correctFma, "unused", "update", "scale",
+                            "state", "term") ||
+        onlineScaledUpdate(*wrongFma, "unused", "update", "scale",
+                           "state", "term") ||
+        onlineRoleStoresToOutput(*pointer, "store", 0) ||
+        !onlineSharedPairIsClosed(*shared, "shared_store", "expected",
+                                  "barrier", "shared_load") ||
+        onlineSharedPairIsClosed(*shared, "shared_store", "wrong", "barrier",
+                                 "shared_load")) {
+      getOperation().emitError(
+          "online PTX oracle accepted a control/dataflow near miss");
+      return signalPassFailure();
+    }
+    llvm::outs() << "online_ptx_oracle_mutations = complete\n";
+  }
+};
 
 void refreshExecutableBundle(ModuleOp module, bool refreshCodeDigest);
 
@@ -2722,6 +2918,8 @@ public:
         module.emitError("online GPU entry has malformed control flow");
         return signalPassFailure();
       }
+      bool entryHasSemanticOutput = false;
+      bool entryClosed = true;
       for (auto [outputIndex, output] :
            llvm::enumerate(entry.getOutputBuffers())) {
         auto buffer = planBuffers.find(output);
@@ -2729,12 +2927,25 @@ public:
           continue;
         const int64_t parameter =
             entry.getInputBuffers().size() + outputIndex;
-        if (buffer->second.getStorage() == MaterializationStorage::Temporary)
-          compactState |=
+        if (buffer->second.getStorage() == MaterializationStorage::Temporary) {
+          entryHasSemanticOutput = true;
+          const bool valid =
               onlineMaximumProtocol(*cfg, parameter, *comparisonOpcode);
-        if (buffer->second.getLiveOut())
-          publicState |=
+          compactState |= valid;
+          entryClosed &= valid;
+        }
+        if (buffer->second.getLiveOut()) {
+          entryHasSemanticOutput = true;
+          const bool valid =
               onlineStateProtocol(*cfg, parameter, *comparisonOpcode);
+          publicState |= valid;
+          entryClosed &= valid;
+        }
+      }
+      if (!entryHasSemanticOutput || !entryClosed) {
+        module.emitError(
+            "online GPU CFG does not prove predicate/update/merge/finalize");
+        return signalPassFailure();
       }
     }
     if (coveredTasks.size() != onlineTasks.size() || !compactState ||
@@ -2863,6 +3074,8 @@ public:
       role = "shared_l_load";
       needle = "shared";
       replacement = "global";
+    } else if (kind == "shared-value") {
+      role = "shared_l_store";
     } else if (kind == "output-store") {
       role = "public_store";
       needle = "global";
@@ -2878,7 +3091,7 @@ public:
 
     SmallVector<int8_t> code(device.getCode());
     StringRef bytes(reinterpret_cast<const char *>(code.data()), code.size());
-    std::optional<size_t> mutationOffset;
+    SmallVector<std::pair<size_t, std::string>> mutations;
     const std::string phaseMarker =
         (Twine("// shuttle.online.role ") + phaseRole).str();
     const std::string roleMarker =
@@ -2907,40 +3120,49 @@ public:
         instructionEnd = slice.size();
       StringRef instruction =
           slice.slice(instructionStart + 1, instructionEnd);
-      size_t localNeedle = instruction.find(needle);
+      StringRef localNeedleText = needle;
+      StringRef localReplacement = replacement;
+      size_t localNeedle = instruction.find(localNeedleText);
+      if (kind == "shared-value") {
+        std::vector<std::string> tokens = onlinePtxTokens(instruction);
+        if (tokens.size() < 2 || tokens[1].empty() ||
+            !llvm::isDigit(tokens[1].back()))
+          continue;
+        localNeedleText = tokens[1];
+        std::string changed = tokens[1];
+        changed.back() = changed.back() == '0' ? '1' : '0';
+        localReplacement = changed;
+        localNeedle = instruction.find(localNeedleText);
+      }
       if (localNeedle == StringRef::npos && kind == "exp") {
-        needle = "exp";
-        replacement = "log";
-        localNeedle = instruction.find(needle);
+        localNeedleText = "exp";
+        localReplacement = "log";
+        localNeedle = instruction.find(localNeedleText);
       }
       if (localNeedle == StringRef::npos && kind == "update") {
-        needle = "fma";
-        replacement = "mad";
-        localNeedle = instruction.find(needle);
+        localNeedleText = "fma";
+        localReplacement = "mad";
+        localNeedle = instruction.find(localNeedleText);
       }
       if (localNeedle == StringRef::npos && kind == "finalize") {
-        needle = "rcp";
-        replacement = "cos";
-        localNeedle = instruction.find(needle);
+        localNeedleText = "rcp";
+        localReplacement = "cos";
+        localNeedle = instruction.find(localNeedleText);
       }
-      if (localNeedle == StringRef::npos || needle.size() != replacement.size())
+      if (localNeedle == StringRef::npos ||
+          localNeedleText.size() != localReplacement.size())
         continue;
       const size_t absolute = entry.getCodeOffset() + instructionStart + 1 +
                               localNeedle;
-      if (mutationOffset) {
-        getOperation().emitError(
-            "online GPU semantic mutation has multiple reaching targets");
-        return signalPassFailure();
-      }
-      mutationOffset = absolute;
+      mutations.emplace_back(absolute, localReplacement.str());
     }
-    if (!mutationOffset) {
+    if (mutations.empty()) {
       getOperation().emitError(
           "test fixture lacks the requested reaching semantic role");
       return signalPassFailure();
     }
-    std::copy(replacement.begin(), replacement.end(),
-              code.begin() + *mutationOffset);
+    for (const auto &[offset, changed] : mutations)
+      std::copy(changed.begin(), changed.end(), code.begin() + offset);
     device.setCodeAttr(DenseI8ArrayAttr::get(device.getContext(), code));
     refreshExecutableBundle(getOperation(), true);
   }
@@ -4565,6 +4787,7 @@ void registerMutationPasses() {
   PassRegistration<SetPreferFusionTuningPass>();
   PassRegistration<RewireOnlineMaximumYieldPass>();
   PassRegistration<VerifyOnlineSufficientStatePass>();
+  PassRegistration<VerifyOnlinePtxOraclePass>();
   PassRegistration<VerifyOnlineGpuExecutionPass>();
   PassRegistration<VerifyOnlineFallbackPass>();
   PassRegistration<CorruptOnlineGpuSemanticsPass>();
