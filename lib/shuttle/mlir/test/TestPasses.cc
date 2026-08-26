@@ -2413,6 +2413,17 @@ public:
         if (auto region = dyn_cast_or_null<RegionOp>(parent);
             region && argument.getOwner() == &region.getBody().front()) {
           collectValue(region.getInputs()[argument.getArgNumber()]);
+          return;
+        }
+        if (auto fold = dyn_cast_or_null<FoldOp>(parent);
+            fold && argument.getOwner() == &fold.getCombiner().front()) {
+          const unsigned argumentNumber = argument.getArgNumber();
+          if (argumentNumber < fold.getInputs().size()) {
+            collectValue(fold.getInputs()[argumentNumber]);
+          } else {
+            collectValue(fold.getInitializers()[argumentNumber -
+                                                fold.getInputs().size()]);
+          }
         }
         return;
       }
@@ -2427,14 +2438,17 @@ public:
         collectValue(yield.getValues()[result.getResultNumber()]);
         return;
       }
+      if (auto fold = dyn_cast<FoldOp>(operation)) {
+        auto result = cast<OpResult>(value);
+        auto yield = cast<YieldOp>(fold.getCombiner().front().getTerminator());
+        collectOperationSources(operation);
+        collectValue(yield.getValues()[result.getResultNumber()]);
+        return;
+      }
       if (!seenOperations.insert(operation).second) {
         return;
       }
       collectOperationSources(operation);
-      if (auto fold = dyn_cast<FoldOp>(operation)) {
-        fold.getCombiner().walk(
-            [&](Operation *nested) { collectOperationSources(nested); });
-      }
       for (Value operand : operation->getOperands()) {
         collectValue(operand);
       }

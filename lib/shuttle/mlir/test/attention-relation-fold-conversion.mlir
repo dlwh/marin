@@ -39,6 +39,11 @@
 // RUN: shuttle-test-opt %S/Inputs/output-dependency-mutation.mlir --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-verify-source-coverage --shuttle-test-verify-output-dependency-coverage -o /dev/null | FileCheck %s --check-prefix=DEPENDENCIES
 // RUN: not shuttle-test-opt %S/Inputs/output-dependency-mutation.mlir --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-verify-source-coverage --shuttle-test-rewire-return --shuttle-test-verify-output-dependency-coverage -o /dev/null 2>&1 | FileCheck %s --check-prefix=DEAD
 
+// A selected scalar combiner operation must likewise reach the exact Fold
+// result yield; merely remaining present in the combiner is not sufficient.
+// RUN: shuttle-test-opt %S/Inputs/output-dependency-fold-mutation.mlir --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-verify-source-coverage --shuttle-test-verify-output-dependency-coverage -o /dev/null | FileCheck %s --check-prefix=DEPENDENCIES
+// RUN: not shuttle-test-opt %S/Inputs/output-dependency-fold-mutation.mlir --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-verify-source-coverage --shuttle-test-rewire-fold-yield --shuttle-test-verify-output-dependency-coverage -o /dev/null 2>&1 | FileCheck %s --check-prefix=DEAD
+
 // Relation is generic index-domain algebra. The check intentionally permits
 // one lossless materialized relation or another equivalent representation.
 // AXIS4-DAG: policy = #shuttle.policy<source_ordered>
