@@ -3,6 +3,7 @@
 
 #include "TestPasses.h"
 
+#include <functional>
 #include <string>
 #include <type_traits>
 
@@ -2364,6 +2365,104 @@ public:
   }
 };
 
+class VerifyOutputDependencyCoveragePass
+    : public MutationPass<VerifyOutputDependencyCoveragePass> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
+      VerifyOutputDependencyCoveragePass)
+  StringRef getArgument() const final {
+    return "shuttle-test-verify-output-dependency-coverage";
+  }
+  StringRef getDescription() const final {
+    return "Verify every covered source result reaches a public output";
+  }
+
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+    auto manifest = module->getAttrOfType<DictionaryAttr>(kManifest);
+    auto complete = manifest ? manifest.getAs<ArrayAttr>("complete")
+                             : ArrayAttr{};
+    auto excluded = manifest ? manifest.getAs<ArrayAttr>("excluded")
+                             : ArrayAttr{};
+    if (!complete || !excluded || !excluded.empty()) {
+      module.emitError(
+          "output dependency coverage requires complete selected coverage");
+      return signalPassFailure();
+    }
+
+    llvm::SmallDenseSet<Attribute> expected(complete.begin(), complete.end());
+    llvm::SmallDenseSet<Attribute> reachable;
+    llvm::DenseSet<Value> seenValues;
+    llvm::DenseSet<Operation *> seenOperations;
+    auto collectOperationSources = [&](Operation *operation) {
+      if (Attribute source = operation->getAttr("source")) {
+        reachable.insert(source);
+      }
+      if (auto sources = operation->getAttrOfType<ArrayAttr>(kSourceRefs)) {
+        reachable.insert(sources.begin(), sources.end());
+      }
+    };
+
+    std::function<void(Value)> collectValue;
+    collectValue = [&](Value value) {
+      if (!seenValues.insert(value).second) {
+        return;
+      }
+      if (auto argument = dyn_cast<BlockArgument>(value)) {
+        Operation *parent = argument.getOwner()->getParentOp();
+        if (auto region = dyn_cast_or_null<RegionOp>(parent);
+            region && argument.getOwner() == &region.getBody().front()) {
+          collectValue(region.getInputs()[argument.getArgNumber()]);
+        }
+        return;
+      }
+
+      Operation *operation = value.getDefiningOp();
+      if (!operation || !seenOperations.insert(operation).second) {
+        return;
+      }
+      collectOperationSources(operation);
+      if (auto region = dyn_cast<RegionOp>(operation)) {
+        auto result = cast<OpResult>(value);
+        auto yield = cast<YieldOp>(region.getBody().front().getTerminator());
+        collectValue(yield.getValues()[result.getResultNumber()]);
+      }
+      if (auto fold = dyn_cast<FoldOp>(operation)) {
+        fold.getCombiner().walk(
+            [&](Operation *nested) { collectOperationSources(nested); });
+      }
+      for (Value operand : operation->getOperands()) {
+        collectValue(operand);
+      }
+    };
+
+    bool hasOutput = false;
+    for (func::FuncOp function : module.getOps<func::FuncOp>()) {
+      for (Block &block : function.getBody()) {
+        auto returnOp = dyn_cast<func::ReturnOp>(block.getTerminator());
+        if (!returnOp) {
+          continue;
+        }
+        for (Value output : returnOp.getOperands()) {
+          hasOutput = true;
+          collectValue(output);
+        }
+      }
+    }
+    const bool completeTrace =
+        reachable.size() == expected.size() &&
+        llvm::all_of(expected, [&](Attribute source) {
+          return reachable.contains(source);
+        });
+    if (!hasOutput || !completeTrace) {
+      module.emitError(
+          "covered source results do not form a complete public-output dependency trace");
+      return signalPassFailure();
+    }
+    llvm::outs() << "output_dependency_coverage = complete\n";
+  }
+};
+
 void refreshExecutableBundle(ModuleOp module, bool refreshCodeDigest) {
   auto device = *module.getOps<DeviceModuleOp>().begin();
   auto bundle = *module.getOps<ExecutableBundleOp>().begin();
@@ -2736,6 +2835,7 @@ void registerMutationPasses() {
   PassRegistration<ScheduleLifetimePass>();
   PassRegistration<RenameSymbolsPass>();
   PassRegistration<SetFastRegionPolicyPass>();
+  PassRegistration<VerifyOutputDependencyCoveragePass>();
   PassRegistration<ReportExecutableBundleFingerprintPass>();
   PassRegistration<CorruptExecutablePass>();
 }
