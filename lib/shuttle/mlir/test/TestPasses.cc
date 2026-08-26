@@ -1525,6 +1525,10 @@ FailureOr<AffineMap> projectedReductionCoordinates(Type scoreType,
   return AffineMap::get(score.getRank(), 0, coordinates, score.getContext());
 }
 
+FailureOr<SmallVector<int64_t>> onlineRelationDomainAxes(
+    MaterializationTaskOp task, RegionOp region,
+    ArrayRef<RelationOp> relations, int64_t relationRank);
+
 class VerifyOnlineSufficientStatePass
     : public MutationPass<VerifyOnlineSufficientStatePass> {
 public:
@@ -1693,6 +1697,7 @@ public:
     FoldOp additiveFold;
     MapOp exponentialMap;
     ContractOp weightedContract;
+    SmallVector<RelationOp> relationOperations;
     auto regionYield = cast<YieldOp>(region.getBody().front().getTerminator());
     for (Operation *operation : onlineAlgebra) {
       if (auto fold = dyn_cast<FoldOp>(operation)) {
@@ -1721,6 +1726,8 @@ public:
         if (reachesOutput && !feedsAnotherContract) {
           weightedContract = contract;
         }
+      } else if (auto relation = dyn_cast<RelationOp>(operation)) {
+        relationOperations.push_back(relation);
       }
     }
     bool relationFeedsScore = false;
@@ -1882,6 +1889,23 @@ public:
       module.emitError(
           "online composition does not prove {m,l,o} state semantics");
       return signalPassFailure();
+    }
+
+    auto rankedScoreType = dyn_cast<RankedTensorType>(scoreType);
+    if (!rankedScoreType || relationOperations.empty()) {
+      module.emitError("online composition lacks a Relation score domain");
+      return signalPassFailure();
+    }
+    for (MaterializationTaskOp task :
+         plan.getBody().front().getOps<MaterializationTaskOp>()) {
+      if (!compositionTaskOrdinals.contains(task.getOrdinal()))
+        continue;
+      if (failed(onlineRelationDomainAxes(task, region, relationOperations,
+                                          rankedScoreType.getRank()))) {
+        module.emitError(
+            "online composition has a mismatched Relation score axis map");
+        return signalPassFailure();
+      }
     }
 
     int64_t actualCandidateBytes = 0;
@@ -2357,31 +2381,6 @@ FailureOr<int64_t> onlineIotaLogicalDimension(RelationOp iota) {
   }
 }
 
-bool onlineOperandDependsOnCoordinateBuiltin(const OnlinePtxCfg &cfg,
-                                             int64_t instruction,
-                                             StringRef operand) {
-  std::set<std::pair<int64_t, std::string>> visited;
-  std::vector<std::pair<int64_t, std::string>> worklist{
-      {instruction, operand.str()}};
-  while (!worklist.empty()) {
-    auto [use, value] = std::move(worklist.back());
-    worklist.pop_back();
-    if (!visited.insert({use, value}).second)
-      continue;
-    if (value == "%tid.x" || value == "%ctaid.x" || value == "%ntid.x" ||
-        value == "%laneid")
-      return true;
-    for (int64_t definition : onlineReachingDefinitions(cfg, use, value)) {
-      if (definition == kOnlineUndefinedDefinition)
-        continue;
-      for (const std::string &dependency :
-           llvm::drop_begin(cfg.instructions[definition].operands))
-        worklist.emplace_back(definition, dependency);
-    }
-  }
-  return false;
-}
-
 struct OnlineIndexAlternatives {
   bool valid = true;
   SmallVector<AffineExpr> values;
@@ -2438,7 +2437,8 @@ OnlineIndexAlternatives onlineIndexAlternatives(
     }
     StringRef opcode = producer.opcode;
     for (AffineExpr left : operands.front().values) {
-      if (opcode.starts_with("mov.") || opcode.starts_with("cvt.")) {
+      if (opcode == "mov.u32" || opcode == "mov.s32" ||
+          opcode == "mov.b32") {
         if (operands.size() != 1)
           result.valid = false;
         else
@@ -2452,15 +2452,15 @@ OnlineIndexAlternatives onlineIndexAlternatives(
       for (AffineExpr right : operands[1].values) {
         auto leftConstant = dyn_cast<AffineConstantExpr>(left);
         auto rightConstant = dyn_cast<AffineConstantExpr>(right);
-        if (opcode.starts_with("add.")) {
+        if (opcode == "add.u32" || opcode == "add.s32") {
           result.values.push_back(left + right);
-        } else if (opcode.starts_with("mul.lo.") &&
+        } else if ((opcode == "mul.lo.u32" || opcode == "mul.lo.s32") &&
                    (leftConstant || rightConstant)) {
           result.values.push_back(left * right);
-        } else if (opcode.starts_with("div.u32") && rightConstant &&
+        } else if (opcode == "div.u32" && rightConstant &&
                    rightConstant.getValue() > 0) {
           result.values.push_back(left.floorDiv(rightConstant.getValue()));
-        } else if (opcode.starts_with("rem.u32") && rightConstant &&
+        } else if (opcode == "rem.u32" && rightConstant &&
                    rightConstant.getValue() > 0) {
           result.values.push_back(left % rightConstant.getValue());
         } else {
@@ -2570,7 +2570,8 @@ FailureOr<SmallVector<AffineExpr>> onlineLogicalCoordinateMaps(
 }
 
 FailureOr<SmallVector<int64_t>> onlineRelationDomainAxes(
-    MaterializationTaskOp task, RegionOp region, int64_t relationRank) {
+    MaterializationTaskOp task, RegionOp region,
+    ArrayRef<RelationOp> relations, int64_t relationRank) {
   Operation *anchor = nullptr;
   for (Operation &operation : region.getBody().front().without_terminator())
     if (operation.getAttr("source") == task.getSource())
@@ -2589,8 +2590,22 @@ FailureOr<SmallVector<int64_t>> onlineRelationDomainAxes(
   auto contract = dyn_cast_or_null<ContractOp>(anchor);
   if (!contract || contract.getIndexingMaps().empty())
     return failure();
-  AffineMap scoreMap =
-      cast<AffineMapAttr>(contract.getIndexingMaps()[0]).getValue();
+  std::optional<unsigned> scoreOperand;
+  for (auto [operand, input] : llvm::enumerate(contract.getInputs())) {
+    Value inputValue = input;
+    if (!llvm::any_of(relations, [&](RelationOp relation) {
+          return valueDependsOn(inputValue, relation);
+        }))
+      continue;
+    if (scoreOperand)
+      return failure();
+    scoreOperand = operand;
+  }
+  if (!scoreOperand || *scoreOperand >= contract.getIndexingMaps().size())
+    return failure();
+  AffineMap scoreMap = cast<AffineMapAttr>(
+                           contract.getIndexingMaps()[*scoreOperand])
+                           .getValue();
   if (scoreMap.getNumResults() != relationRank ||
       scoreMap.getNumDims() != task.getDomainShape().size())
     return failure();
@@ -2706,7 +2721,7 @@ bool onlineRelationSourceClosure(
     }
     case RelationSemantics::Convert: {
       const bool select =
-          StringRef(ptx.opcode).starts_with("selp.f32") &&
+          StringRef(ptx.opcode) == "selp.f32" &&
           ptx.operands.size() == 4 &&
           ptx.operands[1] == "0f3F800000" &&
           ptx.operands[2] == "0f00000000" &&
@@ -3271,6 +3286,18 @@ setp.eq.u32 %p0, 0, 0;
 mov.u32 %r1, %r0;
 ret;
 )ptx");
+    FailureOr<OnlinePtxCfg> typeChangedCoordinate = parse(R"ptx(
+cvt.rn.f32.u32 %f0, %tid.x;
+// shuttle.online.role iota
+mov.u32 %r1, %f0;
+ret;
+)ptx");
+    FailureOr<OnlinePtxCfg> floatingAddCoordinate = parse(R"ptx(
+add.f32 %f0, %tid.x, 0f00000000;
+// shuttle.online.role iota
+mov.u32 %r1, %f0;
+ret;
+)ptx");
     FailureOr<OnlinePtxCfg> shared = parse(R"ptx(
 mov.u64 %rd0, 0;
 // shuttle.online.role expected
@@ -3289,6 +3316,7 @@ ret;
         failed(wrongFma) || failed(pointer) || failed(transformedPointer) ||
         failed(predicatedStore) || failed(coordinate) ||
         failed(zeroedCoordinate) || failed(alternateCoordinate) ||
+        failed(typeChangedCoordinate) || failed(floatingAddCoordinate) ||
         failed(shared))
       return signalPassFailure();
     auto indexMatches = [&](const OnlinePtxCfg &cfg, AffineExpr expected) {
@@ -3317,6 +3345,10 @@ ret;
         indexMatches(*zeroedCoordinate,
                      getAffineDimExpr(3, getOperation().getContext())) ||
         indexMatches(*alternateCoordinate,
+                     getAffineDimExpr(3, getOperation().getContext())) ||
+        indexMatches(*typeChangedCoordinate,
+                     getAffineDimExpr(3, getOperation().getContext())) ||
+        indexMatches(*floatingAddCoordinate,
                      getAffineDimExpr(3, getOperation().getContext())) ||
         !onlineSharedPairIsClosed(*shared, "shared_store", "expected",
                                   "barrier", "shared_load") ||
@@ -3491,7 +3523,7 @@ public:
           cast<RankedTensorType>(representativeScoreType).getRank();
       FailureOr<SmallVector<int64_t>> relationAxes =
           onlineRelationDomainAxes(materialization->second, region,
-                                   relationRank);
+                                   relationOperations, relationRank);
       if (failed(logicalCoordinates) || failed(relationAxes) ||
           !onlineRelationSourceClosure(*cfg, relationOperations,
                                        *logicalCoordinates, *relationAxes,
@@ -3615,6 +3647,27 @@ public:
     if (!device) {
       getOperation().emitError("test fixture has no online GPU device module");
       return signalPassFailure();
+    }
+
+    if (kind == "relation-axis-map") {
+      bool changed = false;
+      for (DeviceEntryOp entry :
+           device.getBody().front().getOps<DeviceEntryOp>()) {
+        auto maps = entry->getAttrOfType<ArrayAttr>("logical_coordinate_maps");
+        if (!maps || maps.size() < 2)
+          continue;
+        SmallVector<Attribute> mutated(maps.begin(), maps.end());
+        std::swap(mutated[0], mutated[1]);
+        entry->setAttr("logical_coordinate_maps",
+                       ArrayAttr::get(entry.getContext(), mutated));
+        changed = true;
+      }
+      if (!changed) {
+        getOperation().emitError(
+            "online GPU entry has no logical coordinate maps");
+        return signalPassFailure();
+      }
+      return;
     }
 
     StringRef phaseRole = "public_store";
