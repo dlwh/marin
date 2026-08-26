@@ -18,7 +18,10 @@ from track1_generic_composition_numerical_policy import (
     deterministic_inputs,
     load_numerical_policy,
 )
-from track1_map_h100_prototype import validate_generic_composition_cell_report, validate_generic_composition_result
+from track1_map_h100_prototype import (
+    validate_generic_composition_cell_report,
+    validate_generic_composition_result,
+)
 
 
 def _snapshot(mode: subject.Mode, invocation: int) -> tuple[tuple[object, ...], ...]:
@@ -147,7 +150,7 @@ def test_policy_binds_two_ordinary_jax_shapes_and_independent_binary64_oracle() 
         assert all(validated.metrics[name] <= limit for name, limit in case.limits.items())
 
 
-def test_coordinate_rejects_public_abi_repeat_full_write_and_observer_drift() -> None:
+def test_coordinate_rejects_public_abi_repeat_and_observer_drift() -> None:
     case = CASES[0]
     inputs = deterministic_inputs(case)
     actual = binary64_oracle(*inputs).astype(np.float32)
@@ -186,13 +189,24 @@ def test_coordinate_rejects_public_abi_repeat_full_write_and_observer_drift() ->
             snapshot,
             stablehlo_sha256,
         )
-    unwritten = np.zeros_like(actual)
+    nonfinite = actual.copy()
+    nonfinite.flat[0] = np.float32(np.nan)
+    with pytest.raises(RuntimeError, match="not finite"):
+        subject.validate_coordinate(
+            case,
+            subject.Mode.DISABLED,
+            nonfinite,
+            nonfinite.copy(),
+            (),
+            stablehlo_sha256,
+        )
+    divergent = np.zeros_like(actual)
     with pytest.raises(RuntimeError, match="maximum_absolute_error"):
         subject.validate_coordinate(
             case,
             subject.Mode.SOURCE_ORDERED,
-            unwritten,
-            unwritten.copy(),
+            divergent,
+            divergent.copy(),
             snapshot,
             stablehlo_sha256,
         )
@@ -227,7 +241,13 @@ def test_enabled_threshold_failure_reports_bounded_coordinate_before_rejection()
     assert report["schema_version"] == 2
     assert report["case_id"] == "rank2-a"
     assert report["mode"] == "source_ordered"
-    assert report["shapes"] == {"a": [2, 3], "b": [3, 5], "init": [], "p": [5, 7], "y": [2, 7]}
+    assert report["shapes"] == {
+        "a": [2, 3],
+        "b": [3, 5],
+        "init": [],
+        "p": [5, 7],
+        "y": [2, 7],
+    }
     assert report["semantic_groups"] == SEMANTIC_CONTRACT["groups"]
     assert report["private_boundary"] == [
         {
@@ -283,7 +303,9 @@ def test_enabled_threshold_failure_reports_bounded_coordinate_before_rejection()
     assert len(payload) < subject.MAX_CELL_REPORT_BYTES
 
 
-def test_disabled_threshold_diagnostic_does_not_reject_enabled_campaign(monkeypatch) -> None:
+def test_disabled_threshold_diagnostic_does_not_reject_enabled_campaign(
+    monkeypatch,
+) -> None:
     observed: list[tuple[str, subject.Mode]] = []
     reports: list[dict[str, object]] = []
     next_invocation = 1
@@ -322,7 +344,9 @@ def test_disabled_threshold_diagnostic_does_not_reject_enabled_campaign(monkeypa
     assert validate_generic_composition_result(subject.result_document(results)) == subject.result_document(results)
 
 
-def test_enabled_threshold_failure_still_rejects_after_all_coordinates(monkeypatch) -> None:
+def test_enabled_threshold_failure_still_rejects_after_all_coordinates(
+    monkeypatch,
+) -> None:
     reports: list[dict[str, object]] = []
     next_invocation = 1
 
@@ -351,7 +375,9 @@ def test_enabled_threshold_failure_still_rejects_after_all_coordinates(monkeypat
     assert reports[4]["acceptance_failures"] == reports[4]["limit_exceeded"]
 
 
-def test_binary64_low_bits_do_not_change_platform_stable_oracle_identity(monkeypatch) -> None:
+def test_binary64_low_bits_do_not_change_platform_stable_oracle_identity(
+    monkeypatch,
+) -> None:
     case = CASES[0]
     reference = binary64_oracle(*deterministic_inputs(case))
     changed_reference = reference.copy()
@@ -380,6 +406,14 @@ def test_binary64_low_bits_do_not_change_platform_stable_oracle_identity(monkeyp
     assert validate_generic_composition_cell_report(reports[1]) == reports[1]
 
 
+def test_array_identity_is_canonical_across_byte_orders() -> None:
+    native = np.asarray([[1.25, -3.5]], dtype=np.float32)
+    big_endian = native.astype(">f4")
+
+    assert native.tobytes() != big_endian.tobytes()
+    assert array_sha256(native) == array_sha256(big_endian)
+
+
 def test_bf16_ulp_remains_diagnostic_when_enabled_float_limits_pass() -> None:
     case = CASES[1]
     reference = binary64_oracle(*deterministic_inputs(case))
@@ -406,7 +440,9 @@ def test_bf16_ulp_remains_diagnostic_when_enabled_float_limits_pass() -> None:
     assert reports[0]["acceptance_failures"] == []
 
 
-def test_structural_failure_remains_fail_fast_without_partial_threshold_recovery(monkeypatch) -> None:
+def test_structural_failure_remains_fail_fast_without_partial_threshold_recovery(
+    monkeypatch,
+) -> None:
     observed: list[tuple[str, subject.Mode]] = []
     reports: list[dict[str, object]] = []
 
@@ -436,7 +472,8 @@ def test_structural_failure_remains_fail_fast_without_partial_threshold_recovery
     "mutation",
     [
         "contract",
-        "full_write",
+        "acceptance",
+        "enabled_metric",
         "repeat",
         "stablehlo",
         "metric",
@@ -444,15 +481,21 @@ def test_structural_failure_remains_fail_fast_without_partial_threshold_recovery
         "telemetry_type",
     ],
 )
-def test_persisted_result_rejects_semantic_and_evidence_mutations(mutation: str) -> None:
+def test_persisted_result_rejects_semantic_and_evidence_mutations(
+    mutation: str,
+) -> None:
     document = _result_document()
     changed = deepcopy(document)
     coordinates = changed["coordinates"]
     assert isinstance(coordinates, list)
     if mutation == "contract":
         changed["semantic_contract"]["groups"].reverse()
-    elif mutation == "full_write":
-        coordinates[0]["full_write"] = False
+    elif mutation == "acceptance":
+        coordinates[0]["acceptance_failures"] = ["maximum_absolute_error"]
+    elif mutation == "enabled_metric":
+        coordinates[4]["metrics"]["maximum_absolute_error"] = CASES[1].limits["maximum_absolute_error"] + 1.0
+        coordinates[4]["limit_exceeded"] = ["maximum_absolute_error"]
+        coordinates[4]["acceptance_failures"] = ["maximum_absolute_error"]
     elif mutation == "repeat":
         coordinates[1]["repeat_sha256"] = "f" * 64
     elif mutation == "stablehlo":

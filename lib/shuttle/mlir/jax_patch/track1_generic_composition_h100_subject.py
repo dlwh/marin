@@ -19,6 +19,7 @@ from jaxlib import _jax
 from track1_generic_composition_numerical_policy import (
     CASES,
     MAX_CELL_REPORT_BYTES,
+    ORACLE_SOURCE_SHA256,
     POLICY_SHA256,
     SEMANTIC_CONTRACT,
     Case,
@@ -63,6 +64,8 @@ class CoordinateResult:
     stablehlo_sha256: str
     metrics: dict[str, float]
     observer: ObserverEvidence | None
+    limit_exceeded: tuple[str, ...]
+    acceptance_failures: tuple[str, ...]
 
 
 class CoordinateThresholdError(RuntimeError):
@@ -166,7 +169,10 @@ def observer_identity(mode: Mode) -> tuple[str, str]:
         raise TypeError("Shuttle options must use canonical JSON text")
     payload = json.loads(canonical)
     canonical_tuning = json.dumps(payload["tuning"], sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode()).hexdigest(), hashlib.sha256(canonical_tuning.encode()).hexdigest()
+    return (
+        hashlib.sha256(canonical.encode()).hexdigest(),
+        hashlib.sha256(canonical_tuning.encode()).hexdigest(),
+    )
 
 
 def validate_observer_snapshot(
@@ -180,7 +186,11 @@ def validate_observer_snapshot(
         return None
     if len(snapshot) != 3 or any(type(event) is not tuple or len(event) != 13 for event in snapshot):
         raise ValueError("enabled generic composition must emit three observer records")
-    if tuple(event[1] for event in snapshot) != ("algebra_coverage", "generated_bundle", "final_erasure"):
+    if tuple(event[1] for event in snapshot) != (
+        "algebra_coverage",
+        "generated_bundle",
+        "final_erasure",
+    ):
         raise ValueError("generic composition observer phase order differs")
     invocation = snapshot[0][0]
     if type(invocation) is not int or invocation <= 0 or any(event[0] != invocation for event in snapshot):
@@ -340,11 +350,12 @@ def _coordinate_report(
     floor = result.case.limits["maximum_absolute_error"]
     mask = np.abs(reference) >= floor
     masked_distance = ordered_distance[mask]
-    exceeded = tuple(name for name, limit in result.case.limits.items() if result.metrics[name] > limit)
     h_shape = (*result.case.a_shape[:-1], result.case.b_shape[-1])
     if device.backend != "gpu" or device.count != 1 or "H100" not in device.kind.upper():
         raise RuntimeError("generic composition diagnostic device evidence differs")
     report = {
+        "acceptance_failures": list(result.acceptance_failures),
+        "acceptance_role": "required_diagnostic" if result.mode is Mode.DISABLED else "enabled_gate",
         "case_id": result.case.case_id,
         "device": {
             "actual_complete": True,
@@ -354,7 +365,7 @@ def _coordinate_report(
             "visible_count": device.count,
         },
         "first_mismatch": first_mismatch,
-        "full_write": True,
+        "limit_exceeded": list(result.limit_exceeded),
         "metrics": {
             **result.metrics,
             "masked_bf16_absolute_floor": floor,
@@ -364,10 +375,13 @@ def _coordinate_report(
         "mode": result.mode.value,
         "numerical_policy_sha256": _grouped_digest(POLICY_SHA256),
         "observer": _observer_document(result.observer),
+        "oracle_identity": {
+            "input_sha256": {name: _grouped_digest(digest) for name, digest in sorted(result.case.input_sha256.items())},
+            "rounded_f32_sha256": _grouped_digest(result.case.rounded_f32_oracle_sha256),
+            "source_sha256": _grouped_digest(ORACLE_SOURCE_SHA256),
+        },
         "output_digests": {
             "actual": _grouped_sha256(actual),
-            "reference_binary64": _grouped_sha256(reference),
-            "reference_f32": _grouped_sha256(reference_f32),
             "repeat": _grouped_sha256(repeated),
         },
         "private_boundary": [
@@ -388,7 +402,7 @@ def _coordinate_report(
         ],
         "repeat_bitwise_equal": True,
         "schema": "track1_generic_composition_h100_cell",
-        "schema_version": 1,
+        "schema_version": 2,
         "semantic_groups": SEMANTIC_CONTRACT["groups"],
         "shapes": {
             "a": list(result.case.a_shape),
@@ -398,7 +412,6 @@ def _coordinate_report(
             "y": list(result.case.result_shape),
         },
         "stablehlo_sha256": _grouped_digest(result.stablehlo_sha256),
-        "threshold_exceeded": list(exceeded),
         "thresholds": result.case.limits,
         "worst_absolute": _scalar_diagnostic(
             actual,
@@ -454,8 +467,8 @@ def validate_coordinate(
         "mean_absolute_error": mean,
         "relative_linf_error": relative,
     }
-    if np.any(oracle.astype(np.float32) == 0):
-        raise RuntimeError("generic composition full-write oracle contains zero")
+    limit_exceeded = tuple(name for name, limit in case.limits.items() if metrics[name] > limit)
+    acceptance_failures = () if mode is Mode.DISABLED else limit_exceeded
     result = CoordinateResult(
         case=case,
         mode=mode,
@@ -464,14 +477,15 @@ def validate_coordinate(
         stablehlo_sha256=stablehlo_sha256,
         metrics=metrics,
         observer=observer,
+        limit_exceeded=limit_exceeded,
+        acceptance_failures=acceptance_failures,
     )
     if report_cell is not None:
         if device is None:
             raise RuntimeError("generic composition diagnostic requires device evidence")
         report_cell(_coordinate_report(result, actual, repeated, oracle, device))
-    exceeded = tuple(name for name, limit in case.limits.items() if metrics[name] > limit)
-    if exceeded:
-        raise CoordinateThresholdError(result, exceeded)
+    if acceptance_failures:
+        raise CoordinateThresholdError(result, acceptance_failures)
     return result
 
 
@@ -517,7 +531,9 @@ def result_document(results: tuple[CoordinateResult, ...]) -> dict[str, object]:
         "coordinates": [
             {
                 "case_id": result.case.case_id,
-                "full_write": True,
+                "acceptance_failures": list(result.acceptance_failures),
+                "acceptance_role": "required_diagnostic" if result.mode is Mode.DISABLED else "enabled_gate",
+                "limit_exceeded": list(result.limit_exceeded),
                 "metrics": result.metrics,
                 "mode": result.mode.value,
                 "observer": (
@@ -541,6 +557,6 @@ def result_document(results: tuple[CoordinateResult, ...]) -> dict[str, object]:
         "numerical_policy_sha256": POLICY_SHA256,
         "pid": os.getpid(),
         "schema": "track1_generic_composition_h100_result",
-        "schema_version": 1,
+        "schema_version": 2,
         "semantic_contract": SEMANTIC_CONTRACT,
     }

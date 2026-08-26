@@ -19,7 +19,13 @@ from track1_generic_composition_numerical_policy import (
     POLICY_SHA256 as COMPOSITION_POLICY_SHA256,
 )
 from track1_generic_composition_numerical_policy import SEMANTIC_CONTRACT
-from track1_map_h100_build import JAX_COMMIT, JAX_PATCH_SHA256, JAX_TREE, XLA_COMMIT, XLA_PATCH_SHA256
+from track1_map_h100_build import (
+    JAX_COMMIT,
+    JAX_PATCH_SHA256,
+    JAX_TREE,
+    XLA_COMMIT,
+    XLA_PATCH_SHA256,
+)
 from track1_map_h100_prototype import (
     BASE_IMAGE,
     BAZEL_SHA256,
@@ -48,7 +54,11 @@ from track1_rmsnorm_contract_numerical_policy import (
 from track1_rmsnorm_contract_numerical_policy import (
     load_numerical_policy as load_contract_numerical_policy,
 )
-from track1_rmsnorm_numerical_policy import POLICY_FILENAME, POLICY_SHA256, load_numerical_policy
+from track1_rmsnorm_numerical_policy import (
+    POLICY_FILENAME,
+    POLICY_SHA256,
+    load_numerical_policy,
+)
 
 MARIN_REPOSITORY = Path(__file__).parents[4]
 AUTHORIZATION_PATH = MARIN_REPOSITORY / "scripts/shuttle/track1_map_h100_prototype_authorization.json"
@@ -70,8 +80,32 @@ def _composition_snapshot(mode: composition_subject.Mode, invocation: int) -> tu
     manifest = f"selected_regions = {membership}"
     common = (mode.value, options_sha256, tuning_sha256)
     return (
-        (invocation, "algebra_coverage", *common, membership, manifest, "a" * 64, "", False, "", 0, 0),
-        (invocation, "generated_bundle", *common, membership, manifest, "a" * 64, "b" * 64, False, "", 2, 2),
+        (
+            invocation,
+            "algebra_coverage",
+            *common,
+            membership,
+            manifest,
+            "a" * 64,
+            "",
+            False,
+            "",
+            0,
+            0,
+        ),
+        (
+            invocation,
+            "generated_bundle",
+            *common,
+            membership,
+            manifest,
+            "a" * 64,
+            "b" * 64,
+            False,
+            "",
+            2,
+            2,
+        ),
         (invocation, "final_erasure", *common, "", "", "", "c" * 64, True, "", 0, 0),
     )
 
@@ -92,15 +126,27 @@ def _document() -> dict[str, object]:
         "schema_version": 1,
         "subjects": {
             "generic_composition": {
-                "disabled_jax_role": "ordinary_source_and_diagnostic",
+                "disabled_jax_role": "required_diagnostic_never_numerical_gate",
+                "enabled_numerical_gates": [
+                    "maximum_absolute_error",
+                    "mean_absolute_error",
+                    "relative_linf_error",
+                ],
                 "host_oracle": "independent_binary64_contract_fold_map_contract",
                 "modes": ["disabled", "source_ordered", "fast"],
                 "numerical_policy": {
                     "path": f"lib/shuttle/mlir/jax_patch/{COMPOSITION_POLICY_FILENAME}",
                     "sha256": COMPOSITION_POLICY_SHA256,
                 },
+                "oracle_identity": [
+                    "oracle_source_sha256",
+                    "input_sha256",
+                    "rounded_f32_oracle_sha256",
+                ],
                 "public_abi": ["a:f32", "b:f32", "p:f32", "init:scalar_f32", "y:f32"],
+                "raw_and_masked_bf16_ulp": "diagnostic_only",
                 "repeat_bitwise_required": True,
+                "runtime_binary64_digest": "not_identity",
                 "semantic_contract": SEMANTIC_CONTRACT,
                 "topology_telemetry": "non_normative",
             },
@@ -121,15 +167,26 @@ def _document() -> dict[str, object]:
                 "emitted_tree_oracle": "abi22_emitted_ptx_v1",
                 "host_oracle": "independent_binary64_rmsnorm_vjp",
                 "modes": ["disabled", "source_ordered", "fast"],
-                "numerical_policy": {"path": f"lib/shuttle/mlir/jax_patch/{POLICY_FILENAME}", "sha256": POLICY_SHA256},
+                "numerical_policy": {
+                    "path": f"lib/shuttle/mlir/jax_patch/{POLICY_FILENAME}",
+                    "sha256": POLICY_SHA256,
+                },
                 "repeat_bitwise_required": True,
                 "shapes": [[2, 7, 19], [3, 2, 5, 11, 263]],
             },
             "rmsnorm_contract": {
                 "boundaries": ["primal", "composed"],
                 "composed_bundle_shapes": {
-                    "5x19x257": {"launches": 40, "temporary_bytes": 79016, "temporaries": 37},
-                    "5x19x7": {"launches": 39, "temporary_bytes": 6996, "temporaries": 36},
+                    "5x19x257": {
+                        "launches": 40,
+                        "temporary_bytes": 79016,
+                        "temporaries": 37,
+                    },
+                    "5x19x7": {
+                        "launches": 39,
+                        "temporary_bytes": 6996,
+                        "temporaries": 36,
+                    },
                 },
                 "composed_topology": "reviewed_hybrid_exact_nonperformance_contract",
                 "coordinate_order": "all_primal_before_any_composed",
@@ -143,7 +200,11 @@ def _document() -> dict[str, object]:
                     "sha256": CONTRACT_POLICY_SHA256,
                 },
                 "primal_bundle_shapes": {
-                    "5x19x257": {"launches": 2, "temporary_bytes": 20, "temporaries": 1},
+                    "5x19x257": {
+                        "launches": 2,
+                        "temporary_bytes": 20,
+                        "temporaries": 1,
+                    },
                     "5x19x7": {"launches": 1, "temporary_bytes": 0, "temporaries": 0},
                 },
                 "raw_full_range_bf16_ulp": "diagnostic_only",
@@ -221,6 +282,21 @@ def _authorization(tmp_path: Path) -> tuple[Path, str, Authorization]:
         (("sources", "xla", "patch_sha256"), list(reversed(XLA_PATCH_SHA256))),
         (("subjects", "rmsnorm", "host_oracle"), "disabled_jax_only"),
         (("subjects", "rmsnorm", "numerical_policy", "sha256"), "0" * 64),
+        (("subjects", "generic_composition", "disabled_jax_role"), "numerical_gate"),
+        (
+            ("subjects", "generic_composition", "enabled_numerical_gates"),
+            ["maximum_absolute_error"],
+        ),
+        (("subjects", "generic_composition", "numerical_policy", "sha256"), "0" * 64),
+        (
+            ("subjects", "generic_composition", "oracle_identity"),
+            ["rounded_f32_oracle_sha256"],
+        ),
+        (
+            ("subjects", "generic_composition", "raw_and_masked_bf16_ulp"),
+            "acceptance_gate",
+        ),
+        (("subjects", "generic_composition", "runtime_binary64_digest"), "identity"),
         (("toolchain", "bazel", "sha256"), "f" * 64),
         (("toolchain", "cuda", "build_distribution"), "local"),
         (("toolchain", "cuda", "build_version"), "13.2.0"),
@@ -229,7 +305,10 @@ def _authorization(tmp_path: Path) -> tuple[Path, str, Authorization]:
         (("toolchain", "cuda", "offline_downloads"), True),
         (("toolchain", "cuda", "physical_tools_root"), "/usr/local/cuda"),
         (("toolchain", "python_package", "dependency_resolution"), True),
-        (("toolchain", "python_package", "dependency_site_packages"), "/usr/local/lib/python3.12/site-packages"),
+        (
+            ("toolchain", "python_package", "dependency_site_packages"),
+            "/usr/local/lib/python3.12/site-packages",
+        ),
         (("toolchain", "python_package", "dependency_source"), "system"),
         (("toolchain", "python_package", "distribution"), "jax-nightly"),
         (("toolchain", "python_package", "expected_base_version"), "0.10.0"),
@@ -256,7 +335,9 @@ def test_authorization_rejects_scope_or_permission_mutation(
         load_authorization(authorization, hashlib.sha256(raw).hexdigest())
 
 
-def test_authorization_requires_exact_canonical_bytes_and_cli_digest(tmp_path: Path) -> None:
+def test_authorization_requires_exact_canonical_bytes_and_cli_digest(
+    tmp_path: Path,
+) -> None:
     path, digest, loaded = _authorization(tmp_path)
 
     assert loaded.sha256 == digest
@@ -277,7 +358,9 @@ def test_checked_in_authorization_is_the_exact_canonical_prototype_scope() -> No
     assert loaded.document == _document()
 
 
-def test_checked_in_source_manifest_matches_the_live_iris_bundle_closure(tmp_path: Path) -> None:
+def test_checked_in_source_manifest_matches_the_live_iris_bundle_closure(
+    tmp_path: Path,
+) -> None:
     raw = AUTHORIZATION_PATH.read_bytes()
     approved_sha256 = hashlib.sha256(raw).hexdigest()
     authorization = load_authorization(AUTHORIZATION_PATH, approved_sha256)
@@ -294,7 +377,9 @@ def test_checked_in_source_manifest_matches_the_live_iris_bundle_closure(tmp_pat
         load_authorization(changed_path, approved_sha256)
 
 
-def test_dry_run_renders_one_network_hydration_then_offline_build_and_five_workers(tmp_path: Path) -> None:
+def test_dry_run_renders_one_network_hydration_then_offline_build_and_five_workers(
+    tmp_path: Path,
+) -> None:
     _, _, authorization = _authorization(tmp_path)
     workspace = tmp_path / "fresh"
 
@@ -378,7 +463,11 @@ def _worker_document(worker: str, pid: int) -> dict[str, object]:
             name = f"jit_rank{rank}_{mode}-{rank}{len(mode)}-cache"
             coordinates.append(
                 {
-                    "cache_entry": [name, len(name), hashlib.sha256(name.encode()).hexdigest()],
+                    "cache_entry": [
+                        name,
+                        len(name),
+                        hashlib.sha256(name.encode()).hexdigest(),
+                    ],
                     "gradient_sha256": hashlib.sha256(f"gradient:{rank}:{mode}".encode()).hexdigest(),
                     "mode": mode,
                     "observer": (
@@ -394,7 +483,12 @@ def _worker_document(worker: str, pid: int) -> dict[str, object]:
                     "rank": rank,
                 }
             )
-    return {"coordinates": coordinates, "pid": pid, "schema_version": 1, "worker": worker}
+    return {
+        "coordinates": coordinates,
+        "pid": pid,
+        "schema_version": 1,
+        "worker": worker,
+    }
 
 
 def _rmsnorm_document() -> dict[str, object]:
@@ -432,7 +526,11 @@ def _rmsnorm_document() -> dict[str, object]:
                                 "final_module_sha256": "1" * 64,
                                 "generated_bundle_sha256": "2" * 64,
                                 "invocation_id": len(coordinates) + 1,
-                                "launch_count": {"forward": 1, "backward": 3, "composed": 4}[boundary],
+                                "launch_count": {
+                                    "forward": 1,
+                                    "backward": 3,
+                                    "composed": 4,
+                                }[boundary],
                                 "temporary_count": 0 if boundary == "forward" else 1,
                             }
                         ),
@@ -456,7 +554,10 @@ def _rmsnorm_contract_document() -> dict[str, object]:
     invocation_id = 0
     for boundary, roles in (
         ("primal", ("result",)),
-        ("composed", ("result", "input_cotangent", "weight_cotangent", "projection_cotangent")),
+        (
+            "composed",
+            ("result", "input_cotangent", "weight_cotangent", "projection_cotangent"),
+        ),
     ):
         for shape in CONTRACT_SHAPES:
             shape_key = "x".join(map(str, shape))
@@ -576,7 +677,9 @@ def test_rmsnorm_contract_result_keeps_disabled_and_raw_ulp_metrics_diagnostic()
         validate_rmsnorm_contract_result(document)
 
 
-def test_failed_rmsnorm_contract_phase_surfaces_the_complete_primal_checkpoint_last(tmp_path: Path) -> None:
+def test_failed_rmsnorm_contract_phase_surfaces_the_complete_primal_checkpoint_last(
+    tmp_path: Path,
+) -> None:
     full = _rmsnorm_contract_document()
     checkpoint = {
         "coordinates": [
@@ -601,7 +704,11 @@ def test_failed_rmsnorm_contract_phase_surfaces_the_complete_primal_checkpoint_l
 
     with pytest.raises(RuntimeError, match="primal checkpoint follows phase tail") as raised:
         prototype._run(
-            [sys.executable, "-c", "import sys; print('late composed failure ' * 2000); sys.exit(19)"],
+            [
+                sys.executable,
+                "-c",
+                "import sys; print('late composed failure ' * 2000); sys.exit(19)",
+            ],
             cwd=None,
             log=tmp_path / "phase.log",
             phase="rmsnorm_contract",
@@ -621,7 +728,9 @@ def test_failed_rmsnorm_contract_phase_surfaces_the_complete_primal_checkpoint_l
         prototype.validate_rmsnorm_contract_primal_checkpoint(changed)
 
 
-def test_failed_generic_composition_phase_surfaces_every_validated_coordinate_record(tmp_path: Path) -> None:
+def test_failed_generic_composition_phase_surfaces_every_validated_coordinate_record(
+    tmp_path: Path,
+) -> None:
     records: list[dict[str, object]] = []
     invocation = 1
     device = composition_subject.DeviceEvidence(backend="gpu", count=1, kind="NVIDIA H100")
@@ -676,8 +785,22 @@ def test_failed_generic_composition_phase_surfaces_every_validated_coordinate_re
     assert "[REDACTED]" in str(raised.value)
 
 
-@pytest.mark.parametrize("mutation", ["missing", "reordered", "open", "noncanonical"])
-def test_generic_composition_diagnostic_decoder_rejects_incomplete_or_mutated_evidence(mutation: str) -> None:
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "acceptance",
+        "missing",
+        "noncanonical",
+        "open",
+        "oracle_input",
+        "oracle_rounded",
+        "oracle_source",
+        "reordered",
+    ],
+)
+def test_generic_composition_diagnostic_decoder_rejects_incomplete_or_mutated_evidence(
+    mutation: str,
+) -> None:
     records: list[dict[str, object]] = []
     invocation = 1
     device = composition_subject.DeviceEvidence(backend="gpu", count=1, kind="NVIDIA H100")
@@ -697,12 +820,20 @@ def test_generic_composition_diagnostic_decoder_rejects_incomplete_or_mutated_ev
                 device=device,
                 report_cell=records.append,
             )
-    if mutation == "missing":
+    if mutation == "acceptance":
+        records[0]["acceptance_failures"] = ["maximum_absolute_error"]
+    elif mutation == "missing":
         records.pop()
     elif mutation == "reordered":
         records[0], records[1] = records[1], records[0]
     elif mutation == "open":
         records[0]["extra"] = True
+    elif mutation == "oracle_input":
+        records[0]["oracle_identity"]["input_sha256"]["a"] = "f" * 8 + ":" + ":".join(["0" * 8] * 7)
+    elif mutation == "oracle_rounded":
+        records[0]["oracle_identity"]["rounded_f32_sha256"] = ":".join(["0" * 8] * 8)
+    elif mutation == "oracle_source":
+        records[0]["oracle_identity"]["source_sha256"] = ":".join(["0" * 8] * 8)
     elif mutation == "noncanonical":
         raw = b"\n".join(json.dumps(record).encode() for record in records) + b"\n"
         with pytest.raises(ValueError, match="canonical"):
@@ -719,7 +850,15 @@ def test_rmsnorm_result_requires_exact_coordinate_output_and_observer_closure() 
     document = _rmsnorm_document()
     assert validate_rmsnorm_result(document) == document
 
-    for mutation in ("coordinate", "result", "observer", "repeat", "threshold", "nonfinite", "diagnostic"):
+    for mutation in (
+        "coordinate",
+        "result",
+        "observer",
+        "repeat",
+        "threshold",
+        "nonfinite",
+        "diagnostic",
+    ):
         changed = deepcopy(document)
         if mutation == "coordinate":
             changed["coordinates"][0]["boundary"] = "composed"
@@ -806,7 +945,9 @@ def test_wheel_set_requires_exact_regular_three_wheel_output(tmp_path: Path) -> 
         wheel_set(tmp_path)
 
 
-def test_source_bundle_manifest_rejects_missing_extra_symlink_and_hash_mutations(tmp_path: Path) -> None:
+def test_source_bundle_manifest_rejects_missing_extra_symlink_and_hash_mutations(
+    tmp_path: Path,
+) -> None:
     for root in (tmp_path / "lib/shuttle/mlir", tmp_path / "lib/shuttle/src/shuttle"):
         root.mkdir(parents=True)
         root.joinpath("source.py").write_text(f"{root.name}\n")
@@ -841,7 +982,12 @@ def test_source_bundle_manifest_rejects_missing_extra_symlink_and_hash_mutations
 
 
 @pytest.mark.parametrize(
-    ("observed_bazel_sha256", "mutate_during_hydration", "hydration_failure", "expected_error"),
+    (
+        "observed_bazel_sha256",
+        "mutate_during_hydration",
+        "hydration_failure",
+        "expected_error",
+    ),
     [
         (
             MISMATCHED_BAZEL_SHA256,
@@ -999,7 +1145,9 @@ def test_execute_rejects_bazel_or_hydration_failure_before_offline_build(
     monkeypatch.setattr(prototype, "apply_source_patches", apply_patches)
     monkeypatch.setattr(prototype, "_run", run)
     monkeypatch.setattr(
-        prototype, "_identity", lambda command: "Python 3.12.11" if command[0] == sys.executable else "tool"
+        prototype,
+        "_identity",
+        lambda command: "Python 3.12.11" if command[0] == sys.executable else "tool",
     )
     monkeypatch.setattr(
         prototype,
@@ -1008,9 +1156,15 @@ def test_execute_rejects_bazel_or_hydration_failure_before_offline_build(
             observed_bazel_sha256 if path.name.startswith("bazel-") else hashlib.sha256(path.name.encode()).hexdigest()
         ),
     )
-    monkeypatch.setattr(Path, "is_file", lambda path: True if path in cuda_tools else original_is_file(path))
     monkeypatch.setattr(
-        os, "access", lambda path, mode: True if Path(path) in cuda_tools else original_access(path, mode)
+        Path,
+        "is_file",
+        lambda path: True if path in cuda_tools else original_is_file(path),
+    )
+    monkeypatch.setattr(
+        os,
+        "access",
+        lambda path, mode: (True if Path(path) in cuda_tools else original_access(path, mode)),
     )
 
     with pytest.raises(RuntimeError, match=expected_error) as raised:

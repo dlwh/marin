@@ -43,7 +43,11 @@ from track1_rmsnorm_contract_h100_topology import (
     PRIMAL_TOPOLOGY_STATUS,
     authorization_bundle_shapes,
 )
-from track1_rmsnorm_numerical_policy import POLICY_FILENAME, POLICY_SHA256, load_numerical_policy
+from track1_rmsnorm_numerical_policy import (
+    POLICY_FILENAME,
+    POLICY_SHA256,
+    load_numerical_policy,
+)
 
 INTEGRATION_COMMIT = "41502f2079385df29fccbf1137bce553aa090297"
 INTEGRATION_TREE = "a1c4babf2b5822ac8f1a96b0d6a133b61426d72a"
@@ -247,7 +251,10 @@ def _expected_authorization(source_manifest_sha256: str) -> dict[str, object]:
                 "emitted_tree_oracle": "abi22_emitted_ptx_v1",
                 "host_oracle": "independent_binary64_rmsnorm_vjp",
                 "modes": ["disabled", "source_ordered", "fast"],
-                "numerical_policy": {"path": f"lib/shuttle/mlir/jax_patch/{POLICY_FILENAME}", "sha256": POLICY_SHA256},
+                "numerical_policy": {
+                    "path": f"lib/shuttle/mlir/jax_patch/{POLICY_FILENAME}",
+                    "sha256": POLICY_SHA256,
+                },
                 "repeat_bitwise_required": True,
                 "shapes": [[2, 7, 19], [3, 2, 5, 11, 263]],
             },
@@ -271,15 +278,27 @@ def _expected_authorization(source_manifest_sha256: str) -> dict[str, object]:
                 "shapes": [list(shape) for shape in contract_policy.SHAPES],
             },
             "generic_composition": {
-                "disabled_jax_role": "ordinary_source_and_diagnostic",
+                "disabled_jax_role": "required_diagnostic_never_numerical_gate",
+                "enabled_numerical_gates": [
+                    "maximum_absolute_error",
+                    "mean_absolute_error",
+                    "relative_linf_error",
+                ],
                 "host_oracle": "independent_binary64_contract_fold_map_contract",
                 "modes": ["disabled", "source_ordered", "fast"],
                 "numerical_policy": {
                     "path": f"lib/shuttle/mlir/jax_patch/{composition_policy.POLICY_FILENAME}",
                     "sha256": composition_policy.POLICY_SHA256,
                 },
+                "oracle_identity": [
+                    "oracle_source_sha256",
+                    "input_sha256",
+                    "rounded_f32_oracle_sha256",
+                ],
                 "public_abi": ["a:f32", "b:f32", "p:f32", "init:scalar_f32", "y:f32"],
+                "raw_and_masked_bf16_ulp": "diagnostic_only",
                 "repeat_bitwise_required": True,
+                "runtime_binary64_digest": "not_identity",
                 "semantic_contract": composition_policy.SEMANTIC_CONTRACT,
                 "topology_telemetry": "non_normative",
             },
@@ -298,7 +317,11 @@ def _expected_authorization(source_manifest_sha256: str) -> dict[str, object]:
             },
         },
         "toolchain": {
-            "bazel": {"sha256": BAZEL_SHA256, "url": BAZEL_URL, "version": BAZEL_VERSION},
+            "bazel": {
+                "sha256": BAZEL_SHA256,
+                "url": BAZEL_URL,
+                "version": BAZEL_VERSION,
+            },
             "cuda": {
                 "build_distribution": "hermetic",
                 "build_version": HERMETIC_CUDA_VERSION,
@@ -500,12 +523,24 @@ def prototype_plan(
                 *install_patterns,
             ],
         },
-        {"name": "install_jax_source", "argv": _jax_source_command(paths, runner_repository, "install")},
-        {"name": "verify_jax_runtime", "argv": _jax_source_command(paths, runner_repository, "verify")},
-        {"name": "populate", "argv": _worker_command(paths, runner_repository, "populate")},
+        {
+            "name": "install_jax_source",
+            "argv": _jax_source_command(paths, runner_repository, "install"),
+        },
+        {
+            "name": "verify_jax_runtime",
+            "argv": _jax_source_command(paths, runner_repository, "verify"),
+        },
+        {
+            "name": "populate",
+            "argv": _worker_command(paths, runner_repository, "populate"),
+        },
         {"name": "reuse", "argv": _worker_command(paths, runner_repository, "reuse")},
         {"name": "rmsnorm", "argv": _rmsnorm_worker_command(paths, runner_repository)},
-        {"name": "rmsnorm_contract", "argv": _rmsnorm_contract_worker_command(paths, runner_repository)},
+        {
+            "name": "rmsnorm_contract",
+            "argv": _rmsnorm_contract_worker_command(paths, runner_repository),
+        },
         {
             "name": "generic_composition",
             "argv": _generic_composition_worker_command(paths, runner_repository),
@@ -568,7 +603,11 @@ def source_bundle_document(bundle_root: Path) -> dict[str, object]:
                     "size": metadata.st_size,
                 }
             )
-    return {"entries": entries, "roots": [root.as_posix() for root in SOURCE_ROOTS], "schema_version": 1}
+    return {
+        "entries": entries,
+        "roots": [root.as_posix() for root in SOURCE_ROOTS],
+        "schema_version": 1,
+    }
 
 
 def require_source_bundle(bundle_root: Path, authorization: Authorization) -> dict[str, object]:
@@ -597,7 +636,12 @@ def validate_worker_result(document: object, role: str) -> dict[str, object]:
     """Validate one canonical JSON-ready worker result."""
     if role not in ("populate", "reuse"):
         raise ValueError("worker result validator role is invalid")
-    if type(document) is not dict or set(document) != {"coordinates", "pid", "schema_version", "worker"}:
+    if type(document) is not dict or set(document) != {
+        "coordinates",
+        "pid",
+        "schema_version",
+        "worker",
+    }:
         raise ValueError("worker result has the wrong root schema")
     if document["schema_version"] != 1 or document["worker"] != role:
         raise ValueError("worker result has the wrong role or schema version")
@@ -662,7 +706,13 @@ def validate_result_pair(populate: object, reuse: object) -> dict[str, object]:
     for first, second in zip(populated["coordinates"], reused["coordinates"], strict=True):
         if any(
             first[field] != second[field]
-            for field in ("rank", "mode", "primal_sha256", "gradient_sha256", "cache_entry")
+            for field in (
+                "rank",
+                "mode",
+                "primal_sha256",
+                "gradient_sha256",
+                "cache_entry",
+            )
         ):
             raise ValueError("worker result reuse differs from populate output or cache")
     return {"populate": populated, "reuse": reused}
@@ -808,7 +858,10 @@ def validate_rmsnorm_result(document: object) -> dict[str, object]:
                 "backward": (3, 1),
                 "composed": (4, 1),
             }[boundary]
-            if (observer["launch_count"], observer["temporary_count"]) != expected_bundle:
+            if (
+                observer["launch_count"],
+                observer["temporary_count"],
+            ) != expected_bundle:
                 raise ValueError("RMSNorm generated bundle shape differs")
     return document
 
@@ -834,7 +887,10 @@ def validate_rmsnorm_contract_result(document: object) -> dict[str, object]:
         raise ValueError("RMSNorm Contract result must cover 12 coordinates")
     boundaries = (
         ("primal", ("result",)),
-        ("composed", ("result", "input_cotangent", "weight_cotangent", "projection_cotangent")),
+        (
+            "composed",
+            ("result", "input_cotangent", "weight_cotangent", "projection_cotangent"),
+        ),
     )
     expected = [
         (shape, boundary, roles, mode)
@@ -961,7 +1017,7 @@ def validate_generic_composition_result(document: object) -> dict[str, object]:
         raise ValueError("generic composition result has the wrong root schema")
     if (
         document["schema"] != "track1_generic_composition_h100_result"
-        or document["schema_version"] != 1
+        or document["schema_version"] != 2
         or document["numerical_policy_sha256"] != composition_policy.POLICY_SHA256
         or document["semantic_contract"] != composition_policy.SEMANTIC_CONTRACT
     ):
@@ -976,8 +1032,10 @@ def validate_generic_composition_result(document: object) -> dict[str, object]:
     stablehlo_by_case: dict[str, str] = {}
     for item, (case, mode) in zip(coordinates, expected, strict=True):
         if type(item) is not dict or set(item) != {
+            "acceptance_failures",
+            "acceptance_role",
             "case_id",
-            "full_write",
+            "limit_exceeded",
             "metrics",
             "mode",
             "observer",
@@ -986,8 +1044,9 @@ def validate_generic_composition_result(document: object) -> dict[str, object]:
             "stablehlo_sha256",
         }:
             raise ValueError("generic composition coordinate schema differs")
-        if item["case_id"] != case.case_id or item["mode"] != mode or item["full_write"] is not True:
-            raise ValueError("generic composition coordinate identity or full-write evidence differs")
+        expected_role = "required_diagnostic" if mode == "disabled" else "enabled_gate"
+        if item["case_id"] != case.case_id or item["mode"] != mode or item["acceptance_role"] != expected_role:
+            raise ValueError("generic composition coordinate identity differs")
         result_sha256 = _sha(item["result_sha256"], "generic composition result")
         if _sha(item["repeat_sha256"], "generic composition repeat") != result_sha256:
             raise ValueError("generic composition repeat result differs")
@@ -1000,10 +1059,16 @@ def validate_generic_composition_result(document: object) -> dict[str, object]:
         metrics = item["metrics"]
         if type(metrics) is not dict or set(metrics) != set(case.limits):
             raise ValueError("generic composition numerical metric schema differs")
-        for name, limit in case.limits.items():
+        for name in case.limits:
             value = metrics[name]
-            if type(value) is not float or not math.isfinite(value) or value < 0 or value > limit:
-                raise ValueError(f"generic composition result exceeds {name}")
+            if type(value) is not float or not math.isfinite(value) or value < 0:
+                raise ValueError(f"generic composition result metric {name} differs")
+        limit_exceeded = [name for name, limit in case.limits.items() if metrics[name] > limit]
+        expected_failures = [] if mode == "disabled" else limit_exceeded
+        if item["limit_exceeded"] != limit_exceeded or item["acceptance_failures"] != expected_failures:
+            raise ValueError("generic composition numerical acceptance classification differs")
+        if expected_failures:
+            raise ValueError("generic composition enabled result exceeds its numerical contract")
         observer = item["observer"]
         if mode == "disabled":
             if observer is not None:
@@ -1065,7 +1130,12 @@ def _validate_generic_composition_point(value: object, shape: tuple[int, ...], n
         or any(type(item) is not int or item < 0 or item >= extent for item, extent in zip(index, shape, strict=True))
     ):
         raise ValueError(f"generic composition {name} index differs")
-    for field in ("absolute_error", "actual_value", "reference_f32_value", "reference_value"):
+    for field in (
+        "absolute_error",
+        "actual_value",
+        "reference_f32_value",
+        "reference_value",
+    ):
         number = value[field]
         if type(number) is not float or not math.isfinite(number):
             raise ValueError(f"generic composition {name} numeric value differs")
@@ -1084,14 +1154,17 @@ def _validate_generic_composition_point(value: object, shape: tuple[int, ...], n
 def validate_generic_composition_cell_report(document: object) -> dict[str, object]:
     """Validate one bounded, closed generic-composition coordinate record."""
     keys = {
+        "acceptance_failures",
+        "acceptance_role",
         "case_id",
         "device",
         "first_mismatch",
-        "full_write",
+        "limit_exceeded",
         "metrics",
         "mode",
         "numerical_policy_sha256",
         "observer",
+        "oracle_identity",
         "output_digests",
         "private_boundary",
         "repeat_bitwise_equal",
@@ -1100,7 +1173,6 @@ def validate_generic_composition_cell_report(document: object) -> dict[str, obje
         "semantic_groups",
         "shapes",
         "stablehlo_sha256",
-        "threshold_exceeded",
         "thresholds",
         "worst_absolute",
         "worst_bf16_ulp",
@@ -1113,9 +1185,8 @@ def validate_generic_composition_cell_report(document: object) -> dict[str, obje
         case is None
         or document["mode"] not in WORKER_MODES
         or document["schema"] != "track1_generic_composition_h100_cell"
-        or document["schema_version"] != 1
+        or document["schema_version"] != 2
         or document["semantic_groups"] != composition_policy.SEMANTIC_CONTRACT["groups"]
-        or document["full_write"] is not True
         or document["repeat_bitwise_equal"] is not True
     ):
         raise ValueError("generic composition diagnostic cell identity differs")
@@ -1137,7 +1208,13 @@ def validate_generic_composition_cell_report(document: object) -> dict[str, obje
         raise ValueError("generic composition diagnostic public ABI shapes differ")
     h_shape = (*case.a_shape[:-1], case.b_shape[-1])
     boundary = [
-        {"consumer": "map_contract", "dtype": "f32", "name": "h", "producer": "contract_fold", "shape": list(h_shape)},
+        {
+            "consumer": "map_contract",
+            "dtype": "f32",
+            "name": "h",
+            "producer": "contract_fold",
+            "shape": list(h_shape),
+        },
         {
             "consumer": "map_contract",
             "dtype": "f32",
@@ -1177,26 +1254,47 @@ def validate_generic_composition_cell_report(document: object) -> dict[str, obje
     for name in ("maximum_masked_bf16_ulp_error", "maximum_raw_bf16_ulp_error"):
         if type(metrics[name]) is not int or metrics[name] < 0:
             raise ValueError("generic composition diagnostic BF16 ULP metric differs")
-    exceeded = [name for name, limit in case.limits.items() if metrics[name] > limit]
-    if document["threshold_exceeded"] != exceeded:
-        raise ValueError("generic composition diagnostic threshold classification differs")
-    digests = document["output_digests"]
-    if type(digests) is not dict or set(digests) != {
-        "actual",
-        "reference_binary64",
-        "reference_f32",
-        "repeat",
+    limit_exceeded = [name for name, limit in case.limits.items() if metrics[name] > limit]
+    expected_role = "required_diagnostic" if document["mode"] == "disabled" else "enabled_gate"
+    expected_failures = [] if document["mode"] == "disabled" else limit_exceeded
+    if (
+        document["limit_exceeded"] != limit_exceeded
+        or document["acceptance_role"] != expected_role
+        or document["acceptance_failures"] != expected_failures
+    ):
+        raise ValueError("generic composition diagnostic acceptance classification differs")
+    oracle_identity = document["oracle_identity"]
+    if type(oracle_identity) is not dict or set(oracle_identity) != {
+        "input_sha256",
+        "rounded_f32_sha256",
+        "source_sha256",
     }:
+        raise ValueError("generic composition diagnostic oracle identity schema differs")
+    expected_inputs = {name: digest for name, digest in sorted(case.input_sha256.items())}
+    observed_inputs = oracle_identity["input_sha256"]
+    if type(observed_inputs) is not dict or set(observed_inputs) != set(expected_inputs):
+        raise ValueError("generic composition diagnostic oracle input identity differs")
+    if {
+        name: _ungrouped_sha(value, f"generic composition oracle input {name}")
+        for name, value in observed_inputs.items()
+    } != expected_inputs:
+        raise ValueError("generic composition diagnostic oracle input identity differs")
+    if (
+        _ungrouped_sha(
+            oracle_identity["rounded_f32_sha256"],
+            "generic composition rounded-f32 oracle",
+        )
+        != case.rounded_f32_oracle_sha256
+        or _ungrouped_sha(oracle_identity["source_sha256"], "generic composition oracle source")
+        != composition_policy.ORACLE_SOURCE_SHA256
+    ):
+        raise ValueError("generic composition diagnostic oracle identity differs")
+    digests = document["output_digests"]
+    if type(digests) is not dict or set(digests) != {"actual", "repeat"}:
         raise ValueError("generic composition diagnostic digest schema differs")
     digest_values = {name: _ungrouped_sha(value, f"generic composition {name}") for name, value in digests.items()}
     if digest_values["actual"] != digest_values["repeat"]:
         raise ValueError("generic composition diagnostic repeat digest differs")
-    reference = composition_policy.binary64_oracle(*composition_policy.deterministic_inputs(case))
-    if (
-        digest_values["reference_binary64"] != composition_policy.array_sha256(reference)
-        or digest_values["reference_f32"] != case.oracle_f32_sha256
-    ):
-        raise ValueError("generic composition diagnostic oracle digest differs")
     first_mismatch = document["first_mismatch"]
     if first_mismatch is not None:
         _validate_generic_composition_point(first_mismatch, case.result_shape, "first mismatch")
@@ -1235,14 +1333,20 @@ def validate_generic_composition_cell_report(document: object) -> dict[str, obje
             or invocation <= 0
         ):
             raise ValueError("generic composition selected diagnostic observer differs")
-        for field in ("final_module_sha256", "generated_bundle_sha256", "membership_sha256"):
+        for field in (
+            "final_module_sha256",
+            "generated_bundle_sha256",
+            "membership_sha256",
+        ):
             _ungrouped_sha(observer[field], f"generic composition observer {field}")
     if len(canonical_json(document)) >= MAX_GENERIC_COMPOSITION_CELL_BYTES:
         raise ValueError("generic composition diagnostic cell exceeds its bounded size")
     return document
 
 
-def validate_generic_composition_diagnostics(raw: bytes) -> tuple[dict[str, object], ...]:
+def validate_generic_composition_diagnostics(
+    raw: bytes,
+) -> tuple[dict[str, object], ...]:
     """Validate the complete create-only canonical NDJSON coordinate evidence."""
     expected = [(case.case_id, mode) for case in composition_policy.CASES for mode in WORKER_MODES]
     if not raw.endswith(b"\n") or len(raw) >= len(expected) * MAX_GENERIC_COMPOSITION_CELL_BYTES:
@@ -1352,12 +1456,19 @@ def validate_rmsnorm_contract_primal_checkpoint(document: object) -> dict[str, o
         if type(invocation_id) is not int or invocation_id <= 0 or invocation_id in invocation_ids:
             raise ValueError("RMSNorm Contract primal checkpoint invocation differs")
         invocation_ids.add(invocation_id)
-        _sha(observer["final_module_sha256"], "RMSNorm Contract primal checkpoint final module")
-        _sha(observer["generated_bundle_sha256"], "RMSNorm Contract primal checkpoint generated bundle")
+        _sha(
+            observer["final_module_sha256"],
+            "RMSNorm Contract primal checkpoint final module",
+        )
+        _sha(
+            observer["generated_bundle_sha256"],
+            "RMSNorm Contract primal checkpoint generated bundle",
+        )
         expected_topology = (1, 0) if shape[-1] == 7 else (2, 1)
-        if (observer["launch_count"], observer["temporary_count"]) != expected_topology or observer[
-            "topology_status"
-        ] != "normative_primal":
+        if (
+            observer["launch_count"],
+            observer["temporary_count"],
+        ) != expected_topology or observer["topology_status"] != "normative_primal":
             raise ValueError("RMSNorm Contract primal checkpoint topology differs")
     if len(invocation_ids) != 4:
         raise ValueError("RMSNorm Contract primal checkpoint observer coverage differs")
@@ -1456,7 +1567,14 @@ def _run(
     failure_records: FailureRecordEvidence | None = None,
 ) -> None:
     with log.open("wb") as stream:
-        result = subprocess.run(command, cwd=cwd, env=environment, stdout=stream, stderr=subprocess.STDOUT, check=False)
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            env=environment,
+            stdout=stream,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
     if result.returncode:
         evidence = ""
         if failure_evidence is not None and failure_evidence.exists():
@@ -1525,7 +1643,10 @@ def _hydration_identity(
             "patched_checkouts": asdict(source_identity),
         },
         "tools": {
-            "bazel": {"identity": _identity([str(paths.bazel), "--version"]), "sha256": _sha256_file(paths.bazel)},
+            "bazel": {
+                "identity": _identity([str(paths.bazel), "--version"]),
+                "sha256": _sha256_file(paths.bazel),
+            },
             "nvcc": {
                 "identity": _identity([str(cuda_root / "bin/nvcc"), "--version"]),
                 "sha256": _sha256_file(cuda_root / "bin/nvcc"),
@@ -1670,7 +1791,12 @@ def execute_prototype(
         jax_repository=paths.jax,
         xla_repository=paths.xla,
     )
-    _run(offline, cwd=paths.jax, log=paths.logs / "offline-build.log", phase="offline_wheel_build")
+    _run(
+        offline,
+        cwd=paths.jax,
+        log=paths.logs / "offline-build.log",
+        phase="offline_wheel_build",
+    )
     wheels = wheel_set(paths.wheels)
 
     _run(
@@ -1781,7 +1907,12 @@ def execute_prototype(
         "schema_version": 1,
         "hydration": hydration_identity,
         "wheels": [
-            {"name": wheel.name, "sha256": _sha256_file(wheel), "size": wheel.stat().st_size} for wheel in wheels
+            {
+                "name": wheel.name,
+                "sha256": _sha256_file(wheel),
+                "size": wheel.stat().st_size,
+            }
+            for wheel in wheels
         ],
         "workers": workers,
         "rmsnorm": rmsnorm,

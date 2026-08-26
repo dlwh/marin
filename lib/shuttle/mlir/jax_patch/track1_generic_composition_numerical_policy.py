@@ -4,15 +4,18 @@
 """Prospective numerical contract for anonymous Contract/Fold composition."""
 
 import hashlib
+import inspect
 import json
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
-POLICY_FILENAME = "track1-generic-composition-h100-numerical-policy-v1.json"
+POLICY_FILENAME = "track1-generic-composition-h100-numerical-policy-v2.json"
 POLICY_PATH = Path(__file__).with_name(POLICY_FILENAME)
-POLICY_SHA256 = "202413163a8c78067b88043db7207eafdeb5b58116341e186398572280466a21"
+POLICY_SHA256 = "78578508ee2106dccc205d6338a6ca94b0ee4d4562766b8a2bf11eae51e11984"
+ORACLE_SOURCE_SHA256 = "493b1766f36b197fb0189df5a3e82631bb66526670f72ec21f0e9e675c0a8d65"
 CELL_REPORT_PREFIX = "GENERIC_COMPOSITION_CELL "
 MAX_CELL_REPORT_BYTES = 4096
 
@@ -26,7 +29,7 @@ class Case:
     result_shape: tuple[int, ...]
     seed: int
     input_sha256: dict[str, str]
-    oracle_f32_sha256: str
+    rounded_f32_oracle_sha256: str
     stablehlo_sha256: str
     limits: dict[str, float]
 
@@ -34,15 +37,18 @@ class Case:
 def array_sha256(value: np.ndarray) -> str:
     """Hash one array with its exact dtype and shape."""
     original = np.asarray(value)
-    array = np.ascontiguousarray(original)
+    dtype = original.dtype.newbyteorder("<")
+    array = np.ascontiguousarray(original.astype(dtype, copy=False))
     digest = hashlib.sha256()
-    digest.update(original.dtype.str.encode())
-    digest.update(np.asarray(original.shape, dtype=np.int64).tobytes())
+    digest.update(dtype.str.encode())
+    digest.update(np.asarray(original.shape, dtype="<i8").tobytes())
     digest.update(array.tobytes())
     return digest.hexdigest()
 
 
-def deterministic_inputs(case: Case) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def deterministic_inputs(
+    case: Case,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Build the prospectively sealed public inputs for one case."""
     rng = np.random.default_rng(case.seed)
     a = (rng.standard_normal(case.a_shape) * 0.15 + 0.05).astype(np.float32)
@@ -67,6 +73,12 @@ def binary64_oracle(
     return (h * s[..., None]) @ p.astype(np.float64)
 
 
+def oracle_source_sha256() -> str:
+    """Hash the normalized source of the sealed binary64 oracle."""
+    source = textwrap.dedent(inspect.getsource(binary64_oracle)).replace("\r\n", "\n").rstrip() + "\n"
+    return hashlib.sha256(source.encode()).hexdigest()
+
+
 def load_numerical_policy() -> tuple[dict[str, object], tuple[Case, ...]]:
     """Load and validate the immutable prospective policy."""
     raw = POLICY_PATH.read_bytes()
@@ -76,17 +88,30 @@ def load_numerical_policy() -> tuple[dict[str, object], tuple[Case, ...]]:
     canonical = (json.dumps(document, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode()
     if raw != canonical or type(document) is not dict:
         raise ValueError("generic composition numerical policy is not canonical")
-    if set(document) != {"cases", "schema", "schema_version", "semantic_contract", "version"}:
+    if set(document) != {
+        "acceptance",
+        "cases",
+        "metric_contract",
+        "oracle_contract",
+        "schema",
+        "schema_version",
+        "semantic_contract",
+        "version",
+    }:
         raise ValueError("generic composition numerical policy schema is open")
     if (
         document["schema"] != "track1_generic_composition_h100_numerical_policy"
-        or document["schema_version"] != 1
-        or document["version"] != "prospective-v1"
+        or document["schema_version"] != 2
+        or document["version"] != "prospective-v2"
     ):
         raise ValueError("generic composition numerical policy identity differs")
     expected_contract = {
         "groups": [
-            {"kind": "contract_fold", "private_outputs": ["h", "s"], "sources": ["contract0", "fold"]},
+            {
+                "kind": "contract_fold",
+                "private_outputs": ["h", "s"],
+                "sources": ["contract0", "fold"],
+            },
             {
                 "kind": "map_contract",
                 "private_inputs": ["h", "s"],
@@ -99,6 +124,37 @@ def load_numerical_policy() -> tuple[dict[str, object], tuple[Case, ...]]:
     }
     if document["semantic_contract"] != expected_contract:
         raise ValueError("generic composition semantic contract differs")
+    if document["acceptance"] != {
+        "disabled_jax": "required_diagnostic_never_numerical_gate",
+        "enabled_modes": ["source_ordered", "fast"],
+        "enabled_thresholds": "case_limits",
+        "nonfinite_action": "reject_all_modes",
+        "raw_and_masked_bf16_ulp": "validated_diagnostic_only_no_magnitude_gate",
+        "repeat_bitwise_required": True,
+    }:
+        raise ValueError("generic composition acceptance contract differs")
+    if document["metric_contract"] != {
+        "maximum_absolute_error": "max_abs_actual_f32_minus_binary64_reference",
+        "mean_absolute_error": "mean_abs_actual_f32_minus_binary64_reference",
+        "relative_linf_error": "maximum_absolute_error_over_max_reference_abs_or_smallest_positive_binary64",
+        "runtime_metrics": "finite_recorded_values_not_byte_identity",
+    }:
+        raise ValueError("generic composition metric contract differs")
+    if (
+        document["oracle_contract"]
+        != {
+            "computation": "binary64_contract_fold_map_contract_v1",
+            "identity_sha256": (
+                "sha256(dtype_little_endian_string||shape_little_endian_i64||c_order_little_endian_bytes)"
+            ),
+            "platform_variation": "binary64_low_bits_may_vary_if_rounded_f32_identity_matches",
+            "rounded_output": "ieee754_binary32_round_to_nearest_even",
+            "source_normalization": "dedent_lf_strip_trailing_append_lf_utf8",
+            "source_sha256": ORACLE_SOURCE_SHA256,
+        }
+        or oracle_source_sha256() != ORACLE_SOURCE_SHA256
+    ):
+        raise ValueError("generic composition oracle source identity differs")
     raw_cases = document["cases"]
     if type(raw_cases) is not list or len(raw_cases) != 2:
         raise ValueError("generic composition policy must contain two cases")
@@ -110,9 +166,9 @@ def load_numerical_policy() -> tuple[dict[str, object], tuple[Case, ...]]:
             "case_id",
             "input_sha256",
             "limits",
-            "oracle_f32_sha256",
             "p_shape",
             "result_shape",
+            "rounded_f32_oracle_sha256",
             "seed",
             "stablehlo_sha256",
         }:
@@ -134,16 +190,16 @@ def load_numerical_policy() -> tuple[dict[str, object], tuple[Case, ...]]:
             result_shape=tuple(value["result_shape"]),
             seed=value["seed"],
             input_sha256=dict(value["input_sha256"]),
-            oracle_f32_sha256=value["oracle_f32_sha256"],
+            rounded_f32_oracle_sha256=value["rounded_f32_oracle_sha256"],
             stablehlo_sha256=value["stablehlo_sha256"],
             limits={name: float(limit) for name, limit in limits.items()},
         )
         inputs = deterministic_inputs(case)
         rounded = binary64_oracle(*inputs).astype(np.float32)
-        if rounded.shape != case.result_shape or array_sha256(rounded) != case.oracle_f32_sha256:
+        if rounded.shape != case.result_shape or array_sha256(rounded) != case.rounded_f32_oracle_sha256:
             raise ValueError("generic composition binary64 oracle differs from policy")
-        if not np.all(np.isfinite(rounded)) or np.any(rounded == 0):
-            raise ValueError("generic composition oracle must bind finite nonzero full writes")
+        if not np.all(np.isfinite(rounded)):
+            raise ValueError("generic composition oracle must be finite")
         cases.append(case)
     if [case.case_id for case in cases] != ["rank2-a", "rank3-b"]:
         raise ValueError("generic composition case order differs")
