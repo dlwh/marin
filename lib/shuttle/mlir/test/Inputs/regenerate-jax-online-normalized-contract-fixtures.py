@@ -84,6 +84,20 @@ def causal_gqa_without_maximum(q, k, v):
     return jnp.einsum("bhgqk,bhkv->bhgqv", weights, v)
 
 
+def causal_gqa_with_mismatched_reduction(q, k, v):
+    """Near miss whose maximum and denominator reduce different coordinates."""
+    scores = jnp.einsum("bhgqd,bhkd->bhgqk", q, k) * jnp.float32(0.125)
+    query = jnp.arange(17, dtype=jnp.int32).reshape(1, 1, 1, 17, 1)
+    key = jnp.arange(17, dtype=jnp.int32).reshape(1, 1, 1, 1, 17)
+    predicate = jnp.broadcast_to(key <= query, scores.shape)
+    masked = jax.lax.select(predicate, scores, jnp.full(scores.shape, -jnp.inf))
+    maximum = jnp.max(masked, axis=3, keepdims=True)
+    numerator = jnp.exp(masked - maximum)
+    denominator = jnp.sum(numerator, axis=4, keepdims=True)
+    weights = numerator / denominator
+    return jnp.einsum("bhgqk,bhkv->bhgqv", weights, v)
+
+
 @dataclass(frozen=True)
 class Fixture:
     filename: str
@@ -129,6 +143,12 @@ FIXTURES = (
         AXIS4_SHAPES,
         "near miss without maximum sufficient-state semantics",
     ),
+    Fixture(
+        "jax-0.10.1-f32-causal-gqa-mismatched-reduction-near-miss.mlir",
+        causal_gqa_with_mismatched_reduction,
+        AXIS4_SHAPES,
+        "near miss whose maximum and denominator reduce different coordinates",
+    ),
 )
 
 
@@ -162,7 +182,7 @@ def audited_fixture(fixture: Fixture) -> str:
         '// Export: jax.jit(fixture.function).lower(*f32_shape_structs).compiler_ir(dialect="stablehlo")',
         f"// Expression: {fixture.expression}",
         f"// Inputs: {shapes}:f32",
-        f"// JAX: {jax.__version__}; jaxlib: {jaxlib.__version__}; XLA: {PINNED_XLA_REVISION}",
+        f"// JAX: {JAX_VERSION}; jaxlib: {JAXLIB_VERSION}; XLA: {PINNED_XLA_REVISION}",
         f"// Raw ordinary-JAX StableHLO SHA-256: {ordinary_digest}",
         f"// Fixture StableHLO SHA-256: {fixture_digest}",
         f"// Textual SSA alpha-renaming: {str(fixture.alpha_rename).lower()}",
@@ -172,6 +192,12 @@ def audited_fixture(fixture: Fixture) -> str:
 
 
 def main() -> None:
+    if jax.__version__ != JAX_VERSION or jaxlib.__version__ != JAXLIB_VERSION:
+        raise SystemExit(
+            "fixture regeneration requires "
+            f"jax=={JAX_VERSION} and jaxlib=={JAXLIB_VERSION}; found "
+            f"jax=={jax.__version__} and jaxlib=={jaxlib.__version__}"
+        )
     parser = argparse.ArgumentParser()
     parser.add_argument("--write", action="store_true")
     args = parser.parse_args()

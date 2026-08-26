@@ -27,6 +27,15 @@
 // fallback, even though its remaining dataflow is structurally similar.
 // RUN: shuttle-test-opt %S/Inputs/jax-0.10.1-f32-causal-gqa-no-maximum-near-miss.mlir --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-verify-source-coverage --shuttle-verify-semantic-erasure --shuttle-test-verify-output-dependency-coverage --shuttle-test-set-fast-region-policy --shuttle-test-set-prefer-fusion-tuning --shuttle-plan-row-fold-materialization --shuttle-verify-materialization-plan --shuttle-test-verify-online-fallback -o /dev/null | FileCheck %s --check-prefix=FALLBACK
 
+// Maximum and additive state updates must reduce the same score coordinate.
+// Equal query/key extents make the wrong-axis computation shape-correct, so
+// only semantic-coordinate checking distinguishes this generic fallback.
+// RUN: shuttle-test-opt %S/Inputs/jax-0.10.1-f32-causal-gqa-mismatched-reduction-near-miss.mlir --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-verify-source-coverage --shuttle-verify-semantic-erasure --shuttle-test-verify-output-dependency-coverage --shuttle-test-set-fast-region-policy --shuttle-test-set-prefer-fusion-tuning --shuttle-plan-row-fold-materialization --shuttle-verify-materialization-plan --shuttle-test-verify-online-fallback -o /dev/null | FileCheck %s --check-prefix=FALLBACK
+
+// A maximum operation that remains represented but no longer feeds the Fold
+// yield is not maximum-state semantics and must retain the generic fallback.
+// RUN: shuttle-test-opt %S/Inputs/jax-0.10.1-f32-causal-gqa-online-axis4.mlir --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-verify-source-coverage --shuttle-verify-semantic-erasure --shuttle-test-verify-output-dependency-coverage --shuttle-test-set-fast-region-policy --shuttle-test-set-prefer-fusion-tuning --shuttle-test-rewire-online-maximum-yield --shuttle-plan-row-fold-materialization --shuttle-verify-materialization-plan --shuttle-test-verify-online-fallback -o /dev/null | FileCheck %s --check-prefix=FALLBACK
+
 // SOURCE_ORDERED retains the exact StableHLO roundtrip for both layouts; it
 // is not required to use, or forbidden from using, any planner topology.
 // RUN: shuttle-test-opt %S/Inputs/jax-0.10.1-f32-causal-gqa-online-axis4.mlir --shuttle-test-report-normalized-fingerprint -o /dev/null > %t.axis4.raw

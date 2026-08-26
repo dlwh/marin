@@ -1341,23 +1341,99 @@ bool valueDependsOn(Value value, Operation *target) {
   return false;
 }
 
-bool foldCombinerIs(FoldOp fold, StringRef operationName) {
-  return !fold.getCombiner().empty() &&
-         llvm::any_of(fold.getCombiner().front().without_terminator(),
-                      [&](Operation &operation) {
-                        return operation.getName().getStringRef() ==
-                               operationName;
-                      });
+bool foldYieldIs(FoldOp fold, StringRef operationName) {
+  if (fold.getCombiner().empty()) {
+    return false;
+  }
+  Block &body = fold.getCombiner().front();
+  auto yield = dyn_cast<YieldOp>(body.getTerminator());
+  if (!yield || yield.getValues().size() != 1 || body.getNumArguments() != 2) {
+    return false;
+  }
+  Operation *combiner = yield.getValues().front().getDefiningOp();
+  if (!combiner || combiner->getName().getStringRef() != operationName ||
+      combiner->getNumOperands() != 2) {
+    return false;
+  }
+  return llvm::all_of(combiner->getOperands(), [&](Value operand) {
+    return operand == body.getArgument(0) || operand == body.getArgument(1);
+  }) &&
+         combiner->getOperand(0) != combiner->getOperand(1);
 }
 
-bool mapBodyContains(MapOp map, StringRef operationName) {
-  return !map.getBody().empty() &&
-         llvm::any_of(map.getBody().front().without_terminator(),
-                      [&](Operation &operation) {
-                        return operation.getName().getStringRef() ==
-                               operationName;
-                      });
+bool mapYieldIs(MapOp map, StringRef operationName) {
+  if (map.getBody().empty()) {
+    return false;
+  }
+  auto yield = dyn_cast<YieldOp>(map.getBody().front().getTerminator());
+  return yield && yield.getValues().size() == 1 &&
+         yield.getValues().front().getDefiningOp() &&
+         yield.getValues().front().getDefiningOp()->getName().getStringRef() ==
+             operationName;
 }
+
+std::optional<unsigned> mapYieldUnaryArgument(MapOp map,
+                                              StringRef operationName) {
+  if (!mapYieldIs(map, operationName)) {
+    return std::nullopt;
+  }
+  auto yield = cast<YieldOp>(map.getBody().front().getTerminator());
+  Operation *unary = yield.getValues().front().getDefiningOp();
+  if (unary->getNumOperands() != 1) {
+    return std::nullopt;
+  }
+  auto argument = dyn_cast<BlockArgument>(unary->getOperand(0));
+  if (!argument || argument.getOwner() != &map.getBody().front() ||
+      argument.getArgNumber() >= map.getInputs().size()) {
+    return std::nullopt;
+  }
+  return argument.getArgNumber();
+}
+
+std::optional<std::pair<unsigned, unsigned>>
+mapYieldBinaryArguments(MapOp map, StringRef operationName) {
+  if (!mapYieldIs(map, operationName)) {
+    return std::nullopt;
+  }
+  auto yield = cast<YieldOp>(map.getBody().front().getTerminator());
+  Operation *binary = yield.getValues().front().getDefiningOp();
+  if (binary->getNumOperands() != 2) {
+    return std::nullopt;
+  }
+  auto lhs = dyn_cast<BlockArgument>(binary->getOperand(0));
+  auto rhs = dyn_cast<BlockArgument>(binary->getOperand(1));
+  if (!lhs || !rhs || lhs.getOwner() != &map.getBody().front() ||
+      rhs.getOwner() != &map.getBody().front() ||
+      lhs.getArgNumber() == rhs.getArgNumber() ||
+      lhs.getArgNumber() >= map.getInputs().size() ||
+      rhs.getArgNumber() >= map.getInputs().size()) {
+    return std::nullopt;
+  }
+  return std::pair(lhs.getArgNumber(), rhs.getArgNumber());
+}
+
+class RewireOnlineMaximumYieldPass
+    : public MutationPass<RewireOnlineMaximumYieldPass> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RewireOnlineMaximumYieldPass)
+  StringRef getArgument() const final {
+    return "shuttle-test-rewire-online-maximum-yield";
+  }
+  void runOnOperation() override {
+    WalkResult result = getOperation().walk([&](FoldOp fold) {
+      if (!foldYieldIs(fold, arith::MaximumFOp::getOperationName())) {
+        return WalkResult::advance();
+      }
+      auto yield = cast<YieldOp>(fold.getCombiner().front().getTerminator());
+      yield->setOperand(0, fold.getCombiner().front().getArgument(0));
+      return WalkResult::interrupt();
+    });
+    if (!result.wasInterrupted()) {
+      getOperation().emitError("test fixture has no live maximum Fold yield");
+      return signalPassFailure();
+    }
+  }
+};
 
 FailureOr<int64_t> staticTensorBytes(Type type) {
   auto tensor = dyn_cast<RankedTensorType>(type);
@@ -1378,6 +1454,23 @@ FailureOr<int64_t> staticTensorBytes(Type type) {
     return failure();
   }
   return elements * elementBytes;
+}
+
+LogicalResult checkedAccumulate(int64_t value, int64_t &total) {
+  if (value < 0 || total > INT64_MAX - value) {
+    return failure();
+  }
+  total += value;
+  return success();
+}
+
+LogicalResult checkedAccumulateTraffic(int64_t bytes, int64_t accesses,
+                                       int64_t &total) {
+  if (bytes < 0 || accesses < 0 ||
+      (bytes != 0 && accesses > INT64_MAX / bytes)) {
+    return failure();
+  }
+  return checkedAccumulate(bytes * accesses, total);
 }
 
 class VerifyOnlineSufficientStatePass
@@ -1422,12 +1515,14 @@ public:
     MaterializationPlanOp plan;
     llvm::SmallDenseSet<Attribute> plannedSources;
     DictionaryAttr cost;
+    llvm::SmallDenseSet<int64_t> compositionTaskOrdinals;
     for (MaterializationPlanOp candidate :
          module.getOps<MaterializationPlanOp>()) {
       if (candidate.getPolicy() != NumericalPolicy::Fast) {
         continue;
       }
       llvm::SmallDenseSet<Attribute> candidateSources;
+      llvm::SmallDenseSet<int64_t> candidateTaskOrdinals;
       DictionaryAttr candidateCost;
       for (MaterializationTaskOp task :
            candidate.getBody().front().getOps<MaterializationTaskOp>()) {
@@ -1441,6 +1536,7 @@ public:
           return signalPassFailure();
         }
         candidateSources.insert(sources->begin(), sources->end());
+        candidateTaskOrdinals.insert(task.getOrdinal());
         if (std::optional<DictionaryAttr> taskCost =
                 task.getCompositionCost()) {
           if (candidateCost && candidateCost != *taskCost) {
@@ -1454,6 +1550,7 @@ public:
       if (!candidateSources.empty()) {
         plan = candidate;
         plannedSources = std::move(candidateSources);
+        compositionTaskOrdinals = std::move(candidateTaskOrdinals);
         cost = candidateCost;
         break;
       }
@@ -1521,14 +1618,13 @@ public:
     auto regionYield = cast<YieldOp>(region.getBody().front().getTerminator());
     for (Operation *operation : onlineAlgebra) {
       if (auto fold = dyn_cast<FoldOp>(operation)) {
-        if (foldCombinerIs(fold, arith::MaximumFOp::getOperationName())) {
+        if (foldYieldIs(fold, arith::MaximumFOp::getOperationName())) {
           maximumFold = fold;
-        } else if (foldCombinerIs(fold,
-                                  arith::AddFOp::getOperationName())) {
+        } else if (foldYieldIs(fold, arith::AddFOp::getOperationName())) {
           additiveFold = fold;
         }
       } else if (auto map = dyn_cast<MapOp>(operation)) {
-        if (mapBodyContains(map, "math.exp")) {
+        if (mapYieldIs(map, "math.exp")) {
           exponentialMap = map;
         }
       } else if (auto contract = dyn_cast<ContractOp>(operation)) {
@@ -1566,25 +1662,107 @@ public:
         llvm::any_of(exponentialMap.getInputs(), [&](Value input) {
           return valueDependsOn(input, maximumFold);
         });
+    MapOp scoreMinusMaximumMap;
+    if (exponentialMap && maximumFold &&
+        maximumFold.getInputs().size() == 1) {
+      auto exponentialArgument =
+          mapYieldUnaryArgument(exponentialMap, "math.exp");
+      if (exponentialArgument) {
+        Value input = exponentialMap.getInputs()[*exponentialArgument];
+        auto candidate = input.getDefiningOp<MapOp>();
+        auto arguments = candidate ? mapYieldBinaryArguments(
+                                         candidate,
+                                         arith::SubFOp::getOperationName())
+                                   : std::nullopt;
+        if (arguments &&
+            candidate.getInputs()[arguments->first] ==
+                maximumFold.getInputs().front() &&
+            valueDependsOn(candidate.getInputs()[arguments->second],
+                           maximumFold)) {
+          scoreMinusMaximumMap = candidate;
+        }
+      }
+    }
     const bool denominatorUsesExponential =
         additiveFold && exponentialMap &&
         additiveFold.getInputs().size() == 1 &&
-        valueDependsOn(additiveFold.getInputs().front(), exponentialMap);
-    const bool contractionUsesNormalizedExponential =
-        weightedContract && additiveFold && exponentialMap &&
-        llvm::any_of(weightedContract.getInputs(), [&](Value input) {
-          return valueDependsOn(input, additiveFold) &&
-                 valueDependsOn(input, exponentialMap);
-        });
+        exponentialMap.getResults().size() == 1 &&
+        additiveFold.getInputs().front() ==
+            exponentialMap.getResults().front();
+    std::optional<unsigned> normalizedWeightOperand;
+    if (weightedContract && additiveFold && exponentialMap) {
+      for (auto [operandNumber, input] :
+           llvm::enumerate(weightedContract.getInputs())) {
+        auto normalization = input.getDefiningOp<MapOp>();
+        auto arguments = normalization
+                             ? mapYieldBinaryArguments(
+                                   normalization, arith::DivFOp::getOperationName())
+                             : std::nullopt;
+        if (arguments &&
+            exponentialMap.getResults().size() == 1 &&
+            normalization.getInputs()[arguments->first] ==
+                exponentialMap.getResults().front() &&
+            valueDependsOn(normalization.getInputs()[arguments->second],
+                           additiveFold)) {
+          normalizedWeightOperand = operandNumber;
+          break;
+        }
+      }
+    }
+    const bool reductionsAlign =
+        maximumFold && additiveFold &&
+        maximumFold.getReductionDimensions() ==
+            additiveFold.getReductionDimensions() &&
+        maximumFold.getInputs().size() == 1 &&
+        additiveFold.getInputs().size() == 1 &&
+        maximumFold.getInputs().front().getType() ==
+            additiveFold.getInputs().front().getType() &&
+        maximumFold.getResults().size() == 1 &&
+        additiveFold.getResults().size() == 1 &&
+        maximumFold.getResults().front().getType() ==
+            additiveFold.getResults().front().getType();
+    bool contractionReducesStateCoordinate = false;
+    if (reductionsAlign && weightedContract &&
+        maximumFold.getReductionDimensions().size() == 1) {
+      const int64_t reduction = maximumFold.getReductionDimensions().front();
+      for (auto [operandNumber, input] :
+           llvm::enumerate(weightedContract.getInputs())) {
+        if (!normalizedWeightOperand ||
+            operandNumber != *normalizedWeightOperand ||
+            operandNumber >= weightedContract.getIndexingMaps().size()) {
+          continue;
+        }
+        auto map = dyn_cast<AffineMapAttr>(
+            weightedContract.getIndexingMaps()[operandNumber]);
+        auto inputType = dyn_cast<RankedTensorType>(input.getType());
+        if (!map || !inputType || reduction < 0 ||
+            reduction >= inputType.getRank()) {
+          continue;
+        }
+        auto domain = dyn_cast<AffineDimExpr>(map.getValue().getResult(reduction));
+        if (!domain ||
+            domain.getPosition() >= weightedContract.getIteratorKinds().size()) {
+          continue;
+        }
+        auto iterator = dyn_cast<StringAttr>(
+            weightedContract.getIteratorKinds()[domain.getPosition()]);
+        contractionReducesStateCoordinate =
+            iterator && iterator.getValue() == "reduction";
+      }
+    }
     if (!relationFeedsScore || !contractFeedsScore ||
-        !exponentialUsesMaximum || !denominatorUsesExponential ||
-        !contractionUsesNormalizedExponential) {
+        !exponentialUsesMaximum || !scoreMinusMaximumMap ||
+        !denominatorUsesExponential ||
+        !normalizedWeightOperand || !reductionsAlign ||
+        !contractionReducesStateCoordinate) {
       module.emitError(
           "online composition does not prove {m,l,o} state semantics");
       return signalPassFailure();
     }
 
     Type scoreType = maximumFold.getInputs().front().getType();
+    int64_t actualCandidateBytes = 0;
+    int64_t actualCandidateTraffic = 0;
     for (MaterializationBufferOp buffer :
          plan.getBody().front().getOps<MaterializationBufferOp>()) {
       if (buffer.getStorage() == MaterializationStorage::Temporary &&
@@ -1592,8 +1770,54 @@ public:
         module.emitError("online composition materializes representative scores");
         return signalPassFailure();
       }
+      auto producer = buffer.getProducer();
+      if (buffer.getStorage() != MaterializationStorage::Temporary ||
+          !producer || !compositionTaskOrdinals.contains(*producer)) {
+        continue;
+      }
+      const int64_t onlineConsumers = llvm::count_if(
+          buffer.getConsumers(), [&](int64_t consumer) {
+            return compositionTaskOrdinals.contains(consumer);
+          });
+      if (onlineConsumers == 0) {
+        continue;
+      }
+      FailureOr<int64_t> bytes = staticTensorBytes(buffer.getTensorType());
+      if (failed(bytes) ||
+          failed(checkedAccumulate(*bytes, actualCandidateBytes)) ||
+          failed(checkedAccumulateTraffic(
+              *bytes, onlineConsumers + 1, actualCandidateTraffic))) {
+        module.emitError("online candidate buffer cost is not statically bounded");
+        return signalPassFailure();
+      }
     }
-    FailureOr<int64_t> scoreBytes = staticTensorBytes(scoreType);
+    int64_t actualBaselineBytes = 0;
+    int64_t actualBaselineTraffic = 0;
+    for (Operation *operation : onlineAlgebra) {
+      for (Value result : operation->getResults()) {
+        const bool liveOut = llvm::any_of(result.getUses(), [&](OpOperand &use) {
+          return use.getOwner() == regionYield;
+        });
+        llvm::SmallDenseSet<Operation *> consumers;
+        for (OpOperand &use : result.getUses()) {
+          if (onlineOperations.contains(use.getOwner())) {
+            consumers.insert(use.getOwner());
+          }
+        }
+        if (liveOut || consumers.empty()) {
+          continue;
+        }
+        FailureOr<int64_t> bytes = staticTensorBytes(result.getType());
+        if (failed(bytes) ||
+            failed(checkedAccumulate(*bytes, actualBaselineBytes)) ||
+            failed(checkedAccumulateTraffic(
+                *bytes, static_cast<int64_t>(consumers.size()) + 1,
+                actualBaselineTraffic))) {
+          module.emitError("materialized baseline cost is not statically bounded");
+          return signalPassFailure();
+        }
+      }
+    }
     auto integerCost = [&](StringRef name) -> std::optional<int64_t> {
       auto value = cost.getAs<IntegerAttr>(name);
       return value ? std::optional<int64_t>(value.getInt()) : std::nullopt;
@@ -1605,13 +1829,21 @@ public:
     auto baselineTraffic = integerCost("baseline_temporary_traffic_bytes");
     auto candidateTraffic = integerCost("candidate_temporary_traffic_bytes");
     auto contractEvaluations = integerCost("contract_evaluations");
-    if (failed(scoreBytes) || !baselineLaunches || !candidateLaunches ||
+    const int64_t actualBaselineLaunches = onlineAlgebra.size();
+    const int64_t actualCandidateLaunches = compositionTaskOrdinals.size();
+    if (!baselineLaunches || !candidateLaunches ||
         !baselineBytes || !candidateBytes || !baselineTraffic ||
         !candidateTraffic || !contractEvaluations ||
-        *candidateLaunches > *baselineLaunches ||
-        *candidateBytes >= *baselineBytes ||
-        *candidateTraffic >= *baselineTraffic ||
-        *candidateBytes >= *scoreBytes || *contractEvaluations <= 0) {
+        *baselineLaunches != actualBaselineLaunches ||
+        *candidateLaunches != actualCandidateLaunches ||
+        *baselineBytes != actualBaselineBytes ||
+        *candidateBytes != actualCandidateBytes ||
+        *baselineTraffic != actualBaselineTraffic ||
+        *candidateTraffic != actualCandidateTraffic ||
+        actualCandidateLaunches > actualBaselineLaunches ||
+        actualCandidateBytes >= actualBaselineBytes ||
+        actualCandidateTraffic >= actualBaselineTraffic ||
+        *contractEvaluations <= 0) {
       module.emitError(
           "online composition lacks relative cost and traffic improvement");
       return signalPassFailure();
@@ -3190,6 +3422,7 @@ void registerMutationPasses() {
   PassRegistration<ReportNormalizedFingerprintPass>();
   PassRegistration<ReportMaterializationFingerprintPass>();
   PassRegistration<SetPreferFusionTuningPass>();
+  PassRegistration<RewireOnlineMaximumYieldPass>();
   PassRegistration<VerifyOnlineSufficientStatePass>();
   PassRegistration<VerifyOnlineFallbackPass>();
   PassRegistration<MaterializationDeleteTaskPass>();
