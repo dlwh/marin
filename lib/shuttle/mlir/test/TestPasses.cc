@@ -7408,8 +7408,8 @@ public:
       role = "partial_index_step";
     } else if (kind == "loop-backedge") {
       role = "partial_backedge";
-      needle = "bra";
-      replacement = "brx";
+      needle = "loop";
+      replacement = "done";
     } else if (kind == "leaf-source") {
       RegionOp region;
       getOperation().walk([&](RegionOp candidate) {
@@ -7442,7 +7442,7 @@ public:
     } else if (kind == "max-leaf-duplicate") {
       role = "partial_merge_max";
     } else if (kind == "max-leaf-coordinate") {
-      role = "partial_index_offset";
+      role = "partial_index_wide";
     } else if (kind == "leaf-max") {
       role = "leaf_max_update";
       needle = "max";
