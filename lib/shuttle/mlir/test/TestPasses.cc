@@ -1876,16 +1876,15 @@ public:
             iterator && iterator.getValue() == "reduction";
       }
     }
-    const bool recomputationMatches =
-        plannedRecomputedSources.size() == requiredRecomputedSources.size() &&
+    const bool scoreSourcesOwned = plannedRecomputedSources.empty() &&
         llvm::all_of(requiredRecomputedSources, [&](Attribute source) {
-          return plannedRecomputedSources.contains(source);
+          return plannedSources.contains(source);
         });
     if (!relationFeedsScore || !contractFeedsScore ||
         !exponentialUsesMaximum || !scoreMinusMaximumMap ||
         !denominatorUsesExponential ||
         !normalizedWeightOperand || !reductionsAlign ||
-        !recomputationMatches ||
+        !scoreSourcesOwned ||
         !stateCoordinatesAlign || !contractionReducesStateCoordinate) {
       module.emitError(
           "online composition does not prove {m,l,o} state semantics");
@@ -3153,6 +3152,8 @@ OnlinePointerAlternatives onlinePointerAlternatives(
                  opcode.starts_with("add.u32") ||
                  opcode.starts_with("add.s32") ||
                  opcode.starts_with("mul.lo.u32") ||
+                 opcode.starts_with("div.u32") ||
+                 opcode.starts_with("rem.u32") ||
                  opcode.starts_with("mad.lo.u32") ||
                  opcode.starts_with("mad.wide.u32") ||
                  opcode.starts_with("shl.b32") ||
@@ -3353,6 +3354,30 @@ FailureOr<std::string> onlineComparisonOpcode(RelationOp relation) {
   return (Twine("setp.") + predicate + "." + suffix).str();
 }
 
+bool onlineRoleIsExactFloatConstant(const OnlinePtxCfg &cfg, StringRef role,
+                                    StringRef bits) {
+  auto found = cfg.roles.find(role.str());
+  if (found == cfg.roles.end())
+    return false;
+  int64_t instruction = found->second;
+  llvm::SmallDenseSet<int64_t> active;
+  while (active.insert(instruction).second) {
+    const OnlinePtxInstruction &producer = cfg.instructions[instruction];
+    if (!producer.predicate.empty() || producer.operands.size() != 2 ||
+        (producer.opcode != "mov.f32" && producer.opcode != "mov.b32"))
+      return false;
+    if (producer.operands[1] == bits)
+      return true;
+    std::set<int64_t> definitions = onlineReachingDefinitions(
+        cfg, instruction, producer.operands[1]);
+    if (definitions.size() != 1 ||
+        definitions.count(kOnlineUndefinedDefinition))
+      return false;
+    instruction = *definitions.begin();
+  }
+  return false;
+}
+
 bool onlineMaskedScoreProtocol(const OnlinePtxCfg &cfg,
                                StringRef comparisonOpcode) {
   auto compare = cfg.roles.find("relation_compare");
@@ -3364,15 +3389,14 @@ bool onlineMaskedScoreProtocol(const OnlinePtxCfg &cfg,
          onlineRoleOperandIs(cfg, "relation_compare", 1, "relation_lhs") &&
          onlineRoleOperandIs(cfg, "relation_compare", 2, "relation_rhs") &&
          onlineRoleIs(cfg, "negative_infinity", {"mov.f32"}) &&
-         llvm::is_contained(
-             cfg.instructions[cfg.roles.at("negative_infinity")].operands,
-             "0fFF800000") &&
+         onlineRoleIsExactFloatConstant(cfg, "negative_infinity",
+                                        "0fFF800000") &&
          onlineRoleIs(cfg, "mask_select", {"selp."},
-                      {"relation_compare", "score_value",
-                       "negative_infinity"}) &&
+                      {"score_value", "negative_infinity"}) &&
          onlineRoleOperandIs(cfg, "mask_select", 1, "score_value") &&
          onlineRoleOperandIs(cfg, "mask_select", 2, "negative_infinity") &&
-         onlineRoleOperandIs(cfg, "mask_select", 3, "relation_compare");
+         onlineRoleTransitivelyDependsOn(cfg, "mask_select",
+                                         "relation_compare");
 }
 
 bool onlineCompactOutputAddressIsProjected(
@@ -5106,23 +5130,188 @@ bool onlineExpOf(const OnlinePtxCfg &cfg, StringRef resultRole,
          onlineRoleIs(cfg, resultRole, {"ex2."}, {scaledArgumentRole});
 }
 
+bool onlineRoleOperandDefinitionsAre(const OnlinePtxCfg &cfg, StringRef role,
+                                     unsigned operand,
+                                     ArrayRef<StringRef> definitions) {
+  auto consumer = cfg.roles.find(role.str());
+  if (consumer == cfg.roles.end() ||
+      cfg.instructions[consumer->second].operands.size() <= operand)
+    return false;
+  std::set<int64_t> expected;
+  for (StringRef definition : definitions) {
+    auto producer = cfg.roles.find(definition.str());
+    if (producer == cfg.roles.end())
+      return false;
+    expected.insert(producer->second);
+  }
+  return onlineReachingDefinitions(
+             cfg, consumer->second,
+             cfg.instructions[consumer->second].operands[operand]) == expected;
+}
+
+bool onlinePartialStateReductionProtocol(const OnlinePtxCfg &cfg,
+                                         int64_t threads) {
+  auto init = cfg.roles.find("partial_index_init");
+  auto guard = cfg.roles.find("partial_index_guard");
+  auto exit = cfg.roles.find("partial_exit_branch");
+  auto loadM = cfg.roles.find("partial_m_load");
+  auto mergeM = cfg.roles.find("partial_merge_max");
+  auto step = cfg.roles.find("partial_index_step");
+  auto backedge = cfg.roles.find("partial_backedge");
+  auto result = cfg.roles.find("state_m");
+  if (init == cfg.roles.end() || guard == cfg.roles.end() ||
+      exit == cfg.roles.end() || loadM == cfg.roles.end() ||
+      mergeM == cfg.roles.end() || step == cfg.roles.end() ||
+      backedge == cfg.roles.end() || result == cfg.roles.end() ||
+      threads <= 0)
+    return false;
+  auto check = [](bool value) { return value; };
+  const OnlinePtxInstruction &exitInstruction = cfg.instructions[exit->second];
+  const OnlinePtxInstruction &backedgeInstruction =
+      cfg.instructions[backedge->second];
+  auto exitTarget = cfg.labels.find(exitInstruction.branchTarget);
+  auto backedgeTarget = cfg.labels.find(backedgeInstruction.branchTarget);
+  if (!check(
+             onlineRoleIsExactFloatConstant(cfg, "partial_m_init",
+                                            "0fFF800000") &&
+                 onlineRoleIsExactFloatConstant(cfg, "partial_l_init",
+                                                "0f00000000") &&
+                 onlineRoleIsExactFloatConstant(cfg, "partial_o_init",
+                                                "0f00000000")) ||
+      !check(onlineRoleIs(cfg, "partial_index_init", {"mov.u32"}) &&
+                               llvm::is_contained(
+                                   cfg.instructions[init->second].operands,
+                                   "1")) ||
+      !check(
+             onlineRoleIs(cfg, "partial_index_guard", {"setp.ge.u32"}) &&
+                 llvm::is_contained(cfg.instructions[guard->second].operands,
+                                    std::to_string(threads)) &&
+                 onlineRoleOperandDefinitionsAre(
+                     cfg, "partial_index_guard", 1,
+                     {"partial_index_init", "partial_index_step"})) ||
+      !check(
+             exitInstruction.opcode == "bra" &&
+                 !exitInstruction.predicate.empty() &&
+                 !exitInstruction.negatedPredicate &&
+                 onlineRoleDirectlyReaches(cfg, "partial_index_guard",
+                                           exit->second) &&
+                 backedgeInstruction.opcode == "bra" &&
+                 backedgeInstruction.predicate.empty() &&
+                 exitTarget != cfg.labels.end() &&
+                 exitTarget->second == cfg.instructions[result->second].block &&
+                 backedgeTarget != cfg.labels.end() &&
+                 backedgeTarget->second ==
+                     cfg.instructions[guard->second].block) ||
+      !check(
+             onlineRoleIs(cfg, "partial_m_load", {"ld.shared.f32"}) &&
+                 onlineRoleIs(cfg, "partial_l_load", {"ld.shared.f32"}) &&
+                 onlineRoleIs(cfg, "partial_o_load", {"ld.shared.f32"})) ||
+      !check(
+             onlineRoleIs(cfg, "partial_merge_max", {"max.f32"},
+                          {"partial_m_load"}) &&
+                 onlineRoleOperandDefinitionsAre(
+                     cfg, "partial_merge_max", 1,
+                     {"partial_m_init", "partial_m_update"})) ||
+      !check(
+             onlineRoleIs(cfg, "partial_merge_l", {"add.rn.f32"}) &&
+                 onlineRoleTransitivelyDependsOn(cfg, "partial_merge_l",
+                                                  "partial_l_load") &&
+                 onlineRoleOperandDefinitionsAre(
+                     cfg, "partial_merge_left_l", 2,
+                     {"partial_l_init", "partial_l_update"})) ||
+      !check(
+             onlineRoleIs(cfg, "partial_merge_o", {"add.rn.f32"}) &&
+                 onlineRoleTransitivelyDependsOn(cfg, "partial_merge_o",
+                                                  "partial_o_load") &&
+                 onlineRoleOperandDefinitionsAre(
+                     cfg, "partial_merge_left_o", 2,
+                     {"partial_o_init", "partial_o_update"})) ||
+      !check(
+             onlineRoleIs(cfg, "partial_m_update", {"mov.f32"},
+                          {"partial_merge_max"}) &&
+                 onlineRoleIs(cfg, "partial_l_update", {"mov.f32"},
+                              {"partial_merge_l"}) &&
+                 onlineRoleIs(cfg, "partial_o_update", {"mov.f32"},
+                              {"partial_merge_o"})) ||
+      !check(
+             onlineRoleIs(cfg, "partial_index_step", {"add.u32"}) &&
+                 onlineRoleOperandDefinitionsAre(
+                     cfg, "partial_index_step", 1,
+                     {"partial_index_init", "partial_index_step"}) &&
+                 llvm::is_contained(cfg.instructions[step->second].operands,
+                                    "1")) ||
+      !check(
+             onlineInstructionDominates(cfg, init->second, guard->second) &&
+                 onlineInstructionDominates(cfg, guard->second,
+                                            loadM->second) &&
+                 onlineInstructionDominates(cfg, loadM->second,
+                                            mergeM->second) &&
+                 onlineInstructionDominates(cfg, mergeM->second,
+                                            step->second) &&
+                 onlineInstructionDominates(cfg, step->second,
+                                            backedge->second) &&
+                 onlineInstructionDominates(cfg, exit->second,
+                                            result->second)))
+    return false;
+  return check(
+               onlineRoleIs(cfg, "leaf_max_update", {"max.f32"},
+                            {"mask_select"})) &&
+         check(
+               onlineRoleIs(cfg, "leaf_l_update", {"fma.rn.f32"}) &&
+                   onlineRoleTransitivelyDependsOn(cfg, "leaf_l_update",
+                                                    "mask_select")) &&
+         check(
+               onlineRoleIs(cfg, "leaf_o_update", {"fma.rn.f32"}) &&
+                   onlineRoleTransitivelyDependsOn(cfg, "leaf_o_update",
+                                                    "value_load") &&
+                   onlineRoleTransitivelyDependsOn(cfg, "leaf_o_update",
+                                                    "mask_select")) &&
+         check(
+               onlineRoleIs(cfg, "leaf_m_store", {"st.shared.f32"},
+                            {"leaf_max_update"}) &&
+                   onlineRoleIs(cfg, "leaf_l_store", {"st.shared.f32"},
+                                {"leaf_l_update"}) &&
+                   onlineRoleIs(cfg, "leaf_o_store", {"st.shared.f32"},
+                                {"leaf_o_update"})) &&
+         check(
+               onlineRoleIs(cfg, "leaf_barrier", {"bar.sync"}) &&
+                   onlineInstructionDominates(
+                       cfg, cfg.roles.at("leaf_m_store"),
+                       cfg.roles.at("leaf_barrier")) &&
+                   onlineInstructionDominates(cfg,
+                                              cfg.roles.at("leaf_barrier"),
+                                              loadM->second));
+}
+
 bool onlineFinalizeProtocol(const OnlinePtxCfg &cfg) {
-  const bool division =
+  const bool mergedDivision =
       onlineRoleIs(cfg, "finalize", {"div.rn.f32"},
                    {"merge_o", "merge_l"}) &&
       onlineRoleOperandIs(cfg, "finalize", 1, "merge_o") &&
       onlineRoleOperandIs(cfg, "finalize", 2, "merge_l");
-  const bool reciprocal =
+  const bool mergedReciprocal =
       onlineRoleIs(cfg, "denominator_reciprocal", {"rcp.rn.f32"},
                    {"merge_l"}) &&
       onlineRoleIs(cfg, "finalize", {"mul.rn.f32"},
                    {"merge_o", "denominator_reciprocal"});
-  return division || reciprocal;
+  const bool updateDivision =
+      onlineRoleIs(cfg, "finalize", {"div.rn.f32"},
+                   {"o_update", "l_update"}) &&
+      onlineRoleOperandIs(cfg, "finalize", 1, "o_update") &&
+      onlineRoleOperandIs(cfg, "finalize", 2, "l_update");
+  const bool updateReciprocal =
+      onlineRoleIs(cfg, "denominator_reciprocal", {"rcp.rn.f32"},
+                   {"l_update"}) &&
+      onlineRoleIs(cfg, "finalize", {"mul.rn.f32"},
+                   {"o_update", "denominator_reciprocal"});
+  return mergedDivision || mergedReciprocal || updateDivision ||
+         updateReciprocal;
 }
 
 bool onlineStateProtocol(const OnlinePtxCfg &cfg, int64_t outputParameter,
-                         StringRef comparisonOpcode) {
-  return onlineMaskedScoreProtocol(cfg, comparisonOpcode) &&
+                         StringRef comparisonOpcode, int64_t threads) {
+  return onlinePartialStateReductionProtocol(cfg, threads) &&
+         onlineMaskedScoreProtocol(cfg, comparisonOpcode) &&
          onlineRoleIs(cfg, "max_init", {"mov.f32"}) &&
          llvm::is_contained(
              cfg.instructions[cfg.roles.at("max_init")].operands,
@@ -5131,9 +5320,12 @@ bool onlineStateProtocol(const OnlinePtxCfg &cfg, int64_t outputParameter,
          llvm::is_contained(
              cfg.instructions[cfg.roles.at("zero_init")].operands,
              "0f00000000") &&
-         onlineRoleIs(cfg, "state_m", {"mov.f32"}, {"max_init"}) &&
-         onlineRoleIs(cfg, "state_l", {"mov.f32"}, {"zero_init"}) &&
-         onlineRoleIs(cfg, "state_o", {"mov.f32"}, {"zero_init"}) &&
+         onlineRoleIs(cfg, "state_m", {"mov.f32"}) &&
+         onlineRoleTransitivelyDependsOn(cfg, "state_m", "max_init") &&
+         onlineRoleIs(cfg, "state_l", {"mov.f32"}) &&
+         onlineRoleTransitivelyDependsOn(cfg, "state_l", "zero_init") &&
+         onlineRoleIs(cfg, "state_o", {"mov.f32"}) &&
+         onlineRoleTransitivelyDependsOn(cfg, "state_o", "zero_init") &&
          onlineRoleIs(cfg, "max_update", {"max.f32"},
                       {"state_m", "mask_select"}) &&
          onlineRoleIs(cfg, "old_delta", {"sub.rn.f32"},
@@ -5154,32 +5346,6 @@ bool onlineStateProtocol(const OnlinePtxCfg &cfg, int64_t outputParameter,
                             "old_rescale", "state_l", "score_weight") &&
          onlineScaledUpdate(cfg, "old_o_scaled", "o_update",
                             "old_rescale", "state_o", "value_weight") &&
-         onlineRoleIs(cfg, "merge_max", {"max.f32"},
-                      {"max_update", "shared_m_load"}) &&
-         onlineRoleIs(cfg, "merge_left_delta", {"sub.rn.f32"},
-                      {"max_update", "merge_max"}) &&
-         onlineExpOf(cfg, "merge_left_rescale", "merge_left_delta",
-                     "merge_left_exp_argument") &&
-         onlineRoleIs(cfg, "merge_right_delta", {"sub.rn.f32"},
-                      {"shared_m_load", "merge_max"}) &&
-         onlineExpOf(cfg, "merge_right_rescale", "merge_right_delta",
-                     "merge_right_exp_argument") &&
-         onlineSharedPairIsClosed(cfg, "shared_m_store", "max_update",
-                                  "merge_barrier", "shared_m_load") &&
-         onlineSharedPairIsClosed(cfg, "shared_l_store", "l_update",
-                                  "merge_barrier", "shared_l_load") &&
-         onlineSharedPairIsClosed(cfg, "shared_o_store", "o_update",
-                                  "merge_barrier", "shared_o_load") &&
-         onlineRoleIs(cfg, "merge_right_l", {"mul.rn.f32"},
-                      {"merge_right_rescale", "shared_l_load"}) &&
-         onlineScaledUpdate(cfg, "merge_left_l", "merge_l",
-                            "merge_left_rescale", "l_update",
-                            "merge_right_l") &&
-         onlineRoleIs(cfg, "merge_right_o", {"mul.rn.f32"},
-                      {"merge_right_rescale", "shared_o_load"}) &&
-         onlineScaledUpdate(cfg, "merge_left_o", "merge_o",
-                            "merge_left_rescale", "o_update",
-                            "merge_right_o") &&
          onlineFinalizeProtocol(cfg) &&
          onlineRoleIs(cfg, "public_store", {"st.global."}, {"finalize"}) &&
          onlineRoleStoresToOutput(cfg, "public_store", outputParameter);
@@ -6719,7 +6885,9 @@ public:
         if (buffer->second.getLiveOut()) {
           entryHasSemanticOutput = true;
           const bool valid =
-              onlineStateProtocol(*cfg, parameter, *comparisonOpcode);
+              scheduled != scheduleTasks.end() &&
+              onlineStateProtocol(*cfg, parameter, *comparisonOpcode,
+                                  scheduled->second.getWorkgroupThreads());
           publicState |= valid;
           entryClosed &= valid;
         }
@@ -6730,7 +6898,7 @@ public:
         return signalPassFailure();
       }
     }
-    if (coveredTasks.size() != onlineTasks.size() || !compactState ||
+    if (coveredTasks.size() != onlineTasks.size() || compactState ||
         !publicState) {
       module.emitError(
           "online GPU CFG does not prove predicate/update/merge/finalize");
@@ -6818,9 +6986,16 @@ public:
       return signalPassFailure();
     }
 
-    if (kind == "max-leaf-drop" || kind == "max-leaf-duplicate" ||
-        kind == "max-leaf-coordinate" || kind == "max-merge-lost" ||
-        kind == "max-root-partial") {
+    const bool hasMaximumCertificate = llvm::any_of(
+        device.getBody().front().getOps<DeviceEntryOp>(),
+        [](DeviceEntryOp entry) {
+          return static_cast<bool>(entry->getAttr(
+              "online_max_reduction_certificate"));
+        });
+    if (hasMaximumCertificate &&
+        (kind == "max-leaf-drop" || kind == "max-leaf-duplicate" ||
+         kind == "max-leaf-coordinate" || kind == "max-merge-lost" ||
+         kind == "max-root-partial")) {
       bool changed = false;
       for (DeviceEntryOp entry :
            device.getBody().front().getOps<DeviceEntryOp>()) {
@@ -6979,105 +7154,37 @@ public:
             "online GPU entry has no logical coordinate maps");
         return signalPassFailure();
       }
+      refreshExecutableBundle(getOperation(), /*refreshCodeDigest=*/false);
       return;
     }
 
     StringRef phaseRole = "public_store";
-    std::string roleStorage;
     StringRef role;
     StringRef needle;
     StringRef replacement;
     std::string sourceMarker;
-    auto reductionRealizationRole = [&](StringRef field) -> std::string {
-      for (DeviceEntryOp entry :
-           device.getBody().front().getOps<DeviceEntryOp>()) {
-        auto certificate = entry->getAttrOfType<DictionaryAttr>(
-            "online_max_reduction_certificate");
-        auto nodes = certificate
-                         ? certificate.getAs<ArrayAttr>("nodes")
-                         : ArrayAttr();
-        if (!nodes)
-          continue;
-        for (Attribute attribute : nodes) {
-          auto realization =
-              cast<DictionaryAttr>(attribute).getAs<DictionaryAttr>(
-                  "realization");
-          auto found = realization
-                           ? realization.getAs<StringAttr>(field)
-                           : StringAttr();
-          if (found)
-            return found.getValue().str();
-        }
-      }
-      return {};
-    };
-    if (kind == "maximum") {
-      phaseRole = "compact_store";
+    if (kind == "maximum" || kind == "max-merge-lost") {
+      phaseRole = "public_store";
+      role = "partial_merge_max";
       needle = "max";
       replacement = "add";
-      for (DeviceEntryOp entry :
-           device.getBody().front().getOps<DeviceEntryOp>()) {
-        auto certificate = entry->getAttrOfType<DictionaryAttr>(
-            "online_max_reduction_certificate");
-        auto nodes = certificate
-                         ? certificate.getAs<ArrayAttr>("nodes")
-                         : ArrayAttr();
-        if (!nodes)
-          continue;
-        for (Attribute attribute : nodes) {
-          auto node = cast<DictionaryAttr>(attribute);
-          auto children = node.getAs<DenseI64ArrayAttr>("children");
-          auto nodeRole = node.getAs<StringAttr>("role");
-          if (children && !children.empty() && nodeRole) {
-            roleStorage = nodeRole.getValue().str();
-            role = roleStorage;
-            break;
-          }
-          auto realization = node.getAs<DictionaryAttr>("realization");
-          auto update = realization
-                            ? realization.getAs<StringAttr>(
-                                  "accumulator_update_role")
-                            : StringAttr();
-          if (update) {
-            roleStorage = update.getValue().str();
-            role = roleStorage;
-          }
-        }
-        if (!role.empty())
-          break;
-      }
-      if (role.empty()) {
-        getOperation().emitError(
-            "online GPU entry has no maximum reduction role");
-        return signalPassFailure();
-      }
     } else if (kind == "max-init") {
-      phaseRole = "compact_store";
-      role = "max_init";
+      role = "partial_m_init";
       needle = "0fFF800000";
       replacement = "0f00000000";
     } else if (kind == "loop-polarity") {
-      phaseRole = "compact_store";
-      roleStorage = reductionRealizationRole("index_guard_role");
-      role = roleStorage;
+      role = "partial_index_guard";
       needle = ".ge.";
       replacement = ".lt.";
     } else if (kind == "loop-bound") {
-      phaseRole = "compact_store";
-      roleStorage = reductionRealizationRole("index_guard_role");
-      role = roleStorage;
+      role = "partial_index_guard";
     } else if (kind == "loop-step") {
-      phaseRole = "compact_store";
-      roleStorage = reductionRealizationRole("index_step_role");
-      role = roleStorage;
+      role = "partial_index_step";
     } else if (kind == "loop-backedge") {
-      phaseRole = "compact_store";
-      roleStorage = reductionRealizationRole("backedge_role");
-      role = roleStorage;
+      role = "partial_backedge";
       needle = "bra";
       replacement = "brx";
     } else if (kind == "leaf-source") {
-      phaseRole = "compact_store";
       RegionOp region;
       getOperation().walk([&](RegionOp candidate) {
         if (!region)
@@ -7100,12 +7207,16 @@ public:
       }
       needle = "fma";
       replacement = "mov";
-    } else if (kind == "root-value") {
-      phaseRole = "compact_store";
-      role = "compact_store";
+    } else if (kind == "root-value" || kind == "max-root-partial") {
+      role = "public_store";
     } else if (kind == "output-coordinate") {
-      phaseRole = "compact_store";
-      role = "compact_output_linear_index";
+      role = "public_output_linear_index";
+    } else if (kind == "max-leaf-drop") {
+      role = "leaf_m_store";
+    } else if (kind == "max-leaf-duplicate") {
+      role = "partial_merge_max";
+    } else if (kind == "max-leaf-coordinate") {
+      role = "partial_index_offset";
     } else if (kind == "zero-init") {
       role = "zero_init";
       needle = "0f00000000";
@@ -7199,12 +7310,16 @@ public:
       size_t localNeedle = instruction.find(localNeedleText);
       if (kind == "shared-value" || kind == "relation-iota" ||
           kind == "loop-bound" || kind == "loop-step" ||
-          kind == "root-value" || kind == "output-coordinate") {
+          kind == "root-value" || kind == "output-coordinate" ||
+          kind == "max-leaf-drop" || kind == "max-leaf-duplicate" ||
+          kind == "max-leaf-coordinate" || kind == "max-root-partial") {
         std::vector<std::string> tokens = onlinePtxTokens(instruction);
         if (tokens.empty())
           continue;
         size_t tokenIndex =
-            kind == "root-value" ? 1
+            (kind == "root-value" || kind == "max-root-partial" ||
+             kind == "max-leaf-drop")
+                ? 1
             : (kind == "loop-bound" || kind == "loop-step")
                 ? tokens.size() - 1
                 : 1;
@@ -7213,10 +7328,14 @@ public:
              !StringRef(tokens[tokenIndex]).ends_with(".x")))
           continue;
         localNeedleText = tokens[tokenIndex];
-        std::string changed = tokens[tokenIndex];
-        changed.back() = llvm::isDigit(changed.back())
-                             ? (changed.back() == '0' ? '1' : '0')
-                             : 'y';
+        std::string changed =
+            kind == "max-leaf-duplicate" && tokens.size() > 2
+                ? tokens[1]
+                : tokens[tokenIndex];
+        if (kind != "max-leaf-duplicate")
+          changed.back() = llvm::isDigit(changed.back())
+                               ? (changed.back() == '0' ? '1' : '0')
+                               : 'y';
         localReplacement = changed;
         localNeedle = instruction.find(localNeedleText);
       }
