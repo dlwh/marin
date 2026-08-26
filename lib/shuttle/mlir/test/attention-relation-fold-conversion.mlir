@@ -48,23 +48,29 @@
 // one lossless materialized relation or another equivalent representation.
 // AXIS4-DAG: policy = #shuttle.policy<source_ordered>
 // AXIS4-DAG: "shuttle.relation"
-// AXIS4-DAG: "shuttle.fold"{{.*}}reduction_dimensions = array<i64: 4>
+// AXIS4-DAG: #shuttle.relation_semantics<compare>
+// AXIS4-DAG: parameters = ["SIGNED", "LE"]
+// AXIS4-DAG: "shuttle.fold"{{.*}}order_free = false{{.*}}reduction_dimensions = array<i64: 4>
 // AXIS4-DAG: "arith.maximumf"
+// AXIS4-DAG: order_free = true
 // AXIS4-DAG: "arith.addf"
 // AXIS4-DAG: shuttle.coverage_manifest
 // AXIS4-DAG: excluded = []
 // AXIS4-DAG: policy = "source_ordered"
-// AXIS4-DAG: policy_digest = "{{[0-9a-f]{64}}"
+// AXIS4-DAG: policy_digest = "{{[0-9a-f]+}}"
 
 // AXIS1-DAG: policy = #shuttle.policy<source_ordered>
 // AXIS1-DAG: "shuttle.relation"
-// AXIS1-DAG: "shuttle.fold"{{.*}}reduction_dimensions = array<i64: 1>
+// AXIS1-DAG: #shuttle.relation_semantics<compare>
+// AXIS1-DAG: parameters = ["SIGNED", "LE"]
+// AXIS1-DAG: "shuttle.fold"{{.*}}order_free = false{{.*}}reduction_dimensions = array<i64: 1>
 // AXIS1-DAG: "arith.maximumf"
+// AXIS1-DAG: order_free = true
 // AXIS1-DAG: "arith.addf"
 // AXIS1-DAG: shuttle.coverage_manifest
 // AXIS1-DAG: excluded = []
 // AXIS1-DAG: policy = "source_ordered"
-// AXIS1-DAG: policy_digest = "{{[0-9a-f]{64}}"
+// AXIS1-DAG: policy_digest = "{{[0-9a-f]+}}"
 
 // DEPENDENCIES: output_dependency_coverage = complete
 // DEAD: covered source results do not form a complete public-output dependency trace

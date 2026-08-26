@@ -158,3 +158,25 @@ module {
     return %result : tensor<3xf32>
   }
 }
+
+// -----
+
+module {
+  func.func @relation_comparison_type(%lhs: tensor<2x4xi32>,
+      %rhs: tensor<2x4xi32>) -> tensor<2x4xi1> {
+    %result = "shuttle.region"(%lhs, %rhs) ({
+    ^bb0(%region_lhs: tensor<2x4xi32>, %region_rhs: tensor<2x4xi32>):
+      // expected-error @+1 {{requires a valid i32 comparison and i1 result}}
+      %relation = "shuttle.relation"(%region_lhs, %region_rhs) {
+        parameters = ["FLOAT", "LE"],
+        semantics = #shuttle.relation_semantics<compare>,
+        source = #shuttle.source_ref<0, 0, 0, 0>
+      } : (tensor<2x4xi32>, tensor<2x4xi32>) -> tensor<2x4xi1>
+      "shuttle.yield"(%relation) : (tensor<2x4xi1>) -> ()
+    }) {
+      policy = #shuttle.policy<source_ordered>,
+      source_refs = [#shuttle.source_ref<0, 0, 0, 0>]
+    } : (tensor<2x4xi32>, tensor<2x4xi32>) -> tensor<2x4xi1>
+    return %result : tensor<2x4xi1>
+  }
+}

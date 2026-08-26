@@ -55,6 +55,27 @@ def Shuttle_MapSemanticsAttr
   let assemblyFormat = "`<` $value `>`";
 }
 
+def Shuttle_RelationSemantics
+    : I32EnumAttr<"RelationSemantics", "Index-domain relation semantics",
+                  [I32EnumAttrCase<"Iota", 0, "iota">,
+                   I32EnumAttrCase<"Constant", 1, "constant">,
+                   I32EnumAttrCase<"Reshape", 2, "reshape">,
+                   I32EnumAttrCase<"BroadcastInDim", 3,
+                                   "broadcast_in_dim">,
+                   I32EnumAttrCase<"Add", 4, "add">,
+                   I32EnumAttrCase<"Compare", 5, "compare">,
+                   I32EnumAttrCase<"Convert", 6, "convert">,
+                   I32EnumAttrCase<"Select", 7, "select">]> {
+  let genSpecializedAttr = 0;
+  let cppNamespace = "::mlir::shuttle";
+}
+
+def Shuttle_RelationSemanticsAttr
+    : EnumAttr<Shuttle_Dialect, Shuttle_RelationSemantics,
+               "relation_semantics"> {
+  let assemblyFormat = "`<` $value `>`";
+}
+
 def Shuttle_MaterializationTaskKind
     : I32EnumAttr<"MaterializationTaskKind", "Materialization task family kind",
                   [I32EnumAttrCase<"Map", 0, "map">,

@@ -441,21 +441,111 @@ bool isSupportedStablehloReduce(Operation *operation) {
       body.getOperations().size() != 2) {
     return false;
   }
-  Operation &add = body.front();
+  Operation &combiner = body.front();
   Operation &terminator = body.back();
-  return add.getName().getStringRef() == stablehlo::AddOp::getOperationName() &&
-         sourceAttributes(&add).empty() && add.getNumOperands() == 2 &&
-         add.getNumResults() == 1 && add.getOperand(0) == body.getArgument(0) &&
-         add.getOperand(1) == body.getArgument(1) &&
-         add.getResult(0).getType() == body.getArgument(0).getType() &&
+  StringRef combinerName = combiner.getName().getStringRef();
+  const bool supportedCombiner =
+      combinerName == stablehlo::AddOp::getOperationName() ||
+      combinerName == stablehlo::MaxOp::getOperationName();
+  return supportedCombiner && sourceAttributes(&combiner).empty() &&
+         combiner.getNumOperands() == 2 && combiner.getNumResults() == 1 &&
+         combiner.getOperand(0) == body.getArgument(0) &&
+         combiner.getOperand(1) == body.getArgument(1) &&
+         combiner.getResult(0).getType() == body.getArgument(0).getType() &&
          terminator.getName().getStringRef() ==
              stablehlo::ReturnOp::getOperationName() &&
          sourceAttributes(&terminator).empty() &&
          terminator.getNumOperands() == 1 &&
-         terminator.getOperand(0) == add.getResult(0);
+         terminator.getOperand(0) == combiner.getResult(0);
+}
+
+bool isSupportedStablehloRelation(Operation *operation) {
+  StringRef name = operation->getName().getStringRef();
+  if (operation->getNumResults() != 1 || operation->getNumRegions() != 0 ||
+      !isMemoryEffectFree(operation)) {
+    return false;
+  }
+  auto result = dyn_cast<RankedTensorType>(operation->getResult(0).getType());
+  if (!result || !result.hasStaticShape()) {
+    return false;
+  }
+  DictionaryAttr attributes = sourceAttributes(operation);
+  if (name == stablehlo::IotaOp::getOperationName()) {
+    auto dimension = operation->getAttrOfType<IntegerAttr>("iota_dimension");
+    return operation->getNumOperands() == 0 &&
+           result.getElementType().isInteger(32) && dimension &&
+           dimension.getInt() >= 0 && dimension.getInt() < result.getRank() &&
+           attributes.size() == 1;
+  }
+  if (name == stablehlo::ConstantOp::getOperationName()) {
+    auto value = operation->getAttrOfType<DenseElementsAttr>("value");
+    return operation->getNumOperands() == 0 && result.getRank() == 0 &&
+           result.getElementType().isInteger(32) && value && value.isSplat() &&
+           attributes.size() == 1;
+  }
+  if (operation->getNumOperands() == 1) {
+    auto input = dyn_cast<RankedTensorType>(operation->getOperand(0).getType());
+    if (!input || !input.hasStaticShape()) {
+      return false;
+    }
+    if (name == stablehlo::ReshapeOp::getOperationName()) {
+      return attributes.empty() && input.getElementType().isInteger(32) &&
+             result.getElementType().isInteger(32) &&
+             input.getNumElements() == result.getNumElements();
+    }
+    if (name == stablehlo::BroadcastInDimOp::getOperationName()) {
+      auto dimensions = operation->getAttrOfType<DenseI64ArrayAttr>(
+          "broadcast_dimensions");
+      return dimensions && attributes.size() == 1 &&
+             dimensions.size() == static_cast<size_t>(input.getRank()) &&
+             input.getElementType() == result.getElementType() &&
+             (result.getElementType().isInteger(32) ||
+              result.getElementType().isInteger(1)) &&
+             hasValidBroadcastDimensions(operation, dimensions);
+    }
+    return name == stablehlo::ConvertOp::getOperationName() &&
+           attributes.empty() && input.getShape() == result.getShape() &&
+           input.getElementType().isInteger(1) &&
+           result.getElementType().isF32();
+  }
+  if (name == stablehlo::CompareOp::getOperationName() &&
+      operation->getNumOperands() == 2) {
+    auto lhs = dyn_cast<RankedTensorType>(operation->getOperand(0).getType());
+    auto rhs = dyn_cast<RankedTensorType>(operation->getOperand(1).getType());
+    auto comparisonType =
+        operation->getAttrOfType<stablehlo::ComparisonTypeAttr>(
+            "compare_type");
+    auto direction =
+        operation->getAttrOfType<stablehlo::ComparisonDirectionAttr>(
+            "comparison_direction");
+    return lhs && rhs && comparisonType && direction && lhs == rhs &&
+           lhs.getShape() == result.getShape() &&
+           lhs.getElementType().isInteger(32) &&
+           result.getElementType().isInteger(1) && attributes.size() == 2;
+  }
+  if (name == stablehlo::AddOp::getOperationName() &&
+      operation->getNumOperands() == 2 && attributes.empty()) {
+    return operation->getOperand(0).getType() == result &&
+           operation->getOperand(1).getType() == result &&
+           result.getElementType().isInteger(32);
+  }
+  if (name == stablehlo::SelectOp::getOperationName() &&
+      operation->getNumOperands() == 3 && attributes.empty()) {
+    auto predicate =
+        dyn_cast<RankedTensorType>(operation->getOperand(0).getType());
+    return predicate && predicate.getElementType().isInteger(1) &&
+           predicate.getShape() == result.getShape() &&
+           operation->getOperand(1).getType() == result &&
+           operation->getOperand(2).getType() == result &&
+           result.getElementType().isF32();
+  }
+  return false;
 }
 
 bool isSupportedStablehlo(Operation *operation) {
+  if (isSupportedStablehloRelation(operation)) {
+    return true;
+  }
   if (isSupportedStablehloReduce(operation)) {
     return true;
   }
@@ -1641,6 +1731,72 @@ LogicalResult convertContractOperation(Operation *operation) {
   return success();
 }
 
+LogicalResult convertRelationOperation(Operation *operation) {
+  SourceRefAttr source = singleSourceRef(operation);
+  if (!source) {
+    return operation->emitOpError("requires exactly one source result");
+  }
+  FailureOr<RelationSemantics> semantics =
+      llvm::StringSwitch<FailureOr<RelationSemantics>>(
+          operation->getName().getStringRef())
+          .Case(stablehlo::IotaOp::getOperationName(), RelationSemantics::Iota)
+          .Case(stablehlo::ConstantOp::getOperationName(),
+                RelationSemantics::Constant)
+          .Case(stablehlo::ReshapeOp::getOperationName(),
+                RelationSemantics::Reshape)
+          .Case(stablehlo::BroadcastInDimOp::getOperationName(),
+                RelationSemantics::BroadcastInDim)
+          .Case(stablehlo::CompareOp::getOperationName(),
+                RelationSemantics::Compare)
+          .Case(stablehlo::AddOp::getOperationName(), RelationSemantics::Add)
+          .Case(stablehlo::ConvertOp::getOperationName(),
+                RelationSemantics::Convert)
+          .Case(stablehlo::SelectOp::getOperationName(),
+                RelationSemantics::Select)
+          .Default(failure());
+  if (failed(semantics) || !isSupportedStablehloRelation(operation)) {
+    return operation->emitOpError("has no lossless Relation conversion");
+  }
+  OpBuilder builder(operation);
+  OperationState state(operation->getLoc(), RelationOp::getOperationName());
+  state.addOperands(operation->getOperands());
+  state.addTypes(operation->getResultTypes());
+  state.addAttribute("semantics", RelationSemanticsAttr::get(
+                                      operation->getContext(), *semantics));
+  SmallVector<Attribute> parameters;
+  if (*semantics == RelationSemantics::Iota) {
+    parameters.push_back(operation->getAttr("iota_dimension"));
+  } else if (*semantics == RelationSemantics::Constant) {
+    parameters.push_back(
+        operation->getAttrOfType<DenseElementsAttr>("value")
+            .getSplatValue<Attribute>());
+  } else if (*semantics == RelationSemantics::BroadcastInDim) {
+    auto dimensions = operation->getAttrOfType<DenseI64ArrayAttr>(
+        "broadcast_dimensions");
+    for (int64_t dimension : dimensions.asArrayRef()) {
+      parameters.push_back(builder.getI64IntegerAttr(dimension));
+    }
+  } else if (*semantics == RelationSemantics::Compare) {
+    auto comparisonType =
+        operation->getAttrOfType<stablehlo::ComparisonTypeAttr>(
+            "compare_type");
+    auto comparisonDirection =
+        operation->getAttrOfType<stablehlo::ComparisonDirectionAttr>(
+            "comparison_direction");
+    parameters.push_back(builder.getStringAttr(
+        stringifyComparisonType(comparisonType.getValue())));
+    parameters.push_back(builder.getStringAttr(
+        stringifyComparisonDirection(comparisonDirection.getValue())));
+  }
+  state.addAttribute("parameters",
+                     ArrayAttr::get(operation->getContext(), parameters));
+  state.addAttribute("source", source);
+  Operation *relation = builder.create(state);
+  operation->getResult(0).replaceAllUsesWith(relation->getResult(0));
+  operation->erase();
+  return success();
+}
+
 LogicalResult convertReduceOperation(Operation *operation) {
   if (!isSupportedStablehloReduce(operation)) {
     return operation->emitOpError(
@@ -1654,14 +1810,15 @@ LogicalResult convertReduceOperation(Operation *operation) {
         "requires one result source and one owner operation reference");
   }
   Block &sourceBody = operation->getRegion(0).front();
-  Operation &sourceAdd = sourceBody.front();
+  Operation &sourceCombiner = sourceBody.front();
   Operation &sourceReturn = sourceBody.back();
-  ArrayAttr addRefs = sourceRefs(&sourceAdd);
-  auto addOwner =
-      sourceAdd.getAttrOfType<DenseI64ArrayAttr>(kOperationRefAttribute);
+  ArrayAttr combinerRefs = sourceRefs(&sourceCombiner);
+  auto combinerOwner =
+      sourceCombiner.getAttrOfType<DenseI64ArrayAttr>(kOperationRefAttribute);
   auto returnOwner =
       sourceReturn.getAttrOfType<DenseI64ArrayAttr>(kOperationRefAttribute);
-  if (!addRefs || addRefs.size() != 1 || !addOwner || !returnOwner) {
+  if (!combinerRefs || combinerRefs.size() != 1 || !combinerOwner ||
+      !returnOwner) {
     return operation->emitOpError("has incomplete nested reducer provenance");
   }
 
@@ -1675,7 +1832,9 @@ LogicalResult convertReduceOperation(Operation *operation) {
   state.addAttribute("accumulator_types",
                      ArrayAttr::get(operation->getContext(),
                                     {TypeAttr::get(builder.getF32Type())}));
-  state.addAttribute("order_free", builder.getBoolAttr(true));
+  const bool orderFree = sourceCombiner.getName().getStringRef() ==
+                         stablehlo::AddOp::getOperationName();
+  state.addAttribute("order_free", builder.getBoolAttr(orderFree));
   state.addAttribute("source", source);
   state.addAttribute(kOperationRefAttribute, ownerRef);
   state.addRegion();
@@ -1686,15 +1845,17 @@ LogicalResult convertReduceOperation(Operation *operation) {
   body->addArgument(builder.getF32Type(), sourceBody.getArgument(0).getLoc());
   body->addArgument(builder.getF32Type(), sourceBody.getArgument(1).getLoc());
   builder.setInsertionPointToEnd(body);
-  OperationState addState(sourceAdd.getLoc(),
-                          arith::AddFOp::getOperationName());
-  addState.addOperands(body->getArguments());
-  addState.addTypes(builder.getF32Type());
-  addState.addAttribute(kSourceRefsAttribute, addRefs);
-  addState.addAttribute(kOperationRefAttribute, addOwner);
-  Operation *add = builder.create(addState);
+  StringRef scalarName =
+      orderFree ? arith::AddFOp::getOperationName()
+                : arith::MaximumFOp::getOperationName();
+  OperationState combinerState(sourceCombiner.getLoc(), scalarName);
+  combinerState.addOperands(body->getArguments());
+  combinerState.addTypes(builder.getF32Type());
+  combinerState.addAttribute(kSourceRefsAttribute, combinerRefs);
+  combinerState.addAttribute(kOperationRefAttribute, combinerOwner);
+  Operation *combiner = builder.create(combinerState);
   OperationState yieldState(sourceReturn.getLoc(), YieldOp::getOperationName());
-  yieldState.addOperands(add->getResult(0));
+  yieldState.addOperands(combiner->getResult(0));
   yieldState.addAttribute(kOperationRefAttribute, returnOwner);
   builder.create(yieldState);
 
@@ -1725,7 +1886,9 @@ struct ConvertStablehloToAlgebraPass
       for (Operation *operation : sourceOperations) {
         StringRef name = operation->getName().getStringRef();
         LogicalResult result =
-            name == stablehlo::ReduceOp::getOperationName()
+            isSupportedStablehloRelation(operation)
+                ? convertRelationOperation(operation)
+            : name == stablehlo::ReduceOp::getOperationName()
                 ? convertReduceOperation(operation)
             : name == stablehlo::DotGeneralOp::getOperationName()
                 ? convertContractOperation(operation)
@@ -1757,6 +1920,8 @@ LogicalResult verifyRegionLocalCoverage(ModuleOp module) {
       Attribute source;
       if (auto map = dyn_cast<MapOp>(operation)) {
         source = map.getSource();
+      } else if (auto relation = dyn_cast<RelationOp>(operation)) {
+        source = relation.getSource();
       } else if (auto contract = dyn_cast<ContractOp>(operation)) {
         source = contract.getSource();
       } else if (auto fold = dyn_cast<FoldOp>(operation)) {
@@ -2181,6 +2346,9 @@ LogicalResult verifyManifestCoverage(ModuleOp module, DictionaryAttr manifest) {
     }
     if (auto map = dyn_cast<MapOp>(operation)) {
       return recordSelected(operation, map.getSource());
+    }
+    if (auto relation = dyn_cast<RelationOp>(operation)) {
+      return recordSelected(operation, relation.getSource());
     }
     if (auto contract = dyn_cast<ContractOp>(operation)) {
       return recordSelected(operation, contract.getSource());
@@ -2672,6 +2840,61 @@ FailureOr<stablehlo::Precision> stablehloPrecision(Attribute attribute) {
       .Default(failure());
 }
 
+FailureOr<OperationState> lowerRelationState(RelationOp relation,
+                                             ValueRange operands) {
+  StringRef stablehloName =
+      llvm::StringSwitch<StringRef>(stringifyRelationSemantics(
+          relation.getSemantics()))
+          .Case("iota", stablehlo::IotaOp::getOperationName())
+          .Case("constant", stablehlo::ConstantOp::getOperationName())
+          .Case("reshape", stablehlo::ReshapeOp::getOperationName())
+          .Case("broadcast_in_dim",
+                stablehlo::BroadcastInDimOp::getOperationName())
+          .Case("compare", stablehlo::CompareOp::getOperationName())
+          .Case("add", stablehlo::AddOp::getOperationName())
+          .Case("convert", stablehlo::ConvertOp::getOperationName())
+          .Case("select", stablehlo::SelectOp::getOperationName())
+          .Default({});
+  if (stablehloName.empty()) {
+    relation.emitOpError("has no authoritative StableHLO lowering");
+    return failure();
+  }
+  OperationState state(relation.getLoc(), stablehloName);
+  state.addOperands(operands);
+  state.addTypes(relation.getResultTypes());
+  if (relation.getSemantics() == RelationSemantics::Iota) {
+    state.addAttribute("iota_dimension", relation.getParameters()[0]);
+  } else if (relation.getSemantics() == RelationSemantics::Constant) {
+    auto result = cast<RankedTensorType>(relation.getResult(0).getType());
+    state.addAttribute(
+        "value", DenseElementsAttr::get(
+                     result, ArrayRef<Attribute>{relation.getParameters()[0]}));
+  } else if (relation.getSemantics() ==
+             RelationSemantics::BroadcastInDim) {
+    SmallVector<int64_t> dimensions;
+    for (Attribute parameter : relation.getParameters()) {
+      dimensions.push_back(cast<IntegerAttr>(parameter).getInt());
+    }
+    state.addAttribute("broadcast_dimensions",
+                       DenseI64ArrayAttr::get(relation.getContext(), dimensions));
+  } else if (relation.getSemantics() == RelationSemantics::Compare) {
+    auto type = stablehlo::symbolizeComparisonType(
+        cast<StringAttr>(relation.getParameters()[0]).getValue());
+    auto direction = stablehlo::symbolizeComparisonDirection(
+        cast<StringAttr>(relation.getParameters()[1]).getValue());
+    if (!type || !direction) {
+      relation.emitOpError("has invalid comparison parameters");
+      return failure();
+    }
+    state.addAttribute("compare_type", stablehlo::ComparisonTypeAttr::get(
+                                           relation.getContext(), *type));
+    state.addAttribute(
+        "comparison_direction", stablehlo::ComparisonDirectionAttr::get(
+                                    relation.getContext(), *direction));
+  }
+  return state;
+}
+
 FailureOr<OperationState> lowerContractState(ContractOp contract,
                                              ValueRange operands) {
   if (operands.size() != 2 || contract.getResults().size() != 1 ||
@@ -2780,11 +3003,6 @@ FailureOr<OperationState> lowerContractState(ContractOp contract,
 
 FailureOr<Operation *> lowerFold(OpBuilder &builder, FoldOp fold,
                                  ValueRange operands) {
-  if (!fold.getOrderFree()) {
-    fold.emitOpError(
-        "order_free=false has no lossless StableHLO Reduce lowering");
-    return failure();
-  }
   if (llvm::any_of(fold->getDiscardableAttrs(), [](NamedAttribute attribute) {
         return attribute.getName().strref() != kOperationRefAttribute;
       })) {
@@ -2799,20 +3017,25 @@ FailureOr<Operation *> lowerFold(OpBuilder &builder, FoldOp fold,
   }
   Block &body = fold.getCombiner().front();
   if (body.getNumArguments() != 2 || body.getOperations().size() != 2) {
-    fold.emitOpError("requires exactly one scalar add and one yield");
+    fold.emitOpError("requires exactly one scalar combiner and one yield");
     return failure();
   }
   auto add = dyn_cast<arith::AddFOp>(body.front());
+  auto maximum = dyn_cast<arith::MaximumFOp>(body.front());
+  Operation *combiner = add ? add.getOperation()
+                            : maximum ? maximum.getOperation() : nullptr;
   auto yield = dyn_cast<YieldOp>(body.back());
   auto fastMath = add ? add->getAttrOfType<arith::FastMathFlagsAttr>("fastmath")
                       : arith::FastMathFlagsAttr{};
-  if (!add || !yield || add.getLhs() != body.getArgument(0) ||
-      add.getRhs() != body.getArgument(1) || yield.getValues().size() != 1 ||
-      yield.getValues()[0] != add.getResult() ||
+  if (!combiner || !yield || combiner->getOperand(0) != body.getArgument(0) ||
+      combiner->getOperand(1) != body.getArgument(1) ||
+      yield.getValues().size() != 1 ||
+      yield.getValues()[0] != combiner->getResult(0) ||
       !body.getArgument(0).getType().isF32() ||
       !body.getArgument(1).getType().isF32() ||
+      (add && !fold.getOrderFree()) || (maximum && fold.getOrderFree()) ||
       (fastMath && fastMath.getValue() != arith::FastMathFlags::none) ||
-      llvm::any_of(add->getAttrs(),
+      llvm::any_of(combiner->getAttrs(),
                    [](NamedAttribute attribute) {
                      StringRef name = attribute.getName().strref();
                      return name != "fastmath" &&
@@ -2822,16 +3045,19 @@ FailureOr<Operation *> lowerFold(OpBuilder &builder, FoldOp fold,
       llvm::any_of(yield->getAttrs(), [](NamedAttribute attribute) {
         return attribute.getName().strref() != kOperationRefAttribute;
       })) {
-    fold.emitOpError("requires the closed ordered scalar f32 add combiner");
+    fold.emitOpError(
+        "requires a closed scalar f32 add or source-ordered maximum combiner");
     return failure();
   }
-  ArrayAttr addRefs = sourceRefs(add);
+  ArrayAttr combinerRefs = sourceRefs(combiner);
   auto foldOwner =
       fold->getAttrOfType<DenseI64ArrayAttr>(kOperationRefAttribute);
-  auto addOwner = add->getAttrOfType<DenseI64ArrayAttr>(kOperationRefAttribute);
+  auto combinerOwner =
+      combiner->getAttrOfType<DenseI64ArrayAttr>(kOperationRefAttribute);
   auto yieldOwner =
       yield->getAttrOfType<DenseI64ArrayAttr>(kOperationRefAttribute);
-  if (!addRefs || addRefs.size() != 1 || !foldOwner || !addOwner ||
+  if (!combinerRefs || combinerRefs.size() != 1 || !foldOwner ||
+      !combinerOwner ||
       !yieldOwner) {
     fold.emitOpError("has incomplete Fold source provenance");
     return failure();
@@ -2852,15 +3078,18 @@ FailureOr<Operation *> lowerFold(OpBuilder &builder, FoldOp fold,
   reducer->addArgument(scalarTensor, body.getArgument(0).getLoc());
   reducer->addArgument(scalarTensor, body.getArgument(1).getLoc());
   OpBuilder reducerBuilder = OpBuilder::atBlockEnd(reducer);
-  OperationState addState(add.getLoc(), stablehlo::AddOp::getOperationName());
-  addState.addOperands(reducer->getArguments());
-  addState.addTypes(scalarTensor);
-  addState.addAttribute(kSourceRefsAttribute, addRefs);
-  addState.addAttribute(kOperationRefAttribute, addOwner);
-  Operation *loweredAdd = reducerBuilder.create(addState);
+  StringRef stablehloCombinerName =
+      add ? stablehlo::AddOp::getOperationName()
+          : stablehlo::MaxOp::getOperationName();
+  OperationState combinerState(combiner->getLoc(), stablehloCombinerName);
+  combinerState.addOperands(reducer->getArguments());
+  combinerState.addTypes(scalarTensor);
+  combinerState.addAttribute(kSourceRefsAttribute, combinerRefs);
+  combinerState.addAttribute(kOperationRefAttribute, combinerOwner);
+  Operation *loweredCombiner = reducerBuilder.create(combinerState);
   OperationState returnState(yield.getLoc(),
                              stablehlo::ReturnOp::getOperationName());
-  returnState.addOperands(loweredAdd->getResult(0));
+  returnState.addOperands(loweredCombiner->getResult(0));
   returnState.addAttribute(kOperationRefAttribute, yieldOwner);
   reducerBuilder.create(returnState);
   return reduce;
@@ -2905,6 +3134,9 @@ LogicalResult lowerRegion(RegionOp region) {
     if (auto map = dyn_cast<MapOp>(operation)) {
       source = map.getSource();
       state = lowerMapState(map, operands);
+    } else if (auto relation = dyn_cast<RelationOp>(operation)) {
+      source = relation.getSource();
+      state = lowerRelationState(relation, operands);
     } else if (auto contract = dyn_cast<ContractOp>(operation)) {
       source = contract.getSource();
       state = lowerContractState(contract, operands);

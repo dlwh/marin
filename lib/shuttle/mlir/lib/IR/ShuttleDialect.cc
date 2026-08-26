@@ -571,6 +571,130 @@ LogicalResult ContractOp::verify() {
   return verifyDotGeneralIterators(*this);
 }
 
+LogicalResult RelationOp::verify() {
+  if (getResults().size() != 1) {
+    return emitOpError("requires exactly one result");
+  }
+  auto result = dyn_cast<RankedTensorType>(getResult(0).getType());
+  if (!result) {
+    return emitOpError("requires ranked tensor results");
+  }
+  SmallVector<RankedTensorType> inputs;
+  for (Value input : getInputs()) {
+    auto inputType = dyn_cast<RankedTensorType>(input.getType());
+    if (!inputType) {
+      return emitOpError("requires ranked tensor inputs");
+    }
+    inputs.push_back(inputType);
+  }
+  const size_t expectedInputs =
+      (getSemantics() == RelationSemantics::Iota ||
+       getSemantics() == RelationSemantics::Constant)
+          ? 0
+      : (getSemantics() == RelationSemantics::Add ||
+         getSemantics() == RelationSemantics::Compare)
+          ? 2
+      : getSemantics() == RelationSemantics::Select ? 3
+                                                    : 1;
+  if (getInputs().size() != expectedInputs) {
+    return emitOpError("has input arity inconsistent with its semantics");
+  }
+  const size_t expectedParameters =
+      (getSemantics() == RelationSemantics::Iota ||
+       getSemantics() == RelationSemantics::Constant)
+          ? 1
+      : getSemantics() == RelationSemantics::BroadcastInDim
+          ? cast<RankedTensorType>(getInputs().front().getType()).getRank()
+      : getSemantics() == RelationSemantics::Compare ? 2
+                                                     : 0;
+  if (getParameters().size() != expectedParameters) {
+    return emitOpError("has parameter arity inconsistent with its semantics");
+  }
+  auto integerParameter = [&](size_t index) {
+    return dyn_cast<IntegerAttr>(getParameters()[index]);
+  };
+  auto stringParameter = [&](size_t index) {
+    return dyn_cast<StringAttr>(getParameters()[index]);
+  };
+  if (getSemantics() == RelationSemantics::Iota) {
+    auto dimension = integerParameter(0);
+    if (!result.hasStaticShape() || !result.getElementType().isInteger(32) ||
+        !dimension || dimension.getInt() < 0 ||
+        dimension.getInt() >= result.getRank()) {
+      return emitOpError(
+          "requires an in-range iota dimension and static i32 result");
+    }
+  } else if (getSemantics() == RelationSemantics::Constant) {
+    auto value = integerParameter(0);
+    if (result.getRank() != 0 || !result.getElementType().isInteger(32) ||
+        !value || value.getType() != result.getElementType()) {
+      return emitOpError("requires one scalar i32 constant value");
+    }
+  } else if (getSemantics() == RelationSemantics::Reshape) {
+    if (!inputs[0].hasStaticShape() || !result.hasStaticShape() ||
+        !inputs[0].getElementType().isInteger(32) ||
+        !result.getElementType().isInteger(32) ||
+        inputs[0].getNumElements() != result.getNumElements()) {
+      return emitOpError("requires a copy-free static i32 reshape");
+    }
+  } else if (getSemantics() == RelationSemantics::BroadcastInDim) {
+    if (!inputs[0].hasStaticShape() || !result.hasStaticShape() ||
+        inputs[0].getElementType() != result.getElementType() ||
+        (!result.getElementType().isInteger(1) &&
+         !result.getElementType().isInteger(32))) {
+      return emitOpError("requires matching static i1 or i32 element types");
+    }
+    llvm::SmallDenseSet<int64_t> dimensions;
+    for (auto [inputDimension, parameter] :
+         llvm::enumerate(getParameters())) {
+      auto resultDimension = dyn_cast<IntegerAttr>(parameter);
+      if (!resultDimension || resultDimension.getInt() < 0 ||
+          resultDimension.getInt() >= result.getRank() ||
+          !dimensions.insert(resultDimension.getInt()).second) {
+        return emitOpError("requires unique in-range broadcast dimensions");
+      }
+      int64_t inputExtent = inputs[0].getDimSize(inputDimension);
+      int64_t resultExtent = result.getDimSize(resultDimension.getInt());
+      if (inputExtent != resultExtent && inputExtent != 1) {
+        return emitOpError("has a non-broadcast-compatible dimension");
+      }
+    }
+  } else if (getSemantics() == RelationSemantics::Add) {
+    if (inputs[0] != inputs[1] || inputs[0] != result ||
+        !result.getElementType().isInteger(32)) {
+      return emitOpError("requires same-shaped i32 inputs and result");
+    }
+  } else if (getSemantics() == RelationSemantics::Compare) {
+    auto comparisonType = stringParameter(0);
+    auto direction = stringParameter(1);
+    if (inputs[0] != inputs[1] ||
+        inputs[0].getShape() != result.getShape() ||
+        !inputs[0].getElementType().isInteger(32) ||
+        !result.getElementType().isInteger(1) || !comparisonType ||
+        (comparisonType.getValue() != "SIGNED" &&
+         comparisonType.getValue() != "UNSIGNED") ||
+        !direction ||
+        !llvm::is_contained(ArrayRef<StringRef>{"EQ", "NE", "GE", "GT",
+                                                     "LE", "LT"},
+                            direction.getValue())) {
+      return emitOpError("requires a valid i32 comparison and i1 result");
+    }
+  } else if (getSemantics() == RelationSemantics::Convert) {
+    if (inputs[0].getShape() != result.getShape() ||
+        !inputs[0].getElementType().isInteger(1) ||
+        !result.getElementType().isF32()) {
+      return emitOpError("requires a same-shaped exact i1-to-f32 conversion");
+    }
+  } else if (getSemantics() == RelationSemantics::Select) {
+    if (inputs[0].getShape() != result.getShape() ||
+        !inputs[0].getElementType().isInteger(1) || inputs[1] != result ||
+        inputs[2] != result || !result.getElementType().isF32()) {
+      return emitOpError("requires an i1 predicate and same-shaped f32 values");
+    }
+  }
+  return success();
+}
+
 LogicalResult ScalarConvertOp::verify() {
   Type inputType = getInput().getType();
   Type resultType = getResult().getType();

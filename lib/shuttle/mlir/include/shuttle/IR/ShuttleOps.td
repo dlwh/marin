@@ -50,6 +50,17 @@ def Shuttle_ContractOp
   let hasVerifier = 1;
 }
 
+def Shuttle_RelationOp
+    : Shuttle_Op<"relation", [ParentOneOf<["::mlir::shuttle::RegionOp"]>,
+                               Pure]> {
+  let summary = "Lossless index-domain relation and predicate operation";
+  let arguments = (ins Variadic<AnyType>:$inputs,
+      Shuttle_RelationSemanticsAttr:$semantics,
+      ArrayAttr:$parameters, Shuttle_SourceRefAttr:$source);
+  let results = (outs Variadic<AnyType>:$results);
+  let hasVerifier = 1;
+}
+
 def Shuttle_ScalarConvertOp : Shuttle_Op<"scalar_convert", [Pure]> {
   let summary = "Scalar conversion with explicit rounding provenance";
   let arguments = (ins AnyType:$input,

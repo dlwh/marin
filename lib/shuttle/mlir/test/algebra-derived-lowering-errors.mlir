@@ -29,7 +29,7 @@ module attributes {shuttle.coverage_manifest = {}} {
       -> tensor<2xf32> {
     %0 = "shuttle.region"(%arg0, %init) ({
     ^bb0(%input: tensor<2x4xf32>, %initial: tensor<f32>):
-      // expected-error @+1 {{order_free=false has no lossless StableHLO Reduce lowering}}
+      // expected-error @+1 {{requires a closed scalar f32 add or source-ordered maximum combiner}}
       %1 = "shuttle.fold"(%input, %initial) ({
       ^bb0(%element: f32, %accumulator: f32):
         %sum = arith.addf %element, %accumulator : f32
