@@ -5149,6 +5149,79 @@ bool onlineRoleOperandDefinitionsAre(const OnlinePtxCfg &cfg, StringRef role,
              cfg.instructions[consumer->second].operands[operand]) == expected;
 }
 
+bool onlineRoleIsUnpredicated(const OnlinePtxCfg &cfg, StringRef role,
+                              ArrayRef<StringRef> opcodes) {
+  auto found = cfg.roles.find(role.str());
+  return found != cfg.roles.end() &&
+         cfg.instructions[found->second].predicate.empty() &&
+         onlineRoleIs(cfg, role, opcodes);
+}
+
+bool onlineSharedStateAddressesAreClosed(const OnlinePtxCfg &cfg,
+                                         int64_t threads) {
+  auto literalOperand = [&](StringRef role, StringRef literal) {
+    auto found = cfg.roles.find(role.str());
+    return found != cfg.roles.end() &&
+           llvm::is_contained(cfg.instructions[found->second].operands,
+                              literal);
+  };
+  const std::string lOffset = std::to_string(threads * 4);
+  const std::string oOffset = std::to_string(threads * 8);
+  return onlineRoleIsUnpredicated(cfg, "shared_base", {"cvta.to.shared.u64"}) &&
+         onlineRoleIsUnpredicated(cfg, "leaf_index", {"mov.u32"}) &&
+         llvm::is_contained(
+             cfg.instructions[cfg.roles.at("leaf_index")].operands,
+             "%tid.x") &&
+         onlineRoleIsUnpredicated(cfg, "leaf_index_wide", {"cvt.u64.u32"}) &&
+         onlineRoleOperandIs(cfg, "leaf_index_wide", 1, "leaf_index") &&
+         onlineRoleIsUnpredicated(cfg, "leaf_index_byte_offset",
+                                  {"mul.lo.u64"}) &&
+         onlineRoleOperandIs(cfg, "leaf_index_byte_offset", 1,
+                             "leaf_index_wide") &&
+         literalOperand("leaf_index_byte_offset", "4") &&
+         onlineRoleIsUnpredicated(cfg, "leaf_m_pointer", {"add.u64"}) &&
+         onlineRoleOperandIs(cfg, "leaf_m_pointer", 1, "shared_base") &&
+         onlineRoleOperandIs(cfg, "leaf_m_pointer", 2,
+                             "leaf_index_byte_offset") &&
+         onlineRoleIsUnpredicated(cfg, "leaf_l_pointer", {"add.u64"}) &&
+         onlineRoleOperandIs(cfg, "leaf_l_pointer", 1, "leaf_m_pointer") &&
+         literalOperand("leaf_l_pointer", lOffset) &&
+         onlineRoleIsUnpredicated(cfg, "leaf_o_pointer", {"add.u64"}) &&
+         onlineRoleOperandIs(cfg, "leaf_o_pointer", 1, "leaf_m_pointer") &&
+         literalOperand("leaf_o_pointer", oOffset) &&
+         onlineRoleIsUnpredicated(cfg, "partial_index_wide",
+                                  {"cvt.u64.u32"}) &&
+         onlineRoleOperandDefinitionsAre(
+             cfg, "partial_index_wide", 1,
+             {"partial_index_init", "partial_index_step"}) &&
+         onlineRoleIsUnpredicated(cfg, "partial_index_byte_offset",
+                                  {"mul.lo.u64"}) &&
+         onlineRoleOperandIs(cfg, "partial_index_byte_offset", 1,
+                             "partial_index_wide") &&
+         literalOperand("partial_index_byte_offset", "4") &&
+         onlineRoleIsUnpredicated(cfg, "partial_m_pointer", {"add.u64"}) &&
+         onlineRoleOperandIs(cfg, "partial_m_pointer", 1, "shared_base") &&
+         onlineRoleOperandIs(cfg, "partial_m_pointer", 2,
+                             "partial_index_byte_offset") &&
+         onlineRoleIsUnpredicated(cfg, "partial_l_pointer", {"add.u64"}) &&
+         onlineRoleOperandIs(cfg, "partial_l_pointer", 1,
+                             "partial_m_pointer") &&
+         literalOperand("partial_l_pointer", lOffset) &&
+         onlineRoleIsUnpredicated(cfg, "partial_o_pointer", {"add.u64"}) &&
+         onlineRoleOperandIs(cfg, "partial_o_pointer", 1,
+                             "partial_m_pointer") &&
+         literalOperand("partial_o_pointer", oOffset) &&
+         onlineRoleOperandIs(cfg, "leaf_m_store", 0, "leaf_m_pointer") &&
+         onlineRoleOperandIs(cfg, "leaf_l_store", 0, "leaf_l_pointer") &&
+         onlineRoleOperandIs(cfg, "leaf_o_store", 0, "leaf_o_pointer") &&
+         onlineRoleOperandIs(cfg, "partial_m_load", 1,
+                             "partial_m_pointer") &&
+         onlineRoleOperandIs(cfg, "partial_l_load", 1,
+                             "partial_l_pointer") &&
+         onlineRoleOperandIs(cfg, "partial_o_load", 1,
+                             "partial_o_pointer");
+}
+
 bool onlinePartialStateReductionProtocol(const OnlinePtxCfg &cfg,
                                          int64_t threads) {
   auto init = cfg.roles.find("partial_index_init");
@@ -5159,10 +5232,13 @@ bool onlinePartialStateReductionProtocol(const OnlinePtxCfg &cfg,
   auto step = cfg.roles.find("partial_index_step");
   auto backedge = cfg.roles.find("partial_backedge");
   auto result = cfg.roles.find("state_m");
+  auto leaderPredicate = cfg.roles.find("leader_predicate");
+  auto leaderExit = cfg.roles.find("leader_exit_branch");
   if (init == cfg.roles.end() || guard == cfg.roles.end() ||
       exit == cfg.roles.end() || loadM == cfg.roles.end() ||
       mergeM == cfg.roles.end() || step == cfg.roles.end() ||
       backedge == cfg.roles.end() || result == cfg.roles.end() ||
+      leaderPredicate == cfg.roles.end() || leaderExit == cfg.roles.end() ||
       threads <= 0)
     return false;
   auto check = [](bool value) { return value; };
@@ -5205,7 +5281,13 @@ bool onlinePartialStateReductionProtocol(const OnlinePtxCfg &cfg,
       !check(
              onlineRoleIs(cfg, "partial_m_load", {"ld.shared.f32"}) &&
                  onlineRoleIs(cfg, "partial_l_load", {"ld.shared.f32"}) &&
-                 onlineRoleIs(cfg, "partial_o_load", {"ld.shared.f32"})) ||
+                 onlineRoleIs(cfg, "partial_o_load", {"ld.shared.f32"}) &&
+                 cfg.instructions[loadM->second].predicate.empty() &&
+                 cfg.instructions[cfg.roles.at("partial_l_load")]
+                     .predicate.empty() &&
+                 cfg.instructions[cfg.roles.at("partial_o_load")]
+                     .predicate.empty() &&
+                 onlineSharedStateAddressesAreClosed(cfg, threads)) ||
       !check(
              onlineRoleIs(cfg, "partial_merge_max", {"max.f32"},
                           {"partial_m_load"}) &&
@@ -5213,19 +5295,46 @@ bool onlinePartialStateReductionProtocol(const OnlinePtxCfg &cfg,
                      cfg, "partial_merge_max", 1,
                      {"partial_m_init", "partial_m_update"})) ||
       !check(
-             onlineRoleIs(cfg, "partial_merge_l", {"add.rn.f32"}) &&
-                 onlineRoleTransitivelyDependsOn(cfg, "partial_merge_l",
-                                                  "partial_l_load") &&
+             onlineRoleIs(cfg, "partial_left_delta", {"sub.rn.f32"},
+                          {"partial_merge_max"}) &&
+                 onlineRoleOperandDefinitionsAre(
+                     cfg, "partial_left_delta", 1,
+                     {"partial_m_init", "partial_m_update"}) &&
+                 onlineRoleOperandIs(cfg, "partial_left_delta", 2,
+                                     "partial_merge_max") &&
+                 onlineRoleIs(cfg, "partial_right_delta", {"sub.rn.f32"},
+                              {"partial_m_load", "partial_merge_max"}) &&
+                 onlineRoleOperandIs(cfg, "partial_right_delta", 1,
+                                     "partial_m_load") &&
+                 onlineRoleOperandIs(cfg, "partial_right_delta", 2,
+                                     "partial_merge_max") &&
+                 onlineExpOf(cfg, "partial_left_rescale",
+                             "partial_left_delta",
+                             "partial_left_exp_argument") &&
+                 onlineExpOf(cfg, "partial_right_rescale",
+                             "partial_right_delta",
+                             "partial_right_exp_argument") &&
+                 onlineRoleIs(cfg, "partial_merge_left_l", {"mul.rn.f32"},
+                              {"partial_left_rescale"}) &&
                  onlineRoleOperandDefinitionsAre(
                      cfg, "partial_merge_left_l", 2,
-                     {"partial_l_init", "partial_l_update"})) ||
+                     {"partial_l_init", "partial_l_update"}) &&
+                 onlineRoleIs(cfg, "partial_merge_right_l", {"mul.rn.f32"},
+                              {"partial_right_rescale", "partial_l_load"}) &&
+                 onlineRoleIs(cfg, "partial_merge_l", {"add.rn.f32"},
+                              {"partial_merge_left_l",
+                               "partial_merge_right_l"})) ||
       !check(
-             onlineRoleIs(cfg, "partial_merge_o", {"add.rn.f32"}) &&
-                 onlineRoleTransitivelyDependsOn(cfg, "partial_merge_o",
-                                                  "partial_o_load") &&
+             onlineRoleIs(cfg, "partial_merge_left_o", {"mul.rn.f32"},
+                          {"partial_left_rescale"}) &&
                  onlineRoleOperandDefinitionsAre(
                      cfg, "partial_merge_left_o", 2,
-                     {"partial_o_init", "partial_o_update"})) ||
+                     {"partial_o_init", "partial_o_update"}) &&
+                 onlineRoleIs(cfg, "partial_merge_right_o", {"mul.rn.f32"},
+                              {"partial_right_rescale", "partial_o_load"}) &&
+                 onlineRoleIs(cfg, "partial_merge_o", {"add.rn.f32"},
+                              {"partial_merge_left_o",
+                               "partial_merge_right_o"})) ||
       !check(
              onlineRoleIs(cfg, "partial_m_update", {"mov.f32"},
                           {"partial_merge_max"}) &&
@@ -5253,7 +5362,27 @@ bool onlinePartialStateReductionProtocol(const OnlinePtxCfg &cfg,
                  onlineInstructionDominates(cfg, exit->second,
                                             result->second)))
     return false;
+  const OnlinePtxInstruction &leaderExitInstruction =
+      cfg.instructions[leaderExit->second];
+  auto leaderTarget = cfg.labels.find(leaderExitInstruction.branchTarget);
+  auto doneTarget = cfg.labels.find("$done");
   return check(
+             onlineRoleIs(cfg, "leader_predicate", {"setp.ne.u32"},
+                          {"leaf_index"}) &&
+                 llvm::is_contained(
+                     cfg.instructions[leaderPredicate->second].operands,
+                     "0") &&
+                 leaderExitInstruction.opcode == "bra" &&
+                 !leaderExitInstruction.predicate.empty() &&
+                 !leaderExitInstruction.negatedPredicate &&
+                 onlineRoleDirectlyReaches(cfg, "leader_predicate",
+                                           leaderExit->second) &&
+                 leaderTarget != cfg.labels.end() &&
+                 doneTarget != cfg.labels.end() &&
+                 leaderTarget->second == doneTarget->second &&
+                 onlineInstructionDominates(cfg, leaderExit->second,
+                                            init->second)) &&
+         check(
                onlineRoleIs(cfg, "leaf_max_update", {"max.f32"},
                             {"mask_select"})) &&
          check(
@@ -5269,10 +5398,16 @@ bool onlinePartialStateReductionProtocol(const OnlinePtxCfg &cfg,
          check(
                onlineRoleIs(cfg, "leaf_m_store", {"st.shared.f32"},
                             {"leaf_max_update"}) &&
+                   cfg.instructions[cfg.roles.at("leaf_m_store")]
+                       .predicate.empty() &&
                    onlineRoleIs(cfg, "leaf_l_store", {"st.shared.f32"},
                                 {"leaf_l_update"}) &&
+                   cfg.instructions[cfg.roles.at("leaf_l_store")]
+                       .predicate.empty() &&
                    onlineRoleIs(cfg, "leaf_o_store", {"st.shared.f32"},
-                                {"leaf_o_update"})) &&
+                                {"leaf_o_update"}) &&
+                   cfg.instructions[cfg.roles.at("leaf_o_store")]
+                       .predicate.empty()) &&
          check(
                onlineRoleIs(cfg, "leaf_barrier", {"bar.sync"}) &&
                    onlineInstructionDominates(
@@ -5280,7 +5415,29 @@ bool onlinePartialStateReductionProtocol(const OnlinePtxCfg &cfg,
                        cfg.roles.at("leaf_barrier")) &&
                    onlineInstructionDominates(cfg,
                                               cfg.roles.at("leaf_barrier"),
-                                              loadM->second));
+                                              loadM->second)) &&
+         check(
+             onlineRoleIs(cfg, "partial_m_result", {"max.f32"},
+                          {"max_init"}) &&
+                 onlineRoleOperandDefinitionsAre(
+                     cfg, "partial_m_result", 1,
+                     {"partial_m_init", "partial_m_update"}) &&
+                 onlineRoleIs(cfg, "partial_l_result", {"add.rn.f32"},
+                              {"zero_init"}) &&
+                 onlineRoleOperandDefinitionsAre(
+                     cfg, "partial_l_result", 1,
+                     {"partial_l_init", "partial_l_update"}) &&
+                 onlineRoleIs(cfg, "partial_o_result", {"add.rn.f32"},
+                              {"zero_init"}) &&
+                 onlineRoleOperandDefinitionsAre(
+                     cfg, "partial_o_result", 1,
+                     {"partial_o_init", "partial_o_update"}) &&
+                 onlineRoleIs(cfg, "state_m", {"mov.f32"},
+                              {"partial_m_result"}) &&
+                 onlineRoleIs(cfg, "state_l", {"mov.f32"},
+                              {"partial_l_result"}) &&
+                 onlineRoleIs(cfg, "state_o", {"mov.f32"},
+                              {"partial_o_result"}));
 }
 
 bool onlineFinalizeProtocol(const OnlinePtxCfg &cfg) {
@@ -7163,11 +7320,15 @@ public:
     StringRef needle;
     StringRef replacement;
     std::string sourceMarker;
-    if (kind == "maximum" || kind == "max-merge-lost") {
+    if (kind == "maximum") {
       phaseRole = "public_store";
       role = "partial_merge_max";
       needle = "max";
       replacement = "add";
+    } else if (kind == "max-merge-lost") {
+      role = "partial_m_update";
+      needle = "mov";
+      replacement = "max";
     } else if (kind == "max-init") {
       role = "partial_m_init";
       needle = "0fFF800000";
@@ -7305,8 +7466,10 @@ public:
         instructionEnd = slice.size();
       StringRef instruction =
           slice.slice(instructionStart + 1, instructionEnd);
-      StringRef localNeedleText = needle;
-      StringRef localReplacement = replacement;
+      std::string localNeedleStorage = needle.str();
+      std::string localReplacementStorage = replacement.str();
+      StringRef localNeedleText = localNeedleStorage;
+      StringRef localReplacement = localReplacementStorage;
       size_t localNeedle = instruction.find(localNeedleText);
       if (kind == "shared-value" || kind == "relation-iota" ||
           kind == "loop-bound" || kind == "loop-step" ||
@@ -7320,6 +7483,8 @@ public:
             (kind == "root-value" || kind == "max-root-partial" ||
              kind == "max-leaf-drop")
                 ? 1
+            : kind == "max-leaf-duplicate"
+                ? 2
             : (kind == "loop-bound" || kind == "loop-step")
                 ? tokens.size() - 1
                 : 1;
@@ -7327,7 +7492,7 @@ public:
             (!llvm::isDigit(tokens[tokenIndex].back()) &&
              !StringRef(tokens[tokenIndex]).ends_with(".x")))
           continue;
-        localNeedleText = tokens[tokenIndex];
+        localNeedleStorage = tokens[tokenIndex];
         std::string changed =
             kind == "max-leaf-duplicate" && tokens.size() > 2
                 ? tokens[1]
@@ -7336,7 +7501,9 @@ public:
           changed.back() = llvm::isDigit(changed.back())
                                ? (changed.back() == '0' ? '1' : '0')
                                : 'y';
-        localReplacement = changed;
+        localReplacementStorage = changed;
+        localNeedleText = localNeedleStorage;
+        localReplacement = localReplacementStorage;
         localNeedle = instruction.find(localNeedleText);
       }
       if (localNeedle == StringRef::npos && kind == "exp") {
