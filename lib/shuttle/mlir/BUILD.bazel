@@ -98,7 +98,9 @@ cc_library(
         "lib/Transforms/Observer.cc",
         "lib/Transforms/ObserverInternal.h",
         "lib/Transforms/ObserverTestInternal.h",
+        "lib/Transforms/OnlinePlanner.inc",
         "lib/Transforms/Passes.cc",
+        "lib/Transforms/StructuralSelection.inc",
     ],
     hdrs = [
         "include/shuttle/Transforms/Observer.h",

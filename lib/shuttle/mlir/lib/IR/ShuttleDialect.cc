@@ -957,12 +957,8 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
     auto tensorType = dyn_cast<RankedTensorType>(buffer.getTensorType());
     if (!tensorType || !tensorType.hasStaticShape() ||
         llvm::any_of(tensorType.getShape(),
-                     [](int64_t extent) { return extent <= 0; }) ||
-        (!tensorType.getElementType().isF32() &&
-         !tensorType.getElementType().isBF16())) {
-      return buffer.emitOpError(
-          "requires a positive static bf16 or f32 ranked tensor type");
-    }
+                     [](int64_t extent) { return extent <= 0; }))
+      return buffer.emitOpError("requires a positive static ranked tensor type");
     std::optional<int64_t> producer =
         optionalIntegerAttribute(buffer, "producer");
     if (buffer.getLiveIn() != !producer.has_value()) {
@@ -971,6 +967,13 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
     }
     const bool external =
         buffer.getStorage() == MaterializationStorage::External;
+    Type elementType = tensorType.getElementType();
+    const bool externalElement = elementType.isF32() || elementType.isBF16();
+    const bool logicalTemporary = elementType.isInteger(1) ||
+                                  elementType.isInteger(32);
+    if ((!externalElement && !(logicalTemporary && !external)))
+      return buffer.emitOpError(
+          "requires bf16/f32 external data or i1/i32 logical temporaries");
     if (external != (buffer.getLiveIn() || buffer.getLiveOut())) {
       return buffer.emitOpError(
           "external storage must exactly identify live-in or live-out buffers");

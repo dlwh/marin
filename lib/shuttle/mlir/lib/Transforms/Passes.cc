@@ -709,16 +709,6 @@ unsigned rankNExpandingSingletonBroadcasts(Operation *operation) {
                         });
 }
 
-bool isTerminalRankNAdditiveReduce(Operation *operation) {
-  if (!isSupportedStablehloReduce(operation)) {
-    return false;
-  }
-  auto input = cast<RankedTensorType>(operation->getOperand(0).getType());
-  auto dimensions = operation->getAttrOfType<DenseI64ArrayAttr>("dimensions");
-  return input.getRank() >= 3 && input.getRank() <= 8 &&
-         dimensions.asArrayRef() == ArrayRef<int64_t>({input.getRank() - 1});
-}
-
 bool isFullPrefixRankNAdditiveReduce(Operation *operation) {
   if (!isSupportedStablehloReduce(operation)) {
     return false;
@@ -883,71 +873,7 @@ bool isAxisAlignedRankNExpansion(Operation *operation) {
                       });
 }
 
-bool isExpansionDrivenByTerminalFold(
-    Operation *expansion,
-    const llvm::SmallPtrSetImpl<Operation *> &componentOperations) {
-  Operation *root = expansion->getOperand(0).getDefiningOp();
-  if (!root) {
-    return false;
-  }
-  SmallVector<Operation *> worklist{root};
-  llvm::SmallPtrSet<Operation *, 8> visited;
-  Operation *terminalFold = nullptr;
-  while (!worklist.empty()) {
-    Operation *producer = worklist.pop_back_val();
-    if (!componentOperations.contains(producer)) {
-      return false;
-    }
-    if (!visited.insert(producer).second) {
-      continue;
-    }
-    if (isTerminalRankNAdditiveReduce(producer)) {
-      if (terminalFold && terminalFold != producer) {
-        return false;
-      }
-      terminalFold = producer;
-      continue;
-    }
-    if (!isClosedDirectStablehloMap(producer)) {
-      return false;
-    }
-    if (producer->getNumOperands() == 0) {
-      if (producer->getName().getStringRef() !=
-          stablehlo::ConstantOp::getOperationName()) {
-        return false;
-      }
-      continue;
-    }
-    for (Value operand : producer->getOperands()) {
-      Operation *operandProducer = operand.getDefiningOp();
-      if (!operandProducer || !componentOperations.contains(operandProducer)) {
-        return false;
-      }
-      worklist.push_back(operandProducer);
-    }
-  }
-  return terminalFold != nullptr;
-}
-
-bool hasRankNExpansionWithoutClosedAnchor(const CandidateComponent &component) {
-  llvm::SmallPtrSet<Operation *, 16> componentOperations(
-      component.operations.begin(), component.operations.end());
-  const bool hasTerminalFold = llvm::any_of(
-      component.operations, isTerminalRankNAdditiveReduce);
-  return llvm::any_of(component.operations, [&](Operation *operation) {
-    unsigned expansions = rankNExpandingSingletonBroadcasts(operation);
-    if (expansions == 0) {
-      return false;
-    }
-    if (expansions == 1) {
-      return !isExpansionDrivenByTerminalFold(operation,
-                                              componentOperations);
-    }
-    return !hasTerminalFold || !isAxisAlignedRankNExpansion(operation) ||
-           !isExpansionDrivenByProjectedParameter(operation,
-                                                  componentOperations);
-  });
-}
+#include "StructuralSelection.inc"
 
 bool hasUnclosedRankOneResult(const CandidateComponent &component) {
   llvm::SmallPtrSet<Operation *, 16> componentOperations(
@@ -3883,6 +3809,8 @@ bool isClosedAdditivePlanningFold(FoldOp fold) {
          (!fastMath || fastMath.getValue() == arith::FastMathFlags::none);
 }
 
+#include "OnlinePlanner.inc"
+
 bool isClosedDirectProjectedMap(MapOp map) {
   if (map.getNumResults() != 1 ||
       map.getIndexingMaps().size() != map.getInputs().size() + 1) {
@@ -4349,7 +4277,18 @@ struct DerivedPlan {
   bool hasFoldRegion = false;
   bool hasContractRegion = false;
   bool hasContractFoldComposition = false;
+  bool hasLogicalRelation = false;
 };
+
+SourceRefAttr algebraSource(Operation *operation) {
+  if (auto map = dyn_cast<MapOp>(operation))
+    return map.getSource();
+  if (auto relation = dyn_cast<RelationOp>(operation))
+    return relation.getSource();
+  if (auto fold = dyn_cast<FoldOp>(operation))
+    return fold.getSource();
+  return cast<ContractOp>(operation).getSource();
+}
 
 bool hasIdentityResultMap(MapOp map) {
   if (map.getNumResults() != 1 ||
@@ -6387,7 +6326,7 @@ FailureOr<DerivedPlan> deriveGpuPlan(RegionOp region,
                                      bool preferFusion = false) {
   SmallVector<Operation *> algebra;
   for (Operation &operation : region.getBody().front().without_terminator()) {
-    if (!isa<MapOp, FoldOp, ContractOp>(operation)) {
+    if (!isa<MapOp, RelationOp, FoldOp, ContractOp>(operation)) {
       return failure();
     }
     algebra.push_back(&operation);
@@ -6402,6 +6341,8 @@ FailureOr<DerivedPlan> deriveGpuPlan(RegionOp region,
   }
   const bool containsContract = llvm::any_of(
       algebra, [](Operation *operation) { return isa<ContractOp>(operation); });
+  const bool containsRelation = llvm::any_of(
+      algebra, [](Operation *operation) { return isa<RelationOp>(operation); });
   if (!preferFusion && containsContract &&
       !isClosedContractMapRegion(region, algebra)) {
     return failure();
@@ -6445,7 +6386,7 @@ FailureOr<DerivedPlan> deriveGpuPlan(RegionOp region,
                                           : MaterializationTaskKind::Map);
     if (auto fold = dyn_cast<FoldOp>(operation)) {
       const bool closedFold =
-          preferFusion ? isClosedAdditivePlanningFold(fold)
+          preferFusion ? isClosedScalarPlanningFold(fold)
                        : (containsRankNFold ? isClosedRankNFold(fold)
                                             : isClosedRankTwoFold(fold));
       if (!closedFold) {
@@ -6477,16 +6418,24 @@ FailureOr<DerivedPlan> deriveGpuPlan(RegionOp region,
           task.reductionDimensions.push_back(position);
         }
       }
-    } else {
+    } else if (auto map = dyn_cast<MapOp>(operation)) {
       FailureOr<SmallVector<int64_t>> domain = preferFusion
-                                                   ? genericMapDomainShape(
-                                                         cast<MapOp>(operation))
-                                                   : mapDomainShape(
-                                                         cast<MapOp>(operation));
+                                                   ? genericMapDomainShape(map)
+                                                   : mapDomainShape(map);
       if (failed(domain)) {
         return failure();
       }
       task.domain = std::move(*domain);
+    } else {
+      auto relation = cast<RelationOp>(operation);
+      if (relation.getNumResults() != 1)
+        return failure();
+      auto result = dyn_cast<RankedTensorType>(relation.getResult(0).getType());
+      if (!result || !result.hasStaticShape() || result.getRank() > 8 ||
+          llvm::any_of(result.getShape(),
+                       [](int64_t extent) { return extent <= 0; }))
+        return failure();
+      task.domain.assign(result.getShape().begin(), result.getShape().end());
     }
     for (Value operand : operation->getOperands()) {
       auto found = bufferForValue.find(operand);
@@ -6535,7 +6484,8 @@ FailureOr<DerivedPlan> deriveGpuPlan(RegionOp region,
     }
   }
 
-  const bool containsOnlyMaps = foldCount == 0 && contractCount == 0;
+  const bool containsOnlyMaps =
+      foldCount == 0 && contractCount == 0 && !containsRelation;
   if (containsOnlyMaps) {
     if (algebra.size() < 2) {
       return failure();
@@ -6596,7 +6546,13 @@ FailureOr<DerivedPlan> deriveGpuPlan(RegionOp region,
   }
   DerivedPlan result{std::move(tasks), std::move(buffers), contractCount != 0,
                      containsRankNFold};
+  result.hasLogicalRelation = containsRelation;
   if (!preferFusion)
+    return result;
+  // Relation/index-domain values are losslessly represented by ordinary
+  // materialization tasks. Scheduling these logical tasks remains fail-closed
+  // until a Relation-aware executable lowering exists.
+  if (containsRelation)
     return result;
   FailureOr<DerivedPlan> composition =
       deriveGenericContractFoldCompositionPlan(region, result);
@@ -6691,11 +6647,13 @@ public:
         llvm::any_of(selected,
                      [](const auto &entry) {
                        return entry.second.hasContract &&
-                              !entry.second.hasContractFoldComposition;
+                              !entry.second.hasContractFoldComposition &&
+                              !entry.second.hasLogicalRelation;
                      }) &&
         llvm::any_of(selected, [](const auto &entry) {
           return entry.second.hasRankNFold &&
-                 !entry.second.hasContractFoldComposition;
+                 !entry.second.hasContractFoldComposition &&
+                 !entry.second.hasLogicalRelation;
         });
     if (mixesContractAndRankNFold) {
       module.emitError(
@@ -6764,11 +6722,7 @@ public:
         const bool foldRegion = !task.foldRegionSources.empty();
         const bool contractRegion = !task.contractRegionSources.empty();
         const bool composition = !task.compositionKind.empty();
-        auto source = isa<MapOp>(task.operation)
-                          ? cast<MapOp>(task.operation).getSource()
-                      : isa<FoldOp>(task.operation)
-                          ? cast<FoldOp>(task.operation).getSource()
-                          : cast<ContractOp>(task.operation).getSource();
+        SourceRefAttr source = algebraSource(task.operation);
         SmallVector<NamedAttribute> attrs{
             builder.getNamedAttr("ordinal", builder.getI64IntegerAttr(ordinal)),
             builder.getNamedAttr("kind", MaterializationTaskKindAttr::get(
@@ -6806,19 +6760,15 @@ public:
             builder.getNamedAttr("source", source)};
         if (composition) {
           SmallVector<Attribute> sources;
-          for (Operation *operation : task.compositionSources) {
-            if (auto map = dyn_cast<MapOp>(operation))
-              sources.push_back(map.getSource());
-            else if (auto fold = dyn_cast<FoldOp>(operation))
-              sources.push_back(fold.getSource());
-            else
-              sources.push_back(cast<ContractOp>(operation).getSource());
-          }
+          for (Operation *operation : task.compositionSources)
+            sources.push_back(algebraSource(operation));
           attrs.push_back(builder.getNamedAttr(
               "composition_kind", builder.getStringAttr(task.compositionKind)));
           attrs.push_back(builder.getNamedAttr("composition_sources",
                                                builder.getArrayAttr(sources)));
-          if (task.compositionKind == "map_contract") {
+          if (task.compositionKind == "map_contract" ||
+              task.compositionKind ==
+                  "online_normalized_exponential_weighted_contract") {
             auto cost = task.compositionCost;
             attrs.push_back(builder.getNamedAttr(
                 "composition_cost",
@@ -7042,6 +6992,11 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
     if (auto map = dyn_cast<MapOp>(operation)) {
       if (!sourceOperations.try_emplace(map.getSource(), operation).second) {
         duplicateSources.insert(map.getSource());
+      }
+    } else if (auto relation = dyn_cast<RelationOp>(operation)) {
+      if (!sourceOperations.try_emplace(relation.getSource(), operation)
+               .second) {
+        duplicateSources.insert(relation.getSource());
       }
     } else if (auto fold = dyn_cast<FoldOp>(operation)) {
       if (!sourceOperations.try_emplace(fold.getSource(), operation).second) {
@@ -7383,7 +7338,7 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
     }
     const bool kindMatches =
         (task.getKind() == MaterializationTaskKind::Map &&
-         isa<MapOp>(source)) ||
+         isa<MapOp, RelationOp>(source)) ||
         (task.getKind() == MaterializationTaskKind::Fold &&
          isa<FoldOp>(source)) ||
         (task.getKind() == MaterializationTaskKind::Contract &&
@@ -7447,6 +7402,15 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
         return failure();
       }
       expectedDomain = std::move(*domain);
+    } else if (auto relation = dyn_cast<RelationOp>(source)) {
+      auto result = relation.getNumResults() == 1
+                        ? dyn_cast<RankedTensorType>(relation.getResult(0).getType())
+                        : RankedTensorType{};
+      if (!result || !result.hasStaticShape()) {
+        task.emitOpError("bound Relation has no closed static domain");
+        return failure();
+      }
+      expectedDomain.assign(result.getShape().begin(), result.getShape().end());
     } else if (auto contract = dyn_cast<ContractOp>(source)) {
       FailureOr<SmallVector<int64_t>> domain = contractDomainShape(contract);
       if (failed(domain)) {
@@ -8078,11 +8042,17 @@ public:
     llvm::SmallDenseSet<Operation *> owners;
     for (MaterializationPlanOp plan : materializationPlans) {
       RegionOp owner;
-      if (failed(
-              verifyMaterializationPlanAgainstSource(module, plan, &owner)) ||
+      if (failed(verifyMaterializationPlanAgainstSource(module, plan,
+                                                        &owner)) ||
+          !owner ||
+          llvm::any_of(owner.getBody().front().without_terminator(),
+                       [](Operation &operation) {
+                         return isa<RelationOp>(operation);
+                       }) ||
           !owners.insert(owner.getOperation()).second) {
         module.emitError(
-            "requires one source-bound materialization plan per GPU region");
+            "requires one source-bound executable materialization plan per "
+            "GPU region");
         return signalPassFailure();
       }
     }

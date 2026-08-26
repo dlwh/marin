@@ -1439,7 +1439,9 @@ FailureOr<int64_t> staticTensorBytes(Type type) {
   auto tensor = dyn_cast<RankedTensorType>(type);
   if (!tensor || !tensor.hasStaticShape() ||
       (!tensor.getElementType().isF32() &&
-       !tensor.getElementType().isBF16())) {
+       !tensor.getElementType().isBF16() &&
+       !tensor.getElementType().isInteger(32) &&
+       !tensor.getElementType().isInteger(1))) {
     return failure();
   }
   int64_t elements = 1;
@@ -1449,7 +1451,11 @@ FailureOr<int64_t> staticTensorBytes(Type type) {
     }
     elements *= extent;
   }
-  const int64_t elementBytes = tensor.getElementType().isF32() ? 4 : 2;
+  const int64_t elementBytes =
+      tensor.getElementType().isF32() ||
+              tensor.getElementType().isInteger(32)
+          ? 4
+          : (tensor.getElementType().isBF16() ? 2 : 1);
   if (elements > INT64_MAX / elementBytes) {
     return failure();
   }
