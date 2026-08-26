@@ -5344,6 +5344,7 @@ bool onlinePartialStateReductionProtocol(const OnlinePtxCfg &cfg,
                               {"partial_merge_o"})) ||
       !check(
              onlineRoleIs(cfg, "partial_index_step", {"add.u32"}) &&
+                 cfg.instructions[step->second].predicate.empty() &&
                  onlineRoleOperandDefinitionsAre(
                      cfg, "partial_index_step", 1,
                      {"partial_index_init", "partial_index_step"}) &&
@@ -5410,12 +5411,26 @@ bool onlinePartialStateReductionProtocol(const OnlinePtxCfg &cfg,
                        .predicate.empty()) &&
          check(
                onlineRoleIs(cfg, "leaf_barrier", {"bar.sync"}) &&
+                   cfg.instructions[cfg.roles.at("leaf_barrier")]
+                       .predicate.empty() &&
                    onlineInstructionDominates(
                        cfg, cfg.roles.at("leaf_m_store"),
                        cfg.roles.at("leaf_barrier")) &&
+                   onlineInstructionDominates(
+                       cfg, cfg.roles.at("leaf_l_store"),
+                       cfg.roles.at("leaf_barrier")) &&
+                   onlineInstructionDominates(
+                       cfg, cfg.roles.at("leaf_o_store"),
+                       cfg.roles.at("leaf_barrier")) &&
                    onlineInstructionDominates(cfg,
                                               cfg.roles.at("leaf_barrier"),
-                                              loadM->second)) &&
+                                              loadM->second) &&
+                   onlineInstructionDominates(
+                       cfg, cfg.roles.at("leaf_barrier"),
+                       cfg.roles.at("partial_l_load")) &&
+                   onlineInstructionDominates(
+                       cfg, cfg.roles.at("leaf_barrier"),
+                       cfg.roles.at("partial_o_load"))) &&
          check(
              onlineRoleIs(cfg, "partial_m_result", {"max.f32"},
                           {"max_init"}) &&
@@ -7399,11 +7414,11 @@ public:
       needle = "add";
       replacement = "sub";
     } else if (kind == "shared-merge") {
-      role = "shared_l_load";
+      role = "partial_l_load";
       needle = "shared";
       replacement = "global";
     } else if (kind == "shared-value") {
-      role = "shared_l_store";
+      role = "leaf_l_store";
     } else if (kind == "output-store") {
       role = "public_store";
       needle = "global";
