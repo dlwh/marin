@@ -1985,6 +1985,36 @@ FailureOr<Simt32Geometry> contractRegionGeometry(ScheduleTaskOp task,
                         static_cast<int64_t>(task.getDomainShape().size()) - 1};
 }
 
+FailureOr<Simt32Geometry> onlineStateGeometry(ScheduleTaskOp task) {
+  auto protocol = task.getOnlineStateProtocolAttr();
+  auto reductionAxis = task.getReductionAxis();
+  ArrayRef<int64_t> domain = task.getDomainShape();
+  if (!protocol ||
+      protocol.getValue() !=
+          "online_normalized_exponential_weighted_contract" ||
+      !reductionAxis || *reductionAxis < 0 ||
+      *reductionAxis >= static_cast<int64_t>(domain.size()) ||
+      domain.empty() || domain.size() > 8)
+    return failure();
+  SmallVector<int64_t> outputShape;
+  for (auto [axis, extent] : llvm::enumerate(domain))
+    if (static_cast<int64_t>(axis) != *reductionAxis)
+      outputShape.push_back(extent);
+  FailureOr<int64_t> outputs = staticElementCount(outputShape);
+  const int64_t reduction = domain[*reductionAxis];
+  if (failed(outputs) || *outputs > UINT32_MAX || reduction <= 0 ||
+      reduction > 256)
+    return failure();
+  SmallVector<int64_t> tile(domain.size(), 1);
+  tile[*reductionAxis] = reduction;
+  const int64_t stateValues =
+      task.getKind() == ScheduleTaskKind::Contract ? 3 : 1;
+  return Simt32Geometry{{*outputs}, std::move(tile), 1, reduction, 32,
+                        stateValues * reduction *
+                            static_cast<int64_t>(sizeof(float)),
+                        *reductionAxis};
+}
+
 } // namespace
 
 LogicalResult SchedulePlanOp::verifyRegions() {
@@ -2101,16 +2131,19 @@ LogicalResult SchedulePlanOp::verifyRegions() {
     const bool isFold = task.getKind() == ScheduleTaskKind::RowFold ||
                         task.getKind() == ScheduleTaskKind::ColumnFold;
     const bool isContract = task.getKind() == ScheduleTaskKind::Contract;
+    const bool isOnline = static_cast<bool>(task.getOnlineStateProtocolAttr());
     const int64_t expectedFoldAxis =
         task.getKind() == ScheduleTaskKind::RowFold
             ? static_cast<int64_t>(task.getDomainShape().size()) - 1
             : 0;
-    if (isFold && task.getReductionAxis() != expectedFoldAxis) {
+    if (isFold && !isOnline && task.getReductionAxis() != expectedFoldAxis) {
       return task.emitOpError(
           "Fold schedule kind must match its reduction axis");
     }
     std::optional<ScheduleReductionOrder> expectedOrder;
-    if (isFold) {
+    if (isOnline) {
+      expectedOrder = ScheduleReductionOrder::LeafOrderFree;
+    } else if (isFold) {
       expectedOrder = ScheduleReductionOrder::TreeAssociationFreeLeafOrderFixed;
     } else if (isContract) {
       expectedOrder = getPolicy() == NumericalPolicy::Fast
@@ -2131,7 +2164,9 @@ LogicalResult SchedulePlanOp::verifyRegions() {
           "Contract-region schedule metadata requires a Contract task");
     }
     FailureOr<Simt32Geometry> expected =
-        hasContractStrategy
+        isOnline
+            ? onlineStateGeometry(task)
+        : hasContractStrategy
             ? contractRegionGeometry(task, getPolicy())
             : simt32Geometry(task.getKind(), task.getDomainShape(),
                              getPolicy());
@@ -2407,6 +2442,29 @@ LogicalResult DeviceModuleOp::verifyRegions() {
             static_cast<int64_t>(entry.getInputBuffers().size() +
                                  entry.getOutputBuffers().size())) {
       return entry.emitOpError("CUDA scratch or kernel arity is invalid");
+    }
+    auto onlineProtocol = entry.getOnlineStateProtocolAttr();
+    auto logicalMaps = entry.getLogicalCoordinateMapsAttr();
+    if (static_cast<bool>(onlineProtocol) != static_cast<bool>(logicalMaps))
+      return entry.emitOpError(
+          "online state protocol requires logical coordinate maps");
+    if (onlineProtocol) {
+      if (getPolicy() != NumericalPolicy::Fast ||
+          onlineProtocol.getValue() !=
+              "online_normalized_exponential_weighted_contract" ||
+          entry.getReductionOrder() !=
+              ScheduleReductionOrder::LeafOrderFree ||
+          logicalMaps.empty() || logicalMaps.size() > 8)
+        return entry.emitOpError(
+            "online state entry requires FAST merge-order semantics");
+      for (Attribute attribute : logicalMaps) {
+        auto map = dyn_cast<AffineMapAttr>(attribute);
+        if (!map || map.getValue().getNumDims() != 7 ||
+            map.getValue().getNumSymbols() != 0 ||
+            map.getValue().getNumResults() != 1)
+          return entry.emitOpError(
+              "online logical coordinate maps require seven physical axes");
+      }
     }
     StringRef ptx(reinterpret_cast<const char *>(entryCode.data()),
                   entryCode.size());

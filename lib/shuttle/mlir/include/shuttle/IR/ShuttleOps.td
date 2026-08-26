@@ -195,6 +195,7 @@ def Shuttle_ScheduleTaskOp
       DenseI64ArrayAttr:$dependencies, OptionalAttr<I64Attr>:$reduction_axis,
       OptionalAttr<Shuttle_ScheduleReductionOrderAttr>:$reduction_order,
       StrAttr:$semantic_fingerprint,
+      OptionalAttr<StrAttr>:$online_state_protocol,
       OptionalAttr<StrAttr>:$contract_region_strategy,
       OptionalAttr<DictionaryAttr>:$contract_region_cost);
 }
@@ -235,7 +236,9 @@ def Shuttle_DeviceEntryOp
       OptionalAttr<DenseI64ArrayAttr>:$grid,
       OptionalAttr<DenseI64ArrayAttr>:$block,
       OptionalAttr<I64Attr>:$dynamic_shared_bytes,
-      OptionalAttr<I64Attr>:$kernel_arity);
+      OptionalAttr<I64Attr>:$kernel_arity,
+      OptionalAttr<StrAttr>:$online_state_protocol,
+      OptionalAttr<ArrayAttr>:$logical_coordinate_maps);
 }
 
 def Shuttle_DeviceModuleYieldOp
