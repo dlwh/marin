@@ -500,12 +500,15 @@ derive(RegionOp region, const DerivedPlan &materialized) {
   contractionTask.compositionRecomputedSources =
       std::move(recomputedOrdered);
 
+  auto countContracts = [](ArrayRef<Operation *> sources) {
+    return llvm::count_if(sources, [](Operation *operation) {
+      return isa<ContractOp>(operation);
+    });
+  };
   const int64_t contractEvaluations =
-      static_cast<int64_t>(scoreContracts.size()) +
-      llvm::count_if(contractionTask.compositionRecomputedSources,
-                     [](Operation *operation) {
-                       return isa<ContractOp>(operation);
-                     });
+      countContracts(maximumTask.compositionSources) +
+      countContracts(contractionTask.compositionSources) +
+      countContracts(contractionTask.compositionRecomputedSources);
 
   PlannedTask::CompositionCost cost{
       static_cast<int64_t>(materialized.tasks.size()),
