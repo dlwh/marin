@@ -1071,10 +1071,13 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
     auto compositionKind = task->getAttrOfType<StringAttr>("composition_kind");
     auto compositionSources =
         task->getAttrOfType<ArrayAttr>("composition_sources");
+    auto compositionRecomputedSources =
+        task->getAttrOfType<ArrayAttr>("composition_recomputed_sources");
     auto compositionCost =
         task->getAttrOfType<DictionaryAttr>("composition_cost");
     const bool hasComposition =
-        compositionKind || compositionSources || compositionCost;
+        compositionKind || compositionSources ||
+        compositionRecomputedSources || compositionCost;
     if ((hasFoldRegionPhases || hasFoldRegionOutputSources ||
          hasFoldRegionBoundaryUses || hasFoldRegionRecomputedSources) &&
         !hasFoldRegionSources) {
@@ -1125,10 +1128,18 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
           (mapContract && compositionSources.size() != 2 &&
            compositionSources.size() != 3) ||
           (online && compositionSources.empty()) ||
+          (compositionRecomputedSources && !online) ||
           (!contractFold && !mapContract && !online) || legacyMetadata ||
           llvm::any_of(compositionSources, [](Attribute source) {
             return !isa<SourceRefAttr>(source);
-          })) {
+          }) ||
+          (compositionRecomputedSources &&
+           (llvm::any_of(compositionRecomputedSources, [](Attribute source) {
+              return !isa<SourceRefAttr>(source);
+            }) ||
+            llvm::any_of(compositionRecomputedSources, [&](Attribute source) {
+              return llvm::is_contained(compositionSources, source);
+            })))) {
         return task.emitOpError(
             "schema-v2 generic composition provenance must be complete and "
             "exclusive");

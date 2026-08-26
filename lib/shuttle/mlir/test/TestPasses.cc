@@ -1563,6 +1563,7 @@ public:
         "online_normalized_exponential_weighted_contract";
     MaterializationPlanOp plan;
     llvm::SmallDenseSet<Attribute> plannedSources;
+    llvm::SmallDenseSet<Attribute> plannedRecomputedSources;
     DictionaryAttr cost;
     llvm::SmallDenseSet<int64_t> compositionTaskOrdinals;
     for (MaterializationPlanOp candidate :
@@ -1571,6 +1572,8 @@ public:
         continue;
       }
       llvm::SmallDenseSet<Attribute> candidateSources;
+      llvm::SmallDenseMap<Attribute, int64_t> primaryOwner;
+      SmallVector<std::pair<int64_t, ArrayAttr>> recomputationDeclarations;
       llvm::SmallDenseSet<int64_t> candidateTaskOrdinals;
       DictionaryAttr candidateCost;
       for (MaterializationTaskOp task :
@@ -1584,8 +1587,18 @@ public:
           module.emitError("online composition has no semantic source closure");
           return signalPassFailure();
         }
-        candidateSources.insert(sources->begin(), sources->end());
+        for (Attribute source : *sources) {
+          if (!candidateSources.insert(source).second ||
+              !primaryOwner.try_emplace(source, task.getOrdinal()).second) {
+            module.emitError(
+                "online composition sources do not uniquely partition the cut");
+            return signalPassFailure();
+          }
+        }
         candidateTaskOrdinals.insert(task.getOrdinal());
+        if (auto recomputed = task->getAttrOfType<ArrayAttr>(
+                "composition_recomputed_sources"))
+          recomputationDeclarations.push_back({task.getOrdinal(), recomputed});
         if (std::optional<DictionaryAttr> taskCost =
                 task.getCompositionCost()) {
           if (candidateCost && candidateCost != *taskCost) {
@@ -1596,9 +1609,22 @@ public:
           candidateCost = *taskCost;
         }
       }
+      llvm::SmallDenseSet<Attribute> candidateRecomputedSources;
+      for (auto [taskOrdinal, sources] : recomputationDeclarations) {
+        for (Attribute source : sources) {
+          auto owner = primaryOwner.find(source);
+          if (owner == primaryOwner.end() || owner->second == taskOrdinal ||
+              !candidateRecomputedSources.insert(source).second) {
+            module.emitError(
+                "online recomputation does not bind an earlier source cut");
+            return signalPassFailure();
+          }
+        }
+      }
       if (!candidateSources.empty()) {
         plan = candidate;
         plannedSources = std::move(candidateSources);
+        plannedRecomputedSources = std::move(candidateRecomputedSources);
         compositionTaskOrdinals = std::move(candidateTaskOrdinals);
         cost = candidateCost;
         break;
@@ -1766,6 +1792,22 @@ public:
     Type scoreType = maximumFold && maximumFold.getInputs().size() == 1
                          ? maximumFold.getInputs().front().getType()
                          : Type{};
+    llvm::SmallDenseSet<Attribute> requiredRecomputedSources;
+    if (maximumFold && maximumFold.getInputs().size() == 1) {
+      llvm::DenseSet<Value> visited;
+      SmallVector<Value> worklist{maximumFold.getInputs().front()};
+      while (!worklist.empty()) {
+        Value value = worklist.pop_back_val();
+        if (!visited.insert(value).second)
+          continue;
+        Operation *producer = value.getDefiningOp();
+        if (!producer || producer->getParentOfType<RegionOp>() != region)
+          continue;
+        if (Attribute source = producer->getAttr("source"))
+          requiredRecomputedSources.insert(source);
+        llvm::append_range(worklist, producer->getOperands());
+      }
+    }
     const bool reductionsAlign =
         maximumFold && additiveFold &&
         maximumFold.getReductionDimensions() ==
@@ -1823,10 +1865,16 @@ public:
             iterator && iterator.getValue() == "reduction";
       }
     }
+    const bool recomputationMatches =
+        plannedRecomputedSources.size() == requiredRecomputedSources.size() &&
+        llvm::all_of(requiredRecomputedSources, [&](Attribute source) {
+          return plannedRecomputedSources.contains(source);
+        });
     if (!relationFeedsScore || !contractFeedsScore ||
         !exponentialUsesMaximum || !scoreMinusMaximumMap ||
         !denominatorUsesExponential ||
         !normalizedWeightOperand || !reductionsAlign ||
+        !recomputationMatches ||
         !stateCoordinatesAlign || !contractionReducesStateCoordinate) {
       module.emitError(
           "online composition does not prove {m,l,o} state semantics");
@@ -1958,6 +2006,55 @@ public:
       return signalPassFailure();
     }
     llvm::outs() << "online_state = fallback\n";
+  }
+};
+
+class DropOnlineRecomputationPass
+    : public MutationPass<DropOnlineRecomputationPass> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(DropOnlineRecomputationPass)
+  StringRef getArgument() const final {
+    return "shuttle-test-drop-online-recomputation";
+  }
+  void runOnOperation() override {
+    MaterializationPlanOp plan = materializationPlan(getOperation());
+    for (MaterializationTaskOp task :
+         plan.getBody().front().getOps<MaterializationTaskOp>()) {
+      if (!task->hasAttr("composition_recomputed_sources"))
+        continue;
+      task->removeAttr("composition_recomputed_sources");
+      refreshMaterializationFingerprint(plan);
+      return;
+    }
+    getOperation().emitError("test fixture has no online recomputation");
+    signalPassFailure();
+  }
+};
+
+class SwapOnlineRecomputationPass
+    : public MutationPass<SwapOnlineRecomputationPass> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SwapOnlineRecomputationPass)
+  StringRef getArgument() const final {
+    return "shuttle-test-swap-online-recomputation";
+  }
+  void runOnOperation() override {
+    MaterializationPlanOp plan = materializationPlan(getOperation());
+    for (MaterializationTaskOp task :
+         plan.getBody().front().getOps<MaterializationTaskOp>()) {
+      auto sources =
+          task->getAttrOfType<ArrayAttr>("composition_recomputed_sources");
+      if (!sources || sources.size() < 2)
+        continue;
+      SmallVector<Attribute> swapped(sources.begin(), sources.end());
+      std::swap(swapped[0], swapped[1]);
+      task->setAttr("composition_recomputed_sources",
+                    ArrayAttr::get(task.getContext(), swapped));
+      refreshMaterializationFingerprint(plan);
+      return;
+    }
+    getOperation().emitError("test fixture has no swappable recomputation");
+    signalPassFailure();
   }
 };
 
@@ -3502,6 +3599,8 @@ void registerMutationPasses() {
   PassRegistration<RewireOnlineMaximumYieldPass>();
   PassRegistration<VerifyOnlineSufficientStatePass>();
   PassRegistration<VerifyOnlineFallbackPass>();
+  PassRegistration<DropOnlineRecomputationPass>();
+  PassRegistration<SwapOnlineRecomputationPass>();
   PassRegistration<MaterializationDeleteTaskPass>();
   PassRegistration<MaterializationReorderTasksPass>();
   PassRegistration<MaterializationSelfConsistentReorderPass>();

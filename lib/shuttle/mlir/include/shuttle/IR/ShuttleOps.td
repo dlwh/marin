@@ -147,6 +147,7 @@ def Shuttle_MaterializationTaskOp
       OptionalAttr<ArrayAttr>:$contract_region_recomputed_sources,
       OptionalAttr<StrAttr>:$composition_kind,
       OptionalAttr<ArrayAttr>:$composition_sources,
+      OptionalAttr<ArrayAttr>:$composition_recomputed_sources,
       OptionalAttr<DictionaryAttr>:$composition_cost);
 }
 

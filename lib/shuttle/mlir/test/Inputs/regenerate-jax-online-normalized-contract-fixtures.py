@@ -98,6 +98,22 @@ def causal_gqa_with_mismatched_reduction(q, k, v):
     return jnp.einsum("bhgqk,bhkv->bhgqv", weights, v)
 
 
+def causal_gqa_with_alternate_score_contract(q, k, v):
+    """Near miss whose representative score has two Contract ancestors."""
+    primary = jnp.einsum("bhgqd,bhkd->bhgqk", q, k)
+    alternate = jnp.einsum("bhgqd,bhkd->bhgqk", q, k * jnp.float32(0.5))
+    scores = (primary + alternate) * jnp.float32(0.125)
+    query = jnp.arange(17, dtype=jnp.int32).reshape(1, 1, 1, 17, 1)
+    key = jnp.arange(17, dtype=jnp.int32).reshape(1, 1, 1, 1, 17)
+    predicate = jnp.broadcast_to(key <= query, scores.shape)
+    masked = jax.lax.select(predicate, scores, jnp.full(scores.shape, -jnp.inf))
+    maximum = jnp.max(masked, axis=4, keepdims=True)
+    numerator = jnp.exp(masked - maximum)
+    denominator = jnp.sum(numerator, axis=4, keepdims=True)
+    weights = numerator / denominator
+    return jnp.einsum("bhgqk,bhkv->bhgqv", weights, v)
+
+
 @dataclass(frozen=True)
 class Fixture:
     filename: str
@@ -148,6 +164,12 @@ FIXTURES = (
         causal_gqa_with_mismatched_reduction,
         AXIS4_SHAPES,
         "near miss whose maximum and denominator reduce different coordinates",
+    ),
+    Fixture(
+        "jax-0.10.1-f32-causal-gqa-alternate-score-contract-near-miss.mlir",
+        causal_gqa_with_alternate_score_contract,
+        AXIS4_SHAPES,
+        "near miss whose representative score has two Contract ancestors",
     ),
 )
 

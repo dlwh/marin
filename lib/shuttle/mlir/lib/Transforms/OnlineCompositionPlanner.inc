@@ -1,6 +1,87 @@
 // Copyright The Marin Authors
 // SPDX-License-Identifier: Apache-2.0
 
+std::string compositionTaskFingerprint(
+    StringRef kind, ArrayRef<Operation *> operations,
+    ArrayRef<Operation *> recomputedOperations) {
+  if (recomputedOperations.empty())
+    return compositionFingerprint(kind, operations);
+  std::string normalized = compositionFingerprint(kind, operations);
+  normalized.append("\nrecomputed\n");
+  normalized.append(closedRegionFingerprint("composition-recomputed-v1",
+                                            recomputedOperations));
+  return sha256(normalized);
+}
+
+bool isClosedFoldRegionMap(MapOp map) {
+  if (!hasIdentityResultMap(map) || map.getNumResults() != 1)
+    return false;
+  FailureOr<SmallVector<int64_t>> domain = genericMapDomainShape(map);
+  if (failed(domain))
+    return false;
+  for (Type type :
+       llvm::concat<Type>(map.getOperandTypes(), map.getResultTypes())) {
+    auto tensor = dyn_cast<RankedTensorType>(type);
+    if (!tensor || !tensor.hasStaticShape() || tensor.getRank() > 8 ||
+        (!tensor.getElementType().isF32() && !tensor.getElementType().isBF16()))
+      return false;
+  }
+  return llvm::all_of(map.getIndexingMaps(), [](Attribute attribute) {
+    auto affine = dyn_cast<AffineMapAttr>(attribute);
+    return affine && affine.getValue().getNumSymbols() == 0;
+  });
+}
+
+bool isCanonicalFoldResultExpansion(MapOp map, unsigned operandOrdinal) {
+  auto input =
+      dyn_cast<RankedTensorType>(map.getInputs()[operandOrdinal].getType());
+  auto fold =
+      dyn_cast_or_null<FoldOp>(map.getInputs()[operandOrdinal].getDefiningOp());
+  FailureOr<SmallVector<int64_t>> domain = genericMapDomainShape(map);
+  auto indexing =
+      dyn_cast<AffineMapAttr>(map.getIndexingMaps()[operandOrdinal]);
+  if (!input || !fold || failed(domain) || !indexing ||
+      indexing.getValue().getNumSymbols() != 0 ||
+      indexing.getValue().getNumResults() != input.getRank())
+    return false;
+  int64_t previousNonSingleton = -1;
+  SmallVector<int64_t> mappedNonSingletonDimensions;
+  for (auto [axis, expression] :
+       llvm::enumerate(indexing.getValue().getResults())) {
+    const int64_t extent = input.getDimSize(axis);
+    if (auto constant = dyn_cast<AffineConstantExpr>(expression)) {
+      if (extent != 1 || constant.getValue() != 0)
+        return false;
+      continue;
+    }
+    auto dimension = dyn_cast<AffineDimExpr>(expression);
+    if (!dimension || dimension.getPosition() >= domain->size() ||
+        (*domain)[dimension.getPosition()] != extent)
+      return false;
+    if (extent != 1) {
+      if (static_cast<int64_t>(dimension.getPosition()) <= previousNonSingleton)
+        return false;
+      previousNonSingleton = dimension.getPosition();
+      mappedNonSingletonDimensions.push_back(dimension.getPosition());
+    }
+  }
+  SmallVector<int64_t> domainNonSingletonDimensions;
+  for (auto [axis, extent] : llvm::enumerate(*domain)) {
+    if (extent != 1)
+      domainNonSingletonDimensions.push_back(axis);
+  }
+  if (mappedNonSingletonDimensions.size() > domainNonSingletonDimensions.size())
+    return false;
+  auto foldInput = cast<RankedTensorType>(fold.getInputs().front().getType());
+  ArrayRef<int64_t> reduction = fold.getReductionDimensions();
+  const bool row =
+      reduction.size() == 1 && reduction.front() == foldInput.getRank() - 1;
+  ArrayRef<int64_t> expected = domainNonSingletonDimensions;
+  expected = row ? expected.take_front(mappedNonSingletonDimensions.size())
+                 : expected.take_back(mappedNonSingletonDimensions.size());
+  return ArrayRef<int64_t>(mappedNonSingletonDimensions) == expected;
+}
+
 namespace online_planner {
 
 bool foldYields(FoldOp fold, StringRef operationName) {
@@ -243,15 +324,15 @@ derive(RegionOp region, const DerivedPlan &materialized) {
   auto scoreType = dyn_cast<RankedTensorType>(score.getType());
   const int64_t reduction = maximumFold.getReductionDimensions().front();
   bool relationFeedsScore = false;
-  bool contractFeedsScore = false;
+  llvm::SmallDenseSet<Operation *> scoreContracts;
   for (Operation *operation : algebra) {
     relationFeedsScore |=
         isa<RelationOp>(operation) && valueDependsOnOperation(score, operation);
-    contractFeedsScore |= isa<ContractOp>(operation) &&
-                          operation != weightedContract &&
-                          valueDependsOnOperation(score, operation);
+    if (isa<ContractOp>(operation) && operation != weightedContract &&
+        valueDependsOnOperation(score, operation))
+      scoreContracts.insert(operation);
   }
-  if (!relationFeedsScore || !contractFeedsScore ||
+  if (!relationFeedsScore || scoreContracts.size() != 1 ||
       !valueDependsOnOperation(maximumExpansion, maximumFold) ||
       additiveFold.getInputs().front() != exponentialMap.getResult(0))
     return failure();
@@ -325,13 +406,30 @@ derive(RegionOp region, const DerivedPlan &materialized) {
     llvm::append_range(worklist, producer->getOperands());
   }
   firstSources.insert(maximumFold);
+  llvm::SmallDenseSet<Operation *> scoreSources;
+  worklist.push_back(score);
+  while (!worklist.empty()) {
+    Operation *producer = worklist.pop_back_val().getDefiningOp();
+    if (!producer || producer->getParentOp() != region ||
+        !scoreSources.insert(producer).second)
+      continue;
+    llvm::append_range(worklist, producer->getOperands());
+  }
   SmallVector<Operation *> firstOrdered;
   SmallVector<Operation *> secondOrdered;
+  SmallVector<Operation *> recomputedOrdered;
   for (Operation *operation : algebra)
     (firstSources.contains(operation) ? firstOrdered : secondOrdered)
         .push_back(operation);
+  for (Operation *operation : algebra)
+    if (scoreSources.contains(operation))
+      recomputedOrdered.push_back(operation);
   if (firstOrdered.empty() || secondOrdered.empty() ||
-      !llvm::is_contained(secondOrdered, weightedContract))
+      recomputedOrdered.empty() ||
+      !llvm::is_contained(secondOrdered, weightedContract) ||
+      llvm::any_of(recomputedOrdered, [&](Operation *operation) {
+        return !firstSources.contains(operation);
+      }))
     return failure();
   auto usedArguments = [&](ArrayRef<Operation *> sources) {
     llvm::SmallDenseSet<unsigned> used;
@@ -399,6 +497,15 @@ derive(RegionOp region, const DerivedPlan &materialized) {
   contractionTask.dependencies.push_back(0);
   contractionTask.compositionKind = maximumTask.compositionKind;
   contractionTask.compositionSources = std::move(secondOrdered);
+  contractionTask.compositionRecomputedSources =
+      std::move(recomputedOrdered);
+
+  const int64_t contractEvaluations =
+      static_cast<int64_t>(scoreContracts.size()) +
+      llvm::count_if(contractionTask.compositionRecomputedSources,
+                     [](Operation *operation) {
+                       return isa<ContractOp>(operation);
+                     });
 
   PlannedTask::CompositionCost cost{
       static_cast<int64_t>(materialized.tasks.size()),
@@ -407,7 +514,7 @@ derive(RegionOp region, const DerivedPlan &materialized) {
       *candidateBytes,
       baselineTraffic,
       2 * *candidateBytes,
-      2};
+      contractEvaluations};
   maximumTask.compositionCost = cost;
   contractionTask.compositionCost = cost;
   plan.tasks.push_back(std::move(maximumTask));

@@ -4251,6 +4251,7 @@ struct PlannedTask {
   SmallVector<Operation *> contractRegionRecomputedSources;
   std::string compositionKind;
   SmallVector<Operation *> compositionSources;
+  SmallVector<Operation *> compositionRecomputedSources;
   struct CompositionCost {
     int64_t baselineLaunches;
     int64_t candidateLaunches;
@@ -4443,75 +4444,6 @@ std::string compositionFingerprint(StringRef kind,
                                    ArrayRef<Operation *> operations) {
   return closedRegionFingerprint((llvm::Twine("composition-") + kind).str(),
                                  operations);
-}
-
-bool isClosedFoldRegionMap(MapOp map) {
-  if (!hasIdentityResultMap(map) || map.getNumResults() != 1)
-    return false;
-  FailureOr<SmallVector<int64_t>> domain = genericMapDomainShape(map);
-  if (failed(domain))
-    return false;
-  for (Type type :
-       llvm::concat<Type>(map.getOperandTypes(), map.getResultTypes())) {
-    auto tensor = dyn_cast<RankedTensorType>(type);
-    if (!tensor || !tensor.hasStaticShape() || tensor.getRank() > 8 ||
-        (!tensor.getElementType().isF32() && !tensor.getElementType().isBF16()))
-      return false;
-  }
-  return llvm::all_of(map.getIndexingMaps(), [](Attribute attribute) {
-    auto affine = dyn_cast<AffineMapAttr>(attribute);
-    return affine && affine.getValue().getNumSymbols() == 0;
-  });
-}
-
-bool isCanonicalFoldResultExpansion(MapOp map, unsigned operandOrdinal) {
-  auto input =
-      dyn_cast<RankedTensorType>(map.getInputs()[operandOrdinal].getType());
-  auto fold =
-      dyn_cast_or_null<FoldOp>(map.getInputs()[operandOrdinal].getDefiningOp());
-  FailureOr<SmallVector<int64_t>> domain = genericMapDomainShape(map);
-  auto indexing =
-      dyn_cast<AffineMapAttr>(map.getIndexingMaps()[operandOrdinal]);
-  if (!input || !fold || failed(domain) || !indexing ||
-      indexing.getValue().getNumSymbols() != 0 ||
-      indexing.getValue().getNumResults() != input.getRank())
-    return false;
-  int64_t previousNonSingleton = -1;
-  SmallVector<int64_t> mappedNonSingletonDimensions;
-  for (auto [axis, expression] :
-       llvm::enumerate(indexing.getValue().getResults())) {
-    const int64_t extent = input.getDimSize(axis);
-    if (auto constant = dyn_cast<AffineConstantExpr>(expression)) {
-      if (extent != 1 || constant.getValue() != 0)
-        return false;
-      continue;
-    }
-    auto dimension = dyn_cast<AffineDimExpr>(expression);
-    if (!dimension || dimension.getPosition() >= domain->size() ||
-        (*domain)[dimension.getPosition()] != extent)
-      return false;
-    if (extent != 1) {
-      if (static_cast<int64_t>(dimension.getPosition()) <= previousNonSingleton)
-        return false;
-      previousNonSingleton = dimension.getPosition();
-      mappedNonSingletonDimensions.push_back(dimension.getPosition());
-    }
-  }
-  SmallVector<int64_t> domainNonSingletonDimensions;
-  for (auto [axis, extent] : llvm::enumerate(*domain)) {
-    if (extent != 1)
-      domainNonSingletonDimensions.push_back(axis);
-  }
-  if (mappedNonSingletonDimensions.size() > domainNonSingletonDimensions.size())
-    return false;
-  auto foldInput = cast<RankedTensorType>(fold.getInputs().front().getType());
-  ArrayRef<int64_t> reduction = fold.getReductionDimensions();
-  const bool row =
-      reduction.size() == 1 && reduction.front() == foldInput.getRank() - 1;
-  ArrayRef<int64_t> expected = domainNonSingletonDimensions;
-  expected = row ? expected.take_front(mappedNonSingletonDimensions.size())
-                 : expected.take_back(mappedNonSingletonDimensions.size());
-  return ArrayRef<int64_t>(mappedNonSingletonDimensions) == expected;
 }
 
 bool valueDependsOnOperation(Value value, Operation *operation) {
@@ -6754,8 +6686,9 @@ public:
                 "semantic_fingerprint",
                 builder.getStringAttr(
                     composition
-                        ? compositionFingerprint(task.compositionKind,
-                                                 task.compositionSources)
+                        ? compositionTaskFingerprint(
+                              task.compositionKind, task.compositionSources,
+                              task.compositionRecomputedSources)
                     : contractRegion
                         ? contractRegionFingerprint(task.contractRegionSources)
                     : foldRegion ? foldRegionFingerprint(task.foldRegionSources)
@@ -6773,6 +6706,14 @@ public:
               "composition_kind", builder.getStringAttr(task.compositionKind)));
           attrs.push_back(builder.getNamedAttr("composition_sources",
                                                builder.getArrayAttr(sources)));
+          if (!task.compositionRecomputedSources.empty()) {
+            SmallVector<Attribute> recomputed;
+            for (Operation *operation : task.compositionRecomputedSources)
+              recomputed.push_back(algebraSource(operation));
+            attrs.push_back(builder.getNamedAttr(
+                "composition_recomputed_sources",
+                builder.getArrayAttr(recomputed)));
+          }
           if (task.compositionKind == "map_contract" ||
               task.compositionKind ==
                   "online_normalized_exponential_weighted_contract") {
@@ -7046,6 +6987,8 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
     auto compositionKind = task->getAttrOfType<StringAttr>("composition_kind");
     auto compositionSources =
         task->getAttrOfType<ArrayAttr>("composition_sources");
+    auto compositionRecomputedSources =
+        task->getAttrOfType<ArrayAttr>("composition_recomputed_sources");
     auto compositionCost =
         task->getAttrOfType<DictionaryAttr>("composition_cost");
     if (compositionKind || compositionSources || compositionCost) {
@@ -7084,6 +7027,24 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
         operations.push_back(found->second);
         ++sourceOccurrences[found->second];
       }
+      SmallVector<Operation *> recomputedOperations;
+      llvm::SmallDenseSet<Operation *> recomputedSet;
+      if (compositionRecomputedSources) {
+        if (!online)
+          return task.emitOpError(
+              "only online composition may declare recomputation");
+        for (Attribute source : compositionRecomputedSources) {
+          auto found = sourceOperations.find(source);
+          if (!isa<SourceRefAttr>(source) || found == sourceOperations.end() ||
+              duplicateSources.contains(source) ||
+              !bound.contains(found->second) ||
+              !recomputedSet.insert(found->second).second)
+            return task.emitOpError(
+                "online recomputation must bind unique earlier composition "
+                "sources");
+          recomputedOperations.push_back(found->second);
+        }
+      }
       if ((contractFold &&
            (!isa<ContractOp>(operations[0]) || !isa<FoldOp>(operations[1]) ||
             sourceOperations.lookup(task.getSource()) != operations[1])) ||
@@ -7097,8 +7058,8 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
           (online &&
            !llvm::is_contained(operations,
                                sourceOperations.lookup(task.getSource()))) ||
-          task.getSemanticFingerprint() !=
-              compositionFingerprint(compositionKind.getValue(), operations))
+          task.getSemanticFingerprint() != compositionTaskFingerprint(
+              compositionKind.getValue(), operations, recomputedOperations))
         return task.emitOpError(
             "composition sources must bind their source-ordered algebra");
       if (mapContract || online) {
@@ -7501,6 +7462,8 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
         actual->getAttrOfType<StringAttr>("composition_kind");
     auto actualCompositionSources =
         actual->getAttrOfType<ArrayAttr>("composition_sources");
+    auto actualCompositionRecomputedSources =
+        actual->getAttrOfType<ArrayAttr>("composition_recomputed_sources");
     auto actualCompositionCost =
         actual->getAttrOfType<DictionaryAttr>("composition_cost");
     auto actualFoldRegionSources =
@@ -7512,6 +7475,9 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
       SmallVector<Attribute> expectedSources;
       for (Operation *operation : expectedTask.compositionSources)
         expectedSources.push_back(algebraSource(operation));
+      SmallVector<Attribute> expectedRecomputedSources;
+      for (Operation *operation : expectedTask.compositionRecomputedSources)
+        expectedRecomputedSources.push_back(algebraSource(operation));
       auto costMatches = [&](StringRef field, int64_t expectedValue) {
         auto value = actualCompositionCost
                          ? actualCompositionCost.getAs<IntegerAttr>(field)
@@ -7528,6 +7494,11 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
           actualCompositionKind.getValue() == expectedTask.compositionKind &&
           actualCompositionSources.getValue() ==
               ArrayRef<Attribute>(expectedSources) &&
+          (expectedRecomputedSources.empty()
+               ? !actualCompositionRecomputedSources
+               : actualCompositionRecomputedSources &&
+                     actualCompositionRecomputedSources.getValue() ==
+                         ArrayRef<Attribute>(expectedRecomputedSources)) &&
           (expectsCost == static_cast<bool>(actualCompositionCost)) &&
           (!expectsCost ||
            (costMatches("baseline_launches", cost.baselineLaunches) &&
@@ -7560,6 +7531,7 @@ verifyMaterializationPlanAgainstSource(ModuleOp module,
       continue;
     }
     if (actualCompositionKind || actualCompositionSources ||
+        actualCompositionRecomputedSources ||
         actualCompositionCost) {
       actual.emitOpError("unexpected generic composition metadata");
       return failure();
