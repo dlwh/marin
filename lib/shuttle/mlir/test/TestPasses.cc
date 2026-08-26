@@ -2059,11 +2059,13 @@ std::vector<std::string> onlinePtxTokens(StringRef text) {
     const bool registerToken = text[index] == '%';
     const bool parameterToken = text[index] == 'p' && index + 1 < text.size() &&
                                 llvm::isDigit(text[index + 1]);
+    const bool sharedSymbolToken = text.substr(index).starts_with("shuttle_smem");
     const bool constantToken =
         (text[index] == '0' && index + 2 < text.size() &&
          text[index + 1] == 'f' && llvm::isHexDigit(text[index + 2])) ||
         llvm::isDigit(text[index]) || text[index] == '-';
-    if (!registerToken && !parameterToken && !constantToken) {
+    if (!registerToken && !parameterToken && !sharedSymbolToken &&
+        !constantToken) {
       ++index;
       continue;
     }
