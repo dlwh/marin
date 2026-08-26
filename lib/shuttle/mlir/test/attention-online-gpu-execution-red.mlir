@@ -9,12 +9,16 @@
 // bra.uni blocks, swapped FMA roles, alternate output pointers, and wrong
 // shared-state store values independently of the future emitter.
 // RUN: shuttle-test-opt %s --shuttle-test-verify-online-ptx-oracle -o /dev/null | FileCheck %s --check-prefix=ORACLE
+// RUN: shuttle-test-opt %S/Inputs/jax-0.10.1-f32-causal-gqa-online-axis4.mlir --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-test-verify-online-ptx-oracle -o /dev/null | FileCheck %s --check-prefix=ORACLE
+// RUN: shuttle-test-opt %S/Inputs/jax-0.10.1-f32-offset-softcap-gqa-online-axis1.mlir --shuttle-test-rename-symbols --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-test-verify-online-ptx-oracle -o /dev/null | FileCheck %s --check-prefix=ORACLE
+// RUN: shuttle-test-opt %S/Inputs/jax-0.10.1-f32-offset-softcap-gqa-online-axis1-mutation.mlir --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-test-verify-online-ptx-oracle -o /dev/null | FileCheck %s --check-prefix=ORACLE
 
 // Both rank-5 GQA score domains must lower with an executable-level semantic
 // certificate for Relation predicate application and the {m,l,o}
 // update/merge/finalize protocol.
 // RUN: shuttle-test-opt %S/Inputs/jax-0.10.1-f32-causal-gqa-online-axis4.mlir --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-verify-source-coverage --shuttle-verify-semantic-erasure --shuttle-test-verify-output-dependency-coverage --shuttle-test-set-fast-region-policy --shuttle-test-set-prefer-fusion-tuning --shuttle-plan-row-fold-materialization --shuttle-verify-materialization-plan --shuttle-test-verify-online-sufficient-state --shuttle-plan-simt32-row-fold-schedule --shuttle-verify-simt32-row-fold-schedule --shuttle-build-gpu-executable-bundle --shuttle-verify-gpu-executable-bundle --shuttle-test-verify-online-gpu-execution -o /dev/null | FileCheck %s --check-prefix=GPU
 // RUN: shuttle-test-opt %S/Inputs/jax-0.10.1-f32-offset-softcap-gqa-online-axis1.mlir --shuttle-test-rename-symbols --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-verify-source-coverage --shuttle-verify-semantic-erasure --shuttle-test-verify-output-dependency-coverage --shuttle-test-set-fast-region-policy --shuttle-test-set-prefer-fusion-tuning --shuttle-plan-row-fold-materialization --shuttle-verify-materialization-plan --shuttle-test-verify-online-sufficient-state --shuttle-plan-simt32-row-fold-schedule --shuttle-verify-simt32-row-fold-schedule --shuttle-build-gpu-executable-bundle --shuttle-verify-gpu-executable-bundle --shuttle-test-verify-online-gpu-execution -o /dev/null | FileCheck %s --check-prefix=GPU
+// RUN: shuttle-test-opt %S/Inputs/jax-0.10.1-f32-offset-softcap-gqa-online-axis1-mutation.mlir --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-verify-source-coverage --shuttle-verify-semantic-erasure --shuttle-test-verify-output-dependency-coverage --shuttle-test-set-fast-region-policy --shuttle-test-set-prefer-fusion-tuning --shuttle-plan-row-fold-materialization --shuttle-verify-materialization-plan --shuttle-test-verify-online-sufficient-state --shuttle-plan-simt32-row-fold-schedule --shuttle-verify-simt32-row-fold-schedule --shuttle-build-gpu-executable-bundle --shuttle-verify-gpu-executable-bundle --shuttle-test-verify-online-gpu-execution -o /dev/null | FileCheck %s --check-prefix=GPU
 
 // The normalized score may be either Contract operand. The rhs-score fixture's
 // executable coordinate map must remain aligned with that semantic operand.
@@ -25,12 +29,21 @@
 // shared reaching stores by address/predicate/barrier. Emitter role markers
 // select semantic definitions, not their textual position or opcode count.
 // The compact maximum additionally carries a source-bound logical reduction
-// certificate. Affine leaf partitions must cover every scheduled reduction
-// coordinate exactly once; arbitrary FAST merge DAGs and bounded strided loop
+// certificate. The raw Contract reduction and a source-semantic score
+// certificate (including transpose, scale, and softcap) must reach the Relation
+// select at the composed affine coordinate. A normalized symbolic PTX proof
+// binds the exact raw Contract source and constants while admitting
+// associative/commutative add/multiply trees, FMA expansion, and
+// reciprocal-versus-divide. Synthetic alternatives exercise each equivalence;
+// ambiguous reaching definitions and unsupported operations fail closed. Raw
+// passthrough, zero annihilation, omitted tanh, wrong arithmetic, and a substituted Contract source fail closed. Affine leaf
+// partitions cover every reduction coordinate exactly once; arbitrary FAST merge DAGs and bounded strided loop
 // families are legal. Same-instance register movement is verifier-bound;
 // shared and shuffle transport remain fail-closed until their producer and
-// consumer partition ownership is certified. The root value and projected
-// non-reduction output address must reach the compact store.
+// consumer partition ownership is certified. Uncertified body cycles and
+// padded launches whose affine score loads can leave an operand buffer fail
+// closed. The root value and projected non-reduction output address must reach
+// the compact store.
 // Mutations independently break each required state-protocol edge without
 // changing physical topology.
 // RUN: not shuttle-test-opt %S/Inputs/jax-0.10.1-f32-causal-gqa-online-axis4.mlir --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-test-set-fast-region-policy --shuttle-test-set-prefer-fusion-tuning --shuttle-plan-row-fold-materialization --shuttle-verify-materialization-plan --shuttle-plan-simt32-row-fold-schedule --shuttle-verify-simt32-row-fold-schedule --shuttle-build-gpu-executable-bundle --shuttle-verify-gpu-executable-bundle '--shuttle-test-corrupt-online-gpu-semantics=kind=maximum' --shuttle-test-verify-online-gpu-execution -o /dev/null 2>&1 | FileCheck %s --check-prefix=SEMANTICS
