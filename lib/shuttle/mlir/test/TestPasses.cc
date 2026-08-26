@@ -1896,13 +1896,17 @@ public:
       auto value = cost.getAs<IntegerAttr>(name);
       return value ? std::optional<int64_t>(value.getInt()) : std::nullopt;
     };
+    auto baselineLaunches = integerCost("baseline_launches");
+    auto candidateLaunches = integerCost("candidate_launches");
     auto baselineBytes = integerCost("baseline_temporary_bytes");
     auto candidateBytes = integerCost("candidate_temporary_bytes");
     auto baselineTraffic = integerCost("baseline_temporary_traffic_bytes");
     auto candidateTraffic = integerCost("candidate_temporary_traffic_bytes");
     auto contractEvaluations = integerCost("contract_evaluations");
-    if (failed(scoreBytes) || !baselineBytes || !candidateBytes ||
-        !baselineTraffic || !candidateTraffic || !contractEvaluations ||
+    if (failed(scoreBytes) || !baselineLaunches || !candidateLaunches ||
+        !baselineBytes || !candidateBytes || !baselineTraffic ||
+        !candidateTraffic || !contractEvaluations ||
+        *candidateLaunches > *baselineLaunches ||
         *baselineBytes != actualBaselineBytes ||
         *candidateBytes != actualCandidateBytes ||
         *baselineTraffic != actualBaselineTraffic ||

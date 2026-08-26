@@ -7,8 +7,8 @@
 
 // FAST may select any dependence-driven plan that carries the full semantic
 // cut, implements the online {m,l,o} state, avoids a representative-score
-// temporary, and improves both temporary bytes and traffic. No task, launch,
-// slot, grid, or algebra-op count is observable.
+// temporary, improves both temporary bytes and traffic, and does not increase
+// launch cost. No task, launch, slot, grid, or algebra-op count is observable.
 // RUN: shuttle-test-opt %S/Inputs/jax-0.10.1-f32-causal-gqa-online-axis4.mlir --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-verify-source-coverage --shuttle-verify-semantic-erasure --shuttle-test-verify-output-dependency-coverage --shuttle-test-set-fast-region-policy --shuttle-test-set-prefer-fusion-tuning --shuttle-plan-row-fold-materialization --shuttle-verify-materialization-plan --shuttle-test-verify-online-sufficient-state -o /dev/null | FileCheck %s --check-prefix=ONLINE
 // RUN: shuttle-test-opt %S/Inputs/jax-0.10.1-f32-offset-softcap-gqa-online-axis1.mlir --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-verify-source-coverage --shuttle-verify-semantic-erasure --shuttle-test-verify-output-dependency-coverage --shuttle-test-set-fast-region-policy --shuttle-test-set-prefer-fusion-tuning --shuttle-plan-row-fold-materialization --shuttle-verify-materialization-plan --shuttle-test-verify-online-sufficient-state -o /dev/null | FileCheck %s --check-prefix=ONLINE
 
