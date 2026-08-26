@@ -2062,7 +2062,8 @@ std::vector<std::string> onlinePtxTokens(StringRef text) {
     const bool sharedSymbolToken =
         text.substr(index).starts_with("shuttle_smem") &&
         (index == 0 ||
-         (!llvm::isAlnum(text[index - 1]) && text[index - 1] != '_'));
+         (!llvm::isAlnum(text[index - 1]) && text[index - 1] != '_' &&
+          text[index - 1] != '.'));
     const bool constantToken =
         (text[index] == '0' && index + 2 < text.size() &&
          text[index + 1] == 'f' && llvm::isHexDigit(text[index + 2])) ||
@@ -5570,8 +5571,11 @@ public:
         onlinePtxTokens("%rd0, shuttle_smem");
     const std::vector<std::string> prefixedSharedSymbol =
         onlinePtxTokens("%rd0, evilshuttle_smem");
+    const std::vector<std::string> dottedSharedSymbol =
+        onlinePtxTokens("%rd0, evil.shuttle_smem");
     if (!llvm::is_contained(sharedSymbol, "shuttle_smem") ||
-        llvm::is_contained(prefixedSharedSymbol, "shuttle_smem")) {
+        llvm::is_contained(prefixedSharedSymbol, "shuttle_smem") ||
+        llvm::is_contained(dottedSharedSymbol, "shuttle_smem")) {
       getOperation().emitError(
           "online PTX shared-memory symbol tokenization is not exact");
       return signalPassFailure();
