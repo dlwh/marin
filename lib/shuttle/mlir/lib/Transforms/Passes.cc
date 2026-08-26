@@ -3032,8 +3032,10 @@ FailureOr<Operation *> lowerFold(OpBuilder &builder, FoldOp fold,
   Operation *combiner = add ? add.getOperation()
                             : maximum ? maximum.getOperation() : nullptr;
   auto yield = dyn_cast<YieldOp>(body.back());
-  auto fastMath = add ? add->getAttrOfType<arith::FastMathFlagsAttr>("fastmath")
-                      : arith::FastMathFlagsAttr{};
+  auto fastMath =
+      combiner
+          ? combiner->getAttrOfType<arith::FastMathFlagsAttr>("fastmath")
+          : arith::FastMathFlagsAttr{};
   if (!combiner || !yield || combiner->getOperand(0) != body.getArgument(0) ||
       combiner->getOperand(1) != body.getArgument(1) ||
       yield.getValues().size() != 1 ||

@@ -63,6 +63,25 @@ module attributes {shuttle.coverage_manifest = {}} {
 
 // -----
 
+module attributes {shuttle.coverage_manifest = {}} {
+  func.func @maximum_fastmath(%arg0: tensor<2x4xf32>, %init: tensor<f32>)
+      -> tensor<2xf32> {
+    %0 = "shuttle.region"(%arg0, %init) ({
+    ^bb0(%input: tensor<2x4xf32>, %initial: tensor<f32>):
+      // expected-error @+1 {{requires a closed order-free scalar f32 add or maximum combiner}}
+      %1 = "shuttle.fold"(%input, %initial) ({
+      ^bb0(%element: f32, %accumulator: f32):
+        %maximum = arith.maximumf %element, %accumulator fastmath<nnan> : f32
+        "shuttle.yield"(%maximum) : (f32) -> ()
+      }) {accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 0>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
+      "shuttle.yield"(%1) : (tensor<2xf32>) -> ()
+    }) {policy = #shuttle.policy<source_ordered>, source_refs = [#shuttle.source_ref<0, 0, 0, 0>]} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
+    return %0 : tensor<2xf32>
+  }
+}
+
+// -----
+
 #input = affine_map<(d0, d1, d2) -> (d1, d1)>
 #result = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
 
