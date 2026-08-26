@@ -30,6 +30,14 @@ namespace {
 constexpr llvm::StringLiteral kManifest = "shuttle.coverage_manifest";
 constexpr llvm::StringLiteral kSourceRefs = "shuttle.source_refs";
 constexpr llvm::StringLiteral kOperationRef = "shuttle.operation_ref";
+constexpr llvm::StringLiteral kFastFusionTuning =
+    R"json({"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json";
+constexpr llvm::StringLiteral kFastFusionOptions =
+    R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+constexpr llvm::StringLiteral kFastFusionTuningDigest =
+    "528d87798df49d74838ca85396578213dc949a9d7ad76d9db7b8be4d0b64868a";
+constexpr llvm::StringLiteral kFastFusionPolicyDigest =
+    "10de636a98b8aef9f56270c33f288459fd3bf64d9206daf809ccbf8f04425bec";
 
 llvm::SmallDenseSet<Attribute> excludedSources(ModuleOp module) {
   llvm::SmallDenseSet<Attribute> sources;
@@ -1281,6 +1289,366 @@ public:
       return signalPassFailure();
     }
     llvm::outs() << plan.getFingerprint() << '\n';
+  }
+};
+
+class SetPreferFusionTuningPass
+    : public MutationPass<SetPreferFusionTuningPass> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SetPreferFusionTuningPass)
+  StringRef getArgument() const final {
+    return "shuttle-test-set-prefer-fusion-tuning";
+  }
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+    auto manifest = module->getAttrOfType<DictionaryAttr>(kManifest);
+    if (!manifest) {
+      module.emitError("test fixture has no coverage manifest");
+      return signalPassFailure();
+    }
+    NamedAttrList fields(manifest);
+    fields.set("canonical_tuning",
+               StringAttr::get(module.getContext(), kFastFusionTuning));
+    fields.set("canonical_options",
+               StringAttr::get(module.getContext(), kFastFusionOptions));
+    fields.set("policy", StringAttr::get(module.getContext(), "fast"));
+    fields.set("policy_digest",
+               StringAttr::get(module.getContext(), kFastFusionPolicyDigest));
+    fields.set("tuning_digest",
+               StringAttr::get(module.getContext(), kFastFusionTuningDigest));
+    module->setAttr(kManifest,
+                    DictionaryAttr::get(module.getContext(), fields));
+  }
+};
+
+bool valueDependsOn(Value value, Operation *target) {
+  llvm::DenseSet<Value> visited;
+  SmallVector<Value> worklist{value};
+  while (!worklist.empty()) {
+    Value current = worklist.pop_back_val();
+    if (!visited.insert(current).second) {
+      continue;
+    }
+    Operation *producer = current.getDefiningOp();
+    if (!producer) {
+      continue;
+    }
+    if (producer == target) {
+      return true;
+    }
+    llvm::append_range(worklist, producer->getOperands());
+  }
+  return false;
+}
+
+bool foldCombinerIs(FoldOp fold, StringRef operationName) {
+  return !fold.getCombiner().empty() &&
+         llvm::any_of(fold.getCombiner().front().without_terminator(),
+                      [&](Operation &operation) {
+                        return operation.getName().getStringRef() ==
+                               operationName;
+                      });
+}
+
+bool mapBodyContains(MapOp map, StringRef operationName) {
+  return !map.getBody().empty() &&
+         llvm::any_of(map.getBody().front().without_terminator(),
+                      [&](Operation &operation) {
+                        return operation.getName().getStringRef() ==
+                               operationName;
+                      });
+}
+
+FailureOr<int64_t> staticTensorBytes(Type type) {
+  auto tensor = dyn_cast<RankedTensorType>(type);
+  if (!tensor || !tensor.hasStaticShape() ||
+      (!tensor.getElementType().isF32() &&
+       !tensor.getElementType().isBF16())) {
+    return failure();
+  }
+  int64_t elements = 1;
+  for (int64_t extent : tensor.getShape()) {
+    if (extent <= 0 || elements > INT64_MAX / extent) {
+      return failure();
+    }
+    elements *= extent;
+  }
+  const int64_t elementBytes = tensor.getElementType().isF32() ? 4 : 2;
+  if (elements > INT64_MAX / elementBytes) {
+    return failure();
+  }
+  return elements * elementBytes;
+}
+
+class VerifyOnlineSufficientStatePass
+    : public MutationPass<VerifyOnlineSufficientStatePass> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(VerifyOnlineSufficientStatePass)
+  StringRef getArgument() const final {
+    return "shuttle-test-verify-online-sufficient-state";
+  }
+  StringRef getDescription() const final {
+    return "Verify a topology-neutral online normalized contraction plan";
+  }
+
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+    auto manifest = module->getAttrOfType<DictionaryAttr>(kManifest);
+    auto manifestPolicy = manifest ? manifest.getAs<StringAttr>("policy")
+                                   : StringAttr{};
+    auto canonicalOptions =
+        manifest ? manifest.getAs<StringAttr>("canonical_options")
+                 : StringAttr{};
+    auto canonicalTuning =
+        manifest ? manifest.getAs<StringAttr>("canonical_tuning")
+                 : StringAttr{};
+    auto policyDigest = manifest ? manifest.getAs<StringAttr>("policy_digest")
+                                 : StringAttr{};
+    auto tuningDigest = manifest ? manifest.getAs<StringAttr>("tuning_digest")
+                                 : StringAttr{};
+    if (!manifestPolicy || manifestPolicy.getValue() != "fast" ||
+        !canonicalOptions ||
+        canonicalOptions.getValue() != kFastFusionOptions ||
+        !canonicalTuning || canonicalTuning.getValue() != kFastFusionTuning ||
+        !policyDigest || policyDigest.getValue() != kFastFusionPolicyDigest ||
+        !tuningDigest || tuningDigest.getValue() != kFastFusionTuningDigest) {
+      module.emitError("online planning lacks exact FAST policy identity");
+      return signalPassFailure();
+    }
+    SmallVector<RegionOp> regions;
+    module.walk([&](RegionOp region) { regions.push_back(region); });
+    constexpr llvm::StringLiteral kind =
+        "online_normalized_exponential_weighted_contract";
+    MaterializationPlanOp plan;
+    llvm::SmallDenseSet<Attribute> plannedSources;
+    DictionaryAttr cost;
+    for (MaterializationPlanOp candidate :
+         module.getOps<MaterializationPlanOp>()) {
+      if (candidate.getPolicy() != NumericalPolicy::Fast) {
+        continue;
+      }
+      llvm::SmallDenseSet<Attribute> candidateSources;
+      DictionaryAttr candidateCost;
+      for (MaterializationTaskOp task :
+           candidate.getBody().front().getOps<MaterializationTaskOp>()) {
+        auto taskKind = task.getCompositionKind();
+        if (!taskKind || *taskKind != kind) {
+          continue;
+        }
+        std::optional<ArrayAttr> sources = task.getCompositionSources();
+        if (!sources || sources->empty()) {
+          module.emitError("online composition has no semantic source closure");
+          return signalPassFailure();
+        }
+        candidateSources.insert(sources->begin(), sources->end());
+        if (std::optional<DictionaryAttr> taskCost =
+                task.getCompositionCost()) {
+          if (candidateCost && candidateCost != *taskCost) {
+            module.emitError(
+                "online composition has inconsistent cost evidence");
+            return signalPassFailure();
+          }
+          candidateCost = *taskCost;
+        }
+      }
+      if (!candidateSources.empty()) {
+        plan = candidate;
+        plannedSources = std::move(candidateSources);
+        cost = candidateCost;
+        break;
+      }
+    }
+    if (!plan || plannedSources.empty() || !cost) {
+      module.emitError("requires online composition semantics and cost evidence");
+      return signalPassFailure();
+    }
+
+    RegionOp region;
+    SmallVector<Operation *> algebra;
+    SmallVector<Operation *> onlineAlgebra;
+    for (RegionOp candidate : regions) {
+      llvm::SmallDenseSet<Attribute> candidateSources;
+      SmallVector<Operation *> candidateAlgebra;
+      for (Operation &operation :
+           candidate.getBody().front().without_terminator()) {
+        Attribute source = operation.getAttr("source");
+        if (!source) {
+          module.emitError("algebra operation lacks source identity");
+          return signalPassFailure();
+        }
+        candidateSources.insert(source);
+        candidateAlgebra.push_back(&operation);
+      }
+      if (llvm::all_of(plannedSources, [&](Attribute source) {
+            return candidateSources.contains(source);
+          })) {
+        region = candidate;
+        algebra = std::move(candidateAlgebra);
+        llvm::copy_if(algebra, std::back_inserter(onlineAlgebra),
+                      [&](Operation *operation) {
+                        return plannedSources.contains(
+                            operation->getAttr("source"));
+                      });
+        break;
+      }
+    }
+    if (!region) {
+      module.emitError("online composition does not close the algebra cut");
+      return signalPassFailure();
+    }
+    llvm::SmallDenseSet<Operation *> onlineOperations(onlineAlgebra.begin(),
+                                                       onlineAlgebra.end());
+    for (Operation *operation : onlineAlgebra) {
+      for (Value operand : operation->getOperands()) {
+        Operation *producer = operand.getDefiningOp();
+        if (!producer || onlineOperations.contains(producer) ||
+            producer->getParentOfType<RegionOp>() != region) {
+          continue;
+        }
+        if (llvm::any_of(onlineAlgebra, [&](Operation *onlineOperation) {
+              return valueDependsOn(operand, onlineOperation);
+            })) {
+          module.emitError("online composition has a non-closed reentry cut");
+          return signalPassFailure();
+        }
+      }
+    }
+
+    FoldOp maximumFold;
+    FoldOp additiveFold;
+    MapOp exponentialMap;
+    ContractOp weightedContract;
+    auto regionYield = cast<YieldOp>(region.getBody().front().getTerminator());
+    for (Operation *operation : onlineAlgebra) {
+      if (auto fold = dyn_cast<FoldOp>(operation)) {
+        if (foldCombinerIs(fold, arith::MaximumFOp::getOperationName())) {
+          maximumFold = fold;
+        } else if (foldCombinerIs(fold,
+                                  arith::AddFOp::getOperationName())) {
+          additiveFold = fold;
+        }
+      } else if (auto map = dyn_cast<MapOp>(operation)) {
+        if (mapBodyContains(map, "math.exp")) {
+          exponentialMap = map;
+        }
+      } else if (auto contract = dyn_cast<ContractOp>(operation)) {
+        const bool reachesOutput =
+            llvm::any_of(regionYield.getValues(), [&](Value output) {
+              return valueDependsOn(output, contract);
+            });
+        const bool feedsAnotherContract =
+            llvm::any_of(algebra, [&](Operation *consumer) {
+              auto other = dyn_cast<ContractOp>(consumer);
+              return other && other != contract &&
+                     llvm::any_of(other.getInputs(), [&](Value input) {
+                       return valueDependsOn(input, contract);
+                     });
+            });
+        if (reachesOutput && !feedsAnotherContract) {
+          weightedContract = contract;
+        }
+      }
+    }
+    bool relationFeedsScore = false;
+    bool contractFeedsScore = false;
+    if (maximumFold && maximumFold.getInputs().size() == 1) {
+      for (Operation *operation : onlineAlgebra) {
+        relationFeedsScore |=
+            isa<RelationOp>(operation) &&
+            valueDependsOn(maximumFold.getInputs().front(), operation);
+        contractFeedsScore |=
+            isa<ContractOp>(operation) && operation != weightedContract &&
+            valueDependsOn(maximumFold.getInputs().front(), operation);
+      }
+    }
+    const bool exponentialUsesMaximum =
+        exponentialMap && maximumFold &&
+        llvm::any_of(exponentialMap.getInputs(), [&](Value input) {
+          return valueDependsOn(input, maximumFold);
+        });
+    const bool denominatorUsesExponential =
+        additiveFold && exponentialMap &&
+        additiveFold.getInputs().size() == 1 &&
+        valueDependsOn(additiveFold.getInputs().front(), exponentialMap);
+    const bool contractionUsesNormalizedExponential =
+        weightedContract && additiveFold && exponentialMap &&
+        llvm::any_of(weightedContract.getInputs(), [&](Value input) {
+          return valueDependsOn(input, additiveFold) &&
+                 valueDependsOn(input, exponentialMap);
+        });
+    if (!relationFeedsScore || !contractFeedsScore ||
+        !exponentialUsesMaximum || !denominatorUsesExponential ||
+        !contractionUsesNormalizedExponential) {
+      module.emitError(
+          "online composition does not prove {m,l,o} state semantics");
+      return signalPassFailure();
+    }
+
+    Type scoreType = maximumFold.getInputs().front().getType();
+    for (MaterializationBufferOp buffer :
+         plan.getBody().front().getOps<MaterializationBufferOp>()) {
+      if (buffer.getStorage() == MaterializationStorage::Temporary &&
+          buffer.getTensorType() == scoreType) {
+        module.emitError("online composition materializes representative scores");
+        return signalPassFailure();
+      }
+    }
+    FailureOr<int64_t> scoreBytes = staticTensorBytes(scoreType);
+    auto integerCost = [&](StringRef name) -> std::optional<int64_t> {
+      auto value = cost.getAs<IntegerAttr>(name);
+      return value ? std::optional<int64_t>(value.getInt()) : std::nullopt;
+    };
+    auto baselineLaunches = integerCost("baseline_launches");
+    auto candidateLaunches = integerCost("candidate_launches");
+    auto baselineBytes = integerCost("baseline_temporary_bytes");
+    auto candidateBytes = integerCost("candidate_temporary_bytes");
+    auto baselineTraffic = integerCost("baseline_temporary_traffic_bytes");
+    auto candidateTraffic = integerCost("candidate_temporary_traffic_bytes");
+    auto contractEvaluations = integerCost("contract_evaluations");
+    if (failed(scoreBytes) || !baselineLaunches || !candidateLaunches ||
+        !baselineBytes || !candidateBytes || !baselineTraffic ||
+        !candidateTraffic || !contractEvaluations ||
+        *candidateLaunches > *baselineLaunches ||
+        *candidateBytes >= *baselineBytes ||
+        *candidateTraffic >= *baselineTraffic ||
+        *candidateBytes >= *scoreBytes || *contractEvaluations <= 0) {
+      module.emitError(
+          "online composition lacks relative cost and traffic improvement");
+      return signalPassFailure();
+    }
+    llvm::outs() << "online_state = {m,l,o}; source_cut = complete; "
+                    "representative_score_materialized = false; "
+                    "temporary_bytes = improved; temporary_traffic = improved\n";
+  }
+};
+
+class VerifyOnlineFallbackPass
+    : public MutationPass<VerifyOnlineFallbackPass> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(VerifyOnlineFallbackPass)
+  StringRef getArgument() const final {
+    return "shuttle-test-verify-online-fallback";
+  }
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+    bool sawPlan = false;
+    for (MaterializationPlanOp plan : module.getOps<MaterializationPlanOp>()) {
+      sawPlan = true;
+      for (MaterializationTaskOp task :
+           plan.getBody().front().getOps<MaterializationTaskOp>()) {
+        if (task.getCompositionKind() &&
+            *task.getCompositionKind() ==
+                "online_normalized_exponential_weighted_contract") {
+          module.emitError("near miss was incorrectly classified as online");
+          return signalPassFailure();
+        }
+      }
+    }
+    if (!sawPlan) {
+      module.emitError("near miss has no lossless materialized fallback");
+      return signalPassFailure();
+    }
+    llvm::outs() << "online_state = fallback\n";
   }
 };
 
@@ -2821,6 +3189,9 @@ void registerMutationPasses() {
   PassRegistration<ManifestVersionMissingPass>();
   PassRegistration<ReportNormalizedFingerprintPass>();
   PassRegistration<ReportMaterializationFingerprintPass>();
+  PassRegistration<SetPreferFusionTuningPass>();
+  PassRegistration<VerifyOnlineSufficientStatePass>();
+  PassRegistration<VerifyOnlineFallbackPass>();
   PassRegistration<MaterializationDeleteTaskPass>();
   PassRegistration<MaterializationReorderTasksPass>();
   PassRegistration<MaterializationSelfConsistentReorderPass>();
