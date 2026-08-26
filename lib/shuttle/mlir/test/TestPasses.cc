@@ -4,6 +4,7 @@
 #include "TestPasses.h"
 
 #include <functional>
+#include <limits>
 #include <map>
 #include <set>
 #include <string>
@@ -2384,6 +2385,7 @@ FailureOr<int64_t> onlineIotaLogicalDimension(RelationOp iota) {
 struct OnlineIndexAlternatives {
   bool valid = true;
   SmallVector<AffineExpr> values;
+  SmallVector<AffineExpr> intermediates;
 };
 
 OnlineIndexAlternatives onlineIndexAlternatives(
@@ -2435,6 +2437,8 @@ OnlineIndexAlternatives onlineIndexAlternatives(
       result.valid = false;
       continue;
     }
+    for (const OnlineIndexAlternatives &operand : operands)
+      llvm::append_range(result.intermediates, operand.intermediates);
     StringRef opcode = producer.opcode;
     for (AffineExpr left : operands.front().values) {
       if (opcode == "mov.u32" || opcode == "mov.s32" ||
@@ -2453,16 +2457,24 @@ OnlineIndexAlternatives onlineIndexAlternatives(
         auto leftConstant = dyn_cast<AffineConstantExpr>(left);
         auto rightConstant = dyn_cast<AffineConstantExpr>(right);
         if (opcode == "add.u32" || opcode == "add.s32") {
-          result.values.push_back(left + right);
+          AffineExpr value = left + right;
+          result.values.push_back(value);
+          result.intermediates.push_back(value);
         } else if ((opcode == "mul.lo.u32" || opcode == "mul.lo.s32") &&
                    (leftConstant || rightConstant)) {
-          result.values.push_back(left * right);
+          AffineExpr value = left * right;
+          result.values.push_back(value);
+          result.intermediates.push_back(value);
         } else if (opcode == "div.u32" && rightConstant &&
                    rightConstant.getValue() > 0) {
-          result.values.push_back(left.floorDiv(rightConstant.getValue()));
+          AffineExpr value = left.floorDiv(rightConstant.getValue());
+          result.values.push_back(value);
+          result.intermediates.push_back(value);
         } else if (opcode == "rem.u32" && rightConstant &&
                    rightConstant.getValue() > 0) {
-          result.values.push_back(left % rightConstant.getValue());
+          AffineExpr value = left % rightConstant.getValue();
+          result.values.push_back(value);
+          result.intermediates.push_back(value);
         } else {
           result.valid = false;
         }
@@ -2509,7 +2521,83 @@ FailureOr<int64_t> evaluateOnlineAffineExpr(AffineExpr expression,
   }
 }
 
-FailureOr<SmallVector<AffineExpr>> onlineLogicalCoordinateMaps(
+FailureOr<int64_t> evaluateOnlineIndexExpr(AffineExpr expression,
+                                           ArrayRef<int64_t> dimensions) {
+  FailureOr<int64_t> value;
+  if (auto dimension = dyn_cast<AffineDimExpr>(expression)) {
+    if (dimension.getPosition() >= dimensions.size())
+      return failure();
+    value = dimensions[dimension.getPosition()];
+  } else if (auto constant = dyn_cast<AffineConstantExpr>(expression)) {
+    value = constant.getValue();
+  } else {
+    auto binary = dyn_cast<AffineBinaryOpExpr>(expression);
+    if (!binary)
+      return failure();
+    FailureOr<int64_t> lhs =
+        evaluateOnlineIndexExpr(binary.getLHS(), dimensions);
+    FailureOr<int64_t> rhs =
+        evaluateOnlineIndexExpr(binary.getRHS(), dimensions);
+    if (failed(lhs) || failed(rhs))
+      return failure();
+    switch (binary.getKind()) {
+    case AffineExprKind::Add:
+      if (*lhs > std::numeric_limits<int32_t>::max() - *rhs)
+        return failure();
+      value = *lhs + *rhs;
+      break;
+    case AffineExprKind::Mul:
+      if (*lhs != 0 && *rhs > std::numeric_limits<int32_t>::max() / *lhs)
+        return failure();
+      value = *lhs * *rhs;
+      break;
+    case AffineExprKind::FloorDiv:
+      if (*rhs <= 0)
+        return failure();
+      value = *lhs / *rhs;
+      break;
+    case AffineExprKind::Mod:
+      if (*rhs <= 0)
+        return failure();
+      value = *lhs % *rhs;
+      break;
+    default:
+      return failure();
+    }
+  }
+  if (failed(value) || *value < 0 ||
+      *value > std::numeric_limits<int32_t>::max())
+    return failure();
+  return value;
+}
+
+bool onlineIndexExprFitsLaunchDomain(AffineExpr expression,
+                                     ArrayRef<int64_t> launchExtents) {
+  int64_t launches = 1;
+  for (int64_t extent : launchExtents) {
+    if (extent <= 0 || launches > 1000000 / extent)
+      return false;
+    launches *= extent;
+  }
+  for (int64_t linear = 0; linear < launches; ++linear) {
+    int64_t remainder = linear;
+    SmallVector<int64_t> physical(launchExtents.size());
+    for (int64_t axis = launchExtents.size() - 1; axis >= 0; --axis) {
+      physical[axis] = remainder % launchExtents[axis];
+      remainder /= launchExtents[axis];
+    }
+    if (failed(evaluateOnlineIndexExpr(expression, physical)))
+      return false;
+  }
+  return true;
+}
+
+struct OnlineLogicalCoordinateProof {
+  SmallVector<AffineExpr> coordinates;
+  SmallVector<int64_t> launchExtents;
+};
+
+FailureOr<OnlineLogicalCoordinateProof> onlineLogicalCoordinateMaps(
     DeviceEntryOp entry, ScheduleTaskOp schedule) {
   auto maps = entry->getAttrOfType<ArrayAttr>("logical_coordinate_maps");
   if (!maps || maps.size() != schedule.getDomainShape().size())
@@ -2566,7 +2654,7 @@ FailureOr<SmallVector<AffineExpr>> onlineLogicalCoordinateMaps(
   }
   if (covered.size() != static_cast<size_t>(domainElements))
     return failure();
-  return coordinates;
+  return OnlineLogicalCoordinateProof{coordinates, launchExtents};
 }
 
 FailureOr<SmallVector<int64_t>> onlineRelationDomainAxes(
@@ -2642,6 +2730,7 @@ FailureOr<std::string> onlineComparisonOpcode(RelationOp relation);
 bool onlineRelationSourceClosure(
     const OnlinePtxCfg &cfg, ArrayRef<RelationOp> relations,
     ArrayRef<AffineExpr> logicalCoordinates,
+    ArrayRef<int64_t> launchExtents,
     ArrayRef<int64_t> relationDomainAxes, MLIRContext *context) {
   for (RelationOp relation : relations) {
     SourceRefAttr source = relation->getAttrOfType<SourceRefAttr>("source");
@@ -2683,7 +2772,14 @@ bool onlineRelationSourceClosure(
           logicalCoordinates[relationDomainAxes[*logicalDimension]];
       if (!alternatives.valid || alternatives.values.empty() ||
           llvm::any_of(alternatives.values,
-                       [&](AffineExpr value) { return value != expected; }))
+                       [&](AffineExpr value) {
+                         return value != expected ||
+                                !onlineIndexExprFitsLaunchDomain(
+                                    value, launchExtents);
+                       }) ||
+          llvm::any_of(alternatives.intermediates, [&](AffineExpr value) {
+            return !onlineIndexExprFitsLaunchDomain(value, launchExtents);
+          }))
         return false;
       break;
     }
@@ -3298,6 +3394,13 @@ add.f32 %f0, %tid.x, 0f00000000;
 mov.u32 %r1, %f0;
 ret;
 )ptx");
+    FailureOr<OnlinePtxCfg> overflowingCoordinate = parse(R"ptx(
+mul.lo.u32 %r0, %tid.x, 268435456;
+div.u32 %r1, %r0, 268435456;
+// shuttle.online.role iota
+mov.u32 %r2, %r1;
+ret;
+)ptx");
     FailureOr<OnlinePtxCfg> shared = parse(R"ptx(
 mov.u64 %rd0, 0;
 // shuttle.online.role expected
@@ -3317,7 +3420,7 @@ ret;
         failed(predicatedStore) || failed(coordinate) ||
         failed(zeroedCoordinate) || failed(alternateCoordinate) ||
         failed(typeChangedCoordinate) || failed(floatingAddCoordinate) ||
-        failed(shared))
+        failed(overflowingCoordinate) || failed(shared))
       return signalPassFailure();
     auto indexMatches = [&](const OnlinePtxCfg &cfg, AffineExpr expected) {
       int64_t iota = cfg.roles.at("iota");
@@ -3325,9 +3428,15 @@ ret;
       OnlineIndexAlternatives alternatives = onlineIndexAlternatives(
           cfg, iota, cfg.instructions[iota].operands[1],
           getOperation().getContext(), active);
+      SmallVector<int64_t> launchExtents{1, 1, 1, 17, 1, 1, 1};
       return alternatives.valid && !alternatives.values.empty() &&
-             llvm::all_of(alternatives.values,
-                          [&](AffineExpr value) { return value == expected; });
+             llvm::all_of(alternatives.values, [&](AffineExpr value) {
+               return value == expected &&
+                      onlineIndexExprFitsLaunchDomain(value, launchExtents);
+             }) &&
+             llvm::all_of(alternatives.intermediates, [&](AffineExpr value) {
+               return onlineIndexExprFitsLaunchDomain(value, launchExtents);
+             });
     };
     if (onlineRoleDirectlyReaches(*predicated, "maybe_value",
                                   predicated->roles.at("use")) ||
@@ -3349,6 +3458,8 @@ ret;
         indexMatches(*typeChangedCoordinate,
                      getAffineDimExpr(3, getOperation().getContext())) ||
         indexMatches(*floatingAddCoordinate,
+                     getAffineDimExpr(3, getOperation().getContext())) ||
+        indexMatches(*overflowingCoordinate,
                      getAffineDimExpr(3, getOperation().getContext())) ||
         !onlineSharedPairIsClosed(*shared, "shared_store", "expected",
                                   "barrier", "shared_load") ||
@@ -3515,9 +3626,9 @@ public:
         return signalPassFailure();
       }
       auto scheduled = scheduleTasks.find(entry.getSourceTask());
-      FailureOr<SmallVector<AffineExpr>> logicalCoordinates =
+      FailureOr<OnlineLogicalCoordinateProof> logicalCoordinates =
           scheduled == scheduleTasks.end()
-              ? FailureOr<SmallVector<AffineExpr>>(failure())
+              ? FailureOr<OnlineLogicalCoordinateProof>(failure())
               : onlineLogicalCoordinateMaps(entry, scheduled->second);
       const int64_t relationRank =
           cast<RankedTensorType>(representativeScoreType).getRank();
@@ -3526,7 +3637,9 @@ public:
                                    relationOperations, relationRank);
       if (failed(logicalCoordinates) || failed(relationAxes) ||
           !onlineRelationSourceClosure(*cfg, relationOperations,
-                                       *logicalCoordinates, *relationAxes,
+                                       logicalCoordinates->coordinates,
+                                       logicalCoordinates->launchExtents,
+                                       *relationAxes,
                                        module.getContext())) {
         module.emitError("online GPU Relation index dataflow is not source-bound");
         return signalPassFailure();
