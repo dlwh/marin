@@ -5167,7 +5167,13 @@ bool onlineSharedStateAddressesAreClosed(const OnlinePtxCfg &cfg,
   };
   const std::string lOffset = std::to_string(threads * 4);
   const std::string oOffset = std::to_string(threads * 8);
-  return onlineRoleIsUnpredicated(cfg, "shared_base", {"cvta.to.shared.u64"}) &&
+  return onlineRoleIsUnpredicated(cfg, "shared_symbol", {"mov.u64"}) &&
+         llvm::is_contained(
+             cfg.instructions[cfg.roles.at("shared_symbol")].operands,
+             "shuttle_smem") &&
+         onlineRoleIsUnpredicated(cfg, "shared_base",
+                                  {"cvta.to.shared.u64"}) &&
+         onlineRoleOperandIs(cfg, "shared_base", 1, "shared_symbol") &&
          onlineRoleIsUnpredicated(cfg, "leaf_index", {"mov.u32"}) &&
          llvm::is_contained(
              cfg.instructions[cfg.roles.at("leaf_index")].operands,
@@ -5384,18 +5390,40 @@ bool onlinePartialStateReductionProtocol(const OnlinePtxCfg &cfg,
                  onlineInstructionDominates(cfg, leaderExit->second,
                                             init->second)) &&
          check(
-               onlineRoleIs(cfg, "leaf_max_update", {"max.f32"},
-                            {"mask_select"})) &&
+               onlineRoleIs(cfg, "leaf_state_m", {"mov.f32"},
+                            {"max_init"}) &&
+                   onlineRoleIs(cfg, "leaf_state_l", {"mov.f32"},
+                                {"zero_init"}) &&
+                   onlineRoleIs(cfg, "leaf_state_o", {"mov.f32"},
+                                {"zero_init"}) &&
+                   onlineRoleIs(cfg, "leaf_max_update", {"max.f32"},
+                                {"leaf_state_m", "mask_select"}) &&
+                   onlineRoleIs(cfg, "leaf_old_delta", {"sub.rn.f32"},
+                                {"leaf_state_m", "leaf_max_update"}) &&
+                   onlineRoleOperandIs(cfg, "leaf_old_delta", 1,
+                                       "leaf_state_m") &&
+                   onlineRoleOperandIs(cfg, "leaf_old_delta", 2,
+                                       "leaf_max_update") &&
+                   onlineExpOf(cfg, "leaf_old_rescale", "leaf_old_delta",
+                               "leaf_old_exp_argument") &&
+                   onlineRoleIs(cfg, "leaf_score_delta", {"sub.rn.f32"},
+                                {"mask_select", "leaf_max_update"}) &&
+                   onlineRoleOperandIs(cfg, "leaf_score_delta", 1,
+                                       "mask_select") &&
+                   onlineRoleOperandIs(cfg, "leaf_score_delta", 2,
+                                       "leaf_max_update") &&
+                   onlineExpOf(cfg, "leaf_score_weight", "leaf_score_delta",
+                               "leaf_score_exp_argument") &&
+                   onlineRoleIs(cfg, "leaf_value_weight", {"mul.rn.f32"},
+                                {"leaf_score_weight", "value_load"})) &&
          check(
-               onlineRoleIs(cfg, "leaf_l_update", {"fma.rn.f32"}) &&
-                   onlineRoleTransitivelyDependsOn(cfg, "leaf_l_update",
-                                                    "mask_select")) &&
+               onlineScaledUpdate(cfg, "leaf_old_l_scaled", "leaf_l_update",
+                                  "leaf_old_rescale", "leaf_state_l",
+                                  "leaf_score_weight")) &&
          check(
-               onlineRoleIs(cfg, "leaf_o_update", {"fma.rn.f32"}) &&
-                   onlineRoleTransitivelyDependsOn(cfg, "leaf_o_update",
-                                                    "value_load") &&
-                   onlineRoleTransitivelyDependsOn(cfg, "leaf_o_update",
-                                                    "mask_select")) &&
+               onlineScaledUpdate(cfg, "leaf_old_o_scaled", "leaf_o_update",
+                                  "leaf_old_rescale", "leaf_state_o",
+                                  "leaf_value_weight")) &&
          check(
                onlineRoleIs(cfg, "leaf_m_store", {"st.shared.f32"},
                             {"leaf_max_update"}) &&
@@ -7393,6 +7421,18 @@ public:
       role = "partial_merge_max";
     } else if (kind == "max-leaf-coordinate") {
       role = "partial_index_offset";
+    } else if (kind == "leaf-max") {
+      role = "leaf_max_update";
+      needle = "max";
+      replacement = "add";
+    } else if (kind == "leaf-exp") {
+      role = "leaf_score_weight";
+      needle = "ex";
+      replacement = "lg";
+    } else if (kind == "leaf-update") {
+      role = "leaf_l_update";
+      needle = "fma";
+      replacement = "mad";
     } else if (kind == "zero-init") {
       role = "zero_init";
       needle = "0f00000000";
