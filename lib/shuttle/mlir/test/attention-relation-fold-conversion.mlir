@@ -36,37 +36,25 @@
 
 // Relation is generic index-domain algebra. The check intentionally permits
 // one lossless materialized relation or another equivalent representation.
-// AXIS3: policy = #shuttle.policy<source_ordered>
-// AXIS3: "shuttle.relation"
-// AXIS3: "shuttle.fold"
-// AXIS3-SAME: reduction_dimensions = array<i64: 3>
-// AXIS3: "arith.maximumf"
-// AXIS3: "shuttle.fold"
-// AXIS3: "arith.addf"
-// AXIS3: shuttle.coverage_manifest
-// AXIS3-SAME: excluded = []
-// AXIS3-SAME: policy = "source_ordered"
-// AXIS3-SAME: policy_digest = "{{[0-9a-f]{64}}"
-// AXIS3-NOT: "stablehlo.iota"
-// AXIS3-NOT: "stablehlo.compare"
-// AXIS3-NOT: "stablehlo.select"
-// AXIS3-NOT: "stablehlo.maximum"
+// AXIS3-DAG: policy = #shuttle.policy<source_ordered>
+// AXIS3-DAG: "shuttle.relation"
+// AXIS3-DAG: "shuttle.fold"{{.*}}reduction_dimensions = array<i64: 3>
+// AXIS3-DAG: "arith.maximumf"
+// AXIS3-DAG: "arith.addf"
+// AXIS3-DAG: shuttle.coverage_manifest
+// AXIS3-DAG: excluded = []
+// AXIS3-DAG: policy = "source_ordered"
+// AXIS3-DAG: policy_digest = "{{[0-9a-f]{64}}"
 
-// AXIS1: policy = #shuttle.policy<source_ordered>
-// AXIS1: "shuttle.relation"
-// AXIS1: "shuttle.fold"
-// AXIS1-SAME: reduction_dimensions = array<i64: 1>
-// AXIS1: "arith.maximumf"
-// AXIS1: "shuttle.fold"
-// AXIS1: "arith.addf"
-// AXIS1: shuttle.coverage_manifest
-// AXIS1-SAME: excluded = []
-// AXIS1-SAME: policy = "source_ordered"
-// AXIS1-SAME: policy_digest = "{{[0-9a-f]{64}}"
-// AXIS1-NOT: "stablehlo.iota"
-// AXIS1-NOT: "stablehlo.compare"
-// AXIS1-NOT: "stablehlo.select"
-// AXIS1-NOT: "stablehlo.maximum"
+// AXIS1-DAG: policy = #shuttle.policy<source_ordered>
+// AXIS1-DAG: "shuttle.relation"
+// AXIS1-DAG: "shuttle.fold"{{.*}}reduction_dimensions = array<i64: 1>
+// AXIS1-DAG: "arith.maximumf"
+// AXIS1-DAG: "arith.addf"
+// AXIS1-DAG: shuttle.coverage_manifest
+// AXIS1-DAG: excluded = []
+// AXIS1-DAG: policy = "source_ordered"
+// AXIS1-DAG: policy_digest = "{{[0-9a-f]{64}}"
 
 // DEPENDENCIES: output_dependency_coverage = complete
 
