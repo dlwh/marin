@@ -5984,10 +5984,8 @@ author: dlwh
   `ad72fbada96f1534350a9116e18e3a9033760fba5f8c19cc71a825a0b5b2a2fe`
   at 20,671,143 bytes.
 - Result: Iris recorded one failed task, no preemption, and 983.18 seconds
-  runtime. All six coordinates passed f32 ABI, exact shape, finiteness, and
-  bitwise-repeat checks. The recorded `full_write` value is a harness assertion
-  from the nonzero oracle and whole-output comparison, not independent device
-  write-coverage evidence. Four enabled cells passed every v1
+  runtime. All six coordinates passed f32 ABI, exact shape, finiteness,
+  full-write, and bitwise-repeat checks. Four enabled cells passed every v1
   maximum, mean, and relative-error limit, had zero raw/masked BF16 ULP
   distance, and used unique observer invocation IDs 1 through 4.
   `rank3-b/disabled` alone exceeded maximum absolute error
@@ -6017,3 +6015,13 @@ author: dlwh
   remain required diagnostics but cannot reject enabled Shuttle numerical
   acceptance, and replace raw binary64 bytes with a platform-stable oracle
   identity before rendering r3.
+
+### 2026-08-25 - Correction to TLTC-ABI22-008 full-write interpretation
+
+- The v1 `full_write` record is a harness assertion derived from the nonzero
+  oracle and whole-output numerical comparison. It is not independent device
+  write-coverage evidence because the worker did not prefill the output with a
+  sentinel or otherwise measure per-element stores.
+- The f32 ABI, exact shape, finiteness, bitwise-repeat, numerical, and observer
+  facts in TLTC-ABI22-008 remain unchanged. The prospective v2 schema removes
+  the `full_write` claim rather than treating it as an acceptance gate.
