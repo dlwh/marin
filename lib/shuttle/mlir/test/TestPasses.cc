@@ -1992,19 +1992,29 @@ public:
   }
 };
 
-struct OnlinePtxStore {
-  std::string pointer;
-  std::string value;
+struct OnlinePtxInstruction {
+  int64_t ordinal = -1;
+  int64_t block = -1;
+  std::string role;
+  std::string predicate;
+  bool negatedPredicate = false;
+  std::string opcode;
+  std::vector<std::string> operands;
+  std::string destination;
+  std::string branchTarget;
 };
 
-struct OnlinePtxDataflow {
-  struct Definition {
-    std::string opcode;
-    std::vector<std::string> operands;
-  };
-  std::map<std::string, Definition> definitions;
-  std::vector<OnlinePtxStore> globalStores;
-  std::vector<std::string> sharedStores;
+using OnlineDefinitionState =
+    std::map<std::string, std::set<int64_t>>;
+
+struct OnlinePtxCfg {
+  std::vector<OnlinePtxInstruction> instructions;
+  std::vector<std::vector<int64_t>> blocks;
+  std::map<std::string, int64_t> labels;
+  std::vector<std::vector<int64_t>> successors;
+  std::vector<std::vector<int64_t>> predecessors;
+  std::vector<OnlineDefinitionState> before;
+  std::map<std::string, int64_t> roles;
 };
 
 std::vector<std::string> onlinePtxTokens(StringRef text) {
@@ -2013,16 +2023,21 @@ std::vector<std::string> onlinePtxTokens(StringRef text) {
     const bool registerToken = text[index] == '%';
     const bool parameterToken = text[index] == 'p' && index + 1 < text.size() &&
                                 llvm::isDigit(text[index + 1]);
-    const bool constantToken = text[index] == '0' && index + 2 < text.size() &&
-                               text[index + 1] == 'f' &&
-                               llvm::isHexDigit(text[index + 2]);
+    const bool constantToken =
+        (text[index] == '0' && index + 2 < text.size() &&
+         text[index + 1] == 'f' && llvm::isHexDigit(text[index + 2])) ||
+        llvm::isDigit(text[index]) || text[index] == '-';
     if (!registerToken && !parameterToken && !constantToken) {
       ++index;
       continue;
     }
-    size_t end = index + (constantToken ? 2 : 1);
+    size_t end = index + (text[index] == '0' && index + 1 < text.size() &&
+                                  text[index + 1] == 'f'
+                              ? 2
+                              : 1);
     while (end < text.size() &&
-           (llvm::isAlnum(text[end]) || text[end] == '_'))
+           (llvm::isAlnum(text[end]) || text[end] == '_' ||
+            text[end] == '.'))
       ++end;
     tokens.push_back(text.slice(index, end).str());
     index = end;
@@ -2030,91 +2045,534 @@ std::vector<std::string> onlinePtxTokens(StringRef text) {
   return tokens;
 }
 
-OnlinePtxDataflow onlinePtxDataflow(StringRef ptx) {
-  OnlinePtxDataflow result;
-  std::map<std::string, std::string> current;
-  std::map<std::string, int64_t> generations;
-  std::vector<std::string> sharedValues;
-  auto reaching = [&](const std::string &token) {
-    if (token.empty() || token.front() != '%')
-      return token;
-    auto found = current.find(token);
-    return found == current.end() ? token : found->second;
-  };
+bool onlinePtxDefinesValue(StringRef opcode,
+                           ArrayRef<std::string> operands) {
+  return !operands.empty() && StringRef(operands.front()).starts_with("%") &&
+         !opcode.starts_with("st.") && !opcode.starts_with("bra") &&
+         !opcode.starts_with("bar.") && opcode != "ret" && opcode != "exit";
+}
+
+void onlineTransfer(const OnlinePtxInstruction &instruction,
+                    OnlineDefinitionState &state) {
+  if (instruction.destination.empty())
+    return;
+  std::set<int64_t> &definitions = state[instruction.destination];
+  if (instruction.predicate.empty())
+    definitions.clear();
+  definitions.insert(instruction.ordinal);
+}
+
+FailureOr<OnlinePtxCfg> onlinePtxCfg(StringRef ptx) {
+  OnlinePtxCfg cfg;
+  cfg.blocks.emplace_back();
+  int64_t block = 0;
+  std::string pendingRole;
   while (!ptx.empty()) {
     auto [line, remainder] = ptx.split('\n');
     ptx = remainder;
     line = line.trim();
-    if (line.empty() || line.starts_with("//") || line.ends_with(":"))
-      continue;
-    size_t opcodeStart = line.find_first_not_of(" @%p0123456789");
-    if (opcodeStart == StringRef::npos)
-      continue;
-    auto [opcode, operands] = line.drop_front(opcodeStart).split(' ');
-    std::vector<std::string> tokens = onlinePtxTokens(operands);
-    if (opcode.starts_with("st.global.")) {
-      if (tokens.size() >= 2)
-        result.globalStores.push_back({reaching(tokens[0]), reaching(tokens[1])});
+    if (line.starts_with("// shuttle.online.role ")) {
+      pendingRole =
+          line.drop_front(StringRef("// shuttle.online.role ").size()).str();
       continue;
     }
-    if (opcode.starts_with("st.shared.")) {
-      if (tokens.size() >= 2) {
-        sharedValues.push_back(reaching(tokens[1]));
-        result.sharedStores.push_back(reaching(tokens[1]));
+    if (line.empty() || line.starts_with("//") || line.starts_with(".") ||
+        line == "{" || line == "}")
+      continue;
+    if (line.ends_with(":")) {
+      if (!cfg.blocks[block].empty()) {
+        cfg.blocks.emplace_back();
+        block = cfg.blocks.size() - 1;
       }
+      cfg.labels.try_emplace(line.drop_back().str(), block);
       continue;
     }
-    if (tokens.empty() || tokens.front().front() != '%')
-      continue;
-    std::vector<std::string> dependencies;
-    for (const std::string &token : llvm::drop_begin(tokens))
-      dependencies.push_back(reaching(token));
-    if (opcode.starts_with("ld.global."))
-      dependencies.push_back((Twine("$op:") + opcode).str());
-    if (opcode.starts_with("ld.shared.")) {
-      dependencies.push_back("$shared");
-      llvm::append_range(dependencies, sharedValues);
+    OnlinePtxInstruction instruction;
+    instruction.ordinal = cfg.instructions.size();
+    instruction.block = block;
+    instruction.role = std::move(pendingRole);
+    pendingRole.clear();
+    if (line.starts_with("@")) {
+      auto [guard, body] = line.split(' ');
+      instruction.negatedPredicate = guard.starts_with("@!");
+      guard.consume_front(instruction.negatedPredicate ? "@!" : "@");
+      instruction.predicate = guard.str();
+      line = body.trim();
     }
-    std::string destination =
-        (Twine(tokens.front()) + "@" + Twine(generations[tokens.front()]++))
-            .str();
-    result.definitions.try_emplace(
-        destination,
-        OnlinePtxDataflow::Definition{opcode.str(), std::move(dependencies)});
-    current[tokens.front()] = destination;
+    auto [opcode, operands] = line.split(' ');
+    instruction.opcode = opcode.rtrim(";").str();
+    instruction.operands = onlinePtxTokens(operands);
+    if (onlinePtxDefinesValue(instruction.opcode, instruction.operands))
+      instruction.destination = instruction.operands.front();
+    if (instruction.opcode == "bra") {
+      StringRef target = operands.trim().rtrim(";");
+      instruction.branchTarget = target.str();
+    }
+    if (!instruction.role.empty() &&
+        !cfg.roles.try_emplace(instruction.role, instruction.ordinal).second)
+      return failure();
+    cfg.blocks[block].push_back(instruction.ordinal);
+    cfg.instructions.push_back(std::move(instruction));
+    if (cfg.instructions.back().opcode == "bra" ||
+        cfg.instructions.back().opcode == "ret" ||
+        cfg.instructions.back().opcode == "exit") {
+      cfg.blocks.emplace_back();
+      block = cfg.blocks.size() - 1;
+    }
   }
-  return result;
+  if (cfg.blocks.back().empty())
+    cfg.blocks.pop_back();
+  if (cfg.blocks.empty())
+    return failure();
+  cfg.successors.resize(cfg.blocks.size());
+  cfg.predecessors.resize(cfg.blocks.size());
+  for (auto [blockOrdinal, instructions] : llvm::enumerate(cfg.blocks)) {
+    if (instructions.empty())
+      continue;
+    const OnlinePtxInstruction &last = cfg.instructions[instructions.back()];
+    if (last.opcode == "bra") {
+      auto target = cfg.labels.find(last.branchTarget);
+      if (target == cfg.labels.end())
+        return failure();
+      cfg.successors[blockOrdinal].push_back(target->second);
+      if (!last.predicate.empty() && blockOrdinal + 1 < cfg.blocks.size())
+        cfg.successors[blockOrdinal].push_back(blockOrdinal + 1);
+    } else if (last.opcode != "ret" && last.opcode != "exit" &&
+               blockOrdinal + 1 < cfg.blocks.size()) {
+      cfg.successors[blockOrdinal].push_back(blockOrdinal + 1);
+    }
+  }
+  for (auto [blockOrdinal, successors] : llvm::enumerate(cfg.successors))
+    for (int64_t successor : successors)
+      cfg.predecessors[successor].push_back(blockOrdinal);
+
+  std::vector<OnlineDefinitionState> incoming(cfg.blocks.size());
+  std::vector<OnlineDefinitionState> outgoing(cfg.blocks.size());
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (int64_t blockOrdinal = 0;
+         blockOrdinal < static_cast<int64_t>(cfg.blocks.size());
+         ++blockOrdinal) {
+      OnlineDefinitionState nextIncoming;
+      for (int64_t predecessor : cfg.predecessors[blockOrdinal])
+        for (const auto &[value, definitions] : outgoing[predecessor])
+          nextIncoming[value].insert(definitions.begin(), definitions.end());
+      OnlineDefinitionState nextOutgoing = nextIncoming;
+      for (int64_t instruction : cfg.blocks[blockOrdinal])
+        onlineTransfer(cfg.instructions[instruction], nextOutgoing);
+      if (nextIncoming != incoming[blockOrdinal] ||
+          nextOutgoing != outgoing[blockOrdinal]) {
+        incoming[blockOrdinal] = std::move(nextIncoming);
+        outgoing[blockOrdinal] = std::move(nextOutgoing);
+        changed = true;
+      }
+    }
+  }
+  cfg.before.resize(cfg.instructions.size());
+  for (auto [blockOrdinal, instructions] : llvm::enumerate(cfg.blocks)) {
+    OnlineDefinitionState state = incoming[blockOrdinal];
+    for (int64_t instruction : instructions) {
+      cfg.before[instruction] = state;
+      onlineTransfer(cfg.instructions[instruction], state);
+    }
+  }
+  return cfg;
 }
 
-std::set<std::string> onlinePtxClosure(const OnlinePtxDataflow &flow,
-                                       StringRef root) {
-  std::set<std::string> closure;
-  std::vector<std::string> worklist{root.str()};
+std::set<int64_t> onlineReachingDefinitions(const OnlinePtxCfg &cfg,
+                                            int64_t instruction,
+                                            StringRef operand) {
+  if (!operand.starts_with("%"))
+    return {};
+  auto found = cfg.before[instruction].find(operand.str());
+  return found == cfg.before[instruction].end() ? std::set<int64_t>()
+                                                : found->second;
+}
+
+bool onlineBlockReachable(const OnlinePtxCfg &cfg, int64_t from,
+                          int64_t to) {
+  std::set<int64_t> seen;
+  std::vector<int64_t> worklist{from};
   while (!worklist.empty()) {
-    std::string value = std::move(worklist.back());
+    int64_t block = worklist.back();
     worklist.pop_back();
-    if (!closure.insert(value).second)
+    if (!seen.insert(block).second)
       continue;
-    auto found = flow.definitions.find(value);
-    if (found == flow.definitions.end())
-      continue;
-    closure.insert((Twine("$op:") + found->second.opcode).str());
-    worklist.insert(worklist.end(), found->second.operands.begin(),
-                    found->second.operands.end());
+    if (block == to)
+      return true;
+    llvm::append_range(worklist, cfg.successors[block]);
   }
-  return closure;
+  return false;
 }
 
-bool closureHasOpcode(const std::set<std::string> &closure,
-                      ArrayRef<StringRef> prefixes) {
-  return llvm::any_of(closure, [&](const std::string &value) {
-    StringRef operation = value;
-    if (!operation.consume_front("$op:"))
-      return false;
-    return llvm::any_of(prefixes, [&](StringRef prefix) {
-      return operation.starts_with(prefix);
-    });
+bool onlineRoleDirectlyReaches(const OnlinePtxCfg &cfg, StringRef role,
+                               int64_t consumer) {
+  auto producer = cfg.roles.find(role.str());
+  if (producer == cfg.roles.end())
+    return false;
+  if (!cfg.instructions[consumer].predicate.empty() &&
+      onlineReachingDefinitions(cfg, consumer,
+                                cfg.instructions[consumer].predicate) ==
+          std::set<int64_t>{producer->second})
+    return true;
+  return llvm::any_of(
+      llvm::drop_begin(cfg.instructions[consumer].operands),
+      [&](const std::string &operand) {
+        return onlineReachingDefinitions(cfg, consumer, operand) ==
+               std::set<int64_t>{producer->second};
+      });
+}
+
+bool onlineRoleOperandIs(const OnlinePtxCfg &cfg, StringRef consumerRole,
+                         size_t operandIndex, StringRef producerRole) {
+  auto consumer = cfg.roles.find(consumerRole.str());
+  auto producer = cfg.roles.find(producerRole.str());
+  if (consumer == cfg.roles.end() || producer == cfg.roles.end() ||
+      operandIndex >= cfg.instructions[consumer->second].operands.size())
+    return false;
+  return onlineReachingDefinitions(
+             cfg, consumer->second,
+             cfg.instructions[consumer->second].operands[operandIndex]) ==
+         std::set<int64_t>{producer->second};
+}
+
+bool onlineRoleIs(const OnlinePtxCfg &cfg, StringRef role,
+                  ArrayRef<StringRef> opcodes,
+                  ArrayRef<StringRef> dependencies = {}) {
+  auto found = cfg.roles.find(role.str());
+  if (found == cfg.roles.end())
+    return false;
+  const OnlinePtxInstruction &instruction = cfg.instructions[found->second];
+  if (!onlineBlockReachable(cfg, 0, instruction.block))
+    return false;
+  if (!llvm::any_of(opcodes, [&](StringRef opcode) {
+        return StringRef(instruction.opcode).starts_with(opcode);
+      }))
+    return false;
+  return llvm::all_of(dependencies, [&](StringRef dependency) {
+    return onlineRoleDirectlyReaches(cfg, dependency, found->second);
   });
+}
+
+std::set<std::string> onlinePointerParameters(const OnlinePtxCfg &cfg,
+                                              int64_t instruction,
+                                              StringRef pointer) {
+  std::set<std::string> parameters;
+  std::set<std::pair<int64_t, std::string>> visited;
+  std::vector<std::pair<int64_t, std::string>> worklist{
+      {instruction, pointer.str()}};
+  while (!worklist.empty()) {
+    auto [use, value] = std::move(worklist.back());
+    worklist.pop_back();
+    if (!visited.insert({use, value}).second)
+      continue;
+    if (StringRef(value).starts_with("p")) {
+      parameters.insert(value);
+      continue;
+    }
+    for (int64_t definition : onlineReachingDefinitions(cfg, use, value)) {
+      const OnlinePtxInstruction &producer = cfg.instructions[definition];
+      for (const std::string &operand :
+           llvm::drop_begin(producer.operands))
+        worklist.emplace_back(definition, operand);
+      if (!producer.predicate.empty())
+        worklist.emplace_back(definition, producer.predicate);
+    }
+  }
+  return parameters;
+}
+
+std::string onlineAddressFingerprint(const OnlinePtxCfg &cfg,
+                                     int64_t instruction, StringRef value,
+                                     std::set<std::pair<int64_t, std::string>>
+                                         &active) {
+  if (!value.starts_with("%"))
+    return value.str();
+  if (!active.insert({instruction, value.str()}).second)
+    return "$cycle";
+  std::set<std::string> alternatives;
+  for (int64_t definition :
+       onlineReachingDefinitions(cfg, instruction, value)) {
+    const OnlinePtxInstruction &producer = cfg.instructions[definition];
+    std::string fingerprint = producer.opcode;
+    for (const std::string &operand : llvm::drop_begin(producer.operands)) {
+      fingerprint += "(";
+      fingerprint += onlineAddressFingerprint(cfg, definition, operand, active);
+      fingerprint += ")";
+    }
+    alternatives.insert(std::move(fingerprint));
+  }
+  active.erase({instruction, value.str()});
+  return (Twine("{") + llvm::join(alternatives, "|") + "}").str();
+}
+
+bool onlineInstructionReachable(const OnlinePtxCfg &cfg, int64_t from,
+                                int64_t to) {
+  const OnlinePtxInstruction &fromInstruction = cfg.instructions[from];
+  const OnlinePtxInstruction &toInstruction = cfg.instructions[to];
+  if (fromInstruction.block == toInstruction.block)
+    return from <= to;
+  return llvm::any_of(cfg.successors[fromInstruction.block],
+                      [&](int64_t successor) {
+                        return onlineBlockReachable(
+                            cfg, successor, toInstruction.block);
+                      });
+}
+
+bool onlineInstructionDominates(const OnlinePtxCfg &cfg, int64_t dominator,
+                                int64_t dominated) {
+  const OnlinePtxInstruction &left = cfg.instructions[dominator];
+  const OnlinePtxInstruction &right = cfg.instructions[dominated];
+  if (!onlineBlockReachable(cfg, 0, left.block) ||
+      !onlineBlockReachable(cfg, 0, right.block))
+    return false;
+  if (left.block == right.block)
+    return dominator <= dominated;
+  std::set<int64_t> seen{left.block};
+  std::vector<int64_t> worklist{0};
+  while (!worklist.empty()) {
+    int64_t block = worklist.back();
+    worklist.pop_back();
+    if (!seen.insert(block).second)
+      continue;
+    if (block == right.block)
+      return false;
+    llvm::append_range(worklist, cfg.successors[block]);
+  }
+  return true;
+}
+
+bool onlineSharedPairIsClosed(const OnlinePtxCfg &cfg, StringRef storeRole,
+                              StringRef barrierRole, StringRef loadRole) {
+  auto store = cfg.roles.find(storeRole.str());
+  auto barrier = cfg.roles.find(barrierRole.str());
+  auto load = cfg.roles.find(loadRole.str());
+  if (store == cfg.roles.end() || barrier == cfg.roles.end() ||
+      load == cfg.roles.end())
+    return false;
+  const OnlinePtxInstruction &storeInstruction =
+      cfg.instructions[store->second];
+  const OnlinePtxInstruction &barrierInstruction =
+      cfg.instructions[barrier->second];
+  const OnlinePtxInstruction &loadInstruction = cfg.instructions[load->second];
+  if (!StringRef(storeInstruction.opcode).starts_with("st.shared.") ||
+      !StringRef(barrierInstruction.opcode).starts_with("bar.") ||
+      !StringRef(loadInstruction.opcode).starts_with("ld.shared.") ||
+      storeInstruction.operands.size() < 2 ||
+      loadInstruction.operands.size() < 2)
+    return false;
+  std::set<std::pair<int64_t, std::string>> storeActive;
+  std::set<std::pair<int64_t, std::string>> loadActive;
+  if (onlineAddressFingerprint(cfg, store->second,
+                               storeInstruction.operands[0], storeActive) !=
+      onlineAddressFingerprint(cfg, load->second,
+                               loadInstruction.operands[1], loadActive))
+    return false;
+  std::set<std::pair<int64_t, std::string>> storePredicateActive;
+  std::set<std::pair<int64_t, std::string>> loadPredicateActive;
+  if (storeInstruction.negatedPredicate != loadInstruction.negatedPredicate ||
+      onlineAddressFingerprint(cfg, store->second, storeInstruction.predicate,
+                               storePredicateActive) !=
+          onlineAddressFingerprint(cfg, load->second,
+                                   loadInstruction.predicate,
+                                   loadPredicateActive))
+    return false;
+  if (!onlineInstructionDominates(cfg, store->second, barrier->second) ||
+      !onlineInstructionDominates(cfg, barrier->second, load->second))
+    return false;
+  const std::string address = onlineAddressFingerprint(
+      cfg, store->second, storeInstruction.operands[0], storeActive);
+  for (const OnlinePtxInstruction &instruction : cfg.instructions) {
+    if (instruction.ordinal == store->second ||
+        !StringRef(instruction.opcode).starts_with("st.shared.") ||
+        instruction.operands.size() < 2 ||
+        !onlineInstructionReachable(cfg, instruction.ordinal, load->second))
+      continue;
+    std::set<std::pair<int64_t, std::string>> active;
+    if (onlineAddressFingerprint(cfg, instruction.ordinal,
+                                 instruction.operands[0], active) == address)
+      return false;
+  }
+  return true;
+}
+
+bool onlineRoleStoresToOutput(const OnlinePtxCfg &cfg, StringRef role,
+                              int64_t parameterIndex) {
+  auto found = cfg.roles.find(role.str());
+  if (found == cfg.roles.end())
+    return false;
+  const OnlinePtxInstruction &store = cfg.instructions[found->second];
+  if (!StringRef(store.opcode).starts_with("st.global.") ||
+      store.operands.size() < 2)
+    return false;
+  return onlinePointerParameters(cfg, found->second, store.operands[0]) ==
+         std::set<std::string>{(Twine("p") + Twine(parameterIndex)).str()};
+}
+
+FailureOr<std::string> onlineComparisonOpcode(RelationOp relation) {
+  ArrayAttr parameters = relation.getParameters();
+  if (!parameters || parameters.size() != 2)
+    return failure();
+  auto type = dyn_cast<StringAttr>(parameters[0]);
+  auto direction = dyn_cast<StringAttr>(parameters[1]);
+  if (!type || !direction)
+    return failure();
+  StringRef suffix =
+      type.getValue() == "SIGNED"
+          ? "s32"
+          : type.getValue() == "UNSIGNED" ? "u32" : StringRef();
+  StringRef predicate =
+      llvm::StringSwitch<StringRef>(direction.getValue())
+          .Case("EQ", "eq")
+          .Case("NE", "ne")
+          .Case("GE", "ge")
+          .Case("GT", "gt")
+          .Case("LE", "le")
+          .Case("LT", "lt")
+          .Default("");
+  if (suffix.empty() || predicate.empty())
+    return failure();
+  return (Twine("setp.") + predicate + "." + suffix).str();
+}
+
+bool onlineMaskedScoreProtocol(const OnlinePtxCfg &cfg,
+                               StringRef comparisonOpcode) {
+  auto compare = cfg.roles.find("relation_compare");
+  return compare != cfg.roles.end() &&
+         StringRef(cfg.instructions[compare->second].opcode)
+             .starts_with(comparisonOpcode) &&
+         onlineRoleIs(cfg, "relation_compare", {"setp."},
+                      {"relation_lhs", "relation_rhs"}) &&
+         onlineRoleOperandIs(cfg, "relation_compare", 1, "relation_lhs") &&
+         onlineRoleOperandIs(cfg, "relation_compare", 2, "relation_rhs") &&
+         onlineRoleIs(cfg, "negative_infinity", {"mov.f32"}) &&
+         llvm::is_contained(
+             cfg.instructions[cfg.roles.at("negative_infinity")].operands,
+             "0fFF800000") &&
+         onlineRoleIs(cfg, "mask_select", {"selp."},
+                      {"relation_compare", "score_value",
+                       "negative_infinity"}) &&
+         onlineRoleOperandIs(cfg, "mask_select", 1, "score_value") &&
+         onlineRoleOperandIs(cfg, "mask_select", 2, "negative_infinity") &&
+         onlineRoleOperandIs(cfg, "mask_select", 3, "relation_compare");
+}
+
+bool onlineMaximumProtocol(const OnlinePtxCfg &cfg, int64_t outputParameter,
+                           StringRef comparisonOpcode) {
+  return onlineMaskedScoreProtocol(cfg, comparisonOpcode) &&
+         onlineRoleIs(cfg, "max_init", {"mov.f32"}) &&
+         llvm::is_contained(
+             cfg.instructions[cfg.roles.at("max_init")].operands,
+             "0fFF800000") &&
+         onlineRoleIs(cfg, "max_update", {"max.f32"},
+                      {"mask_select", "max_init"}) &&
+         onlineRoleIs(cfg, "compact_store", {"st.global."},
+                      {"max_update"}) &&
+         onlineRoleStoresToOutput(cfg, "compact_store", outputParameter);
+}
+
+bool onlineScaledUpdate(const OnlinePtxCfg &cfg, StringRef scaledRole,
+                        StringRef updateRole, StringRef scaleRole,
+                        StringRef stateRole, StringRef newTermRole) {
+  return (onlineRoleIs(cfg, scaledRole, {"mul.rn.f32"},
+                       {scaleRole, stateRole}) &&
+          onlineRoleIs(cfg, updateRole, {"add.rn.f32"},
+                       {scaledRole, newTermRole})) ||
+         onlineRoleIs(cfg, updateRole, {"fma.rn.f32"},
+                      {scaleRole, stateRole, newTermRole});
+}
+
+bool onlineExpOf(const OnlinePtxCfg &cfg, StringRef resultRole,
+                 StringRef argumentRole, StringRef scaledArgumentRole) {
+  if (onlineRoleIs(cfg, resultRole, {"exp."}, {argumentRole}))
+    return true;
+  auto scaled = cfg.roles.find(scaledArgumentRole.str());
+  return scaled != cfg.roles.end() &&
+         onlineRoleIs(cfg, scaledArgumentRole, {"mul.rn.f32"},
+                      {argumentRole}) &&
+         llvm::is_contained(cfg.instructions[scaled->second].operands,
+                            "0f3FB8AA3B") &&
+         onlineRoleIs(cfg, resultRole, {"ex2."}, {scaledArgumentRole});
+}
+
+bool onlineFinalizeProtocol(const OnlinePtxCfg &cfg) {
+  const bool division =
+      onlineRoleIs(cfg, "finalize", {"div.rn.f32"},
+                   {"merge_o", "merge_l"}) &&
+      onlineRoleOperandIs(cfg, "finalize", 1, "merge_o") &&
+      onlineRoleOperandIs(cfg, "finalize", 2, "merge_l");
+  const bool reciprocal =
+      onlineRoleIs(cfg, "denominator_reciprocal", {"rcp.rn.f32"},
+                   {"merge_l"}) &&
+      onlineRoleIs(cfg, "finalize", {"mul.rn.f32"},
+                   {"merge_o", "denominator_reciprocal"});
+  return division || reciprocal;
+}
+
+bool onlineStateProtocol(const OnlinePtxCfg &cfg, int64_t outputParameter,
+                         StringRef comparisonOpcode) {
+  return onlineMaskedScoreProtocol(cfg, comparisonOpcode) &&
+         onlineRoleIs(cfg, "max_init", {"mov.f32"}) &&
+         llvm::is_contained(
+             cfg.instructions[cfg.roles.at("max_init")].operands,
+             "0fFF800000") &&
+         onlineRoleIs(cfg, "zero_init", {"mov.f32"}) &&
+         llvm::is_contained(
+             cfg.instructions[cfg.roles.at("zero_init")].operands,
+             "0f00000000") &&
+         onlineRoleIs(cfg, "state_m", {"mov.f32"}, {"max_init"}) &&
+         onlineRoleIs(cfg, "state_l", {"mov.f32"}, {"zero_init"}) &&
+         onlineRoleIs(cfg, "state_o", {"mov.f32"}, {"zero_init"}) &&
+         onlineRoleIs(cfg, "max_update", {"max.f32"},
+                      {"state_m", "mask_select"}) &&
+         onlineRoleIs(cfg, "old_delta", {"sub.rn.f32"},
+                      {"state_m", "max_update"}) &&
+         onlineRoleOperandIs(cfg, "old_delta", 1, "state_m") &&
+         onlineRoleOperandIs(cfg, "old_delta", 2, "max_update") &&
+         onlineExpOf(cfg, "old_rescale", "old_delta",
+                     "old_exp_argument") &&
+         onlineRoleIs(cfg, "score_delta", {"sub.rn.f32"},
+                      {"mask_select", "max_update"}) &&
+         onlineRoleOperandIs(cfg, "score_delta", 1, "mask_select") &&
+         onlineRoleOperandIs(cfg, "score_delta", 2, "max_update") &&
+         onlineExpOf(cfg, "score_weight", "score_delta",
+                     "score_exp_argument") &&
+         onlineRoleIs(cfg, "value_weight", {"mul.rn.f32"},
+                      {"score_weight", "value_load"}) &&
+         onlineScaledUpdate(cfg, "old_l_scaled", "l_update",
+                            "old_rescale", "state_l", "score_weight") &&
+         onlineScaledUpdate(cfg, "old_o_scaled", "o_update",
+                            "old_rescale", "state_o", "value_weight") &&
+         onlineRoleIs(cfg, "merge_max", {"max.f32"},
+                      {"max_update", "shared_m_load"}) &&
+         onlineRoleIs(cfg, "merge_left_delta", {"sub.rn.f32"},
+                      {"max_update", "merge_max"}) &&
+         onlineExpOf(cfg, "merge_left_rescale", "merge_left_delta",
+                     "merge_left_exp_argument") &&
+         onlineRoleIs(cfg, "merge_right_delta", {"sub.rn.f32"},
+                      {"shared_m_load", "merge_max"}) &&
+         onlineExpOf(cfg, "merge_right_rescale", "merge_right_delta",
+                     "merge_right_exp_argument") &&
+         onlineSharedPairIsClosed(cfg, "shared_m_store", "merge_barrier",
+                                  "shared_m_load") &&
+         onlineSharedPairIsClosed(cfg, "shared_l_store", "merge_barrier",
+                                  "shared_l_load") &&
+         onlineSharedPairIsClosed(cfg, "shared_o_store", "merge_barrier",
+                                  "shared_o_load") &&
+         onlineRoleIs(cfg, "merge_right_l", {"mul.rn.f32"},
+                      {"merge_right_rescale", "shared_l_load"}) &&
+         onlineScaledUpdate(cfg, "merge_left_l", "merge_l",
+                            "merge_left_rescale", "l_update",
+                            "merge_right_l") &&
+         onlineRoleIs(cfg, "merge_right_o", {"mul.rn.f32"},
+                      {"merge_right_rescale", "shared_o_load"}) &&
+         onlineScaledUpdate(cfg, "merge_left_o", "merge_o",
+                            "merge_left_rescale", "o_update",
+                            "merge_right_o") &&
+         onlineFinalizeProtocol(cfg) &&
+         onlineRoleIs(cfg, "public_store", {"st.global."}, {"finalize"}) &&
+         onlineRoleStoresToOutput(cfg, "public_store", outputParameter);
 }
 
 void refreshExecutableBundle(ModuleOp module, bool refreshCodeDigest);
@@ -2162,6 +2620,7 @@ public:
     RegionOp region;
     Type representativeScoreType;
     llvm::SmallDenseSet<Attribute> relationSources;
+    std::optional<std::string> comparisonOpcode;
     module.walk([&](RegionOp candidate) {
       for (Operation &operation :
            candidate.getBody().front().without_terminator()) {
@@ -2173,11 +2632,22 @@ public:
           region = candidate;
           representativeScoreType = fold.getInputs().front().getType();
         }
-        if (isa<RelationOp>(operation))
+        if (auto relation = dyn_cast<RelationOp>(operation)) {
           relationSources.insert(source);
+          if (relation.getSemantics() == RelationSemantics::Compare) {
+            FailureOr<std::string> opcode = onlineComparisonOpcode(relation);
+            if (failed(opcode) ||
+                (comparisonOpcode && *comparisonOpcode != *opcode)) {
+              comparisonOpcode.reset();
+              return;
+            }
+            comparisonOpcode = std::move(*opcode);
+          }
+        }
       }
     });
     if (!region || !representativeScoreType || relationSources.empty() ||
+        !comparisonOpcode ||
         llvm::any_of(relationSources, [&](Attribute source) {
           return !certifiedSources.contains(source);
         })) {
@@ -2218,9 +2688,13 @@ public:
     for (ScheduleTaskOp task :
          schedule.getBody().front().getOps<ScheduleTaskOp>())
       scheduleSources.try_emplace(task.getOrdinal(), task.getSourceTask());
+    llvm::SmallDenseMap<int64_t, MaterializationBufferOp> planBuffers;
+    for (MaterializationBufferOp buffer :
+         plan.getBody().front().getOps<MaterializationBufferOp>())
+      planBuffers.try_emplace(buffer.getOrdinal(), buffer);
     llvm::SmallDenseSet<int64_t> coveredTasks;
-    std::set<std::string> compactClosure;
-    std::set<std::string> publicClosure;
+    bool compactState = false;
+    bool publicState = false;
     for (DeviceEntryOp entry :
          device.getBody().front().getOps<DeviceEntryOp>()) {
       auto source = scheduleSources.find(entry.getSourceTask());
@@ -2243,61 +2717,39 @@ public:
       StringRef ptx(reinterpret_cast<const char *>(device.getCode().data() +
                                                    entry.getCodeOffset()),
                     entry.getCodeLength());
-      OnlinePtxDataflow flow = onlinePtxDataflow(ptx);
-      if (flow.globalStores.empty()) {
-        module.emitError("online GPU entry has no live semantic store");
+      FailureOr<OnlinePtxCfg> cfg = onlinePtxCfg(ptx);
+      if (failed(cfg)) {
+        module.emitError("online GPU entry has malformed control flow");
         return signalPassFailure();
       }
-      bool writesCompact = false;
-      bool writesPublic = false;
-      for (int64_t output : materialization->second.getOutputBuffers()) {
-        for (MaterializationBufferOp buffer :
-             plan.getBody().front().getOps<MaterializationBufferOp>()) {
-          if (buffer.getOrdinal() != output)
-            continue;
-          writesCompact |=
-              buffer.getStorage() == MaterializationStorage::Temporary;
-          writesPublic |= buffer.getLiveOut();
-        }
-      }
-      for (const OnlinePtxStore &store : flow.globalStores) {
-        std::set<std::string> closure = onlinePtxClosure(flow, store.value);
-        if (writesCompact)
-          compactClosure.insert(closure.begin(), closure.end());
-        if (writesPublic)
-          publicClosure.insert(closure.begin(), closure.end());
+      for (auto [outputIndex, output] :
+           llvm::enumerate(entry.getOutputBuffers())) {
+        auto buffer = planBuffers.find(output);
+        if (buffer == planBuffers.end())
+          continue;
+        const int64_t parameter =
+            entry.getInputBuffers().size() + outputIndex;
+        if (buffer->second.getStorage() == MaterializationStorage::Temporary)
+          compactState |=
+              onlineMaximumProtocol(*cfg, parameter, *comparisonOpcode);
+        if (buffer->second.getLiveOut())
+          publicState |=
+              onlineStateProtocol(*cfg, parameter, *comparisonOpcode);
       }
     }
-    const bool compactState =
-        closureHasOpcode(compactClosure, {"setp."}) &&
-        closureHasOpcode(compactClosure, {"selp.", "mov."}) &&
-        closureHasOpcode(compactClosure, {"max."}) &&
-        compactClosure.count("0fFF800000");
-    const bool publicState =
-        closureHasOpcode(publicClosure, {"setp."}) &&
-        closureHasOpcode(publicClosure, {"selp.", "mov."}) &&
-        closureHasOpcode(publicClosure, {"max."}) &&
-        closureHasOpcode(publicClosure, {"ex2.", "exp."}) &&
-        closureHasOpcode(publicClosure, {"add.", "fma."}) &&
-        closureHasOpcode(publicClosure, {"mul.", "fma."}) &&
-        closureHasOpcode(publicClosure, {"div.", "rcp."}) &&
-        publicClosure.count("$shared") &&
-        publicClosure.count("0f00000000");
     if (coveredTasks.size() != onlineTasks.size() || !compactState ||
         !publicState) {
       module.emitError(
-          "online GPU dataflow does not prove predicate/update/merge/finalize");
+          "online GPU CFG does not prove predicate/update/merge/finalize");
       return signalPassFailure();
     }
 
     llvm::SmallDenseMap<int64_t, Type> operandTypes;
     llvm::SmallDenseMap<int64_t, Type> resultTypes;
-    llvm::SmallDenseMap<int64_t, MaterializationBufferOp> planBuffers;
     SmallVector<int64_t> expectedOperands;
     SmallVector<int64_t> expectedResults;
     for (MaterializationBufferOp buffer :
          plan.getBody().front().getOps<MaterializationBufferOp>()) {
-      planBuffers.try_emplace(buffer.getOrdinal(), buffer);
       if (buffer.getStorage() != MaterializationStorage::External)
         continue;
       if (buffer.getLiveIn() && !buffer.getLiveOut())
@@ -2372,32 +2824,123 @@ public:
       getOperation().emitError("test fixture has no online GPU device module");
       return signalPassFailure();
     }
-    SmallVector<int8_t> code(device.getCode());
+
+    StringRef phaseRole = "public_store";
+    StringRef role;
     StringRef needle;
     StringRef replacement;
     if (kind == "maximum") {
-      needle = "max.f32";
-      replacement = "add.f32";
-    } else if (kind == "finalize") {
-      needle = "div.rn.f32";
-      replacement = "mul.rn.f32";
+      phaseRole = "compact_store";
+      role = "max_update";
+      needle = "max";
+      replacement = "add";
     } else if (kind == "max-init") {
+      phaseRole = "compact_store";
+      role = "max_init";
       needle = "0fFF800000";
       replacement = "0f00000000";
     } else if (kind == "zero-init") {
+      role = "zero_init";
       needle = "0f00000000";
       replacement = "0f3F800000";
+    } else if (kind == "compare") {
+      role = "relation_compare";
+      needle = "setp";
+      replacement = "setx";
+    } else if (kind == "select") {
+      role = "mask_select";
+      needle = "selp";
+      replacement = "maxx";
+    } else if (kind == "exp") {
+      role = "score_weight";
+      needle = "ex";
+      replacement = "lg";
+    } else if (kind == "update") {
+      role = "l_update";
+      needle = "add";
+      replacement = "sub";
+    } else if (kind == "shared-merge") {
+      role = "shared_l_load";
+      needle = "shared";
+      replacement = "global";
+    } else if (kind == "output-store") {
+      role = "public_store";
+      needle = "global";
+      replacement = "shared";
+    } else if (kind == "finalize") {
+      role = "finalize";
+      needle = "div";
+      replacement = "mul";
     } else {
       getOperation().emitError("unknown online GPU semantic mutation");
       return signalPassFailure();
     }
+
+    SmallVector<int8_t> code(device.getCode());
     StringRef bytes(reinterpret_cast<const char *>(code.data()), code.size());
-    size_t offset = bytes.find(needle);
-    if (offset == StringRef::npos || needle.size() != replacement.size()) {
-      getOperation().emitError("test fixture lacks requested online semantic");
+    std::optional<size_t> mutationOffset;
+    const std::string phaseMarker =
+        (Twine("// shuttle.online.role ") + phaseRole).str();
+    const std::string roleMarker =
+        (Twine("// shuttle.online.role ") + role).str();
+    for (DeviceEntryOp entry :
+         device.getBody().front().getOps<DeviceEntryOp>()) {
+      StringRef slice = bytes.slice(entry.getCodeOffset(),
+                                    entry.getCodeOffset() + entry.getCodeLength());
+      if (!slice.contains(phaseMarker))
+        continue;
+      size_t marker = slice.find(roleMarker);
+      if (marker == StringRef::npos ||
+          slice.find(roleMarker, marker + roleMarker.size()) != StringRef::npos) {
+        getOperation().emitError(
+            "online GPU semantic role is not unique in its protocol phase");
+        return signalPassFailure();
+      }
+      size_t instructionStart = slice.find('\n', marker);
+      size_t instructionEnd =
+          instructionStart == StringRef::npos
+              ? StringRef::npos
+              : slice.find('\n', instructionStart + 1);
+      if (instructionStart == StringRef::npos)
+        continue;
+      if (instructionEnd == StringRef::npos)
+        instructionEnd = slice.size();
+      StringRef instruction =
+          slice.slice(instructionStart + 1, instructionEnd);
+      size_t localNeedle = instruction.find(needle);
+      if (localNeedle == StringRef::npos && kind == "exp") {
+        needle = "exp";
+        replacement = "log";
+        localNeedle = instruction.find(needle);
+      }
+      if (localNeedle == StringRef::npos && kind == "update") {
+        needle = "fma";
+        replacement = "mad";
+        localNeedle = instruction.find(needle);
+      }
+      if (localNeedle == StringRef::npos && kind == "finalize") {
+        needle = "rcp";
+        replacement = "cos";
+        localNeedle = instruction.find(needle);
+      }
+      if (localNeedle == StringRef::npos || needle.size() != replacement.size())
+        continue;
+      const size_t absolute = entry.getCodeOffset() + instructionStart + 1 +
+                              localNeedle;
+      if (mutationOffset) {
+        getOperation().emitError(
+            "online GPU semantic mutation has multiple reaching targets");
+        return signalPassFailure();
+      }
+      mutationOffset = absolute;
+    }
+    if (!mutationOffset) {
+      getOperation().emitError(
+          "test fixture lacks the requested reaching semantic role");
       return signalPassFailure();
     }
-    std::copy(replacement.begin(), replacement.end(), code.begin() + offset);
+    std::copy(replacement.begin(), replacement.end(),
+              code.begin() + *mutationOffset);
     device.setCodeAttr(DenseI8ArrayAttr::get(device.getContext(), code));
     refreshExecutableBundle(getOperation(), true);
   }
