@@ -33,6 +33,40 @@ def causal_gqa(q, k, v):
     return jnp.einsum("bhgqk,bhkv->bhgqv", weights, v)
 
 
+def causal_gqa_with_output_epilogue(q, k, v):
+    """Normalized causal GQA followed by a live scalar output epilogue."""
+    output = causal_gqa(q, k, v)
+    return jnp.tanh(output * jnp.float32(0.5)) + jnp.float32(0.25)
+
+
+def causal_gqa_long_key(q, k, v):
+    """Normalized causal GQA whose key extent exceeds the online scheduler."""
+    scores = jnp.einsum("bhgqd,bhkd->bhgqk", q, k) * jnp.float32(0.125)
+    query = jnp.arange(17, dtype=jnp.int32).reshape(1, 1, 1, 17, 1)
+    key = jnp.arange(257, dtype=jnp.int32).reshape(1, 1, 1, 1, 257)
+    predicate = jnp.broadcast_to(key <= query, scores.shape)
+    masked = jax.lax.select(predicate, scores, jnp.full(scores.shape, -jnp.inf))
+    maximum = jnp.max(masked, axis=4, keepdims=True)
+    numerator = jnp.exp(masked - maximum)
+    denominator = jnp.sum(numerator, axis=4, keepdims=True)
+    weights = numerator / denominator
+    return jnp.einsum("bhgqk,bhkv->bhgqv", weights, v)
+
+
+def causal_gqa_rank9(q, k, v):
+    """Normalized causal GQA whose weighted Contract domain has rank nine."""
+    scores = jnp.einsum("abcdhgqz,abcdhkz->abcdhgqk", q, k) * jnp.float32(0.125)
+    query = jnp.arange(17, dtype=jnp.int32).reshape(1, 1, 1, 1, 1, 1, 17, 1)
+    key = jnp.arange(17, dtype=jnp.int32).reshape(1, 1, 1, 1, 1, 1, 1, 17)
+    predicate = jnp.broadcast_to(key <= query, scores.shape)
+    masked = jax.lax.select(predicate, scores, jnp.full(scores.shape, -jnp.inf))
+    maximum = jnp.max(masked, axis=7, keepdims=True)
+    numerator = jnp.exp(masked - maximum)
+    denominator = jnp.sum(numerator, axis=7, keepdims=True)
+    weights = numerator / denominator
+    return jnp.einsum("abcdhgqk,abcdhkv->abcdhgqv", weights, v)
+
+
 def offset_softcap_gqa(q, k, v, *, scale: float, softcap: float):
     """The same computation with a different layout and predicate offset."""
     scores = jnp.einsum("qbhgd,kbhd->qkbhg", q, k) * jnp.float32(scale)
@@ -124,6 +158,12 @@ class Fixture:
 
 
 AXIS4_SHAPES = ((1, 2, 2, 17, 8), (1, 2, 17, 8), (1, 2, 17, 7))
+LONG_KEY_SHAPES = ((1, 2, 2, 17, 8), (1, 2, 257, 8), (1, 2, 257, 7))
+RANK9_SHAPES = (
+    (1, 1, 1, 1, 2, 2, 17, 8),
+    (1, 1, 1, 1, 2, 17, 8),
+    (1, 1, 1, 1, 2, 17, 7),
+)
 AXIS1_SHAPES = ((19, 2, 3, 2, 5), (23, 2, 3, 5), (23, 2, 3, 11))
 
 FIXTURES = (
@@ -146,6 +186,24 @@ FIXTURES = (
         AXIS1_SHAPES,
         "semantic scale/softcap mutation of the axis-1 fixture",
         alpha_rename=True,
+    ),
+    Fixture(
+        "jax-0.10.1-f32-causal-gqa-online-output-epilogue.mlir",
+        causal_gqa_with_output_epilogue,
+        AXIS4_SHAPES,
+        "causal GQA with a live tanh/multiply/add output epilogue",
+    ),
+    Fixture(
+        "jax-0.10.1-f32-causal-gqa-online-key257-fallback.mlir",
+        causal_gqa_long_key,
+        LONG_KEY_SHAPES,
+        "causal GQA with key extent 257 requiring generic fallback",
+    ),
+    Fixture(
+        "jax-0.10.1-f32-causal-gqa-online-rank9-fallback.mlir",
+        causal_gqa_rank9,
+        RANK9_SHAPES,
+        "causal GQA with a rank-nine weighted Contract domain requiring generic fallback",
     ),
     Fixture(
         "jax-0.10.1-f32-causal-gqa-public-score-near-miss.mlir",

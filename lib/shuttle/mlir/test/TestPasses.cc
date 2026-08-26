@@ -6847,6 +6847,784 @@ ret;
 
 void refreshExecutableBundle(ModuleOp module, bool refreshCodeDigest);
 
+FailureOr<FloatAttr> onlineTensorScalarConstant(Value value) {
+  auto map = value.getDefiningOp<MapOp>();
+  if (!map || map.getNumResults() != 1)
+    return failure();
+  auto yield = dyn_cast<YieldOp>(map.getBody().front().getTerminator());
+  if (!yield || yield.getValues().size() != 1)
+    return failure();
+  Value scalar = yield.getValues().front();
+  if (auto constant = scalar.getDefiningOp<arith::ConstantFloatOp>())
+    return cast<FloatAttr>(constant.getValue());
+  auto argument = dyn_cast<BlockArgument>(scalar);
+  if (!argument || argument.getOwner() != &map.getBody().front() ||
+      argument.getArgNumber() >= map.getInputs().size())
+    return failure();
+  return onlineTensorScalarConstant(map.getInputs()[argument.getArgNumber()]);
+}
+
+FailureOr<DictionaryAttr> expectedOnlineStateMachine(
+    ModuleOp module, MaterializationPlanOp plan, SchedulePlanOp schedule,
+    InvocationAbiOp abi, RegionOp region,
+    ArrayRef<MaterializationTaskOp> onlineTasks, Builder &builder) {
+  constexpr llvm::StringLiteral kind =
+      "online_normalized_exponential_weighted_contract";
+  if (region.getPolicy() != NumericalPolicy::Fast ||
+      plan.getPolicy() != NumericalPolicy::Fast ||
+      schedule.getPolicy() != NumericalPolicy::Fast || onlineTasks.empty())
+    return failure();
+  DictionaryAttr manifest = module->getAttrOfType<DictionaryAttr>(kManifest);
+  StringAttr manifestPolicy = manifest ? manifest.getAs<StringAttr>("policy")
+                                       : StringAttr{};
+  StringAttr policyDigest =
+      manifest ? manifest.getAs<StringAttr>("policy_digest") : StringAttr{};
+  ArrayAttr complete = manifest ? manifest.getAs<ArrayAttr>("complete")
+                                : ArrayAttr{};
+  if (!manifestPolicy || manifestPolicy.getValue() != "fast" ||
+      !policyDigest || policyDigest.getValue().size() != 64 || !complete ||
+      !llvm::equal(complete, region.getSourceRefs()))
+    return failure();
+  Attribute publicResultAnchors =
+      region->getAttr("shuttle.result_source_refs");
+  if (!publicResultAnchors)
+    return failure();
+  llvm::SmallDenseSet<Attribute> selectedSources;
+  int64_t scoreExecutions = 0;
+  for (MaterializationTaskOp task : onlineTasks) {
+    if (!task.getCompositionKind() || *task.getCompositionKind() != kind)
+      return failure();
+    auto sources = task.getCompositionSources();
+    if (!sources || sources->empty())
+      return failure();
+    for (Attribute source : *sources)
+      if (!selectedSources.insert(source).second)
+        return failure();
+  }
+  auto yield = dyn_cast<YieldOp>(region.getBody().front().getTerminator());
+  if (!yield || yield.getValues().size() != 1)
+    return failure();
+  FoldOp maximumFold;
+  FoldOp additiveFold;
+  ContractOp weightedContract;
+  SmallVector<RelationOp> relations;
+  SmallVector<Operation *> selected;
+  for (Operation &operation : region.getBody().front().without_terminator()) {
+    Attribute source = operation.getAttr("source");
+    if (!source || !selectedSources.contains(source))
+      continue;
+    selected.push_back(&operation);
+    if (auto fold = dyn_cast<FoldOp>(operation)) {
+      if (foldYieldIs(fold, arith::MaximumFOp::getOperationName()))
+        maximumFold = fold;
+      else if (foldYieldIs(fold, arith::AddFOp::getOperationName()))
+        additiveFold = fold;
+    } else if (auto relation = dyn_cast<RelationOp>(operation)) {
+      relations.push_back(relation);
+    }
+  }
+  for (Operation *operation : selected) {
+    auto contract = dyn_cast<ContractOp>(operation);
+    if (!contract || !valueDependsOn(yield.getValues().front(), contract))
+      continue;
+    const bool feedsSelectedContract = llvm::any_of(
+        selected, [&](Operation *candidate) {
+          auto consumer = dyn_cast<ContractOp>(candidate);
+          return consumer && consumer != contract &&
+                 llvm::any_of(consumer.getInputs(), [&](Value input) {
+                   return valueDependsOn(input, contract);
+                 });
+        });
+    if (feedsSelectedContract)
+      continue;
+    if (weightedContract)
+      return failure();
+    weightedContract = contract;
+  }
+  if (!maximumFold || !additiveFold || !weightedContract ||
+      relations.empty() || maximumFold.getReductionDimensions().size() != 1 ||
+      maximumFold.getReductionDimensions() !=
+          additiveFold.getReductionDimensions() ||
+      weightedContract.getInputs().size() != 2 ||
+      weightedContract.getIndexingMaps().size() != 3)
+    return failure();
+  if (maximumFold.getInitializers().size() != 1 ||
+      additiveFold.getInitializers().size() != 1)
+    return failure();
+  FailureOr<FloatAttr> maximumIdentity =
+      onlineTensorScalarConstant(maximumFold.getInitializers().front());
+  FailureOr<FloatAttr> additiveIdentity =
+      onlineTensorScalarConstant(additiveFold.getInitializers().front());
+  if (failed(maximumIdentity) || failed(additiveIdentity) ||
+      !maximumIdentity->getValue().isInfinity() ||
+      !maximumIdentity->getValue().isNegative() ||
+      !additiveIdentity->getValue().isZero())
+    return failure();
+
+  SmallVector<ContractOp> scoreContracts;
+  llvm::SmallDenseSet<Operation *> ancestors;
+  std::function<void(Value)> collectContracts = [&](Value value) {
+    Operation *definition = value.getDefiningOp();
+    if (!definition || !ancestors.insert(definition).second)
+      return;
+    if (auto contract = dyn_cast<ContractOp>(definition))
+      scoreContracts.push_back(contract);
+    for (Value operand : definition->getOperands())
+      collectContracts(operand);
+  };
+  collectContracts(maximumFold.getInputs().front());
+  if (scoreContracts.size() != 1)
+    return failure();
+  ContractOp scoreContract = scoreContracts.front();
+  SourceRefAttr scoreSource =
+      scoreContract->getAttrOfType<SourceRefAttr>("source");
+  SourceRefAttr weightedSource =
+      weightedContract->getAttrOfType<SourceRefAttr>("source");
+  if (!scoreSource || !weightedSource)
+    return failure();
+  for (MaterializationTaskOp task : onlineTasks) {
+    scoreExecutions += llvm::count(*task.getCompositionSources(), scoreSource);
+    if (auto recomputed = task->getAttrOfType<ArrayAttr>(
+            "composition_recomputed_sources"))
+      scoreExecutions += llvm::count(recomputed, scoreSource);
+  }
+  if (scoreExecutions != 1)
+    return failure();
+
+  Value scoreValue;
+  Value falseValue;
+  auto select = maximumFold.getInputs().front().getDefiningOp<RelationOp>();
+  if (!select || select.getSemantics() != RelationSemantics::Select ||
+      select.getInputs().size() != 3)
+    return failure();
+  for (auto [index, candidate] :
+       llvm::enumerate(select.getInputs().drop_front())) {
+    llvm::SmallDenseSet<Operation *> active;
+    if (!onlineValueDependsOnOperation(candidate, scoreContract, active))
+      falseValue = candidate;
+    else {
+      if (index != 0 || scoreValue)
+        return failure();
+      scoreValue = candidate;
+    }
+  }
+  FailureOr<FloatAttr> maskedIdentity =
+      falseValue ? onlineTensorScalarConstant(falseValue)
+                 : FailureOr<FloatAttr>(failure());
+  SourceRefAttr predicateSource =
+      select.getInputs().front().getDefiningOp()
+          ? select.getInputs().front()
+                .getDefiningOp()
+                ->getAttrOfType<SourceRefAttr>("source")
+          : SourceRefAttr{};
+  if (!scoreValue || failed(maskedIdentity) ||
+      !predicateSource ||
+      !maskedIdentity->getValue().isInfinity() ||
+      !maskedIdentity->getValue().isNegative())
+    return failure();
+  llvm::SmallDenseSet<Operation *> scoreActive;
+  FailureOr<Attribute> scoreSemantics =
+      onlineScoreSemantics(scoreValue, scoreContract, builder, scoreActive);
+  if (failed(scoreSemantics))
+    return failure();
+
+  std::optional<unsigned> normalizedOperand;
+  for (auto [operand, input] : llvm::enumerate(weightedContract.getInputs())) {
+    if (!valueDependsOn(input, additiveFold))
+      continue;
+    if (normalizedOperand)
+      return failure();
+    normalizedOperand = operand;
+  }
+  if (!normalizedOperand)
+    return failure();
+  auto normalizedMap = dyn_cast<AffineMapAttr>(
+      weightedContract.getIndexingMaps()[*normalizedOperand]);
+  auto valueMap = dyn_cast<AffineMapAttr>(
+      weightedContract.getIndexingMaps()[1 - *normalizedOperand]);
+  auto outputMap = dyn_cast<AffineMapAttr>(
+      weightedContract.getIndexingMaps()[2]);
+  auto valueType = dyn_cast<RankedTensorType>(
+      weightedContract.getInputs()[1 - *normalizedOperand].getType());
+  auto outputType = dyn_cast<RankedTensorType>(
+      weightedContract.getResult(0).getType());
+  if (!normalizedMap || !valueMap || !outputMap || !valueType || !outputType)
+    return failure();
+  llvm::SmallDenseSet<unsigned> normalizedDimensions;
+  llvm::SmallDenseSet<unsigned> valueDimensions;
+  for (AffineExpr expression : normalizedMap.getValue().getResults()) {
+    auto dimension = dyn_cast<AffineDimExpr>(expression);
+    if (!dimension)
+      return failure();
+    normalizedDimensions.insert(dimension.getPosition());
+  }
+  for (AffineExpr expression : valueMap.getValue().getResults()) {
+    auto dimension = dyn_cast<AffineDimExpr>(expression);
+    if (!dimension)
+      return failure();
+    valueDimensions.insert(dimension.getPosition());
+  }
+  SmallVector<int64_t> vectorDimensions;
+  SmallVector<int64_t> vectorExtents;
+  for (auto [axis, expression] :
+       llvm::enumerate(outputMap.getValue().getResults())) {
+    auto dimension = dyn_cast<AffineDimExpr>(expression);
+    if (!dimension)
+      return failure();
+    if (!normalizedDimensions.contains(dimension.getPosition()) &&
+        valueDimensions.contains(dimension.getPosition())) {
+      vectorDimensions.push_back(dimension.getPosition());
+      vectorExtents.push_back(outputType.getDimSize(axis));
+    }
+  }
+  if (vectorDimensions.empty() ||
+      llvm::any_of(vectorExtents, [](int64_t extent) { return extent <= 0; }))
+    return failure();
+  SmallVector<int64_t> scoreScopeDimensions;
+  for (AffineExpr expression : normalizedMap.getValue().getResults())
+    scoreScopeDimensions.push_back(
+        cast<AffineDimExpr>(expression).getPosition());
+  SmallVector<int64_t> stateReductionDimensions;
+  for (int64_t axis : maximumFold.getReductionDimensions()) {
+    if (axis < 0 || axis >= normalizedMap.getValue().getNumResults())
+      return failure();
+    stateReductionDimensions.push_back(
+        cast<AffineDimExpr>(normalizedMap.getValue().getResult(axis))
+            .getPosition());
+  }
+
+  auto valueArgument = dyn_cast<BlockArgument>(
+      weightedContract.getInputs()[1 - *normalizedOperand]);
+  if (!valueArgument ||
+      valueArgument.getOwner() != &region.getBody().front())
+    return failure();
+  FailureOr<AffineMap> outputCoordinates = mapCoordinatesToAncestor(
+      yield.getValues().front(), weightedContract.getResult(0));
+  llvm::SmallDenseSet<Operation *> epilogueActive;
+  FailureOr<OnlineFloatExpression> epilogue = onlineSourceFloatExpression(
+      yield.getValues().front(), weightedContract, epilogueActive);
+  if (failed(outputCoordinates) || failed(epilogue))
+    return failure();
+  SmallVector<Attribute> epilogueSources;
+  Value current = yield.getValues().front();
+  while (current != weightedContract.getResult(0)) {
+    auto map = current.getDefiningOp<MapOp>();
+    if (!map || map.getNumResults() != 1)
+      return failure();
+    SourceRefAttr source = map->getAttrOfType<SourceRefAttr>("source");
+    if (!source)
+      return failure();
+    epilogueSources.push_back(source);
+    Value next;
+    for (Value input : map.getInputs()) {
+      if (!valueDependsOn(input, weightedContract))
+        continue;
+      if (next)
+        return failure();
+      next = input;
+    }
+    if (!next)
+      return failure();
+    current = next;
+  }
+
+  SmallVector<Attribute> orderedSources;
+  SmallVector<Attribute> relationSources;
+  SmallVector<Attribute> relationGraph;
+  for (Operation &operation : region.getBody().front().without_terminator()) {
+    Attribute source = operation.getAttr("source");
+    if (source && selectedSources.contains(source))
+      orderedSources.push_back(source);
+    auto relation = dyn_cast<RelationOp>(operation);
+    if (relation && source && selectedSources.contains(source)) {
+      relationSources.push_back(source);
+      SmallVector<Attribute> inputs;
+      for (Value input : relation.getInputs()) {
+        if (auto argument = dyn_cast<BlockArgument>(input)) {
+          if (argument.getOwner() != &region.getBody().front())
+            return failure();
+          inputs.push_back(builder.getDictionaryAttr({builder.getNamedAttr(
+              "region_input", builder.getI64IntegerAttr(
+                                  argument.getArgNumber()))}));
+          continue;
+        }
+        Operation *producer = input.getDefiningOp();
+        SourceRefAttr producerSource =
+            producer ? producer->getAttrOfType<SourceRefAttr>("source")
+                     : SourceRefAttr{};
+        auto result = dyn_cast<OpResult>(input);
+        if (!producerSource || !result)
+          return failure();
+        inputs.push_back(builder.getDictionaryAttr({
+            builder.getNamedAttr("source", producerSource),
+            builder.getNamedAttr(
+                "result", builder.getI64IntegerAttr(result.getResultNumber())),
+        }));
+      }
+      SmallVector<Attribute> resultTypes;
+      for (Type type : relation.getResultTypes())
+        resultTypes.push_back(TypeAttr::get(type));
+      relationGraph.push_back(builder.getDictionaryAttr({
+          builder.getNamedAttr("source", source),
+          builder.getNamedAttr("semantics", relation.getSemanticsAttr()),
+          builder.getNamedAttr("parameters", relation.getParameters()),
+          builder.getNamedAttr("inputs", builder.getArrayAttr(inputs)),
+          builder.getNamedAttr("result_types",
+                               builder.getArrayAttr(resultTypes)),
+      }));
+    }
+  }
+  Type f32 = builder.getF32Type();
+  Type vectorType = RankedTensorType::get(vectorExtents, f32);
+  auto operands = [&](std::initializer_list<StringRef> names) {
+    SmallVector<Attribute> values;
+    for (StringRef name : names)
+      values.push_back(builder.getStringAttr(name));
+    return builder.getArrayAttr(values);
+  };
+  auto instruction = [&](StringRef result, StringRef opcode,
+                         std::initializer_list<StringRef> inputs,
+                         Type resultType) {
+    return builder.getDictionaryAttr({
+        builder.getNamedAttr("result", builder.getStringAttr(result)),
+        builder.getNamedAttr("opcode", builder.getStringAttr(opcode)),
+        builder.getNamedAttr("operands", operands(inputs)),
+        builder.getNamedAttr("result_type", TypeAttr::get(resultType)),
+    });
+  };
+  auto state = builder.getDictionaryAttr({
+      builder.getNamedAttr("m_type", TypeAttr::get(builder.getF32Type())),
+      builder.getNamedAttr("m_identity",
+                           *maximumIdentity),
+      builder.getNamedAttr("l_type", TypeAttr::get(builder.getF32Type())),
+      builder.getNamedAttr("l_identity", *additiveIdentity),
+      builder.getNamedAttr("o_element_type",
+                           TypeAttr::get(builder.getF32Type())),
+      builder.getNamedAttr("o_vector_extents",
+                           builder.getDenseI64ArrayAttr(vectorExtents)),
+      builder.getNamedAttr("o_identity", builder.getF32FloatAttr(0.0)),
+  });
+  auto leaf = builder.getArrayAttr({
+      instruction("leaf_m", "select", {"predicate", "score", "neg_inf"},
+                  f32),
+      instruction("leaf_l", "select", {"predicate", "one", "zero"}, f32),
+      instruction("leaf_o", "select", {"predicate", "value", "zero_vector"},
+                  vectorType),
+  });
+  auto merge = builder.getArrayAttr({
+      instruction("left_empty", "equal", {"left_l", "zero"},
+                  builder.getI1Type()),
+      instruction("right_empty", "equal", {"right_l", "zero"},
+                  builder.getI1Type()),
+      instruction("merged_m_nonempty", "maximum", {"left_m", "right_m"},
+                  f32),
+      instruction("left_delta", "subtract", {"left_m", "merged_m_nonempty"},
+                  f32),
+      instruction("right_delta", "subtract",
+                  {"right_m", "merged_m_nonempty"}, f32),
+      instruction("left_scale", "exp", {"left_delta"}, f32),
+      instruction("right_scale", "exp", {"right_delta"}, f32),
+      instruction("scaled_left_l", "multiply", {"left_scale", "left_l"},
+                  f32),
+      instruction("scaled_right_l", "multiply", {"right_scale", "right_l"},
+                  f32),
+      instruction("merged_l_nonempty", "add",
+                  {"scaled_left_l", "scaled_right_l"}, f32),
+      instruction("scaled_left_o", "multiply",
+                  {"left_scale", "left_o"}, vectorType),
+      instruction("scaled_right_o", "multiply",
+                  {"right_scale", "right_o"}, vectorType),
+      instruction("merged_o_nonempty", "add",
+                  {"scaled_left_o", "scaled_right_o"}, vectorType),
+      instruction("merged_m_right_guard", "select",
+                  {"right_empty", "left_m", "merged_m_nonempty"}, f32),
+      instruction("merged_l_right_guard", "select",
+                  {"right_empty", "left_l", "merged_l_nonempty"}, f32),
+      instruction("merged_o_right_guard", "select",
+                  {"right_empty", "left_o", "merged_o_nonempty"}, vectorType),
+      instruction("merged_m", "select",
+                  {"left_empty", "right_m", "merged_m_right_guard"}, f32),
+      instruction("merged_l", "select",
+                  {"left_empty", "right_l", "merged_l_right_guard"}, f32),
+      instruction("merged_o", "select",
+                  {"left_empty", "right_o", "merged_o_right_guard"},
+                  vectorType),
+  });
+  auto finalize = builder.getArrayAttr({instruction(
+      "normalized_o", "divide", {"merged_o", "merged_l"}, vectorType)});
+  auto transition = builder.getDictionaryAttr({
+      builder.getNamedAttr("leaf", leaf),
+      builder.getNamedAttr(
+          "update",
+          builder.getDictionaryAttr({
+              builder.getNamedAttr("opcode", builder.getStringAttr("merge")),
+              builder.getNamedAttr("operands",
+                                   operands({"accumulator", "leaf"})),
+          })),
+      builder.getNamedAttr("merge", merge),
+      builder.getNamedAttr("finalize", finalize),
+  });
+  auto execution = builder.getDictionaryAttr({
+      builder.getNamedAttr("score_scope_dimensions",
+                           builder.getDenseI64ArrayAttr(scoreScopeDimensions)),
+      builder.getNamedAttr("vector_scope_dimensions",
+                           builder.getDenseI64ArrayAttr(vectorDimensions)),
+      builder.getNamedAttr("reduction_dimensions",
+                           builder.getDenseI64ArrayAttr(
+                               stateReductionDimensions)),
+      builder.getNamedAttr("score_result", builder.getStringAttr("score")),
+      builder.getNamedAttr("vector_body_score_operand",
+                           builder.getStringAttr("score")),
+      builder.getNamedAttr("score_outside_vector_scope",
+                           builder.getBoolAttr(true)),
+  });
+  return builder.getDictionaryAttr({
+      builder.getNamedAttr("schema_version", builder.getI64IntegerAttr(1)),
+      builder.getNamedAttr(
+          "protocol",
+          builder.getStringAttr(
+              "online_normalized_exponential_weighted_contract_v1")),
+      builder.getNamedAttr("policy", builder.getStringAttr("fast")),
+      builder.getNamedAttr("source_refs", region.getSourceRefsAttr()),
+      builder.getNamedAttr("selected_algebra_sources",
+                           builder.getArrayAttr(orderedSources)),
+      builder.getNamedAttr("public_result_anchors",
+                           publicResultAnchors),
+      builder.getNamedAttr("coverage_policy_digest", policyDigest),
+      builder.getNamedAttr("score_source", scoreSource),
+      builder.getNamedAttr("representative_score_type",
+                           TypeAttr::get(scoreContract.getResult(0).getType())),
+      builder.getNamedAttr("score_semantics", *scoreSemantics),
+      builder.getNamedAttr("score_evaluations_per_leaf",
+                           builder.getI64IntegerAttr(1)),
+      builder.getNamedAttr("score_invariant_dimensions",
+                           builder.getDenseI64ArrayAttr(vectorDimensions)),
+      builder.getNamedAttr("execution", execution),
+      builder.getNamedAttr("relation_sources",
+                           builder.getArrayAttr(relationSources)),
+      builder.getNamedAttr("relation_graph",
+                           builder.getArrayAttr(relationGraph)),
+      builder.getNamedAttr(
+          "leaf_predicate_source", predicateSource),
+      builder.getNamedAttr("masked_score_identity", *maskedIdentity),
+      builder.getNamedAttr("weighted_contract_source", weightedSource),
+      builder.getNamedAttr("normalized_operand",
+                           builder.getI64IntegerAttr(*normalizedOperand)),
+      builder.getNamedAttr("reduction_dimensions",
+                           builder.getDenseI64ArrayAttr(
+                               maximumFold.getReductionDimensions())),
+      builder.getNamedAttr("vector_dimensions",
+                           builder.getDenseI64ArrayAttr(vectorDimensions)),
+      builder.getNamedAttr("vector_extents",
+                           builder.getDenseI64ArrayAttr(vectorExtents)),
+      builder.getNamedAttr("value_input_index",
+                           builder.getI64IntegerAttr(
+                               valueArgument.getArgNumber())),
+      builder.getNamedAttr("value_indexing_map", valueMap),
+      builder.getNamedAttr("weighted_output_indexing_map", outputMap),
+      builder.getNamedAttr("public_output_type",
+                           TypeAttr::get(yield.getValues().front().getType())),
+      builder.getNamedAttr("public_output_to_weighted_coordinates",
+                           AffineMapAttr::get(*outputCoordinates)),
+      builder.getNamedAttr("state", state),
+      builder.getNamedAttr("transition", transition),
+      builder.getNamedAttr("epilogue_expression",
+                           builder.getStringAttr(
+                               onlineFloatExpressionText(*epilogue))),
+      builder.getNamedAttr("epilogue_sources",
+                           builder.getArrayAttr(epilogueSources)),
+      builder.getNamedAttr("source_schedule_fingerprint",
+                           builder.getStringAttr(schedule.getFingerprint())),
+      builder.getNamedAttr("public_abi_fingerprint",
+                           builder.getStringAttr(abi.getFingerprint())),
+  });
+}
+
+class VerifyOnlineStateMachinePass
+    : public MutationPass<VerifyOnlineStateMachinePass> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(VerifyOnlineStateMachinePass)
+  StringRef getArgument() const final {
+    return "shuttle-test-verify-online-state-machine";
+  }
+  StringRef getDescription() const final {
+    return "Verify typed source-bound online state-machine semantics";
+  }
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+    MaterializationPlanOp plan;
+    SmallVector<MaterializationTaskOp> onlineTasks;
+    for (MaterializationPlanOp candidate :
+         module.getOps<MaterializationPlanOp>()) {
+      SmallVector<MaterializationTaskOp> candidateTasks;
+      for (MaterializationTaskOp task :
+           candidate.getBody().front().getOps<MaterializationTaskOp>())
+        if (task.getCompositionKind() &&
+            *task.getCompositionKind() ==
+                "online_normalized_exponential_weighted_contract")
+          candidateTasks.push_back(task);
+      if (!candidateTasks.empty()) {
+        if (plan) {
+          module.emitError("online state machine has ambiguous source plans");
+          return signalPassFailure();
+        }
+        plan = candidate;
+        onlineTasks = std::move(candidateTasks);
+      }
+    }
+    SchedulePlanOp schedule;
+    for (SchedulePlanOp candidate : module.getOps<SchedulePlanOp>())
+      if (plan && candidate.getSourcePlanFingerprint() == plan.getFingerprint())
+        schedule = candidate;
+    InvocationAbiOp abi;
+    for (InvocationAbiOp candidate : module.getOps<InvocationAbiOp>())
+      if (plan && schedule &&
+          candidate.getSourcePlanFingerprint() == plan.getFingerprint() &&
+          candidate.getSourceScheduleFingerprint() == schedule.getFingerprint())
+        abi = candidate;
+    DeviceModuleOp device;
+    for (DeviceModuleOp candidate : module.getOps<DeviceModuleOp>())
+      if (schedule && candidate.getSourceScheduleFingerprint() ==
+                          schedule.getFingerprint())
+        device = candidate;
+    if (!plan || !schedule || !abi || !device ||
+        (device.getCodeFormat() != ExecutableCodeFormat::CudaPtxSm90V1 &&
+         device.getCodeFormat() != ExecutableCodeFormat::CudaPtxSm100V1)) {
+      module.emitError(
+          "requires one closed FAST state-machine executable bundle");
+      return signalPassFailure();
+    }
+    llvm::SmallDenseSet<Attribute> sources;
+    for (MaterializationTaskOp task : onlineTasks) {
+      ArrayAttr taskSources = *task.getCompositionSources();
+      for (Attribute source : taskSources)
+        sources.insert(source);
+    }
+    RegionOp region;
+    module.walk([&](RegionOp candidate) {
+      llvm::SmallDenseSet<Attribute> candidateSources;
+      for (Operation &operation :
+           candidate.getBody().front().without_terminator())
+        if (Attribute source = operation.getAttr("source"))
+          candidateSources.insert(source);
+      if (llvm::all_of(sources, [&](Attribute source) {
+            return candidateSources.contains(source);
+          }))
+        region = candidate;
+    });
+    Builder builder(module.getContext());
+    FailureOr<DictionaryAttr> expected =
+        region ? expectedOnlineStateMachine(module, plan, schedule, abi, region,
+                                            onlineTasks, builder)
+               : FailureOr<DictionaryAttr>(failure());
+    if (failed(expected)) {
+      module.emitError(
+          "online state machine is not derivable from source SSA and affine maps");
+      return signalPassFailure();
+    }
+    TypeAttr representativeScore =
+        expected->getAs<TypeAttr>("representative_score_type");
+    if (!representativeScore)
+      return signalPassFailure();
+    for (MaterializationBufferOp buffer :
+         plan.getBody().front().getOps<MaterializationBufferOp>()) {
+      if (buffer.getStorage() == MaterializationStorage::Temporary &&
+          buffer.getTensorType() == representativeScore.getValue()) {
+        buffer.emitError("online state machine materializes representative score");
+        return signalPassFailure();
+      }
+    }
+    llvm::SmallDenseMap<int64_t, int64_t> scheduleSources;
+    for (ScheduleTaskOp task :
+         schedule.getBody().front().getOps<ScheduleTaskOp>())
+      scheduleSources.try_emplace(task.getOrdinal(), task.getSourceTask());
+    llvm::SmallDenseSet<int64_t> onlineOrdinals;
+    for (MaterializationTaskOp task : onlineTasks)
+      onlineOrdinals.insert(task.getOrdinal());
+    bool sawOnlineEntry = false;
+    for (DeviceEntryOp entry :
+         device.getBody().front().getOps<DeviceEntryOp>()) {
+      auto source = scheduleSources.find(entry.getSourceTask());
+      if (source == scheduleSources.end() ||
+          !onlineOrdinals.contains(source->second))
+        continue;
+      sawOnlineEntry = true;
+      auto certificate =
+          entry->getAttrOfType<DictionaryAttr>("online_state_machine");
+      if (!certificate || certificate != *expected ||
+          !entry.getOnlineStateProtocol() ||
+          *entry.getOnlineStateProtocol() !=
+              "online_normalized_exponential_weighted_contract_v1" ||
+          entry.getCodeLength() <= 0 || entry.getKernelArity().value_or(0) <= 0) {
+        entry.emitError(
+            "online device entry lacks the exact typed source state machine");
+        return signalPassFailure();
+      }
+    }
+    if (!sawOnlineEntry) {
+      module.emitError(
+          "online device entry lacks the exact typed source state machine");
+      return signalPassFailure();
+    }
+    llvm::outs() << "online_state_machine = source_bound; state = {m,l,o[Dv]}; "
+                    "score = once; mask_identity = safe; epilogue = exact; "
+                    "public_abi = exact; ptx_semantics = hardware_deferred\n";
+  }
+};
+
+Attribute mutateOnlineStateMachineField(Attribute attribute, StringRef key,
+                                        Attribute replacement, bool &changed,
+                                        Builder &builder) {
+  auto dictionary = dyn_cast<DictionaryAttr>(attribute);
+  if (!dictionary)
+    return attribute;
+  SmallVector<NamedAttribute> fields;
+  for (NamedAttribute field : dictionary) {
+    Attribute value = field.getValue();
+    if (!changed && field.getName().strref() == key) {
+      value = replacement;
+      changed = true;
+    } else {
+      value = mutateOnlineStateMachineField(value, key, replacement, changed,
+                                            builder);
+    }
+    fields.push_back(builder.getNamedAttr(field.getName(), value));
+  }
+  return builder.getDictionaryAttr(fields);
+}
+
+Attribute mutateOnlineStateMachineInstruction(Attribute attribute,
+                                              StringRef result,
+                                              StringRef field,
+                                              Attribute replacement,
+                                              bool &changed,
+                                              Builder &builder) {
+  if (auto dictionary = dyn_cast<DictionaryAttr>(attribute)) {
+    auto instructionResult = dictionary.getAs<StringAttr>("result");
+    SmallVector<NamedAttribute> fields;
+    for (NamedAttribute named : dictionary) {
+      Attribute value = named.getValue();
+      if (!changed && instructionResult &&
+          instructionResult.getValue() == result &&
+          named.getName().strref() == field) {
+        value = replacement;
+        changed = true;
+      } else {
+        value = mutateOnlineStateMachineInstruction(
+            value, result, field, replacement, changed, builder);
+      }
+      fields.push_back(builder.getNamedAttr(named.getName(), value));
+    }
+    return builder.getDictionaryAttr(fields);
+  }
+  if (auto array = dyn_cast<ArrayAttr>(attribute)) {
+    SmallVector<Attribute> elements;
+    for (Attribute element : array)
+      elements.push_back(mutateOnlineStateMachineInstruction(
+          element, result, field, replacement, changed, builder));
+    return builder.getArrayAttr(elements);
+  }
+  return attribute;
+}
+
+class CorruptOnlineStateMachinePass
+    : public MutationPass<CorruptOnlineStateMachinePass> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(CorruptOnlineStateMachinePass)
+  CorruptOnlineStateMachinePass() = default;
+  CorruptOnlineStateMachinePass(const CorruptOnlineStateMachinePass &other)
+      : MutationPass<CorruptOnlineStateMachinePass>(other) {}
+  StringRef getArgument() const final {
+    return "shuttle-test-corrupt-online-state-machine";
+  }
+  Option<std::string> mutation{
+      *this, "kind", llvm::cl::desc("State-machine semantic edge to corrupt"),
+      llvm::cl::init("score-once")};
+
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+    Builder builder(module.getContext());
+    bool found = false;
+    bool changed = false;
+    module.walk([&](DeviceEntryOp entry) {
+      DictionaryAttr certificate =
+          entry->getAttrOfType<DictionaryAttr>("online_state_machine");
+      if (!certificate)
+        return;
+      found = true;
+      bool entryChanged = false;
+      Attribute mutated = certificate;
+      if (mutation == "score-source") {
+        Attribute replacement = certificate.get("weighted_contract_source");
+        mutated = mutateOnlineStateMachineField(
+            mutated, "score_source", replacement, entryChanged, builder);
+      } else if (mutation == "score-once") {
+        mutated = mutateOnlineStateMachineField(
+            mutated, "score_evaluations_per_leaf",
+            builder.getI64IntegerAttr(2), entryChanged, builder);
+      } else if (mutation == "relation-source") {
+        mutated = mutateOnlineStateMachineField(
+            mutated, "relation_sources", builder.getArrayAttr({}),
+            entryChanged, builder);
+      } else if (mutation == "vector-axis") {
+        mutated = mutateOnlineStateMachineField(
+            mutated, "vector_dimensions", builder.getDenseI64ArrayAttr({0}),
+            entryChanged, builder);
+      } else if (mutation == "leaf-identity") {
+        mutated = mutateOnlineStateMachineInstruction(
+            mutated, "leaf_l", "operands",
+            builder.getArrayAttr({builder.getStringAttr("predicate"),
+                                  builder.getStringAttr("one"),
+                                  builder.getStringAttr("one")}),
+            entryChanged, builder);
+      } else if (mutation == "merge") {
+        mutated = mutateOnlineStateMachineInstruction(
+            mutated, "merged_o_nonempty", "opcode",
+            builder.getStringAttr("subtract"), entryChanged, builder);
+      } else if (mutation == "finalize") {
+        mutated = mutateOnlineStateMachineInstruction(
+            mutated, "normalized_o", "opcode",
+            builder.getStringAttr("multiply"), entryChanged, builder);
+      } else if (mutation == "value-map") {
+        mutated = mutateOnlineStateMachineField(
+            mutated, "value_indexing_map",
+            AffineMapAttr::get(AffineMap::get(0, 0, module.getContext())),
+            entryChanged, builder);
+      } else if (mutation == "public-map") {
+        mutated = mutateOnlineStateMachineField(
+            mutated, "public_output_to_weighted_coordinates",
+            AffineMapAttr::get(AffineMap::get(0, 0, module.getContext())),
+            entryChanged, builder);
+      } else if (mutation == "epilogue") {
+        mutated = mutateOnlineStateMachineField(
+            mutated, "epilogue_expression", builder.getStringAttr("raw_value"),
+            entryChanged, builder);
+      } else if (mutation == "abi") {
+        mutated = mutateOnlineStateMachineField(
+            mutated, "public_abi_fingerprint",
+            builder.getStringAttr(std::string(64, '0')), entryChanged, builder);
+      } else if (mutation == "source-closure") {
+        mutated = mutateOnlineStateMachineField(
+            mutated, "source_refs", builder.getArrayAttr({}), entryChanged,
+            builder);
+      } else {
+        module.emitError("unknown online state-machine corruption kind");
+        return signalPassFailure();
+      }
+      if (!entryChanged) {
+        entry.emitError("online state-machine corruption target is absent");
+        return signalPassFailure();
+      }
+      entry->setAttr("online_state_machine", mutated);
+      changed = true;
+    });
+    if (!found || !changed) {
+      module.emitError("requires an online state-machine certificate");
+      return signalPassFailure();
+    }
+  }
+};
+
 class VerifyOnlineGpuExecutionPass
     : public MutationPass<VerifyOnlineGpuExecutionPass> {
 public:
@@ -9237,6 +10015,8 @@ void registerMutationPasses() {
   PassRegistration<RewireOnlineMaximumYieldPass>();
   PassRegistration<VerifyOnlineSufficientStatePass>();
   PassRegistration<VerifyOnlinePtxOraclePass>();
+  PassRegistration<VerifyOnlineStateMachinePass>();
+  PassRegistration<CorruptOnlineStateMachinePass>();
   PassRegistration<VerifyOnlineGpuExecutionPass>();
   PassRegistration<VerifyOnlineFallbackPass>();
   PassRegistration<CorruptOnlineGpuSemanticsPass>();
