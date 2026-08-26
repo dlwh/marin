@@ -21,8 +21,8 @@ PINNED_XLA_REVISION = "9b635916ecc6df6efee62d8e4b0c7ef87ef84d69"
 
 def causal_score_relation(scores):
     """Return a causal row maximum and a live i1-to-f32 relation projection."""
-    query_position = jnp.arange(17, dtype=jnp.int32).reshape(1, 1, 17, 1)
-    key_position = jnp.arange(17, dtype=jnp.int32).reshape(1, 1, 1, 17)
+    query_position = jnp.arange(17, dtype=jnp.int32).reshape(1, 1, 1, 17, 1)
+    key_position = jnp.arange(17, dtype=jnp.int32).reshape(1, 1, 1, 1, 17)
     valid = key_position <= query_position
     valid_f32 = valid.astype(jnp.float32)
     predicate = jnp.broadcast_to(valid, scores.shape)
@@ -32,13 +32,13 @@ def causal_score_relation(scores):
         scaled_scores,
         jnp.full(scores.shape, -jnp.inf, dtype=jnp.float32),
     )
-    return jnp.max(masked_scores, axis=3), jnp.sum(valid_f32, axis=3)
+    return jnp.max(masked_scores, axis=4), jnp.sum(valid_f32, axis=4)
 
 
 def offset_causal_score_relation(scores, *, scale: float, softcap: float):
     """Return the same relation semantics in a different axis arrangement."""
-    query_position = jnp.arange(19, dtype=jnp.int32).reshape(19, 1, 1, 1)
-    key_position = jnp.arange(23, dtype=jnp.int32).reshape(1, 23, 1, 1)
+    query_position = jnp.arange(19, dtype=jnp.int32).reshape(19, 1, 1, 1, 1)
+    key_position = jnp.arange(23, dtype=jnp.int32).reshape(1, 23, 1, 1, 1)
     valid = key_position <= query_position + jnp.int32(4)
     valid_f32 = valid.astype(jnp.float32)
     predicate = jnp.broadcast_to(valid, scores.shape)
@@ -71,22 +71,22 @@ class Fixture:
 
 FIXTURES = (
     Fixture(
-        "jax-0.10.1-f32-causal-relation-max-axis3.mlir",
+        "jax-0.10.1-f32-causal-relation-max-axis4.mlir",
         causal_score_relation,
-        (1, 4, 17, 17),
-        "causal mask over [batch, query_head, query, key], max/sum on axis 3",
+        (1, 2, 2, 17, 17),
+        "causal mask over [batch, kv_head, group, query, key], max/sum on axis 4",
     ),
     Fixture(
         "jax-0.10.1-f32-offset-causal-softcap-max-axis1.mlir",
         offset_causal_score_relation_primary,
-        (19, 23, 2, 6),
-        "offset causal mask over [query, key, batch, query_head], softcap 12, max/sum on axis 1",
+        (19, 23, 2, 3, 2),
+        "offset causal mask over [query, key, batch, kv_head, group], softcap 12, max/sum on axis 1",
         alpha_rename=True,
     ),
     Fixture(
         "jax-0.10.1-f32-offset-causal-softcap-max-axis1-mutation.mlir",
         offset_causal_score_relation_mutation,
-        (19, 23, 2, 6),
+        (19, 23, 2, 3, 2),
         "semantic mutation of the axis-1 fixture: scale 0.25 and softcap 7",
         alpha_rename=True,
     ),

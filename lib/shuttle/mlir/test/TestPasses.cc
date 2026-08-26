@@ -2418,15 +2418,19 @@ public:
       }
 
       Operation *operation = value.getDefiningOp();
-      if (!operation || !seenOperations.insert(operation).second) {
+      if (!operation) {
         return;
       }
-      collectOperationSources(operation);
       if (auto region = dyn_cast<RegionOp>(operation)) {
         auto result = cast<OpResult>(value);
         auto yield = cast<YieldOp>(region.getBody().front().getTerminator());
         collectValue(yield.getValues()[result.getResultNumber()]);
+        return;
       }
+      if (!seenOperations.insert(operation).second) {
+        return;
+      }
+      collectOperationSources(operation);
       if (auto fold = dyn_cast<FoldOp>(operation)) {
         fold.getCombiner().walk(
             [&](Operation *nested) { collectOperationSources(nested); });
@@ -2438,6 +2442,9 @@ public:
 
     bool hasOutput = false;
     for (func::FuncOp function : module.getOps<func::FuncOp>()) {
+      if (!function.isPublic()) {
+        continue;
+      }
       for (Block &block : function.getBody()) {
         auto returnOp = dyn_cast<func::ReturnOp>(block.getTerminator());
         if (!returnOp) {
