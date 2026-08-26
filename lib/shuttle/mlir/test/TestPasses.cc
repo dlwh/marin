@@ -4,8 +4,11 @@
 #include "TestPasses.h"
 
 #include <functional>
+#include <map>
+#include <set>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -1989,6 +1992,417 @@ public:
   }
 };
 
+struct OnlinePtxStore {
+  std::string pointer;
+  std::string value;
+};
+
+struct OnlinePtxDataflow {
+  struct Definition {
+    std::string opcode;
+    std::vector<std::string> operands;
+  };
+  std::map<std::string, Definition> definitions;
+  std::vector<OnlinePtxStore> globalStores;
+  std::vector<std::string> sharedStores;
+};
+
+std::vector<std::string> onlinePtxTokens(StringRef text) {
+  std::vector<std::string> tokens;
+  for (size_t index = 0; index < text.size();) {
+    const bool registerToken = text[index] == '%';
+    const bool parameterToken = text[index] == 'p' && index + 1 < text.size() &&
+                                llvm::isDigit(text[index + 1]);
+    const bool constantToken = text[index] == '0' && index + 2 < text.size() &&
+                               text[index + 1] == 'f' &&
+                               llvm::isHexDigit(text[index + 2]);
+    if (!registerToken && !parameterToken && !constantToken) {
+      ++index;
+      continue;
+    }
+    size_t end = index + (constantToken ? 2 : 1);
+    while (end < text.size() &&
+           (llvm::isAlnum(text[end]) || text[end] == '_'))
+      ++end;
+    tokens.push_back(text.slice(index, end).str());
+    index = end;
+  }
+  return tokens;
+}
+
+OnlinePtxDataflow onlinePtxDataflow(StringRef ptx) {
+  OnlinePtxDataflow result;
+  std::map<std::string, std::string> current;
+  std::map<std::string, int64_t> generations;
+  std::vector<std::string> sharedValues;
+  auto reaching = [&](const std::string &token) {
+    if (token.empty() || token.front() != '%')
+      return token;
+    auto found = current.find(token);
+    return found == current.end() ? token : found->second;
+  };
+  while (!ptx.empty()) {
+    auto [line, remainder] = ptx.split('\n');
+    ptx = remainder;
+    line = line.trim();
+    if (line.empty() || line.starts_with("//") || line.ends_with(":"))
+      continue;
+    size_t opcodeStart = line.find_first_not_of(" @%p0123456789");
+    if (opcodeStart == StringRef::npos)
+      continue;
+    auto [opcode, operands] = line.drop_front(opcodeStart).split(' ');
+    std::vector<std::string> tokens = onlinePtxTokens(operands);
+    if (opcode.starts_with("st.global.")) {
+      if (tokens.size() >= 2)
+        result.globalStores.push_back({reaching(tokens[0]), reaching(tokens[1])});
+      continue;
+    }
+    if (opcode.starts_with("st.shared.")) {
+      if (tokens.size() >= 2) {
+        sharedValues.push_back(reaching(tokens[1]));
+        result.sharedStores.push_back(reaching(tokens[1]));
+      }
+      continue;
+    }
+    if (tokens.empty() || tokens.front().front() != '%')
+      continue;
+    std::vector<std::string> dependencies;
+    for (const std::string &token : llvm::drop_begin(tokens))
+      dependencies.push_back(reaching(token));
+    if (opcode.starts_with("ld.global."))
+      dependencies.push_back((Twine("$op:") + opcode).str());
+    if (opcode.starts_with("ld.shared.")) {
+      dependencies.push_back("$shared");
+      llvm::append_range(dependencies, sharedValues);
+    }
+    std::string destination =
+        (Twine(tokens.front()) + "@" + Twine(generations[tokens.front()]++))
+            .str();
+    result.definitions.try_emplace(
+        destination,
+        OnlinePtxDataflow::Definition{opcode.str(), std::move(dependencies)});
+    current[tokens.front()] = destination;
+  }
+  return result;
+}
+
+std::set<std::string> onlinePtxClosure(const OnlinePtxDataflow &flow,
+                                       StringRef root) {
+  std::set<std::string> closure;
+  std::vector<std::string> worklist{root.str()};
+  while (!worklist.empty()) {
+    std::string value = std::move(worklist.back());
+    worklist.pop_back();
+    if (!closure.insert(value).second)
+      continue;
+    auto found = flow.definitions.find(value);
+    if (found == flow.definitions.end())
+      continue;
+    closure.insert((Twine("$op:") + found->second.opcode).str());
+    worklist.insert(worklist.end(), found->second.operands.begin(),
+                    found->second.operands.end());
+  }
+  return closure;
+}
+
+bool closureHasOpcode(const std::set<std::string> &closure,
+                      ArrayRef<StringRef> prefixes) {
+  return llvm::any_of(closure, [&](const std::string &value) {
+    StringRef operation = value;
+    if (!operation.consume_front("$op:"))
+      return false;
+    return llvm::any_of(prefixes, [&](StringRef prefix) {
+      return operation.starts_with(prefix);
+    });
+  });
+}
+
+void refreshExecutableBundle(ModuleOp module, bool refreshCodeDigest);
+
+class VerifyOnlineGpuExecutionPass
+    : public MutationPass<VerifyOnlineGpuExecutionPass> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(VerifyOnlineGpuExecutionPass)
+  StringRef getArgument() const final {
+    return "shuttle-test-verify-online-gpu-execution";
+  }
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+    constexpr llvm::StringLiteral kind =
+        "online_normalized_exponential_weighted_contract";
+
+    MaterializationPlanOp plan;
+    llvm::SmallDenseSet<int64_t> onlineTasks;
+    llvm::SmallDenseMap<int64_t, MaterializationTaskOp> materializationTasks;
+    llvm::SmallDenseSet<Attribute> certifiedSources;
+    for (MaterializationPlanOp candidate :
+         module.getOps<MaterializationPlanOp>()) {
+      if (candidate.getPolicy() != NumericalPolicy::Fast)
+        continue;
+      for (MaterializationTaskOp task :
+           candidate.getBody().front().getOps<MaterializationTaskOp>()) {
+        if (!task.getCompositionKind() || *task.getCompositionKind() != kind)
+          continue;
+        plan = candidate;
+        onlineTasks.insert(task.getOrdinal());
+        materializationTasks.try_emplace(task.getOrdinal(), task);
+        std::optional<ArrayAttr> sources = task.getCompositionSources();
+        for (Attribute source : *sources)
+          certifiedSources.insert(source);
+        if (auto recomputed = task->getAttrOfType<ArrayAttr>(
+                "composition_recomputed_sources"))
+          certifiedSources.insert(recomputed.begin(), recomputed.end());
+      }
+    }
+    if (!plan || onlineTasks.empty()) {
+      module.emitError("requires one FAST online execution certificate");
+      return signalPassFailure();
+    }
+
+    RegionOp region;
+    Type representativeScoreType;
+    llvm::SmallDenseSet<Attribute> relationSources;
+    module.walk([&](RegionOp candidate) {
+      for (Operation &operation :
+           candidate.getBody().front().without_terminator()) {
+        Attribute source = operation.getAttr("source");
+        if (!source || !certifiedSources.contains(source))
+          continue;
+        if (auto fold = dyn_cast<FoldOp>(operation);
+            fold && foldYieldIs(fold, arith::MaximumFOp::getOperationName())) {
+          region = candidate;
+          representativeScoreType = fold.getInputs().front().getType();
+        }
+        if (isa<RelationOp>(operation))
+          relationSources.insert(source);
+      }
+    });
+    if (!region || !representativeScoreType || relationSources.empty() ||
+        llvm::any_of(relationSources, [&](Attribute source) {
+          return !certifiedSources.contains(source);
+        })) {
+      module.emitError("online GPU certificate does not apply its Relation");
+      return signalPassFailure();
+    }
+    for (MaterializationBufferOp buffer :
+         plan.getBody().front().getOps<MaterializationBufferOp>()) {
+      if (buffer.getStorage() == MaterializationStorage::Temporary &&
+          buffer.getTensorType() == representativeScoreType) {
+        module.emitError("online GPU execution materializes representative scores");
+        return signalPassFailure();
+      }
+    }
+
+    SchedulePlanOp schedule;
+    for (SchedulePlanOp candidate : module.getOps<SchedulePlanOp>())
+      if (candidate.getSourcePlanFingerprint() == plan.getFingerprint())
+        schedule = candidate;
+    DeviceModuleOp device;
+    for (DeviceModuleOp candidate : module.getOps<DeviceModuleOp>())
+      if (schedule && candidate.getSourceScheduleFingerprint() ==
+                          schedule.getFingerprint())
+        device = candidate;
+    InvocationAbiOp abi;
+    for (InvocationAbiOp candidate : module.getOps<InvocationAbiOp>())
+      if (schedule && candidate.getSourcePlanFingerprint() ==
+                          plan.getFingerprint() &&
+          candidate.getSourceScheduleFingerprint() == schedule.getFingerprint())
+        abi = candidate;
+    if (!schedule || !device || !abi ||
+        device.getPolicy() != NumericalPolicy::Fast) {
+      module.emitError("online GPU source, schedule, device, and ABI are not closed");
+      return signalPassFailure();
+    }
+
+    llvm::SmallDenseMap<int64_t, int64_t> scheduleSources;
+    for (ScheduleTaskOp task :
+         schedule.getBody().front().getOps<ScheduleTaskOp>())
+      scheduleSources.try_emplace(task.getOrdinal(), task.getSourceTask());
+    llvm::SmallDenseSet<int64_t> coveredTasks;
+    std::set<std::string> compactClosure;
+    std::set<std::string> publicClosure;
+    for (DeviceEntryOp entry :
+         device.getBody().front().getOps<DeviceEntryOp>()) {
+      auto source = scheduleSources.find(entry.getSourceTask());
+      if (source == scheduleSources.end() ||
+          !onlineTasks.contains(source->second))
+        continue;
+      auto materialization = materializationTasks.find(source->second);
+      if (materialization == materializationTasks.end()) {
+        module.emitError("online GPU entry has no source-bound semantics");
+        return signalPassFailure();
+      }
+      coveredTasks.insert(source->second);
+      if (entry.getCodeOffset() < 0 || entry.getCodeLength() <= 0 ||
+          entry.getCodeOffset() >
+              static_cast<int64_t>(device.getCode().size()) -
+                  entry.getCodeLength()) {
+        module.emitError("online GPU entry has an invalid code slice");
+        return signalPassFailure();
+      }
+      StringRef ptx(reinterpret_cast<const char *>(device.getCode().data() +
+                                                   entry.getCodeOffset()),
+                    entry.getCodeLength());
+      OnlinePtxDataflow flow = onlinePtxDataflow(ptx);
+      if (flow.globalStores.empty()) {
+        module.emitError("online GPU entry has no live semantic store");
+        return signalPassFailure();
+      }
+      bool writesCompact = false;
+      bool writesPublic = false;
+      for (int64_t output : materialization->second.getOutputBuffers()) {
+        for (MaterializationBufferOp buffer :
+             plan.getBody().front().getOps<MaterializationBufferOp>()) {
+          if (buffer.getOrdinal() != output)
+            continue;
+          writesCompact |=
+              buffer.getStorage() == MaterializationStorage::Temporary;
+          writesPublic |= buffer.getLiveOut();
+        }
+      }
+      for (const OnlinePtxStore &store : flow.globalStores) {
+        std::set<std::string> closure = onlinePtxClosure(flow, store.value);
+        if (writesCompact)
+          compactClosure.insert(closure.begin(), closure.end());
+        if (writesPublic)
+          publicClosure.insert(closure.begin(), closure.end());
+      }
+    }
+    const bool compactState =
+        closureHasOpcode(compactClosure, {"setp."}) &&
+        closureHasOpcode(compactClosure, {"selp.", "mov."}) &&
+        closureHasOpcode(compactClosure, {"max."}) &&
+        compactClosure.count("0fFF800000");
+    const bool publicState =
+        closureHasOpcode(publicClosure, {"setp."}) &&
+        closureHasOpcode(publicClosure, {"selp.", "mov."}) &&
+        closureHasOpcode(publicClosure, {"max."}) &&
+        closureHasOpcode(publicClosure, {"ex2.", "exp."}) &&
+        closureHasOpcode(publicClosure, {"add.", "fma."}) &&
+        closureHasOpcode(publicClosure, {"mul.", "fma."}) &&
+        closureHasOpcode(publicClosure, {"div.", "rcp."}) &&
+        publicClosure.count("$shared") &&
+        publicClosure.count("0f00000000");
+    if (coveredTasks.size() != onlineTasks.size() || !compactState ||
+        !publicState) {
+      module.emitError(
+          "online GPU dataflow does not prove predicate/update/merge/finalize");
+      return signalPassFailure();
+    }
+
+    llvm::SmallDenseMap<int64_t, Type> operandTypes;
+    llvm::SmallDenseMap<int64_t, Type> resultTypes;
+    llvm::SmallDenseMap<int64_t, MaterializationBufferOp> planBuffers;
+    SmallVector<int64_t> expectedOperands;
+    SmallVector<int64_t> expectedResults;
+    for (MaterializationBufferOp buffer :
+         plan.getBody().front().getOps<MaterializationBufferOp>()) {
+      planBuffers.try_emplace(buffer.getOrdinal(), buffer);
+      if (buffer.getStorage() != MaterializationStorage::External)
+        continue;
+      if (buffer.getLiveIn() && !buffer.getLiveOut())
+        expectedOperands.push_back(buffer.getOrdinal());
+      if (buffer.getLiveOut())
+        expectedResults.push_back(buffer.getOrdinal());
+    }
+    for (InvocationSlotOp slot :
+         abi.getBody().front().getOps<InvocationSlotOp>()) {
+      if (slot.getStorage() == MaterializationStorage::Temporary &&
+          slot.getTensorType() == representativeScoreType) {
+        module.emitError("online GPU ABI exposes representative-score storage");
+        return signalPassFailure();
+      }
+      if (!slot.getBindingIndex())
+        continue;
+      const int64_t index = *slot.getBindingIndex();
+      if (slot.getBinding() == ExecutableBindingKind::Operand) {
+        if (index < 0 || index >= static_cast<int64_t>(expectedOperands.size()) ||
+            slot.getSourceBuffer() != expectedOperands[index]) {
+          module.emitError("online GPU operand ABI is not source-bound");
+          return signalPassFailure();
+        }
+        operandTypes.try_emplace(*slot.getBindingIndex(), slot.getTensorType());
+      } else if (slot.getBinding() == ExecutableBindingKind::Result) {
+        if (index < 0 || index >= static_cast<int64_t>(expectedResults.size()) ||
+            slot.getSourceBuffer() != expectedResults[index]) {
+          module.emitError("online GPU result ABI is not source-bound");
+          return signalPassFailure();
+        }
+        resultTypes.try_emplace(*slot.getBindingIndex(), slot.getTensorType());
+      }
+    }
+    Block &body = region.getBody().front();
+    auto yield = cast<YieldOp>(body.getTerminator());
+    if (operandTypes.size() != body.getNumArguments() ||
+        resultTypes.size() != yield.getValues().size() ||
+        llvm::any_of(llvm::enumerate(body.getArguments()), [&](auto item) {
+          return operandTypes.lookup(item.index()) != item.value().getType();
+        }) ||
+        llvm::any_of(llvm::enumerate(yield.getValues()), [&](auto item) {
+          return resultTypes.lookup(item.index()) != item.value().getType();
+        })) {
+      module.emitError("online GPU public ABI is not an exact source projection");
+      return signalPassFailure();
+    }
+    llvm::outs() << "online_gpu = semantic_state_closed; relation = applied; "
+                    "public_abi = exact; representative_score_materialized = "
+                    "false; resources = observational\n";
+  }
+};
+
+class CorruptOnlineGpuSemanticsPass
+    : public MutationPass<CorruptOnlineGpuSemanticsPass> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(CorruptOnlineGpuSemanticsPass)
+  CorruptOnlineGpuSemanticsPass() = default;
+  CorruptOnlineGpuSemanticsPass(const CorruptOnlineGpuSemanticsPass &other)
+      : MutationPass<CorruptOnlineGpuSemanticsPass>(other) {}
+  Option<std::string> kind{*this, "kind", llvm::cl::desc("Mutation kind"),
+                           llvm::cl::init("")};
+  StringRef getArgument() const final {
+    return "shuttle-test-corrupt-online-gpu-semantics";
+  }
+  void runOnOperation() override {
+    DeviceModuleOp device;
+    for (DeviceModuleOp candidate : getOperation().getOps<DeviceModuleOp>()) {
+      device = candidate;
+      break;
+    }
+    if (!device) {
+      getOperation().emitError("test fixture has no online GPU device module");
+      return signalPassFailure();
+    }
+    SmallVector<int8_t> code(device.getCode());
+    StringRef needle;
+    StringRef replacement;
+    if (kind == "maximum") {
+      needle = "max.f32";
+      replacement = "add.f32";
+    } else if (kind == "finalize") {
+      needle = "div.rn.f32";
+      replacement = "mul.rn.f32";
+    } else if (kind == "max-init") {
+      needle = "0fFF800000";
+      replacement = "0f00000000";
+    } else if (kind == "zero-init") {
+      needle = "0f00000000";
+      replacement = "0f3F800000";
+    } else {
+      getOperation().emitError("unknown online GPU semantic mutation");
+      return signalPassFailure();
+    }
+    StringRef bytes(reinterpret_cast<const char *>(code.data()), code.size());
+    size_t offset = bytes.find(needle);
+    if (offset == StringRef::npos || needle.size() != replacement.size()) {
+      getOperation().emitError("test fixture lacks requested online semantic");
+      return signalPassFailure();
+    }
+    std::copy(replacement.begin(), replacement.end(), code.begin() + offset);
+    device.setCodeAttr(DenseI8ArrayAttr::get(device.getContext(), code));
+    refreshExecutableBundle(getOperation(), true);
+  }
+};
+
 class VerifyOnlineFallbackPass
     : public MutationPass<VerifyOnlineFallbackPass> {
 public:
@@ -3608,7 +4022,9 @@ void registerMutationPasses() {
   PassRegistration<SetPreferFusionTuningPass>();
   PassRegistration<RewireOnlineMaximumYieldPass>();
   PassRegistration<VerifyOnlineSufficientStatePass>();
+  PassRegistration<VerifyOnlineGpuExecutionPass>();
   PassRegistration<VerifyOnlineFallbackPass>();
+  PassRegistration<CorruptOnlineGpuSemanticsPass>();
   PassRegistration<DropOnlineRecomputationPass>();
   PassRegistration<SwapOnlineRecomputationPass>();
   PassRegistration<MaterializationDeleteTaskPass>();
