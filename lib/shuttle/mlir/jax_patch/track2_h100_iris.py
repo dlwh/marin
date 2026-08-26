@@ -33,6 +33,7 @@ from track2_h100_batch import (
 
 REQUEST_SCHEMA = "shuttle_track2_h100_iris_request_v1"
 REPRESENTATIVE_REQUEST_SCHEMA = "shuttle_track2_rmsnorm_representative_iris_request_v1"
+ATTENTION_REQUEST_SCHEMA = "shuttle_fast_attention_h100_numerics_iris_request_v1"
 RUNNER_REPOSITORY = Path("/app")
 WORKSPACE = Path("/tmp/shuttle-track2-h100")
 SOURCE_MANIFEST_PATH = RUNNER_REPOSITORY / SOURCE_MANIFEST_NAME
@@ -58,6 +59,13 @@ def representative_job_name(run: int) -> str:
     if type(run) is not int or run < 1 or run > MAX_RUN:
         raise ValueError(f"run must be a positive integer no greater than {MAX_RUN}")
     return JobName.root("dlwh", f"shuttle-track2-rmsnorm-h100-r{run}").to_wire()
+
+
+def attention_job_name(run: int) -> str:
+    """Return the deterministic FAST attention canary identity."""
+    if type(run) is not int or run < 1 or run > MAX_RUN:
+        raise ValueError(f"run must be a positive integer no greater than {MAX_RUN}")
+    return JobName.root("dlwh", f"shuttle-fast-attention-h100-r{run}").to_wire()
 
 
 def _git(repository: Path, *arguments: str) -> str:
@@ -188,6 +196,12 @@ def _representative_entrypoint_command() -> list[str]:
     return command
 
 
+def _attention_entrypoint_command() -> list[str]:
+    command = _entrypoint_command()
+    command[-1] = "--execute-attention"
+    return command
+
+
 def build_launch_request(*, bundle_root: Path, run: int) -> controller_pb2.Controller.LaunchJobRequest:
     """Build the one-task, zero-retry request without opening a connection."""
     if bundle_root.is_symlink() or not bundle_root.is_dir():
@@ -232,6 +246,20 @@ def build_representative_launch_request(*, bundle_root: Path, run: int) -> contr
         )
     )
     validate_representative_launch_request(request, run=run)
+    return request
+
+
+def build_attention_launch_request(*, bundle_root: Path, run: int) -> controller_pb2.Controller.LaunchJobRequest:
+    """Build the reviewed FAST attention numerical request."""
+    request = build_launch_request(bundle_root=bundle_root, run=run)
+    request.name = attention_job_name(run)
+    request.entrypoint.CopyFrom(
+        build_runtime_entrypoint(
+            Entrypoint.from_command(*_attention_entrypoint_command()),
+            job_pb2.EnvironmentConfig(setup_scripts=[]),
+        )
+    )
+    validate_attention_launch_request(request, run=run)
     return request
 
 
@@ -359,6 +387,28 @@ def validate_representative_launch_request(request: controller_pb2.Controller.La
     validate_launch_request(normalized, run=run)
 
 
+def validate_attention_launch_request(request: controller_pb2.Controller.LaunchJobRequest, *, run: int) -> None:
+    """Validate the attention request by exact normalization to v1."""
+    if request.name != attention_job_name(run):
+        raise ValueError("attention LaunchJobRequest name differs")
+    expected = build_runtime_entrypoint(
+        Entrypoint.from_command(*_attention_entrypoint_command()),
+        job_pb2.EnvironmentConfig(setup_scripts=[]),
+    )
+    if request.entrypoint != expected:
+        raise ValueError("attention LaunchJobRequest entrypoint differs")
+    normalized = type(request)()
+    normalized.CopyFrom(request)
+    normalized.name = job_name(run)
+    normalized.entrypoint.CopyFrom(
+        build_runtime_entrypoint(
+            Entrypoint.from_command(*_entrypoint_command()),
+            job_pb2.EnvironmentConfig(setup_scripts=[]),
+        )
+    )
+    validate_launch_request(normalized, run=run)
+
+
 def decode_launch_request(raw: bytes, *, run: int) -> controller_pb2.Controller.LaunchJobRequest:
     """Decode canonical request bytes and revalidate their complete scope."""
     request = controller_pb2.Controller.LaunchJobRequest()
@@ -382,6 +432,19 @@ def decode_representative_launch_request(raw: bytes, *, run: int) -> controller_
     if request.SerializeToString(deterministic=True) != raw:
         raise ValueError("LaunchJobRequest protobuf is not canonical")
     validate_representative_launch_request(request, run=run)
+    return request
+
+
+def decode_attention_launch_request(raw: bytes, *, run: int) -> controller_pb2.Controller.LaunchJobRequest:
+    """Decode and revalidate canonical FAST attention request bytes."""
+    request = controller_pb2.Controller.LaunchJobRequest()
+    try:
+        request.ParseFromString(raw)
+    except DecodeError as error:
+        raise ValueError("LaunchJobRequest protobuf is malformed") from error
+    if request.SerializeToString(deterministic=True) != raw:
+        raise ValueError("LaunchJobRequest protobuf is not canonical")
+    validate_attention_launch_request(request, run=run)
     return request
 
 
@@ -414,6 +477,23 @@ def _representative_summary(raw: bytes, *, run: int) -> dict[str, object]:
         "request_size": len(raw),
         "run": run,
         "schema": REPRESENTATIVE_REQUEST_SCHEMA,
+        "source_commit": manifest["commit"],
+        "source_tree": manifest["tree"],
+    }
+
+
+def _attention_summary(raw: bytes, *, run: int) -> dict[str, object]:
+    request = decode_attention_launch_request(raw, run=run)
+    manifest = _validated_bundle(request.bundle_blob)
+    return {
+        "bundle_sha256": request.bundle_id,
+        "bundle_size": len(request.bundle_blob),
+        "image": request.task_image,
+        "job_name": request.name,
+        "request_sha256": hashlib.sha256(raw).hexdigest(),
+        "request_size": len(raw),
+        "run": run,
+        "schema": ATTENTION_REQUEST_SCHEMA,
         "source_commit": manifest["commit"],
         "source_tree": manifest["tree"],
     }
@@ -458,12 +538,12 @@ def _submit(request: controller_pb2.Controller.LaunchJobRequest, *, config: Path
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="action", required=True)
-    for name in ("render", "render-representative"):
+    for name in ("render", "render-representative", "render-attention"):
         render = subparsers.add_parser(name)
         render.add_argument("--bundle-root", required=True, type=Path)
         render.add_argument("--run", required=True, type=int)
         render.add_argument("--output", required=True, type=Path)
-    for name in ("submit", "submit-representative"):
+    for name in ("submit", "submit-representative", "submit-attention"):
         submit = subparsers.add_parser(name)
         submit.add_argument("--request", required=True, type=Path)
         submit.add_argument("--expected-request-sha256", required=True)
@@ -471,16 +551,23 @@ def main(argv: list[str] | None = None) -> int:
         submit.add_argument("--config", required=True, type=Path)
         submit.add_argument("--receipt", required=True, type=Path)
     arguments = parser.parse_args(argv)
-    if arguments.action in ("render", "render-representative"):
+    if arguments.action in ("render", "render-representative", "render-attention"):
         representative = arguments.action == "render-representative"
-        request = (
-            build_representative_launch_request(bundle_root=arguments.bundle_root, run=arguments.run)
-            if representative
-            else build_launch_request(bundle_root=arguments.bundle_root, run=arguments.run)
-        )
+        attention = arguments.action == "render-attention"
+        if representative:
+            request = build_representative_launch_request(bundle_root=arguments.bundle_root, run=arguments.run)
+        elif attention:
+            request = build_attention_launch_request(bundle_root=arguments.bundle_root, run=arguments.run)
+        else:
+            request = build_launch_request(bundle_root=arguments.bundle_root, run=arguments.run)
         raw = request.SerializeToString(deterministic=True)
         _write_create_only(arguments.output, raw)
-        summary = _representative_summary(raw, run=arguments.run) if representative else _summary(raw, run=arguments.run)
+        if representative:
+            summary = _representative_summary(raw, run=arguments.run)
+        elif attention:
+            summary = _attention_summary(raw, run=arguments.run)
+        else:
+            summary = _summary(raw, run=arguments.run)
         print(canonical_json(summary).decode(), end="")
         return 0
 
@@ -491,14 +578,16 @@ def main(argv: list[str] | None = None) -> int:
     ):
         raise ValueError("reviewed request SHA-256 differs")
     representative = arguments.action == "submit-representative"
-    request = (
-        decode_representative_launch_request(raw, run=arguments.run)
-        if representative
-        else decode_launch_request(raw, run=arguments.run)
-    )
-    request_summary = (
-        _representative_summary(raw, run=arguments.run) if representative else _summary(raw, run=arguments.run)
-    )
+    attention = arguments.action == "submit-attention"
+    if representative:
+        request = decode_representative_launch_request(raw, run=arguments.run)
+        request_summary = _representative_summary(raw, run=arguments.run)
+    elif attention:
+        request = decode_attention_launch_request(raw, run=arguments.run)
+        request_summary = _attention_summary(raw, run=arguments.run)
+    else:
+        request = decode_launch_request(raw, run=arguments.run)
+        request_summary = _summary(raw, run=arguments.run)
     receipt_descriptor = _reserve_create_only(arguments.receipt)
     pending = {
         "config": str(arguments.config),
@@ -506,7 +595,11 @@ def main(argv: list[str] | None = None) -> int:
         "schema": (
             "shuttle_track2_rmsnorm_representative_submit_receipt_v1"
             if representative
-            else "shuttle_track2_h100_submit_receipt_v1"
+            else (
+                "shuttle_fast_attention_h100_numerics_submit_receipt_v1"
+                if attention
+                else "shuttle_track2_h100_submit_receipt_v1"
+            )
         ),
         "status": "submission_pending",
     }
@@ -522,7 +615,11 @@ def main(argv: list[str] | None = None) -> int:
             "schema": (
                 "shuttle_track2_rmsnorm_representative_submit_receipt_v1"
                 if representative
-                else "shuttle_track2_h100_submit_receipt_v1"
+                else (
+                    "shuttle_fast_attention_h100_numerics_submit_receipt_v1"
+                    if attention
+                    else "shuttle_track2_h100_submit_receipt_v1"
+                )
             ),
             "status": "submitted",
         }
