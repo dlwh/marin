@@ -1,0 +1,17 @@
+{
+  "authorization_sha256": "388c7458ab88f75f6f533443df3f13c399ea3cdb335f6e13754b1f08466ccd2d",
+  "bundle_sha256": "fbfe32effd21a94b8d4b1c7f2a9fd6eee5e179241c9a17c113e781d0bd505778",
+  "config": "lib/iris/config/cw-us-east-02a.yaml",
+  "job_id": "/dlwh/shuttle-track1-generic-composition-h100-canary-r3",
+  "last_check": "2026-08-26T00:44:20Z",
+  "request_path": "scratch/20260825-1720_generic_composition_r3_launch.pb",
+  "request_sha256": "cd0fdcb01019f6dd38cc9062393bfab7689cb285c30867709adbea466cbf2b75",
+  "restart_count": 0,
+  "resubmission_authorized": false,
+  "state": "SUCCEEDED",
+  "submitted_at": "2026-08-26T00:20:44Z",
+  "terminal": true,
+  "terminal_evidence": "scratch/20260825-1720_generic_composition_r3_terminal.json",
+  "result_sha256": "eb4782ba2eee9d69e29e7abaf616ab483104953fa44527d572da0846da8b0cdb",
+  "ts": 1787703644000
+}

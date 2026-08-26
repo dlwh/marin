@@ -6025,3 +6025,66 @@ author: dlwh
 - The f32 ABI, exact shape, finiteness, bitwise-repeat, numerical, and observer
   facts in TLTC-ABI22-008 remain unchanged. The prospective v2 schema removes
   the `full_write` claim rather than treating it as an acceptance gate.
+
+### 2026-08-25 - TLTC-ABI22-009 anonymous composition r3 H100 acceptance
+
+- Hypothesis: under the prospective v2 contract, disabled ordinary XLA can
+  remain a required finite, ABI-correct, repeatable diagnostic while enabled
+  Shuttle SOURCE_ORDERED and FAST are accepted against the unchanged maximum,
+  mean, and relative-error gates for the anonymous ordinary-JAX
+  `Contract0 -> Fold / Map(h,s) -> Contract1` source.
+- Executed source: reviewed commit
+  `a2553850f6b1aa6c4b0b20e006305bfb6d6d27d0`, tree
+  `3c5cbcaee6cf468ab942ebd40cb501e0c89d5184`, source-manifest SHA-256
+  `c5dba478034a6174ff3d7b4615e7126e3752e60c490e2550731eb4c335bfb5a1`,
+  authorization SHA-256
+  `388c7458ab88f75f6f533443df3f13c399ea3cdb335f6e13754b1f08466ccd2d`,
+  and numerical-policy-v2 SHA-256
+  `78578508ee2106dccc205d6338a6ca94b0ee4d4562766b8a2bf11eae51e11984`.
+- Config: `/dlwh/shuttle-track1-generic-composition-h100-canary-r3` ran
+  batch-priority on one H100 in `cw-us-east-02a`, with one replica and all
+  retry/failure budgets zero. Request SHA-256 was
+  `cd0fdcb01019f6dd38cc9062393bfab7689cb285c30867709adbea466cbf2b75`
+  at 20,915,530 bytes; bundle SHA-256 was
+  `fbfe32effd21a94b8d4b1c7f2a9fd6eee5e179241c9a17c113e781d0bd505778`
+  at 20,914,519 bytes.
+- Result: Iris recorded one successful task, exit code 0, no failure or
+  preemption, and 958.38 seconds runtime. The 84,478-byte canonical result has
+  SHA-256
+  `eb4782ba2eee9d69e29e7abaf616ab483104953fa44527d572da0846da8b0cdb`.
+  All six rank2-a/rank3-b by disabled/SOURCE_ORDERED/FAST coordinates passed
+  f32 ABI, exact shape, finiteness, and within-coordinate bitwise repeatability.
+  The four enabled cells passed the unchanged three numerical gates and had
+  zero raw and masked BF16 ULP diagnostic distance. Their observer invocation
+  IDs were 1 through 4, with one common membership identity and final erasure.
+- Numerical evidence: enabled worst maximum absolute error was
+  `9.150818462977384e-7`, worst mean absolute error was
+  `9.081548102228527e-8`, and worst relative Linf error was
+  `3.236162003428692e-7`, all at rank3-b/SOURCE_ORDERED. The required
+  rank3-b/disabled diagnostic repeated r2's maximum and mean limit comparisons:
+  `0.0006204024596327962 > 0.0005` and
+  `0.00011096225522005224 > 0.00005`. Disabled comparison fields do not
+  participate in enabled Shuttle acceptance under v2.
+- Interpretation: the result observed two launches and two temporaries for
+  each enabled coordinate. Those counts are nonnormative telemetry, not a
+  decomposition requirement. The semantic-group and private `{h,s}` fields
+  are policy/harness assertions rather than independent device topology
+  measurements. This bounded run does not establish performance,
+  representative-shape behavior, or a preferred kernel decomposition.
+- Wheels: jaxlib SHA-256
+  `a424effb482353eb45fbefd9f47b6d0e6e0975289b75094408b89a057816aa02`,
+  CUDA plugin SHA-256
+  `49accfe8c00d716c88fab56171fa790cf3256e3c2e5e98b972848661cff773c8`,
+  and CUDA PJRT SHA-256
+  `a20f9b8366eef7504e048653f3c75f0e10875f59985844b3adb8e70188de2a97`.
+- Artifacts:
+  `lib/shuttle/mlir/artifacts/track1-generic-composition-h100-r3-success-20260825/`
+  preserves the canonical result and six diagnostics, submission and terminal
+  records, monitoring metadata, executed authorization/source manifest/v2
+  policy, wheel and request identities, source lineage, and checksums. The
+  20.9 MB request bytes remain external and are bound by SHA-256 and size.
+- Next action: design a separate performance/codegen campaign using the same
+  ordinary-JAX source and two shapes, with warmed ordinary-XLA and Shuttle
+  measurements at both kernel-only and full logical boundaries. Compile/cache
+  cost and codegen/resource counters remain observational evidence; no exact
+  topology count becomes an acceptance rule.
