@@ -13,12 +13,14 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <vector>
 
@@ -6948,6 +6950,77 @@ std::vector<float> causalGqaEpilogueReference(
   return result;
 }
 
+llvm::json::Object fastAttentionFailureDiagnostic(
+    llvm::ArrayRef<float> q, llvm::ArrayRef<float> k,
+    llvm::ArrayRef<float> v, llvm::ArrayRef<float> actual,
+    llvm::ArrayRef<float> reference) {
+  constexpr int64_t heads = 2;
+  constexpr int64_t groups = 2;
+  constexpr int64_t queries = 17;
+  constexpr int64_t keys = 17;
+  constexpr int64_t features = 8;
+  constexpr int64_t values = 7;
+  auto qIndex = [=](int64_t head, int64_t group, int64_t query,
+                    int64_t feature) {
+    return (((head * groups + group) * queries + query) * features) + feature;
+  };
+  auto kIndex = [=](int64_t head, int64_t key, int64_t feature) {
+    return ((head * keys + key) * features) + feature;
+  };
+  auto vIndex = [=](int64_t head, int64_t key, int64_t value) {
+    return ((head * keys + key) * values) + value;
+  };
+  auto resultIndex = [=](int64_t head, int64_t group, int64_t query,
+                         int64_t value) {
+    return (((head * groups + group) * queries + query) * values) + value;
+  };
+
+  llvm::json::Array rows;
+  for (auto [head, group, query] :
+       {std::tuple<int64_t, int64_t, int64_t>{0, 0, 0},
+        std::tuple<int64_t, int64_t, int64_t>{1, 1, 8}}) {
+    std::vector<double> scores(query + 1);
+    double maximum = -std::numeric_limits<double>::infinity();
+    for (int64_t key = 0; key <= query; ++key) {
+      double score = 0.0;
+      for (int64_t feature = 0; feature < features; ++feature)
+        score += static_cast<double>(q[qIndex(head, group, query, feature)]) *
+                 static_cast<double>(k[kIndex(head, key, feature)]);
+      scores[key] = score * 0.125;
+      maximum = std::max(maximum, scores[key]);
+    }
+    double denominator = 0.0;
+    std::array<double, values> numerator{};
+    for (int64_t key = 0; key <= query; ++key) {
+      double weight = std::exp(scores[key] - maximum);
+      denominator += weight;
+      for (int64_t value = 0; value < values; ++value)
+        numerator[value] += weight * v[vIndex(head, key, value)];
+    }
+    llvm::json::Array outputComponents;
+    llvm::json::Array numeratorComponents;
+    for (int64_t value = 0; value < values; ++value) {
+      const int64_t index = resultIndex(head, group, query, value);
+      numeratorComponents.push_back(numerator[value]);
+      outputComponents.push_back(llvm::json::Object{
+          {"dv", value},
+          {"actual", actual[index]},
+          {"reference", reference[index]},
+          {"absolute_error",
+           std::abs(static_cast<double>(actual[index]) - reference[index])}});
+    }
+    rows.push_back(llvm::json::Object{
+        {"hkv", head},
+        {"group", group},
+        {"query", query},
+        {"expected_m", maximum},
+        {"expected_l", denominator},
+        {"expected_o", std::move(numeratorComponents)},
+        {"output", std::move(outputComponents)}});
+  }
+  return llvm::json::Object{{"rows", std::move(rows)}};
+}
+
 TEST(GpuTransportV2Test, H100RunnerMatchesIndependentFastAttentionOracle) {
   if (std::getenv("SHUTTLE_RUN_H100_ATTENTION_NUMERICS") == nullptr)
     GTEST_SKIP() << "set SHUTTLE_RUN_H100_ATTENTION_NUMERICS=1 on an H100";
@@ -7032,6 +7105,15 @@ TEST(GpuTransportV2Test, H100RunnerMatchesIndependentFastAttentionOracle) {
     meanAbsoluteError += error;
   }
   meanAbsoluteError /= actual.size();
+  if (maximumAbsoluteError > 3.0e-3 || meanAbsoluteError > 5.0e-4) {
+    llvm::json::Object diagnostic =
+        fastAttentionFailureDiagnostic(q, k, v, actual, expected);
+    std::cerr << "FAST_ATTENTION_DIAGNOSTIC="
+              << llvm::formatv("{0}", llvm::json::Value(
+                                         std::move(diagnostic)))
+                     .str()
+              << '\n';
+  }
   EXPECT_LE(maximumAbsoluteError, 3.0e-3);
   EXPECT_LE(meanAbsoluteError, 5.0e-4);
   runner->reset();

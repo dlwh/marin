@@ -98,6 +98,8 @@ cc_library(
         "lib/Transforms/Observer.cc",
         "lib/Transforms/ObserverInternal.h",
         "lib/Transforms/ObserverTestInternal.h",
+        "lib/Transforms/GpuScheduleGeometry.inc",
+        "lib/Transforms/OnlineAttentionEmitter.inc",
         "lib/Transforms/OnlineCompositionPlanner.inc",
         "lib/Transforms/OnlinePlanner.inc",
         "lib/Transforms/Passes.cc",
