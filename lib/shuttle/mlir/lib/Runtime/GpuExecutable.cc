@@ -300,7 +300,7 @@ absl::StatusOr<Parsed> parse(ArrayRef<uint8_t> bytes) {
       return invalidTransport();
     auto entryDigest = reader.text();
     if (!dependencies || !predication || *predication > 1 ||
-        (reduction && *reduction != 0) || !entryDigest ||
+        (reduction && *reduction > 1) || !entryDigest ||
         expectedOffset > static_cast<int64_t>(code->size()) - *codeLength)
       return invalidTransport();
     ArrayRef<uint8_t> slice = code->slice(expectedOffset, *codeLength);
