@@ -6886,7 +6886,7 @@ TEST(GpuTransportV2Test,
 
 std::vector<float> causalGqaEpilogueReference(
     llvm::ArrayRef<float> q, llvm::ArrayRef<float> k,
-    llvm::ArrayRef<float> v) {
+  llvm::ArrayRef<float> v) {
   constexpr int64_t batches = 1;
   constexpr int64_t heads = 2;
   constexpr int64_t groups = 2;
@@ -6954,7 +6954,6 @@ llvm::json::Object fastAttentionFailureDiagnostic(
     llvm::ArrayRef<float> q, llvm::ArrayRef<float> k,
     llvm::ArrayRef<float> v, llvm::ArrayRef<float> actual,
     llvm::ArrayRef<float> reference) {
-  constexpr int64_t heads = 2;
   constexpr int64_t groups = 2;
   constexpr int64_t queries = 17;
   constexpr int64_t keys = 17;
@@ -6973,6 +6972,10 @@ llvm::json::Object fastAttentionFailureDiagnostic(
   auto resultIndex = [=](int64_t head, int64_t group, int64_t query,
                          int64_t value) {
     return (((head * groups + group) * queries + query) * values) + value;
+  };
+  auto diagnosticNumber = [](double value) -> llvm::json::Value {
+    return std::isfinite(value) ? llvm::json::Value(value)
+                                : llvm::json::Value(nullptr);
   };
 
   llvm::json::Array rows;
@@ -7002,12 +7005,15 @@ llvm::json::Object fastAttentionFailureDiagnostic(
     for (int64_t value = 0; value < values; ++value) {
       const int64_t index = resultIndex(head, group, query, value);
       numeratorComponents.push_back(numerator[value]);
+      const double actualValue = actual[index];
+      const double absoluteError =
+          std::abs(actualValue - static_cast<double>(reference[index]));
       outputComponents.push_back(llvm::json::Object{
           {"dv", value},
-          {"actual", actual[index]},
+          {"actual", diagnosticNumber(actualValue)},
+          {"actual_finite", std::isfinite(actualValue)},
           {"reference", reference[index]},
-          {"absolute_error",
-           std::abs(static_cast<double>(actual[index]) - reference[index])}});
+          {"absolute_error", diagnosticNumber(absoluteError)}});
     }
     rows.push_back(llvm::json::Object{
         {"hkv", head},
@@ -7019,6 +7025,26 @@ llvm::json::Object fastAttentionFailureDiagnostic(
         {"output", std::move(outputComponents)}});
   }
   return llvm::json::Object{{"rows", std::move(rows)}};
+}
+
+TEST(GpuTransportV2Test,
+     FastAttentionFailureDiagnosticSerializesNonFiniteValues) {
+  std::vector<float> q(2 * 2 * 17 * 8, 0.0f);
+  std::vector<float> k(2 * 17 * 8, 0.0f);
+  std::vector<float> v(2 * 17 * 7, 0.0f);
+  std::vector<float> actual(2 * 2 * 17 * 7, 0.0f);
+  std::vector<float> reference(actual.size(), 0.0f);
+  actual.front() = std::numeric_limits<float>::quiet_NaN();
+  llvm::json::Object diagnostic =
+      fastAttentionFailureDiagnostic(q, k, v, actual, reference);
+  std::string serialized =
+      llvm::formatv("{0}", llvm::json::Value(std::move(diagnostic))).str();
+  EXPECT_NE(serialized.find("\"actual\":null"), std::string::npos);
+  EXPECT_NE(serialized.find("\"actual_finite\":false"), std::string::npos);
+  llvm::Expected<llvm::json::Value> parsed = llvm::json::parse(serialized);
+  EXPECT_TRUE(static_cast<bool>(parsed));
+  if (!parsed)
+    llvm::consumeError(parsed.takeError());
 }
 
 TEST(GpuTransportV2Test, H100RunnerMatchesIndependentFastAttentionOracle) {
@@ -7098,14 +7124,19 @@ TEST(GpuTransportV2Test, H100RunnerMatchesIndependentFastAttentionOracle) {
                   .ok());
   double maximumAbsoluteError = 0.0;
   double meanAbsoluteError = 0.0;
+  bool allFinite = true;
   for (auto [index, value] : llvm::enumerate(actual)) {
-    ASSERT_TRUE(std::isfinite(value)) << "element " << index;
+    if (!std::isfinite(value)) {
+      allFinite = false;
+      continue;
+    }
     double error = std::abs(static_cast<double>(value) - expected[index]);
     maximumAbsoluteError = std::max(maximumAbsoluteError, error);
     meanAbsoluteError += error;
   }
   meanAbsoluteError /= actual.size();
-  if (maximumAbsoluteError > 3.0e-3 || meanAbsoluteError > 5.0e-4) {
+  if (!allFinite || maximumAbsoluteError > 3.0e-3 ||
+      meanAbsoluteError > 5.0e-4) {
     llvm::json::Object diagnostic =
         fastAttentionFailureDiagnostic(q, k, v, actual, expected);
     std::cerr << "FAST_ATTENTION_DIAGNOSTIC="
@@ -7114,6 +7145,7 @@ TEST(GpuTransportV2Test, H100RunnerMatchesIndependentFastAttentionOracle) {
                      .str()
               << '\n';
   }
+  EXPECT_TRUE(allFinite);
   EXPECT_LE(maximumAbsoluteError, 3.0e-3);
   EXPECT_LE(meanAbsoluteError, 5.0e-4);
   runner->reset();
