@@ -4253,6 +4253,7 @@ struct PlannedTask {
   SmallVector<Operation *> compositionSources;
   SmallVector<Operation *> compositionRecomputedSources;
   SmallVector<int64_t> onlineVectorDimensions;
+  bool onlineMma = false;
   struct CompositionCost {
     int64_t baselineLaunches;
     int64_t candidateLaunches;
@@ -6711,6 +6712,9 @@ public:
             attrs.push_back(builder.getNamedAttr(
                 "online_vector_dimensions",
                 builder.getDenseI64ArrayAttr(task.onlineVectorDimensions)));
+          if (task.onlineMma)
+            attrs.push_back(builder.getNamedAttr("online_mma",
+                                                builder.getBoolAttr(true)));
           if (!task.compositionRecomputedSources.empty()) {
             SmallVector<Attribute> recomputed;
             for (Operation *operation : task.compositionRecomputedSources)
@@ -8022,6 +8026,9 @@ public:
         if (auto vectorDimensions = task.getOnlineVectorDimensionsAttr())
           attrs.push_back(builder.getNamedAttr("online_vector_dimensions",
                                                vectorDimensions));
+        if (task.getOnlineMma().value_or(false))
+          attrs.push_back(builder.getNamedAttr("online_mma",
+                                              builder.getBoolAttr(true)));
         if (geometry->reductionAxis) {
           attrs.push_back(builder.getNamedAttr(
               "reduction_axis",
@@ -8126,6 +8133,10 @@ verifySchedulePlanAgainstMaterialization(MaterializationPlanOp source,
         expected.getOnlineVectorDimensionsAttr())
       return actual.emitOpError(
           "online vector dimensions must equal materialization semantics");
+    if (actual.getOnlineMma().value_or(false) !=
+        expected.getOnlineMma().value_or(false))
+      return actual.emitOpError(
+          "online MMA capability must equal materialization semantics");
     FailureOr<ScheduledGeometry> expectedGeometry =
         isOnlineStateTask(expected)
             ? deriveOnlineStateGeometry(expected)
@@ -8381,7 +8392,7 @@ struct PtxEmitter {
       output << ".param .u64 p" << index;
     }
     output << ")\n{\n"
-              "  .reg .pred %p<64>;\n"
+           << "  .reg .pred %p<" << std::max<int64_t>(64, pred) << ">;\n"
            << "  .reg .b16 %h<" << std::max<int64_t>(16, bf16) << ">;\n"
            << "  .reg .b32 %r<" << std::max<int64_t>(128, u32) << ">;\n"
            << "  .reg .b64 %rd<" << std::max<int64_t>(128, u64) << ">;\n"

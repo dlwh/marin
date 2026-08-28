@@ -11,4 +11,4 @@ fi
 
 SHUTTLE_RUN_H100_ATTENTION_NUMERICS=1 exec "$1" \
   --gtest_fail_if_no_test_selected \
-  --gtest_filter=GpuTransportV2Test.H100RunnerMatchesIndependentFastAttentionOracle
+  --gtest_filter='GpuTransportV2Test.H100RunnerMatchesIndependent*FastAttentionOracle'

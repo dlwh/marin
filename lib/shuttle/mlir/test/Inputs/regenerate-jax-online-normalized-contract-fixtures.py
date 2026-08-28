@@ -39,6 +39,32 @@ def causal_gqa_with_output_epilogue(q, k, v):
     return jnp.tanh(output * jnp.float32(0.5)) + jnp.float32(0.25)
 
 
+def causal_gqa_benchmark(q, k, v):
+    """Representative normalized causal GQA with shape-derived extents."""
+    scores = jnp.einsum("bhgqd,bhkd->bhgqk", q, k) * jnp.float32(q.shape[-1] ** -0.5)
+    query_extent = q.shape[-2]
+    key_extent = k.shape[-2]
+    query = jnp.arange(query_extent, dtype=jnp.int32).reshape(1, 1, 1, query_extent, 1)
+    key = jnp.arange(key_extent, dtype=jnp.int32).reshape(1, 1, 1, 1, key_extent)
+    predicate = jnp.broadcast_to(key <= query, scores.shape)
+    masked = jax.lax.select(predicate, scores, jnp.full(scores.shape, -jnp.inf))
+    maximum = jnp.max(masked, axis=4, keepdims=True)
+    numerator = jnp.exp(masked - maximum)
+    denominator = jnp.sum(numerator, axis=4, keepdims=True)
+    weights = numerator / denominator
+    return jnp.einsum("bhgqk,bhkv->bhgqv", weights, v)
+
+
+def causal_gqa_bf16_benchmark(q, k, v):
+    """BF16 public attention with FP32 score and sufficient-state arithmetic."""
+    return causal_gqa_benchmark(q.astype(jnp.float32), k.astype(jnp.float32), v.astype(jnp.float32)).astype(jnp.bfloat16)
+
+
+def causal_gqa_bf16_axis4(q, k, v):
+    """Tiny BF16 public fixture preserving the accepted axis-4 semantics."""
+    return causal_gqa(q.astype(jnp.float32), k.astype(jnp.float32), v.astype(jnp.float32)).astype(jnp.bfloat16)
+
+
 def causal_gqa_long_key(q, k, v):
     """Normalized causal GQA whose key extent exceeds the online scheduler."""
     scores = jnp.einsum("bhgqd,bhkd->bhgqk", q, k) * jnp.float32(0.125)
@@ -155,9 +181,20 @@ class Fixture:
     shapes: tuple[tuple[int, ...], ...]
     expression: str
     alpha_rename: bool = False
+    argument_dtype: str = "float32"
 
 
 AXIS4_SHAPES = ((1, 2, 2, 17, 8), (1, 2, 17, 8), (1, 2, 17, 7))
+BENCHMARK_256_SHAPES = (
+    (1, 8, 4, 256, 64),
+    (1, 8, 256, 64),
+    (1, 8, 256, 64),
+)
+BENCHMARK_2048_SHAPES = (
+    (1, 8, 4, 2048, 128),
+    (1, 8, 2048, 128),
+    (1, 8, 2048, 128),
+)
 LONG_KEY_SHAPES = ((1, 2, 2, 17, 8), (1, 2, 257, 8), (1, 2, 257, 7))
 RANK9_SHAPES = (
     (1, 1, 1, 1, 2, 2, 17, 8),
@@ -192,6 +229,39 @@ FIXTURES = (
         causal_gqa_with_output_epilogue,
         AXIS4_SHAPES,
         "causal GQA with a live tanh/multiply/add output epilogue",
+    ),
+    Fixture(
+        "jax-0.10.1-f32-causal-gqa-online-benchmark-s256-d64.mlir",
+        causal_gqa_benchmark,
+        BENCHMARK_256_SHAPES,
+        "representative causal GQA B1 Hq32 Hkv8 S256 D=Dv64",
+    ),
+    Fixture(
+        "jax-0.10.1-f32-causal-gqa-online-benchmark-s2048-d128.mlir",
+        causal_gqa_benchmark,
+        BENCHMARK_2048_SHAPES,
+        "representative causal GQA B1 Hq32 Hkv8 S2048 D=Dv128",
+    ),
+    Fixture(
+        "jax-0.10.1-bf16-causal-gqa-online-benchmark-s256-d64.mlir",
+        causal_gqa_bf16_benchmark,
+        BENCHMARK_256_SHAPES,
+        "BF16 causal GQA B1 Hq32 Hkv8 S256 D=Dv64 with FP32 state",
+        argument_dtype="bfloat16",
+    ),
+    Fixture(
+        "jax-0.10.1-bf16-causal-gqa-online-axis4.mlir",
+        causal_gqa_bf16_axis4,
+        AXIS4_SHAPES,
+        "BF16 causal GQA axis-4 fixture with FP32 sufficient state",
+        argument_dtype="bfloat16",
+    ),
+    Fixture(
+        "jax-0.10.1-bf16-causal-gqa-online-benchmark-s2048-d128.mlir",
+        causal_gqa_bf16_benchmark,
+        BENCHMARK_2048_SHAPES,
+        "BF16 causal GQA B1 Hq32 Hkv8 S2048 D=Dv128 with FP32 state",
+        argument_dtype="bfloat16",
     ),
     Fixture(
         "jax-0.10.1-f32-causal-gqa-online-key257-fallback.mlir",
@@ -233,7 +303,8 @@ FIXTURES = (
 
 
 def export_stablehlo(fixture: Fixture) -> str:
-    arguments = tuple(jax.ShapeDtypeStruct(shape, jnp.float32) for shape in fixture.shapes)
+    dtype = getattr(jnp, fixture.argument_dtype)
+    arguments = tuple(jax.ShapeDtypeStruct(shape, dtype) for shape in fixture.shapes)
     module = jax.jit(fixture.function).lower(*arguments).compiler_ir(dialect="stablehlo")
     return f"{module}".rstrip() + "\n"
 

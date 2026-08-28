@@ -469,7 +469,74 @@ derive(RegionOp region, const DerivedPlan &materialized) {
       "online_normalized_exponential_weighted_contract";
   contractionTask.compositionSources = algebra;
   contractionTask.onlineVectorDimensions = std::move(vectorDimensions);
-
+  auto uniqueRegionArgument = [&](Value value) -> BlockArgument {
+    llvm::SmallDenseSet<Operation *> visited;
+    SmallVector<Value> worklist{value};
+    BlockArgument found;
+    while (!worklist.empty()) {
+      Value current = worklist.pop_back_val();
+      if (auto argument = dyn_cast<BlockArgument>(current)) {
+        if (argument.getOwner() != &body ||
+            (found && found != argument))
+          return {};
+        found = argument;
+        continue;
+      }
+      Operation *producer = current.getDefiningOp();
+      if (!producer || !visited.insert(producer).second)
+        continue;
+      llvm::append_range(worklist, producer->getOperands());
+    }
+    return found;
+  };
+  ContractOp scoreContract = cast<ContractOp>(*scoreContracts.begin());
+  FailureOr<SmallVector<int64_t>> scoreDomain =
+      contractDomainShape(scoreContract);
+  FailureOr<SmallVector<int64_t>> weightedDomain =
+      contractDomainShape(weightedContract);
+  int64_t vectorElements = 1;
+  for (int64_t axis : contractionTask.onlineVectorDimensions) {
+    if (axis < 0 || failed(weightedDomain) ||
+        axis >= static_cast<int64_t>(weightedDomain->size()) ||
+        (*weightedDomain)[axis] <= 0 ||
+        vectorElements > 128 / (*weightedDomain)[axis]) {
+      vectorElements = 0;
+      break;
+    }
+    vectorElements *= (*weightedDomain)[axis];
+  }
+  std::optional<int64_t> scoreReduction;
+  int64_t scoreReductionCount = 0;
+  for (auto [axis, kind] : llvm::enumerate(scoreContract.getIteratorKinds()))
+    if (cast<StringAttr>(kind).getValue() == "reduction") {
+      ++scoreReductionCount;
+      scoreReduction = axis;
+    }
+  BlockArgument queryArgument =
+      uniqueRegionArgument(scoreContract.getInputs()[0]);
+  BlockArgument keyArgument = uniqueRegionArgument(scoreContract.getInputs()[1]);
+  BlockArgument valueArgument = uniqueRegionArgument(
+      weightedContract.getInputs()[1 - *normalizedOperand]);
+  auto publicType = dyn_cast<RankedTensorType>(
+      regionYield.getValues().front().getType());
+  auto isBf16Argument = [](BlockArgument argument) {
+    auto type = argument ? dyn_cast<RankedTensorType>(argument.getType())
+                         : RankedTensorType();
+    return type && type.getElementType().isBF16();
+  };
+  contractionTask.onlineMma =
+      succeeded(scoreDomain) && succeeded(weightedDomain) &&
+      scoreReductionCount == 1 && scoreReduction &&
+      queryArgument && keyArgument && valueArgument && publicType &&
+      publicType.getElementType().isBF16() && isBf16Argument(queryArgument) &&
+      isBf16Argument(keyArgument) && isBf16Argument(valueArgument) &&
+      (*scoreDomain)[*scoreReduction] > 0 &&
+      (*scoreDomain)[*scoreReduction] <= 256 &&
+      (*scoreDomain)[*scoreReduction] % 16 == 0 && vectorElements > 0 &&
+      vectorElements <= 128 && vectorElements % 8 == 0 &&
+      (*weightedDomain)[reductionCoordinate.getPosition()] > 0 &&
+      (*weightedDomain)[reductionCoordinate.getPosition()] <= 2048 &&
+      (*weightedDomain)[reductionCoordinate.getPosition()] % 16 == 0;
   auto countContracts = [](ArrayRef<Operation *> sources) {
     return llvm::count_if(sources, [](Operation *operation) {
       return isa<ContractOp>(operation);

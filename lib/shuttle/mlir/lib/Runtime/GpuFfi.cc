@@ -8,6 +8,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <optional>
 #include <string>
@@ -27,6 +28,7 @@
 #include "xla/stream_executor/kernel_spec.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
+#include "tsl/profiler/lib/traceme.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
@@ -38,12 +40,29 @@ namespace {
 namespace ffi = xla::ffi;
 namespace se = stream_executor;
 
+struct LoadedExecutable {
+  std::vector<std::string> ptx;
+  std::vector<std::unique_ptr<se::Kernel>> kernels;
+};
+
+struct InitializationCache {
+  std::mutex mutex;
+  llvm::DenseMap<se::StreamExecutor *, std::shared_ptr<const LoadedExecutable>>
+      executables;
+};
+
 struct InstantiateState {
   std::vector<uint8_t> transport;
   std::string digest;
   std::shared_ptr<const GpuExecutable> executable;
   std::vector<GpuExternalBinding> operands;
   std::vector<GpuExternalBinding> results;
+  // Instantiate state has compilation lifetime. Keep immutable driver-loaded
+  // kernels here so XLA's execution-scoped Initialize stage does not reload
+  // the same PTX for every invocation. The StreamExecutor key binds a cache
+  // entry to its CUDA device/context; invocation-local temporary storage stays
+  // in PrepareState.
+  std::shared_ptr<InitializationCache> initializationCache;
 };
 
 struct PrepareState {
@@ -52,8 +71,7 @@ struct PrepareState {
 };
 
 struct InitializeState {
-  std::vector<std::string> ptx;
-  std::vector<std::unique_ptr<se::Kernel>> kernels;
+  std::shared_ptr<const LoadedExecutable> executable;
 };
 
 absl::Status invalid(StringRef message) {
@@ -197,6 +215,7 @@ instantiate(int64_t transportSchemaVersion, absl::string_view bundleBytes,
             int64_t bundleSize, absl::string_view bundleSha256,
             int64_t deviceSchemaVersion, int64_t invocationAbiSchemaVersion,
             int64_t bundleSchemaVersion, absl::string_view completion) {
+  tsl::profiler::TraceMe trace("ShuttleGpuFfi::Instantiate");
   try {
     if (transportSchemaVersion != 2 ||
         (deviceSchemaVersion != 3 && deviceSchemaVersion != 4) ||
@@ -226,7 +245,8 @@ instantiate(int64_t transportSchemaVersion, absl::string_view bundleBytes,
     std::vector<uint8_t> owned(borrowed.begin(), borrowed.end());
     return std::make_unique<InstantiateState>(InstantiateState{
         std::move(owned), std::move(digest), std::move(*executable),
-        std::move(operands), std::move(results)});
+        std::move(operands), std::move(results),
+        std::make_shared<InitializationCache>()});
   } catch (const std::bad_alloc &) {
     return absl::ResourceExhaustedError(
         "insufficient memory to instantiate Shuttle GPU executable");
@@ -239,6 +259,7 @@ instantiate(int64_t transportSchemaVersion, absl::string_view bundleBytes,
 absl::StatusOr<std::unique_ptr<PrepareState>>
 prepare(InstantiateState *state, se::DeviceAddressAllocator *allocator,
         int32_t deviceOrdinal) {
+  tsl::profiler::TraceMe trace("ShuttleGpuFfi::Prepare");
   try {
     if (state == nullptr || allocator == nullptr || deviceOrdinal < 0)
       return invalid("GPU executable Prepare context is invalid");
@@ -310,6 +331,7 @@ prepare(InstantiateState *state, se::DeviceAddressAllocator *allocator,
 absl::StatusOr<std::unique_ptr<InitializeState>>
 initialize(InstantiateState *state, se::Stream *stream,
            const se::GpuComputeCapability *capability) {
+  tsl::profiler::TraceMe trace("ShuttleGpuFfi::Initialize");
   try {
     if (state == nullptr || stream == nullptr || stream->parent() == nullptr ||
         capability == nullptr || !capability->IsCuda())
@@ -325,17 +347,46 @@ initialize(InstantiateState *state, se::Stream *stream,
     if (!capabilityMatches)
       return invalid(
           "GPU executable target does not match CUDA compute capability");
-    auto initialized = std::make_unique<InitializeState>();
-    initialized->ptx.reserve(state->executable->launches().size());
-    initialized->kernels.reserve(state->executable->launches().size());
+    if (state->initializationCache == nullptr)
+      return invalid("GPU executable Initialize cache is invalid");
+    const bool requiresSharedMemoryOptIn = llvm::any_of(
+        state->executable->launches(), [](const GpuLaunch &launch) {
+          return launch.dynamicSharedMemoryBytes > 48 * 1024;
+        });
+    const int64_t dynamicSharedMemoryLimit =
+        requiresSharedMemoryOptIn
+            ? stream->parent()
+                  ->GetDeviceDescription()
+                  .shared_memory_per_block_optin()
+            : 48 * 1024;
+    if (requiresSharedMemoryOptIn && dynamicSharedMemoryLimit <= 48 * 1024)
+      return invalid(
+          "GPU executable requires unavailable dynamic shared-memory opt-in");
+    std::lock_guard lock(state->initializationCache->mutex);
+    auto cached = state->initializationCache->executables.find(stream->parent());
+    if (cached != state->initializationCache->executables.end()) {
+      tsl::profiler::TraceMe cacheHit("ShuttleGpuFfi::InitializeCacheHit");
+      return std::make_unique<InitializeState>(
+          InitializeState{cached->second});
+    }
+
+    tsl::profiler::TraceMe cacheMiss("ShuttleGpuFfi::InitializeCacheMiss");
+    auto loaded = std::make_shared<LoadedExecutable>();
+    loaded->ptx.reserve(state->executable->launches().size());
+    loaded->kernels.reserve(state->executable->launches().size());
     for (const GpuLaunch &launch : state->executable->launches()) {
+      if (launch.dynamicSharedMemoryBytes > 48 * 1024 &&
+          launch.dynamicSharedMemoryBytes >
+          static_cast<uint64_t>(dynamicSharedMemoryLimit))
+        return invalid(
+            "GPU executable dynamic shared memory exceeds device opt-in capacity");
       ArrayRef<uint8_t> slice = state->executable->codeBytes().slice(
           launch.codeOffset, launch.codeLength);
-      initialized->ptx.emplace_back(
+      loaded->ptx.emplace_back(
           reinterpret_cast<const char *>(slice.data()), slice.size());
       se::KernelLoaderSpec spec =
           se::KernelLoaderSpec::CreateCudaPtxInMemorySpec(
-              initialized->ptx.back(), "shuttle_entry",
+              loaded->ptx.back(), "shuttle_entry",
               launch.inputSlots.size() + launch.outputSlots.size());
       absl::StatusOr<std::unique_ptr<se::Kernel>> kernel =
           stream->parent()->LoadKernel(spec);
@@ -344,11 +395,13 @@ initialize(InstantiateState *state, se::Stream *stream,
       se::KernelMetadata metadata;
       metadata.set_shared_memory_bytes(launch.dynamicSharedMemoryBytes);
       (*kernel)->set_metadata(metadata);
-      initialized->kernels.push_back(std::move(*kernel));
+      loaded->kernels.push_back(std::move(*kernel));
     }
-    if (initialized->kernels.size() != state->executable->launches().size())
+    if (loaded->kernels.size() != state->executable->launches().size())
       return invalid("GPU executable kernel projection is invalid");
-    return initialized;
+    std::shared_ptr<const LoadedExecutable> immutable = std::move(loaded);
+    state->initializationCache->executables[stream->parent()] = immutable;
+    return std::make_unique<InitializeState>(InitializeState{immutable});
   } catch (const std::bad_alloc &) {
     return absl::ResourceExhaustedError(
         "insufficient memory to initialize Shuttle GPU executable");
@@ -361,16 +414,22 @@ initialize(InstantiateState *state, se::Stream *stream,
 absl::Status execute(ffi::RemainingArgs arguments, ffi::RemainingRets results,
                      InstantiateState *state, PrepareState *prepared,
                      InitializeState *initialized, se::Stream *stream) {
+  tsl::profiler::TraceMe trace("ShuttleGpuFfi::Execute");
   try {
     if (state == nullptr || prepared == nullptr || initialized == nullptr ||
-        stream == nullptr ||
-        initialized->kernels.size() != state->executable->launches().size())
+        initialized->executable == nullptr || stream == nullptr ||
+        initialized->executable->kernels.size() !=
+            state->executable->launches().size())
       return invalid("GPU executable Execute state is invalid");
     llvm::DenseMap<int64_t, se::DeviceAddressBase> slots = prepared->slots;
-    if (absl::Status status =
-            externalAddresses(arguments, results, *state, slots);
-        !status.ok())
-      return status;
+    {
+      tsl::profiler::TraceMe bind("ShuttleGpuFfi::BindArguments");
+      if (absl::Status status =
+              externalAddresses(arguments, results, *state, slots);
+          !status.ok())
+        return status;
+    }
+    tsl::profiler::TraceMe launches("ShuttleGpuFfi::EnqueueKernels");
     for (const GpuLaunch &launch : state->executable->launches()) {
       SmallVector<se::KernelArg> kernelArguments;
       for (int64_t slot : launch.inputSlots) {
@@ -387,7 +446,8 @@ absl::Status execute(ffi::RemainingArgs arguments, ffi::RemainingRets results,
           se::BlockDim(launch.grid[0], launch.grid[1], launch.grid[2]),
           se::ThreadDim(launch.block[0], launch.block[1], launch.block[2]));
       if (absl::Status status = xla::gpu::ExecuteKernelOnStream(
-              *initialized->kernels[launch.taskOrdinal], kernelArguments,
+              *initialized->executable->kernels[launch.taskOrdinal],
+              kernelArguments,
               dimensions, std::nullopt, stream);
           !status.ok())
         return status;

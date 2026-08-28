@@ -100,6 +100,7 @@ cc_library(
         "lib/Transforms/ObserverTestInternal.h",
         "lib/Transforms/GpuScheduleGeometry.inc",
         "lib/Transforms/OnlineAttentionEmitter.inc",
+        "lib/Transforms/OnlineAttentionMmaEmitter.inc",
         "lib/Transforms/OnlineCompositionPlanner.inc",
         "lib/Transforms/OnlinePlanner.inc",
         "lib/Transforms/Passes.cc",
@@ -161,6 +162,7 @@ cc_library(
         "@xla//xla/stream_executor:kernel",
         "@xla//xla/stream_executor:kernel_spec",
         "@xla//xla/stream_executor:stream",
+        "@tsl//tsl/profiler/lib:traceme",
     ],
 )
 
@@ -344,6 +346,8 @@ cc_test(
     data = [
         "test/Inputs/abi22-generic-contract-fold-composition-rank2.mlir",
         "test/Inputs/abi22-generic-contract-fold-composition-rank3.mlir",
+        "test/Inputs/jax-0.10.1-bf16-causal-gqa-online-axis4.mlir",
+        "test/Inputs/jax-0.10.1-bf16-causal-gqa-online-benchmark-s2048-d128.mlir",
         "test/Inputs/jax-0.10.1-f32-causal-gqa-online-output-epilogue.mlir",
         "test/Inputs/jax-0.10.1-bf16-batched_contract-2x5x3x7x11-backward.mlir",
         "test/Inputs/jax-0.10.1-bf16-batched_contract-2x5x3x7x11-composed.mlir",

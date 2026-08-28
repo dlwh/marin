@@ -29,7 +29,10 @@ inline constexpr uint64_t kMaximumGpuEntryCodeBytes = 512 * 1024;
 inline constexpr uint64_t kMaximumGpuSlotBytes = 32 * 1024 * 1024;
 inline constexpr uint64_t kMaximumGpuTemporaryBytes = 256 * 1024 * 1024;
 inline constexpr uint64_t kMaximumGpuAggregateTaskPositions = 256 * 1024 * 1024;
-inline constexpr uint64_t kMaximumGpuDynamicSharedMemoryBytes = 16 * 1024;
+// SM90/SM100 executables may opt in above the legacy 48 KiB per-block limit.
+// Initialize still checks the concrete device's advertised opt-in capacity
+// before loading any launch.
+inline constexpr uint64_t kMaximumGpuDynamicSharedMemoryBytes = 96 * 1024;
 
 struct GpuLaunch {
   int64_t taskOrdinal;

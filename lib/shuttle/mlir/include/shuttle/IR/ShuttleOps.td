@@ -149,7 +149,8 @@ def Shuttle_MaterializationTaskOp
       OptionalAttr<ArrayAttr>:$composition_sources,
       OptionalAttr<ArrayAttr>:$composition_recomputed_sources,
       OptionalAttr<DictionaryAttr>:$composition_cost,
-      OptionalAttr<DenseI64ArrayAttr>:$online_vector_dimensions);
+      OptionalAttr<DenseI64ArrayAttr>:$online_vector_dimensions,
+      OptionalAttr<BoolAttr>:$online_mma);
 }
 
 def Shuttle_MaterializationPlanYieldOp
@@ -198,6 +199,7 @@ def Shuttle_ScheduleTaskOp
       StrAttr:$semantic_fingerprint,
       OptionalAttr<StrAttr>:$online_state_protocol,
       OptionalAttr<DenseI64ArrayAttr>:$online_vector_dimensions,
+      OptionalAttr<BoolAttr>:$online_mma,
       OptionalAttr<StrAttr>:$contract_region_strategy,
       OptionalAttr<DictionaryAttr>:$contract_region_cost);
 }

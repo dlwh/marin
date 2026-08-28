@@ -587,15 +587,15 @@ LogicalResult RelationOp::verify() {
     }
     inputs.push_back(inputType);
   }
-  const size_t expectedInputs =
-      (getSemantics() == RelationSemantics::Iota ||
-       getSemantics() == RelationSemantics::Constant)
-          ? 0
-      : (getSemantics() == RelationSemantics::Add ||
-         getSemantics() == RelationSemantics::Compare)
-          ? 2
-      : getSemantics() == RelationSemantics::Select ? 3
-                                                    : 1;
+  const size_t expectedInputs = (getSemantics() == RelationSemantics::Iota ||
+                                 getSemantics() == RelationSemantics::Constant)
+                                    ? 0
+                                : (getSemantics() == RelationSemantics::Add ||
+                                   getSemantics() == RelationSemantics::Compare)
+                                    ? 2
+                                : getSemantics() == RelationSemantics::Select
+                                    ? 3
+                                    : 1;
   if (getInputs().size() != expectedInputs) {
     return emitOpError("has input arity inconsistent with its semantics");
   }
@@ -645,8 +645,7 @@ LogicalResult RelationOp::verify() {
       return emitOpError("requires matching static i1 or i32 element types");
     }
     llvm::SmallDenseSet<int64_t> dimensions;
-    for (auto [inputDimension, parameter] :
-         llvm::enumerate(getParameters())) {
+    for (auto [inputDimension, parameter] : llvm::enumerate(getParameters())) {
       auto resultDimension = dyn_cast<IntegerAttr>(parameter);
       if (!resultDimension || resultDimension.getInt() < 0 ||
           resultDimension.getInt() >= result.getRank() ||
@@ -667,16 +666,15 @@ LogicalResult RelationOp::verify() {
   } else if (getSemantics() == RelationSemantics::Compare) {
     auto comparisonType = stringParameter(0);
     auto direction = stringParameter(1);
-    if (inputs[0] != inputs[1] ||
-        inputs[0].getShape() != result.getShape() ||
+    if (inputs[0] != inputs[1] || inputs[0].getShape() != result.getShape() ||
         !inputs[0].getElementType().isInteger(32) ||
         !result.getElementType().isInteger(1) || !comparisonType ||
         (comparisonType.getValue() != "SIGNED" &&
          comparisonType.getValue() != "UNSIGNED") ||
         !direction ||
-        !llvm::is_contained(ArrayRef<StringRef>{"EQ", "NE", "GE", "GT",
-                                                     "LE", "LT"},
-                            direction.getValue())) {
+        !llvm::is_contained(
+            ArrayRef<StringRef>{"EQ", "NE", "GE", "GT", "LE", "LT"},
+            direction.getValue())) {
       return emitOpError("requires a valid i32 comparison and i1 result");
     }
   } else if (getSemantics() == RelationSemantics::Convert) {
@@ -958,7 +956,8 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
     if (!tensorType || !tensorType.hasStaticShape() ||
         llvm::any_of(tensorType.getShape(),
                      [](int64_t extent) { return extent <= 0; }))
-      return buffer.emitOpError("requires a positive static ranked tensor type");
+      return buffer.emitOpError(
+          "requires a positive static ranked tensor type");
     std::optional<int64_t> producer =
         optionalIntegerAttribute(buffer, "producer");
     if (buffer.getLiveIn() != !producer.has_value()) {
@@ -969,8 +968,8 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
         buffer.getStorage() == MaterializationStorage::External;
     Type elementType = tensorType.getElementType();
     const bool externalElement = elementType.isF32() || elementType.isBF16();
-    const bool logicalTemporary = elementType.isInteger(1) ||
-                                  elementType.isInteger(32);
+    const bool logicalTemporary =
+        elementType.isInteger(1) || elementType.isInteger(32);
     if ((!externalElement && !(logicalTemporary && !external)))
       return buffer.emitOpError(
           "requires bf16/f32 external data or i1/i32 logical temporaries");
@@ -1075,9 +1074,8 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
         task->getAttrOfType<ArrayAttr>("composition_recomputed_sources");
     auto compositionCost =
         task->getAttrOfType<DictionaryAttr>("composition_cost");
-    const bool hasComposition =
-        compositionKind || compositionSources ||
-        compositionRecomputedSources || compositionCost;
+    const bool hasComposition = compositionKind || compositionSources ||
+                                compositionRecomputedSources || compositionCost;
     if ((hasFoldRegionPhases || hasFoldRegionOutputSources ||
          hasFoldRegionBoundaryUses || hasFoldRegionRecomputedSources) &&
         !hasFoldRegionSources) {
@@ -1107,10 +1105,9 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
           compositionKind && compositionKind.getValue() == "contract_fold";
       const bool mapContract =
           compositionKind && compositionKind.getValue() == "map_contract";
-      const bool online =
-          compositionKind &&
-          compositionKind.getValue() ==
-              "online_normalized_exponential_weighted_contract";
+      const bool online = compositionKind &&
+                          compositionKind.getValue() ==
+                              "online_normalized_exponential_weighted_contract";
       const bool legacyMetadata =
           task->hasAttr("fused_sources") ||
           task->hasAttr("composed_input_maps") ||
@@ -1130,13 +1127,13 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
           (online && compositionSources.empty()) ||
           (compositionRecomputedSources && !online) ||
           (!contractFold && !mapContract && !online) || legacyMetadata ||
-          llvm::any_of(compositionSources, [](Attribute source) {
-            return !isa<SourceRefAttr>(source);
-          }) ||
+          llvm::any_of(
+              compositionSources,
+              [](Attribute source) { return !isa<SourceRefAttr>(source); }) ||
           (compositionRecomputedSources &&
-           (llvm::any_of(compositionRecomputedSources, [](Attribute source) {
-              return !isa<SourceRefAttr>(source);
-            }) ||
+           (llvm::any_of(
+                compositionRecomputedSources,
+                [](Attribute source) { return !isa<SourceRefAttr>(source); }) ||
             llvm::any_of(compositionRecomputedSources, [&](Attribute source) {
               return llvm::is_contained(compositionSources, source);
             })))) {
@@ -1153,7 +1150,8 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
             "baseline_temporary_traffic_bytes",
             "candidate_temporary_traffic_bytes",
             "contract_evaluations"};
-        if (!compositionCost || compositionCost.size() != std::size(costFields) ||
+        if (!compositionCost ||
+            compositionCost.size() != std::size(costFields) ||
             (task.getKind() != MaterializationTaskKind::Fold &&
              task.getKind() != MaterializationTaskKind::Contract) ||
             task.getOutputBuffers().empty() || task.getDomainShape().size() > 9)
@@ -1404,17 +1402,15 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
         }
         continue;
       }
-      const bool hasEpilogue =
-          static_cast<bool>(task->getAttrOfType<ArrayAttr>(
-              "fold_epilogue_sources"));
+      const bool hasEpilogue = static_cast<bool>(
+          task->getAttrOfType<ArrayAttr>("fold_epilogue_sources"));
       const int64_t domainRank = task.getDomainShape().size();
       ArrayRef<int64_t> reductionDimensions = task.getReductionDimensions();
-      const int64_t reductionAxis = reductionDimensions.size() == 1
-                                        ? reductionDimensions.front()
-                                        : -1;
-      const bool singleAxisFold =
-          domainRank >= 1 && domainRank <= 8 && reductionAxis >= 0 &&
-          reductionAxis < domainRank;
+      const int64_t reductionAxis =
+          reductionDimensions.size() == 1 ? reductionDimensions.front() : -1;
+      const bool singleAxisFold = domainRank >= 1 && domainRank <= 8 &&
+                                  reductionAxis >= 0 &&
+                                  reductionAxis < domainRank;
       const bool fullPrefixRankNFold =
           domainRank >= 3 && domainRank <= 8 &&
           reductionDimensions.size() == static_cast<size_t>(domainRank - 1) &&
@@ -1456,13 +1452,13 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
       };
       const bool resultShapeMatches =
           resultType.getShape() == ArrayRef<int64_t>(expectedResultShape) ||
-          (hasEpilogue && isSingletonInsertion(
-                              expectedResultShape, resultType.getShape()));
+          (hasEpilogue &&
+           isSingletonInsertion(expectedResultShape, resultType.getShape()));
       if (inputType.getShape() != task.getDomainShape() ||
           !inputType.getElementType().isF32() ||
           initializerType.getRank() != 0 ||
-          !initializerType.getElementType().isF32() ||
-          !resultShapeMatches || !resultType.getElementType().isF32() ||
+          !initializerType.getElementType().isF32() || !resultShapeMatches ||
+          !resultType.getElementType().isF32() ||
           (hasEpilogue &&
            llvm::any_of(task.getInputBuffers().drop_front(2),
                         [&](int64_t bufferOrdinal) {
@@ -1927,12 +1923,11 @@ FailureOr<Simt32Geometry> simt32Geometry(ScheduleTaskKind kind,
     return failure();
   }
   const int64_t reductionAxis = rowFold ? domain.size() - 1 : 0;
-  FailureOr<int64_t> reduction =
-      rowFold ? FailureOr<int64_t>(domain.back())
-              : staticElementCount(domain.drop_back());
-  FailureOr<int64_t> outputs =
-      rowFold ? staticElementCount(domain.drop_back())
-              : FailureOr<int64_t>(domain.back());
+  FailureOr<int64_t> reduction = rowFold
+                                     ? FailureOr<int64_t>(domain.back())
+                                     : staticElementCount(domain.drop_back());
+  FailureOr<int64_t> outputs = rowFold ? staticElementCount(domain.drop_back())
+                                       : FailureOr<int64_t>(domain.back());
   if (failed(reduction) || failed(outputs) || *outputs > UINT32_MAX) {
     return failure();
   }
@@ -1973,7 +1968,7 @@ FailureOr<Simt32Geometry> contractRegionGeometry(ScheduleTaskOp task,
                               ? roundUpToSubgroup(reduction.getInt()) *
                                     static_cast<int64_t>(sizeof(float))
                               : std::min<int64_t>(reduction.getInt(), 256) * 2;
-  if (threads <= 0 || threads > 1024 || scratch < 0 || scratch > 16 * 1024)
+  if (threads <= 0 || threads > 1024 || scratch < 0 || scratch > 96 * 1024)
     return failure();
   return Simt32Geometry{{rows.getInt(), tiles.getInt()},
                         {tile.getInt()},
@@ -1986,6 +1981,12 @@ FailureOr<Simt32Geometry> contractRegionGeometry(ScheduleTaskOp task,
 }
 
 FailureOr<Simt32Geometry> onlineStateGeometry(ScheduleTaskOp task) {
+  constexpr int64_t kOnlineWarpSize = 32;
+  constexpr int64_t kOnlineWarpsPerBlock = 4;
+  constexpr int64_t kOnlineMmaRowsPerBlock = 128;
+  constexpr int64_t kOnlineMmaSharedMemoryBytes = 64 * 1024;
+  constexpr int64_t kMaximumOnlineVectorElements = 128;
+  constexpr int64_t kMaximumOnlineReductionElements = 2048;
   auto protocol = task.getOnlineStateProtocolAttr();
   auto reductionAxis = task.getReductionAxis();
   auto vectorDimensions = task.getOnlineVectorDimensions();
@@ -2003,7 +2004,8 @@ FailureOr<Simt32Geometry> onlineStateGeometry(ScheduleTaskOp task) {
   for (int64_t axis : *vectorDimensions) {
     if (axis < 0 || axis >= static_cast<int64_t>(domain.size()) ||
         axis == *reductionAxis || !vectorAxes.insert(axis).second ||
-        domain[axis] <= 0 || vectorElements > 64 / domain[axis])
+        domain[axis] <= 0 ||
+        vectorElements > kMaximumOnlineVectorElements / domain[axis])
       return failure();
     vectorElements *= domain[axis];
   }
@@ -2015,14 +2017,35 @@ FailureOr<Simt32Geometry> onlineStateGeometry(ScheduleTaskOp task) {
   FailureOr<int64_t> outputs = staticElementCount(outputShape);
   const int64_t reduction = domain[*reductionAxis];
   if (failed(outputs) || *outputs > UINT32_MAX || reduction <= 0 ||
-      reduction > 256)
+      reduction > kMaximumOnlineReductionElements)
+    return failure();
+  if (outputShape.size() < 2)
+    return failure();
+  FailureOr<int64_t> sharedRows =
+      staticElementCount(ArrayRef<int64_t>(outputShape).drop_back(2));
+  FailureOr<int64_t> localRows =
+      staticElementCount(ArrayRef<int64_t>(outputShape).take_back(2));
+  if (failed(sharedRows) || failed(localRows) || *sharedRows > UINT32_MAX ||
+      *localRows > UINT32_MAX ||
+      *sharedRows >
+          UINT32_MAX / ceilDivPositive(*localRows, kOnlineWarpsPerBlock))
     return failure();
   SmallVector<int64_t> tile(domain.size(), 1);
   tile[*reductionAxis] = reduction;
   for (int64_t axis : vectorAxes)
     tile[axis] = domain[axis];
-  return Simt32Geometry{{*outputs}, std::move(tile), 1, 1, 1, 0,
-                        *reductionAxis};
+  const int64_t rowsPerBlock = task.getOnlineMma().value_or(false)
+                                   ? kOnlineMmaRowsPerBlock
+                                   : kOnlineWarpsPerBlock;
+  return Simt32Geometry{
+      {*sharedRows * ceilDivPositive(*localRows, rowsPerBlock)},
+      std::move(tile),
+      1,
+      kOnlineWarpsPerBlock * kOnlineWarpSize,
+      kOnlineWarpSize,
+      task.getOnlineMma().value_or(false) ? kOnlineMmaSharedMemoryBytes
+                                          : 96 * 1024,
+      *reductionAxis};
 }
 
 } // namespace
@@ -2174,8 +2197,7 @@ LogicalResult SchedulePlanOp::verifyRegions() {
           "Contract-region schedule metadata requires a Contract task");
     }
     FailureOr<Simt32Geometry> expected =
-        isOnline
-            ? onlineStateGeometry(task)
+        isOnline ? onlineStateGeometry(task)
         : hasContractStrategy
             ? contractRegionGeometry(task, getPolicy())
             : simt32Geometry(task.getKind(), task.getDomainShape(),
@@ -2447,7 +2469,7 @@ LogicalResult DeviceModuleOp::verifyRegions() {
       threads *= extent;
     }
     if (*entry.getDynamicSharedBytes() < 0 ||
-        *entry.getDynamicSharedBytes() > 16 * 1024 ||
+        *entry.getDynamicSharedBytes() > 96 * 1024 ||
         *entry.getKernelArity() !=
             static_cast<int64_t>(entry.getInputBuffers().size() +
                                  entry.getOutputBuffers().size())) {
@@ -2462,8 +2484,7 @@ LogicalResult DeviceModuleOp::verifyRegions() {
       if (getPolicy() != NumericalPolicy::Fast ||
           onlineProtocol.getValue() !=
               "online_normalized_exponential_weighted_contract" ||
-          entry.getReductionOrder() !=
-              ScheduleReductionOrder::LeafOrderFree ||
+          entry.getReductionOrder() != ScheduleReductionOrder::LeafOrderFree ||
           logicalMaps.empty() || logicalMaps.size() > 8)
         return entry.emitOpError(
             "online state entry requires FAST merge-order semantics");
@@ -2612,8 +2633,8 @@ LogicalResult InvocationAbiOp::verifyRegions() {
     std::optional<int64_t> bindingIndex = slot.getBindingIndex();
     if (slot.getBinding() != expectedBinding ||
         ((expectedBinding == ExecutableBindingKind::None) != !bindingIndex) ||
-        (bindingIndex &&
-         (*bindingIndex < 0 || !bindingIndices->insert(*bindingIndex).second))) {
+        (bindingIndex && (*bindingIndex < 0 ||
+                          !bindingIndices->insert(*bindingIndex).second))) {
       return slot.emitOpError(
           "binding kind and index must uniquely identify the external ABI");
     }

@@ -1957,10 +1957,12 @@ TEST(GpuTransportV2Test, Abi17ThroughAbi21PreserveEveryTransportAndRuntimeCap) {
       raisedEntry);
 
   llvm::SmallVector<uint8_t> sharedCap(*bytes);
-  writeU32(sharedCap, decoded->launchSharedOffsets.front(), 16 * 1024 + 4);
+  writeU32(sharedCap, decoded->launchSharedOffsets.front(),
+           mlir::shuttle::kMaximumGpuDynamicSharedMemoryBytes + 4);
   rehashDeviceAndBundle(sharedCap, *decoded);
   DecodeLimits raisedShared;
-  raisedShared.sharedBytes = 16 * 1024 + 4;
+  raisedShared.sharedBytes =
+      mlir::shuttle::kMaximumGpuDynamicSharedMemoryBytes + 4;
   expectOnlyCapsRejected("shared", sharedCap, raisedShared);
 
   const auto positionsPacket = completeSchema2Packet(
@@ -4034,6 +4036,20 @@ TEST(GpuTransportV2Test, ExportedFfiBundleOwnsEveryLifecycleStage) {
                                XLA_FFI_ExecutionStage_INITIALIZE)
                   .ok());
   expectLoadedKernels(*decoded, *trace, 0);
+
+  // XLA creates a fresh initialize-state container for every execution. The
+  // compilation-scoped instantiate state must reuse the driver-loaded kernels
+  // for the same StreamExecutor instead of loading every PTX module again.
+  xla::ffi::ExecutionState repeatedInitializeState;
+  xla::ffi::InvokeContext repeatedInitializeContext = context;
+  repeatedInitializeContext.state_context.initialize =
+      &repeatedInitializeState;
+  ASSERT_TRUE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(), handlers.initialize,
+                               frame, repeatedInitializeContext,
+                               XLA_FFI_ExecutionStage_INITIALIZE)
+                  .ok());
+  expectLoadedKernels(*decoded, *trace, 0);
+
   ASSERT_TRUE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(), handlers.execute,
                                frame, context, XLA_FFI_ExecutionStage_EXECUTE)
                   .ok());
@@ -6886,7 +6902,7 @@ TEST(GpuTransportV2Test,
 
 std::vector<float> causalGqaEpilogueReference(
     llvm::ArrayRef<float> q, llvm::ArrayRef<float> k,
-  llvm::ArrayRef<float> v) {
+    llvm::ArrayRef<float> v, bool applyEpilogue = true) {
   constexpr int64_t batches = 1;
   constexpr int64_t heads = 2;
   constexpr int64_t groups = 2;
@@ -6941,7 +6957,9 @@ std::vector<float> causalGqaEpilogueReference(
               output += weight * v[vIndex(batch, head, key, value)];
             }
             result[resultIndex(batch, head, group, query, value)] =
-                static_cast<float>(std::tanh(output * 0.5) + 0.25);
+                applyEpilogue
+                    ? static_cast<float>(std::tanh(output * 0.5) + 0.25)
+                    : static_cast<float>(output);
           }
         }
       }
@@ -7148,6 +7166,316 @@ TEST(GpuTransportV2Test, H100RunnerMatchesIndependentFastAttentionOracle) {
   EXPECT_TRUE(allFinite);
   EXPECT_LE(maximumAbsoluteError, 3.0e-3);
   EXPECT_LE(meanAbsoluteError, 5.0e-4);
+  runner->reset();
+  (*executor)->Deallocate(&deviceResult);
+  for (auto &device : deviceOperands)
+    (*executor)->Deallocate(&device);
+}
+
+TEST(GpuTransportV2Test,
+     H100RunnerMatchesIndependentBf16FastAttentionOracle) {
+  if (std::getenv("SHUTTLE_RUN_H100_ATTENTION_NUMERICS") == nullptr)
+    GTEST_SKIP() << "set SHUTTLE_RUN_H100_ATTENTION_NUMERICS=1 on an H100";
+  auto platform = stream_executor::PlatformManager::PlatformWithName("CUDA");
+  ASSERT_TRUE(platform.ok()) << platform.status();
+  auto executor = (*platform)->ExecutorForDevice(0);
+  ASSERT_TRUE(executor.ok()) << executor.status();
+  ASSERT_NE((*executor)->GetDeviceDescription().name().find("H100"),
+            std::string::npos);
+  auto stream = (*executor)->CreateStream();
+  ASSERT_TRUE(stream.ok()) << stream.status();
+  stream_executor::StreamExecutorAddressAllocator allocator(*executor);
+  const auto &capability =
+      (*executor)->GetDeviceDescription().gpu_compute_capability();
+
+  auto source = fixtureSource("jax-0.10.1-bf16-causal-gqa-online-axis4.mlir");
+  ASSERT_TRUE(source);
+  constexpr llvm::StringLiteral options =
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+  constexpr llvm::StringLiteral tuning =
+      R"json({"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json";
+  auto built = buildFixture(*source, mlir::shuttle::NumericalPolicy::Fast,
+                            options, tuning);
+  ASSERT_TRUE(built);
+  auto transport = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+  ASSERT_TRUE(mlir::succeeded(transport));
+  auto runner = mlir::shuttle::GpuRunner::Create(
+      *transport, &allocator, 0, stream->get(), &capability);
+  ASSERT_TRUE(runner.ok()) << runner.status();
+
+  std::vector<uint16_t> q(1 * 2 * 2 * 17 * 8);
+  std::vector<uint16_t> k(1 * 2 * 17 * 8);
+  std::vector<uint16_t> v(1 * 2 * 17 * 7);
+  for (size_t index = 0; index < q.size(); ++index)
+    q[index] = roundToBf16(
+        -0.7f + static_cast<float>((index * 17) % 101) / 71.0f);
+  for (size_t index = 0; index < k.size(); ++index)
+    k[index] = roundToBf16(
+        -0.6f + static_cast<float>((index * 13) % 97) / 67.0f);
+  for (size_t index = 0; index < v.size(); ++index)
+    v[index] = roundToBf16(
+        -0.9f + static_cast<float>((index * 19) % 109) / 59.0f);
+  std::vector<float> qFloat(q.size());
+  std::vector<float> kFloat(k.size());
+  std::vector<float> vFloat(v.size());
+  llvm::transform(q, qFloat.begin(), expandBf16);
+  llvm::transform(k, kFloat.begin(), expandBf16);
+  llvm::transform(v, vFloat.begin(), expandBf16);
+  std::vector<float> expected =
+      causalGqaEpilogueReference(qFloat, kFloat, vFloat,
+                                 /*applyEpilogue=*/false);
+  llvm::transform(expected, expected.begin(), [](float value) {
+    return expandBf16(roundToBf16(value));
+  });
+
+  std::vector<std::vector<uint16_t>> hostOperands{q, k, v};
+  std::vector<stream_executor::DeviceAddressBase> deviceOperands;
+  llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> operands;
+  for (const std::vector<uint16_t> &host : hostOperands) {
+    auto device = (*executor)->AllocateArray<uint16_t>(host.size());
+    ASSERT_TRUE(device);
+    ASSERT_TRUE((*executor)
+                    ->SynchronousMemcpyH2D(host.data(),
+                                           host.size() * sizeof(uint16_t),
+                                           &device)
+                    .ok());
+    operands.push_back(
+        {device.opaque(), static_cast<int64_t>(device.size())});
+    deviceOperands.push_back(device);
+  }
+  std::vector<uint16_t> actual(expected.size(), 0x7FC1);
+  auto deviceResult = (*executor)->AllocateArray<uint16_t>(actual.size());
+  ASSERT_TRUE(deviceResult);
+  ASSERT_TRUE((*executor)
+                  ->SynchronousMemcpyH2D(actual.data(),
+                                         actual.size() * sizeof(uint16_t),
+                                         &deviceResult)
+                  .ok());
+  llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> results{{
+      deviceResult.opaque(), static_cast<int64_t>(deviceResult.size())}};
+  ASSERT_TRUE((*runner)->Execute(operands, results).ok());
+  ASSERT_TRUE((*runner)->AwaitCompletion().ok());
+  ASSERT_TRUE((*executor)
+                  ->SynchronousMemcpyD2H(deviceResult,
+                                         actual.size() * sizeof(uint16_t),
+                                         actual.data())
+                  .ok());
+  double maximumAbsoluteError = 0.0;
+  double meanAbsoluteError = 0.0;
+  for (auto [index, bits] : llvm::enumerate(actual)) {
+    const double error = std::abs(
+        static_cast<double>(expandBf16(bits)) - expected[index]);
+    maximumAbsoluteError = std::max(maximumAbsoluteError, error);
+    meanAbsoluteError += error;
+  }
+  meanAbsoluteError /= actual.size();
+  EXPECT_LE(maximumAbsoluteError, 1.5e-2);
+  EXPECT_LE(meanAbsoluteError, 3.0e-3);
+  runner->reset();
+  (*executor)->Deallocate(&deviceResult);
+  for (auto &device : deviceOperands)
+    (*executor)->Deallocate(&device);
+}
+
+TEST(GpuTransportV2Test,
+     H100RunnerMatchesIndependentBf16S2048D128FastAttentionOracle) {
+  if (std::getenv("SHUTTLE_RUN_H100_ATTENTION_NUMERICS") == nullptr)
+    GTEST_SKIP() << "set SHUTTLE_RUN_H100_ATTENTION_NUMERICS=1 on an H100";
+  auto platform = stream_executor::PlatformManager::PlatformWithName("CUDA");
+  ASSERT_TRUE(platform.ok()) << platform.status();
+  auto executor = (*platform)->ExecutorForDevice(0);
+  ASSERT_TRUE(executor.ok()) << executor.status();
+  ASSERT_NE((*executor)->GetDeviceDescription().name().find("H100"),
+            std::string::npos);
+  auto stream = (*executor)->CreateStream();
+  ASSERT_TRUE(stream.ok()) << stream.status();
+  stream_executor::StreamExecutorAddressAllocator allocator(*executor);
+  const auto &capability =
+      (*executor)->GetDeviceDescription().gpu_compute_capability();
+
+  auto source = fixtureSource(
+      "jax-0.10.1-bf16-causal-gqa-online-benchmark-s2048-d128.mlir");
+  ASSERT_TRUE(source);
+  constexpr llvm::StringLiteral options =
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+  constexpr llvm::StringLiteral tuning =
+      R"json({"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json";
+  auto built = buildFixture(*source, mlir::shuttle::NumericalPolicy::Fast,
+                            options, tuning);
+  ASSERT_TRUE(built);
+  auto transport = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+  ASSERT_TRUE(mlir::succeeded(transport));
+  auto runner = mlir::shuttle::GpuRunner::Create(
+      *transport, &allocator, 0, stream->get(), &capability);
+  ASSERT_TRUE(runner.ok()) << runner.status();
+
+  constexpr int64_t batches = 1;
+  constexpr int64_t heads = 8;
+  constexpr int64_t groups = 4;
+  constexpr int64_t sequence = 2048;
+  constexpr int64_t dimension = 128;
+  constexpr int64_t warmupIterations = 10;
+  constexpr int64_t measuredIterations = 51;
+  std::vector<uint16_t> q(batches * heads * groups * sequence * dimension);
+  std::vector<uint16_t> k(batches * heads * sequence * dimension);
+  std::vector<uint16_t> v(batches * heads * sequence * dimension);
+  auto queryIndex = [=](int64_t head, int64_t group, int64_t query,
+                        int64_t feature) {
+    return (((head * groups + group) * sequence + query) * dimension) +
+           feature;
+  };
+  auto keyIndex = [=](int64_t head, int64_t key, int64_t feature) {
+    return (head * sequence + key) * dimension + feature;
+  };
+  auto valueIndex = [=](int64_t head, int64_t key, int64_t value) {
+    return (head * sequence + key) * dimension + value;
+  };
+  for (int64_t head = 0; head < heads; ++head)
+    for (int64_t key = 0; key < sequence; ++key) {
+      for (int64_t feature = 0; feature < dimension; ++feature)
+        k[keyIndex(head, key, feature)] = roundToBf16(
+            static_cast<float>((head * 11 + key * 7 + feature * 13) % 29 -
+                               14) /
+            16.0f);
+      for (int64_t value = 0; value < dimension; ++value)
+        v[valueIndex(head, key, value)] = roundToBf16(
+            -0.75f + static_cast<float>((head * 29 + key * 17 + value * 7) %
+                                        127) /
+                         79.0f);
+    }
+  for (int64_t head = 0; head < heads; ++head)
+    for (int64_t group = 0; group < groups; ++group)
+      for (int64_t query = 0; query < sequence; ++query)
+        for (int64_t feature = 0; feature < dimension; ++feature)
+          q[queryIndex(head, group, query, feature)] = roundToBf16(
+              static_cast<float>((head * 17 + group * 19 + query * 5 +
+                                  feature * 11) %
+                                     31 -
+                                 15) /
+              16.0f);
+
+  std::vector<std::vector<uint16_t>> hostOperands{q, k, v};
+  std::vector<stream_executor::DeviceAddressBase> deviceOperands;
+  llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> operands;
+  for (const std::vector<uint16_t> &host : hostOperands) {
+    auto device = (*executor)->AllocateArray<uint16_t>(host.size());
+    ASSERT_TRUE(device);
+    ASSERT_TRUE((*executor)
+                    ->SynchronousMemcpyH2D(
+                        host.data(), host.size() * sizeof(uint16_t), &device)
+                    .ok());
+    operands.push_back(
+        {device.opaque(), static_cast<int64_t>(device.size())});
+    deviceOperands.push_back(device);
+  }
+  std::vector<uint16_t> actual(q.size(), UINT16_C(0x7FC1));
+  auto deviceResult = (*executor)->AllocateArray<uint16_t>(actual.size());
+  ASSERT_TRUE(deviceResult);
+  ASSERT_TRUE((*executor)
+                  ->SynchronousMemcpyH2D(actual.data(),
+                                         actual.size() * sizeof(uint16_t),
+                                         &deviceResult)
+                  .ok());
+  llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> results{{
+      deviceResult.opaque(), static_cast<int64_t>(deviceResult.size())}};
+
+  for (int64_t iteration = 0; iteration < warmupIterations; ++iteration) {
+    absl::Status status = (*runner)->Execute(operands, results);
+    ASSERT_TRUE(status.ok()) << status;
+  }
+  std::vector<int64_t> samples;
+  samples.reserve(measuredIterations);
+  for (int64_t iteration = 0; iteration < measuredIterations; ++iteration) {
+    auto elapsed = (*runner)->ExecuteTimed(operands, results);
+    ASSERT_TRUE(elapsed.ok()) << elapsed.status();
+    ASSERT_GT(*elapsed, 0);
+    samples.push_back(*elapsed);
+  }
+  ASSERT_TRUE((*executor)
+                  ->SynchronousMemcpyD2H(deviceResult,
+                                         actual.size() * sizeof(uint16_t),
+                                         actual.data())
+                  .ok());
+  double maximumAbsoluteError = 0.0;
+  double meanAbsoluteError = 0.0;
+  int64_t checkedElements = 0;
+  auto resultIndex = [=](int64_t head, int64_t group, int64_t query,
+                         int64_t value) {
+    return (((head * groups + group) * sequence + query) * dimension) + value;
+  };
+  constexpr std::array<int64_t, 5> heldoutQueries{0, 17, 257, 1023, 2047};
+  constexpr std::array<int64_t, 2> heldoutHeads{0, 7};
+  constexpr std::array<int64_t, 2> heldoutGroups{0, 3};
+  constexpr std::array<int64_t, 5> heldoutValues{0, 1, 31, 63, 127};
+  constexpr double scoreScale = 0.0883883461;
+  for (int64_t head : heldoutHeads) {
+    for (int64_t group : heldoutGroups) {
+      for (int64_t query : heldoutQueries) {
+        std::vector<double> scores(query + 1);
+        double maximum = -std::numeric_limits<double>::infinity();
+        for (int64_t key = 0; key <= query; ++key) {
+          double dot = 0.0;
+          for (int64_t feature = 0; feature < dimension; ++feature)
+            dot += expandBf16(q[queryIndex(head, group, query, feature)]) *
+                   expandBf16(k[keyIndex(head, key, feature)]);
+          scores[key] = dot * scoreScale;
+          maximum = std::max(maximum, scores[key]);
+        }
+        double denominator = 0.0;
+        std::array<double, heldoutValues.size()> numerators{};
+        for (int64_t key = 0; key <= query; ++key) {
+          const double weight = std::exp(scores[key] - maximum);
+          denominator += weight;
+          for (auto [slot, value] : llvm::enumerate(heldoutValues))
+            numerators[slot] +=
+                weight * expandBf16(v[valueIndex(head, key, value)]);
+        }
+        for (auto [slot, value] : llvm::enumerate(heldoutValues)) {
+          const size_t index = resultIndex(head, group, query, value);
+          ASSERT_NE(actual[index], UINT16_C(0x7FC1))
+              << "head=" << head << " group=" << group
+              << " query=" << query << " value=" << value
+              << " index=" << index;
+          const double actualValue = expandBf16(actual[index]);
+          const double expectedValue = expandBf16(roundToBf16(
+              static_cast<float>(numerators[slot] / denominator)));
+          const double error = std::abs(actualValue - expectedValue);
+          maximumAbsoluteError = std::max(maximumAbsoluteError, error);
+          meanAbsoluteError += error;
+          ++checkedElements;
+        }
+      }
+    }
+  }
+  ASSERT_GT(checkedElements, 0);
+  meanAbsoluteError /= checkedElements;
+  EXPECT_LE(maximumAbsoluteError, 1.5e-2);
+  EXPECT_LE(meanAbsoluteError, 3.0e-3);
+
+  std::vector<int64_t> sortedSamples = samples;
+  llvm::sort(sortedSamples);
+  llvm::json::Array rawSamples;
+  for (int64_t sample : samples)
+    rawSamples.push_back(sample);
+  llvm::json::Object report{
+      {"schema", "shuttle_fast_attention_native_timing_v1"},
+      {"shape", llvm::json::Object{{"batch", batches},
+                                   {"query_heads", heads * groups},
+                                   {"kv_heads", heads},
+                                   {"sequence", sequence},
+                                   {"qk_dimension", dimension},
+                                   {"value_dimension", dimension}}},
+      {"dtype", "bf16"},
+      {"warmup_iterations", warmupIterations},
+      {"measured_iterations", measuredIterations},
+      {"cuda_event_samples_ns", std::move(rawSamples)},
+      {"median_ns", sortedSamples[measuredIterations / 2]},
+      {"maximum_absolute_error", maximumAbsoluteError},
+      {"mean_absolute_error", meanAbsoluteError}};
+  std::cout << "FAST_ATTENTION_NATIVE_TIMING="
+            << llvm::formatv("{0}", llvm::json::Value(std::move(report))).str()
+            << '\n';
+
   runner->reset();
   (*executor)->Deallocate(&deviceResult);
   for (auto &device : deviceOperands)

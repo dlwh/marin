@@ -111,12 +111,12 @@ FailureOr<ScheduledGeometry> deriveSimt32Geometry(ScheduleTaskKind kind,
     return failure();
   }
   const int64_t reductionAxis = rowFold ? domain.size() - 1 : 0;
-  FailureOr<int64_t> reduction =
-      rowFold ? FailureOr<int64_t>(domain.back())
-              : scheduleElementCount(domain.drop_back());
-  FailureOr<int64_t> outputs =
-      rowFold ? scheduleElementCount(domain.drop_back())
-              : FailureOr<int64_t>(domain.back());
+  FailureOr<int64_t> reduction = rowFold
+                                     ? FailureOr<int64_t>(domain.back())
+                                     : scheduleElementCount(domain.drop_back());
+  FailureOr<int64_t> outputs = rowFold
+                                   ? scheduleElementCount(domain.drop_back())
+                                   : FailureOr<int64_t>(domain.back());
   if (failed(reduction) || failed(outputs) || *outputs > UINT32_MAX) {
     return failure();
   }
@@ -135,6 +135,17 @@ FailureOr<ScheduledGeometry> deriveSimt32Geometry(ScheduleTaskKind kind,
 
 FailureOr<ScheduledGeometry>
 deriveOnlineStateGeometry(MaterializationTaskOp task) {
+  constexpr int64_t kOnlineWarpSize = 32;
+  constexpr int64_t kOnlineWarpsPerBlock = 4;
+  // The current SM90 MMA lowering assigns one m16 row fragment to each warp.
+  // This is the resource-safe half-size form of the M128/N64 tuning target;
+  // the emitter may grow it to two row fragments per warp when its register
+  // budget admits the full target.
+  constexpr int64_t kOnlineMmaRowsPerBlock = 128;
+  // Persistent Q plus one K and one V tile. Probabilities remain in registers.
+  constexpr int64_t kOnlineMmaSharedMemoryBytes = 64 * 1024;
+  constexpr int64_t kMaximumOnlineVectorElements = 128;
+  constexpr int64_t kMaximumOnlineReductionElements = 2048;
   ArrayRef<int64_t> domain = task.getDomainShape();
   ArrayRef<int64_t> reductions = task.getReductionDimensions();
   auto vectorDimensions = task.getOnlineVectorDimensions();
@@ -150,7 +161,8 @@ deriveOnlineStateGeometry(MaterializationTaskOp task) {
   for (int64_t axis : *vectorDimensions) {
     if (axis < 0 || axis >= static_cast<int64_t>(domain.size()) ||
         axis == reductionAxis || !vectorAxes.insert(axis).second ||
-        domain[axis] <= 0 || vectorElements > 64 / domain[axis])
+        domain[axis] <= 0 ||
+        vectorElements > kMaximumOnlineVectorElements / domain[axis])
       return failure();
     vectorElements *= domain[axis];
   }
@@ -161,14 +173,35 @@ deriveOnlineStateGeometry(MaterializationTaskOp task) {
       outputShape.push_back(extent);
   FailureOr<int64_t> outputs = scheduleElementCount(outputShape);
   if (failed(outputs) || *outputs > UINT32_MAX || reduction <= 0 ||
-      reduction > 256)
+      reduction > kMaximumOnlineReductionElements)
+    return failure();
+  if (outputShape.size() < 2)
+    return failure();
+  FailureOr<int64_t> sharedRows =
+      scheduleElementCount(ArrayRef<int64_t>(outputShape).drop_back(2));
+  FailureOr<int64_t> localRows =
+      scheduleElementCount(ArrayRef<int64_t>(outputShape).take_back(2));
+  if (failed(sharedRows) || failed(localRows) || *sharedRows > UINT32_MAX ||
+      *localRows > UINT32_MAX ||
+      *sharedRows >
+          UINT32_MAX / ceilDivPositive(*localRows, kOnlineWarpsPerBlock))
     return failure();
   SmallVector<int64_t> tile(domain.size(), 1);
   tile[reductionAxis] = reduction;
   for (int64_t axis : vectorAxes)
     tile[axis] = domain[axis];
-  return ScheduledGeometry{{*outputs}, std::move(tile), 1, 1, 1, 0,
-                           reductionAxis};
+  const bool onlineMma = task.getOnlineMma().value_or(false);
+  const int64_t rowsPerBlock =
+      onlineMma ? kOnlineMmaRowsPerBlock : kOnlineWarpsPerBlock;
+  return ScheduledGeometry{
+      {*sharedRows * ceilDivPositive(*localRows, rowsPerBlock)},
+      std::move(tile),
+      1,
+      kOnlineWarpsPerBlock * kOnlineWarpSize,
+      kOnlineWarpSize,
+      onlineMma ? kOnlineMmaSharedMemoryBytes
+                : static_cast<int64_t>(kMaximumGpuDynamicSharedMemoryBytes),
+      reductionAxis};
 }
 
 FailureOr<ScheduledGeometry>
