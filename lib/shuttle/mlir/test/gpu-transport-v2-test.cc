@@ -27,9 +27,11 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/SymbolTable.h"
+#include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
 #include "shuttle/IR/ShuttleDialect.h"
@@ -62,6 +64,59 @@
 #include "gtest/gtest.h"
 
 namespace {
+
+std::optional<int64_t>
+evaluateAffineExpression(mlir::AffineExpr expression,
+                         llvm::ArrayRef<int64_t> coordinates) {
+  if (auto dimension = llvm::dyn_cast<mlir::AffineDimExpr>(expression)) {
+    if (dimension.getPosition() >= coordinates.size())
+      return std::nullopt;
+    return coordinates[dimension.getPosition()];
+  }
+  if (auto constant = llvm::dyn_cast<mlir::AffineConstantExpr>(expression))
+    return constant.getValue();
+  auto binary = llvm::dyn_cast<mlir::AffineBinaryOpExpr>(expression);
+  if (!binary)
+    return std::nullopt;
+  std::optional<int64_t> lhs =
+      evaluateAffineExpression(binary.getLHS(), coordinates);
+  std::optional<int64_t> rhs =
+      evaluateAffineExpression(binary.getRHS(), coordinates);
+  if (!lhs || !rhs)
+    return std::nullopt;
+  switch (binary.getKind()) {
+  case mlir::AffineExprKind::Add:
+    return *lhs + *rhs;
+  case mlir::AffineExprKind::Mul:
+    return *lhs * *rhs;
+  case mlir::AffineExprKind::FloorDiv:
+    if (*rhs <= 0)
+      return std::nullopt;
+    return *lhs / *rhs;
+  case mlir::AffineExprKind::Mod:
+    if (*rhs <= 0)
+      return std::nullopt;
+    return *lhs % *rhs;
+  default:
+    return std::nullopt;
+  }
+}
+
+std::optional<std::vector<int64_t>>
+evaluateAffineMap(mlir::AffineMap map, llvm::ArrayRef<int64_t> coordinates) {
+  if (map.getNumDims() != coordinates.size() || map.getNumSymbols() != 0)
+    return std::nullopt;
+  std::vector<int64_t> results;
+  results.reserve(map.getNumResults());
+  for (mlir::AffineExpr expression : map.getResults()) {
+    std::optional<int64_t> result =
+        evaluateAffineExpression(expression, coordinates);
+    if (!result)
+      return std::nullopt;
+    results.push_back(*result);
+  }
+  return results;
+}
 
 std::vector<mlir::shuttle::GpuExternalBinding>
 externalBindingsBySlot(const mlir::shuttle::GpuExecutable &executable) {
@@ -150,10 +205,10 @@ std::string sha256(llvm::ArrayRef<uint8_t> prefix,
   return llvm::toHex(sha.final(), true);
 }
 
-std::string performanceWorkloadDigest(
-    llvm::StringRef caseName, llvm::StringRef policy,
-    llvm::ArrayRef<int64_t> shape,
-    llvm::ArrayRef<std::vector<uint16_t>> operands) {
+std::string
+performanceWorkloadDigest(llvm::StringRef caseName, llvm::StringRef policy,
+                          llvm::ArrayRef<int64_t> shape,
+                          llvm::ArrayRef<std::vector<uint16_t>> operands) {
   llvm::SHA256 sha;
   auto updateInteger = [&](uint64_t value) {
     std::array<uint8_t, 8> bytes;
@@ -231,9 +286,9 @@ private:
 };
 
 llvm::SmallVector<uint8_t>
-completeSchema2Packet(llvm::ArrayRef<uint64_t> codeLengths,
-                      uint32_t gridX = 1, uint32_t sharedBytes = 0,
-                      uint64_t temporaryRank = 1) {
+completeSchema2Packet(llvm::ArrayRef<uint64_t> codeLengths, uint32_t gridX = 1,
+                      uint32_t sharedBytes = 0, uint64_t temporaryRank = 1,
+                      llvm::ArrayRef<int64_t> externalShape = {1}) {
   if (codeLengths.size() < 2)
     return {};
   const std::string schedule(64, 'a');
@@ -309,16 +364,25 @@ completeSchema2Packet(llvm::ArrayRef<uint64_t> codeLengths,
   for (uint64_t ordinal = 0; ordinal < slotCount; ++ordinal) {
     const bool external = ordinal == 0 || ordinal + 1 == slotCount;
     const uint8_t element = external ? 0 : 1;
-    const uint64_t rank = !external && ordinal == 1 ? temporaryRank : 1;
+    const uint64_t rank =
+        external ? externalShape.size() : (ordinal == 1 ? temporaryRank : 1);
+    llvm::SmallVector<int64_t> shape =
+        external ? llvm::SmallVector<int64_t>(externalShape)
+                 : llvm::SmallVector<int64_t>(rank, 1);
     const int64_t width = element == 0 ? 2 : 4;
     invocationSuffix.i64(ordinal);
     invocationSuffix.i64(ordinal);
     invocationSuffix.u8(element);
     invocationSuffix.u64(rank);
-    for (uint64_t axis = 0; axis < rank; ++axis)
-      invocationSuffix.i64(1);
-    invocationSuffix.i64(width);
-    llvm::SmallVector<int64_t> strides(rank, width);
+    for (int64_t extent : shape)
+      invocationSuffix.i64(extent);
+    int64_t requiredBytes = width;
+    llvm::SmallVector<int64_t> strides(rank);
+    for (uint64_t axis = rank; axis > 0; --axis) {
+      strides[axis - 1] = requiredBytes;
+      requiredBytes *= shape[axis - 1];
+    }
+    invocationSuffix.i64(requiredBytes);
     invocationSuffix.integers(strides);
     invocationSuffix.i64(0);
     invocationSuffix.i64(width);
@@ -362,7 +426,7 @@ bool isDigest(llvm::StringRef value) {
 
 struct Decoded {
   llvm::SmallVector<uint8_t> code;
-  llvm::SmallVector<mlir::shuttle::GpuLaunch> launches;
+  llvm::SmallVector<mlir::shuttle::GpuLaunch, 0> launches;
   uint8_t policy = 0;
   uint64_t devicePolicyOffset = 0;
   llvm::SmallVector<int64_t> slotReuseGroups;
@@ -417,13 +481,12 @@ struct DecodeLimits {
   uint64_t taskPositions = 256 * 1024 * 1024;
   uint64_t sharedBytes = 16 * 1024;
   uint64_t rank = 8;
-  uint64_t slotBytes = 32 * 1024 * 1024;
+  uint64_t temporarySlotBytes = 32 * 1024 * 1024;
   uint64_t temporaryBytes = 256 * 1024 * 1024;
 };
 
-std::optional<Decoded>
-decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes,
-                    DecodeLimits limits = {}) {
+std::optional<Decoded> decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes,
+                                           DecodeLimits limits = {}) {
   if (bytes.size() > limits.transportBytes)
     return std::nullopt;
   Reader reader(bytes);
@@ -461,7 +524,7 @@ decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes,
   if (!isDigest(deviceRoot) || entryCount == 0 || entryCount > limits.records)
     return std::nullopt;
 
-  llvm::SmallVector<mlir::shuttle::GpuLaunch> launches;
+  llvm::SmallVector<mlir::shuttle::GpuLaunch, 0> launches;
   llvm::SmallVector<uint64_t> launchGridOffsets;
   llvm::SmallVector<uint64_t> launchFirstInputOffsets;
   llvm::SmallVector<uint64_t> entryLengthOffsets;
@@ -504,8 +567,15 @@ decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes,
         reader.u8() > 1)
       return std::nullopt;
     uint8_t hasReduction = reader.u8();
-    if (hasReduction > 1 || (hasReduction && reader.u8() > 0))
+    if (hasReduction > 1)
       return std::nullopt;
+    if (hasReduction) {
+      const uint8_t reduction = reader.u8();
+      if (reduction >
+          static_cast<uint8_t>(mlir::shuttle::ScheduleReductionOrder::
+                                   StableTotalOrderLeafOrderFixed))
+        return std::nullopt;
+    }
     uint64_t entryDigestPayloadOffset = 0;
     llvm::StringRef codeDigest = reader.text(&entryDigestPayloadOffset);
     auto slice = code.slice(nextOffset, length);
@@ -518,8 +588,7 @@ decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes,
     launchSharedOffsets.push_back(reader.position());
     uint32_t shared = reader.u32();
     if (llvm::is_contained(grid, 0) || llvm::is_contained(block, 0) ||
-        block[0] * block[1] * block[2] > 1024 ||
-        shared > limits.sharedBytes ||
+        block[0] * block[1] * block[2] > 1024 || shared > limits.sharedBytes ||
         reader.u16() != inputs.size() + outputs.size())
       return std::nullopt;
     uint64_t positions = 1;
@@ -562,8 +631,7 @@ decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes,
   uint64_t invocationSuffixStart = reader.position();
   uint64_t invocationSlotCountOffset = reader.position();
   uint64_t slotCount = reader.u64();
-  if (!isDigest(invocationRoot) || slotCount == 0 ||
-      slotCount > limits.records)
+  if (!isDigest(invocationRoot) || slotCount == 0 || slotCount > limits.records)
     return std::nullopt;
   uint64_t temporaryBytes = 0;
   int64_t scalarSlots = 0;
@@ -588,7 +656,7 @@ decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes,
     if (reader.i64() != ordinal || reader.i64() != ordinal)
       return std::nullopt;
     uint8_t elementType = reader.u8();
-    if (elementType > 1)
+    if (elementType > 3)
       return std::nullopt;
     slotRankOffsets.push_back(reader.position());
     uint64_t rank = reader.u64();
@@ -596,7 +664,7 @@ decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes,
       return std::nullopt;
     llvm::SmallVector<int64_t> dimensions;
     llvm::SmallVector<uint64_t> dimensionOffsets;
-    int64_t expectedBytes = elementType == 0 ? 2 : 4;
+    int64_t expectedBytes = elementType == 0 ? 2 : elementType == 2 ? 1 : 4;
     for (uint64_t axis = 0; axis < rank; ++axis) {
       dimensionOffsets.push_back(reader.position());
       int64_t extent = reader.i64();
@@ -614,10 +682,10 @@ decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes,
     int64_t alignment = reader.i64();
     uint8_t addressSpace = reader.u8();
     uint8_t access = reader.u8();
-    if (required != expectedBytes ||
-        required > static_cast<int64_t>(limits.slotBytes) ||
-        strides.size() != rank || offset != 0 ||
-        alignment != (elementType == 0 ? 2 : 4) || addressSpace != 1 ||
+    if (required != expectedBytes || strides.size() != rank || offset != 0 ||
+        alignment != (elementType == 0   ? 2
+                      : elementType == 2 ? 1
+                                         : 4) ||
         access > 2)
       return std::nullopt;
     uint8_t storage = reader.u8();
@@ -644,6 +712,8 @@ decodeInlineSchema2(llvm::ArrayRef<uint8_t> bytes,
     if (rank == 0)
       ++scalarSlots;
     if (storage == 1) {
+      if (required > static_cast<int64_t>(limits.temporarySlotBytes))
+        return std::nullopt;
       if (binding != 0 || hasBindingIndex || access != 2)
         return std::nullopt;
       auto inserted = temporaryGroupIndexes.try_emplace(
@@ -834,9 +904,9 @@ void rehashDeviceAndBundle(llvm::MutableArrayRef<uint8_t> bytes,
 }
 
 llvm::SmallVector<uint8_t>
-replaceEntryCodeAndRehash(llvm::ArrayRef<uint8_t> bytes,
-                          const Decoded &decoded, int64_t entry,
-                          llvm::StringRef from, llvm::StringRef to) {
+replaceEntryCodeAndRehash(llvm::ArrayRef<uint8_t> bytes, const Decoded &decoded,
+                          int64_t entry, llvm::StringRef from,
+                          llvm::StringRef to) {
   if (entry < 0 || entry >= static_cast<int64_t>(decoded.launches.size()) ||
       from.size() != to.size())
     return {};
@@ -858,29 +928,6 @@ replaceEntryCodeAndRehash(llvm::ArrayRef<uint8_t> bytes,
               sha256(code.slice(launch.codeOffset, launch.codeLength)));
   rehashDeviceAndBundle(result, decoded);
   return result;
-}
-
-std::optional<std::string>
-projectedF32LoadedRegister(llvm::StringRef ptx, int64_t inputPointer) {
-  std::string suffix =
-      (", [%rd" + llvm::Twine(inputPointer) + "];").str();
-  std::optional<std::string> loaded;
-  llvm::SmallVector<llvm::StringRef> lines;
-  ptx.split(lines, '\n');
-  for (llvm::StringRef line : lines) {
-    line = line.trim();
-    if (!line.starts_with("ld.global.f32 ") || !line.ends_with(suffix))
-      continue;
-    if (loaded)
-      return std::nullopt;
-    llvm::StringRef destination =
-        line.drop_front(llvm::StringRef("ld.global.f32 ").size())
-            .drop_back(suffix.size());
-    if (!destination.starts_with("%f") || destination.contains(','))
-      return std::nullopt;
-    loaded = destination.str();
-  }
-  return loaded;
 }
 
 void rehashInvocationAndBundle(llvm::MutableArrayRef<uint8_t> bytes,
@@ -1006,6 +1053,41 @@ std::optional<std::string> fixtureSource(llvm::StringRef filename) {
   return source.str();
 }
 
+std::optional<std::string> sourceFile(llvm::StringRef path) {
+  std::ifstream input(path.str());
+  std::ostringstream source;
+  source << input.rdbuf();
+  if (!input)
+    return std::nullopt;
+  return source.str();
+}
+
+std::optional<std::vector<uint8_t>> numpyPayload(llvm::StringRef path) {
+  std::ifstream input(path.str(), std::ios::binary);
+  if (!input)
+    return std::nullopt;
+  std::vector<uint8_t> bytes{std::istreambuf_iterator<char>(input), {}};
+  constexpr std::array<uint8_t, 6> magic{0x93, 'N', 'U', 'M', 'P', 'Y'};
+  if (bytes.size() < 10 ||
+      !std::equal(magic.begin(), magic.end(), bytes.begin()))
+    return std::nullopt;
+  uint64_t headerBytes =
+      static_cast<uint64_t>(bytes[8]) | (static_cast<uint64_t>(bytes[9]) << 8);
+  uint64_t payloadOffset = 10 + headerBytes;
+  if (bytes[6] >= 2) {
+    if (bytes.size() < 12)
+      return std::nullopt;
+    headerBytes = static_cast<uint64_t>(bytes[8]) |
+                  (static_cast<uint64_t>(bytes[9]) << 8) |
+                  (static_cast<uint64_t>(bytes[10]) << 16) |
+                  (static_cast<uint64_t>(bytes[11]) << 24);
+    payloadOffset = 12 + headerBytes;
+  }
+  if (payloadOffset > bytes.size())
+    return std::nullopt;
+  return std::vector<uint8_t>(bytes.begin() + payloadOffset, bytes.end());
+}
+
 std::string contractMapModule(int64_t rows, int64_t reduction, int64_t columns,
                               llvm::StringRef moduleSymbol,
                               llvm::StringRef precision = "DEFAULT",
@@ -1047,6 +1129,11 @@ module @live_f32_and_bf16 {
 }
 )mlir";
 
+constexpr llvm::StringLiteral kFastPreferFusionOptions =
+    R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+constexpr llvm::StringLiteral kPreferFusionTuning =
+    R"json({"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json";
+
 std::unique_ptr<BuiltBundle> buildFixture(
     llvm::StringRef source,
     mlir::shuttle::NumericalPolicy policy =
@@ -1054,7 +1141,10 @@ std::unique_ptr<BuiltBundle> buildFixture(
     llvm::StringRef canonicalOptions = {},
     llvm::StringRef canonicalTuning =
         R"json({"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json",
-    mlir::shuttle::GpuTarget gpuTarget = mlir::shuttle::GpuTarget::Sm90) {
+    mlir::shuttle::GpuTarget gpuTarget = mlir::shuttle::GpuTarget::Sm90,
+    std::shared_ptr<const mlir::shuttle::GpuPhysicalArtifactProvider> provider =
+        {},
+    bool buildExecutable = true, bool canonicalize = false) {
   mlir::DialectRegistry registry;
   mlir::stablehlo::registerAllDialects(registry);
   registry.insert<mlir::arith::ArithDialect, mlir::func::FuncDialect,
@@ -1079,13 +1169,1291 @@ std::unique_ptr<BuiltBundle> buildFixture(
     manager.addPass(mlir::shuttle::createFormStructuralRegionsPass());
   }
   manager.addPass(mlir::shuttle::createConvertStablehloToAlgebraPass());
+  if (canonicalize)
+    manager.addPass(mlir::shuttle::createShuttleCanonicalizePass());
   manager.addPass(mlir::shuttle::createPlanRowFoldMaterializationPass());
   manager.addPass(mlir::shuttle::createPlanSimt32RowFoldSchedulePass());
-  manager.addPass(mlir::shuttle::createBuildGpuExecutableBundlePass(gpuTarget));
+  manager.addPass(mlir::shuttle::createPlanSourceEventLoweringPass());
+  if (!buildExecutable) {
+    if (mlir::failed(manager.run(*result->module)))
+      return {};
+    return result;
+  }
+  manager.addPass(
+      provider ? mlir::shuttle::createBuildGpuExecutableBundlePass(
+                     gpuTarget, std::move(provider))
+               : mlir::shuttle::createBuildGpuExecutableBundlePass(gpuTarget));
   manager.addPass(mlir::shuttle::createVerifyGpuExecutableBundlePass());
   if (mlir::failed(manager.run(*result->module)))
     return {};
   return result;
+}
+
+class RecordingFatbinProvider final
+    : public mlir::shuttle::GpuPhysicalArtifactProvider {
+public:
+  explicit RecordingFatbinProvider(
+      mlir::shuttle::GpuFatbinExecutableBundle bundle,
+      bool swapOperandBindings = false,
+      std::vector<mlir::shuttle::GpuSourceEventLegalization>
+          sourceEventLegalizations = {},
+      std::vector<mlir::shuttle::GpuInternalEventLegalization>
+          internalEventLegalizations = {})
+      : bundle(std::move(bundle)), swapOperandBindings(swapOperandBindings),
+        sourceEventLegalizations(std::move(sourceEventLegalizations)),
+        internalEventLegalizations(std::move(internalEventLegalizations)) {}
+
+  absl::StatusOr<std::optional<mlir::shuttle::GpuPhysicalArtifactCompilation>>
+  compile(
+      const mlir::shuttle::GpuPhysicalArtifactRequest &request) const override {
+    ++calls;
+    requestFingerprint = request.fingerprint;
+    requestJson = mlir::shuttle::gpuPhysicalArtifactRequestJson(request);
+    target = request.target;
+    compositionKinds.clear();
+    mlir::shuttle::MaterializationPlanOp materialization =
+        request.materialization;
+    for (mlir::shuttle::MaterializationTaskOp task :
+         materialization.getBody()
+             .front()
+             .getOps<mlir::shuttle::MaterializationTaskOp>()) {
+      if (auto kind = task->getAttrOfType<mlir::StringAttr>("composition_kind"))
+        compositionKinds.push_back(kind.str());
+    }
+    mlir::shuttle::GpuFatbinExecutableBundle result = bundle;
+    llvm::SmallVector<mlir::shuttle::MaterializationBufferOp> buffers(
+        materialization.getBody()
+            .front()
+            .getOps<mlir::shuttle::MaterializationBufferOp>());
+    for (mlir::shuttle::GpuSlot &slot : result.slots) {
+      if (slot.storage != mlir::shuttle::MaterializationStorage::External)
+        continue;
+      std::optional<size_t> sourceOrdinal;
+      for (auto [ordinal, binding] : llvm::enumerate(request.bindingIndices)) {
+        if (!binding || *binding != slot.bindingIndex ||
+            buffers[ordinal].getStorage() !=
+                mlir::shuttle::MaterializationStorage::External)
+          continue;
+        const auto expectedBinding =
+            request.regionResultIndices[ordinal]
+                ? mlir::shuttle::ExecutableBindingKind::Result
+                : mlir::shuttle::ExecutableBindingKind::Operand;
+        if (slot.bindingKind == expectedBinding)
+          sourceOrdinal = ordinal;
+      }
+      if (!sourceOrdinal)
+        return absl::InternalError(
+            "artifact external slot has no matching request binding");
+      slot.tensorType = buffers[*sourceOrdinal].getTensorType();
+    }
+    if (swapOperandBindings) {
+      auto first = llvm::find_if(result.slots, [](const auto &slot) {
+        return slot.bindingKind ==
+               mlir::shuttle::ExecutableBindingKind::Operand;
+      });
+      auto second =
+          first == result.slots.end()
+              ? result.slots.end()
+              : std::find_if(
+                    std::next(first), result.slots.end(), [](const auto &slot) {
+                      return slot.bindingKind ==
+                             mlir::shuttle::ExecutableBindingKind::Operand;
+                    });
+      if (second == result.slots.end())
+        return absl::InternalError(
+            "artifact does not have two operand bindings to swap");
+      std::swap(first->bindingIndex, second->bindingIndex);
+    }
+    return mlir::shuttle::GpuPhysicalArtifactCompilation{
+        std::move(result), sourceEventLegalizations,
+        internalEventLegalizations};
+  }
+
+  mutable int calls = 0;
+  mutable std::string requestFingerprint;
+  mutable std::string requestJson;
+  mutable mlir::shuttle::GpuTarget target = mlir::shuttle::GpuTarget::Sm100;
+  mutable std::vector<std::string> compositionKinds;
+
+private:
+  mlir::shuttle::GpuFatbinExecutableBundle bundle;
+  bool swapOperandBindings;
+  std::vector<mlir::shuttle::GpuSourceEventLegalization>
+      sourceEventLegalizations;
+  std::vector<mlir::shuttle::GpuInternalEventLegalization>
+      internalEventLegalizations;
+};
+
+class RecordingDecliningProvider final
+    : public mlir::shuttle::GpuPhysicalArtifactProvider {
+public:
+  absl::StatusOr<std::optional<mlir::shuttle::GpuPhysicalArtifactCompilation>>
+  compile(
+      const mlir::shuttle::GpuPhysicalArtifactRequest &request) const override {
+    requestFingerprint = request.fingerprint;
+    requestJson = mlir::shuttle::gpuPhysicalArtifactRequestJson(request);
+    if (const char *capture =
+            std::getenv("SHUTTLE_TEST_PHYSICAL_REQUEST_CAPTURE")) {
+      std::ofstream(capture) << requestJson;
+    }
+    otherTargetFingerprint =
+        mlir::shuttle::gpuPhysicalArtifactRequestFingerprint(
+            request.region, request.materialization, request.schedule,
+            request.eventPlan, mlir::shuttle::GpuTarget::Sm100);
+    structuralPlan.clear();
+    llvm::raw_string_ostream stream(structuralPlan);
+    auto appendAttribute = [&](mlir::Operation *operation,
+                               llvm::StringRef name) {
+      stream << name << "=";
+      if (mlir::Attribute attribute = operation->getAttr(name))
+        attribute.print(stream);
+      stream << ";";
+    };
+    mlir::shuttle::MaterializationPlanOp materialization =
+        request.materialization;
+    mlir::shuttle::SchedulePlanOp schedule = request.schedule;
+    appendAttribute(materialization, "stateful_contract_fold_pullback");
+    for (mlir::shuttle::MaterializationTaskOp task :
+         materialization.getBody()
+             .front()
+             .getOps<mlir::shuttle::MaterializationTaskOp>()) {
+      stream << "materialization_task{";
+      for (llvm::StringRef name :
+           {"ordinal", "composition_owner_dimensions",
+            "online_vector_dimensions", "composition_stream_dimensions",
+            "composition_producer_contraction_dimensions",
+            "composition_consumer_contraction_dimensions",
+            "composition_state_inputs", "composition_state_outputs",
+            "input_buffers", "output_buffers", "reduction_dimensions"})
+        appendAttribute(task, name);
+      stream << "}";
+    }
+    for (mlir::shuttle::ScheduleTaskOp task :
+         schedule.getBody().front().getOps<mlir::shuttle::ScheduleTaskOp>()) {
+      stream << "schedule_task{";
+      for (llvm::StringRef name :
+           {"ordinal", "composition_owner_dimensions",
+            "online_vector_dimensions", "grid_shape", "tile_shape",
+            "serial_tiles", "reduction_dimensions"})
+        appendAttribute(task, name);
+      stream << "}";
+    }
+    stream.flush();
+    return std::nullopt;
+  }
+
+  mutable std::string requestFingerprint;
+  mutable std::string requestJson;
+  mutable std::string otherTargetFingerprint;
+  mutable std::string structuralPlan;
+};
+
+void checkNativeStreamOrderErasure(
+    const std::vector<std::vector<uint8_t>> &images) {
+  auto source = fixtureSource("jax-0.10.1-f32-causal-gqa-online-axis4.mlir");
+  ASSERT_TRUE(source);
+  constexpr llvm::StringLiteral options =
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+  constexpr llvm::StringLiteral tuning =
+      R"json({"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json";
+
+  auto generic =
+      buildFixture(*source, mlir::shuttle::NumericalPolicy::Fast, options,
+                   tuning, mlir::shuttle::GpuTarget::Sm90, {}, true, true);
+  ASSERT_TRUE(generic);
+  auto genericTransport =
+      mlir::shuttle::serializeGpuExecutableBundle(*generic->module);
+  ASSERT_TRUE(mlir::succeeded(genericTransport));
+  auto genericExecutable =
+      mlir::shuttle::GpuExecutable::Load(*genericTransport);
+  ASSERT_TRUE(genericExecutable.ok()) << genericExecutable.status();
+  ASSERT_EQ((*genericExecutable)->launches().size(), 2u);
+
+  mlir::shuttle::GpuFatbinExecutableBundle artifact{
+      5,
+      mlir::shuttle::ExecutableCodeFormat::CudaFatbinSm90V1,
+      std::string(64, '0'),
+      std::string(64, '0'),
+      images,
+      {(*genericExecutable)->launches().begin(),
+       (*genericExecutable)->launches().end()},
+      {(*genericExecutable)->slots().begin(),
+       (*genericExecutable)->slots().end()},
+  };
+  artifact.launches[0].sourceTaskOrdinals = {0};
+  artifact.launches[1].sourceTaskOrdinals = {1};
+  artifact.launches[1].imageIndex = images.size() - 1;
+  using Expression = mlir::shuttle::GpuAffineExpression;
+  using ExpressionKind = mlir::shuttle::GpuAffineExpressionKind;
+  auto dimension = [](int64_t position) {
+    return Expression{ExpressionKind::Dimension, position, {}};
+  };
+  auto constant = [](int64_t value) {
+    return Expression{ExpressionKind::Constant, value, {}};
+  };
+  mlir::shuttle::GpuAffineMap globalOwner{
+      2, {constant(0), constant(0), constant(0)}};
+  mlir::shuttle::GpuAffineMap launchBoundary{2, {constant(0)}};
+  mlir::shuttle::GpuEventCoverPiece fullRelation{
+      std::nullopt,
+      {0, globalOwner, launchBoundary},
+      {1, globalOwner, launchBoundary},
+  };
+  artifact.eventRealizations = {
+      {0,
+       mlir::shuttle::GpuEventRealizationKind::StreamOrder,
+       {0, 0, 1, 0},
+       {fullRelation}}};
+  artifact.physicalEventProvenance =
+      R"json({"fingerprint":"b0f7d98841f203ed0e0830b586d1d7ef86695f44a929e0f4ad89489aa00d8f25","physical_schedule_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","schedule":{"allocations":[{"acquire_before_consumer":true,"allocation_id":"pipeline","allocation_owners":[[]],"capacity":1,"covered_plans":["internal_ready"],"generation_count":1,"generations":[0],"initial_counts":[1],"mechanism_coordinates":[[0]],"notify_relations":[{"mechanism_coordinate":[0],"task_coordinate":[0],"task_family":"producer"}],"release_on_notify":true,"scope":"cta","slots":[0],"transaction_bytes_by_coordinate":[128],"wait_relations":[{"mechanism_coordinate":[0],"task_coordinate":[0],"task_family":"consumer"}]}],"fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","realizations":[{"allocation_ids":["pipeline"],"event":{"event_domain":{"axes":[{"extent":1,"name":"event"}],"kind":"event_domain","name":"internal_ready events"},"generation_policy":"per_invocation","initial_count":{"counts":[{"coordinate":[0],"value":1}],"provenance":"notify indegree"},"memory_scope":"cta","name":"internal_ready","notify_relation":{"pairs":[{"source":[0],"target":[0]}],"source_domain":{"axes":[{"extent":1,"name":"producer"}],"kind":"task_family","name":"producer","placement":"transfer"},"target_domain":{"axes":[{"extent":1,"name":"event"}],"kind":"event_domain","name":"internal_ready events"}},"required_dependence":{"relation":{"pairs":[{"source":[0],"target":[0]}],"source_domain":{"axes":[{"extent":1,"name":"producer"}],"kind":"task_family","name":"producer","placement":"transfer"},"target_domain":{"axes":[{"extent":1,"name":"consumer"}],"kind":"task_family","name":"consumer","placement":"matrix"}},"visibility":{"acquire_before_consumer":true,"release_on_notify":true,"scope":"cta"}},"scheduling_mode":null,"trigger_relation":{"pairs":[{"source":[0],"target":[0]}],"source_domain":{"axes":[{"extent":1,"name":"event"}],"kind":"event_domain","name":"internal_ready events"},"target_domain":{"axes":[{"extent":1,"name":"consumer"}],"kind":"task_family","name":"consumer","placement":"matrix"}},"visibility":{"acquire_before_consumer":true,"release_on_notify":true,"scope":"cta"}},"kind":"physical","mechanism":"bounded pipeline","plan":"internal_ready"}],"schema_version":3},"schema_version":1})json";
+  artifact.physicalEventProvenanceDigest =
+      mlir::shuttle::gpuExecutableBundleDigest(
+          llvm::ArrayRef<uint8_t>(reinterpret_cast<const uint8_t *>(
+                                      artifact.physicalEventProvenance.data()),
+                                  artifact.physicalEventProvenance.size()));
+  artifact.deviceIrSnapshots = {
+      {std::string(64, 'e'),
+       {{"cute.arch.mbarrier_arrive", 1}, {"cute.arch.mbarrier_wait", 1}}},
+  };
+  auto typedInternalSchedule = mlir::shuttle::parseGpuInternalEventSchedule(
+      artifact.physicalEventProvenance);
+  ASSERT_TRUE(typedInternalSchedule.ok()) << typedInternalSchedule.status();
+  ASSERT_EQ(typedInternalSchedule->regions.size(), 1u);
+  EXPECT_EQ(typedInternalSchedule->regions[0].schemaVersion, 3);
+  ASSERT_EQ(typedInternalSchedule->regions[0].events.size(), 1u);
+  EXPECT_EQ(typedInternalSchedule->regions[0].events[0].name, "internal_ready");
+  ASSERT_EQ(typedInternalSchedule->regions[0].allocations.size(), 1u);
+  EXPECT_THAT(typedInternalSchedule->regions[0].allocations[0].initialCounts,
+              testing::ElementsAre(1));
+  EXPECT_EQ(typedInternalSchedule->regions[0].allocations[0].legalizationKind,
+            mlir::shuttle::GpuInternalEventAllocation::LegalizationKind::
+                CtaTransactionMbarrier);
+
+  auto explicitEnvelope = llvm::json::parse(artifact.physicalEventProvenance);
+  ASSERT_TRUE(static_cast<bool>(explicitEnvelope));
+  auto *explicitSchedule =
+      explicitEnvelope->getAsObject()->getObject("schedule");
+  ASSERT_NE(explicitSchedule, nullptr);
+  (*explicitSchedule)["schema_version"] = 5;
+  auto *explicitAllocations = explicitSchedule->getArray("allocations");
+  ASSERT_NE(explicitAllocations, nullptr);
+  (*explicitAllocations)[0].getAsObject()->insert(
+      {"mechanism_kind", "cta_transaction_mbarrier"});
+  std::string explicitCanonical =
+      llvm::formatv("{0}", llvm::json::Value(std::move(*explicitEnvelope)))
+          .str();
+  auto explicitTyped =
+      mlir::shuttle::parseGpuInternalEventSchedule(explicitCanonical);
+  ASSERT_TRUE(explicitTyped.ok()) << explicitTyped.status();
+  EXPECT_EQ(explicitTyped->regions[0].schemaVersion, 5);
+  EXPECT_EQ(explicitTyped->regions[0].allocations[0].legalizationKind,
+            mlir::shuttle::GpuInternalEventAllocation::LegalizationKind::
+                CtaTransactionMbarrier);
+
+  auto mismatchedEnvelope = llvm::json::parse(explicitCanonical);
+  ASSERT_TRUE(static_cast<bool>(mismatchedEnvelope));
+  auto *mismatchedAllocation = mismatchedEnvelope->getAsObject()
+                                   ->getObject("schedule")
+                                   ->getArray("allocations")
+                                   ->front()
+                                   .getAsObject();
+  (*mismatchedAllocation)["mechanism_kind"] = "cta_async_completion_queue";
+  std::string mismatchedCanonical =
+      llvm::formatv("{0}", llvm::json::Value(std::move(*mismatchedEnvelope)))
+          .str();
+  EXPECT_FALSE(
+      mlir::shuttle::parseGpuInternalEventSchedule(mismatchedCanonical).ok());
+
+  auto asyncEnvelope = llvm::json::parse(explicitCanonical);
+  ASSERT_TRUE(static_cast<bool>(asyncEnvelope));
+  auto *asyncAllocation = asyncEnvelope->getAsObject()
+                              ->getObject("schedule")
+                              ->getArray("allocations")
+                              ->front()
+                              .getAsObject();
+  (*asyncAllocation)["mechanism_kind"] = "cta_async_completion_queue";
+  (*asyncAllocation)["transaction_bytes_by_coordinate"] = nullptr;
+  std::string asyncCanonical =
+      llvm::formatv("{0}", llvm::json::Value(std::move(*asyncEnvelope))).str();
+  auto asyncTyped =
+      mlir::shuttle::parseGpuInternalEventSchedule(asyncCanonical);
+  ASSERT_TRUE(asyncTyped.ok()) << asyncTyped.status();
+  EXPECT_EQ(asyncTyped->regions[0].allocations[0].legalizationKind,
+            mlir::shuttle::GpuInternalEventAllocation::LegalizationKind::
+                CtaAsyncCompletionQueue);
+
+  std::string malformedInternalSchedule = artifact.physicalEventProvenance;
+  size_t initialCount =
+      malformedInternalSchedule.find("\"initial_counts\":[1]");
+  ASSERT_NE(initialCount, std::string::npos);
+  malformedInternalSchedule.replace(
+      initialCount, std::string("\"initial_counts\":[1]").size(),
+      "\"initial_counts\":[0]");
+  EXPECT_FALSE(
+      mlir::shuttle::parseGpuInternalEventSchedule(malformedInternalSchedule)
+          .ok());
+
+  auto forwardEnvelope = llvm::json::parse(artifact.physicalEventProvenance);
+  auto pullbackEnvelope = llvm::json::parse(artifact.physicalEventProvenance);
+  ASSERT_TRUE(static_cast<bool>(forwardEnvelope));
+  ASSERT_TRUE(static_cast<bool>(pullbackEnvelope));
+  llvm::json::Object *forwardObject = forwardEnvelope->getAsObject();
+  llvm::json::Object *pullbackObject = pullbackEnvelope->getAsObject();
+  ASSERT_NE(forwardObject, nullptr);
+  ASSERT_NE(pullbackObject, nullptr);
+  llvm::json::Object *pullbackRegion = pullbackObject->getObject("schedule");
+  ASSERT_NE(pullbackRegion, nullptr);
+  (*pullbackRegion)["schema_version"] = 4;
+  llvm::json::Array regions;
+  regions.push_back(std::move(*forwardObject->get("schedule")));
+  regions.push_back(std::move(*pullbackObject->get("schedule")));
+  llvm::json::Object combinedSchedule{{"fingerprint", std::string(64, 'c')},
+                                      {"regions", std::move(regions)},
+                                      {"schema_version", 1}};
+  llvm::json::Object combinedEnvelope{
+      {"fingerprint", std::string(64, 'd')},
+      {"physical_schedule_fingerprint", std::string(64, 'c')},
+      {"schedule", std::move(combinedSchedule)},
+      {"schema_version", 1}};
+  std::string combinedCanonical =
+      llvm::formatv("{0}", llvm::json::Value(std::move(combinedEnvelope)))
+          .str();
+  auto combined =
+      mlir::shuttle::parseGpuInternalEventSchedule(combinedCanonical);
+  ASSERT_TRUE(combined.ok()) << combined.status();
+  ASSERT_EQ(combined->regions.size(), 2u);
+  EXPECT_EQ(combined->regions[0].schemaVersion, 3);
+  EXPECT_EQ(combined->regions[1].schemaVersion, 4);
+  mlir::shuttle::GpuFatbinExecutableBundle missingEventCoverArtifact = artifact;
+  missingEventCoverArtifact.eventRealizations.clear();
+  mlir::shuttle::GpuFatbinExecutableBundle incompleteEventCoverArtifact =
+      artifact;
+  incompleteEventCoverArtifact.eventRealizations[0]
+      .coverPieces[0]
+      .relationSubset = mlir::shuttle::GpuIntegerSet{2, {dimension(0)}, {1}};
+  std::vector<mlir::shuttle::GpuInternalEventLegalization>
+      internalLegalizations{
+          {0,
+           "pipeline",
+           {{0,
+             mlir::shuttle::GpuInternalEventOperationKind::Notify,
+             0,
+             "producer",
+             {0},
+             {0},
+             mlir::shuttle::GpuInternalEventAllocation::LegalizationKind::
+                 CtaTransactionMbarrier,
+             mlir::shuttle::GpuEventPhysicalScope::ThreadBlock,
+             {},
+             0,
+             0,
+             1,
+             1,
+             1,
+             true,
+             128},
+            {1,
+             mlir::shuttle::GpuInternalEventOperationKind::Wait,
+             0,
+             "consumer",
+             {0},
+             {0},
+             mlir::shuttle::GpuInternalEventAllocation::LegalizationKind::
+                 CtaTransactionMbarrier,
+             mlir::shuttle::GpuEventPhysicalScope::ThreadBlock,
+             {},
+             0,
+             0,
+             1,
+             1,
+             1,
+             true,
+             std::nullopt}}}};
+  auto trustedInternalProvider = std::make_shared<RecordingFatbinProvider>(
+      artifact, false, std::vector<mlir::shuttle::GpuSourceEventLegalization>{},
+      internalLegalizations);
+  auto trustedInternal = buildFixture(
+      *source, mlir::shuttle::NumericalPolicy::Fast, options, tuning,
+      mlir::shuttle::GpuTarget::Sm90, trustedInternalProvider, true, true);
+  ASSERT_TRUE(trustedInternal);
+  auto trustedInternalDevice =
+      *trustedInternal->module->getOps<mlir::shuttle::DeviceModuleOp>().begin();
+  auto snapshotDigests = trustedInternalDevice.getDeviceIrSnapshotDigestsAttr();
+  ASSERT_TRUE(snapshotDigests);
+  ASSERT_EQ(snapshotDigests.size(), 1u);
+  EXPECT_EQ(llvm::cast<mlir::StringAttr>(snapshotDigests[0]).getValue(),
+            std::string(64, 'e'));
+  auto trustedInternalBundle =
+      *trustedInternal->module->getOps<mlir::shuttle::ExecutableBundleOp>()
+           .begin();
+  trustedInternalDevice->removeAttr("device_ir_snapshot_digests");
+  trustedInternalDevice.setFingerprint(
+      mlir::shuttle::deviceModuleFingerprint(trustedInternalDevice));
+  trustedInternalBundle.setDeviceModuleFingerprint(
+      trustedInternalDevice.getFingerprint());
+  trustedInternalBundle.setFingerprint(
+      mlir::shuttle::executableBundleFingerprint(trustedInternalBundle));
+  mlir::PassManager rejectMissingSnapshot(trustedInternal->context.get());
+  rejectMissingSnapshot.addPass(
+      mlir::shuttle::createVerifyGpuExecutableBundlePass());
+  EXPECT_TRUE(
+      mlir::failed(rejectMissingSnapshot.run(*trustedInternal->module)));
+  trustedInternalDevice.setDeviceIrSnapshotDigestsAttr(snapshotDigests);
+  trustedInternalDevice.setFingerprint(
+      mlir::shuttle::deviceModuleFingerprint(trustedInternalDevice));
+  trustedInternalBundle.setDeviceModuleFingerprint(
+      trustedInternalDevice.getFingerprint());
+  trustedInternalBundle.setFingerprint(
+      mlir::shuttle::executableBundleFingerprint(trustedInternalBundle));
+  auto internalCertificates =
+      trustedInternalDevice.getTrustedInternalEventCertificatesAttr();
+  ASSERT_TRUE(internalCertificates);
+  ASSERT_EQ(internalCertificates.size(), 1u);
+  auto internalCertificate =
+      llvm::cast<mlir::DictionaryAttr>(internalCertificates[0]);
+  EXPECT_EQ(internalCertificate.getAs<mlir::IntegerAttr>("region").getInt(), 0);
+  EXPECT_EQ(
+      internalCertificate.getAs<mlir::StringAttr>("allocation_id").getValue(),
+      "pipeline");
+  EXPECT_EQ(internalCertificate.getAs<mlir::StringAttr>("device_image_digest")
+                .getValue(),
+            mlir::shuttle::gpuExecutableBundleDigest(
+                *mlir::shuttle::gpuFatbinCodeIdentity(artifact.images,
+                                                      artifact.launches)));
+
+  if (images.size() > 1) {
+    auto originalTransport = trustedInternalDevice.getNativeTransportAttr();
+    auto originalCode = trustedInternalDevice.getCodeAttr();
+    auto originalCodeDigest = trustedInternalDevice.getCodeDigestAttr();
+    auto updateFingerprints = [&] {
+      trustedInternalDevice.setFingerprint(
+          mlir::shuttle::deviceModuleFingerprint(trustedInternalDevice));
+      trustedInternalBundle.setDeviceModuleFingerprint(
+          trustedInternalDevice.getFingerprint());
+      trustedInternalBundle.setFingerprint(
+          mlir::shuttle::executableBundleFingerprint(trustedInternalBundle));
+    };
+    auto attached = mlir::shuttle::deserializeGpuFatbinExecutableBundle(
+        llvm::ArrayRef<uint8_t>(reinterpret_cast<const uint8_t *>(
+                                    originalTransport.asArrayRef().data()),
+                                originalTransport.size()),
+        trustedInternal->context.get());
+    ASSERT_TRUE(attached.ok()) << attached.status();
+    auto rejectStaleCertificate =
+        [&](const mlir::shuttle::GpuFatbinExecutableBundle &modified) {
+          auto transport =
+              mlir::shuttle::serializeGpuFatbinExecutableBundle(modified);
+          ASSERT_TRUE(transport.ok()) << transport.status();
+          auto identity = mlir::shuttle::gpuFatbinCodeIdentity(
+              modified.images, modified.launches);
+          ASSERT_TRUE(identity.ok()) << identity.status();
+          mlir::OpBuilder builder(trustedInternal->context.get());
+          trustedInternalDevice.setNativeTransportAttr(
+              builder.getDenseI8ArrayAttr(llvm::ArrayRef<int8_t>(
+                  reinterpret_cast<const int8_t *>(transport->data()),
+                  transport->size())));
+          trustedInternalDevice.setCodeAttr(
+              builder.getDenseI8ArrayAttr(llvm::ArrayRef<int8_t>(
+                  reinterpret_cast<const int8_t *>(identity->data()),
+                  identity->size())));
+          trustedInternalDevice.setCodeDigest(
+              mlir::shuttle::gpuExecutableBundleDigest(*identity));
+          updateFingerprints();
+          // Outer transport and module hashes are valid; the old trusted
+          // certificate must still reject the changed image or image binding.
+          ASSERT_TRUE(mlir::succeeded(trustedInternalDevice.verifyRegions()));
+          mlir::PassManager verify(trustedInternal->context.get());
+          verify.addPass(mlir::shuttle::createVerifyGpuExecutableBundlePass());
+          EXPECT_TRUE(mlir::failed(verify.run(*trustedInternal->module)));
+          trustedInternalDevice.setNativeTransportAttr(originalTransport);
+          trustedInternalDevice.setCodeAttr(originalCode);
+          trustedInternalDevice.setCodeDigestAttr(originalCodeDigest);
+          updateFingerprints();
+        };
+    auto changedImage = *attached;
+    changedImage.images[1].back() ^= 1;
+    rejectStaleCertificate(changedImage);
+    auto changedBinding = *attached;
+    std::swap(changedBinding.launches[0].imageIndex,
+              changedBinding.launches[1].imageIndex);
+    rejectStaleCertificate(changedBinding);
+    mlir::PassManager verifyRestored(trustedInternal->context.get());
+    verifyRestored.addPass(
+        mlir::shuttle::createVerifyGpuExecutableBundlePass());
+    EXPECT_TRUE(mlir::succeeded(verifyRestored.run(*trustedInternal->module)));
+
+    auto maximumImages = artifact;
+    for (auto &image : maximumImages.images)
+      image.resize(mlir::shuttle::kMaximumGpuCodeBytes / images.size());
+    auto maximumProvider = std::make_shared<RecordingFatbinProvider>(
+        maximumImages, false,
+        std::vector<mlir::shuttle::GpuSourceEventLegalization>{},
+        internalLegalizations);
+    // Identity framing is not device code and must not consume the raw limit.
+    EXPECT_TRUE(buildFixture(*source, mlir::shuttle::NumericalPolicy::Fast,
+                             options, tuning, mlir::shuttle::GpuTarget::Sm90,
+                             maximumProvider, true, true));
+    maximumImages.images.back().push_back(0);
+    auto oversizedProvider = std::make_shared<RecordingFatbinProvider>(
+        maximumImages, false,
+        std::vector<mlir::shuttle::GpuSourceEventLegalization>{},
+        internalLegalizations);
+    EXPECT_FALSE(buildFixture(*source, mlir::shuttle::NumericalPolicy::Fast,
+                              options, tuning, mlir::shuttle::GpuTarget::Sm90,
+                              oversizedProvider, true, true));
+  }
+
+  auto replaceableInternalProvider = std::make_shared<RecordingFatbinProvider>(
+      artifact, false, std::vector<mlir::shuttle::GpuSourceEventLegalization>{},
+      internalLegalizations);
+  auto replaceableInternal = buildFixture(
+      *source, mlir::shuttle::NumericalPolicy::Fast, options, tuning,
+      mlir::shuttle::GpuTarget::Sm90, replaceableInternalProvider, true, true);
+  ASSERT_TRUE(replaceableInternal);
+  mlir::PassManager consumeCertifiedInternal(
+      replaceableInternal->context.get());
+  consumeCertifiedInternal.addPass(
+      mlir::shuttle::createReplaceWithGpuExecutableBundlePass());
+  consumeCertifiedInternal.addPass(
+      mlir::shuttle::createStripSourceProvenancePass());
+  consumeCertifiedInternal.addPass(
+      mlir::shuttle::createVerifyNoShuttleOpsPass());
+  EXPECT_TRUE(mlir::succeeded(
+      consumeCertifiedInternal.run(*replaceableInternal->module)));
+  size_t customCalls = 0;
+  replaceableInternal->module->walk([&](mlir::Operation *operation) {
+    if (operation->getName().getStringRef() != "stablehlo.custom_call")
+      return;
+    ++customCalls;
+    auto config =
+        operation->getAttrOfType<mlir::DictionaryAttr>("backend_config");
+    ASSERT_TRUE(config);
+    auto bytes = config.getAs<mlir::StringAttr>("bundle_bytes");
+    ASSERT_TRUE(bytes);
+    auto loaded = mlir::shuttle::GpuExecutable::Load(llvm::ArrayRef<uint8_t>(
+        reinterpret_cast<const uint8_t *>(bytes.getValue().data()),
+        bytes.getValue().size()));
+    ASSERT_TRUE(loaded.ok()) << loaded.status();
+    ASSERT_EQ((*loaded)->codeImages().size(), images.size());
+    for (size_t index = 0; index < artifact.launches.size(); ++index) {
+      const auto &launch = (*loaded)->launches()[index];
+      EXPECT_EQ(launch.imageIndex, artifact.launches[index].imageIndex);
+      EXPECT_EQ((*loaded)->codeImage(launch.imageIndex),
+                llvm::ArrayRef<uint8_t>(images[launch.imageIndex]));
+    }
+  });
+  EXPECT_EQ(customCalls, 1u);
+
+  llvm::SmallVector<mlir::NamedAttribute> forgedFields(
+      internalCertificate.begin(), internalCertificate.end());
+  mlir::OpBuilder forgedBuilder(trustedInternal->context.get());
+  for (mlir::NamedAttribute &field : forgedFields)
+    if (field.getName() == "compiler_ir_digest")
+      field.setValue(forgedBuilder.getStringAttr(std::string(64, 'f')));
+  trustedInternalDevice.setTrustedInternalEventCertificatesAttr(
+      forgedBuilder.getArrayAttr(
+          {forgedBuilder.getDictionaryAttr(forgedFields)}));
+  trustedInternalDevice.setFingerprint(
+      mlir::shuttle::deviceModuleFingerprint(trustedInternalDevice));
+  trustedInternalBundle.setDeviceModuleFingerprint(
+      trustedInternalDevice.getFingerprint());
+  trustedInternalBundle.setFingerprint(
+      mlir::shuttle::executableBundleFingerprint(trustedInternalBundle));
+  mlir::PassManager rejectForgedInternal(trustedInternal->context.get());
+  rejectForgedInternal.addPass(
+      mlir::shuttle::createVerifyGpuExecutableBundlePass());
+  EXPECT_TRUE(mlir::failed(rejectForgedInternal.run(*trustedInternal->module)));
+
+  auto mismatchedInternalLegalization = internalLegalizations;
+  mismatchedInternalLegalization[0].operations[1].taskFamily = "producer";
+  auto mismatchedInternalProvider = std::make_shared<RecordingFatbinProvider>(
+      artifact, false, std::vector<mlir::shuttle::GpuSourceEventLegalization>{},
+      std::move(mismatchedInternalLegalization));
+  EXPECT_FALSE(buildFixture(*source, mlir::shuttle::NumericalPolicy::Fast,
+                            options, tuning, mlir::shuttle::GpuTarget::Sm90,
+                            mismatchedInternalProvider, true, true));
+  auto projectedProvider = std::make_shared<RecordingFatbinProvider>(artifact);
+  auto projected = buildFixture(*source, mlir::shuttle::NumericalPolicy::Fast,
+                                options, tuning, mlir::shuttle::GpuTarget::Sm90,
+                                projectedProvider, true, true);
+  ASSERT_TRUE(projected);
+  EXPECT_THAT(projectedProvider->requestJson,
+              testing::HasSubstr("\"kind\":\"integer_set\""));
+  EXPECT_THAT(projectedProvider->requestJson,
+              testing::HasSubstr("shuttle.imperative_event_notify"));
+  auto schedule =
+      *projected->module->getOps<mlir::shuttle::SchedulePlanOp>().begin();
+  EXPECT_TRUE(schedule.getBody()
+                  .front()
+                  .getOps<mlir::shuttle::EventRealizationOp>()
+                  .empty());
+  mlir::shuttle::EventLoweringPlanOp eventPlan;
+  for (mlir::shuttle::EventLoweringPlanOp candidate :
+       projected->module->getOps<mlir::shuttle::EventLoweringPlanOp>())
+    if (candidate.getPhysicalLaunchRecipeFingerprint()) {
+      ASSERT_FALSE(eventPlan);
+      eventPlan = candidate;
+    }
+  ASSERT_TRUE(eventPlan);
+  auto erasures =
+      eventPlan.getBody().front().getOps<mlir::shuttle::EventRealizationOp>();
+  ASSERT_EQ(llvm::range_size(erasures), 1u);
+  mlir::shuttle::EventRealizationOp erasure = *erasures.begin();
+  EXPECT_EQ(erasure.getKind(),
+            mlir::shuttle::EventRealizationKind::StreamOrderErased);
+  EXPECT_THAT(erasure.getCoveringLaunchOrder(),
+              testing::ElementsAre(0, 0, 1, 0));
+  EXPECT_TRUE(eventPlan.getBody()
+                  .front()
+                  .getOps<mlir::shuttle::ImperativeEventNotifyOp>()
+                  .empty());
+  EXPECT_TRUE(eventPlan.getBody()
+                  .front()
+                  .getOps<mlir::shuttle::ImperativeEventWaitOp>()
+                  .empty());
+  auto device =
+      *projected->module->getOps<mlir::shuttle::DeviceModuleOp>().begin();
+  ASSERT_TRUE(device.getPhysicalLaunchRecipeFingerprint());
+  EXPECT_EQ(eventPlan.getPhysicalLaunchRecipeFingerprint(),
+            *device.getPhysicalLaunchRecipeFingerprint());
+  auto physicalEventProvenance =
+      projected->module->getOps<mlir::shuttle::InternalEventPlanOp>();
+  ASSERT_EQ(llvm::range_size(physicalEventProvenance), 1u);
+  auto internal = *physicalEventProvenance.begin();
+  EXPECT_EQ(llvm::range_size(internal.getBody()
+                                 .front()
+                                 .getOps<mlir::shuttle::InternalEventTaskOp>()),
+            2u);
+  EXPECT_EQ(
+      llvm::range_size(internal.getBody()
+                           .front()
+                           .getOps<mlir::shuttle::InternalEventTensorOp>()),
+      1u);
+  EXPECT_EQ(
+      llvm::range_size(internal.getBody()
+                           .front()
+                           .getOps<mlir::shuttle::InternalEventAllocationOp>()),
+      1u);
+  EXPECT_EQ(llvm::range_size(
+                internal.getBody()
+                    .front()
+                    .getOps<mlir::shuttle::InternalEventRealizationOp>()),
+            1u);
+  auto internalNotifications =
+      internal.getBody().front().getOps<mlir::shuttle::InternalEventNotifyOp>();
+  auto internalWaits =
+      internal.getBody().front().getOps<mlir::shuttle::InternalEventWaitOp>();
+  ASSERT_EQ(llvm::range_size(internalNotifications), 1u);
+  ASSERT_EQ(llvm::range_size(internalWaits), 1u);
+  auto internalNotification = *internalNotifications.begin();
+  auto internalWait = *internalWaits.begin();
+  EXPECT_EQ(internalNotification.getAllocation(), 0);
+  EXPECT_EQ(internalNotification.getRelation(), 0);
+  EXPECT_EQ(internalNotification.getTask(), 1);
+  EXPECT_THAT(internalNotification.getTaskCoordinate(),
+              testing::ElementsAre(0));
+  EXPECT_THAT(internalNotification.getMechanismCoordinate(),
+              testing::ElementsAre(0));
+  EXPECT_EQ(internalNotification.getArrivalCount(), 1);
+  EXPECT_EQ(internalNotification.getInitialCount(), 1);
+  EXPECT_EQ(internalNotification.getLegalization(), "cta_transaction_mbarrier");
+  ASSERT_TRUE(internalNotification.getTransactionBytes());
+  EXPECT_EQ(*internalNotification.getTransactionBytes(), 128);
+  EXPECT_EQ(internalWait.getTask(), 0);
+  EXPECT_EQ(internalWait.getRequiredCount(), 1);
+  EXPECT_EQ(internalWait.getLegalization(), "cta_transaction_mbarrier");
+  auto internalAllocation =
+      *internal.getBody()
+           .front()
+           .getOps<mlir::shuttle::InternalEventAllocationOp>()
+           .begin();
+  EXPECT_EQ(internalAllocation.getLegalization(), "cta_transaction_mbarrier");
+  mlir::OpBuilder internalBuilder(projected->context.get());
+  internalNotification->setAttr("legalization",
+                                internalBuilder.getStringAttr("cta_mbarrier"));
+  EXPECT_TRUE(mlir::failed(internal.verifyRegions()));
+  internalNotification->setAttr(
+      "legalization",
+      internalBuilder.getStringAttr("cta_transaction_mbarrier"));
+  internalNotification->setAttr("initial_count",
+                                internalBuilder.getI64IntegerAttr(0));
+  EXPECT_TRUE(mlir::failed(internal.verifyRegions()));
+  internalNotification->setAttr("initial_count",
+                                internalBuilder.getI64IntegerAttr(1));
+  EXPECT_TRUE(mlir::succeeded(internal.verifyRegions()));
+  EXPECT_EQ(internal.getCanonicalSchedule(), artifact.physicalEventProvenance);
+  EXPECT_EQ(internal.getCanonicalScheduleDigest(),
+            artifact.physicalEventProvenanceDigest);
+  EXPECT_EQ(internal.getPhysicalScheduleFingerprint(), std::string(64, 'a'));
+  EXPECT_EQ(internal.getPhysicalLaunchRecipeFingerprint(),
+            *device.getPhysicalLaunchRecipeFingerprint());
+  mlir::StringAttr physicalFingerprint =
+      eventPlan.getPhysicalLaunchRecipeFingerprintAttr();
+  eventPlan->removeAttr("physical_launch_recipe_fingerprint");
+  eventPlan.setFingerprint(
+      mlir::shuttle::eventLoweringPlanFingerprint(eventPlan));
+  EXPECT_TRUE(mlir::failed(eventPlan.verifyRegions()));
+  eventPlan.setPhysicalLaunchRecipeFingerprintAttr(physicalFingerprint);
+  eventPlan.setFingerprint(
+      mlir::shuttle::eventLoweringPlanFingerprint(eventPlan));
+  auto bundle =
+      *projected->module->getOps<mlir::shuttle::ExecutableBundleOp>().begin();
+  ASSERT_TRUE(bundle.getEventLoweringPlanFingerprint());
+  EXPECT_EQ(*bundle.getEventLoweringPlanFingerprint(),
+            eventPlan.getFingerprint());
+  auto projectedTransport =
+      mlir::shuttle::serializeGpuExecutableBundle(*projected->module);
+  ASSERT_TRUE(mlir::succeeded(projectedTransport));
+  auto projectedExecutable =
+      mlir::shuttle::GpuExecutable::Load(*projectedTransport);
+  ASSERT_TRUE(projectedExecutable.ok()) << projectedExecutable.status();
+  ASSERT_EQ((*projectedExecutable)->codeImages().size(), images.size());
+  for (size_t index = 0; index < artifact.launches.size(); ++index) {
+    const auto &launch = (*projectedExecutable)->launches()[index];
+    EXPECT_EQ(launch.imageIndex, artifact.launches[index].imageIndex);
+    EXPECT_EQ((*projectedExecutable)->codeImage(launch.imageIndex),
+              llvm::ArrayRef<uint8_t>(images[launch.imageIndex]));
+  }
+  if (images.size() > 1) {
+    auto changedImage = mlir::shuttle::deserializeGpuFatbinExecutableBundle(
+        *projectedTransport, projected->context.get());
+    ASSERT_TRUE(changedImage.ok()) << changedImage.status();
+    changedImage->images[1].back() ^= 1;
+    auto transport =
+        mlir::shuttle::serializeGpuFatbinExecutableBundle(*changedImage);
+    ASSERT_TRUE(transport.ok()) << transport.status();
+    auto originalTransport = device.getNativeTransportAttr();
+    mlir::OpBuilder builder(projected->context.get());
+    auto updateFingerprints = [&] {
+      device.setFingerprint(mlir::shuttle::deviceModuleFingerprint(device));
+      bundle.setDeviceModuleFingerprint(device.getFingerprint());
+      bundle.setFingerprint(mlir::shuttle::executableBundleFingerprint(bundle));
+    };
+    device.setNativeTransportAttr(
+        builder.getDenseI8ArrayAttr(llvm::ArrayRef<int8_t>(
+            reinterpret_cast<const int8_t *>(transport->data()),
+            transport->size())));
+    updateFingerprints();
+    EXPECT_TRUE(mlir::failed(
+        mlir::shuttle::serializeGpuExecutableBundle(*projected->module)));
+    device.setNativeTransportAttr(originalTransport);
+    updateFingerprints();
+    EXPECT_TRUE(mlir::succeeded(
+        mlir::shuttle::serializeGpuExecutableBundle(*projected->module)));
+  }
+  EXPECT_EQ((*projectedExecutable)->eventRealizations().size(), 1u);
+  ASSERT_TRUE((*projectedExecutable)->internalEventSchedule());
+  EXPECT_EQ((*projectedExecutable)->internalEventSchedule()->regions.size(),
+            1u);
+  mlir::PassManager rejectUncertifiedInternal(projected->context.get());
+  rejectUncertifiedInternal.addPass(
+      mlir::shuttle::createReplaceWithGpuExecutableBundlePass());
+  EXPECT_TRUE(mlir::failed(rejectUncertifiedInternal.run(*projected->module)));
+  EXPECT_EQ(
+      llvm::range_size(
+          projected->module->getOps<mlir::shuttle::InternalEventPlanOp>()),
+      1u);
+
+  mlir::shuttle::GpuFatbinExecutableBundle erasedInternalArtifact = artifact;
+  auto erasedEnvelope =
+      llvm::json::parse(erasedInternalArtifact.physicalEventProvenance);
+  ASSERT_TRUE(static_cast<bool>(erasedEnvelope));
+  llvm::json::Object *erasedSchedule =
+      erasedEnvelope->getAsObject()->getObject("schedule");
+  ASSERT_NE(erasedSchedule, nullptr);
+  (*erasedSchedule)["allocations"] = llvm::json::Array{};
+  llvm::json::Object *erasedRealization =
+      (*erasedSchedule->getArray("realizations"))[0].getAsObject();
+  ASSERT_NE(erasedRealization, nullptr);
+  (*erasedRealization)["kind"] = "erased_program_order";
+  (*erasedRealization)["mechanism"] = "program order";
+  (*erasedRealization)["allocation_ids"] = llvm::json::Array{};
+  erasedEnvelope->getAsObject()->erase("fingerprint");
+  const std::string erasedEnvelopePayload =
+      llvm::formatv("{0}", *erasedEnvelope).str();
+  (*erasedEnvelope->getAsObject())["fingerprint"] =
+      mlir::shuttle::gpuExecutableBundleDigest(llvm::ArrayRef<uint8_t>(
+          reinterpret_cast<const uint8_t *>(erasedEnvelopePayload.data()),
+          erasedEnvelopePayload.size()));
+  erasedInternalArtifact.physicalEventProvenance =
+      llvm::formatv("{0}", std::move(*erasedEnvelope)).str();
+  erasedInternalArtifact.physicalEventProvenanceDigest =
+      mlir::shuttle::gpuExecutableBundleDigest(llvm::ArrayRef<uint8_t>(
+          reinterpret_cast<const uint8_t *>(
+              erasedInternalArtifact.physicalEventProvenance.data()),
+          erasedInternalArtifact.physicalEventProvenance.size()));
+  auto erasedInternalProvider =
+      std::make_shared<RecordingFatbinProvider>(erasedInternalArtifact);
+  auto erasedInternal = buildFixture(
+      *source, mlir::shuttle::NumericalPolicy::Fast, options, tuning,
+      mlir::shuttle::GpuTarget::Sm90, erasedInternalProvider, true, true);
+  ASSERT_TRUE(erasedInternal);
+  auto erasedPlans =
+      erasedInternal->module->getOps<mlir::shuttle::InternalEventPlanOp>();
+  ASSERT_EQ(llvm::range_size(erasedPlans), 1u);
+  auto erasedPlan = *erasedPlans.begin();
+  EXPECT_TRUE(erasedPlan.getBody()
+                  .front()
+                  .getOps<mlir::shuttle::InternalEventAllocationOp>()
+                  .empty());
+  EXPECT_TRUE(erasedPlan.getBody()
+                  .front()
+                  .getOps<mlir::shuttle::InternalEventNotifyOp>()
+                  .empty());
+  EXPECT_TRUE(erasedPlan.getBody()
+                  .front()
+                  .getOps<mlir::shuttle::InternalEventWaitOp>()
+                  .empty());
+  auto erasedRealizations =
+      erasedPlan.getBody()
+          .front()
+          .getOps<mlir::shuttle::InternalEventRealizationOp>();
+  ASSERT_EQ(llvm::range_size(erasedRealizations), 1u);
+  EXPECT_EQ((*erasedRealizations.begin()).getKind(), "erased_program_order");
+  mlir::PassManager consumeErasedInternal(erasedInternal->context.get());
+  consumeErasedInternal.addPass(
+      mlir::shuttle::createReplaceWithGpuExecutableBundlePass());
+  consumeErasedInternal.addPass(
+      mlir::shuttle::createStripSourceProvenancePass());
+  consumeErasedInternal.addPass(mlir::shuttle::createVerifyNoShuttleOpsPass());
+  EXPECT_TRUE(
+      mlir::succeeded(consumeErasedInternal.run(*erasedInternal->module)));
+
+  auto missingEventCoverProvider = std::make_shared<RecordingFatbinProvider>(
+      std::move(missingEventCoverArtifact));
+  EXPECT_FALSE(buildFixture(*source, mlir::shuttle::NumericalPolicy::Fast,
+                            options, tuning, mlir::shuttle::GpuTarget::Sm90,
+                            missingEventCoverProvider, true, true));
+
+  auto incompleteEventCoverProvider = std::make_shared<RecordingFatbinProvider>(
+      std::move(incompleteEventCoverArtifact));
+  EXPECT_FALSE(buildFixture(*source, mlir::shuttle::NumericalPolicy::Fast,
+                            options, tuning, mlir::shuttle::GpuTarget::Sm90,
+                            incompleteEventCoverProvider, true, true));
+
+  std::swap(artifact.launches[0].sourceTaskOrdinals,
+            artifact.launches[1].sourceTaskOrdinals);
+  auto invertedProvider =
+      std::make_shared<RecordingFatbinProvider>(std::move(artifact));
+  EXPECT_FALSE(buildFixture(*source, mlir::shuttle::NumericalPolicy::Fast,
+                            options, tuning, mlir::shuttle::GpuTarget::Sm90,
+                            invertedProvider, true, true));
+}
+
+TEST(GpuTransportV2Test,
+     NativeStreamOrderErasureAcceptsProjectedPhysicalLaunches) {
+  checkNativeStreamOrderErasure({{0x50, 0xed, 0x55, 0xba, 1, 0, 0, 0}});
+}
+
+TEST(GpuTransportV2Test,
+     NativeMultiImageAttachmentBindsLaunchesAndTrustedCertificates) {
+  checkNativeStreamOrderErasure({{0x50, 0xed, 0x55, 0xba, 1, 0, 0, 0},
+                                 {0x50, 0xed, 0x55, 0xba, 2, 0, 0, 0}});
+}
+
+TEST(GpuTransportV2Test,
+     StandaloneOrderedAccumulationScheduleMaterializesStructuredPlan) {
+  auto source = fixtureSource("jax-0.10.1-f32-causal-gqa-online-axis4.mlir");
+  ASSERT_TRUE(source);
+  constexpr llvm::StringLiteral options =
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+  constexpr llvm::StringLiteral tuning =
+      R"json({"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json";
+  constexpr llvm::StringLiteral orderedSchedule =
+      R"json({"fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","physical_schedule_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","schedule":{"fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","regions":[{"allocations":[{"acquire_before_consumer":true,"allocation_id":"gradient.allocation","allocation_owners":[[0],[0]],"capacity":1,"covered_plans":["gradient.ordered_contribution"],"generation_count":2,"generations":[0,1],"initial_counts":[0,1],"mechanism_coordinates":[[0,0],[0,1]],"notify_relations":[{"mechanism_coordinate":[0,1],"task_coordinate":[0,0],"task_family":"contribution"}],"release_on_notify":true,"scope":"device","slots":[0,0],"transaction_bytes_by_coordinate":null,"wait_relations":[{"mechanism_coordinate":[0,1],"task_coordinate":[0,1],"task_family":"contribution"}]}],"name":"gradient","predecessor_pairs":[[[0,0],[0,1]]],"realizations":[{"allocation_ids":["gradient.allocation"],"event":{"event_domain":{"axes":[{"extent":1,"name":"owner"},{"extent":2,"name":"part"}],"kind":"event_domain","name":"gradient.ordered_contribution.events"},"generation_policy":"phased","initial_count":{"counts":[{"coordinate":[0,0],"value":0},{"coordinate":[0,1],"value":1}],"provenance":"notify-relation indegree"},"memory_scope":"device","name":"gradient.ordered_contribution","notify_relation":{"pairs":[{"source":[0,0],"target":[0,1]}],"source_domain":{"axes":[{"extent":1,"name":"owner"},{"extent":2,"name":"part"}],"kind":"task_family","name":"contribution","placement":"matrix"},"target_domain":{"axes":[{"extent":1,"name":"owner"},{"extent":2,"name":"part"}],"kind":"event_domain","name":"gradient.ordered_contribution.events"}},"required_dependence":{"relation":{"pairs":[{"source":[0,0],"target":[0,1]}],"source_domain":{"axes":[{"extent":1,"name":"owner"},{"extent":2,"name":"part"}],"kind":"task_family","name":"contribution","placement":"matrix"},"target_domain":{"axes":[{"extent":1,"name":"owner"},{"extent":2,"name":"part"}],"kind":"task_family","name":"contribution","placement":"matrix"}},"visibility":{"acquire_before_consumer":true,"release_on_notify":true,"scope":"device"}},"scheduling_mode":null,"trigger_relation":{"pairs":[{"source":[0,0],"target":[0,0]},{"source":[0,1],"target":[0,1]}],"source_domain":{"axes":[{"extent":1,"name":"owner"},{"extent":2,"name":"part"}],"kind":"event_domain","name":"gradient.ordered_contribution.events"},"target_domain":{"axes":[{"extent":1,"name":"owner"},{"extent":2,"name":"part"}],"kind":"task_family","name":"contribution","placement":"matrix"}},"visibility":{"acquire_before_consumer":true,"release_on_notify":true,"scope":"device"}},"kind":"physical","mechanism":"device semaphore queue with owner-relative phased generations","plan":"gradient.ordered_contribution"}],"schema_version":2,"task_axes":[{"extent":1,"name":"owner"},{"extent":2,"name":"part"}]}],"schema_version":1},"schema_version":1})json";
+
+  auto parsed = mlir::shuttle::parseGpuInternalEventSchedule(orderedSchedule);
+  ASSERT_TRUE(parsed.ok()) << parsed.status();
+  ASSERT_EQ(parsed->regions.size(), 1u);
+  const mlir::shuttle::GpuInternalEventRegion &region = parsed->regions[0];
+  EXPECT_EQ(region.schemaVersion, 2);
+  EXPECT_TRUE(region.fingerprint.empty());
+  ASSERT_EQ(region.taskFamilies.size(), 1u);
+  EXPECT_EQ(region.taskFamilies[0].name, "contribution");
+  ASSERT_EQ(region.events.size(), 1u);
+  EXPECT_EQ(region.events[0].generationPolicy,
+            mlir::shuttle::GpuInternalEventGenerationPolicy::Phased);
+  ASSERT_EQ(region.allocations.size(), 1u);
+  EXPECT_EQ(region.allocations[0].scope,
+            mlir::shuttle::GpuEventPhysicalScope::Device);
+  EXPECT_EQ(region.allocations[0].generationCount, 2);
+  EXPECT_THAT(region.allocations[0].generations, testing::ElementsAre(0, 1));
+  EXPECT_EQ(region.allocations[0].legalizationKind,
+            mlir::shuttle::GpuInternalEventAllocation::LegalizationKind::
+                DeviceSemaphoreQueue);
+
+  auto generic =
+      buildFixture(*source, mlir::shuttle::NumericalPolicy::Fast, options,
+                   tuning, mlir::shuttle::GpuTarget::Sm90, {}, true, true);
+  ASSERT_TRUE(generic);
+  auto genericTransport =
+      mlir::shuttle::serializeGpuExecutableBundle(*generic->module);
+  ASSERT_TRUE(mlir::succeeded(genericTransport));
+  auto genericExecutable =
+      mlir::shuttle::GpuExecutable::Load(*genericTransport);
+  ASSERT_TRUE(genericExecutable.ok()) << genericExecutable.status();
+  ASSERT_EQ((*genericExecutable)->launches().size(), 2u);
+
+  mlir::shuttle::GpuFatbinExecutableBundle artifact{
+      5,
+      mlir::shuttle::ExecutableCodeFormat::CudaFatbinSm90V1,
+      std::string(64, '0'),
+      std::string(64, '0'),
+      {{0x50, 0xed, 0x55, 0xba, 1, 0, 0, 0}},
+      {(*genericExecutable)->launches().begin(),
+       (*genericExecutable)->launches().end()},
+      {(*genericExecutable)->slots().begin(),
+       (*genericExecutable)->slots().end()},
+  };
+  artifact.launches[0].sourceTaskOrdinals = {0};
+  artifact.launches[1].sourceTaskOrdinals = {1};
+  using Expression = mlir::shuttle::GpuAffineExpression;
+  using ExpressionKind = mlir::shuttle::GpuAffineExpressionKind;
+  auto constant = [](int64_t value) {
+    return Expression{ExpressionKind::Constant, value, {}};
+  };
+  mlir::shuttle::GpuAffineMap globalOwner{
+      2, {constant(0), constant(0), constant(0)}};
+  mlir::shuttle::GpuAffineMap launchBoundary{2, {constant(0)}};
+  artifact.eventRealizations = {
+      {0,
+       mlir::shuttle::GpuEventRealizationKind::StreamOrder,
+       {0, 0, 1, 0},
+       {{std::nullopt,
+         {0, globalOwner, launchBoundary},
+         {1, globalOwner, launchBoundary}}}}};
+  artifact.physicalEventProvenance = orderedSchedule.str();
+  artifact.physicalEventProvenanceDigest =
+      mlir::shuttle::gpuExecutableBundleDigest(
+          llvm::ArrayRef<uint8_t>(reinterpret_cast<const uint8_t *>(
+                                      artifact.physicalEventProvenance.data()),
+                                  artifact.physicalEventProvenance.size()));
+
+  auto provider = std::make_shared<RecordingFatbinProvider>(artifact);
+  auto projected = buildFixture(*source, mlir::shuttle::NumericalPolicy::Fast,
+                                options, tuning, mlir::shuttle::GpuTarget::Sm90,
+                                provider, true, true);
+  ASSERT_TRUE(projected);
+  auto plans = projected->module->getOps<mlir::shuttle::InternalEventPlanOp>();
+  ASSERT_EQ(llvm::range_size(plans), 1u);
+  auto plan = *plans.begin();
+  auto tasks =
+      plan.getBody().front().getOps<mlir::shuttle::InternalEventTaskOp>();
+  auto events =
+      plan.getBody().front().getOps<mlir::shuttle::InternalEventTensorOp>();
+  auto allocations =
+      plan.getBody().front().getOps<mlir::shuttle::InternalEventAllocationOp>();
+  auto realizations = plan.getBody()
+                          .front()
+                          .getOps<mlir::shuttle::InternalEventRealizationOp>();
+  ASSERT_EQ(llvm::range_size(tasks), 1u);
+  ASSERT_EQ(llvm::range_size(events), 1u);
+  ASSERT_EQ(llvm::range_size(allocations), 1u);
+  ASSERT_EQ(llvm::range_size(realizations), 1u);
+  auto notifications =
+      plan.getBody().front().getOps<mlir::shuttle::InternalEventNotifyOp>();
+  auto waits =
+      plan.getBody().front().getOps<mlir::shuttle::InternalEventWaitOp>();
+  ASSERT_EQ(llvm::range_size(notifications), 1u);
+  ASSERT_EQ(llvm::range_size(waits), 1u);
+  auto notification = *notifications.begin();
+  auto wait = *waits.begin();
+  EXPECT_EQ(notification.getMechanismCoordinateOrdinal(), 1);
+  EXPECT_THAT(notification.getMechanismCoordinate(),
+              testing::ElementsAre(0, 1));
+  EXPECT_THAT(notification.getAllocationOwner(), testing::ElementsAre(0));
+  EXPECT_EQ(notification.getGeneration(), 1);
+  EXPECT_EQ(notification.getGenerationCount(), 2);
+  EXPECT_EQ(notification.getInitialCount(), 1);
+  EXPECT_EQ(notification.getLegalization(), "device_semaphore_queue");
+  EXPECT_FALSE(notification.getTransactionBytes());
+  EXPECT_EQ(wait.getMechanismCoordinateOrdinal(), 1);
+  EXPECT_EQ(wait.getRequiredCount(), 1);
+  EXPECT_EQ(wait.getLegalization(), "device_semaphore_queue");
+  EXPECT_EQ((*tasks.begin()).getName(), "contribution");
+  EXPECT_EQ((*events.begin()).getGenerationPolicy(), "phased");
+  EXPECT_EQ((*allocations.begin()).getScope(), "device");
+  EXPECT_EQ((*allocations.begin()).getLegalization(), "device_semaphore_queue");
+  EXPECT_EQ((*allocations.begin()).getGenerationCount(), 2);
+  EXPECT_EQ((*realizations.begin()).getKind(), "physical");
+  EXPECT_TRUE(mlir::succeeded(plan.verifyRegions()));
+}
+
+TEST(GpuTransportV2Test,
+     SourceEventLoweringPrecedesAndDoesNotRequirePhysicalBinding) {
+  auto source = fixtureSource("jax-0.10.1-f32-causal-gqa-online-axis4.mlir");
+  ASSERT_TRUE(source);
+  constexpr llvm::StringLiteral options =
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+  constexpr llvm::StringLiteral tuning =
+      R"json({"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json";
+  auto planned =
+      buildFixture(*source, mlir::shuttle::NumericalPolicy::Fast, options,
+                   tuning, mlir::shuttle::GpuTarget::Sm90, {}, false, true);
+  ASSERT_TRUE(planned);
+  EXPECT_TRUE(planned->module->getOps<mlir::shuttle::DeviceModuleOp>().empty());
+  auto schedule =
+      *planned->module->getOps<mlir::shuttle::SchedulePlanOp>().begin();
+  auto eventPlans =
+      planned->module->getOps<mlir::shuttle::EventLoweringPlanOp>();
+  ASSERT_EQ(llvm::range_size(eventPlans), 1u);
+  mlir::shuttle::EventLoweringPlanOp eventPlan = *eventPlans.begin();
+  EXPECT_FALSE(eventPlan.getPhysicalLaunchRecipeFingerprint());
+  EXPECT_EQ(eventPlan.getSourceScheduleFingerprint(),
+            schedule.getFingerprint());
+  EXPECT_EQ(
+      llvm::range_size(eventPlan.getBody()
+                           .front()
+                           .getOps<mlir::shuttle::ImperativeEventNotifyOp>()),
+      llvm::range_size(
+          schedule.getBody().front().getOps<mlir::shuttle::EventTensorOp>()));
+  EXPECT_EQ(
+      llvm::range_size(eventPlan.getBody()
+                           .front()
+                           .getOps<mlir::shuttle::ImperativeEventWaitOp>()),
+      llvm::range_size(
+          schedule.getBody().front().getOps<mlir::shuttle::EventTensorOp>()));
+  EXPECT_TRUE(
+      mlir::succeeded(mlir::shuttle::verifyEventLoweringPlanAgainstSchedule(
+          schedule, eventPlan)));
+}
+
+TEST(GpuTransportV2Test,
+     ImperativeEventPlanRetainsTheExactBoundedGenerationRelation) {
+  auto source = fixtureSource("jax-0.10.1-f32-causal-gqa-online-axis4.mlir");
+  ASSERT_TRUE(source);
+  constexpr llvm::StringLiteral options =
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+  constexpr llvm::StringLiteral tuning =
+      R"json({"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json";
+  auto fixture =
+      buildFixture(*source, mlir::shuttle::NumericalPolicy::Fast, options,
+                   tuning, mlir::shuttle::GpuTarget::Sm90, {}, true, true);
+  ASSERT_TRUE(fixture);
+  auto schedule =
+      *fixture->module->getOps<mlir::shuttle::SchedulePlanOp>().begin();
+  mlir::shuttle::EventLoweringPlanOp eventPlan;
+  for (mlir::shuttle::EventLoweringPlanOp candidate :
+       fixture->module->getOps<mlir::shuttle::EventLoweringPlanOp>())
+    if (!candidate.getPhysicalLaunchRecipeFingerprint()) {
+      ASSERT_FALSE(eventPlan);
+      eventPlan = candidate;
+    }
+  ASSERT_TRUE(eventPlan);
+  mlir::OpBuilder builder(fixture->context.get());
+  EXPECT_FALSE(eventPlan.getPhysicalLaunchRecipeFingerprint());
+  auto notification = *eventPlan.getBody()
+                           .front()
+                           .getOps<mlir::shuttle::ImperativeEventNotifyOp>()
+                           .begin();
+  auto wait = *eventPlan.getBody()
+                   .front()
+                   .getOps<mlir::shuttle::ImperativeEventWaitOp>()
+                   .begin();
+  EXPECT_FALSE(notification->hasAttr("acquire"));
+  EXPECT_FALSE(wait->hasAttr("release"));
+  EXPECT_TRUE(
+      mlir::succeeded(mlir::shuttle::verifyEventLoweringPlanAgainstSchedule(
+          schedule, eventPlan)));
+  std::string sourceBoundFingerprint = eventPlan.getFingerprint().str();
+  eventPlan.setPhysicalLaunchRecipeFingerprintAttr(
+      builder.getStringAttr(std::string(64, '0')));
+  eventPlan.setFingerprint(
+      mlir::shuttle::eventLoweringPlanFingerprint(eventPlan));
+  EXPECT_NE(eventPlan.getFingerprint(), sourceBoundFingerprint);
+  eventPlan->removeAttr("physical_launch_recipe_fingerprint");
+  eventPlan.setFingerprint(
+      mlir::shuttle::eventLoweringPlanFingerprint(eventPlan));
+  EXPECT_EQ(eventPlan.getFingerprint(), sourceBoundFingerprint);
+
+  auto bundle =
+      *fixture->module->getOps<mlir::shuttle::ExecutableBundleOp>().begin();
+  mlir::StringAttr physicalEventPlanFingerprint =
+      bundle.getEventLoweringPlanFingerprintAttr();
+  bundle.setEventLoweringPlanFingerprintAttr(eventPlan.getFingerprintAttr());
+  bundle.setFingerprint(mlir::shuttle::executableBundleFingerprint(bundle));
+  EXPECT_TRUE(mlir::failed(bundle.verify()));
+  bundle.setEventLoweringPlanFingerprintAttr(physicalEventPlanFingerprint);
+  bundle.setFingerprint(mlir::shuttle::executableBundleFingerprint(bundle));
+
+  notification->setAttr("notify_count", builder.getI64IntegerAttr(2));
+  wait->setAttr("notify_count", builder.getI64IntegerAttr(2));
+  eventPlan.setFingerprint(
+      mlir::shuttle::eventLoweringPlanFingerprint(eventPlan));
+  EXPECT_TRUE(
+      mlir::failed(mlir::shuttle::verifyEventLoweringPlanAgainstSchedule(
+          schedule, eventPlan)));
+}
+
+TEST(GpuTransportV2Test,
+     NormalizedExponentialPullbackPlanningIgnoresNeutralCorrectionView) {
+  auto source =
+      fixtureSource("jax-0.10.1-bf16-causal-gqa-value-and-grad-s128-d128.mlir");
+  ASSERT_TRUE(source);
+  std::string rewritten = *source;
+  constexpr llvm::StringLiteral original = "    %60 = stablehlo.add %51, %59 : "
+                                           "tensor<1x8x4x128x128xf32>\n";
+  constexpr llvm::StringLiteral replacement =
+      "    %neg59 = stablehlo.negate %59 : tensor<1x8x4x128x128xf32>\n"
+      "    %pos59 = stablehlo.negate %neg59 : tensor<1x8x4x128x128xf32>\n"
+      "    %60 = stablehlo.add %51, %pos59 : "
+      "tensor<1x8x4x128x128xf32>\n";
+  size_t correction = rewritten.find(original.str());
+  ASSERT_NE(correction, std::string::npos);
+  rewritten.replace(correction, original.size(), replacement.str());
+
+  constexpr llvm::StringLiteral options =
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+  constexpr llvm::StringLiteral tuning =
+      R"json({"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json";
+  auto baselineProvider = std::make_shared<RecordingDecliningProvider>();
+  auto rewrittenProvider = std::make_shared<RecordingDecliningProvider>();
+  auto baseline =
+      buildFixture(*source, mlir::shuttle::NumericalPolicy::Fast, options,
+                   tuning, mlir::shuttle::GpuTarget::Sm90, baselineProvider);
+  auto changed =
+      buildFixture(rewritten, mlir::shuttle::NumericalPolicy::Fast, options,
+                   tuning, mlir::shuttle::GpuTarget::Sm90, rewrittenProvider);
+  // The recording provider intentionally declines compilation after the
+  // production pipeline has formed and submitted the physical request.
+  EXPECT_FALSE(baseline);
+  EXPECT_FALSE(changed);
+  ASSERT_EQ(baselineProvider->requestFingerprint.size(), 64);
+  ASSERT_EQ(rewrittenProvider->requestFingerprint.size(), 64);
+  EXPECT_THAT(baselineProvider->structuralPlan,
+              testing::HasSubstr("stateful_contract_fold_pullback=true"));
+  EXPECT_EQ(baselineProvider->structuralPlan,
+            rewrittenProvider->structuralPlan);
+  EXPECT_NE(baselineProvider->requestFingerprint,
+            rewrittenProvider->requestFingerprint);
+}
+
+TEST(GpuTransportV2Test,
+     ScalarObjectivePullbackPhysicalRequestCarriesExactTaskAndBufferRoles) {
+  auto source = fixtureSource(
+      "jax-0.10.1-bf16-causal-gqa-scalar-value-and-grad-s128-d128.mlir");
+  ASSERT_TRUE(source);
+  constexpr llvm::StringLiteral options =
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+  constexpr llvm::StringLiteral tuning =
+      R"json({"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json";
+  auto provider = std::make_shared<RecordingDecliningProvider>();
+  auto built =
+      buildFixture(*source, mlir::shuttle::NumericalPolicy::Fast, options,
+                   tuning, mlir::shuttle::GpuTarget::Sm90, provider);
+  EXPECT_FALSE(built);
+  EXPECT_THAT(provider->requestJson,
+              testing::HasSubstr("\"schema_version\":3"));
+  EXPECT_THAT(provider->requestJson,
+              testing::HasSubstr("#shuttle.schedule_task_kind<all_axis_fold>"));
+  EXPECT_THAT(provider->requestJson,
+              testing::HasSubstr("\"producer_phase\":\"partial\""));
+  EXPECT_THAT(provider->requestJson,
+              testing::HasSubstr("\"consumer_phase\":\"merge\""));
+  EXPECT_THAT(provider->requestJson,
+              testing::HasSubstr("\"storage_capacity\":128"));
+  EXPECT_THAT(provider->requestJson, testing::HasSubstr("\"forward_task\":0"));
+  EXPECT_THAT(provider->requestJson,
+              testing::HasSubstr("\"objective_task\":1"));
+  EXPECT_THAT(provider->requestJson,
+              testing::HasSubstr("\"owner_pullback_task\":2"));
+  EXPECT_THAT(provider->requestJson,
+              testing::HasSubstr("\"streamed_pullback_task\":3"));
+  EXPECT_THAT(provider->requestJson,
+              testing::HasSubstr("\"maximum_state_buffer\":8"));
+  EXPECT_THAT(provider->requestJson,
+              testing::HasSubstr("\"normalizer_state_buffer\":9"));
+  EXPECT_THAT(provider->requestJson,
+              testing::HasSubstr("\"output_dependent_state_buffer\":10"));
+}
+
+TEST(GpuTransportV2Test,
+     NonFoldCompositionDependencyUsesGenericBoundedEventRelation) {
+  auto source =
+      fixtureSource("jax-0.10.1-bf16-causal-gqa-value-and-grad-s19-d128.mlir");
+  ASSERT_TRUE(source);
+  constexpr llvm::StringLiteral options =
+      R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
+  constexpr llvm::StringLiteral tuning =
+      R"json({"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json";
+  auto built =
+      buildFixture(*source, mlir::shuttle::NumericalPolicy::Fast, options,
+                   tuning, mlir::shuttle::GpuTarget::Sm90, {}, false);
+  ASSERT_TRUE(built);
+
+  auto materialization =
+      *built->module->getOps<mlir::shuttle::MaterializationPlanOp>().begin();
+  llvm::SmallVector<mlir::shuttle::MaterializationTaskOp> tasks(
+      materialization.getBody()
+          .front()
+          .getOps<mlir::shuttle::MaterializationTaskOp>());
+  auto schedule =
+      *built->module->getOps<mlir::shuttle::SchedulePlanOp>().begin();
+  llvm::SmallVector<mlir::shuttle::EventTensorOp> events(
+      schedule.getBody().front().getOps<mlir::shuttle::EventTensorOp>());
+  bool found = false;
+  for (auto [consumerOrdinal, consumer] : llvm::enumerate(tasks)) {
+    for (int64_t producerOrdinal : consumer.getDependencies()) {
+      auto producer = tasks[producerOrdinal];
+      if (producer.getKind() == mlir::shuttle::MaterializationTaskKind::Fold ||
+          !producer->hasAttr("composition_sources") ||
+          !consumer->hasAttr("composition_sources"))
+        continue;
+      auto event = llvm::find_if(events, [&](mlir::shuttle::EventTensorOp e) {
+        return e.getProducerTask() == producerOrdinal &&
+               e.getConsumerTask() == static_cast<int64_t>(consumerOrdinal);
+      });
+      ASSERT_NE(event, events.end());
+      EXPECT_FALSE(event->getRelationDomainShape().empty());
+      EXPECT_GT(event->getStorageCapacity(), 0);
+      found = true;
+    }
+  }
+  EXPECT_TRUE(found);
+}
+
+TEST(GpuTransportV2Test,
+     ScheduleVerifierCountsRuntimeParametricDependencyAsExactEventProgram) {
+  auto built = buildFixture(contractMapModule(3, 5, 2, "parametric_event"),
+                            mlir::shuttle::NumericalPolicy::SourceOrdered, {},
+                            {}, mlir::shuttle::GpuTarget::Sm90, {}, false);
+  ASSERT_TRUE(built);
+  auto schedule =
+      *built->module->getOps<mlir::shuttle::SchedulePlanOp>().begin();
+  llvm::SmallVector<mlir::shuttle::ScheduleTaskOp> tasks(
+      schedule.getBody().front().getOps<mlir::shuttle::ScheduleTaskOp>());
+  llvm::SmallVector<mlir::shuttle::EventTensorOp> events(
+      schedule.getBody().front().getOps<mlir::shuttle::EventTensorOp>());
+  ASSERT_EQ(tasks.size(), 2);
+  ASSERT_EQ(events.size(), 1);
+  EXPECT_THAT(tasks[1].getDependencies(), testing::ElementsAre(0));
+  int64_t capacity = 1;
+  for (int64_t extent : tasks[1].getGridShape())
+    capacity *= extent;
+
+  mlir::OpBuilder builder(built->context.get());
+  auto program = builder.getDictionaryAttr({
+      builder.getNamedAttr("dependency_ordinal", builder.getI64IntegerAttr(0)),
+      builder.getNamedAttr("producer_task", builder.getI64IntegerAttr(0)),
+      builder.getNamedAttr("consumer_task", builder.getI64IntegerAttr(1)),
+      builder.getNamedAttr(
+          "relation_source",
+          mlir::shuttle::SourceRefAttr::get(built->context.get(), 0, 0, 0, 0)),
+      builder.getNamedAttr(
+          "relation_semantics",
+          mlir::shuttle::RelationSemanticsAttr::get(
+              built->context.get(), mlir::shuttle::RelationSemantics::Gather)),
+      builder.getNamedAttr("shared_buffers", builder.getDenseI64ArrayAttr({0})),
+      builder.getNamedAttr("derivation",
+                           builder.getStringAttr("exact_consumer")),
+      builder.getNamedAttr("storage_capacity",
+                           builder.getI64IntegerAttr(capacity)),
+      builder.getNamedAttr("generations", builder.getI64IntegerAttr(1)),
+  });
+  schedule.setParametricDependenciesAttr(builder.getArrayAttr({program}));
+  events.front().erase();
+  schedule.setFingerprint(mlir::shuttle::schedulePlanFingerprint(schedule));
+  EXPECT_TRUE(mlir::succeeded(schedule.verify()));
 }
 
 TEST(GpuTransportV2Test, Sm100CodegenAndTransportAreTargetBound) {
@@ -1198,12 +2566,24 @@ serializeAllGpuBundles(mlir::ModuleOp module) {
         return std::nullopt;
       abi = candidate;
     }
-    if (!device || !abi)
+    mlir::shuttle::EventLoweringPlanOp eventPlan;
+    for (mlir::shuttle::EventLoweringPlanOp candidate :
+         module.getOps<mlir::shuttle::EventLoweringPlanOp>()) {
+      if (!bundle.getEventLoweringPlanFingerprint() ||
+          candidate.getFingerprint() !=
+              *bundle.getEventLoweringPlanFingerprint())
+        continue;
+      if (eventPlan)
+        return std::nullopt;
+      eventPlan = candidate;
+    }
+    if (!device || !abi || !eventPlan)
       return std::nullopt;
     mlir::OwningOpRef<mlir::ModuleOp> tuple =
         mlir::ModuleOp::create(module.getLoc());
     mlir::OpBuilder builder(module.getContext());
     builder.setInsertionPointToEnd(tuple->getBody());
+    builder.insert(eventPlan->clone());
     builder.insert(device->clone());
     builder.insert(abi->clone());
     builder.insert(bundle->clone());
@@ -1299,7 +2679,9 @@ std::string mapOnlyModule(int64_t inputs, bool permutedResult) {
             "      ^bb0(%left: f32, %right: f32):\n"
             "        %sum = arith.addf %left, %right : f32\n"
             "        \"shuttle.yield\"(%sum) : (f32) -> ()\n"
-            "      }) {accumulator_types = [f32], operandSegmentSizes = "
+            "      }) {indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, "
+            "affine_map<(d0, d1) -> (d0)>], accumulator_types = [f32], "
+            "operandSegmentSizes = "
             "array<i32: 1, 1>, order_free = true, reduction_dimensions = "
             "array<i64: 1>, source = #shuttle.source_ref<0, 0, 2, 0>} : "
             "(tensor<2x3xf32>, tensor<f32>) -> tensor<2xf32>\n"
@@ -1373,11 +2755,11 @@ std::unique_ptr<BuiltBundle> buildAlgebraFixture(
   result->module->getOperation()->setAttr(
       "shuttle.coverage_manifest",
       builder.getDictionaryAttr(builder.getNamedAttr(
-          "canonical_tuning",
-          builder.getStringAttr(tuning))));
+          "canonical_tuning", builder.getStringAttr(tuning))));
   mlir::PassManager manager(result->context.get());
   manager.addPass(mlir::shuttle::createPlanRowFoldMaterializationPass());
   manager.addPass(mlir::shuttle::createPlanSimt32RowFoldSchedulePass());
+  manager.addPass(mlir::shuttle::createPlanSourceEventLoweringPass());
   manager.addPass(mlir::shuttle::createBuildGpuExecutableBundlePass());
   manager.addPass(mlir::shuttle::createVerifyGpuExecutableBundlePass());
   if (mlir::failed(manager.run(*result->module)))
@@ -1558,7 +2940,168 @@ TEST(GpuTransportV2Test, ScalarConvertPreservesBf16RoundingBoundary) {
       devices[0].getCode().size());
   EXPECT_TRUE(ptx.contains("cvt.rn.bf16.f32 %h2, %f0;"));
   EXPECT_TRUE(ptx.contains("cvt.f32.bf16 %f1, %h2;"));
-  EXPECT_FALSE(buildAlgebraFixture(bf16ArithmeticMapModule()));
+
+  auto bf16Arithmetic = buildAlgebraFixture(bf16ArithmeticMapModule());
+  ASSERT_TRUE(bf16Arithmetic);
+  auto bf16Devices = llvm::to_vector(
+      bf16Arithmetic->module->getOps<mlir::shuttle::DeviceModuleOp>());
+  ASSERT_EQ(bf16Devices.size(), 1);
+  llvm::StringRef bf16Ptx(
+      reinterpret_cast<const char *>(bf16Devices[0].getCode().data()),
+      bf16Devices[0].getCode().size());
+  EXPECT_TRUE(bf16Ptx.contains("add.rn.f32"));
+  EXPECT_TRUE(bf16Ptx.contains("cvt.rn.bf16.f32"));
+  EXPECT_TRUE(bf16Ptx.contains("cvt.f32.bf16"));
+}
+
+TEST(GpuTransportV2Test, TypedMapTemporariesPreserveConsumedLiveResults) {
+  constexpr llvm::StringLiteral source = R"mlir(
+module @typed_map_outputs {
+  func.func public @main(%x: tensor<1x2048x1xbf16>, %y: tensor<1x2048x1xbf16>) -> (tensor<1x2048x1xbf16>, tensor<1x2048x1xbf16>) {
+    %sum = stablehlo.add %x, %y : tensor<1x2048x1xbf16>
+    %root = stablehlo.rsqrt %sum : tensor<1x2048x1xbf16>
+    %quotient = stablehlo.divide %root, %sum : tensor<1x2048x1xbf16>
+    return %root, %quotient : tensor<1x2048x1xbf16>, tensor<1x2048x1xbf16>
+  }
+}
+)mlir";
+  auto built = buildFixture(source);
+  ASSERT_TRUE(built);
+  mlir::PassManager verify(built->context.get());
+  verify.addPass(mlir::shuttle::createVerifySourceCoveragePass());
+  verify.addPass(mlir::shuttle::createVerifySemanticErasurePass());
+  verify.addPass(mlir::shuttle::createVerifyMaterializationPlanPass());
+  verify.addPass(mlir::shuttle::createVerifySimt32RowFoldSchedulePass());
+  ASSERT_TRUE(mlir::succeeded(verify.run(*built->module)));
+  auto materialization =
+      *built->module->getOps<mlir::shuttle::MaterializationPlanOp>().begin();
+  auto buffers =
+      llvm::to_vector(materialization.getBody()
+                          .front()
+                          .getOps<mlir::shuttle::MaterializationBufferOp>());
+  ASSERT_EQ(buffers.size(), 5u);
+  const auto temporaryType = buffers[2].getTensorType();
+  for (unsigned width : {1u, 32u}) {
+    // Integer storage is valid for other task families, but a typed floating
+    // Map temporary must not silently cross into those representations.
+    buffers[2]->setAttr("tensor_type",
+                        mlir::TypeAttr::get(mlir::RankedTensorType::get(
+                            {1, 2048, 1}, mlir::IntegerType::get(
+                                              built->context.get(), width))));
+    EXPECT_TRUE(mlir::failed(mlir::verify(materialization.getOperation())));
+  }
+  buffers[2]->setAttr("tensor_type", mlir::TypeAttr::get(temporaryType));
+  ASSERT_TRUE(mlir::succeeded(mlir::verify(materialization.getOperation())));
+  auto manifest =
+      built->module->getOperation()->getAttrOfType<mlir::DictionaryAttr>(
+          "shuttle.coverage_manifest");
+  ASSERT_TRUE(manifest);
+  EXPECT_EQ(manifest.getAs<mlir::ArrayAttr>("complete").size(), 3u);
+  EXPECT_TRUE(manifest.getAs<mlir::ArrayAttr>("excluded").empty());
+  auto selected = manifest.getAs<mlir::ArrayAttr>("selected_regions");
+  ASSERT_EQ(selected.size(), 1u);
+  EXPECT_EQ(mlir::cast<mlir::ArrayAttr>(selected[0]).size(), 3u);
+
+  auto bytes = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+  ASSERT_TRUE(mlir::succeeded(bytes));
+  auto decoded = decodeInlineSchema2(*bytes);
+  ASSERT_TRUE(decoded);
+  auto loaded = mlir::shuttle::GpuExecutable::Load(*bytes);
+  ASSERT_TRUE(loaded.ok()) << loaded.status();
+  ASSERT_EQ(decoded->launches.size(), 3u);
+  ASSERT_EQ((*loaded)->slots().size(), 5u);
+  EXPECT_EQ(decoded->temporaryBytes, 4096u);
+  const auto &sum = (*loaded)->slots()[2];
+  EXPECT_EQ(sum.storage, mlir::shuttle::MaterializationStorage::Temporary);
+  EXPECT_EQ(sum.requiredBytes, 4096);
+  EXPECT_TRUE(mlir::cast<mlir::RankedTensorType>(sum.tensorType)
+                  .getElementType()
+                  .isBF16());
+  const auto &root = (*loaded)->slots()[3];
+  EXPECT_EQ(root.storage, mlir::shuttle::MaterializationStorage::External);
+  EXPECT_EQ(root.bindingKind, mlir::shuttle::ExecutableBindingKind::Result);
+  EXPECT_EQ(root.bindingIndex, 0);
+  EXPECT_EQ(root.requiredBytes, 4096);
+  EXPECT_EQ((*loaded)->slots()[4].bindingIndex, 1);
+  EXPECT_EQ(decoded->launches[0].outputSlots, (std::vector<int64_t>{2}));
+  EXPECT_EQ(decoded->launches[1].inputSlots, (std::vector<int64_t>{2}));
+  EXPECT_EQ(decoded->launches[1].outputSlots, (std::vector<int64_t>{3}));
+  EXPECT_EQ(decoded->launches[1].dependencies, (std::vector<int64_t>{0}));
+  EXPECT_EQ(decoded->launches[2].inputSlots, (std::vector<int64_t>{3, 2}));
+  EXPECT_EQ(decoded->launches[2].dependencies, (std::vector<int64_t>{0, 1}));
+  EXPECT_EQ(decoded->slotFinalUses[3], 2);
+
+  const llvm::StringRef operations[] = {"add.rn.f32", "sqrt.rn.f32",
+                                        "div.rn.f32"};
+  for (auto [ordinal, launch] : llvm::enumerate(decoded->launches)) {
+    llvm::StringRef ptx(reinterpret_cast<const char *>(decoded->code.data() +
+                                                       launch.codeOffset),
+                        launch.codeLength);
+    const size_t operation = ptx.find(operations[ordinal]);
+    const size_t rounding = ptx.find("cvt.rn.bf16.f32", operation);
+    const size_t widened = ptx.find("cvt.f32.bf16", rounding);
+    const size_t stored = ptx.find("st.global.u16", widened);
+    ASSERT_NE(operation, llvm::StringRef::npos);
+    ASSERT_NE(rounding, llvm::StringRef::npos);
+    ASSERT_NE(widened, llvm::StringRef::npos);
+    ASSERT_NE(stored, llvm::StringRef::npos);
+    EXPECT_LT(operation, rounding);
+    EXPECT_LT(rounding, widened);
+    EXPECT_LT(widened, stored);
+    EXPECT_TRUE(ptx.contains("ld.global.u16"));
+    EXPECT_FALSE(ptx.contains("st.global.f32"));
+  }
+  // Reading the retained result before its producer must still fail even
+  // when the transport's hashes have been recomputed by the mutation helper.
+  auto futureResult = futureProducedResultInput(*bytes, *decoded);
+  ASSERT_FALSE(futureResult.empty());
+  EXPECT_FALSE(decodeInlineSchema2(futureResult));
+  EXPECT_FALSE(mlir::shuttle::GpuExecutable::Load(futureResult).ok());
+
+  mlir::PassManager replace(built->context.get());
+  replace.addPass(mlir::shuttle::createReplaceWithGpuExecutableBundlePass());
+  replace.addPass(mlir::shuttle::createStripSourceProvenancePass());
+  replace.addPass(mlir::shuttle::createVerifyNoShuttleOpsPass());
+  ASSERT_TRUE(mlir::succeeded(replace.run(*built->module)));
+  int64_t calls = 0;
+  built->module->walk([&](mlir::Operation *operation) {
+    if (operation->getName().getStringRef() != "stablehlo.custom_call")
+      return;
+    ++calls;
+    EXPECT_EQ(operation->getNumResults(), 2u);
+  });
+  EXPECT_EQ(calls, 1);
+}
+
+TEST(GpuTransportV2Test, SingleTypedPointwiseMapsNeedNoTemporary) {
+  for (llvm::StringRef shape : {"", "1x2048x1x"}) {
+    for (llvm::StringRef dtype : {"bf16", "f32"}) {
+      const std::string type = ("tensor<" + shape + dtype + ">").str();
+      const std::string source = "module { func.func @main(%x: " + type +
+                                 ") -> " + type +
+                                 " { %y = stablehlo.negate %x : " + type +
+                                 " return %y : " + type + " } }";
+      SCOPED_TRACE(source);
+      auto built = buildFixture(source);
+      if (shape.empty() && dtype == "bf16") {
+        // This planner path retains its scalar BF16 admission boundary.
+        EXPECT_FALSE(built);
+        continue;
+      }
+      ASSERT_TRUE(built);
+      auto bytes = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+      ASSERT_TRUE(mlir::succeeded(bytes));
+      auto decoded = decodeInlineSchema2(*bytes);
+      ASSERT_TRUE(decoded);
+      EXPECT_EQ(decoded->launches.size(), 1u);
+      EXPECT_EQ(decoded->temporaryBytes, 0u);
+      EXPECT_EQ(decoded->externalSlots, 2);
+      const int64_t elements = shape.empty() ? 1 : 2048;
+      EXPECT_EQ(decoded->slotRequiredBytes,
+                (llvm::SmallVector<int64_t>(2, elements *
+                                                   (dtype == "bf16" ? 2 : 4))));
+    }
+  }
 }
 
 TEST(GpuTransportV2Test,
@@ -1924,8 +3467,7 @@ TEST(GpuTransportV2Test, Abi17ThroughAbi21PreserveEveryTransportAndRuntimeCap) {
 
   llvm::SmallVector<uint64_t> transportLengths(32, 512 * 1024);
   const auto transportPacket = completeSchema2Packet(transportLengths);
-  ASSERT_GT(transportPacket.size(),
-            mlir::shuttle::kMaximumGpuTransportBytes);
+  ASSERT_GT(transportPacket.size(), mlir::shuttle::kMaximumGpuTransportBytes);
   DecodeLimits raisedTransport;
   raisedTransport.transportBytes = transportPacket.size();
   raisedTransport.codeBytes = 16 * 1024 * 1024;
@@ -1948,8 +3490,7 @@ TEST(GpuTransportV2Test, Abi17ThroughAbi21PreserveEveryTransportAndRuntimeCap) {
                          raisedRecords);
 
   DecodeLimits raisedEntry;
-  raisedEntry.entryCodeBytes =
-      mlir::shuttle::kMaximumGpuEntryCodeBytes + 1;
+  raisedEntry.entryCodeBytes = mlir::shuttle::kMaximumGpuEntryCodeBytes + 1;
   expectOnlyCapsRejected(
       "entry",
       completeSchema2Packet(
@@ -1984,31 +3525,29 @@ TEST(GpuTransportV2Test, Abi17ThroughAbi21PreserveEveryTransportAndRuntimeCap) {
                          raisedRank);
 
   llvm::SmallVector<uint8_t> slotByteCap(*bytes);
-  const uint64_t publicSlot = llvm::find(decoded->slotStorage, 0) -
-                              decoded->slotStorage.begin();
-  ASSERT_LT(publicSlot, decoded->slotStorage.size());
-  int64_t oversizedExtent = decoded->slotDimensions[publicSlot].front();
-  int64_t oversizedBytes = decoded->slotRequiredBytes[publicSlot];
+  const uint64_t temporarySlot =
+      llvm::find(decoded->slotStorage, 1) - decoded->slotStorage.begin();
+  ASSERT_LT(temporarySlot, decoded->slotStorage.size());
+  int64_t oversizedExtent = decoded->slotDimensions[temporarySlot].front();
+  int64_t oversizedBytes = decoded->slotRequiredBytes[temporarySlot];
   while (oversizedBytes <= 32 * 1024 * 1024) {
     oversizedExtent *= 2;
     oversizedBytes *= 2;
   }
-  writeU64(slotByteCap,
-           decoded->slotDimensionOffsets[publicSlot].front(),
+  writeU64(slotByteCap, decoded->slotDimensionOffsets[temporarySlot].front(),
            oversizedExtent);
-  writeU64(slotByteCap, decoded->slotRequiredOffsets[publicSlot],
+  writeU64(slotByteCap, decoded->slotRequiredOffsets[temporarySlot],
            oversizedBytes);
   rehashInvocationAndBundle(slotByteCap, *decoded);
   DecodeLimits raisedSlotBytes;
-  raisedSlotBytes.slotBytes = oversizedBytes;
-  expectOnlyCapsRejected("slot bytes", slotByteCap, raisedSlotBytes);
+  raisedSlotBytes.temporarySlotBytes = oversizedBytes;
+  expectOnlyCapsRejected("temporary slot bytes", slotByteCap, raisedSlotBytes);
 
   llvm::SmallVector<uint8_t> temporaryCap(*bytes);
   int64_t widenedTemporaries = 0;
   int64_t widenedTemporaryBytes = 0;
-  for (size_t slot = 0; slot < decoded->slotStorage.size() &&
-                        widenedTemporaries < 9;
-       ++slot) {
+  for (size_t slot = 0;
+       slot < decoded->slotStorage.size() && widenedTemporaries < 9; ++slot) {
     if (decoded->slotStorage[slot] != 1 ||
         decoded->slotDimensionOffsets[slot].empty())
       continue;
@@ -2016,8 +3555,7 @@ TEST(GpuTransportV2Test, Abi17ThroughAbi21PreserveEveryTransportAndRuntimeCap) {
     ASSERT_EQ(decoded->slotRequiredBytes[slot] % priorExtent, 0);
     const int64_t bytesPerLeadingElement =
         decoded->slotRequiredBytes[slot] / priorExtent;
-    const int64_t widenedExtent =
-        (32 * 1024 * 1024) / bytesPerLeadingElement;
+    const int64_t widenedExtent = (32 * 1024 * 1024) / bytesPerLeadingElement;
     const int64_t widenedBytes = widenedExtent * bytesPerLeadingElement;
     writeU64(temporaryCap, decoded->slotDimensionOffsets[slot].front(),
              widenedExtent);
@@ -2032,8 +3570,7 @@ TEST(GpuTransportV2Test, Abi17ThroughAbi21PreserveEveryTransportAndRuntimeCap) {
   DecodeLimits raisedTemporaryBytes;
   raisedTemporaryBytes.temporaryBytes =
       widenedTemporaryBytes + decoded->temporaryBytes;
-  expectOnlyCapsRejected("temporary bytes", temporaryCap,
-                         raisedTemporaryBytes);
+  expectOnlyCapsRejected("temporary bytes", temporaryCap, raisedTemporaryBytes);
 }
 
 TEST(GpuTransportV2Test,
@@ -2290,8 +3827,8 @@ TEST(GpuTransportV2Test,
       }
       std::vector<mlir::shuttle::GpuExternalBinding> structuralBindings =
           externalBindingsBySlot(**loaded);
-      for (auto [binding, expectedBytes] : llvm::zip_equal(
-               structuralBindings, boundary.externalBytes))
+      for (auto [binding, expectedBytes] :
+           llvm::zip_equal(structuralBindings, boundary.externalBytes))
         EXPECT_EQ(binding.requiredBytes, expectedBytes);
     }
 
@@ -2450,10 +3987,9 @@ TEST(GpuTransportV2Test,
 
   for (const Shape &shape : shapes) {
     for (const Boundary &boundary : boundaries) {
-      std::string filename =
-          ("jax-0.10.1-bf16-rank_n_fold_map-" + shape.stem + "-" +
-           boundary.suffix + ".mlir")
-              .str();
+      std::string filename = ("jax-0.10.1-bf16-rank_n_fold_map-" + shape.stem +
+                              "-" + boundary.suffix + ".mlir")
+                                 .str();
       SCOPED_TRACE(filename);
       auto source = fixtureSource(filename);
       ASSERT_TRUE(source);
@@ -2471,8 +4007,7 @@ TEST(GpuTransportV2Test,
         ASSERT_TRUE(loaded.ok()) << loaded.status();
         EXPECT_EQ(decoded->launches.size(), boundary.launches);
         EXPECT_EQ(decoded->externalSlots, boundary.externalSlots);
-        ASSERT_EQ((*loaded)->externalBindings().size(),
-                  boundary.externalSlots);
+        ASSERT_EQ((*loaded)->externalBindings().size(), boundary.externalSlots);
         for (const auto &binding : (*loaded)->externalBindings())
           EXPECT_EQ(binding.requiredBytes, shape.publicBytes);
         int64_t inputSlots = 0;
@@ -2534,26 +4069,23 @@ TEST(GpuTransportV2Test,
           EXPECT_EQ(launch.block,
                     (std::array<uint64_t, 3>{shape.threads, 1, 1}));
           EXPECT_EQ(launch.dynamicSharedMemoryBytes, shape.scratch);
-          llvm::StringRef ptx(
-              reinterpret_cast<const char *>(decoded->code.data() +
-                                             launch.codeOffset),
-              launch.codeLength);
+          llvm::StringRef ptx(reinterpret_cast<const char *>(
+                                  decoded->code.data() + launch.codeOffset),
+                              launch.codeLength);
           EXPECT_TRUE(ptx.contains(
-              ("setp.ge.u32 %p0, %r1, " + llvm::Twine(shape.outputCount) +
-               ";")
-                  .str()));
-          EXPECT_TRUE(ptx.contains(
-              ("mad.lo.u64 %rd3, %rd2, " +
-               llvm::Twine(shape.reductionExtent) + ", %rd1;")
+              ("setp.ge.u32 %p0, %r1, " + llvm::Twine(shape.outputCount) + ";")
                   .str()));
           EXPECT_TRUE(
-              ptx.contains("mad.lo.u64 %rd3, %rd3, 4, %rd0;"));
+              ptx.contains(("mad.lo.u64 %rd3, %rd2, " +
+                            llvm::Twine(shape.reductionExtent) + ", %rd1;")
+                               .str()));
+          EXPECT_TRUE(ptx.contains("mad.lo.u64 %rd3, %rd3, 4, %rd0;"));
           EXPECT_TRUE(ptx.contains("mul.lo.u64 %rd9, %rd9, 4;"));
-          EXPECT_EQ(ptx.count("ld.global.f32"),
-                    static_cast<size_t>(
-                        (shape.reductionExtent + shape.threads - 1) /
-                            shape.threads +
-                        1));
+          EXPECT_EQ(
+              ptx.count("ld.global.f32"),
+              static_cast<size_t>((shape.reductionExtent + shape.threads - 1) /
+                                      shape.threads +
+                                  1));
           EXPECT_FALSE(ptx.contains("ld.global.u16"));
         }
         EXPECT_EQ(foldLaunches, boundary.folds);
@@ -2572,7 +4104,6 @@ TEST(GpuTransportV2Test,
     std::vector<int64_t> singletonStrides;
     std::vector<int64_t> publicStrides;
     std::vector<int64_t> sampleCoordinates;
-    int64_t reductionExtent;
     uint64_t mapGrid;
     uint64_t foldGrid;
     uint64_t foldThreads;
@@ -2599,7 +4130,6 @@ TEST(GpuTransportV2Test,
        {28, 4, 4},
        {266, 38, 2},
        {1, 5, 18},
-       19,
        2,
        14,
        32,
@@ -2616,7 +4146,6 @@ TEST(GpuTransportV2Test,
        {440, 220, 44, 4, 4},
        {57860, 28930, 5786, 526, 2},
        {2, 1, 4, 10, 262},
-       263,
        340,
        330,
        256,
@@ -2635,10 +4164,9 @@ TEST(GpuTransportV2Test,
 
   for (const Shape &shape : shapes) {
     for (const Boundary &boundary : boundaries) {
-      std::string filename =
-          ("jax-0.10.1-bf16-singleton_broadcast-" + shape.stem + "-" +
-           boundary.suffix + ".mlir")
-              .str();
+      std::string filename = ("jax-0.10.1-bf16-singleton_broadcast-" +
+                              shape.stem + "-" + boundary.suffix + ".mlir")
+                                 .str();
       SCOPED_TRACE(filename);
       auto source = fixtureSource(filename);
       ASSERT_TRUE(source);
@@ -2660,8 +4188,7 @@ TEST(GpuTransportV2Test,
                                                                           : 1);
         EXPECT_EQ(decoded->launches.size(), boundary.launches);
         EXPECT_EQ(decoded->externalSlots, boundary.externalSlots);
-        ASSERT_EQ((*loaded)->externalBindings().size(),
-                  boundary.externalSlots);
+        ASSERT_EQ((*loaded)->externalBindings().size(), boundary.externalSlots);
         for (const auto &binding : (*loaded)->externalBindings()) {
           EXPECT_EQ(binding.requiredBytes, shape.publicBytes);
         }
@@ -2670,20 +4197,15 @@ TEST(GpuTransportV2Test,
         int64_t fullFoldLaunches = 0;
         int64_t singletonFoldLaunches = 0;
         for (const auto &launch : decoded->launches) {
-          llvm::StringRef ptx(
-              reinterpret_cast<const char *>(decoded->code.data() +
-                                             launch.codeOffset),
-              launch.codeLength);
-          bool isExpansion = launch.inputSlots.size() == 1 &&
-                             launch.outputSlots.size() == 1;
+          bool isExpansion =
+              launch.inputSlots.size() == 1 && launch.outputSlots.size() == 1;
           if (isExpansion) {
             int64_t input = launch.inputSlots.front();
             int64_t output = launch.outputSlots.front();
-            isExpansion =
-                decoded->slotDimensions[input] ==
-                    llvm::ArrayRef<int64_t>(shape.singletonShape) &&
-                decoded->slotDimensions[output] ==
-                    llvm::ArrayRef<int64_t>(shape.fullShape);
+            isExpansion = decoded->slotDimensions[input] ==
+                              llvm::ArrayRef<int64_t>(shape.singletonShape) &&
+                          decoded->slotDimensions[output] ==
+                              llvm::ArrayRef<int64_t>(shape.fullShape);
           }
           if (isExpansion) {
             ++expansionLaunches;
@@ -2701,40 +4223,8 @@ TEST(GpuTransportV2Test,
             EXPECT_EQ(decoded->slotRequiredBytes[output], shape.fullBytes);
             EXPECT_EQ(launch.grid,
                       (std::array<uint64_t, 3>{shape.mapGrid, 1, 1}));
-            EXPECT_EQ(launch.block,
-                      (std::array<uint64_t, 3>{256, 1, 1}));
+            EXPECT_EQ(launch.block, (std::array<uint64_t, 3>{256, 1, 1}));
             EXPECT_EQ(launch.dynamicSharedMemoryBytes, 0);
-            llvm::SmallVector<llvm::StringRef> lines;
-            ptx.split(lines, '\n');
-            int64_t divisionsByReductionExtent = 0;
-            int64_t coordinateDivisionsByReductionExtent = 0;
-            std::string suffix =
-                (", " + llvm::Twine(shape.reductionExtent) + ";").str();
-            for (llvm::StringRef line : lines) {
-              if (!line.starts_with("  div.u64 ") || !line.ends_with(suffix)) {
-                continue;
-              }
-              ++divisionsByReductionExtent;
-              if (line.contains(", %rd0, ")) {
-                ++coordinateDivisionsByReductionExtent;
-              }
-            }
-            EXPECT_EQ(divisionsByReductionExtent, 2);
-            EXPECT_EQ(coordinateDivisionsByReductionExtent, 1);
-
-            int64_t inputByte = 0;
-            int64_t outputByte = 0;
-            for (size_t axis = 0; axis < shape.sampleCoordinates.size(); ++axis) {
-              const int64_t inputCoordinate =
-                  axis + 1 == shape.sampleCoordinates.size()
-                      ? 0
-                      : shape.sampleCoordinates[axis];
-              inputByte += inputCoordinate * shape.singletonStrides[axis];
-              outputByte +=
-                  shape.sampleCoordinates[axis] * shape.fullStrides[axis];
-            }
-            EXPECT_EQ(inputByte, shape.sampleInputByte);
-            EXPECT_EQ(outputByte, shape.sampleOutputByte);
           }
           if (launch.dynamicSharedMemoryBytes != 0) {
             EXPECT_EQ(launch.grid,
@@ -2755,8 +4245,7 @@ TEST(GpuTransportV2Test,
               ++singletonFoldLaunches;
               EXPECT_EQ(decoded->slotDimensions[input],
                         llvm::ArrayRef<int64_t>(shape.singletonShape));
-              EXPECT_EQ(launch.block,
-                        (std::array<uint64_t, 3>{32, 1, 1}));
+              EXPECT_EQ(launch.block, (std::array<uint64_t, 3>{32, 1, 1}));
               EXPECT_EQ(launch.dynamicSharedMemoryBytes, 128);
             }
           }
@@ -2764,6 +4253,39 @@ TEST(GpuTransportV2Test,
         EXPECT_EQ(expansionLaunches, boundary.expansions);
         EXPECT_EQ(fullFoldLaunches, boundary.fullFolds);
         EXPECT_EQ(singletonFoldLaunches, boundary.singletonFolds);
+
+        int64_t expansionRelations = 0;
+        built->module->walk([&](mlir::shuttle::MapOp map) {
+          if (map.getInputs().size() != 1 || map.getNumResults() != 1)
+            return;
+          auto input = llvm::dyn_cast<mlir::RankedTensorType>(
+              map.getInputs().front().getType());
+          auto result = llvm::dyn_cast<mlir::RankedTensorType>(
+              map.getResult(0).getType());
+          if (!input || !result ||
+              input.getShape() !=
+                  llvm::ArrayRef<int64_t>(shape.singletonShape) ||
+              result.getShape() != llvm::ArrayRef<int64_t>(shape.fullShape))
+            return;
+          ++expansionRelations;
+          auto inputMap =
+              llvm::dyn_cast<mlir::AffineMapAttr>(map.getIndexingMaps()[0]);
+          ASSERT_TRUE(inputMap);
+          auto mapped =
+              evaluateAffineMap(inputMap.getValue(), shape.sampleCoordinates);
+          ASSERT_TRUE(mapped);
+          ASSERT_EQ(mapped->size(), shape.singletonStrides.size());
+          int64_t inputByte = 0;
+          int64_t outputByte = 0;
+          for (size_t axis = 0; axis < shape.sampleCoordinates.size(); ++axis) {
+            inputByte += (*mapped)[axis] * shape.singletonStrides[axis];
+            outputByte +=
+                shape.sampleCoordinates[axis] * shape.fullStrides[axis];
+          }
+          EXPECT_EQ(inputByte, shape.sampleInputByte);
+          EXPECT_EQ(outputByte, shape.sampleOutputByte);
+        });
+        EXPECT_EQ(expansionRelations, boundary.expansions);
 
         for (size_t slot = 0; slot < decoded->slotDimensions.size(); ++slot) {
           if (decoded->slotStorage[slot] != 0) {
@@ -2811,8 +4333,8 @@ TEST(GpuTransportV2Test,
   expectRejected(codeDigest);
 
   llvm::SmallVector<uint8_t> requiredBytes(*bytes);
-  const int64_t temporary = llvm::find(decoded->slotStorage, 1) -
-                            decoded->slotStorage.begin();
+  const int64_t temporary =
+      llvm::find(decoded->slotStorage, 1) - decoded->slotStorage.begin();
   ASSERT_LT(temporary, decoded->slotStorage.size());
   writeU64(requiredBytes, decoded->slotRequiredOffsets[temporary],
            decoded->slotRequiredBytes[temporary] + 4);
@@ -2839,7 +4361,6 @@ TEST(GpuTransportV2Test,
     std::vector<int64_t> inserted;
     std::vector<int64_t> weight;
     std::vector<int64_t> coordinates;
-    std::vector<int64_t> divisors;
     uint64_t fullGrid;
     uint64_t parameterGrid;
     int64_t fullBytes;
@@ -2849,17 +4370,36 @@ TEST(GpuTransportV2Test,
     int64_t sampleOutputByte;
   };
   const Shape shapes[] = {
-      {"2x7x19", {2, 7, 19}, {1, 1, 19}, {19}, {1, 6, 18}, {2, 7},
-       2, 1, 1064, 76, 38, 72, 1060},
-      {"3x2x5x11x263", {3, 2, 5, 11, 263}, {1, 1, 1, 1, 263},
-       {263}, {2, 1, 4, 10, 262}, {3, 2, 5, 11}, 340, 2, 347160,
-       1052, 526, 1048, 347156},
+      {"2x7x19",
+       {2, 7, 19},
+       {1, 1, 19},
+       {19},
+       {1, 6, 18},
+       2,
+       1,
+       1064,
+       76,
+       38,
+       72,
+       1060},
+      {"3x2x5x11x263",
+       {3, 2, 5, 11, 263},
+       {1, 1, 1, 1, 263},
+       {263},
+       {2, 1, 4, 10, 262},
+       340,
+       2,
+       347160,
+       1052,
+       526,
+       1048,
+       347156},
   };
   for (const Shape &shape : shapes) {
-    auto source = fixtureSource(
-        ("jax-0.10.1-bf16-projected_parameter_broadcast-" + shape.stem +
-         "-forward.mlir")
-            .str());
+    auto source =
+        fixtureSource(("jax-0.10.1-bf16-projected_parameter_broadcast-" +
+                       shape.stem + "-forward.mlir")
+                          .str());
     ASSERT_TRUE(source);
     std::optional<llvm::SmallVector<uint8_t>> sourceTransport;
     for (mlir::shuttle::NumericalPolicy policy :
@@ -2878,6 +4418,8 @@ TEST(GpuTransportV2Test,
       EXPECT_EQ(decoded->externalSlots, 3);
       EXPECT_EQ((*loaded)->externalBindings().size(), 3);
       int64_t projectedLaunches = 0;
+      llvm::SmallVector<int64_t> projectedInputStrides;
+      llvm::SmallVector<int64_t> projectedOutputStrides;
       for (const auto &launch : decoded->launches) {
         if (launch.inputSlots.size() != 1 || launch.outputSlots.size() != 1)
           continue;
@@ -2891,83 +4433,43 @@ TEST(GpuTransportV2Test,
         ++projectedLaunches;
         EXPECT_EQ(decoded->slotRequiredBytes[input], shape.insertedBytes);
         EXPECT_EQ(decoded->slotRequiredBytes[output], shape.fullBytes);
-        EXPECT_EQ(launch.grid,
-                  (std::array<uint64_t, 3>{shape.fullGrid, 1, 1}));
-        EXPECT_EQ(launch.block,
-                  (std::array<uint64_t, 3>{256, 1, 1}));
-        llvm::StringRef ptx(
-            reinterpret_cast<const char *>(decoded->code.data() +
-                                           launch.codeOffset),
-            launch.codeLength);
-        int64_t elementStride = 1;
-        llvm::SmallVector<int64_t> elementStrides(shape.full.size());
-        for (size_t axis = shape.full.size(); axis > 0; --axis) {
-          elementStrides[axis - 1] = elementStride;
-          elementStride *= shape.full[axis - 1];
-        }
-        const int64_t linearRegister = 8 + shape.full.size();
-        for (size_t axis = 0; axis < shape.full.size(); ++axis) {
-          EXPECT_TRUE(ptx.contains(
-              ("div.u64 %rd" + llvm::Twine(8 + axis) + ", %rd0, " +
-               llvm::Twine(elementStrides[axis]) + ";")
-                  .str()));
-          int64_t mappedRegister = 8 + axis;
-          if (axis < shape.divisors.size()) {
-            mappedRegister = linearRegister + 1 + axis;
-            EXPECT_TRUE(ptx.contains(
-                ("div.u64 %rd" + llvm::Twine(mappedRegister) + ", %rd" +
-                 llvm::Twine(8 + axis) + ", " +
-                 llvm::Twine(shape.divisors[axis]) + ";")
-                    .str()));
-          }
-          EXPECT_TRUE(ptx.contains(
-              ("mad.lo.u64 %rd" + llvm::Twine(linearRegister) + ", %rd" +
-               llvm::Twine(linearRegister) + ", " +
-               llvm::Twine(shape.inserted[axis]) + ", %rd" +
-               llvm::Twine(mappedRegister) + ";")
-                  .str()));
-        }
-        const int64_t inputPointer = 8 + 2 * shape.full.size();
-        EXPECT_TRUE(ptx.contains(
-            ("mad.lo.u64 %rd" + llvm::Twine(inputPointer) + ", %rd" +
-             llvm::Twine(linearRegister) + ", 4, %rd" +
-             llvm::Twine(inputPointer) + ";")
-                .str()));
-        auto loaded = projectedF32LoadedRegister(ptx, inputPointer);
-        ASSERT_TRUE(loaded);
-        llvm::SmallVector<llvm::StringRef> ptxLines;
-        ptx.split(ptxLines, '\n');
-        int64_t matchingStores = llvm::count_if(
-            ptxLines, [&](llvm::StringRef line) {
-              return line.contains("st.global.f32") &&
-                     line.contains(*loaded);
-            });
-        EXPECT_EQ(matchingStores, 1);
-        const int64_t outputPointer = inputPointer + 1;
-        EXPECT_TRUE(ptx.contains(
-            ("mad.lo.u64 %rd" + llvm::Twine(outputPointer) +
-             ", %rd0, 4, %rd" + llvm::Twine(outputPointer) + ";")
-                .str()));
-        EXPECT_TRUE(ptx.contains(
-            ("st.global.f32 [%rd" + llvm::Twine(outputPointer) + "], " +
-             *loaded + ";")
-                .str()));
-        EXPECT_FALSE(ptx.contains("st.global.u16"));
+        projectedInputStrides = decoded->slotStrides[input];
+        projectedOutputStrides = decoded->slotStrides[output];
+        EXPECT_EQ(launch.grid, (std::array<uint64_t, 3>{shape.fullGrid, 1, 1}));
+        EXPECT_EQ(launch.block, (std::array<uint64_t, 3>{256, 1, 1}));
+      }
+      ASSERT_EQ(projectedLaunches, 1);
+      ASSERT_EQ(projectedInputStrides.size(), shape.inserted.size());
+      ASSERT_EQ(projectedOutputStrides.size(), shape.full.size());
+      int64_t projectedRelations = 0;
+      built->module->walk([&](mlir::shuttle::MapOp map) {
+        if (map.getInputs().size() != 1 || map.getNumResults() != 1)
+          return;
+        auto input = llvm::dyn_cast<mlir::RankedTensorType>(
+            map.getInputs().front().getType());
+        auto result =
+            llvm::dyn_cast<mlir::RankedTensorType>(map.getResult(0).getType());
+        if (!input || !result ||
+            input.getShape() != llvm::ArrayRef<int64_t>(shape.inserted) ||
+            result.getShape() != llvm::ArrayRef<int64_t>(shape.full))
+          return;
+        ++projectedRelations;
+        auto inputMap =
+            llvm::dyn_cast<mlir::AffineMapAttr>(map.getIndexingMaps()[0]);
+        ASSERT_TRUE(inputMap);
+        auto mapped = evaluateAffineMap(inputMap.getValue(), shape.coordinates);
+        ASSERT_TRUE(mapped);
+        ASSERT_EQ(mapped->size(), projectedInputStrides.size());
         int64_t inputByte = 0;
         int64_t outputByte = 0;
         for (size_t axis = 0; axis < shape.full.size(); ++axis) {
-          int64_t inputCoordinate =
-              axis < shape.divisors.size()
-                  ? shape.coordinates[axis] / shape.divisors[axis]
-                  : shape.coordinates[axis];
-          inputByte += inputCoordinate * decoded->slotStrides[input][axis];
-          outputByte +=
-              shape.coordinates[axis] * decoded->slotStrides[output][axis];
+          inputByte += (*mapped)[axis] * projectedInputStrides[axis];
+          outputByte += shape.coordinates[axis] * projectedOutputStrides[axis];
         }
         EXPECT_EQ(inputByte, shape.sampleInputByte);
         EXPECT_EQ(outputByte, shape.sampleOutputByte);
-      }
-      EXPECT_EQ(projectedLaunches, 1);
+      });
+      EXPECT_EQ(projectedRelations, 1);
       int64_t publicWeightBindings = 0;
       int64_t publicFullBindings = 0;
       for (size_t slot = 0; slot < decoded->slotDimensions.size(); ++slot) {
@@ -2978,9 +4480,8 @@ TEST(GpuTransportV2Test,
           ++publicFullBindings;
           EXPECT_EQ(decoded->slotRequiredBytes[slot], shape.fullBytes / 2);
         }
-        if (
-            decoded->slotDimensions[slot] ==
-                llvm::ArrayRef<int64_t>(shape.weight)) {
+        if (decoded->slotDimensions[slot] ==
+            llvm::ArrayRef<int64_t>(shape.weight)) {
           ++publicWeightBindings;
           EXPECT_EQ(decoded->slotRequiredBytes[slot], shape.weightBytes);
         }
@@ -2997,11 +4498,9 @@ TEST(GpuTransportV2Test,
   }
 }
 
-TEST(GpuTransportV2Test,
-     Abi20ProjectedParameterTransportMutationsAreBehaviorSensitive) {
-  auto source = fixtureSource(
-      "jax-0.10.1-bf16-projected_parameter_broadcast-"
-      "3x2x5x11x263-forward.mlir");
+TEST(GpuTransportV2Test, Abi20ProjectedParameterTransportMutationsFailClosed) {
+  auto source = fixtureSource("jax-0.10.1-bf16-projected_parameter_broadcast-"
+                              "3x2x5x11x263-forward.mlir");
   ASSERT_TRUE(source);
   auto built = buildGpuContractFixture(
       *source, mlir::shuttle::NumericalPolicy::SourceOrdered);
@@ -3010,51 +4509,6 @@ TEST(GpuTransportV2Test,
   ASSERT_TRUE(mlir::succeeded(bytes));
   auto decoded = decodeInlineSchema2(*bytes);
   ASSERT_TRUE(decoded);
-
-  const std::vector<int64_t> inserted{1, 1, 1, 1, 263};
-  const std::vector<int64_t> full{3, 2, 5, 11, 263};
-  int64_t projectedEntry = -1;
-  int64_t projectedEntries = 0;
-  std::string projectedLoad;
-  for (const auto &launch : decoded->launches) {
-    if (launch.inputSlots.size() != 1 || launch.outputSlots.size() != 1 ||
-        decoded->slotDimensions[launch.inputSlots.front()] !=
-            llvm::ArrayRef<int64_t>(inserted) ||
-        decoded->slotDimensions[launch.outputSlots.front()] !=
-            llvm::ArrayRef<int64_t>(full))
-      continue;
-    ++projectedEntries;
-    llvm::StringRef ptx(
-        reinterpret_cast<const char *>(decoded->code.data() +
-                                       launch.codeOffset),
-        launch.codeLength);
-    auto loaded = projectedF32LoadedRegister(ptx, /*inputPointer=*/18);
-    ASSERT_TRUE(loaded);
-    projectedEntry = launch.taskOrdinal;
-    projectedLoad = "ld.global.f32 " + *loaded + ", [%rd18];";
-  }
-  ASSERT_EQ(projectedEntries, 1);
-  ASSERT_GE(projectedEntry, 0);
-  std::string wrongProjectedLoad = projectedLoad;
-  size_t pointer = wrongProjectedLoad.find("%rd18");
-  ASSERT_NE(pointer, std::string::npos);
-  wrongProjectedLoad.replace(pointer, llvm::StringRef("%rd18").size(),
-                             "%rd17");
-  auto wrongPointer = replaceEntryCodeAndRehash(
-      *bytes, *decoded, projectedEntry, projectedLoad,
-      wrongProjectedLoad);
-  ASSERT_FALSE(wrongPointer.empty());
-  auto wrongPointerDecoded = decodeInlineSchema2(wrongPointer);
-  ASSERT_TRUE(wrongPointerDecoded);
-  auto wrongPointerLoaded = mlir::shuttle::GpuExecutable::Load(wrongPointer);
-  ASSERT_TRUE(wrongPointerLoaded.ok()) << wrongPointerLoaded.status();
-  const auto &wrongLaunch = wrongPointerDecoded->launches[projectedEntry];
-  llvm::StringRef wrongPtx(
-      reinterpret_cast<const char *>(wrongPointerDecoded->code.data() +
-                                     wrongLaunch.codeOffset),
-      wrongLaunch.codeLength);
-  EXPECT_FALSE(projectedF32LoadedRegister(wrongPtx, /*inputPointer=*/18));
-  EXPECT_TRUE(projectedF32LoadedRegister(wrongPtx, /*inputPointer=*/17));
 
   auto expectRejected = [](llvm::ArrayRef<uint8_t> mutation) {
     EXPECT_FALSE(decodeInlineSchema2(mutation));
@@ -3083,7 +4537,6 @@ TEST(GpuTransportV2Test,
     int64_t reductionElements;
     int64_t featureElements;
     uint64_t threads;
-    uint64_t serialTiles;
     uint64_t scratchBytes;
     int64_t finalInputByte;
     int64_t fullPublicBytes;
@@ -3092,11 +4545,32 @@ TEST(GpuTransportV2Test,
     int64_t composedRawTemporaryBytes;
   };
   const Shape shapes[] = {
-      {"2x7x19", {2, 7, 19}, {1, 1, 19}, {19}, 14, 19, 32, 1,
-       128, 1060, 532, 38, -1, -1},
-      {"3x2x5x11x263", {3, 2, 5, 11, 263}, {1, 1, 1, 1, 263},
-       {263}, 330, 263, 256, 2, 1024, 347156, 173580, 526,
-       5580976, 6275296},
+      {"2x7x19",
+       {2, 7, 19},
+       {1, 1, 19},
+       {19},
+       14,
+       19,
+       32,
+       128,
+       1060,
+       532,
+       38,
+       -1,
+       -1},
+      {"3x2x5x11x263",
+       {3, 2, 5, 11, 263},
+       {1, 1, 1, 1, 263},
+       {263},
+       330,
+       263,
+       256,
+       1024,
+       347156,
+       173580,
+       526,
+       5580976,
+       6275296},
   };
   struct Boundary {
     llvm::StringRef name;
@@ -3110,10 +4584,10 @@ TEST(GpuTransportV2Test,
   };
   for (const Shape &shape : shapes) {
     for (const Boundary &boundary : boundaries) {
-      auto source = fixtureSource(
-          ("jax-0.10.1-bf16-projected_parameter_broadcast-" + shape.stem +
-           "-" + boundary.name + ".mlir")
-              .str());
+      auto source =
+          fixtureSource(("jax-0.10.1-bf16-projected_parameter_broadcast-" +
+                         shape.stem + "-" + boundary.name + ".mlir")
+                            .str());
       ASSERT_TRUE(source);
       std::optional<llvm::SmallVector<uint8_t>> sourceTransport;
       for (mlir::shuttle::NumericalPolicy policy :
@@ -3141,18 +4615,16 @@ TEST(GpuTransportV2Test,
                                        shape.fullPublicBytes,
                                        shape.featurePublicBytes,
                                        shape.fullPublicBytes}
-                : std::vector<int64_t>{shape.fullPublicBytes,
-                                       shape.featurePublicBytes,
-                                       shape.fullPublicBytes,
-                                       shape.fullPublicBytes,
-                                       shape.featurePublicBytes,
-                                       shape.fullPublicBytes};
+                : std::vector<int64_t>{
+                      shape.fullPublicBytes,    shape.featurePublicBytes,
+                      shape.fullPublicBytes,    shape.fullPublicBytes,
+                      shape.featurePublicBytes, shape.fullPublicBytes};
         ASSERT_EQ((*loaded)->externalBindings().size(),
                   expectedBindingBytes.size());
         std::vector<mlir::shuttle::GpuExternalBinding> structuralBindings =
             externalBindingsBySlot(**loaded);
-        for (auto [binding, expectedBytes] : llvm::zip_equal(
-                 structuralBindings, expectedBindingBytes))
+        for (auto [binding, expectedBytes] :
+             llvm::zip_equal(structuralBindings, expectedBindingBytes))
           EXPECT_EQ(binding.requiredBytes, expectedBytes);
 
         int64_t prefixFolds = 0;
@@ -3190,32 +4662,10 @@ TEST(GpuTransportV2Test,
           EXPECT_EQ(launch.block,
                     (std::array<uint64_t, 3>{shape.threads, 1, 1}));
           EXPECT_EQ(launch.dynamicSharedMemoryBytes, shape.scratchBytes);
-          llvm::StringRef ptx(
-              reinterpret_cast<const char *>(decoded->code.data() +
-                                               launch.codeOffset),
-              launch.codeLength);
-          EXPECT_TRUE(ptx.contains(
-              ("mul.lo.u32 %r4, %r0, " + llvm::Twine(shape.serialTiles) +
-               ";")
-                  .str()));
-          EXPECT_TRUE(ptx.contains(
-              ("setp.ge.u32 %p1, %r4, " +
-               llvm::Twine(shape.reductionElements) + ";")
-                  .str()));
-          EXPECT_TRUE(ptx.contains(
-              ("mad.lo.u64 %rd3, %rd1, " +
-               llvm::Twine(shape.featureElements) + ", %rd2;\n"
-                "  mad.lo.u64 %rd3, %rd3, 4, %rd0;\n"
-                "  ld.global.f32 %f0, [%rd3];")
-                  .str()));
-          EXPECT_TRUE(ptx.contains(
-              "mul.lo.u64 %rd9, %rd9, 4;\n"
-              "  add.u64 %rd8, %rd8, %rd9;\n"
-              "  st.global.f32 [%rd8], %f37;"));
           int64_t finalByte = 0;
           for (size_t axis = 0; axis < shape.full.size(); ++axis)
-            finalByte +=
-                (shape.full[axis] - 1) * decoded->slotStrides[tensorInput][axis];
+            finalByte += (shape.full[axis] - 1) *
+                         decoded->slotStrides[tensorInput][axis];
           EXPECT_EQ(finalByte, shape.finalInputByte);
           EXPECT_EQ((shape.reductionElements - 1) * shape.featureElements * 4 +
                         (shape.featureElements - 1) * 4,
@@ -3247,11 +4697,9 @@ TEST(GpuTransportV2Test,
   }
 }
 
-TEST(GpuTransportV2Test,
-     Abi21FullPrefixFoldTransportMutationsAreBehaviorSensitive) {
-  auto source = fixtureSource(
-      "jax-0.10.1-bf16-projected_parameter_broadcast-"
-      "3x2x5x11x263-backward.mlir");
+TEST(GpuTransportV2Test, Abi21FullPrefixFoldTransportMutationsFailClosed) {
+  auto source = fixtureSource("jax-0.10.1-bf16-projected_parameter_broadcast-"
+                              "3x2x5x11x263-backward.mlir");
   ASSERT_TRUE(source);
   auto built = buildGpuContractFixture(
       *source, mlir::shuttle::NumericalPolicy::SourceOrdered);
@@ -3260,52 +4708,6 @@ TEST(GpuTransportV2Test,
   ASSERT_TRUE(mlir::succeeded(bytes));
   auto decoded = decodeInlineSchema2(*bytes);
   ASSERT_TRUE(decoded);
-  const std::vector<int64_t> full{3, 2, 5, 11, 263};
-  const std::vector<int64_t> feature{263};
-  int64_t prefixEntry = -1;
-  for (const auto &launch : decoded->launches) {
-    if (launch.dynamicSharedMemoryBytes != 1024 ||
-        launch.outputSlots.size() != 1 ||
-        decoded->slotDimensions[launch.outputSlots.front()] !=
-            llvm::ArrayRef<int64_t>(feature))
-      continue;
-    for (int64_t input : launch.inputSlots)
-      if (decoded->slotDimensions[input] == llvm::ArrayRef<int64_t>(full))
-        prefixEntry = launch.taskOrdinal;
-  }
-  ASSERT_GE(prefixEntry, 0);
-  const auto &prefixLaunch = decoded->launches[prefixEntry];
-  constexpr llvm::StringLiteral address =
-      "mad.lo.u64 %rd3, %rd1, 263, %rd2;\n"
-      "  mad.lo.u64 %rd3, %rd3, 4, %rd0;\n"
-      "  ld.global.f32 %f0, [%rd3];";
-  constexpr llvm::StringLiteral deadAddress =
-      "mad.lo.u64 %rd6, %rd1, 263, %rd2;\n"
-      "  mad.lo.u64 %rd3, %rd3, 4, %rd0;\n"
-      "  ld.global.f32 %f0, [%rd3];";
-  auto dead = replaceEntryCodeAndRehash(*bytes, *decoded, prefixEntry, address,
-                                        deadAddress);
-  ASSERT_FALSE(dead.empty());
-  auto deadDecoded = decodeInlineSchema2(dead);
-  ASSERT_TRUE(deadDecoded);
-  ASSERT_TRUE(mlir::shuttle::GpuExecutable::Load(dead).ok());
-  const auto &deadLaunch = deadDecoded->launches[prefixEntry];
-  llvm::StringRef deadPtx(
-      reinterpret_cast<const char *>(deadDecoded->code.data() +
-                                     deadLaunch.codeOffset),
-      deadLaunch.codeLength);
-  EXPECT_FALSE(deadPtx.contains(address));
-  EXPECT_TRUE(deadPtx.contains(deadAddress));
-
-  llvm::SmallVector<uint8_t> wrongGrid(*bytes);
-  writeU32(wrongGrid, decoded->launchGridOffsets[prefixEntry], 264);
-  rehashDeviceAndBundle(wrongGrid, *decoded);
-  auto wrongGridDecoded = decodeInlineSchema2(wrongGrid);
-  ASSERT_TRUE(wrongGridDecoded);
-  ASSERT_TRUE(mlir::shuttle::GpuExecutable::Load(wrongGrid).ok());
-  EXPECT_EQ(wrongGridDecoded->launches[prefixEntry].grid,
-            (std::array<uint64_t, 3>{264, 1, 1}));
-  EXPECT_NE(wrongGridDecoded->launches[prefixEntry].grid, prefixLaunch.grid);
 
   auto expectRejected = [](llvm::ArrayRef<uint8_t> mutation) {
     EXPECT_FALSE(decodeInlineSchema2(mutation));
@@ -3451,10 +4853,9 @@ TEST(GpuTransportV2Test,
     ASSERT_EQ((*loaded)->externalBindings().size(), expectedBindings[index]);
     std::vector<mlir::shuttle::GpuExternalBinding> structuralBindings =
         externalBindingsBySlot(**loaded);
-    for (auto [binding, expectedBytes] :
-         llvm::zip_equal(structuralBindings,
-                         llvm::ArrayRef<int64_t>(expectedBytes[index])
-                             .take_front(expectedBindings[index]))) {
+    for (auto [binding, expectedBytes] : llvm::zip_equal(
+             structuralBindings, llvm::ArrayRef<int64_t>(expectedBytes[index])
+                                     .take_front(expectedBindings[index]))) {
       EXPECT_EQ(binding.requiredBytes, expectedBytes);
     }
     for (auto [ordinal, binding] :
@@ -3536,8 +4937,9 @@ TEST(GpuTransportV2Test, FoldDynamicSharedMemoryIsDeclaredAtModuleScope) {
            llvm::StringRef::npos) {
       llvm::StringRef remaining = ptx.drop_front(conversion);
       llvm::StringRef instruction = remaining.take_front(remaining.find('\n'));
-      auto operands = instruction.drop_front(
-          llvm::StringRef("cvta.to.shared.u64 ").size()).split(',');
+      auto operands =
+          instruction.drop_front(llvm::StringRef("cvta.to.shared.u64 ").size())
+              .split(',');
       llvm::StringRef destination = operands.first.trim();
       llvm::StringRef source = operands.second.trim(" ;");
       EXPECT_EQ(source, destination);
@@ -3615,6 +5017,10 @@ TEST(GpuTransportV2Test, GeneratedBundleFingerprintBindsEveryClosedRoot) {
       mlir::IntegerAttr::get(mlir::IntegerType::get(built->context.get(), 64),
                              slot.getRequiredBytes() + 1));
   expectMutationChangesFingerprint(
+      slot, "source_buffer",
+      mlir::IntegerAttr::get(mlir::IntegerType::get(built->context.get(), 64),
+                             slot.getSourceBuffer() + 7));
+  expectMutationChangesFingerprint(
       bundle, "device_module_fingerprint",
       mlir::StringAttr::get(built->context.get(), std::string(64, '0')));
 }
@@ -3622,8 +5028,10 @@ TEST(GpuTransportV2Test, GeneratedBundleFingerprintBindsEveryClosedRoot) {
 class SyntheticAllocator final
     : public stream_executor::DeviceAddressAllocator {
 public:
-  explicit SyntheticAllocator(uintptr_t base = 0x10000000)
-      : DeviceAddressAllocator(nullptr), base(base) {}
+  explicit SyntheticAllocator(uintptr_t base = 0x10000000,
+                              bool alignAddresses = false)
+      : DeviceAddressAllocator(nullptr), base(base),
+        alignAddresses(alignAddresses) {}
 
   absl::StatusOr<stream_executor::ScopedDeviceAddress<uint8_t>>
   Allocate(int deviceOrdinal, uint64_t size, bool, int64_t) final {
@@ -3633,6 +5041,8 @@ public:
     uintptr_t address = base;
     for (uint64_t previous : sizes)
       address += previous + 256;
+    if (alignAddresses)
+      address = (address + 255) & ~uintptr_t{255};
     return stream_executor::ScopedDeviceAddress<uint8_t>(
         stream_executor::DeviceAddressBase(reinterpret_cast<void *>(address),
                                            size),
@@ -3652,6 +5062,7 @@ public:
 
 private:
   uintptr_t base;
+  bool alignAddresses;
 };
 
 struct LoadedKernel {
@@ -3680,7 +5091,11 @@ class RecordingKernel final : public stream_executor::Kernel {
 public:
   RecordingKernel(unsigned arity, size_t ordinal,
                   std::shared_ptr<ExecutionTrace> trace)
-      : arity(arity), ordinal(ordinal), trace(std::move(trace)) {}
+      : arity(arity), ordinal(ordinal), trace(std::move(trace)) {
+    stream_executor::KernelMetadata metadata;
+    metadata.set_shared_memory_bytes(0);
+    set_metadata(metadata);
+  }
   unsigned Arity() const final { return arity; }
   absl::StatusOr<int32_t>
   GetMaxOccupiedBlocksPerCore(stream_executor::ThreadDim, size_t) const final {
@@ -3935,7 +5350,6 @@ TEST(GpuTransportV2Test, Sm100RuntimeRequiresExactComputeCapability) {
   ASSERT_TRUE(mlir::succeeded(transport));
   auto executable = mlir::shuttle::GpuExecutable::Load(*transport);
   ASSERT_TRUE(executable.ok()) << executable.status();
-
   SyntheticAllocator allocator;
   stream_executor::MockStreamExecutor executor;
   stream_executor::MockStream stream;
@@ -3971,6 +5385,675 @@ TEST(GpuTransportV2Test, Sm100RuntimeRequiresExactComputeCapability) {
   EXPECT_FALSE(mlir::shuttle::GpuRunner::Create(*legacyTransport, &allocator, 0,
                                                 &stream, &sm100)
                    .ok());
+}
+
+TEST(GpuTransportV2Test,
+     RuntimeChecksStaticAndDynamicSharedMemoryAgainstDevice) {
+  auto built = buildFixture();
+  ASSERT_TRUE(built);
+  auto original = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+  ASSERT_TRUE(mlir::succeeded(original));
+  auto decoded = decodeInlineSchema2(*original);
+  ASSERT_TRUE(decoded);
+  for (auto [dynamicBytes, staticBytes, deviceBytes, accepted] :
+       {std::tuple{225 * 1024, 2 * 1024, 227 * 1024, true},
+        std::tuple{225 * 1024, 2 * 1024 + 1, 227 * 1024, false},
+        std::tuple{227 * 1024, 0, 227 * 1024, true},
+        std::tuple{227 * 1024, 0, 227 * 1024 - 1, false},
+        std::tuple{225 * 1024, 0, 0, false}}) {
+    SCOPED_TRACE(dynamicBytes);
+    SCOPED_TRACE(staticBytes);
+    SCOPED_TRACE(deviceBytes);
+    llvm::SmallVector<uint8_t> transport(*original);
+    writeU32(transport, decoded->launchSharedOffsets.front(), dynamicBytes);
+    rehashDeviceAndBundle(transport, *decoded);
+    SyntheticAllocator allocator;
+    stream_executor::MockStreamExecutor executor;
+    stream_executor::MockStream stream;
+    auto trace = std::make_shared<ExecutionTrace>();
+    EXPECT_CALL(stream, parent()).WillRepeatedly(testing::Return(&executor));
+    stream_executor::DeviceDescription description;
+    description.set_shared_memory_per_block_optin(deviceBytes);
+    EXPECT_CALL(executor, GetDeviceDescription())
+        .WillRepeatedly(testing::ReturnRef(description));
+    EXPECT_CALL(executor, LoadKernel(testing::_))
+        .WillRepeatedly([trace, staticBytes](
+                            const stream_executor::KernelLoaderSpec &spec) {
+          auto kernel = recordLoadedKernel(spec, trace);
+          stream_executor::KernelMetadata metadata;
+          metadata.set_shared_memory_bytes(staticBytes);
+          kernel->set_metadata(metadata);
+          return kernel;
+        });
+    stream_executor::GpuComputeCapability capability{
+        stream_executor::CudaComputeCapability{9, 0}};
+    auto runner = mlir::shuttle::GpuRunner::Create(transport, &allocator, 0,
+                                                   &stream, &capability);
+    EXPECT_EQ(runner.ok(), accepted) << runner.status();
+  }
+}
+
+TEST(GpuTransportV2Test, CallerOwnedBuffersDoNotConsumeNativeTemporaryBudget) {
+  for (auto [columns, expectedBytes] : {std::pair{14336, INT64_C(117440512)},
+                                        std::pair{98304, INT64_C(805306368)}}) {
+    auto transport =
+        completeSchema2Packet({128, 128}, 1, 0, 1, {4096, columns});
+    auto decoded = decodeInlineSchema2(transport);
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded->slotRequiredBytes[0], expectedBytes);
+    EXPECT_EQ(decoded->slotRequiredBytes[2], expectedBytes);
+    auto executable = mlir::shuttle::GpuExecutable::Load(transport);
+    ASSERT_TRUE(executable.ok()) << executable.status();
+    SyntheticAllocator allocator;
+    stream_executor::MockStreamExecutor executor;
+    stream_executor::MockStream stream;
+    auto trace = std::make_shared<ExecutionTrace>();
+    EXPECT_CALL(stream, parent()).WillRepeatedly(testing::Return(&executor));
+    EXPECT_CALL(stream, BlockHostUntilDone())
+        .WillRepeatedly(testing::Return(absl::OkStatus()));
+    EXPECT_CALL(executor, LoadKernel(testing::_))
+        .WillRepeatedly([trace](const stream_executor::KernelLoaderSpec &spec) {
+          return recordLoadedKernel(spec, trace);
+        });
+    stream_executor::GpuComputeCapability capability{
+        stream_executor::CudaComputeCapability{9, 0}};
+    auto runner = mlir::shuttle::GpuRunner::Create(transport, &allocator, 0,
+                                                   &stream, &capability);
+    ASSERT_TRUE(runner.ok()) << runner.status();
+    EXPECT_EQ((*runner)->resources().temporaryBytes, 4);
+    EXPECT_EQ(allocator.sizes, (llvm::SmallVector<uint64_t>{4}));
+    llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> operands{
+        {reinterpret_cast<void *>(UINT64_C(0x200000000)), expectedBytes}};
+    llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> results{
+        {reinterpret_cast<void *>(UINT64_C(0x400000000)), expectedBytes}};
+    ASSERT_TRUE((*runner)->Execute(operands, results).ok());
+    ASSERT_EQ(trace->launches.size(), 2);
+    EXPECT_EQ(trace->launches[0].arguments[0], UINT64_C(0x200000000));
+    EXPECT_EQ(trace->launches[1].arguments[1], UINT64_C(0x400000000));
+    auto invalid = results;
+    invalid[0].sizeBytes -= 2;
+    EXPECT_FALSE((*runner)->Execute(operands, invalid).ok());
+    invalid = results;
+    invalid[0].data = operands[0].data;
+    EXPECT_FALSE((*runner)->Execute(operands, invalid).ok());
+    invalid[0].data =
+        reinterpret_cast<void *>(std::numeric_limits<uintptr_t>::max() - 1);
+    EXPECT_FALSE((*runner)->Execute(operands, invalid).ok());
+    EXPECT_EQ(trace->launches.size(), 2);
+    runner->reset();
+    EXPECT_EQ(allocator.deallocations, 1);
+  }
+}
+
+TEST(GpuTransportV2Test, RunnerAcceptsTypedMultiResultSelectionAbi) {
+  auto source = fixtureSource("jax-0.10.1-bf16-selection.mlir");
+  ASSERT_TRUE(source);
+  auto built = buildFixture(*source, mlir::shuttle::NumericalPolicy::Fast);
+  ASSERT_TRUE(built);
+  auto transport = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+  ASSERT_TRUE(mlir::succeeded(transport));
+  auto executable = mlir::shuttle::GpuExecutable::Load(*transport);
+  ASSERT_TRUE(executable.ok()) << executable.status();
+
+  SyntheticAllocator allocator;
+  stream_executor::MockStreamExecutor executor;
+  stream_executor::MockStream stream;
+  auto trace = std::make_shared<ExecutionTrace>();
+  EXPECT_CALL(stream, parent()).WillRepeatedly(testing::Return(&executor));
+  EXPECT_CALL(executor, LoadKernel(testing::_))
+      .Times((*executable)->launches().size())
+      .WillRepeatedly([trace](const stream_executor::KernelLoaderSpec &spec) {
+        return recordLoadedKernel(spec, trace);
+      });
+  stream_executor::GpuComputeCapability capability{
+      stream_executor::CudaComputeCapability{9, 0}};
+  auto runner = mlir::shuttle::GpuRunner::Create(*transport, &allocator, 0,
+                                                 &stream, &capability);
+  ASSERT_TRUE(runner.ok()) << runner.status();
+  EXPECT_EQ((*runner)->resources().externalOperandCount, 1);
+  EXPECT_EQ((*runner)->resources().externalResultCount, 2);
+  ASSERT_EQ((*executable)->externalBindings().size(), 3);
+  EXPECT_TRUE(cast<mlir::RankedTensorType>(
+                  (*executable)->externalBindings().back().tensorType)
+                  .getElementType()
+                  .isInteger(32));
+}
+
+TEST(GpuTransportV2Test, RunnerAcceptsGenericNineOperandTwelveResultAbi) {
+  const char *sourcePath = std::getenv("SHUTTLE_TEST_MULTI_RESULT_SOURCE");
+  if (sourcePath == nullptr)
+    GTEST_SKIP()
+        << "set SHUTTLE_TEST_MULTI_RESULT_SOURCE to a StableHLO module";
+  auto source = sourceFile(sourcePath);
+  ASSERT_TRUE(source);
+  auto built = buildFixture(*source, mlir::shuttle::NumericalPolicy::Fast,
+                            kFastPreferFusionOptions, kPreferFusionTuning,
+                            mlir::shuttle::GpuTarget::Sm90, {}, true, true);
+  ASSERT_TRUE(built);
+  auto materialization =
+      *built->module->getOps<mlir::shuttle::MaterializationPlanOp>().begin();
+  EXPECT_TRUE(llvm::any_of(materialization.getBody()
+                               .front()
+                               .getOps<mlir::shuttle::MaterializationTaskOp>(),
+                           [](mlir::shuttle::MaterializationTaskOp task) {
+                             return task->hasAttr("fused_sources");
+                           }));
+  EXPECT_TRUE(llvm::any_of(
+      materialization.getBody()
+          .front()
+          .getOps<mlir::shuttle::MaterializationTaskOp>(),
+      [](mlir::shuttle::MaterializationTaskOp task) {
+        auto kind = task->getAttrOfType<mlir::StringAttr>("composition_kind");
+        auto sources =
+            task->getAttrOfType<mlir::ArrayAttr>("composition_sources");
+        return kind && kind.getValue() == "relation_gather" && sources &&
+               sources.size() > 1 && task.getOutputBuffers().size() == 1;
+      }));
+  llvm::SmallVector<mlir::shuttle::MaterializationTaskOp> plannedTasks(
+      materialization.getBody()
+          .front()
+          .getOps<mlir::shuttle::MaterializationTaskOp>());
+  llvm::SmallVector<mlir::shuttle::MaterializationBufferOp> plannedBuffers(
+      materialization.getBody()
+          .front()
+          .getOps<mlir::shuttle::MaterializationBufferOp>());
+  EXPECT_TRUE(llvm::any_of(
+      plannedTasks, [](mlir::shuttle::MaterializationTaskOp task) {
+        auto sources =
+            task->getAttrOfType<mlir::ArrayAttr>("fused_output_sources");
+        return sources && sources.size() > 1 &&
+               sources.size() == task.getOutputBuffers().size();
+      }));
+  EXPECT_TRUE(llvm::any_of(
+      plannedTasks, [&](mlir::shuttle::MaterializationTaskOp task) {
+        auto kind = task->getAttrOfType<mlir::StringAttr>("composition_kind");
+        auto sources =
+            task->getAttrOfType<mlir::ArrayAttr>("composition_sources");
+        if (!kind || kind.getValue() != "map_contract" || !sources ||
+            sources.size() < 2 || task.getOutputBuffers().size() != 1)
+          return false;
+        int64_t output = task.getOutputBuffers().front();
+        if (output < 0 || output >= plannedBuffers.size())
+          return false;
+        auto type = mlir::dyn_cast<mlir::RankedTensorType>(
+            plannedBuffers[output].getTensorType());
+        return type && type.getElementType().isBF16();
+      }));
+  EXPECT_TRUE(llvm::any_of(
+      plannedTasks, [](mlir::shuttle::MaterializationTaskOp task) {
+        auto kind = task->getAttrOfType<mlir::StringAttr>("composition_kind");
+        auto cost = task->getAttrOfType<mlir::DictionaryAttr>(
+            "composition_cost");
+        auto evaluations =
+            cost ? cost.getAs<mlir::IntegerAttr>("contract_evaluations")
+                 : mlir::IntegerAttr{};
+        return kind && kind.getValue() == "map_contract" && evaluations &&
+               evaluations.getInt() > 1 &&
+               task.getKind() == mlir::shuttle::MaterializationTaskKind::Map &&
+               task.getReductionDimensions().empty() &&
+               task.getOutputBuffers().size() == 1;
+      }));
+  bool hasCrossDomainIndexEvent = false;
+  for (auto [taskOrdinal, task] : llvm::enumerate(plannedTasks)) {
+    auto kind = task->getAttrOfType<mlir::StringAttr>("composition_kind");
+    if (!kind || kind.getValue() != "relation_gather")
+      continue;
+    hasCrossDomainIndexEvent |=
+        llvm::any_of(task.getOutputBuffers(), [&](int64_t output) {
+          if (output < 0 || output >= plannedBuffers.size())
+            return false;
+          auto type = mlir::dyn_cast<mlir::RankedTensorType>(
+              plannedBuffers[output].getTensorType());
+          if (!type || !type.getElementType().isInteger(32))
+            return false;
+          return llvm::any_of(
+              plannedBuffers[output].getConsumers(), [&](int64_t consumer) {
+                if (consumer < 0 || consumer >= plannedTasks.size() ||
+                    consumer == static_cast<int64_t>(taskOrdinal))
+                  return false;
+                auto consumerKind =
+                    plannedTasks[consumer]->getAttrOfType<mlir::StringAttr>(
+                        "composition_kind");
+                return consumerKind &&
+                       consumerKind.getValue() == "indexed_accumulation";
+              });
+        });
+  }
+  EXPECT_FALSE(hasCrossDomainIndexEvent);
+  EXPECT_TRUE(llvm::any_of(
+      plannedTasks, [](mlir::shuttle::MaterializationTaskOp task) {
+        auto kind = task->getAttrOfType<mlir::StringAttr>("composition_kind");
+        auto recomputed = task->getAttrOfType<mlir::ArrayAttr>(
+            "composition_recomputed_sources");
+        return kind && kind.getValue() == "indexed_accumulation" &&
+               recomputed && !recomputed.empty();
+      }));
+  auto schedule =
+      *built->module->getOps<mlir::shuttle::SchedulePlanOp>().begin();
+  llvm::SmallVector<mlir::shuttle::ScheduleTaskOp> scheduledTasks(
+      schedule.getBody().front().getOps<mlir::shuttle::ScheduleTaskOp>());
+  llvm::SmallVector<mlir::shuttle::EventTensorOp> events(
+      schedule.getBody().front().getOps<mlir::shuttle::EventTensorOp>());
+  bool hasExactRecomputationEvent = false;
+  for (auto [consumerOrdinal, consumer] : llvm::enumerate(plannedTasks)) {
+    auto kind = consumer->getAttrOfType<mlir::StringAttr>("composition_kind");
+    if (!kind || kind.getValue() != "indexed_accumulation" ||
+        !consumer->hasAttr("composition_recomputed_sources"))
+      continue;
+    for (int64_t producerOrdinal : consumer.getDependencies()) {
+      if (plannedTasks[producerOrdinal].getKind() !=
+          mlir::shuttle::MaterializationTaskKind::Selection)
+        continue;
+      auto event = llvm::find_if(events, [&](mlir::shuttle::EventTensorOp e) {
+        return e.getProducerTask() == producerOrdinal &&
+               e.getConsumerTask() == static_cast<int64_t>(consumerOrdinal);
+      });
+      ASSERT_NE(event, events.end());
+      llvm::SmallVector<int64_t> expectedDomain(
+          scheduledTasks[producerOrdinal].getGridShape());
+      llvm::append_range(expectedDomain,
+                         scheduledTasks[consumerOrdinal].getGridShape());
+      EXPECT_EQ(event->getRelationDomainShape(),
+                llvm::ArrayRef<int64_t>(expectedDomain));
+      int64_t expectedCapacity = 1;
+      for (int64_t extent : expectedDomain)
+        expectedCapacity *= extent;
+      EXPECT_EQ(event->getStorageCapacity(), expectedCapacity);
+      EXPECT_EQ(event->getGenerations(), 1);
+      hasExactRecomputationEvent = true;
+    }
+  }
+  EXPECT_TRUE(hasExactRecomputationEvent);
+  auto transport = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+  ASSERT_TRUE(mlir::succeeded(transport));
+  auto executable = mlir::shuttle::GpuExecutable::Load(*transport);
+  ASSERT_TRUE(executable.ok()) << executable.status();
+
+  for (auto [launchOrdinal, launch] :
+       llvm::enumerate((*executable)->launches())) {
+    EXPECT_EQ(launch.taskOrdinal, static_cast<int64_t>(launchOrdinal));
+    EXPECT_EQ(launch.sourceTaskOrdinals,
+              std::vector<int64_t>({static_cast<int64_t>(launchOrdinal)}));
+  }
+
+  SyntheticAllocator allocator(0x10000000, true);
+  stream_executor::MockStreamExecutor executor;
+  stream_executor::MockStream stream;
+  auto trace = std::make_shared<ExecutionTrace>();
+  EXPECT_CALL(stream, parent()).WillRepeatedly(testing::Return(&executor));
+  EXPECT_CALL(executor, LoadKernel(testing::_))
+      .Times((*executable)->launches().size())
+      .WillRepeatedly([trace](const stream_executor::KernelLoaderSpec &spec) {
+        return recordLoadedKernel(spec, trace);
+      });
+  stream_executor::GpuComputeCapability capability{
+      stream_executor::CudaComputeCapability{9, 0}};
+  auto runner = mlir::shuttle::GpuRunner::Create(*transport, &allocator, 0,
+                                                 &stream, &capability);
+  ASSERT_TRUE(runner.ok()) << runner.status();
+  EXPECT_EQ((*runner)->resources().externalOperandCount, 9);
+  EXPECT_EQ((*runner)->resources().externalResultCount, 12);
+}
+
+TEST(GpuTransportV2Test, H100RunnerMatchesGenericMultiResultOracle) {
+  const char *sourcePath = std::getenv("SHUTTLE_TEST_MULTI_RESULT_SOURCE");
+  const char *fixtureRoot = std::getenv("SHUTTLE_TEST_MULTI_RESULT_FIXTURE");
+  if (sourcePath == nullptr || fixtureRoot == nullptr)
+    GTEST_SKIP() << "set generic multi-result source and fixture paths";
+  auto source = sourceFile(sourcePath);
+  ASSERT_TRUE(source);
+  const bool preferFusion =
+      std::getenv("SHUTTLE_TEST_MULTI_RESULT_PREFER_FUSION") != nullptr;
+  auto built =
+      preferFusion
+          ? buildFixture(*source, mlir::shuttle::NumericalPolicy::Fast,
+                         kFastPreferFusionOptions, kPreferFusionTuning,
+                         mlir::shuttle::GpuTarget::Sm90, {}, true, true)
+          : buildFixture(*source, mlir::shuttle::NumericalPolicy::Fast, {}, {},
+                         mlir::shuttle::GpuTarget::Sm90, {}, true, true);
+  ASSERT_TRUE(built);
+  auto transport = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+  ASSERT_TRUE(mlir::succeeded(transport));
+  auto executable = mlir::shuttle::GpuExecutable::Load(*transport);
+  ASSERT_TRUE(executable.ok()) << executable.status();
+
+  std::vector<mlir::shuttle::GpuExternalBinding> operandBindings;
+  std::vector<mlir::shuttle::GpuExternalBinding> resultBindings;
+  for (const auto &binding : (*executable)->externalBindings()) {
+    if (binding.kind == mlir::shuttle::ExecutableBindingKind::Operand)
+      operandBindings.push_back(binding);
+    else if (binding.kind == mlir::shuttle::ExecutableBindingKind::Result)
+      resultBindings.push_back(binding);
+  }
+  auto byIndex = [](const auto &left, const auto &right) {
+    return left.index < right.index;
+  };
+  llvm::sort(operandBindings, byIndex);
+  llvm::sort(resultBindings, byIndex);
+  ASSERT_EQ(operandBindings.size(), 9);
+  ASSERT_EQ(resultBindings.size(), 12);
+
+  auto platform = stream_executor::PlatformManager::PlatformWithName("CUDA");
+  ASSERT_TRUE(platform.ok()) << platform.status();
+  auto executor = (*platform)->ExecutorForDevice(0);
+  ASSERT_TRUE(executor.ok()) << executor.status();
+  ASSERT_NE((*executor)->GetDeviceDescription().name().find("H100"),
+            std::string::npos);
+  auto stream = (*executor)->CreateStream();
+  ASSERT_TRUE(stream.ok()) << stream.status();
+  stream_executor::StreamExecutorAddressAllocator allocator(*executor);
+  const auto &capability =
+      (*executor)->GetDeviceDescription().gpu_compute_capability();
+  auto runner = mlir::shuttle::GpuRunner::Create(*transport, &allocator, 0,
+                                                 stream->get(), &capability);
+  ASSERT_TRUE(runner.ok()) << runner.status();
+
+  std::vector<stream_executor::DeviceMemory<uint8_t>> deviceOperands;
+  std::vector<stream_executor::DeviceMemory<uint8_t>> deviceResults;
+  llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> operands;
+  llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> results;
+  for (const auto &binding : operandBindings) {
+    auto path = (llvm::Twine(fixtureRoot) + "/input_" +
+                 llvm::Twine(binding.index) + ".npy")
+                    .str();
+    auto payload = numpyPayload(path);
+    ASSERT_TRUE(payload) << path;
+    ASSERT_EQ(payload->size(), binding.requiredBytes) << path;
+    auto allocation =
+        (*executor)->AllocateArray<uint8_t>(binding.requiredBytes);
+    ASSERT_TRUE(allocation);
+    ASSERT_TRUE((*executor)
+                    ->SynchronousMemcpyH2D(payload->data(), payload->size(),
+                                           &allocation)
+                    .ok());
+    operands.push_back({allocation.opaque(), binding.requiredBytes});
+    deviceOperands.push_back(allocation);
+  }
+  for (const auto &binding : resultBindings) {
+    auto allocation =
+        (*executor)->AllocateArray<uint8_t>(binding.requiredBytes);
+    ASSERT_TRUE(allocation);
+    results.push_back({allocation.opaque(), binding.requiredBytes});
+    deviceResults.push_back(allocation);
+  }
+
+  ASSERT_TRUE((*runner)->Execute(operands, results).ok());
+  ASSERT_TRUE((*runner)->AwaitCompletion().ok());
+  for (const auto &[ordinal, binding] : llvm::enumerate(resultBindings)) {
+    auto path = (llvm::Twine(fixtureRoot) + "/expected_" +
+                 llvm::Twine(binding.index) + ".npy")
+                    .str();
+    auto expected = numpyPayload(path);
+    ASSERT_TRUE(expected) << path;
+    std::vector<uint8_t> actual(binding.requiredBytes);
+    ASSERT_TRUE((*executor)
+                    ->SynchronousMemcpyD2H(deviceResults[ordinal],
+                                           actual.size(), actual.data())
+                    .ok());
+    auto type = cast<mlir::RankedTensorType>(binding.tensorType);
+    ASSERT_EQ(expected->size(), type.getNumElements() * sizeof(float)) << path;
+    if (type.getElementType().isBF16()) {
+      for (int64_t index = 0; index < type.getNumElements(); ++index) {
+        uint16_t actualBits;
+        uint32_t expectedBits;
+        std::memcpy(&actualBits, actual.data() + index * sizeof(uint16_t),
+                    sizeof(actualBits));
+        std::memcpy(&expectedBits, expected->data() + index * sizeof(float),
+                    sizeof(expectedBits));
+        EXPECT_EQ(actualBits, expectedBits >> 16)
+            << "result " << binding.index << " element " << index;
+      }
+      continue;
+    }
+    if (type.getElementType().isInteger(32)) {
+      for (int64_t index = 0; index < type.getNumElements(); ++index) {
+        int32_t actualValue;
+        float expectedValue;
+        std::memcpy(&actualValue, actual.data() + index * sizeof(int32_t),
+                    sizeof(actualValue));
+        std::memcpy(&expectedValue, expected->data() + index * sizeof(float),
+                    sizeof(float));
+        EXPECT_EQ(actualValue, static_cast<int32_t>(expectedValue))
+            << "result " << binding.index << " element " << index;
+      }
+      continue;
+    }
+    ASSERT_TRUE(type.getElementType().isF32());
+    ASSERT_EQ(actual.size() % sizeof(float), 0);
+    for (size_t offset = 0; offset < actual.size(); offset += sizeof(float)) {
+      float actualValue;
+      float expectedValue;
+      std::memcpy(&actualValue, actual.data() + offset, sizeof(float));
+      std::memcpy(&expectedValue, expected->data() + offset, sizeof(float));
+      EXPECT_LE(std::abs(actualValue - expectedValue),
+                1e-7f + 1e-6f * std::abs(expectedValue))
+          << "result " << binding.index << " element "
+          << offset / sizeof(float);
+    }
+  }
+
+  constexpr int64_t warmupIterations = 5;
+  constexpr int64_t measuredIterations = 50;
+  for (int64_t iteration = 0; iteration < warmupIterations; ++iteration) {
+    ASSERT_TRUE((*runner)->Execute(operands, results).ok());
+    ASSERT_TRUE((*runner)->AwaitCompletion().ok());
+  }
+  std::vector<double> elapsedMicros;
+  elapsedMicros.reserve(measuredIterations);
+  for (int64_t iteration = 0; iteration < measuredIterations; ++iteration) {
+    auto start = std::chrono::steady_clock::now();
+    ASSERT_TRUE((*runner)->Execute(operands, results).ok());
+    ASSERT_TRUE((*runner)->AwaitCompletion().ok());
+    auto stop = std::chrono::steady_clock::now();
+    elapsedMicros.push_back(
+        std::chrono::duration<double, std::micro>(stop - start).count());
+  }
+  llvm::sort(elapsedMicros);
+  std::cout << "SHUTTLE_MULTI_RESULT_PLAN="
+            << (preferFusion ? "prefer_fusion" : "automatic")
+            << " LAUNCHES=" << (*executable)->launches().size()
+            << " MEDIAN_US=" << elapsedMicros[measuredIterations / 2] << '\n';
+
+  if (const char *reportPath =
+          std::getenv("SHUTTLE_TEST_MULTI_RESULT_REPORT")) {
+    llvm::json::Array bindings;
+    for (auto [launchOrdinal, launch] :
+         llvm::enumerate((*executable)->launches())) {
+      llvm::json::Array sourceTasks;
+      for (int64_t sourceTask : launch.sourceTaskOrdinals)
+        sourceTasks.push_back(sourceTask);
+      llvm::json::Array grid;
+      llvm::json::Array block;
+      for (uint64_t extent : launch.grid)
+        grid.push_back(static_cast<int64_t>(extent));
+      for (uint64_t extent : launch.block)
+        block.push_back(static_cast<int64_t>(extent));
+      bindings.push_back(llvm::json::Object{
+          {"launch_ordinal", static_cast<int64_t>(launchOrdinal)},
+          {"task_ordinal", launch.taskOrdinal},
+          {"source_task_ordinals", std::move(sourceTasks)},
+          {"kernel_name", launch.kernelName},
+          {"code_digest", launch.codeDigest},
+          {"code_offset", launch.codeOffset},
+          {"code_length", launch.codeLength},
+          {"grid", std::move(grid)},
+          {"block", std::move(block)},
+          {"dynamic_shared_memory_bytes",
+           static_cast<int64_t>(launch.dynamicSharedMemoryBytes)},
+      });
+    }
+    llvm::json::Object report{
+        {"schema", "shuttle_multi_result_module_bindings_v1"},
+        {"plan", preferFusion ? "prefer_fusion" : "automatic"},
+        {"executable_digest",
+         mlir::shuttle::gpuExecutableBundleDigest(*transport)},
+        {"bindings", std::move(bindings)},
+    };
+    std::ofstream stream(reportPath, std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(stream.good());
+    stream << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(report)))
+                  .str();
+    stream.close();
+    ASSERT_TRUE(stream.good());
+  }
+
+  runner->reset();
+  for (auto &allocation : deviceResults)
+    (*executor)->Deallocate(&allocation);
+  for (auto &allocation : deviceOperands)
+    (*executor)->Deallocate(&allocation);
+}
+
+TEST(GpuTransportV2Test, H100RunnerMatchesAnonymousMultiPhaseMapContractMap) {
+  if (std::getenv("SHUTTLE_RUN_H100_MULTI_PHASE") == nullptr)
+    GTEST_SKIP() << "set SHUTTLE_RUN_H100_MULTI_PHASE=1 on an H100 worker";
+  constexpr llvm::StringLiteral source = R"mlir(
+module @anonymous_multi_phase_map_contract_map {
+  func.func public @main(%left: tensor<2x3xf32>, %right: tensor<3x4xf32>)
+      -> (tensor<2x3xf32>, tensor<2x4xf32>) {
+    %mapped = stablehlo.negate %left : tensor<2x3xf32>
+    %contracted = stablehlo.dot_general %mapped, %right,
+        contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT]
+        : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
+    %output = stablehlo.negate %contracted : tensor<2x4xf32>
+    return %mapped, %output : tensor<2x3xf32>, tensor<2x4xf32>
+  }
+}
+)mlir";
+  auto built = buildFixture(source, mlir::shuttle::NumericalPolicy::Fast,
+                            kFastPreferFusionOptions, kPreferFusionTuning,
+                            mlir::shuttle::GpuTarget::Sm90, {}, true, true);
+  ASSERT_TRUE(built);
+  auto transport = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+  ASSERT_TRUE(mlir::succeeded(transport));
+  auto executable = mlir::shuttle::GpuExecutable::Load(*transport);
+  ASSERT_TRUE(executable.ok()) << executable.status();
+  ASSERT_EQ((*executable)->launches().size(), 1);
+  const auto &launch = (*executable)->launches().front();
+  EXPECT_EQ(launch.taskOrdinal, 0);
+  EXPECT_EQ(launch.sourceTaskOrdinals, std::vector<int64_t>({0}));
+  EXPECT_EQ(launch.grid, (std::array<uint64_t, 3>{3, 1, 1}));
+  EXPECT_EQ(launch.block, (std::array<uint64_t, 3>{32, 1, 1}));
+
+  std::vector<mlir::shuttle::GpuExternalBinding> operandBindings;
+  std::vector<mlir::shuttle::GpuExternalBinding> resultBindings;
+  for (const auto &binding : (*executable)->externalBindings()) {
+    if (binding.kind == mlir::shuttle::ExecutableBindingKind::Operand)
+      operandBindings.push_back(binding);
+    else if (binding.kind == mlir::shuttle::ExecutableBindingKind::Result)
+      resultBindings.push_back(binding);
+  }
+  auto byIndex = [](const auto &left, const auto &right) {
+    return left.index < right.index;
+  };
+  llvm::sort(operandBindings, byIndex);
+  llvm::sort(resultBindings, byIndex);
+  ASSERT_EQ(operandBindings.size(), 2);
+  ASSERT_EQ(resultBindings.size(), 2);
+
+  const std::vector<float> left = {1.0f, -2.0f, 3.0f, -4.0f, 5.0f, -6.0f};
+  const std::vector<float> right = {1.0f, 2.0f,  -1.0f, 0.5f,  -2.0f, 3.0f,
+                                    4.0f, -0.5f, 0.25f, -1.0f, 2.0f,  5.0f};
+  std::vector<float> expectedMapped(left.size());
+  for (size_t index = 0; index < left.size(); ++index)
+    expectedMapped[index] = -left[index];
+  std::vector<float> expectedOutput(8, 0.0f);
+  for (int64_t row = 0; row < 2; ++row)
+    for (int64_t column = 0; column < 4; ++column)
+      for (int64_t reduction = 0; reduction < 3; ++reduction)
+        expectedOutput[row * 4 + column] +=
+            left[row * 3 + reduction] * right[reduction * 4 + column];
+
+  auto platform = stream_executor::PlatformManager::PlatformWithName("CUDA");
+  ASSERT_TRUE(platform.ok()) << platform.status();
+  auto executor = (*platform)->ExecutorForDevice(0);
+  ASSERT_TRUE(executor.ok()) << executor.status();
+  ASSERT_NE((*executor)->GetDeviceDescription().name().find("H100"),
+            std::string::npos);
+  auto stream = (*executor)->CreateStream();
+  ASSERT_TRUE(stream.ok()) << stream.status();
+  stream_executor::StreamExecutorAddressAllocator allocator(*executor);
+  const auto &capability =
+      (*executor)->GetDeviceDescription().gpu_compute_capability();
+  auto runner = mlir::shuttle::GpuRunner::Create(*transport, &allocator, 0,
+                                                 stream->get(), &capability);
+  ASSERT_TRUE(runner.ok()) << runner.status();
+
+  std::vector<stream_executor::DeviceMemory<uint8_t>> deviceOperands;
+  llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> operands;
+  for (auto [binding, values] :
+       llvm::zip_equal(operandBindings,
+                       std::array<llvm::ArrayRef<float>, 2>{left, right})) {
+    ASSERT_EQ(binding.requiredBytes, values.size() * sizeof(float));
+    auto allocation =
+        (*executor)->AllocateArray<uint8_t>(binding.requiredBytes);
+    ASSERT_TRUE(allocation);
+    ASSERT_TRUE((*executor)
+                    ->SynchronousMemcpyH2D(values.data(), binding.requiredBytes,
+                                           &allocation)
+                    .ok());
+    operands.push_back({allocation.opaque(), binding.requiredBytes});
+    deviceOperands.push_back(allocation);
+  }
+  std::vector<stream_executor::DeviceMemory<uint8_t>> deviceResults;
+  llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> results;
+  for (const auto &binding : resultBindings) {
+    auto allocation =
+        (*executor)->AllocateArray<uint8_t>(binding.requiredBytes);
+    ASSERT_TRUE(allocation);
+    results.push_back({allocation.opaque(), binding.requiredBytes});
+    deviceResults.push_back(allocation);
+  }
+
+  ASSERT_TRUE((*runner)->Execute(operands, results).ok());
+  ASSERT_TRUE((*runner)->AwaitCompletion().ok());
+  for (auto [ordinal, expected] :
+       llvm::enumerate(std::array<llvm::ArrayRef<float>, 2>{expectedMapped,
+                                                            expectedOutput})) {
+    ASSERT_EQ(resultBindings[ordinal].requiredBytes,
+              expected.size() * sizeof(float));
+    std::vector<float> actual(expected.size());
+    ASSERT_TRUE((*executor)
+                    ->SynchronousMemcpyD2H(
+                        deviceResults[ordinal],
+                        resultBindings[ordinal].requiredBytes, actual.data())
+                    .ok());
+    for (size_t index = 0; index < expected.size(); ++index)
+      EXPECT_LE(std::abs(actual[index] - expected[index]),
+                1e-7f + 1e-6f * std::abs(expected[index]))
+          << "result " << ordinal << " element " << index;
+  }
+
+  if (const char *reportPath = std::getenv("SHUTTLE_TEST_MULTI_PHASE_REPORT")) {
+    llvm::json::Array sourceTasks;
+    for (int64_t sourceTask : launch.sourceTaskOrdinals)
+      sourceTasks.push_back(sourceTask);
+    llvm::json::Object report{
+        {"schema", "shuttle_multi_phase_module_binding_v1"},
+        {"executable_digest",
+         mlir::shuttle::gpuExecutableBundleDigest(*transport)},
+        {"launch_count", 1},
+        {"phase_grid_ranges",
+         llvm::json::Array{llvm::json::Array{0, 1}, llvm::json::Array{1, 2},
+                           llvm::json::Array{2, 3}}},
+        {"result_count", 2},
+        {"kernel_name", launch.kernelName},
+        {"code_digest", launch.codeDigest},
+        {"source_task_ordinals", std::move(sourceTasks)},
+    };
+    std::ofstream reportStream(reportPath, std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(reportStream.good());
+    reportStream
+        << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(report))).str();
+    reportStream.close();
+    ASSERT_TRUE(reportStream.good());
+  }
+
+  runner->reset();
+  for (auto &allocation : deviceResults)
+    (*executor)->Deallocate(&allocation);
+  for (auto &allocation : deviceOperands)
+    (*executor)->Deallocate(&allocation);
 }
 
 TEST(GpuTransportV2Test, ExportedFfiBundleOwnsEveryLifecycleStage) {
@@ -4042,8 +6125,7 @@ TEST(GpuTransportV2Test, ExportedFfiBundleOwnsEveryLifecycleStage) {
   // for the same StreamExecutor instead of loading every PTX module again.
   xla::ffi::ExecutionState repeatedInitializeState;
   xla::ffi::InvokeContext repeatedInitializeContext = context;
-  repeatedInitializeContext.state_context.initialize =
-      &repeatedInitializeState;
+  repeatedInitializeContext.state_context.initialize = &repeatedInitializeState;
   ASSERT_TRUE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(), handlers.initialize,
                                frame, repeatedInitializeContext,
                                XLA_FFI_ExecutionStage_INITIALIZE)
@@ -4253,8 +6335,7 @@ TEST(GpuTransportV2Test,
         .WillOnce(testing::Return(absl::OkStatus()));
     EXPECT_CALL(executor, LoadKernel(testing::_))
         .Times(decoded->launches.size() * 2)
-        .WillRepeatedly([trace](
-                            const stream_executor::KernelLoaderSpec &spec) {
+        .WillRepeatedly([trace](const stream_executor::KernelLoaderSpec &spec) {
           return recordLoadedKernel(spec, trace);
         });
 
@@ -4264,20 +6345,20 @@ TEST(GpuTransportV2Test,
     xla::ffi::InvokeContext context;
     context.device_ordinal = 0;
     context.backend_context = xla::ffi::InvokeContext::GpuContext{
-        &stream, &allocator, nullptr, nullptr, nullptr, nullptr, nullptr,
-        &capability};
+        &stream, &allocator, nullptr, nullptr,
+        nullptr, nullptr,    nullptr, &capability};
     context.state_context = {&instantiateState, &prepareState,
                              &initializeState};
-    ASSERT_TRUE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(),
-                                 handlers.instantiate, frame->frame, context,
+    ASSERT_TRUE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(), handlers.instantiate,
+                                 frame->frame, context,
                                  XLA_FFI_ExecutionStage_INSTANTIATE)
                     .ok());
     ASSERT_TRUE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(), handlers.prepare,
                                  frame->frame, context,
                                  XLA_FFI_ExecutionStage_PREPARE)
                     .ok());
-    ASSERT_TRUE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(),
-                                 handlers.initialize, frame->frame, context,
+    ASSERT_TRUE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(), handlers.initialize,
+                                 frame->frame, context,
                                  XLA_FFI_ExecutionStage_INITIALIZE)
                     .ok());
     ASSERT_TRUE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(), handlers.execute,
@@ -4289,31 +6370,30 @@ TEST(GpuTransportV2Test,
              &*primitiveMismatch,
              &*alignmentMismatch,
          }) {
-      EXPECT_FALSE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(),
-                                    handlers.execute, mismatch->frame, context,
+      EXPECT_FALSE(xla::ffi::Invoke(xla::ffi::GetXlaFfiApi(), handlers.execute,
+                                    mismatch->frame, context,
                                     XLA_FFI_ExecutionStage_EXECUTE)
                        .ok());
       EXPECT_EQ(trace->launchAttempts.load(), decoded->launches.size());
     }
 
-    auto runner = mlir::shuttle::GpuRunner::Create(
-        *transport, &allocator, 0, &stream, &capability);
+    auto runner = mlir::shuttle::GpuRunner::Create(*transport, &allocator, 0,
+                                                   &stream, &capability);
     ASSERT_TRUE(runner.ok()) << runner.status();
     llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> operands;
     llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> results;
     for (const mlir::shuttle::GpuExternalBinding &binding :
          (*executable)->externalBindings()) {
-      uintptr_t address = UINT64_C(0x200000000) +
-                          static_cast<uintptr_t>(binding.slotOrdinal) *
-                              UINT64_C(0x10000000);
-      mlir::shuttle::GpuRunnerBuffer buffer{
-          reinterpret_cast<void *>(address), binding.requiredBytes};
+      uintptr_t address =
+          UINT64_C(0x200000000) +
+          static_cast<uintptr_t>(binding.slotOrdinal) * UINT64_C(0x10000000);
+      mlir::shuttle::GpuRunnerBuffer buffer{reinterpret_cast<void *>(address),
+                                            binding.requiredBytes};
       if (binding.kind == mlir::shuttle::ExecutableBindingKind::Operand) {
         ASSERT_EQ(binding.index, static_cast<int64_t>(operands.size()));
         operands.push_back(buffer);
       } else {
-        ASSERT_EQ(binding.kind,
-                  mlir::shuttle::ExecutableBindingKind::Result);
+        ASSERT_EQ(binding.kind, mlir::shuttle::ExecutableBindingKind::Result);
         ASSERT_EQ(binding.index, static_cast<int64_t>(results.size()));
         results.push_back(buffer);
       }
@@ -4345,10 +6425,10 @@ TEST(GpuTransportV2Test,
     uint64_t temporaryBytes;
   };
   constexpr Boundary boundaries[] = {
-      {"jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-forward.mlir",
-       1, 3, 0, 0},
-      {"jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-backward.mlir",
-       3, 6, 1, 56},
+      {"jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-forward.mlir", 1,
+       3, 0, 0},
+      {"jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-backward.mlir", 3,
+       6, 1, 56},
       {"jax-0.10.1-bf16-projected_parameter_broadcast-"
        "3x2x5x11x263-backward.mlir",
        3, 6, 1, 1320},
@@ -4361,10 +6441,20 @@ TEST(GpuTransportV2Test,
     SCOPED_TRACE(boundary.filename);
     auto source = fixtureSource(boundary.filename);
     ASSERT_TRUE(source);
-    auto built = buildFixture(
-        *source, mlir::shuttle::NumericalPolicy::SourceOrdered, options,
-        tuning);
+    auto built =
+        buildFixture(*source, mlir::shuttle::NumericalPolicy::SourceOrdered,
+                     options, tuning);
     ASSERT_TRUE(built);
+    auto materializations =
+        built->module->getOps<mlir::shuttle::MaterializationPlanOp>();
+    ASSERT_EQ(llvm::range_size(materializations), 1);
+    mlir::shuttle::MaterializationPlanOp materialization =
+        *materializations.begin();
+    EXPECT_EQ(
+        llvm::range_size(materialization.getBody()
+                             .front()
+                             .getOps<mlir::shuttle::MaterializationTaskOp>()),
+        boundary.launches);
     auto transport =
         mlir::shuttle::serializeGpuExecutableBundle(*built->module);
     ASSERT_TRUE(mlir::succeeded(transport));
@@ -4383,18 +6473,16 @@ TEST(GpuTransportV2Test,
     llvm::DenseMap<int64_t, uintptr_t> externalSlots;
     for (const mlir::shuttle::GpuExternalBinding &binding :
          (*executable)->externalBindings()) {
-      uintptr_t address = UINT64_C(0x100000000) +
-                          static_cast<uintptr_t>(binding.slotOrdinal) *
-                              UINT64_C(0x10000000);
-      mlir::shuttle::GpuRunnerBuffer buffer{
-          reinterpret_cast<void *>(address), binding.requiredBytes};
-      if (binding.kind ==
-          mlir::shuttle::ExecutableBindingKind::Operand) {
+      uintptr_t address =
+          UINT64_C(0x100000000) +
+          static_cast<uintptr_t>(binding.slotOrdinal) * UINT64_C(0x10000000);
+      mlir::shuttle::GpuRunnerBuffer buffer{reinterpret_cast<void *>(address),
+                                            binding.requiredBytes};
+      if (binding.kind == mlir::shuttle::ExecutableBindingKind::Operand) {
         ASSERT_EQ(binding.index, static_cast<int64_t>(operands.size()));
         operands.push_back(buffer);
       } else {
-        ASSERT_EQ(binding.kind,
-                  mlir::shuttle::ExecutableBindingKind::Result);
+        ASSERT_EQ(binding.kind, mlir::shuttle::ExecutableBindingKind::Result);
         ASSERT_EQ(binding.index, static_cast<int64_t>(results.size()));
         results.push_back(buffer);
       }
@@ -4416,23 +6504,20 @@ TEST(GpuTransportV2Test,
         .WillRepeatedly(testing::Return(absl::OkStatus()));
     EXPECT_CALL(executor, LoadKernel(testing::_))
         .Times(boundary.launches)
-        .WillRepeatedly([trace](
-                            const stream_executor::KernelLoaderSpec &spec) {
+        .WillRepeatedly([trace](const stream_executor::KernelLoaderSpec &spec) {
           return recordLoadedKernel(spec, trace);
         });
 
-    auto runner = mlir::shuttle::GpuRunner::Create(
-        *transport, &allocator, 0, &stream, &capability);
+    auto runner = mlir::shuttle::GpuRunner::Create(*transport, &allocator, 0,
+                                                   &stream, &capability);
     ASSERT_TRUE(runner.ok()) << runner.status();
-    const mlir::shuttle::GpuRunnerResources &resources =
-        (*runner)->resources();
+    const mlir::shuttle::GpuRunnerResources &resources = (*runner)->resources();
     EXPECT_EQ(resources.codeBytes, decoded->code.size());
     EXPECT_EQ(resources.launchCount, boundary.launches);
     EXPECT_EQ(resources.slotCount, decoded->slots);
     EXPECT_EQ(resources.externalOperandCount, operands.size());
     EXPECT_EQ(resources.externalResultCount, results.size());
-    EXPECT_EQ(resources.temporaryAllocationCount,
-              boundary.temporaryGroups);
+    EXPECT_EQ(resources.temporaryAllocationCount, boundary.temporaryGroups);
     EXPECT_EQ(resources.temporaryBytes, boundary.temporaryBytes);
     EXPECT_EQ(allocator.sizes, decoded->temporaryGroupBytes);
     expectLoadedKernels(*decoded, *trace, 0);
@@ -4466,8 +6551,8 @@ TEST(GpuTransportV2Test,
 
     stream_executor::GpuComputeCapability unsupported{
         stream_executor::CudaComputeCapability{8, 0}};
-    EXPECT_FALSE(mlir::shuttle::GpuRunner::Create(
-                     *transport, &allocator, 0, &stream, &unsupported)
+    EXPECT_FALSE(mlir::shuttle::GpuRunner::Create(*transport, &allocator, 0,
+                                                  &stream, &unsupported)
                      .ok());
   }
 }
@@ -4482,8 +6567,8 @@ uint16_t roundToBf16(float value) {
 uint16_t roundBinary64ToBf16(double value) {
   llvm::APFloat converted(value);
   bool losesInformation = false;
-  converted.convert(llvm::APFloat::BFloat(),
-                    llvm::APFloat::rmNearestTiesToEven, &losesInformation);
+  converted.convert(llvm::APFloat::BFloat(), llvm::APFloat::rmNearestTiesToEven,
+                    &losesInformation);
   return static_cast<uint16_t>(converted.bitcastToAPInt().getZExtValue());
 }
 
@@ -4584,12 +6669,10 @@ TEST(GpuTransportV2Test,
       R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
   constexpr llvm::StringLiteral tuning =
       R"json({"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json";
-  auto built = buildFixture(*source,
-                            mlir::shuttle::NumericalPolicy::SourceOrdered,
-                            options, tuning);
+  auto built = buildFixture(
+      *source, mlir::shuttle::NumericalPolicy::SourceOrdered, options, tuning);
   ASSERT_TRUE(built);
-  auto transport =
-      mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+  auto transport = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
   ASSERT_TRUE(mlir::succeeded(transport));
   auto decoded = decodeInlineSchema2(*transport);
   ASSERT_TRUE(decoded);
@@ -4609,9 +6692,9 @@ TEST(GpuTransportV2Test,
     EXPECT_FALSE(decodeInlineSchema2(mutation));
     EXPECT_FALSE(mlir::shuttle::GpuExecutable::Load(mutation).ok());
   };
-  expectRejected(mutateBindingIndexAndRehash(
-      *transport, *decoded, resultSlots[1],
-      decoded->slotBindingIndex[resultSlots[2]]));
+  expectRejected(
+      mutateBindingIndexAndRehash(*transport, *decoded, resultSlots[1],
+                                  decoded->slotBindingIndex[resultSlots[2]]));
   expectRejected(
       mutateBindingIndexAndRehash(*transport, *decoded, resultSlots[0], 3));
   expectRejected(
@@ -4744,8 +6827,7 @@ bool prospectiveLayerNormMatrixIsExact(
   };
   constexpr ExpectedBoundary expectedBoundaries[] = {
       {7, 13, "jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-forward.mlir"},
-      {2048, 4096,
-       "jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-forward.mlir"},
+      {2048, 4096, "jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-forward.mlir"},
   };
   for (const ExpectedBoundary &expected : expectedBoundaries) {
     if (llvm::count_if(boundaries, [&](const auto &boundary) {
@@ -4788,17 +6870,16 @@ bool prospectiveLayerNormMatrixIsExact(
   return executions == 8;
 }
 
-std::string prospectiveLayerNormCoordinate(
-    const ProspectiveLayerNormCell &cell,
-    mlir::shuttle::NumericalPolicy policy) {
-  return llvm::formatv(
-             "{0}x{1}_{2}_{3}", cell.rows, cell.features,
-             cell.testCase == ProspectiveLayerNormCase::Balanced
-                 ? "balanced"
-                 : "positive_offset",
-             policy == mlir::shuttle::NumericalPolicy::SourceOrdered
-                 ? "source_ordered"
-                 : "fast")
+std::string
+prospectiveLayerNormCoordinate(const ProspectiveLayerNormCell &cell,
+                               mlir::shuttle::NumericalPolicy policy) {
+  return llvm::formatv("{0}x{1}_{2}_{3}", cell.rows, cell.features,
+                       cell.testCase == ProspectiveLayerNormCase::Balanced
+                           ? "balanced"
+                           : "positive_offset",
+                       policy == mlir::shuttle::NumericalPolicy::SourceOrdered
+                           ? "source_ordered"
+                           : "fast")
       .str();
 }
 
@@ -4965,9 +7046,7 @@ prospectiveScheduledLayerNorm(const LayerNormInputs &inputs, int64_t rows,
   return output;
 }
 
-double prospectiveBinary64Epsilon() {
-  return static_cast<double>(1.0e-5f);
-}
+double prospectiveBinary64Epsilon() { return static_cast<double>(1.0e-5f); }
 
 std::vector<uint16_t>
 prospectiveBinary64LayerNorm(const LayerNormInputs &inputs, int64_t rows,
@@ -4988,8 +7067,9 @@ prospectiveBinary64LayerNorm(const LayerNormInputs &inputs, int64_t rows,
           mean;
       squaredSum += centered * centered;
     }
-    double inverse = 1.0 / std::sqrt(squaredSum / static_cast<double>(features) +
-                                     prospectiveBinary64Epsilon());
+    double inverse =
+        1.0 / std::sqrt(squaredSum / static_cast<double>(features) +
+                        prospectiveBinary64Epsilon());
     for (int64_t feature = 0; feature < features; ++feature) {
       const int64_t element = row * features + feature;
       double centered =
@@ -5139,8 +7219,7 @@ constexpr mlir::shuttle::NumericalPolicy prospectiveLayerNormBCPolicies[] = {
 };
 
 uint32_t prospectiveLayerNormBCMix32(uint32_t index, uint32_t stream) {
-  uint32_t value = index + UINT32_C(0xBB67AE85) +
-                   stream * UINT32_C(0x9E3779B9);
+  uint32_t value = index + UINT32_C(0xBB67AE85) + stream * UINT32_C(0x9E3779B9);
   value ^= value >> 16;
   value *= UINT32_C(0x7FEB352D);
   value ^= value >> 15;
@@ -5149,8 +7228,8 @@ uint32_t prospectiveLayerNormBCMix32(uint32_t index, uint32_t stream) {
   return value;
 }
 
-ProspectiveLayerNormBCInputs prospectiveLayerNormBCInputs(
-    const ProspectiveLayerNormBCShape &shape) {
+ProspectiveLayerNormBCInputs
+prospectiveLayerNormBCInputs(const ProspectiveLayerNormBCShape &shape) {
   ProspectiveLayerNormBCInputs inputs;
   inputs.x.resize(shape.rows * shape.features);
   inputs.dy.resize(shape.rows * shape.features);
@@ -5168,18 +7247,15 @@ ProspectiveLayerNormBCInputs prospectiveLayerNormBCInputs(
   }
   for (int64_t feature = 0; feature < shape.features; ++feature) {
     uint32_t gammaBits = prospectiveLayerNormBCMix32(feature, 2);
-    int32_t gamma =
-        64 + static_cast<int32_t>(gammaBits % UINT32_C(129));
+    int32_t gamma = 64 + static_cast<int32_t>(gammaBits % UINT32_C(129));
     if ((gammaBits & UINT32_C(0x100)) != 0)
       gamma = -gamma;
     int32_t beta =
         static_cast<int32_t>(prospectiveLayerNormBCMix32(feature, 3) %
                              UINT32_C(257)) -
         128;
-    inputs.gamma[feature] =
-        roundToBf16(static_cast<float>(gamma) / 128.0f);
-    inputs.beta[feature] =
-        roundToBf16(static_cast<float>(beta) / 128.0f);
+    inputs.gamma[feature] = roundToBf16(static_cast<float>(gamma) / 128.0f);
+    inputs.beta[feature] = roundToBf16(static_cast<float>(beta) / 128.0f);
   }
   if (shape.rows == 2048 && shape.features == 4096) {
     for (int64_t row = 0; row < shape.rows; ++row) {
@@ -5187,8 +7263,8 @@ ProspectiveLayerNormBCInputs prospectiveLayerNormBCInputs(
       inputs.dy[row * shape.features + 1] = roundToBf16(0.0f);
     }
     constexpr float sentinel[] = {
-        -1.0f / 2048.0f, 512.0f,   -0.5f,    4.0f,
-        -16384.0f,        16384.0f, -256.0f, -128.0f,
+        -1.0f / 2048.0f, 512.0f,   -0.5f,   4.0f,
+        -16384.0f,       16384.0f, -256.0f, -128.0f,
     };
     for (auto [index, value] : llvm::enumerate(sentinel)) {
       inputs.dy[index * 8 * shape.features] = roundToBf16(value);
@@ -5198,8 +7274,9 @@ ProspectiveLayerNormBCInputs prospectiveLayerNormBCInputs(
   return inputs;
 }
 
-std::vector<float> prospectiveScheduledColumnFold(
-    llvm::ArrayRef<float> values, int64_t rows, int64_t features) {
+std::vector<float> prospectiveScheduledColumnFold(llvm::ArrayRef<float> values,
+                                                  int64_t rows,
+                                                  int64_t features) {
   std::vector<float> transposed(values.size());
   for (int64_t row = 0; row < rows; ++row)
     for (int64_t feature = 0; feature < features; ++feature)
@@ -5207,9 +7284,9 @@ std::vector<float> prospectiveScheduledColumnFold(
   return prospectiveScheduledFold(transposed, features, rows);
 }
 
-ProspectiveLayerNormBCOutputs prospectiveScheduledLayerNormBC(
-    const ProspectiveLayerNormBCInputs &inputs, int64_t rows,
-    int64_t features) {
+ProspectiveLayerNormBCOutputs
+prospectiveScheduledLayerNormBC(const ProspectiveLayerNormBCInputs &inputs,
+                                int64_t rows, int64_t features) {
   const size_t elements = static_cast<size_t>(rows * features);
   std::vector<float> x(elements), dy(elements), gamma(features), beta(features);
   for (size_t index = 0; index < elements; ++index) {
@@ -5222,7 +7299,8 @@ ProspectiveLayerNormBCOutputs prospectiveScheduledLayerNormBC(
   }
 
   std::vector<float> sums = prospectiveScheduledFold(x, rows, features);
-  std::vector<float> centered(elements), squared(elements), normalized(elements);
+  std::vector<float> centered(elements), squared(elements),
+      normalized(elements);
   std::vector<float> means(rows);
   for (int64_t row = 0; row < rows; ++row) {
     means[row] = prospectiveDivide(sums[row], static_cast<float>(features));
@@ -5237,8 +7315,8 @@ ProspectiveLayerNormBCOutputs prospectiveScheduledLayerNormBC(
       prospectiveScheduledFold(squared, rows, features);
   std::vector<float> inverse(rows), shifted(rows);
   for (int64_t row = 0; row < rows; ++row) {
-    float variance = prospectiveDivide(squaredSums[row],
-                                       static_cast<float>(features));
+    float variance =
+        prospectiveDivide(squaredSums[row], static_cast<float>(features));
     shifted[row] = prospectiveAdd(variance, 1.0e-5f);
     inverse[row] = prospectiveDivide(1.0f, prospectiveSqrt(shifted[row]));
     for (int64_t feature = 0; feature < features; ++feature) {
@@ -5262,8 +7340,7 @@ ProspectiveLayerNormBCOutputs prospectiveScheduledLayerNormBC(
   for (int64_t row = 0; row < rows; ++row) {
     correction[row] = prospectiveDivide(inverse[row], shifted[row]);
     correction[row] = prospectiveMultiply(-0.5f, correction[row]);
-    correction[row] =
-        prospectiveMultiply(correctionSums[row], correction[row]);
+    correction[row] = prospectiveMultiply(correctionSums[row], correction[row]);
     correction[row] =
         prospectiveDivide(correction[row], static_cast<float>(features));
     correction[row] = prospectiveAdd(0.0f, correction[row]);
@@ -5307,24 +7384,23 @@ ProspectiveLayerNormBCOutputs prospectiveScheduledLayerNormBC(
     }
   std::vector<float> dgamma =
       prospectiveScheduledColumnFold(dgammaInput, rows, features);
-  std::vector<float> dbeta =
-      prospectiveScheduledColumnFold(dy, rows, features);
+  std::vector<float> dbeta = prospectiveScheduledColumnFold(dy, rows, features);
   outputs.dgamma.resize(features);
   outputs.dbeta.resize(features);
   for (int64_t feature = 0; feature < features; ++feature) {
     outputs.dgamma[feature] =
         roundToBf16(prospectiveAdd(0.0f, dgamma[feature]));
-    outputs.dbeta[feature] =
-        roundToBf16(prospectiveAdd(0.0f, dbeta[feature]));
+    outputs.dbeta[feature] = roundToBf16(prospectiveAdd(0.0f, dbeta[feature]));
   }
   return outputs;
 }
 
-ProspectiveLayerNormBCOutputs prospectiveBinary64LayerNormBC(
-    const ProspectiveLayerNormBCInputs &inputs, int64_t rows,
-    int64_t features) {
+ProspectiveLayerNormBCOutputs
+prospectiveBinary64LayerNormBC(const ProspectiveLayerNormBCInputs &inputs,
+                               int64_t rows, int64_t features) {
   const size_t elements = static_cast<size_t>(rows * features);
-  std::vector<double> centered(elements), normalized(elements), weighted(elements);
+  std::vector<double> centered(elements), normalized(elements),
+      weighted(elements);
   std::vector<double> inverse(rows);
   for (int64_t row = 0; row < rows; ++row) {
     double sum = 0.0;
@@ -5334,17 +7410,18 @@ ProspectiveLayerNormBCOutputs prospectiveBinary64LayerNormBC(
     double squaredSum = 0.0;
     for (int64_t feature = 0; feature < features; ++feature) {
       size_t element = row * features + feature;
-      centered[element] = static_cast<double>(expandBf16(inputs.x[element])) - mean;
+      centered[element] =
+          static_cast<double>(expandBf16(inputs.x[element])) - mean;
       squaredSum += centered[element] * centered[element];
     }
-    inverse[row] =
-        1.0 / std::sqrt(squaredSum / static_cast<double>(features) +
-                        static_cast<double>(1.0e-5f));
+    inverse[row] = 1.0 / std::sqrt(squaredSum / static_cast<double>(features) +
+                                   static_cast<double>(1.0e-5f));
     for (int64_t feature = 0; feature < features; ++feature) {
       size_t element = row * features + feature;
       normalized[element] = centered[element] * inverse[row];
-      weighted[element] = static_cast<double>(expandBf16(inputs.dy[element])) *
-                          static_cast<double>(expandBf16(inputs.gamma[feature]));
+      weighted[element] =
+          static_cast<double>(expandBf16(inputs.dy[element])) *
+          static_cast<double>(expandBf16(inputs.gamma[feature]));
     }
   }
 
@@ -5369,9 +7446,8 @@ ProspectiveLayerNormBCOutputs prospectiveBinary64LayerNormBC(
       double dy = expandBf16(inputs.dy[element]);
       double y = normalized[element] * expandBf16(inputs.gamma[feature]) +
                  expandBf16(inputs.beta[feature]);
-      double dx = inverse[row] *
-                  (weighted[element] - meanWeighted -
-                   normalized[element] * meanWeightedNormalized);
+      double dx = inverse[row] * (weighted[element] - meanWeighted -
+                                  normalized[element] * meanWeightedNormalized);
       outputs.y[element] = roundBinary64ToBf16(y);
       outputs.dx[element] = roundBinary64ToBf16(dx);
       dgamma[feature] += dy * normalized[element];
@@ -5411,12 +7487,14 @@ bool prospectiveLayerNormBCMatrixIsExact(
     llvm::ArrayRef<mlir::shuttle::NumericalPolicy> policies) {
   if (shapes.size() != 2 || boundaries.size() != 2 || policies.size() != 2)
     return false;
-  if (llvm::count_if(shapes, [](const auto &shape) {
-        return shape.rows == 7 && shape.features == 13;
-      }) != 1 ||
-      llvm::count_if(shapes, [](const auto &shape) {
-        return shape.rows == 2048 && shape.features == 4096;
-      }) != 1 ||
+  if (llvm::count_if(shapes,
+                     [](const auto &shape) {
+                       return shape.rows == 7 && shape.features == 13;
+                     }) != 1 ||
+      llvm::count_if(shapes,
+                     [](const auto &shape) {
+                       return shape.rows == 2048 && shape.features == 4096;
+                     }) != 1 ||
       std::count(boundaries.begin(), boundaries.end(), "backward") != 1 ||
       std::count(boundaries.begin(), boundaries.end(), "composed") != 1 ||
       std::count(policies.begin(), policies.end(),
@@ -5446,9 +7524,9 @@ TEST(GpuTransportV2Test,
 
 TEST(GpuTransportV2Test,
      ProspectiveLayerNormMatrixRejectsRemovalAndDuplication) {
-  EXPECT_TRUE(prospectiveLayerNormMatrixIsExact(
-      prospectiveLayerNormBoundaries, prospectiveLayerNormCells,
-      prospectiveLayerNormPolicies));
+  EXPECT_TRUE(prospectiveLayerNormMatrixIsExact(prospectiveLayerNormBoundaries,
+                                                prospectiveLayerNormCells,
+                                                prospectiveLayerNormPolicies));
 
   std::vector<ProspectiveLayerNormBoundary> boundaries(
       std::begin(prospectiveLayerNormBoundaries),
@@ -5555,12 +7633,12 @@ TEST(GpuTransportV2Test,
       std::begin(prospectiveLayerNormBCPolicies),
       std::end(prospectiveLayerNormBCPolicies));
   policies.pop_back();
-  EXPECT_FALSE(prospectiveLayerNormBCMatrixIsExact(
-      prospectiveLayerNormBCShapes, boundaries, policies));
+  EXPECT_FALSE(prospectiveLayerNormBCMatrixIsExact(prospectiveLayerNormBCShapes,
+                                                   boundaries, policies));
   policies = {mlir::shuttle::NumericalPolicy::Fast,
               mlir::shuttle::NumericalPolicy::Fast};
-  EXPECT_FALSE(prospectiveLayerNormBCMatrixIsExact(
-      prospectiveLayerNormBCShapes, boundaries, policies));
+  EXPECT_FALSE(prospectiveLayerNormBCMatrixIsExact(prospectiveLayerNormBCShapes,
+                                                   boundaries, policies));
 }
 
 TEST(GpuTransportV2Test,
@@ -5589,17 +7667,13 @@ TEST(GpuTransportV2Test,
         prospectiveBinary64LayerNormBC(inputs, shape.rows, shape.features);
     ProspectiveLayerNormBCOutputs scheduled =
         prospectiveScheduledLayerNormBC(inputs, shape.rows, shape.features);
-    EXPECT_EQ(prospectiveBf16Digest(binary64.y,
-                                    {shape.rows, shape.features}),
+    EXPECT_EQ(prospectiveBf16Digest(binary64.y, {shape.rows, shape.features}),
               shape.yBinary64Digest);
-    EXPECT_EQ(prospectiveBf16Digest(scheduled.y,
-                                    {shape.rows, shape.features}),
+    EXPECT_EQ(prospectiveBf16Digest(scheduled.y, {shape.rows, shape.features}),
               shape.yScheduleDigest);
-    EXPECT_EQ(prospectiveBf16Digest(binary64.dx,
-                                    {shape.rows, shape.features}),
+    EXPECT_EQ(prospectiveBf16Digest(binary64.dx, {shape.rows, shape.features}),
               shape.dxBinary64Digest);
-    EXPECT_EQ(prospectiveBf16Digest(scheduled.dx,
-                                    {shape.rows, shape.features}),
+    EXPECT_EQ(prospectiveBf16Digest(scheduled.dx, {shape.rows, shape.features}),
               shape.dxScheduleDigest);
     EXPECT_EQ(prospectiveBf16Digest(binary64.dgamma, {shape.features}),
               shape.dgammaBinary64Digest);
@@ -5623,8 +7697,7 @@ TEST(GpuTransportV2Test,
       expectProspectiveLayerNormBCLimits(role, *metrics);
     };
     expectMetrics("y", scheduled.y, binary64.y, shape.yScheduleMetrics);
-    expectMetrics("dx", scheduled.dx, binary64.dx,
-                  shape.dxScheduleMetrics);
+    expectMetrics("dx", scheduled.dx, binary64.dx, shape.dxScheduleMetrics);
     expectMetrics("dgamma", scheduled.dgamma, binary64.dgamma,
                   shape.dgammaScheduleMetrics);
     expectMetrics("dbeta", scheduled.dbeta, binary64.dbeta,
@@ -5665,23 +7738,20 @@ TEST(GpuTransportV2Test,
           accumulator = prospectiveAdd(accumulator, value);
         return accumulator;
       });
-      expectWrongFold("global_adjacent_pair",
-                      [](llvm::ArrayRef<float> values) {
-                        std::vector<float> partials(values.begin(),
-                                                    values.end());
-                        while (partials.size() > 1) {
-                          std::vector<float> reduced((partials.size() + 1) /
-                                                     2);
-                          size_t pairs = partials.size() / 2;
-                          for (size_t pair = 0; pair < pairs; ++pair)
-                            reduced[pair] = prospectiveAdd(
-                                partials[pair * 2], partials[pair * 2 + 1]);
-                          if ((partials.size() & 1) != 0)
-                            reduced[pairs] = partials.back();
-                          partials = std::move(reduced);
-                        }
-                        return partials.front();
-                      });
+      expectWrongFold("global_adjacent_pair", [](llvm::ArrayRef<float> values) {
+        std::vector<float> partials(values.begin(), values.end());
+        while (partials.size() > 1) {
+          std::vector<float> reduced((partials.size() + 1) / 2);
+          size_t pairs = partials.size() / 2;
+          for (size_t pair = 0; pair < pairs; ++pair)
+            reduced[pair] =
+                prospectiveAdd(partials[pair * 2], partials[pair * 2 + 1]);
+          if ((partials.size() & 1) != 0)
+            reduced[pairs] = partials.back();
+          partials = std::move(reduced);
+        }
+        return partials.front();
+      });
       expectWrongFold("reverse_serial", [](llvm::ArrayRef<float> values) {
         float accumulator = 0.0f;
         for (float value : llvm::reverse(values))
@@ -5718,8 +7788,8 @@ module @three_map_bf16_chain {
       R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
   constexpr llvm::StringLiteral tuning =
       R"json({"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json";
-  auto built = buildFixture(source, mlir::shuttle::NumericalPolicy::SourceOrdered,
-                            options, tuning);
+  auto built = buildFixture(
+      source, mlir::shuttle::NumericalPolicy::SourceOrdered, options, tuning);
   ASSERT_TRUE(built);
   auto transport = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
   ASSERT_TRUE(mlir::succeeded(transport));
@@ -5735,8 +7805,8 @@ module @three_map_bf16_chain {
   stream_executor::StreamExecutorAddressAllocator allocator(*executor);
   const auto &capability =
       (*executor)->GetDeviceDescription().gpu_compute_capability();
-  auto runner = mlir::shuttle::GpuRunner::Create(
-      *transport, &allocator, 0, stream->get(), &capability);
+  auto runner = mlir::shuttle::GpuRunner::Create(*transport, &allocator, 0,
+                                                 stream->get(), &capability);
   ASSERT_TRUE(runner.ok()) << runner.status();
   ASSERT_EQ((*runner)->resources().launchCount, 3);
 
@@ -5759,10 +7829,10 @@ module @three_map_bf16_chain {
                                          actual.size() * sizeof(uint16_t),
                                          &deviceResult)
                   .ok());
-  llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> operands{{
-      deviceInput.opaque(), static_cast<int64_t>(deviceInput.size())}};
-  llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> results{{
-      deviceResult.opaque(), static_cast<int64_t>(deviceResult.size())}};
+  llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> operands{
+      {deviceInput.opaque(), static_cast<int64_t>(deviceInput.size())}};
+  llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> results{
+      {deviceResult.opaque(), static_cast<int64_t>(deviceResult.size())}};
 
   ASSERT_TRUE((*runner)->Execute(operands, results).ok());
   ASSERT_TRUE((*runner)->AwaitCompletion().ok());
@@ -5956,15 +8026,14 @@ TEST(GpuTransportV2Test,
       R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
   constexpr llvm::StringLiteral tuning =
       R"json({"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json";
-  ASSERT_TRUE(prospectiveLayerNormMatrixIsExact(
-      prospectiveLayerNormBoundaries, prospectiveLayerNormCells,
-      prospectiveLayerNormPolicies));
+  ASSERT_TRUE(prospectiveLayerNormMatrixIsExact(prospectiveLayerNormBoundaries,
+                                                prospectiveLayerNormCells,
+                                                prospectiveLayerNormPolicies));
   std::vector<std::string> executedCoordinates;
   for (const ProspectiveLayerNormBoundary &boundary :
        prospectiveLayerNormBoundaries) {
     SCOPED_TRACE(boundary.fixture.str());
-    for (mlir::shuttle::NumericalPolicy policy :
-         prospectiveLayerNormPolicies) {
+    for (mlir::shuttle::NumericalPolicy policy : prospectiveLayerNormPolicies) {
       const llvm::StringRef policyName =
           policy == mlir::shuttle::NumericalPolicy::SourceOrdered
               ? "source_ordered"
@@ -6107,8 +8176,8 @@ TEST(GpuTransportV2Test,
         ASSERT_TRUE(metrics)
             << "all actual and reference outputs must be finite";
         expectProspectiveLayerNormMetrics(*metrics, cell);
-        executedCoordinates.push_back(prospectiveLayerNormCoordinate(cell,
-                                                                      policy));
+        executedCoordinates.push_back(
+            prospectiveLayerNormCoordinate(cell, policy));
         RecordProperty(
             llvm::formatv("metrics_{0}x{1}_{2}_{3}", cell.rows, cell.features,
                           caseName, policyName)
@@ -6143,8 +8212,7 @@ TEST(GpuTransportV2Test,
   EXPECT_EQ(executedCoordinates, expectedCoordinates);
 }
 
-TEST(GpuTransportV2Test,
-     H100RunnerMatchesProspectiveLayerNormBCContractV1) {
+TEST(GpuTransportV2Test, H100RunnerMatchesProspectiveLayerNormBCContractV1) {
   if (std::getenv("SHUTTLE_RUN_H100_NUMERICS") == nullptr)
     GTEST_SKIP() << "set SHUTTLE_RUN_H100_NUMERICS=1 on an H100 worker";
 
@@ -6195,35 +8263,36 @@ TEST(GpuTransportV2Test,
         shape.rows == 7 ? "81928ab3539c0f03" : "44d152ecc3e9ff18";
     for (llvm::StringRef boundary : boundaries) {
       const bool composed = boundary == "composed";
-      std::string fixture =
-          (llvm::Twine("jax-0.10.1-bf16-layer_norm_") + stem + "-" +
-           boundary + ".mlir")
-              .str();
+      std::string fixture = (llvm::Twine("jax-0.10.1-bf16-layer_norm_") + stem +
+                             "-" + boundary + ".mlir")
+                                .str();
       auto source = fixtureSource(fixture);
       ASSERT_TRUE(source);
       const std::vector<const std::vector<uint16_t> *> hostOperands =
-          composed
-              ? std::vector<const std::vector<uint16_t> *>{
-                    &inputs.x, &inputs.gamma, &inputs.beta, &inputs.dy}
-              : std::vector<const std::vector<uint16_t> *>{
-                    &inputs.x, &inputs.gamma, &inputs.dy};
+          composed ? std::vector<const std::vector<uint16_t> *>{&inputs.x,
+                                                                &inputs.gamma,
+                                                                &inputs.beta,
+                                                                &inputs.dy}
+                   : std::vector<const std::vector<uint16_t> *>{
+                         &inputs.x, &inputs.gamma, &inputs.dy};
       const std::vector<const std::vector<uint16_t> *> scheduledOutputs =
           composed
-              ? std::vector<const std::vector<uint16_t> *>{
-                    &scheduled.y, &scheduled.dx, &scheduled.dgamma,
-                    &scheduled.dbeta}
+              ? std::vector<const std::vector<uint16_t> *>{&scheduled.y,
+                                                           &scheduled.dx,
+                                                           &scheduled.dgamma,
+                                                           &scheduled.dbeta}
               : std::vector<const std::vector<uint16_t> *>{
                     &scheduled.dx, &scheduled.dgamma, &scheduled.dbeta};
       const std::vector<const std::vector<uint16_t> *> binary64Outputs =
           composed
-              ? std::vector<const std::vector<uint16_t> *>{
-                    &binary64.y, &binary64.dx, &binary64.dgamma,
-                    &binary64.dbeta}
+              ? std::vector<const std::vector<uint16_t> *>{&binary64.y,
+                                                           &binary64.dx,
+                                                           &binary64.dgamma,
+                                                           &binary64.dbeta}
               : std::vector<const std::vector<uint16_t> *>{
                     &binary64.dx, &binary64.dgamma, &binary64.dbeta};
       const std::vector<llvm::StringRef> outputRoles =
-          composed ? std::vector<llvm::StringRef>{"y", "dx", "dgamma",
-                                                       "dbeta"}
+          composed ? std::vector<llvm::StringRef>{"y", "dx", "dgamma", "dbeta"}
                    : std::vector<llvm::StringRef>{"dx", "dgamma", "dbeta"};
       auto expectSealedOutput = [&](llvm::StringRef role,
                                     llvm::ArrayRef<uint16_t> scheduledOutput,
@@ -6231,68 +8300,60 @@ TEST(GpuTransportV2Test,
                                     llvm::StringRef scheduledDigest,
                                     llvm::StringRef binary64Digest,
                                     const ProspectiveLayerNormMetrics &sealed) {
-        EXPECT_EQ(prospectiveBf16Digest(scheduledOutput,
-                                        role == "dgamma" || role == "dbeta"
-                                            ? llvm::ArrayRef<int64_t>{
-                                                  shape.features}
-                                            : llvm::ArrayRef<int64_t>{
-                                                  shape.rows, shape.features}),
-                  scheduledDigest);
-        EXPECT_EQ(prospectiveBf16Digest(binary64Output,
-                                        role == "dgamma" || role == "dbeta"
-                                            ? llvm::ArrayRef<int64_t>{
-                                                  shape.features}
-                                            : llvm::ArrayRef<int64_t>{
-                                                  shape.rows, shape.features}),
-                  binary64Digest);
+        EXPECT_EQ(
+            prospectiveBf16Digest(
+                scheduledOutput,
+                role == "dgamma" || role == "dbeta"
+                    ? llvm::ArrayRef<int64_t>{shape.features}
+                    : llvm::ArrayRef<int64_t>{shape.rows, shape.features}),
+            scheduledDigest);
+        EXPECT_EQ(
+            prospectiveBf16Digest(
+                binary64Output,
+                role == "dgamma" || role == "dbeta"
+                    ? llvm::ArrayRef<int64_t>{shape.features}
+                    : llvm::ArrayRef<int64_t>{shape.rows, shape.features}),
+            binary64Digest);
         auto metrics =
             prospectiveLayerNormMetrics(scheduledOutput, binary64Output);
         ASSERT_TRUE(metrics);
         EXPECT_DOUBLE_EQ(metrics->maxAbsoluteError, sealed.maxAbsoluteError);
-        EXPECT_DOUBLE_EQ(metrics->meanAbsoluteError,
-                         sealed.meanAbsoluteError);
-        EXPECT_DOUBLE_EQ(metrics->relativeLinfError,
-                         sealed.relativeLinfError);
+        EXPECT_DOUBLE_EQ(metrics->meanAbsoluteError, sealed.meanAbsoluteError);
+        EXPECT_DOUBLE_EQ(metrics->relativeLinfError, sealed.relativeLinfError);
         EXPECT_EQ(metrics->maxBf16UlpError, sealed.maxBf16UlpError);
         expectProspectiveLayerNormBCLimits(role, *metrics);
       };
       if (composed)
-        expectSealedOutput("y", scheduled.y, binary64.y,
-                           shape.yScheduleDigest, shape.yBinary64Digest,
-                           shape.yScheduleMetrics);
+        expectSealedOutput("y", scheduled.y, binary64.y, shape.yScheduleDigest,
+                           shape.yBinary64Digest, shape.yScheduleMetrics);
       expectSealedOutput("dx", scheduled.dx, binary64.dx,
                          shape.dxScheduleDigest, shape.dxBinary64Digest,
                          shape.dxScheduleMetrics);
       expectSealedOutput("dgamma", scheduled.dgamma, binary64.dgamma,
-                         shape.dgammaScheduleDigest,
-                         shape.dgammaBinary64Digest,
+                         shape.dgammaScheduleDigest, shape.dgammaBinary64Digest,
                          shape.dgammaScheduleMetrics);
       expectSealedOutput("dbeta", scheduled.dbeta, binary64.dbeta,
-                         shape.dbetaScheduleDigest,
-                         shape.dbetaBinary64Digest,
+                         shape.dbetaScheduleDigest, shape.dbetaBinary64Digest,
                          shape.dbetaScheduleMetrics);
       const std::vector<int64_t> expectedBindingBytes =
-          composed ? std::vector<int64_t>{matrixBytes, featureBytes,
-                                                   featureBytes, matrixBytes,
-                                                   matrixBytes, matrixBytes,
-                                                   featureBytes, featureBytes}
-                   : std::vector<int64_t>{matrixBytes, featureBytes,
-                                                   matrixBytes, matrixBytes,
-                                                   featureBytes, featureBytes};
+          composed
+              ? std::vector<int64_t>{matrixBytes,  featureBytes, featureBytes,
+                                     matrixBytes,  matrixBytes,  matrixBytes,
+                                     featureBytes, featureBytes}
+              : std::vector<int64_t>{matrixBytes, featureBytes, matrixBytes,
+                                     matrixBytes, featureBytes, featureBytes};
       const std::vector<int64_t> expectedBindingSlots =
           composed ? std::vector<int64_t>{0, 1, 2, 3, 6, 9, 8, 7}
                    : std::vector<int64_t>{0, 1, 2, 7, 6, 5};
       const std::vector<std::vector<int64_t>> expectedLaunchInputs =
-          composed ? std::vector<std::vector<int64_t>>{{0, 1, 2, 3},
-                                                        {0, 3, 4, 5}}
-                   : std::vector<std::vector<int64_t>>{{0, 1, 2},
-                                                        {0, 2, 3, 4}};
+          composed
+              ? std::vector<std::vector<int64_t>>{{0, 1, 2, 3}, {0, 3, 4, 5}}
+              : std::vector<std::vector<int64_t>>{{0, 1, 2}, {0, 2, 3, 4}};
       const std::vector<std::vector<int64_t>> expectedLaunchOutputs =
           composed ? std::vector<std::vector<int64_t>>{{4, 5, 6, 9}, {7, 8}}
                    : std::vector<std::vector<int64_t>>{{3, 4, 7}, {5, 6}};
       const std::vector<int64_t> temporarySlots =
-          composed ? std::vector<int64_t>{4, 5}
-                   : std::vector<int64_t>{3, 4};
+          composed ? std::vector<int64_t>{4, 5} : std::vector<int64_t>{3, 4};
       for (mlir::shuttle::NumericalPolicy policy :
            prospectiveLayerNormBCPolicies) {
         const llvm::StringRef policyName =
@@ -6319,13 +8380,12 @@ TEST(GpuTransportV2Test,
         for (auto [ordinal, binding] : llvm::enumerate(bindings)) {
           const bool operand = ordinal < hostOperands.size();
           EXPECT_EQ(binding.kind,
-                    operand
-                        ? mlir::shuttle::ExecutableBindingKind::Operand
-                        : mlir::shuttle::ExecutableBindingKind::Result);
+                    operand ? mlir::shuttle::ExecutableBindingKind::Operand
+                            : mlir::shuttle::ExecutableBindingKind::Result);
           EXPECT_EQ(binding.index,
-                    operand ? static_cast<int64_t>(ordinal)
-                            : static_cast<int64_t>(ordinal -
-                                                   hostOperands.size()));
+                    operand
+                        ? static_cast<int64_t>(ordinal)
+                        : static_cast<int64_t>(ordinal - hostOperands.size()));
           EXPECT_EQ(binding.slotOrdinal, expectedBindingSlots[ordinal]);
           EXPECT_EQ(binding.requiredBytes, expectedBindingBytes[ordinal]);
         }
@@ -6333,8 +8393,7 @@ TEST(GpuTransportV2Test,
         for (int64_t slot : temporarySlots) {
           EXPECT_EQ((*executable)->slots()[slot].storage,
                     mlir::shuttle::MaterializationStorage::Temporary);
-          EXPECT_EQ((*executable)->slots()[slot].requiredBytes,
-                    shape.rows * 4);
+          EXPECT_EQ((*executable)->slots()[slot].requiredBytes, shape.rows * 4);
         }
         const auto &launches = (*executable)->launches();
         ASSERT_EQ(launches.size(), 2u);
@@ -6344,8 +8403,7 @@ TEST(GpuTransportV2Test,
             ((std::min<int64_t>(shape.rows, 256) + 31) / 32) * 32;
         for (int64_t launch = 0; launch < 2; ++launch) {
           EXPECT_EQ(launches[launch].taskOrdinal, launch);
-          EXPECT_EQ(launches[launch].inputSlots,
-                    expectedLaunchInputs[launch]);
+          EXPECT_EQ(launches[launch].inputSlots, expectedLaunchInputs[launch]);
           EXPECT_EQ(launches[launch].outputSlots,
                     expectedLaunchOutputs[launch]);
           EXPECT_EQ(launches[launch].dependencies,
@@ -6357,9 +8415,9 @@ TEST(GpuTransportV2Test,
                                                           : shape.features),
                         1, 1}));
           const int64_t threads = launch == 0 ? rowThreads : featureThreads;
-          EXPECT_EQ(launches[launch].block,
-                    (std::array<uint64_t, 3>{
-                        static_cast<uint64_t>(threads), 1, 1}));
+          EXPECT_EQ(
+              launches[launch].block,
+              (std::array<uint64_t, 3>{static_cast<uint64_t>(threads), 1, 1}));
           EXPECT_EQ(launches[launch].dynamicSharedMemoryBytes,
                     static_cast<uint64_t>(threads * 4));
         }
@@ -6380,11 +8438,11 @@ TEST(GpuTransportV2Test,
         for (const std::vector<uint16_t> *host : hostOperands) {
           auto device = (*executor)->AllocateArray<uint16_t>(host->size());
           ASSERT_TRUE(device);
-          ASSERT_TRUE((*executor)
-                          ->SynchronousMemcpyH2D(
-                              host->data(), host->size() * sizeof(uint16_t),
-                              &device)
-                          .ok());
+          ASSERT_TRUE(
+              (*executor)
+                  ->SynchronousMemcpyH2D(
+                      host->data(), host->size() * sizeof(uint16_t), &device)
+                  .ok());
           deviceOperands.push_back(device);
           operands.push_back(
               {device.opaque(), static_cast<int64_t>(device.size())});
@@ -6405,10 +8463,10 @@ TEST(GpuTransportV2Test,
             run[output].assign(scheduledOutputs[output]->size(),
                                UINT16_C(0x7FC1));
             ASSERT_TRUE((*executor)
-                            ->SynchronousMemcpyH2D(
-                                run[output].data(),
-                                run[output].size() * sizeof(uint16_t),
-                                &deviceResults[output])
+                            ->SynchronousMemcpyH2D(run[output].data(),
+                                                   run[output].size() *
+                                                       sizeof(uint16_t),
+                                                   &deviceResults[output])
                             .ok());
           }
           absl::Status execution = (*runner)->Execute(operands, results);
@@ -6416,10 +8474,10 @@ TEST(GpuTransportV2Test,
           ASSERT_TRUE((*runner)->AwaitCompletion().ok());
           for (size_t output = 0; output < scheduledOutputs.size(); ++output)
             ASSERT_TRUE((*executor)
-                            ->SynchronousMemcpyD2H(
-                                deviceResults[output],
-                                run[output].size() * sizeof(uint16_t),
-                                run[output].data())
+                            ->SynchronousMemcpyD2H(deviceResults[output],
+                                                   run[output].size() *
+                                                       sizeof(uint16_t),
+                                                   run[output].data())
                             .ok());
         }
 
@@ -6428,22 +8486,20 @@ TEST(GpuTransportV2Test,
           int64_t scheduleDifferences = 0;
           for (size_t element = 0; element < actualRuns[0][output].size();
                ++element) {
-            repeatabilityDifferences +=
-                actualRuns[0][output][element] !=
-                actualRuns[1][output][element];
+            repeatabilityDifferences += actualRuns[0][output][element] !=
+                                        actualRuns[1][output][element];
             scheduleDifferences += actualRuns[0][output][element] !=
                                    (*scheduledOutputs[output])[element];
           }
           EXPECT_EQ(repeatabilityDifferences, 0) << outputRoles[output].str();
           EXPECT_EQ(scheduleDifferences, 0) << outputRoles[output].str();
-          auto metrics = prospectiveLayerNormMetrics(
-              actualRuns[0][output], *binary64Outputs[output]);
+          auto metrics = prospectiveLayerNormMetrics(actualRuns[0][output],
+                                                     *binary64Outputs[output]);
           ASSERT_TRUE(metrics) << outputRoles[output].str();
           expectProspectiveLayerNormBCLimits(outputRoles[output], *metrics);
           RecordProperty(
-              llvm::formatv("metrics_{0}_{1}x{2}_{3}_{4}", boundary,
-                            shape.rows, shape.features, policyName,
-                            outputRoles[output])
+              llvm::formatv("metrics_{0}_{1}x{2}_{3}_{4}", boundary, shape.rows,
+                            shape.features, policyName, outputRoles[output])
                   .str(),
               llvm::formatv(
                   "max_absolute={0},mean_absolute={1},relative_linf={2},"
@@ -6454,10 +8510,10 @@ TEST(GpuTransportV2Test,
                   scheduleDifferences, repeatabilityDifferences)
                   .str());
         }
-        executedCoordinates.push_back(
-            llvm::formatv("{0}_{1}x{2}_{3}", boundary, shape.rows,
-                          shape.features, policyName)
-                .str());
+        executedCoordinates.push_back(llvm::formatv("{0}_{1}x{2}_{3}", boundary,
+                                                    shape.rows, shape.features,
+                                                    policyName)
+                                          .str());
 
         runner->reset();
         for (auto &device : deviceResults)
@@ -6477,9 +8533,9 @@ TEST(GpuTransportV2Test,
   EXPECT_EQ(executedCoordinates, expectedCoordinates);
 }
 
-std::vector<uint16_t> rmsNormForwardReference(
-    llvm::ArrayRef<uint16_t> x, llvm::ArrayRef<uint16_t> weight,
-    int64_t rows, int64_t features) {
+std::vector<uint16_t> rmsNormForwardReference(llvm::ArrayRef<uint16_t> x,
+                                              llvm::ArrayRef<uint16_t> weight,
+                                              int64_t rows, int64_t features) {
   std::vector<uint16_t> result(x.size());
   for (int64_t row = 0; row < rows; ++row) {
     float squareSum = 0.0f;
@@ -6522,21 +8578,20 @@ rmsNormBackwardReference(llvm::ArrayRef<uint16_t> x,
       innerProduct += value * upstream * scale;
       weightCotangent[feature] += upstream * value * inverseRoot;
     }
-    float derivativeScale = inverseRoot * inverseRoot * inverseRoot /
-                            static_cast<float>(features);
+    float derivativeScale =
+        inverseRoot * inverseRoot * inverseRoot / static_cast<float>(features);
     for (int64_t feature = 0; feature < features; ++feature) {
       float value = expandBf16(x[row * features + feature]);
       float upstream = expandBf16(cotangent[row * features + feature]);
       float scale = expandBf16(weight[feature]);
-      inputCotangent[row * features + feature] = roundToBf16(
-          upstream * scale * inverseRoot -
-          value * derivativeScale * innerProduct);
+      inputCotangent[row * features + feature] =
+          roundToBf16(upstream * scale * inverseRoot -
+                      value * derivativeScale * innerProduct);
     }
   }
   std::vector<uint16_t> roundedWeightCotangent(features);
   for (int64_t feature = 0; feature < features; ++feature)
-    roundedWeightCotangent[feature] =
-        roundToBf16(weightCotangent[feature]);
+    roundedWeightCotangent[feature] = roundToBf16(weightCotangent[feature]);
   return {std::move(inputCotangent), std::move(roundedWeightCotangent)};
 }
 
@@ -6566,13 +8621,11 @@ TEST(GpuTransportV2Test,
     if (index < features) {
       x[index] = roundToBf16(-0.001f + 0.002f * index / (features - 1));
     } else {
-      x[index] =
-          roundToBf16(-0.75f + 1.625f * index / (x.size() - 1));
+      x[index] = roundToBf16(-0.75f + 1.625f * index / (x.size() - 1));
     }
   }
   for (size_t index = 0; index < weight.size(); ++index)
-    weight[index] =
-        roundToBf16(0.5f + 0.75f * index / (weight.size() - 1));
+    weight[index] = roundToBf16(0.5f + 0.75f * index / (weight.size() - 1));
   for (size_t index = 0; index < cotangent.size(); ++index)
     cotangent[index] =
         roundToBf16(-0.5f + 1.125f * index / (cotangent.size() - 1));
@@ -6591,116 +8644,116 @@ TEST(GpuTransportV2Test,
       SCOPED_TRACE(policy == mlir::shuttle::NumericalPolicy::SourceOrdered
                        ? "source_ordered"
                        : "fast");
-    auto source = fixtureSource(
-        backward
-            ? "jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-"
-              "backward.mlir"
-            : "jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-"
-              "forward.mlir");
-    ASSERT_TRUE(source);
-    auto built = buildFixture(
-        *source, policy,
-        policy == mlir::shuttle::NumericalPolicy::SourceOrdered
-            ? sourceOrderedOptions
-            : fastOptions,
-        tuning);
-    ASSERT_TRUE(built);
-    auto transport =
-        mlir::shuttle::serializeGpuExecutableBundle(*built->module);
-    ASSERT_TRUE(mlir::succeeded(transport));
-    auto executable = mlir::shuttle::GpuExecutable::Load(*transport);
-    ASSERT_TRUE(executable.ok()) << executable.status();
-    llvm::SmallVector<int64_t> resultBytes;
-    for (const auto &binding : (*executable)->externalBindings())
-      if (binding.kind == mlir::shuttle::ExecutableBindingKind::Result)
-        resultBytes.push_back(binding.requiredBytes);
-    llvm::SmallVector<int64_t> expectedResultBytes;
-    if (backward)
-      expectedResultBytes.push_back(weight.size() * sizeof(uint16_t));
-    expectedResultBytes.push_back(x.size() * sizeof(uint16_t));
-    ASSERT_EQ(resultBytes, expectedResultBytes);
-    auto runner = mlir::shuttle::GpuRunner::Create(
-        *transport, &allocator, 0, stream->get(), &capability);
-    ASSERT_TRUE(runner.ok()) << runner.status();
-    EXPECT_EQ((*runner)->resources().launchCount, backward ? 3 : 1);
+      auto source = fixtureSource(
+          backward ? "jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-"
+                     "backward.mlir"
+                   : "jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-"
+                     "forward.mlir");
+      ASSERT_TRUE(source);
+      auto built =
+          buildFixture(*source, policy,
+                       policy == mlir::shuttle::NumericalPolicy::SourceOrdered
+                           ? sourceOrderedOptions
+                           : fastOptions,
+                       tuning);
+      ASSERT_TRUE(built);
+      auto transport =
+          mlir::shuttle::serializeGpuExecutableBundle(*built->module);
+      ASSERT_TRUE(mlir::succeeded(transport));
+      auto executable = mlir::shuttle::GpuExecutable::Load(*transport);
+      ASSERT_TRUE(executable.ok()) << executable.status();
+      llvm::SmallVector<int64_t> resultBytes;
+      for (const auto &binding : (*executable)->externalBindings())
+        if (binding.kind == mlir::shuttle::ExecutableBindingKind::Result)
+          resultBytes.push_back(binding.requiredBytes);
+      llvm::SmallVector<int64_t> expectedResultBytes;
+      if (backward)
+        expectedResultBytes.push_back(weight.size() * sizeof(uint16_t));
+      expectedResultBytes.push_back(x.size() * sizeof(uint16_t));
+      ASSERT_EQ(resultBytes, expectedResultBytes);
+      auto runner = mlir::shuttle::GpuRunner::Create(
+          *transport, &allocator, 0, stream->get(), &capability);
+      ASSERT_TRUE(runner.ok()) << runner.status();
+      EXPECT_EQ((*runner)->resources().launchCount, backward ? 3 : 1);
 
-    std::vector<std::vector<uint16_t>> hostOperands{x, weight};
-    if (backward)
-      hostOperands.push_back(cotangent);
-    std::vector<std::vector<uint16_t>> hostResults;
-    if (backward) {
-      hostResults.emplace_back(weight.size());
-      hostResults.emplace_back(x.size());
-    } else {
-      hostResults.emplace_back(x.size());
-    }
-    std::vector<stream_executor::DeviceAddressBase> deviceOperands;
-    std::vector<stream_executor::DeviceAddressBase> deviceResults;
-    llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> operands;
-    llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> results;
-    for (const auto &host : hostOperands) {
-      auto device = (*executor)->AllocateArray<uint16_t>(host.size());
-      ASSERT_TRUE(device);
-      ASSERT_TRUE((*executor)
-                      ->SynchronousMemcpyH2D(
-                          host.data(), host.size() * sizeof(uint16_t), &device)
-                      .ok());
-      deviceOperands.push_back(device);
-      operands.push_back(
-          {device.opaque(), static_cast<int64_t>(device.size())});
-    }
-    for (auto &host : hostResults) {
-      auto device = (*executor)->AllocateArray<uint16_t>(host.size());
-      ASSERT_TRUE(device);
-      std::vector<uint16_t> poison(host.size(), UINT16_C(0x7FC1));
-      ASSERT_TRUE((*executor)
-                      ->SynchronousMemcpyH2D(
-                          poison.data(), poison.size() * sizeof(uint16_t),
-                          &device)
-                      .ok());
-      deviceResults.push_back(device);
-      results.push_back(
-          {device.opaque(), static_cast<int64_t>(device.size())});
-    }
-    absl::Status execution = (*runner)->Execute(operands, results);
-    ASSERT_TRUE(execution.ok()) << execution;
-    ASSERT_TRUE((*runner)->AwaitCompletion().ok());
-    for (auto [index, host] : llvm::enumerate(hostResults))
-      ASSERT_TRUE((*executor)
-                      ->SynchronousMemcpyD2H(
-                          deviceResults[index], host.size() * sizeof(uint16_t),
-                          host.data())
-                      .ok());
-
-    std::vector<std::vector<uint16_t>> expected;
-    if (backward) {
-      auto [dx, dw] = rmsNormBackwardReference(x, weight, cotangent, rows,
-                                               features);
-      expected = {std::move(dw), std::move(dx)};
-    } else {
-      expected = {rmsNormForwardReference(x, weight, rows, features)};
-    }
-    ASSERT_EQ(hostResults.size(), expected.size());
-    for (auto [resultIndex, actual] : llvm::enumerate(hostResults)) {
-      ASSERT_EQ(actual.size(), expected[resultIndex].size());
-      for (auto [element, actualBits] : llvm::enumerate(actual)) {
-        EXPECT_NE(actualBits, UINT16_C(0x7FC1));
-        float actualValue = expandBf16(actualBits);
-        EXPECT_TRUE(std::isfinite(actualValue));
-        uint16_t expectedBits = expected[resultIndex][element];
-        int32_t ulpDistance =
-            std::abs(orderedBf16(actualBits) - orderedBf16(expectedBits));
-        int32_t maximumUlps =
-            policy == mlir::shuttle::NumericalPolicy::SourceOrdered ? 1 : 4;
-        EXPECT_LE(ulpDistance, maximumUlps)
-            << "result " << resultIndex << " element " << element;
+      std::vector<std::vector<uint16_t>> hostOperands{x, weight};
+      if (backward)
+        hostOperands.push_back(cotangent);
+      std::vector<std::vector<uint16_t>> hostResults;
+      if (backward) {
+        hostResults.emplace_back(weight.size());
+        hostResults.emplace_back(x.size());
+      } else {
+        hostResults.emplace_back(x.size());
       }
-    }
-    runner->reset();
-    for (auto &device : deviceResults)
-      (*executor)->Deallocate(&device);
-    for (auto &device : deviceOperands)
-      (*executor)->Deallocate(&device);
+      std::vector<stream_executor::DeviceAddressBase> deviceOperands;
+      std::vector<stream_executor::DeviceAddressBase> deviceResults;
+      llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> operands;
+      llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> results;
+      for (const auto &host : hostOperands) {
+        auto device = (*executor)->AllocateArray<uint16_t>(host.size());
+        ASSERT_TRUE(device);
+        ASSERT_TRUE((*executor)
+                        ->SynchronousMemcpyH2D(host.data(),
+                                               host.size() * sizeof(uint16_t),
+                                               &device)
+                        .ok());
+        deviceOperands.push_back(device);
+        operands.push_back(
+            {device.opaque(), static_cast<int64_t>(device.size())});
+      }
+      for (auto &host : hostResults) {
+        auto device = (*executor)->AllocateArray<uint16_t>(host.size());
+        ASSERT_TRUE(device);
+        std::vector<uint16_t> poison(host.size(), UINT16_C(0x7FC1));
+        ASSERT_TRUE((*executor)
+                        ->SynchronousMemcpyH2D(poison.data(),
+                                               poison.size() * sizeof(uint16_t),
+                                               &device)
+                        .ok());
+        deviceResults.push_back(device);
+        results.push_back(
+            {device.opaque(), static_cast<int64_t>(device.size())});
+      }
+      absl::Status execution = (*runner)->Execute(operands, results);
+      ASSERT_TRUE(execution.ok()) << execution;
+      ASSERT_TRUE((*runner)->AwaitCompletion().ok());
+      for (auto [index, host] : llvm::enumerate(hostResults))
+        ASSERT_TRUE((*executor)
+                        ->SynchronousMemcpyD2H(deviceResults[index],
+                                               host.size() * sizeof(uint16_t),
+                                               host.data())
+                        .ok());
+
+      std::vector<std::vector<uint16_t>> expected;
+      if (backward) {
+        auto [dx, dw] =
+            rmsNormBackwardReference(x, weight, cotangent, rows, features);
+        expected = {std::move(dw), std::move(dx)};
+      } else {
+        expected = {rmsNormForwardReference(x, weight, rows, features)};
+      }
+      ASSERT_EQ(hostResults.size(), expected.size());
+      for (auto [resultIndex, actual] : llvm::enumerate(hostResults)) {
+        ASSERT_EQ(actual.size(), expected[resultIndex].size());
+        for (auto [element, actualBits] : llvm::enumerate(actual)) {
+          EXPECT_NE(actualBits, UINT16_C(0x7FC1));
+          float actualValue = expandBf16(actualBits);
+          EXPECT_TRUE(std::isfinite(actualValue));
+          uint16_t expectedBits = expected[resultIndex][element];
+          int32_t ulpDistance =
+              std::abs(orderedBf16(actualBits) - orderedBf16(expectedBits));
+          int32_t maximumUlps =
+              policy == mlir::shuttle::NumericalPolicy::SourceOrdered ? 1 : 4;
+          EXPECT_LE(ulpDistance, maximumUlps)
+              << "result " << resultIndex << " element " << element;
+        }
+      }
+      runner->reset();
+      for (auto &device : deviceResults)
+        (*executor)->Deallocate(&device);
+      for (auto &device : deviceOperands)
+        (*executor)->Deallocate(&device);
     }
   }
 }
@@ -6726,20 +8779,18 @@ std::vector<uint16_t> rmsNormContractReference(
       squareLeaves = std::move(compacted);
     }
     float inverseRoot =
-        1.0f / std::sqrt(squareLeaves.front() /
-                             static_cast<float>(reduction) +
+        1.0f / std::sqrt(squareLeaves.front() / static_cast<float>(reduction) +
                          epsilon);
     for (int64_t column = 0; column < columns; ++column) {
       std::array<float, 32> accumulators{};
       for (int64_t index = 0; index < reduction; ++index) {
-        float normalized = expandBf16(roundToBf16(
-            expandBf16(x[row * reduction + index]) * inverseRoot *
-            expandBf16(weight[index])));
+        float normalized =
+            expandBf16(roundToBf16(expandBf16(x[row * reduction + index]) *
+                                   inverseRoot * expandBf16(weight[index])));
         int64_t lane = fast ? index % 32 : 0;
-        accumulators[lane] =
-            std::fma(normalized,
-                     expandBf16(projection[index * columns + column]),
-                     accumulators[lane]);
+        accumulators[lane] = std::fma(
+            normalized, expandBf16(projection[index * columns + column]),
+            accumulators[lane]);
       }
       if (fast) {
         for (int64_t offset : {16, 8, 4, 2, 1}) {
@@ -6754,8 +8805,7 @@ std::vector<uint16_t> rmsNormContractReference(
   return result;
 }
 
-TEST(GpuTransportV2Test,
-     H100RunnerMatchesIndependentRmsNormContractOracle) {
+TEST(GpuTransportV2Test, H100RunnerMatchesIndependentRmsNormContractOracle) {
   if (std::getenv("SHUTTLE_RUN_H100_NUMERICS") == nullptr)
     GTEST_SKIP() << "set SHUTTLE_RUN_H100_NUMERICS=1 on an H100 worker";
 
@@ -6786,8 +8836,7 @@ TEST(GpuTransportV2Test,
   };
   constexpr Boundary boundaries[] = {
       {"jax-0.10.1-bf16-rmsnorm_contract-5x19x7-forward.mlir", 7, 1, 0, 0},
-      {"jax-0.10.1-bf16-rmsnorm_contract-5x19x257-forward.mlir", 257, 2, 1,
-       20},
+      {"jax-0.10.1-bf16-rmsnorm_contract-5x19x257-forward.mlir", 257, 2, 1, 20},
   };
   constexpr int64_t rows = 5;
   constexpr int64_t reduction = 19;
@@ -6801,15 +8850,13 @@ TEST(GpuTransportV2Test,
     for (size_t index = 0; index < x.size(); ++index) {
       x[index] = index < reduction
                      ? roundToBf16(-0.001f + 0.002f * index / (reduction - 1))
-                     : roundToBf16(-0.75f +
-                                   1.625f * index / (x.size() - 1));
+                     : roundToBf16(-0.75f + 1.625f * index / (x.size() - 1));
     }
     for (size_t index = 0; index < weight.size(); ++index)
-      weight[index] =
-          roundToBf16(0.5f + 0.75f * index / (weight.size() - 1));
+      weight[index] = roundToBf16(0.5f + 0.75f * index / (weight.size() - 1));
     for (size_t index = 0; index < projection.size(); ++index)
-      projection[index] = roundToBf16(
-          -0.25f + 0.625f * index / (projection.size() - 1));
+      projection[index] =
+          roundToBf16(-0.25f + 0.625f * index / (projection.size() - 1));
 
     for (mlir::shuttle::NumericalPolicy policy :
          {mlir::shuttle::NumericalPolicy::SourceOrdered,
@@ -6819,18 +8866,15 @@ TEST(GpuTransportV2Test,
       std::vector<uint16_t> expected = rmsNormContractReference(
           x, weight, projection, rows, reduction, boundary.columns, fast);
       std::vector<uint16_t> withoutEpsilon = rmsNormContractReference(
-          x, weight, projection, rows, reduction, boundary.columns, fast,
-          0.0f);
-      EXPECT_TRUE(llvm::any_of(llvm::zip_equal(expected, withoutEpsilon),
-                               [](auto values) {
-                                 return std::abs(orderedBf16(std::get<0>(values)) -
-                                                 orderedBf16(std::get<1>(values))) >
-                                        4;
-                               }));
+          x, weight, projection, rows, reduction, boundary.columns, fast, 0.0f);
+      EXPECT_TRUE(llvm::any_of(
+          llvm::zip_equal(expected, withoutEpsilon), [](auto values) {
+            return std::abs(orderedBf16(std::get<0>(values)) -
+                            orderedBf16(std::get<1>(values))) > 4;
+          }));
 
       auto built = buildFixture(
-          *source, policy,
-          fast ? fastOptions : sourceOrderedOptions, tuning);
+          *source, policy, fast ? fastOptions : sourceOrderedOptions, tuning);
       ASSERT_TRUE(built);
       auto transport =
           mlir::shuttle::serializeGpuExecutableBundle(*built->module);
@@ -6849,8 +8893,7 @@ TEST(GpuTransportV2Test,
       EXPECT_EQ((*runner)->resources().launchCount, boundary.launches);
       EXPECT_EQ((*runner)->resources().temporaryAllocationCount,
                 boundary.temporaryGroups);
-      EXPECT_EQ((*runner)->resources().temporaryBytes,
-                boundary.temporaryBytes);
+      EXPECT_EQ((*runner)->resources().temporaryBytes, boundary.temporaryBytes);
 
       std::vector<std::vector<uint16_t>> hostOperands{x, weight, projection};
       std::vector<uint16_t> actual(expected.size());
@@ -6860,9 +8903,9 @@ TEST(GpuTransportV2Test,
         auto device = (*executor)->AllocateArray<uint16_t>(host.size());
         ASSERT_TRUE(device);
         ASSERT_TRUE((*executor)
-                        ->SynchronousMemcpyH2D(
-                            host.data(), host.size() * sizeof(uint16_t),
-                            &device)
+                        ->SynchronousMemcpyH2D(host.data(),
+                                               host.size() * sizeof(uint16_t),
+                                               &device)
                         .ok());
         operands.push_back(
             {device.opaque(), static_cast<int64_t>(device.size())});
@@ -6872,12 +8915,12 @@ TEST(GpuTransportV2Test,
       ASSERT_TRUE(deviceResult);
       std::vector<uint16_t> poison(actual.size(), UINT16_C(0x7FC1));
       ASSERT_TRUE((*executor)
-                      ->SynchronousMemcpyH2D(
-                          poison.data(), poison.size() * sizeof(uint16_t),
-                          &deviceResult)
+                      ->SynchronousMemcpyH2D(poison.data(),
+                                             poison.size() * sizeof(uint16_t),
+                                             &deviceResult)
                       .ok());
-      llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> results{{
-          deviceResult.opaque(), static_cast<int64_t>(deviceResult.size())}};
+      llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> results{
+          {deviceResult.opaque(), static_cast<int64_t>(deviceResult.size())}};
       ASSERT_TRUE((*runner)->Execute(operands, results).ok());
       ASSERT_TRUE((*runner)->AwaitCompletion().ok());
       ASSERT_TRUE((*executor)
@@ -6888,8 +8931,8 @@ TEST(GpuTransportV2Test,
       for (auto [element, actualBits] : llvm::enumerate(actual)) {
         EXPECT_NE(actualBits, UINT16_C(0x7FC1));
         EXPECT_TRUE(std::isfinite(expandBf16(actualBits)));
-        int32_t ulpDistance = std::abs(orderedBf16(actualBits) -
-                                       orderedBf16(expected[element]));
+        int32_t ulpDistance =
+            std::abs(orderedBf16(actualBits) - orderedBf16(expected[element]));
         EXPECT_LE(ulpDistance, fast ? 4 : 1) << "element " << element;
       }
       runner->reset();
@@ -6900,9 +8943,10 @@ TEST(GpuTransportV2Test,
   }
 }
 
-std::vector<float> causalGqaEpilogueReference(
-    llvm::ArrayRef<float> q, llvm::ArrayRef<float> k,
-    llvm::ArrayRef<float> v, bool applyEpilogue = true) {
+std::vector<float> causalGqaEpilogueReference(llvm::ArrayRef<float> q,
+                                              llvm::ArrayRef<float> k,
+                                              llvm::ArrayRef<float> v,
+                                              bool applyEpilogue = true) {
   constexpr int64_t batches = 1;
   constexpr int64_t heads = 2;
   constexpr int64_t groups = 2;
@@ -6911,22 +8955,20 @@ std::vector<float> causalGqaEpilogueReference(
   constexpr int64_t features = 8;
   constexpr int64_t values = 7;
   std::vector<float> result(batches * heads * groups * queries * values);
-  auto qIndex = [=](int64_t batch, int64_t head, int64_t group,
-                   int64_t query, int64_t feature) {
+  auto qIndex = [=](int64_t batch, int64_t head, int64_t group, int64_t query,
+                    int64_t feature) {
     return ((((batch * heads + head) * groups + group) * queries + query) *
             features) +
            feature;
   };
-  auto kIndex = [=](int64_t batch, int64_t head, int64_t key,
-                   int64_t feature) {
+  auto kIndex = [=](int64_t batch, int64_t head, int64_t key, int64_t feature) {
     return (((batch * heads + head) * keys + key) * features) + feature;
   };
-  auto vIndex = [=](int64_t batch, int64_t head, int64_t key,
-                   int64_t value) {
+  auto vIndex = [=](int64_t batch, int64_t head, int64_t key, int64_t value) {
     return (((batch * heads + head) * keys + key) * values) + value;
   };
   auto resultIndex = [=](int64_t batch, int64_t head, int64_t group,
-                        int64_t query, int64_t value) {
+                         int64_t query, int64_t value) {
     return ((((batch * heads + head) * groups + group) * queries + query) *
             values) +
            value;
@@ -6940,10 +8982,10 @@ std::vector<float> causalGqaEpilogueReference(
           for (int64_t key = 0; key <= query; ++key) {
             double score = 0.0;
             for (int64_t feature = 0; feature < features; ++feature)
-              score += static_cast<double>(
-                           q[qIndex(batch, head, group, query, feature)]) *
-                       static_cast<double>(
-                           k[kIndex(batch, head, key, feature)]);
+              score +=
+                  static_cast<double>(
+                      q[qIndex(batch, head, group, query, feature)]) *
+                  static_cast<double>(k[kIndex(batch, head, key, feature)]);
             scores[key] = score * 0.125;
             maximum = std::max(maximum, scores[key]);
           }
@@ -6969,9 +9011,8 @@ std::vector<float> causalGqaEpilogueReference(
 }
 
 llvm::json::Object fastAttentionFailureDiagnostic(
-    llvm::ArrayRef<float> q, llvm::ArrayRef<float> k,
-    llvm::ArrayRef<float> v, llvm::ArrayRef<float> actual,
-    llvm::ArrayRef<float> reference) {
+    llvm::ArrayRef<float> q, llvm::ArrayRef<float> k, llvm::ArrayRef<float> v,
+    llvm::ArrayRef<float> actual, llvm::ArrayRef<float> reference) {
   constexpr int64_t groups = 2;
   constexpr int64_t queries = 17;
   constexpr int64_t keys = 17;
@@ -7033,14 +9074,14 @@ llvm::json::Object fastAttentionFailureDiagnostic(
           {"reference", reference[index]},
           {"absolute_error", diagnosticNumber(absoluteError)}});
     }
-    rows.push_back(llvm::json::Object{
-        {"hkv", head},
-        {"group", group},
-        {"query", query},
-        {"expected_m", maximum},
-        {"expected_l", denominator},
-        {"expected_o", std::move(numeratorComponents)},
-        {"output", std::move(outputComponents)}});
+    rows.push_back(
+        llvm::json::Object{{"hkv", head},
+                           {"group", group},
+                           {"query", query},
+                           {"expected_m", maximum},
+                           {"expected_l", denominator},
+                           {"expected_o", std::move(numeratorComponents)},
+                           {"output", std::move(outputComponents)}});
   }
   return llvm::json::Object{{"rows", std::move(rows)}};
 }
@@ -7080,8 +9121,8 @@ TEST(GpuTransportV2Test, H100RunnerMatchesIndependentFastAttentionOracle) {
   const auto &capability =
       (*executor)->GetDeviceDescription().gpu_compute_capability();
 
-  auto source = fixtureSource(
-      "jax-0.10.1-f32-causal-gqa-online-output-epilogue.mlir");
+  auto source =
+      fixtureSource("jax-0.10.1-f32-causal-gqa-online-output-epilogue.mlir");
   ASSERT_TRUE(source);
   constexpr llvm::StringLiteral options =
       R"json({"execution_mode":"gpu_executable_bundle","numerics":"fast","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
@@ -7094,8 +9135,8 @@ TEST(GpuTransportV2Test, H100RunnerMatchesIndependentFastAttentionOracle) {
   ASSERT_TRUE(mlir::succeeded(transport));
   auto executable = mlir::shuttle::GpuExecutable::Load(*transport);
   ASSERT_TRUE(executable.ok()) << executable.status();
-  auto runner = mlir::shuttle::GpuRunner::Create(
-      *transport, &allocator, 0, stream->get(), &capability);
+  auto runner = mlir::shuttle::GpuRunner::Create(*transport, &allocator, 0,
+                                                 stream->get(), &capability);
   ASSERT_TRUE(runner.ok()) << runner.status();
 
   std::vector<float> q(1 * 2 * 2 * 17 * 8);
@@ -7118,8 +9159,7 @@ TEST(GpuTransportV2Test, H100RunnerMatchesIndependentFastAttentionOracle) {
                     ->SynchronousMemcpyH2D(host.data(),
                                            host.size() * sizeof(float), &device)
                     .ok());
-    operands.push_back(
-        {device.opaque(), static_cast<int64_t>(device.size())});
+    operands.push_back({device.opaque(), static_cast<int64_t>(device.size())});
     deviceOperands.push_back(device);
   }
   std::vector<float> actual(expected.size(),
@@ -7131,8 +9171,8 @@ TEST(GpuTransportV2Test, H100RunnerMatchesIndependentFastAttentionOracle) {
                                          actual.size() * sizeof(float),
                                          &deviceResult)
                   .ok());
-  llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> results{{
-      deviceResult.opaque(), static_cast<int64_t>(deviceResult.size())}};
+  llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> results{
+      {deviceResult.opaque(), static_cast<int64_t>(deviceResult.size())}};
   ASSERT_TRUE((*runner)->Execute(operands, results).ok());
   ASSERT_TRUE((*runner)->AwaitCompletion().ok());
   ASSERT_TRUE((*executor)
@@ -7157,11 +9197,10 @@ TEST(GpuTransportV2Test, H100RunnerMatchesIndependentFastAttentionOracle) {
       meanAbsoluteError > 5.0e-4) {
     llvm::json::Object diagnostic =
         fastAttentionFailureDiagnostic(q, k, v, actual, expected);
-    std::cerr << "FAST_ATTENTION_DIAGNOSTIC="
-              << llvm::formatv("{0}", llvm::json::Value(
-                                         std::move(diagnostic)))
-                     .str()
-              << '\n';
+    std::cerr
+        << "FAST_ATTENTION_DIAGNOSTIC="
+        << llvm::formatv("{0}", llvm::json::Value(std::move(diagnostic))).str()
+        << '\n';
   }
   EXPECT_TRUE(allFinite);
   EXPECT_LE(maximumAbsoluteError, 3.0e-3);
@@ -7172,8 +9211,7 @@ TEST(GpuTransportV2Test, H100RunnerMatchesIndependentFastAttentionOracle) {
     (*executor)->Deallocate(&device);
 }
 
-TEST(GpuTransportV2Test,
-     H100RunnerMatchesIndependentBf16FastAttentionOracle) {
+TEST(GpuTransportV2Test, H100RunnerMatchesIndependentBf16FastAttentionOracle) {
   if (std::getenv("SHUTTLE_RUN_H100_ATTENTION_NUMERICS") == nullptr)
     GTEST_SKIP() << "set SHUTTLE_RUN_H100_ATTENTION_NUMERICS=1 on an H100";
   auto platform = stream_executor::PlatformManager::PlatformWithName("CUDA");
@@ -7199,22 +9237,22 @@ TEST(GpuTransportV2Test,
   ASSERT_TRUE(built);
   auto transport = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
   ASSERT_TRUE(mlir::succeeded(transport));
-  auto runner = mlir::shuttle::GpuRunner::Create(
-      *transport, &allocator, 0, stream->get(), &capability);
+  auto runner = mlir::shuttle::GpuRunner::Create(*transport, &allocator, 0,
+                                                 stream->get(), &capability);
   ASSERT_TRUE(runner.ok()) << runner.status();
 
   std::vector<uint16_t> q(1 * 2 * 2 * 17 * 8);
   std::vector<uint16_t> k(1 * 2 * 17 * 8);
   std::vector<uint16_t> v(1 * 2 * 17 * 7);
   for (size_t index = 0; index < q.size(); ++index)
-    q[index] = roundToBf16(
-        -0.7f + static_cast<float>((index * 17) % 101) / 71.0f);
+    q[index] =
+        roundToBf16(-0.7f + static_cast<float>((index * 17) % 101) / 71.0f);
   for (size_t index = 0; index < k.size(); ++index)
-    k[index] = roundToBf16(
-        -0.6f + static_cast<float>((index * 13) % 97) / 67.0f);
+    k[index] =
+        roundToBf16(-0.6f + static_cast<float>((index * 13) % 97) / 67.0f);
   for (size_t index = 0; index < v.size(); ++index)
-    v[index] = roundToBf16(
-        -0.9f + static_cast<float>((index * 19) % 109) / 59.0f);
+    v[index] =
+        roundToBf16(-0.9f + static_cast<float>((index * 19) % 109) / 59.0f);
   std::vector<float> qFloat(q.size());
   std::vector<float> kFloat(k.size());
   std::vector<float> vFloat(v.size());
@@ -7224,9 +9262,8 @@ TEST(GpuTransportV2Test,
   std::vector<float> expected =
       causalGqaEpilogueReference(qFloat, kFloat, vFloat,
                                  /*applyEpilogue=*/false);
-  llvm::transform(expected, expected.begin(), [](float value) {
-    return expandBf16(roundToBf16(value));
-  });
+  llvm::transform(expected, expected.begin(),
+                  [](float value) { return expandBf16(roundToBf16(value)); });
 
   std::vector<std::vector<uint16_t>> hostOperands{q, k, v};
   std::vector<stream_executor::DeviceAddressBase> deviceOperands;
@@ -7235,12 +9272,10 @@ TEST(GpuTransportV2Test,
     auto device = (*executor)->AllocateArray<uint16_t>(host.size());
     ASSERT_TRUE(device);
     ASSERT_TRUE((*executor)
-                    ->SynchronousMemcpyH2D(host.data(),
-                                           host.size() * sizeof(uint16_t),
-                                           &device)
+                    ->SynchronousMemcpyH2D(
+                        host.data(), host.size() * sizeof(uint16_t), &device)
                     .ok());
-    operands.push_back(
-        {device.opaque(), static_cast<int64_t>(device.size())});
+    operands.push_back({device.opaque(), static_cast<int64_t>(device.size())});
     deviceOperands.push_back(device);
   }
   std::vector<uint16_t> actual(expected.size(), 0x7FC1);
@@ -7251,8 +9286,8 @@ TEST(GpuTransportV2Test,
                                          actual.size() * sizeof(uint16_t),
                                          &deviceResult)
                   .ok());
-  llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> results{{
-      deviceResult.opaque(), static_cast<int64_t>(deviceResult.size())}};
+  llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> results{
+      {deviceResult.opaque(), static_cast<int64_t>(deviceResult.size())}};
   ASSERT_TRUE((*runner)->Execute(operands, results).ok());
   ASSERT_TRUE((*runner)->AwaitCompletion().ok());
   ASSERT_TRUE((*executor)
@@ -7263,8 +9298,8 @@ TEST(GpuTransportV2Test,
   double maximumAbsoluteError = 0.0;
   double meanAbsoluteError = 0.0;
   for (auto [index, bits] : llvm::enumerate(actual)) {
-    const double error = std::abs(
-        static_cast<double>(expandBf16(bits)) - expected[index]);
+    const double error =
+        std::abs(static_cast<double>(expandBf16(bits)) - expected[index]);
     maximumAbsoluteError = std::max(maximumAbsoluteError, error);
     meanAbsoluteError += error;
   }
@@ -7305,8 +9340,8 @@ TEST(GpuTransportV2Test,
   ASSERT_TRUE(built);
   auto transport = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
   ASSERT_TRUE(mlir::succeeded(transport));
-  auto runner = mlir::shuttle::GpuRunner::Create(
-      *transport, &allocator, 0, stream->get(), &capability);
+  auto runner = mlir::shuttle::GpuRunner::Create(*transport, &allocator, 0,
+                                                 stream->get(), &capability);
   ASSERT_TRUE(runner.ok()) << runner.status();
 
   constexpr int64_t batches = 1;
@@ -7321,8 +9356,7 @@ TEST(GpuTransportV2Test,
   std::vector<uint16_t> v(batches * heads * sequence * dimension);
   auto queryIndex = [=](int64_t head, int64_t group, int64_t query,
                         int64_t feature) {
-    return (((head * groups + group) * sequence + query) * dimension) +
-           feature;
+    return (((head * groups + group) * sequence + query) * dimension) + feature;
   };
   auto keyIndex = [=](int64_t head, int64_t key, int64_t feature) {
     return (head * sequence + key) * dimension + feature;
@@ -7334,24 +9368,22 @@ TEST(GpuTransportV2Test,
     for (int64_t key = 0; key < sequence; ++key) {
       for (int64_t feature = 0; feature < dimension; ++feature)
         k[keyIndex(head, key, feature)] = roundToBf16(
-            static_cast<float>((head * 11 + key * 7 + feature * 13) % 29 -
-                               14) /
+            static_cast<float>((head * 11 + key * 7 + feature * 13) % 29 - 14) /
             16.0f);
       for (int64_t value = 0; value < dimension; ++value)
-        v[valueIndex(head, key, value)] = roundToBf16(
-            -0.75f + static_cast<float>((head * 29 + key * 17 + value * 7) %
-                                        127) /
-                         79.0f);
+        v[valueIndex(head, key, value)] =
+            roundToBf16(-0.75f + static_cast<float>(
+                                     (head * 29 + key * 17 + value * 7) % 127) /
+                                     79.0f);
     }
   for (int64_t head = 0; head < heads; ++head)
     for (int64_t group = 0; group < groups; ++group)
       for (int64_t query = 0; query < sequence; ++query)
         for (int64_t feature = 0; feature < dimension; ++feature)
           q[queryIndex(head, group, query, feature)] = roundToBf16(
-              static_cast<float>((head * 17 + group * 19 + query * 5 +
-                                  feature * 11) %
-                                     31 -
-                                 15) /
+              static_cast<float>(
+                  (head * 17 + group * 19 + query * 5 + feature * 11) % 31 -
+                  15) /
               16.0f);
 
   std::vector<std::vector<uint16_t>> hostOperands{q, k, v};
@@ -7364,8 +9396,7 @@ TEST(GpuTransportV2Test,
                     ->SynchronousMemcpyH2D(
                         host.data(), host.size() * sizeof(uint16_t), &device)
                     .ok());
-    operands.push_back(
-        {device.opaque(), static_cast<int64_t>(device.size())});
+    operands.push_back({device.opaque(), static_cast<int64_t>(device.size())});
     deviceOperands.push_back(device);
   }
   std::vector<uint16_t> actual(q.size(), UINT16_C(0x7FC1));
@@ -7376,8 +9407,8 @@ TEST(GpuTransportV2Test,
                                          actual.size() * sizeof(uint16_t),
                                          &deviceResult)
                   .ok());
-  llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> results{{
-      deviceResult.opaque(), static_cast<int64_t>(deviceResult.size())}};
+  llvm::SmallVector<mlir::shuttle::GpuRunnerBuffer> results{
+      {deviceResult.opaque(), static_cast<int64_t>(deviceResult.size())}};
 
   for (int64_t iteration = 0; iteration < warmupIterations; ++iteration) {
     absl::Status status = (*runner)->Execute(operands, results);
@@ -7433,12 +9464,11 @@ TEST(GpuTransportV2Test,
         for (auto [slot, value] : llvm::enumerate(heldoutValues)) {
           const size_t index = resultIndex(head, group, query, value);
           ASSERT_NE(actual[index], UINT16_C(0x7FC1))
-              << "head=" << head << " group=" << group
-              << " query=" << query << " value=" << value
-              << " index=" << index;
+              << "head=" << head << " group=" << group << " query=" << query
+              << " value=" << value << " index=" << index;
           const double actualValue = expandBf16(actual[index]);
-          const double expectedValue = expandBf16(roundToBf16(
-              static_cast<float>(numerators[slot] / denominator)));
+          const double expectedValue = expandBf16(
+              roundToBf16(static_cast<float>(numerators[slot] / denominator)));
           const double error = std::abs(actualValue - expectedValue);
           maximumAbsoluteError = std::max(maximumAbsoluteError, error);
           meanAbsoluteError += error;
@@ -7483,8 +9513,7 @@ TEST(GpuTransportV2Test,
 }
 
 TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
-  const char *runPerformance =
-      std::getenv("SHUTTLE_RUN_H100_PERFORMANCE");
+  const char *runPerformance = std::getenv("SHUTTLE_RUN_H100_PERFORMANCE");
   if (runPerformance == nullptr || llvm::StringRef(runPerformance) != "1")
     GTEST_SKIP() << "set SHUTTLE_RUN_H100_PERFORMANCE=1 on an H100 worker";
   const char *reportPath = std::getenv("SHUTTLE_H100_PERF_REPORT");
@@ -7532,16 +9561,48 @@ TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
   const PerformanceSpec specs[] = {
       {"rmsnorm_forward",
        "jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-forward.mlir",
-       {2, 7, 19}, false, 0, 1, 3, 2, 1, 0, 0},
+       {2, 7, 19},
+       false,
+       0,
+       1,
+       3,
+       2,
+       1,
+       0,
+       0},
       {"rmsnorm_backward",
        "jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-backward.mlir",
-       {2, 7, 19}, true, 0, 3, 6, 3, 2, 1, 56},
+       {2, 7, 19},
+       true,
+       0,
+       3,
+       6,
+       3,
+       2,
+       1,
+       56},
       {"rmsnorm_contract_inline",
        "jax-0.10.1-bf16-rmsnorm_contract-5x19x7-forward.mlir",
-       {5, 19, 7}, false, 7, 1, 4, 3, 1, 0, 0},
+       {5, 19, 7},
+       false,
+       7,
+       1,
+       4,
+       3,
+       1,
+       0,
+       0},
       {"rmsnorm_contract_compact",
        "jax-0.10.1-bf16-rmsnorm_contract-5x19x257-forward.mlir",
-       {5, 19, 257}, false, 257, 2, 5, 3, 1, 1, 20},
+       {5, 19, 257},
+       false,
+       257,
+       2,
+       5,
+       3,
+       1,
+       1,
+       20},
   };
 
   struct PerformanceCell {
@@ -7568,11 +9629,10 @@ TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
   std::vector<uint16_t> normWeight(normFeatures);
   std::vector<uint16_t> normCotangent(normRows * normFeatures);
   for (size_t index = 0; index < normX.size(); ++index) {
-    normX[index] = index < normFeatures
-                       ? roundToBf16(-0.001f +
-                                     0.002f * index / (normFeatures - 1))
-                       : roundToBf16(-0.75f +
-                                     1.625f * index / (normX.size() - 1));
+    normX[index] =
+        index < normFeatures
+            ? roundToBf16(-0.001f + 0.002f * index / (normFeatures - 1))
+            : roundToBf16(-0.75f + 1.625f * index / (normX.size() - 1));
     normCotangent[index] =
         roundToBf16(-0.5f + 1.125f * index / (normX.size() - 1));
   }
@@ -7590,12 +9650,12 @@ TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
       auto source = fixtureSource(spec.fixture);
       ASSERT_TRUE(source);
       cell.fixture = *source;
-      auto built = buildFixture(
-          *source, policy,
-          policy == mlir::shuttle::NumericalPolicy::SourceOrdered
-              ? sourceOrderedOptions
-              : fastOptions,
-          tuning);
+      auto built =
+          buildFixture(*source, policy,
+                       policy == mlir::shuttle::NumericalPolicy::SourceOrdered
+                           ? sourceOrderedOptions
+                           : fastOptions,
+                       tuning);
       ASSERT_TRUE(built);
       auto serialized =
           mlir::shuttle::serializeGpuExecutableBundle(*built->module);
@@ -7635,17 +9695,16 @@ TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
         std::vector<uint16_t> weight(reduction);
         std::vector<uint16_t> projection(reduction * spec.columns);
         for (size_t index = 0; index < x.size(); ++index)
-          x[index] = index < reduction
-                         ? roundToBf16(-0.001f +
-                                       0.002f * index / (reduction - 1))
-                         : roundToBf16(-0.75f +
-                                       1.625f * index / (x.size() - 1));
+          x[index] =
+              index < reduction
+                  ? roundToBf16(-0.001f + 0.002f * index / (reduction - 1))
+                  : roundToBf16(-0.75f + 1.625f * index / (x.size() - 1));
         for (size_t index = 0; index < weight.size(); ++index)
           weight[index] =
               roundToBf16(0.5f + 0.75f * index / (weight.size() - 1));
         for (size_t index = 0; index < projection.size(); ++index)
-          projection[index] = roundToBf16(
-              -0.25f + 0.625f * index / (projection.size() - 1));
+          projection[index] =
+              roundToBf16(-0.25f + 0.625f * index / (projection.size() - 1));
         cell.hostOperands = {x, weight, projection};
         cell.expected = {rmsNormContractReference(
             x, weight, projection, rows, reduction, spec.columns,
@@ -7656,9 +9715,10 @@ TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
         if (binding.kind != mlir::shuttle::ExecutableBindingKind::Result)
           continue;
         ASSERT_LT(resultBindingIndex, cell.expected.size());
-        EXPECT_EQ(binding.requiredBytes,
-                  static_cast<int64_t>(cell.expected[resultBindingIndex].size() *
-                                       sizeof(uint16_t)));
+        EXPECT_EQ(
+            binding.requiredBytes,
+            static_cast<int64_t>(cell.expected[resultBindingIndex].size() *
+                                 sizeof(uint16_t)));
         ++resultBindingIndex;
       }
       ASSERT_EQ(resultBindingIndex, cell.expected.size());
@@ -7668,9 +9728,9 @@ TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
         auto device = (*executor)->AllocateArray<uint16_t>(host.size());
         ASSERT_TRUE(device);
         ASSERT_TRUE((*executor)
-                        ->SynchronousMemcpyH2D(
-                            host.data(), host.size() * sizeof(uint16_t),
-                            &device)
+                        ->SynchronousMemcpyH2D(host.data(),
+                                               host.size() * sizeof(uint16_t),
+                                               &device)
                         .ok());
         cell.operandBindings.push_back(
             {device.opaque(), static_cast<int64_t>(device.size())});
@@ -7681,9 +9741,9 @@ TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
         ASSERT_TRUE(device);
         std::vector<uint16_t> poison(actual.size(), UINT16_C(0x7FC1));
         ASSERT_TRUE((*executor)
-                        ->SynchronousMemcpyH2D(
-                            poison.data(), poison.size() * sizeof(uint16_t),
-                            &device)
+                        ->SynchronousMemcpyH2D(poison.data(),
+                                               poison.size() * sizeof(uint16_t),
+                                               &device)
                         .ok());
         cell.resultBindings.push_back(
             {device.opaque(), static_cast<int64_t>(device.size())});
@@ -7705,7 +9765,8 @@ TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
   }
   for (int64_t round = 0; round < measuredIterations; ++round) {
     for (size_t position = 0; position < cells.size(); ++position) {
-      size_t cellIndex = round % 2 == 0 ? position : cells.size() - 1 - position;
+      size_t cellIndex =
+          round % 2 == 0 ? position : cells.size() - 1 - position;
       PerformanceCell &cell = cells[cellIndex];
       auto elapsed =
           cell.runner->ExecuteTimed(cell.operandBindings, cell.resultBindings);
@@ -7715,17 +9776,16 @@ TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
   }
   for (PerformanceCell &cell : cells)
     for (int64_t iteration = 0; iteration < warmupIterations; ++iteration)
-      ASSERT_TRUE(cell.runner
-                      ->Execute(cell.operandBindings, cell.resultBindings)
-                      .ok());
+      ASSERT_TRUE(
+          cell.runner->Execute(cell.operandBindings, cell.resultBindings).ok());
   for (int64_t round = 0; round < measuredIterations; ++round) {
     for (size_t position = 0; position < cells.size(); ++position) {
-      size_t cellIndex = round % 2 == 0 ? position : cells.size() - 1 - position;
+      size_t cellIndex =
+          round % 2 == 0 ? position : cells.size() - 1 - position;
       PerformanceCell &cell = cells[cellIndex];
       auto start = std::chrono::steady_clock::now();
-      ASSERT_TRUE(cell.runner
-                      ->Execute(cell.operandBindings, cell.resultBindings)
-                      .ok());
+      ASSERT_TRUE(
+          cell.runner->Execute(cell.operandBindings, cell.resultBindings).ok());
       auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
                          std::chrono::steady_clock::now() - start)
                          .count();
@@ -7745,9 +9805,9 @@ TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
     llvm::json::Array outputDigests;
     for (auto [resultIndex, actual] : llvm::enumerate(cell.actual)) {
       ASSERT_TRUE((*executor)
-                      ->SynchronousMemcpyD2H(
-                          cell.deviceResults[resultIndex],
-                          actual.size() * sizeof(uint16_t), actual.data())
+                      ->SynchronousMemcpyD2H(cell.deviceResults[resultIndex],
+                                             actual.size() * sizeof(uint16_t),
+                                             actual.data())
                       .ok());
       ASSERT_EQ(actual.size(), cell.expected[resultIndex].size());
       for (auto [element, actualBits] : llvm::enumerate(actual)) {
@@ -7755,13 +9815,12 @@ TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
         float actualValue = expandBf16(actualBits);
         float expectedValue = expandBf16(cell.expected[resultIndex][element]);
         EXPECT_TRUE(std::isfinite(actualValue));
-        maximumAbsoluteError =
-            std::max(maximumAbsoluteError,
-                     std::abs(actualValue - expectedValue));
-        maximumUlp =
-            std::max(maximumUlp,
-                     std::abs(orderedBf16(actualBits) -
-                              orderedBf16(cell.expected[resultIndex][element])));
+        maximumAbsoluteError = std::max(maximumAbsoluteError,
+                                        std::abs(actualValue - expectedValue));
+        maximumUlp = std::max(
+            maximumUlp,
+            std::abs(orderedBf16(actualBits) -
+                     orderedBf16(cell.expected[resultIndex][element])));
       }
       auto bytes = llvm::ArrayRef<uint8_t>(
           reinterpret_cast<const uint8_t *>(actual.data()),
@@ -7769,9 +9828,8 @@ TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
       outputDigests.push_back(sha256(bytes));
     }
     EXPECT_LE(maximumUlp,
-              cell.policy == mlir::shuttle::NumericalPolicy::SourceOrdered
-                  ? 1
-                  : 4);
+              cell.policy == mlir::shuttle::NumericalPolicy::SourceOrdered ? 1
+                                                                           : 4);
 
     llvm::json::Array samples;
     llvm::json::Array hostSamples;
@@ -7786,14 +9844,12 @@ TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
       hostSamples.push_back(cell.hostSamples[round]);
       rounds.push_back(round);
       hostRounds.push_back(round);
-      positions.push_back(round % 2 == 0
-                              ? static_cast<int64_t>(cellIndex)
-                              : static_cast<int64_t>(cells.size() - 1 -
-                                                     cellIndex));
-      hostPositions.push_back(round % 2 == 0
-                                  ? static_cast<int64_t>(cellIndex)
-                                  : static_cast<int64_t>(cells.size() - 1 -
-                                                         cellIndex));
+      positions.push_back(
+          round % 2 == 0 ? static_cast<int64_t>(cellIndex)
+                         : static_cast<int64_t>(cells.size() - 1 - cellIndex));
+      hostPositions.push_back(
+          round % 2 == 0 ? static_cast<int64_t>(cellIndex)
+                         : static_cast<int64_t>(cells.size() - 1 - cellIndex));
     }
     llvm::json::Array shape;
     for (int64_t extent : cell.spec->shape)
@@ -7807,8 +9863,7 @@ TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
         {"slot_count", cell.resources.slotCount},
         {"external_operand_count", cell.resources.externalOperandCount},
         {"external_result_count", cell.resources.externalResultCount},
-        {"temporary_allocation_count",
-         cell.resources.temporaryAllocationCount},
+        {"temporary_allocation_count", cell.resources.temporaryAllocationCount},
         {"temporary_bytes", cell.resources.temporaryBytes},
     };
     llvm::json::Object output{
@@ -7820,10 +9875,10 @@ TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
         {"workload_digest",
          performanceWorkloadDigest(cell.spec->caseName, policyName,
                                    cell.spec->shape, cell.hostOperands)},
-        {"fixture_digest", sha256(llvm::ArrayRef<uint8_t>(
-                               reinterpret_cast<const uint8_t *>(
-                                   cell.fixture.data()),
-                               cell.fixture.size()))},
+        {"fixture_digest",
+         sha256(llvm::ArrayRef<uint8_t>(
+             reinterpret_cast<const uint8_t *>(cell.fixture.data()),
+             cell.fixture.size()))},
         {"executable_digest",
          mlir::shuttle::gpuExecutableBundleDigest(cell.transport)},
         {"ptx_digests", std::move(ptxDigests)},
@@ -7860,18 +9915,16 @@ TEST(GpuTransportV2Test, H100RunnerWritesCounterbalancedPerformanceReport) {
                 reinterpret_cast<const uint8_t *>(options.data()),
                 options.size()))}}},
       {"protocol",
-       llvm::json::Object{
-           {"clock", "cuda_event"},
-           {"counterbalance", "forward_reverse_alternating"},
-           {"warmup_iterations", warmupIterations},
-           {"measured_iterations", measuredIterations}}},
+       llvm::json::Object{{"clock", "cuda_event"},
+                          {"counterbalance", "forward_reverse_alternating"},
+                          {"warmup_iterations", warmupIterations},
+                          {"measured_iterations", measuredIterations}}},
       {"host_protocol",
-       llvm::json::Object{
-           {"mode", "exploratory_host_v1"},
-           {"clock", "host_block_until_ready"},
-           {"counterbalance", "forward_reverse_alternating"},
-           {"warmup_iterations", warmupIterations},
-           {"measured_iterations", measuredIterations}}},
+       llvm::json::Object{{"mode", "exploratory_host_v1"},
+                          {"clock", "host_block_until_ready"},
+                          {"counterbalance", "forward_reverse_alternating"},
+                          {"warmup_iterations", warmupIterations},
+                          {"measured_iterations", measuredIterations}}},
       {"cells", std::move(reportCells)},
   };
   std::ofstream report(reportPath, std::ios::binary | std::ios::trunc);
@@ -7923,16 +9976,15 @@ TEST(GpuTransportV2Test,
           : "jax-0.10.1-bf16-projected_parameter_broadcast-2048x4096-"
             "composed.mlir";
   auto source = fixtureSource(fixture);
-  ASSERT_TRUE(source)
-      << "representative fixture unavailable: " << fixture.str()
-      << " RUNFILES_DIR="
-      << (std::getenv("RUNFILES_DIR") == nullptr
-              ? "<unset>"
-              : std::getenv("RUNFILES_DIR"))
-      << " TEST_SRCDIR="
-      << (std::getenv("TEST_SRCDIR") == nullptr
-              ? "<unset>"
-              : std::getenv("TEST_SRCDIR"));
+  ASSERT_TRUE(source) << "representative fixture unavailable: " << fixture.str()
+                      << " RUNFILES_DIR="
+                      << (std::getenv("RUNFILES_DIR") == nullptr
+                              ? "<unset>"
+                              : std::getenv("RUNFILES_DIR"))
+                      << " TEST_SRCDIR="
+                      << (std::getenv("TEST_SRCDIR") == nullptr
+                              ? "<unset>"
+                              : std::getenv("TEST_SRCDIR"));
   constexpr llvm::StringLiteral sourceOrderedOptions =
       R"json({"execution_mode":"gpu_executable_bundle","numerics":"source_ordered","pipeline_abi_version":22,"schema_version":1,"tuning":{"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]}})json";
   constexpr llvm::StringLiteral fastOptions =
@@ -8446,8 +10498,8 @@ TEST(GpuTransportV2Test,
 
 TEST(GpuTransportV2Test,
      Abi17RankNFoldUsesUnchangedFfiSchemasAndRankFiveLaunches) {
-  auto source = fixtureSource(
-      "jax-0.10.1-bf16-rank_n_fold_map-3x2x4x7x269-forward.mlir");
+  auto source =
+      fixtureSource("jax-0.10.1-bf16-rank_n_fold_map-3x2x4x7x269-forward.mlir");
   ASSERT_TRUE(source);
   auto built = buildGpuContractFixture(
       *source, mlir::shuttle::NumericalPolicy::SourceOrdered);
@@ -8586,9 +10638,8 @@ TEST(GpuTransportV2Test,
 
 TEST(GpuTransportV2Test,
      Abi20ProjectedParameterUsesUnchangedFfiSchemasAndThreeBindings) {
-  auto source = fixtureSource(
-      "jax-0.10.1-bf16-projected_parameter_broadcast-"
-      "3x2x5x11x263-forward.mlir");
+  auto source = fixtureSource("jax-0.10.1-bf16-projected_parameter_broadcast-"
+                              "3x2x5x11x263-forward.mlir");
   ASSERT_TRUE(source);
   auto built = buildGpuContractFixture(
       *source, mlir::shuttle::NumericalPolicy::SourceOrdered);
@@ -8657,12 +10708,11 @@ TEST(GpuTransportV2Test,
 
 TEST(GpuTransportV2Test,
      Abi21FullPrefixFoldUsesUnchangedFfiSchemasAndFiveBindings) {
-  auto source = fixtureSource(
-      "jax-0.10.1-bf16-projected_parameter_broadcast-"
-      "3x2x5x11x263-backward.mlir");
+  auto source = fixtureSource("jax-0.10.1-bf16-projected_parameter_broadcast-"
+                              "3x2x5x11x263-backward.mlir");
   ASSERT_TRUE(source);
-  auto built = buildGpuContractFixture(
-      *source, mlir::shuttle::NumericalPolicy::Fast);
+  auto built =
+      buildGpuContractFixture(*source, mlir::shuttle::NumericalPolicy::Fast);
   ASSERT_TRUE(built);
   auto transport = mlir::shuttle::serializeGpuExecutableBundle(*built->module);
   ASSERT_TRUE(mlir::succeeded(transport));

@@ -25,9 +25,9 @@
 // AXIS: Fold schedule kind must match its reduction axis
 // TILE: schedule geometry must equal the SIMT32 derivation
 // RESOURCE: schedule geometry must equal the SIMT32 derivation
-// DEPENDENCY: schedule dependencies must equal the materialization task
+// DEPENDENCY: must uniquely eventize one ordered schedule-task dependency
 // DELETE: invalid schedule lifetime interval
-// REORDER: schedule dependencies must equal the materialization task
+// REORDER: must uniquely eventize one ordered schedule-task dependency
 // SOURCE: requires one valid schedule per materialization plan
 // BINDING: schedule source tasks must be unique structural ordinals
 // TYPE: schedule buffer type and lifetime must equal materialization

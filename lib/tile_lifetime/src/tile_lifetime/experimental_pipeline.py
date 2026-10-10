@@ -12,7 +12,7 @@ import numpy as np
 from shuttle.experimental.stablehlo_import import import_stablehlo
 from shuttle.ir import DType
 from tile_lifetime.compiler import RowScalePlacement
-from tile_lifetime.dense_region import compile_dense_transformer_region
+from tile_lifetime.dense_region import compile_reference_dense_transformer_region
 from tile_lifetime.experimental_msa_recovery import (
     NaturalProjectedRoutedAttentionCompilation,
     RecoveredProjectedRoutedAttentionProgram,
@@ -30,17 +30,17 @@ from tile_lifetime.experimental_semantic_recovery import (
     recover_dense_transformer_region,
 )
 from tile_lifetime.ir import ScaledDotProductAttentionOp
-from tile_lifetime.plan import NumericalPolicy, RegionPlan, SemanticErasureReport, SemanticLoweringStep
+from tile_lifetime.normalized_exp_contract_region import NormalizedExpContractProgram
+from tile_lifetime.plan import NumericalPolicy, ReferenceRegionPlan, SemanticErasureReport, SemanticLoweringStep
 from tile_lifetime.routed_attention_plan import RoutedAttentionPlanConfig
 from tile_lifetime.semantic_erasure import (
     ErasedTensorProgram,
     SemanticErasureError,
     build_tensor_erasure_report,
     validate_erased_tensor_program,
-    validate_plan_semantic_erasure,
+    validate_reference_plan_semantic_erasure,
 )
 from tile_lifetime.streaming_attention import (
-    StreamingAttentionProgram,
     StreamingTileSchedule,
     streaming_attention_from_semantic_operation,
 )
@@ -72,7 +72,7 @@ class FrontendProvenance:
 class ExperimentalWholePatternStreamingAttentionCompilation:
     """Historical named-attention recovery retained for bounded comparisons."""
 
-    program: StreamingAttentionProgram
+    program: NormalizedExpContractProgram[StreamingTileSchedule]
     provenance: FrontendProvenance
     semantic_erasure_report: SemanticErasureReport
 
@@ -81,7 +81,7 @@ class ExperimentalWholePatternStreamingAttentionCompilation:
 class StableHLODenseCompilation:
     """Dense plan with source evidence and an experimental classification."""
 
-    plan: RegionPlan
+    plan: ReferenceRegionPlan
     provenance: FrontendProvenance
     status: FrontendCompilationStatus
 
@@ -212,7 +212,7 @@ def compile_experimental_stablehlo_dense_transformer_region(
         stablehlo_graph,
         gemm_accumulation_dtype=gemm_accumulation_dtype,
     )
-    plan = compile_dense_transformer_region(
+    plan = compile_reference_dense_transformer_region(
         recovered.graph,
         numerical_policy=numerical_policy,
         rms_scale_placement=rms_scale_placement,
@@ -236,7 +236,7 @@ def validate_experimental_stablehlo_dense_compilation(compilation: StableHLODens
         raise SemanticErasureError("experimental StableHLO candidates must originate from a StableHLO artifact")
     if not compilation.provenance.source_operation_ids:
         raise SemanticErasureError("experimental StableHLO candidates must retain source-operation provenance")
-    validate_plan_semantic_erasure(compilation.plan)
+    validate_reference_plan_semantic_erasure(compilation.plan)
 
 
 def require_architecturally_conforming_dense_compilation(compilation: StableHLODenseCompilation) -> None:

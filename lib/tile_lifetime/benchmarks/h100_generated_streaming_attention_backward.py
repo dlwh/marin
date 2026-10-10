@@ -53,6 +53,339 @@ LOG2_E = 1.4426950408889634
 
 
 @triton.jit
+def _normalized_exponential_reverse_query_kernel(
+    query,
+    key,
+    value,
+    output_cotangent,
+    query_cotangent,
+    row_maximum,
+    row_exponential_sum,
+    row_centered_product_sum,
+    sequence_length,
+    query_heads,
+    key_value_heads,
+    scale,
+    scale_log2,
+    softcap,
+    output_scale,
+    stride_qb: tl.constexpr,
+    stride_qs: tl.constexpr,
+    stride_qh: tl.constexpr,
+    stride_qd: tl.constexpr,
+    stride_kb: tl.constexpr,
+    stride_ks: tl.constexpr,
+    stride_kh: tl.constexpr,
+    stride_kd: tl.constexpr,
+    stride_vb: tl.constexpr,
+    stride_vs: tl.constexpr,
+    stride_vh: tl.constexpr,
+    stride_vd: tl.constexpr,
+    stride_db: tl.constexpr,
+    stride_ds: tl.constexpr,
+    stride_dh: tl.constexpr,
+    stride_dd: tl.constexpr,
+    stride_dqb: tl.constexpr,
+    stride_dqs: tl.constexpr,
+    stride_dqh: tl.constexpr,
+    stride_dqd: tl.constexpr,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    head_dimension: tl.constexpr,
+    head_group_size: tl.constexpr,
+    causal: tl.constexpr,
+    has_softcap: tl.constexpr,
+):
+    query_block_index = tl.program_id(0)
+    batch_key_value_head = tl.program_id(1)
+    batch_index = batch_key_value_head // key_value_heads
+    key_value_head = batch_key_value_head % key_value_heads
+    query_start = query_block_index * block_m
+    packed_query_rows: tl.constexpr = block_m * head_group_size
+    packed_rows = tl.arange(0, packed_query_rows)
+    query_offsets_in_block = packed_rows // head_group_size
+    query_head_offsets = packed_rows % head_group_size
+    query_heads_for_rows = key_value_head * head_group_size + query_head_offsets
+    query_tokens = query_start + query_offsets_in_block
+    key_offsets = tl.arange(0, block_n)
+    features = tl.arange(0, head_dimension)
+    query_valid = query_tokens < sequence_length
+    query_offsets = (
+        batch_index * stride_qb
+        + query_tokens[:, None] * stride_qs
+        + query_heads_for_rows[:, None] * stride_qh
+        + features[None, :] * stride_qd
+    )
+    output_cotangent_offsets = (
+        batch_index * stride_db
+        + query_tokens[:, None] * stride_ds
+        + query_heads_for_rows[:, None] * stride_dh
+        + features[None, :] * stride_dd
+    )
+    query_cotangent_offsets = (
+        batch_index * stride_dqb
+        + query_tokens[:, None] * stride_dqs
+        + query_heads_for_rows[:, None] * stride_dqh
+        + features[None, :] * stride_dqd
+    )
+    query_tile = tl.load(query + query_offsets, mask=query_valid[:, None], other=0.0)
+    output_cotangent_tile = tl.load(
+        output_cotangent + output_cotangent_offsets,
+        mask=query_valid[:, None],
+        other=0.0,
+    )
+    maximum_log2 = tl.full((packed_query_rows,), -float("inf"), tl.float32)
+    exponential_sum = tl.zeros((packed_query_rows,), tl.float32)
+    weighted_differential_sum = tl.zeros((packed_query_rows,), tl.float32)
+    key_stop = sequence_length
+    if causal:
+        key_stop = query_start + block_m
+    for key_start in tl.range(0, key_stop, block_n):
+        key_start = tl.multiple_of(key_start, block_n)
+        key_block = tl.make_block_ptr(
+            base=key + batch_index * stride_kb + key_value_head * stride_kh,
+            shape=(head_dimension, sequence_length),
+            strides=(stride_kd, stride_ks),
+            offsets=(0, key_start),
+            block_shape=(head_dimension, block_n),
+            order=(0, 1),
+        )
+        value_block = tl.make_block_ptr(
+            base=value + batch_index * stride_vb + key_value_head * stride_vh,
+            shape=(head_dimension, sequence_length),
+            strides=(stride_vd, stride_vs),
+            offsets=(0, key_start),
+            block_shape=(head_dimension, block_n),
+            order=(0, 1),
+        )
+        key_tile = tl.load(key_block, boundary_check=(0, 1), padding_option="zero")
+        value_tile = tl.load(value_block, boundary_check=(0, 1), padding_option="zero")
+        score_log2 = tl.dot(query_tile, key_tile) * scale_log2
+        if has_softcap:
+            cap_log2 = softcap * 1.4426950408889634
+            score_log2 = cap_log2 * (2.0 * tl.sigmoid(2.0 * score_log2 / cap_log2) - 1.0)
+        key_valid = key_start + key_offsets < sequence_length
+        valid = query_valid[:, None] & key_valid[None, :]
+        if causal:
+            valid &= query_tokens[:, None] >= key_start + key_offsets[None, :]
+        masked_score = tl.where(valid, score_log2, -float("inf"))
+        next_maximum_log2 = tl.maximum(maximum_log2, tl.max(masked_score, axis=1))
+        previous_scale = tl.where(
+            maximum_log2 == -float("inf"),
+            0.0,
+            tl.math.exp2(maximum_log2 - next_maximum_log2),
+        )
+        exponential = tl.where(valid, tl.math.exp2(score_log2 - next_maximum_log2[:, None]), 0.0)
+        probability_cotangent = tl.dot(output_cotangent_tile, value_tile) * output_scale
+        exponential_sum = exponential_sum * previous_scale + tl.sum(exponential, axis=1)
+        weighted_differential_sum = weighted_differential_sum * previous_scale + tl.sum(
+            exponential * probability_cotangent,
+            axis=1,
+        )
+        maximum_log2 = next_maximum_log2
+
+    centered_product_sum = weighted_differential_sum / (exponential_sum * exponential_sum)
+    row_offset = (batch_index * query_heads + query_heads_for_rows) * sequence_length + query_tokens
+    tl.store(row_maximum + row_offset, maximum_log2 / 1.4426950408889634, mask=query_valid)
+    tl.store(row_exponential_sum + row_offset, exponential_sum, mask=query_valid)
+    tl.store(row_centered_product_sum + row_offset, centered_product_sum, mask=query_valid)
+
+    query_gradient = tl.zeros((packed_query_rows, head_dimension), tl.float32)
+    for key_start in tl.range(0, key_stop, block_n):
+        key_start = tl.multiple_of(key_start, block_n)
+        key_block = tl.make_block_ptr(
+            base=key + batch_index * stride_kb + key_value_head * stride_kh,
+            shape=(head_dimension, sequence_length),
+            strides=(stride_kd, stride_ks),
+            offsets=(0, key_start),
+            block_shape=(head_dimension, block_n),
+            order=(0, 1),
+        )
+        value_block = tl.make_block_ptr(
+            base=value + batch_index * stride_vb + key_value_head * stride_vh,
+            shape=(head_dimension, sequence_length),
+            strides=(stride_vd, stride_vs),
+            offsets=(0, key_start),
+            block_shape=(head_dimension, block_n),
+            order=(0, 1),
+        )
+        key_tile = tl.load(key_block, boundary_check=(0, 1), padding_option="zero")
+        value_tile = tl.load(value_block, boundary_check=(0, 1), padding_option="zero")
+        score_log2 = tl.dot(query_tile, key_tile) * scale_log2
+        score_slope = tl.full((packed_query_rows, block_n), scale, tl.float32)
+        if has_softcap:
+            cap_log2 = softcap * 1.4426950408889634
+            tanh_score = 2.0 * tl.sigmoid(2.0 * score_log2 / cap_log2) - 1.0
+            score_log2 = cap_log2 * tanh_score
+            score_slope *= 1.0 - tanh_score * tanh_score
+        key_valid = key_start + key_offsets < sequence_length
+        valid = query_valid[:, None] & key_valid[None, :]
+        if causal:
+            valid &= query_tokens[:, None] >= key_start + key_offsets[None, :]
+        exponential = tl.where(valid, tl.math.exp2(score_log2 - maximum_log2[:, None]), 0.0)
+        probability_cotangent = tl.dot(output_cotangent_tile, value_tile) * output_scale
+        mapped_score_cotangent = exponential * (
+            probability_cotangent / exponential_sum[:, None] - centered_product_sum[:, None]
+        )
+        raw_score_cotangent = tl.where(valid, mapped_score_cotangent * score_slope, 0.0)
+        query_gradient += tl.dot(raw_score_cotangent.to(tl.bfloat16), tl.trans(key_tile))
+    tl.store(
+        query_cotangent + query_cotangent_offsets,
+        query_gradient.to(tl.bfloat16),
+        mask=query_valid[:, None],
+    )
+
+
+@triton.jit
+def _normalized_exponential_reverse_key_value_kernel(
+    query,
+    key,
+    value,
+    output_cotangent,
+    row_maximum,
+    row_exponential_sum,
+    row_centered_product_sum,
+    key_cotangent,
+    value_cotangent,
+    sequence_length,
+    query_heads,
+    key_value_heads,
+    scale,
+    scale_log2,
+    softcap,
+    output_scale,
+    stride_qb: tl.constexpr,
+    stride_qs: tl.constexpr,
+    stride_qh: tl.constexpr,
+    stride_qd: tl.constexpr,
+    stride_kb: tl.constexpr,
+    stride_ks: tl.constexpr,
+    stride_kh: tl.constexpr,
+    stride_kd: tl.constexpr,
+    stride_vb: tl.constexpr,
+    stride_vs: tl.constexpr,
+    stride_vh: tl.constexpr,
+    stride_vd: tl.constexpr,
+    stride_db: tl.constexpr,
+    stride_ds: tl.constexpr,
+    stride_dh: tl.constexpr,
+    stride_dd: tl.constexpr,
+    stride_dkb: tl.constexpr,
+    stride_dks: tl.constexpr,
+    stride_dkh: tl.constexpr,
+    stride_dkd: tl.constexpr,
+    stride_dvb: tl.constexpr,
+    stride_dvs: tl.constexpr,
+    stride_dvh: tl.constexpr,
+    stride_dvd: tl.constexpr,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    head_dimension: tl.constexpr,
+    head_group_size: tl.constexpr,
+    causal: tl.constexpr,
+    has_softcap: tl.constexpr,
+):
+    key_block_index = tl.program_id(0)
+    batch_key_value_head = tl.program_id(1)
+    batch_index = batch_key_value_head // key_value_heads
+    key_value_head = batch_key_value_head % key_value_heads
+    key_start = key_block_index * block_n
+    key_offsets = key_start + tl.arange(0, block_n)
+    key_valid = key_offsets < sequence_length
+    key_block = tl.make_block_ptr(
+        base=key + batch_index * stride_kb + key_value_head * stride_kh,
+        shape=(head_dimension, sequence_length),
+        strides=(stride_kd, stride_ks),
+        offsets=(0, key_start),
+        block_shape=(head_dimension, block_n),
+        order=(0, 1),
+    )
+    value_block = tl.make_block_ptr(
+        base=value + batch_index * stride_vb + key_value_head * stride_vh,
+        shape=(head_dimension, sequence_length),
+        strides=(stride_vd, stride_vs),
+        offsets=(0, key_start),
+        block_shape=(head_dimension, block_n),
+        order=(0, 1),
+    )
+    key_tile = tl.load(key_block, boundary_check=(0, 1), padding_option="zero")
+    value_tile = tl.load(value_block, boundary_check=(0, 1), padding_option="zero")
+    key_gradient = tl.zeros((block_n, head_dimension), tl.float32)
+    value_gradient = tl.zeros((block_n, head_dimension), tl.float32)
+    packed_query_rows: tl.constexpr = block_m * head_group_size
+    packed_rows = tl.arange(0, packed_query_rows)
+    query_offsets_in_block = packed_rows // head_group_size
+    query_head_offsets = packed_rows % head_group_size
+    query_heads_for_rows = key_value_head * head_group_size + query_head_offsets
+    features = tl.arange(0, head_dimension)
+    first_query_start = 0
+    if causal:
+        first_query_start = (key_start // block_m) * block_m
+    for query_start in tl.range(first_query_start, sequence_length, block_m):
+        query_start = tl.multiple_of(query_start, block_m)
+        query_tokens = query_start + query_offsets_in_block
+        query_valid = query_tokens < sequence_length
+        query_offsets = (
+            batch_index * stride_qb
+            + query_tokens[:, None] * stride_qs
+            + query_heads_for_rows[:, None] * stride_qh
+            + features[None, :] * stride_qd
+        )
+        output_cotangent_offsets = (
+            batch_index * stride_db
+            + query_tokens[:, None] * stride_ds
+            + query_heads_for_rows[:, None] * stride_dh
+            + features[None, :] * stride_dd
+        )
+        query_tile = tl.load(query + query_offsets, mask=query_valid[:, None], other=0.0)
+        output_cotangent_tile = tl.load(
+            output_cotangent + output_cotangent_offsets,
+            mask=query_valid[:, None],
+            other=0.0,
+        )
+        row_offset = (batch_index * query_heads + query_heads_for_rows) * sequence_length + query_tokens
+        maximum = tl.load(row_maximum + row_offset, mask=query_valid, other=0.0)
+        exponential_sum = tl.load(row_exponential_sum + row_offset, mask=query_valid, other=1.0)
+        centered_product_sum = tl.load(row_centered_product_sum + row_offset, mask=query_valid, other=0.0)
+        score_log2 = tl.dot(query_tile, key_tile) * scale_log2
+        score_slope = tl.full((packed_query_rows, block_n), scale, tl.float32)
+        if has_softcap:
+            cap_log2 = softcap * 1.4426950408889634
+            tanh_score = 2.0 * tl.sigmoid(2.0 * score_log2 / cap_log2) - 1.0
+            score_log2 = cap_log2 * tanh_score
+            score_slope *= 1.0 - tanh_score * tanh_score
+        valid = query_valid[:, None] & key_valid[None, :]
+        if causal:
+            valid &= query_tokens[:, None] >= key_offsets[None, :]
+        exponential = tl.where(valid, tl.math.exp2(score_log2 - maximum[:, None] * 1.4426950408889634), 0.0)
+        probability = exponential / exponential_sum[:, None]
+        value_gradient += output_scale * tl.dot(
+            tl.trans(probability.to(tl.bfloat16)),
+            output_cotangent_tile,
+        )
+        probability_cotangent = tl.dot(output_cotangent_tile, value_tile) * output_scale
+        mapped_score_cotangent = exponential * (
+            probability_cotangent / exponential_sum[:, None] - centered_product_sum[:, None]
+        )
+        raw_score_cotangent = tl.where(valid, mapped_score_cotangent * score_slope, 0.0)
+        key_gradient += tl.dot(tl.trans(raw_score_cotangent.to(tl.bfloat16)), query_tile)
+    key_cotangent_offsets = (
+        batch_index * stride_dkb
+        + key_offsets[:, None] * stride_dks
+        + key_value_head * stride_dkh
+        + features[None, :] * stride_dkd
+    )
+    value_cotangent_offsets = (
+        batch_index * stride_dvb
+        + key_offsets[:, None] * stride_dvs
+        + key_value_head * stride_dvh
+        + features[None, :] * stride_dvd
+    )
+    tl.store(key_cotangent + key_cotangent_offsets, key_gradient.to(tl.bfloat16), mask=key_valid[:, None])
+    tl.store(value_cotangent + value_cotangent_offsets, value_gradient.to(tl.bfloat16), mask=key_valid[:, None])
+
+
+@triton.jit
 def _streaming_dq_kernel(
     query,
     key,
@@ -426,8 +759,6 @@ def prepare_streaming_attention_backward_launches(
     )
     if schedule.domain_traversal is not expected_domain:
         raise ValueError("physical traversal must match the score DomainRestriction")
-    if lowered.causal and block_m % block_n:
-        raise ValueError("lower-triangular traversal requires query tiles divisible by key tiles")
     expected_state_shape = (query.shape[0], query.shape[2], query.shape[1])
     if log_sum_exp.shape != expected_state_shape or output_dot.shape != expected_state_shape:
         raise ValueError("saved Fold state and output-dot buffer shapes must be [batch, head, query]")
@@ -503,6 +834,106 @@ def prepare_streaming_attention_backward_launches(
         query_cotangent=emit_query_cotangent,
         key_value_cotangents=emit_key_value_cotangents,
     )
+
+
+def prepare_normalized_exponential_reverse_launches(
+    program: StreamingAttentionBackwardProgram,
+    inputs: dict[str, torch.Tensor],
+    output_cotangent: torch.Tensor,
+    query_cotangent: torch.Tensor,
+    key_cotangent: torch.Tensor,
+    value_cotangent: torch.Tensor,
+    row_maximum: torch.Tensor,
+    row_exponential_sum: torch.Tensor,
+    row_centered_product_sum: torch.Tensor,
+    *,
+    schedule: StreamingAttentionBackwardTileSchedule,
+    num_warps: int,
+    num_stages: int,
+) -> StreamingAttentionBackwardLaunches:
+    """Bind the two owner traversals selected by the Shuttle reverse plan."""
+    if program.maximum_vjp is not StreamingAttentionBackwardMaximumVJP.NORMALIZED_EXP_INVARIANT:
+        raise ValueError("two-task reverse requires the normalized-exp maximum-VJP rewrite")
+    verify_streaming_attention_backward_score_map_vjp(program)
+    forward = program.forward
+    lowered = lower_score_map(forward)
+    query = inputs[forward.qk.inputs[0].name]
+    key = inputs[forward.qk.inputs[1].name]
+    value = inputs[forward.pv.inputs[1].name]
+    block_m = schedule.query_tile_size
+    block_n = schedule.key_value_tile_size
+    head_group_size = query.shape[2] // key.shape[2]
+    state_shape = (query.shape[0], query.shape[2], query.shape[1])
+    states = (row_maximum, row_exponential_sum, row_centered_product_sum)
+    if any(state.shape != state_shape or state.dtype is not torch.float32 for state in states):
+        raise ValueError("two-task reverse state must be three FP32 [batch, head, query] tensors")
+    if query.shape[1] % block_m or key.shape[1] % block_n:
+        raise ValueError("two-task reverse requires tile-aligned sequence lengths")
+    scalar_arguments = (
+        query.shape[1],
+        query.shape[2],
+        key.shape[2],
+        lowered.scale,
+        lowered.scale * LOG2_E,
+        lowered.softcap or 1.0,
+        program.output_scale,
+    )
+
+    def emit_query_cotangent() -> None:
+        _normalized_exponential_reverse_query_kernel[
+            (triton.cdiv(query.shape[1], block_m), query.shape[0] * key.shape[2])
+        ](
+            query,
+            key,
+            value,
+            output_cotangent,
+            query_cotangent,
+            *states,
+            *scalar_arguments,
+            *query.stride(),
+            *key.stride(),
+            *value.stride(),
+            *output_cotangent.stride(),
+            *query_cotangent.stride(),
+            block_m,
+            block_n,
+            query.shape[-1],
+            head_group_size,
+            lowered.causal,
+            lowered.softcap is not None,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+
+    def emit_key_value_cotangents() -> None:
+        _normalized_exponential_reverse_key_value_kernel[
+            (triton.cdiv(key.shape[1], block_n), key.shape[0] * key.shape[2])
+        ](
+            query,
+            key,
+            value,
+            output_cotangent,
+            *states,
+            key_cotangent,
+            value_cotangent,
+            *scalar_arguments,
+            *query.stride(),
+            *key.stride(),
+            *value.stride(),
+            *output_cotangent.stride(),
+            *key_cotangent.stride(),
+            *value_cotangent.stride(),
+            block_m,
+            block_n,
+            query.shape[-1],
+            head_group_size,
+            lowered.causal,
+            lowered.softcap is not None,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+
+    return StreamingAttentionBackwardLaunches(emit_query_cotangent, emit_key_value_cotangents)
 
 
 def emit_streaming_attention_backward(
@@ -600,9 +1031,15 @@ def main() -> None:
     parser.add_argument("--mutation", choices=("causal", "softcap"), default="causal")
     parser.add_argument("--scale", type=float, default=1.0 / math.sqrt(128))
     parser.add_argument("--block-m", type=int, choices=(16, 32, 64), default=32)
-    parser.add_argument("--block-n", type=int, choices=(16, 32, 64), default=32)
+    parser.add_argument("--block-n", type=int, choices=(16, 32, 64, 128), default=32)
     parser.add_argument("--num-warps", type=int, choices=(4, 8), default=8)
     parser.add_argument("--num-stages", type=int, choices=(2, 3, 4), default=3)
+    parser.add_argument(
+        "--state-policy",
+        choices=("recompute", "saved_forward"),
+        default="recompute",
+        help="Whether reverse kernels recompute row state or consume output/LSE saved by the forward kernel.",
+    )
     parser.add_argument("--profile-components", action="store_true")
     parser.add_argument("--warmups", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=30)
@@ -677,8 +1114,8 @@ def main() -> None:
         inputs,
         output,
         log_sum_exp,
-        block_m=args.block_m,
-        block_n=args.block_n,
+        block_m=32,
+        block_n=32,
         heads_per_program=4,
         num_warps=8,
         num_stages=3,
@@ -688,22 +1125,40 @@ def main() -> None:
     query_cotangent = torch.empty_like(inputs["query"])
     key_cotangent = torch.empty_like(inputs["key"])
     value_cotangent = torch.empty_like(inputs["value"])
-    output_dot = torch.empty_like(log_sum_exp)
+    row_maximum = torch.empty_like(log_sum_exp)
+    row_exponential_sum = torch.empty_like(log_sum_exp)
+    row_centered_product_sum = torch.empty_like(log_sum_exp)
 
-    generated_launches = prepare_streaming_attention_backward_launches(
-        backward,
-        inputs,
-        output,
-        log_sum_exp,
-        output_cotangent,
-        query_cotangent,
-        key_cotangent,
-        value_cotangent,
-        output_dot,
-        schedule=backward_schedule,
-        num_warps=args.num_warps,
-        num_stages=args.num_stages,
-    )
+    if args.state_policy == "saved_forward":
+        generated_launches = prepare_streaming_attention_backward_launches(
+            backward,
+            inputs,
+            output,
+            log_sum_exp,
+            output_cotangent,
+            query_cotangent,
+            key_cotangent,
+            value_cotangent,
+            row_centered_product_sum,
+            schedule=backward_schedule,
+            num_warps=args.num_warps,
+            num_stages=args.num_stages,
+        )
+    else:
+        generated_launches = prepare_normalized_exponential_reverse_launches(
+            backward,
+            inputs,
+            output_cotangent,
+            query_cotangent,
+            key_cotangent,
+            value_cotangent,
+            row_maximum,
+            row_exponential_sum,
+            row_centered_product_sum,
+            schedule=backward_schedule,
+            num_warps=args.num_warps,
+            num_stages=args.num_stages,
+        )
     generated_call = generated_launches.execute
 
     generated_call()
@@ -804,6 +1259,7 @@ def main() -> None:
             "requested_score_scale": args.scale,
             "semantic_score_scale": semantic_scale,
             "dtype": "bfloat16",
+            "state_policy": args.state_policy,
         },
         "semantic_generation": {
             "provenance": backward.provenance.value,
@@ -841,6 +1297,11 @@ def main() -> None:
                 else None
             ),
             "materialized_values": [value.name for value in backward.materialized_values],
+            "reverse_state_boundary": (
+                ["forward.output", "forward.log_sum_exp"]
+                if args.state_policy == "saved_forward"
+                else ["row.maximum", "row.exponential_sum", "row.centered_product_sum"]
+            ),
         },
         "schedule": {
             "block_m": args.block_m,

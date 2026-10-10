@@ -35,6 +35,7 @@ class EventRealizationKind(StrEnum):
 
     ERASED_PROGRAM_ORDER = "erased_program_order"
     ERASED_STREAM_ORDER = "erased_stream_order"
+    ERASED_ALGEBRAIC_REFINEMENT = "erased_algebraic_refinement"
     PHYSICAL = "physical"
 
 
@@ -79,15 +80,18 @@ class BoundedBufferPlan:
     """Finite storage assignment plus mechanically derived safe-reuse edges.
 
     ``producer`` coordinates identify logical buffer items. ``uses`` map each
-    item to all tasks that read it. ``slots`` and ``generations`` are schedule
-    choices over the producer domain. ``reuse_dependences`` are derived from
-    the unique last consumer of each prior slot generation.
+    item to all tasks that read it. ``allocation_owners``, ``slots``, and
+    ``generations`` are schedule choices over the producer domain. A physical
+    slot belongs to one allocation owner, so independent CTAs or output tiles
+    may use the same slot/generation pair. ``reuse_dependences`` are derived
+    from the unique last consumer of each prior generation of one owner/slot.
     """
 
     name: str
     producer: TaskFamily
     uses: tuple[TaskRelation, ...]
     capacity: int
+    allocation_owners: tuple[Coordinate, ...]
     slots: tuple[int, ...]
     generations: tuple[int, ...]
     last_consumers: tuple[tuple[Coordinate, TaskInstance], ...]
@@ -99,14 +103,19 @@ class BoundedBufferPlan:
         item_count = len(self.producer.coordinates)
         if self.capacity <= 0:
             raise ValueError("bounded buffer capacity must be positive")
-        if len(self.slots) != item_count or len(self.generations) != item_count:
+        if (
+            len(self.allocation_owners) != item_count
+            or len(self.slots) != item_count
+            or len(self.generations) != item_count
+        ):
             raise ValueError("bounded buffer assignments must cover every logical item")
         if any(slot < 0 or slot >= self.capacity for slot in self.slots):
             raise ValueError("bounded buffer slot is outside its capacity")
         if any(generation < 0 for generation in self.generations):
             raise ValueError("bounded buffer generations must be non-negative")
-        if len(set(zip(self.slots, self.generations, strict=True))) != item_count:
-            raise ValueError("one physical slot/generation pair may identify only one logical item")
+        assignments = zip(self.allocation_owners, self.slots, self.generations, strict=True)
+        if len(set(assignments)) != item_count:
+            raise ValueError("one owner/slot/generation tuple may identify only one logical item")
 
 
 def derive_bounded_buffer_plan(
@@ -116,6 +125,7 @@ def derive_bounded_buffer_plan(
     producer: TaskFamily,
     uses: tuple[TaskRelation, ...],
     capacity: int,
+    allocation_owner_for: dict[Coordinate, Coordinate],
     slot_for: dict[Coordinate, int],
     generation_for: dict[Coordinate, int],
     visibility: MemoryVisibility,
@@ -133,8 +143,18 @@ def derive_bounded_buffer_plan(
         if relation.source != producer:
             raise EventDataflowError(("every bounded buffer use must originate at its producer family",))
     coordinates = producer.coordinates
-    if set(slot_for) != set(coordinates) or set(generation_for) != set(coordinates):
-        raise EventDataflowError(("bounded buffer slot and generation maps must cover the producer domain",))
+    if (
+        set(allocation_owner_for) != set(coordinates)
+        or set(slot_for) != set(coordinates)
+        or set(generation_for) != set(coordinates)
+    ):
+        raise EventDataflowError(("bounded buffer owner, slot, and generation maps must cover the producer domain",))
+    assignments = {
+        (allocation_owner_for[coordinate], slot_for[coordinate], generation_for[coordinate])
+        for coordinate in coordinates
+    }
+    if len(assignments) != len(coordinates):
+        raise EventDataflowError(("one owner/slot/generation tuple may identify only one logical item",))
 
     reachability = _task_reachability(program)
     readers_by_item: dict[Coordinate, set[TaskInstance]] = defaultdict(set)
@@ -157,16 +177,16 @@ def derive_bounded_buffer_plan(
             )
         last_consumers[coordinate] = maxima[0]
 
-    by_slot: dict[int, list[Coordinate]] = defaultdict(list)
+    by_owner_slot: dict[tuple[Coordinate, int], list[Coordinate]] = defaultdict(list)
     for coordinate in coordinates:
-        by_slot[slot_for[coordinate]].append(coordinate)
+        by_owner_slot[(allocation_owner_for[coordinate], slot_for[coordinate])].append(coordinate)
     reuse_pairs_by_families: dict[tuple[str, str], list[tuple[Coordinate, Coordinate]]] = defaultdict(list)
     family_by_name = {family.name: family for family in program.task_families}
-    for slot, items in by_slot.items():
+    for (owner, slot), items in by_owner_slot.items():
         ordered = sorted(items, key=lambda coordinate: generation_for[coordinate])
         generations = [generation_for[coordinate] for coordinate in ordered]
         if generations != list(range(generations[0], generations[0] + len(generations))):
-            raise EventDataflowError((f"buffer slot {slot} generations must be contiguous",))
+            raise EventDataflowError((f"buffer owner {owner} slot {slot} generations must be contiguous",))
         for prior, following in pairwise(ordered):
             last = last_consumers[prior]
             reuse_pairs_by_families[(last.family, producer.name)].append((last.coordinate, following))
@@ -181,6 +201,7 @@ def derive_bounded_buffer_plan(
         producer=producer,
         uses=uses,
         capacity=capacity,
+        allocation_owners=tuple(allocation_owner_for[coordinate] for coordinate in coordinates),
         slots=tuple(slot_for[coordinate] for coordinate in coordinates),
         generations=tuple(generation_for[coordinate] for coordinate in coordinates),
         last_consumers=tuple((coordinate, last_consumers[coordinate]) for coordinate in coordinates),

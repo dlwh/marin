@@ -102,6 +102,10 @@ def compiler_options(
 ) -> CompilerOptions:
     """Return canonical XLA compiler options for a Shuttle-enabled jaxlib."""
     options = Options(numerics=numerics, execution_mode=execution_mode, tuning=tuning, gpu_target=gpu_target)
+    if execution_mode is ExecutionMode.GPU_EXECUTABLE_BUNDLE:
+        from shuttle.physical_artifact import activate_gpu_physical_artifact_providers  # noqa: PLC0415
+
+        activate_gpu_physical_artifact_providers()
     return {
         ENABLE_OPTION: True,
         OPTIONS_OPTION: canonical_options_json(options),

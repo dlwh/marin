@@ -1,12 +1,12 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Replace a recovered JAX reverse region with generated typed FFI.
+"""Quarantined XLA adapter for the legacy fixed attention benchmark kernel.
 
-Both the whole-entry and region-local passes derive operand roles from
-Contract, Fold, and DomainRestriction dataflow.  They reject modules whose
-physical graph cannot establish that provenance.  No frontend or model names
-participate in matching.
+This historical benchmark/oracle path reconstructs fixed-kernel parameters
+from physical HLO and is intentionally absent from the package API and every
+compiler-provider registry. Canonical lowering preserves scalar Map ASTs and
+domain predicates in typed physical requests instead.
 """
 
 from __future__ import annotations
@@ -1385,7 +1385,7 @@ def _broadcast_scalar_constant(nodes: dict[str, InlinedHloNode], node_id: str) -
 
 
 def _program_score_policy(program: StreamingAttentionBackwardProgram) -> tuple[float, bool]:
-    raw_score_name = program.forward.qk.output.name
+    raw_score_name = program.forward.region.producer.output.name
     causal = False
 
     def literal(expression: ScalarExpression) -> float | bool | None:
@@ -1411,7 +1411,7 @@ def _program_score_policy(program: StreamingAttentionBackwardProgram) -> tuple[f
                     return float(value)
         raise ValueError("whole-entry replacement currently supports an affine scaled score Map")
 
-    return visit(program.forward.score_map.expression), causal
+    return visit(program.forward.region.score_map.expression), causal
 
 
 def _ffi_shape(specification: StreamingAttentionBackwardFfiBuffer) -> str:

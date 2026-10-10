@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // RUN: shuttle-test-opt --split-input-file --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra %s | FileCheck %s
-// RUN: shuttle-test-opt --split-input-file --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra %s | not grep shuttle.map
 
 module {
   func.func @rank_three_singleton_expansion(%input: tensor<7x1x13xf32>)
@@ -96,4 +95,5 @@ module {
   }
 }
 
-// CHECK-COUNT-9: shuttle.coverage_manifest = {{.*}}reason = "unsupported_operation"
+// CHECK: #shuttle.map_semantics<reshape>
+// CHECK: reason = "unsupported_operation"

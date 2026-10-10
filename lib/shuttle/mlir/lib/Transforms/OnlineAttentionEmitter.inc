@@ -11,99 +11,119 @@ struct OnlineEmissionMatch {
   SmallVector<RelationOp> relations;
 };
 
-FailureOr<OnlineEmissionMatch> matchOnlineEmission(RegionOp region) {
+FailureOr<OnlineEmissionMatch>
+matchOnlineEmission(RegionOp region,
+                    MaterializationTaskOp materializationTask) {
   Block &body = region.getBody().front();
-  auto yield = dyn_cast<YieldOp>(body.getTerminator());
-  if (!yield || yield.getValues().size() != 1)
+  auto plan = materializationTask->getParentOfType<MaterializationPlanOp>();
+  auto capabilities =
+      plan ? plan->getAttrOfType<ArrayAttr>("normalized_exp_contract_regions")
+           : ArrayAttr{};
+  auto taskSources = materializationTask.getCompositionSources();
+  if (!capabilities || !taskSources)
     return failure();
-  SmallVector<Operation *> algebra;
+  SmallVector<Operation *> operations;
   for (Operation &operation : body.without_terminator())
-    algebra.push_back(&operation);
-  ContractOp weighted;
-  for (Operation *operation : algebra) {
-    auto contract = dyn_cast<ContractOp>(operation);
-    if (!contract ||
-        !valueDependsOnOperation(yield.getValues().front(), contract))
-      continue;
-    const bool feedsContract = llvm::any_of(algebra, [&](Operation *candidate) {
-      auto other = dyn_cast<ContractOp>(candidate);
-      return other && other != contract &&
-             llvm::any_of(other.getInputs(), [&](Value input) {
-               return valueDependsOnOperation(input, contract);
-             });
-    });
-    if (!feedsContract) {
-      if (weighted)
-        return failure();
-      weighted = contract;
-    }
-  }
-  if (!weighted || weighted.getNumResults() != 1)
-    return failure();
-  FoldOp maximum;
-  FoldOp additive;
-  Value score;
-  std::optional<unsigned> normalizedOperand;
-  for (auto [operand, input] : llvm::enumerate(weighted.getInputs())) {
-    auto normalization = input.getDefiningOp<MapOp>();
-    auto division = normalization
-                        ? online_planner::binaryMapArguments(
-                              normalization, arith::DivFOp::getOperationName())
-                        : std::nullopt;
-    if (!division)
-      continue;
-    auto exponential =
-        normalization.getInputs()[division->first].getDefiningOp<MapOp>();
-    auto exponentialArgument =
-        exponential ? online_planner::unaryMapArgument(
-                          exponential, math::ExpOp::getOperationName())
-                    : std::nullopt;
-    FailureOr<FoldOp> sum = online_planner::uniqueFoldAncestor(
-        normalization.getInputs()[division->second],
-        arith::AddFOp::getOperationName());
-    if (!exponentialArgument || failed(sum) ||
-        (*sum).getInputs().front() != exponential.getResult(0))
-      continue;
-    auto subtraction =
-        exponential.getInputs()[*exponentialArgument].getDefiningOp<MapOp>();
-    auto subtractionArguments =
-        subtraction ? online_planner::binaryMapArguments(
-                          subtraction, arith::SubFOp::getOperationName())
-                    : std::nullopt;
-    if (!subtractionArguments)
-      continue;
-    FailureOr<FoldOp> max = online_planner::uniqueFoldAncestor(
-        subtraction.getInputs()[subtractionArguments->second],
-        arith::MaximumFOp::getOperationName());
-    if (failed(max) || maximum)
+    if (operation.getNumResults() != 0)
+      operations.push_back(&operation);
+  auto operationAt = [&](DictionaryAttr capability,
+                         StringRef field) -> Operation * {
+    auto ordinal = capability.getAs<IntegerAttr>(field);
+    if (!ordinal || ordinal.getInt() < 0 ||
+        ordinal.getInt() >= static_cast<int64_t>(operations.size()))
+      return nullptr;
+    return operations[ordinal.getInt()];
+  };
+  auto resultAt = [&](DictionaryAttr capability, StringRef operationField,
+                      StringRef resultField) -> Value {
+    Operation *operation = operationAt(capability, operationField);
+    auto result = capability.getAs<IntegerAttr>(resultField);
+    if (!operation || !result || result.getInt() < 0 ||
+        result.getInt() >= operation->getNumResults())
+      return {};
+    return operation->getResult(result.getInt());
+  };
+  SmallVector<DictionaryAttr> candidates;
+  for (Attribute attribute : capabilities) {
+    auto capability = dyn_cast<DictionaryAttr>(attribute);
+    Operation *producer =
+        capability ? operationAt(capability, "producer_operation") : nullptr;
+    Operation *consumer =
+        capability ? operationAt(capability, "consumer_operation") : nullptr;
+    if (!isa_and_nonnull<ContractOp>(producer) ||
+        !isa_and_nonnull<ContractOp>(consumer))
       return failure();
-    maximum = *max;
-    additive = *sum;
-    score = subtraction.getInputs()[subtractionArguments->first];
-    normalizedOperand = operand;
+    const bool taskOwnsRegion =
+        llvm::any_of(*taskSources, [&](Attribute source) {
+          return source == algebraSource(producer) ||
+                 source == algebraSource(consumer);
+        });
+    if (taskOwnsRegion)
+      candidates.push_back(capability);
   }
-  if (!maximum || !additive || !score || !normalizedOperand ||
-      maximum.getInputs().front() != score)
+  if (candidates.size() != 1)
     return failure();
-  ContractOp scoreContract;
+  DictionaryAttr capability = candidates.front();
+  auto scoreContract = dyn_cast_or_null<ContractOp>(
+      operationAt(capability, "producer_operation"));
+  auto weighted = dyn_cast_or_null<ContractOp>(
+      operationAt(capability, "consumer_operation"));
+  auto maximum =
+      dyn_cast_or_null<FoldOp>(operationAt(capability, "maximum_operation"));
+  auto additive =
+      dyn_cast_or_null<FoldOp>(operationAt(capability, "normalizer_operation"));
+  Operation *normalizedWeight =
+      operationAt(capability, "normalized_weight_operation");
+  Operation *finalizer = operationAt(capability, "finalizer_operation");
+  Value score = resultAt(capability, "score_operation", "score_result");
+  Value maximumResult =
+      resultAt(capability, "maximum_operation", "maximum_result");
+  Value normalizerResult =
+      resultAt(capability, "normalizer_operation", "normalizer_result");
+  Value normalizedWeightResult = resultAt(
+      capability, "normalized_weight_operation", "normalized_weight_result");
+  Value finalizerResult =
+      resultAt(capability, "finalizer_operation", "finalizer_result");
+  auto foldOperations = capability.getAs<DenseI64ArrayAttr>("fold_operations");
+  auto maximumOperation = capability.getAs<IntegerAttr>("maximum_operation");
+  auto normalizerOperation =
+      capability.getAs<IntegerAttr>("normalizer_operation");
+  auto normalizedOperand = capability.getAs<IntegerAttr>("normalized_operand");
+  if (!scoreContract || !weighted || !maximum || !additive ||
+      !normalizedWeight || !finalizer || !score || !maximumResult ||
+      !normalizerResult || !normalizedWeightResult || !finalizerResult ||
+      !foldOperations || foldOperations.empty() || !maximumOperation ||
+      !normalizerOperation || !normalizedOperand ||
+      normalizedOperand.getInt() < 0 ||
+      normalizedOperand.getInt() >= weighted.getNumOperands() ||
+      llvm::any_of(foldOperations.asArrayRef(),
+                   [&](int64_t ordinal) {
+                     return ordinal < 0 ||
+                            ordinal >=
+                                static_cast<int64_t>(operations.size()) ||
+                            !isa<FoldOp>(operations[ordinal]);
+                   }) ||
+      !llvm::is_contained(foldOperations.asArrayRef(),
+                          maximumOperation.getInt()) ||
+      !llvm::is_contained(foldOperations.asArrayRef(),
+                          normalizerOperation.getInt()) ||
+      !valueDependsOnOperation(score, scoreContract) ||
+      !valueDependsOnOperation(weighted.getInputs()[normalizedOperand.getInt()],
+                               normalizedWeight) ||
+      !valueDependsOnOperation(finalizerResult, weighted))
+    return failure();
   SmallVector<RelationOp> relations;
-  for (Operation *operation : algebra) {
+  for (Operation *operation : operations)
     if (auto relation = dyn_cast<RelationOp>(operation);
         relation && valueDependsOnOperation(score, relation))
       relations.push_back(relation);
-    if (auto contract = dyn_cast<ContractOp>(operation);
-        contract && contract != weighted &&
-        valueDependsOnOperation(score, contract)) {
-      if (scoreContract)
-        return failure();
-      scoreContract = contract;
-    }
-  }
-  if (!scoreContract || relations.empty())
-    return failure();
-  return OnlineEmissionMatch{
-      weighted,           scoreContract,       maximum, additive, score,
-      *normalizedOperand, std::move(relations)};
+  return OnlineEmissionMatch{weighted,
+                             scoreContract,
+                             maximum,
+                             additive,
+                             score,
+                             static_cast<unsigned>(normalizedOperand.getInt()),
+                             std::move(relations)};
 }
 
 enum class OnlineScalarKind { F32, U32, Predicate };
@@ -1438,22 +1458,6 @@ emitOnlineVectorStatePtx(RegionOp region,
   if (scoreElements <= 0 || scoreElements > 256 || tileElements <= 0 ||
       task.getScratchBytes() < kSharedBytes)
     return failure();
-  std::optional<int64_t> causalQueryAxis;
-  const bool hasOffsetRelation =
-      llvm::any_of(match.relations, [](RelationOp op) {
-        return op.getSemantics() == RelationSemantics::Add;
-      });
-  if (!hasOffsetRelation) {
-    for (auto [axis, extent] : llvm::enumerate(domain)) {
-      if (static_cast<int64_t>(axis) == reductionAxis ||
-          static_cast<int64_t>(axis) == vectorAxis ||
-          extent != domain[reductionAxis] || extent % 4 != 0)
-        continue;
-      if (causalQueryAxis)
-        return failure();
-      causalQueryAxis = axis;
-    }
-  }
   PtxEmitter ptx(materializationTask.getInputBuffers().size() + 1);
   ptx.header(task.getSemanticFingerprint(), /*usesDynamicSharedMemory=*/true);
   FailureOr<OnlineEvalContext> context =
@@ -1506,29 +1510,6 @@ emitOnlineVectorStatePtx(RegionOp region,
   int64_t reductionLimit = ptx.nextU32();
   ptx.stream << "  mov.u32 %r" << reductionLimit << ", "
              << domain[reductionAxis] << ";\n";
-  if (causalQueryAxis) {
-    int64_t blockFirstRow = ptx.nextU32();
-    int64_t queryMaximum = ptx.nextU32();
-    ptx.stream << "  mul.lo.u32 %r" << blockFirstRow << ", %r" << localBlock
-               << ", 4;\n  rem.u32 %r" << queryMaximum << ", %r"
-               << blockFirstRow << ", " << domain[*causalQueryAxis] << ";\n";
-    for (int64_t warpIndex = 1; warpIndex < 4; ++warpIndex) {
-      int64_t candidateRow = ptx.nextU32();
-      int64_t candidateQuery = ptx.nextU32();
-      int64_t nextMaximum = ptx.nextU32();
-      int64_t greater = ptx.nextPred();
-      ptx.stream << "  add.u32 %r" << candidateRow << ", %r" << blockFirstRow
-                 << ", " << warpIndex << ";\n  rem.u32 %r" << candidateQuery
-                 << ", %r" << candidateRow << ", " << domain[*causalQueryAxis]
-                 << ";\n  setp.gt.u32 %p" << greater << ", %r" << candidateQuery
-                 << ", %r" << queryMaximum << ";\n  selp.u32 %r" << nextMaximum
-                 << ", %r" << candidateQuery << ", %r" << queryMaximum << ", %p"
-                 << greater << ";\n  mov.u32 %r" << queryMaximum << ", %r"
-                 << nextMaximum << ";\n";
-    }
-    ptx.stream << "  add.u32 %r" << reductionLimit << ", %r" << queryMaximum
-               << ", 1;\n";
-  }
 
   // Q is invariant across the streamed key tiles. Each lane retains the
   // feature components it owns for the lifetime of the row.
@@ -1888,11 +1869,14 @@ FailureOr<std::string> emitOnlineSufficientStatePtx(
     RegionOp region, MaterializationTaskOp materializationTask,
     SmallVectorImpl<MaterializationBufferOp> &buffers, ScheduleTaskOp task) {
   if (!isOnlineStateTask(materializationTask) ||
-      materializationTask.getCompositionKind() != kOnlineStateProtocol ||
-      task.getOnlineStateProtocol() != kOnlineStateProtocol ||
+      task->getAttr("composition_owner_dimensions") !=
+          materializationTask->getAttr("composition_owner_dimensions") ||
+      task->getAttr("composition_stream_dimensions") !=
+          materializationTask->getAttr("composition_stream_dimensions") ||
       task.getReductionOrder() != ScheduleReductionOrder::LeafOrderFree)
     return failure();
-  FailureOr<OnlineEmissionMatch> match = matchOnlineEmission(region);
+  FailureOr<OnlineEmissionMatch> match =
+      matchOnlineEmission(region, materializationTask);
   if (failed(match))
     return failure();
   if (materializationTask.getOnlineMma().value_or(false))
@@ -1967,7 +1951,8 @@ FailureOr<OnlineScalarValue> emitOnlineValue(OnlineEvalContext &context,
 
 FailureOr<SmallVector<AffineMap>>
 onlineLogicalCoordinateMaps(ScheduleTaskOp task) {
-  if (!task.getOnlineStateProtocolAttr() || !task.getReductionAxis() ||
+  if (!task.getCompositionOwnerDimensionsAttr() ||
+      !task.getCompositionStreamDimensionsAttr() || !task.getReductionAxis() ||
       !task.getOnlineVectorDimensions())
     return failure();
   ArrayRef<int64_t> domain = task.getDomainShape();

@@ -5,6 +5,9 @@
 
 from dataclasses import dataclass
 
+import jax.numpy as jnp
+from jax import Array
+
 from tile_lifetime.attention import (
     compile_reference_attention_region,
     select_reference_hopper_attention_config,
@@ -19,7 +22,7 @@ from tile_lifetime.plan import (
     MaterializationRecord,
     NumericalEquivalence,
     NumericalPolicy,
-    RegionPlan,
+    ReferenceRegionPlan,
     RewriteExplanation,
     TransformSkeleton,
 )
@@ -32,11 +35,38 @@ class _QKVRoPEAttentionRegion:
     attention: ScaledDotProductAttentionOp
 
 
+def project_qkv(
+    source: Array,
+    query_weight: Array,
+    key_weight: Array,
+    value_weight: Array,
+) -> tuple[Array, Array, Array]:
+    """Apply three ordinary batched matrix contractions.
+
+    Weight shapes expose the head and feature dimensions directly instead of
+    encoding head relationships in a projection mode.
+    """
+    query = jnp.einsum("bsm,mhd->bshd", source, query_weight)
+    key = jnp.einsum("bsm,mhd->bshd", source, key_weight)
+    value = jnp.einsum("bsm,mhv->bshv", source, value_weight)
+    return query, key, value
+
+
+def rotate_adjacent_pairs(source: Array, sine: Array, cosine: Array) -> Array:
+    """Rotate adjacent feature pairs using ordinary shape and scalar operations."""
+    pair_shape = (*source.shape[:-1], source.shape[-1] // 2, 2)
+    pairs = jnp.reshape(source, pair_shape)
+    even = pairs[..., 0]
+    odd = pairs[..., 1]
+    rotated = jnp.stack((even * cosine - odd * sine, even * sine + odd * cosine), axis=-1)
+    return jnp.reshape(rotated, source.shape)
+
+
 def compile_reference_qkv_rope_attention_region(
     graph: TensorGraph,
     *,
     numerical_policy: NumericalPolicy,
-) -> RegionPlan:
+) -> ReferenceRegionPlan:
     """Compile the historical named QKV/RoPE/attention comparison path."""
     region, rejection_reasons = _find_region(graph)
     if region is None:
@@ -84,7 +114,7 @@ def _find_region(graph: TensorGraph) -> tuple[_QKVRoPEAttentionRegion | None, tu
     return _QKVRoPEAttentionRegion(projection=projection, rope=rope, attention=attention), ()
 
 
-def _fused_plan(graph: TensorGraph, region: _QKVRoPEAttentionRegion) -> RegionPlan:
+def _fused_plan(graph: TensorGraph, region: _QKVRoPEAttentionRegion) -> ReferenceRegionPlan:
     projection = region.projection
     rope = region.rope
     attention = region.attention
@@ -204,14 +234,14 @@ def _fused_plan(graph: TensorGraph, region: _QKVRoPEAttentionRegion) -> RegionPl
             "materialized unrotated BF16 Q and K"
         ),
     )
-    return RegionPlan(
+    return ReferenceRegionPlan(
         skeletons=(qkv_gemm, *attention_plan.skeletons),
         materializations=materializations,
         rewrites=(rewrite, *attention_plan.rewrites),
     )
 
 
-def _materialized_plan(graph: TensorGraph, region: _QKVRoPEAttentionRegion) -> RegionPlan:
+def _materialized_plan(graph: TensorGraph, region: _QKVRoPEAttentionRegion) -> ReferenceRegionPlan:
     projection = region.projection
     rope = region.rope
     attention_plan = compile_reference_attention_region(graph, numerical_policy=NumericalPolicy.BITWISE_EXACT)
@@ -246,7 +276,7 @@ def _materialized_plan(graph: TensorGraph, region: _QKVRoPEAttentionRegion) -> R
         rope.output,
         rope.key_output,
     )
-    return RegionPlan(
+    return ReferenceRegionPlan(
         skeletons=(qkv_gemm, *transforms, *attention_plan.skeletons),
         materializations=tuple(
             MaterializationRecord(

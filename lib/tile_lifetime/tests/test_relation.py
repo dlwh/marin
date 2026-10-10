@@ -7,9 +7,12 @@ import pytest
 from shuttle.ir import DType
 from tile_lifetime import (
     RelationPlanError,
+    RelationProjectionAxis,
+    RelationProjectionSpec,
     build_partitioned_merge_rows,
     build_relation_plan,
     compile_ordered_relation_fold,
+    project_relation_rows,
 )
 from tile_lifetime.tile_program import TilePrimitive
 
@@ -94,6 +97,35 @@ def test_relation_plan_coalesces_payload_by_source_item_and_destination_rank() -
     assert plan.exchange_source_item.tolist() == [0, 2, 3, 1, 2, 3]
     assert plan.exchange_destination_rank.tolist() == [0, 0, 0, 1, 1, 1]
     np.testing.assert_array_equal(plan.expand_coalesced(coalesced), plan.dispatch(payload))
+
+
+def test_relation_projection_tracks_inverse_validity_and_physical_extent() -> None:
+    plan = build_relation_plan(
+        np.array([[0, 2], [1, 3]], dtype=np.int32),
+        np.ones((2, 2), dtype=np.float32),
+        destination_rank_by_item=np.array([0, 1, 0, 1], dtype=np.int32),
+        destination_local_item_by_item=np.array([0, 0, 1, 1], dtype=np.int32),
+        padding_quantum=1,
+    )
+    projection = project_relation_rows(
+        plan,
+        RelationProjectionSpec(
+            grouping_axes=(RelationProjectionAxis.SOURCE_ITEM, RelationProjectionAxis.DESTINATION_RANK),
+            payload_axis=RelationProjectionAxis.SOURCE_ITEM,
+        ),
+        physical_row_extent=4,
+    )
+
+    assert projection.physical_row_extent == 4
+    assert projection.physical_row_valid.tolist() == [True, True, False, False]
+    assert projection.logical_edge_to_physical_row.tolist() == [0, 0, 1, 1]
+    assert projection.physical_row_edge_offsets.tolist() == [0, 2, 4, 4, 4]
+    payload = np.array([[10.0], [20.0]], dtype=np.float32)
+    np.testing.assert_array_equal(projection.gather_payload(payload), [[10.0], [20.0], [0.0], [0.0]])
+    np.testing.assert_array_equal(
+        projection.expand_rows(projection.gather_payload(payload)),
+        [[[10.0], [10.0]], [[20.0], [20.0]]],
+    )
 
 
 def test_relation_plan_marks_padding_and_keeps_it_out_of_inverse_dispatch() -> None:

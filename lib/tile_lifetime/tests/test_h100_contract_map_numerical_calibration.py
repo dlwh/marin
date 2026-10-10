@@ -55,7 +55,13 @@ def test_cpu_calibration_covers_every_reviewed_case_output_and_heldout_seed() ->
 def test_checked_in_cpu_calibration_is_exactly_regenerable() -> None:
     environment = dict(os.environ)
     environment["JAX_PLATFORMS"] = "cpu"
-    environment["PYTHONPATH"] = f"{ROOT / 'lib/tile_lifetime/src'}:{ROOT}"
+    environment["PYTHONPATH"] = os.pathsep.join(
+        (
+            str(ROOT / "lib/tile_lifetime/src"),
+            str(ROOT / "lib/shuttle/src"),
+            str(ROOT),
+        )
+    )
 
     completed = subprocess.run(
         [sys.executable, str(GENERATOR)],

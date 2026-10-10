@@ -10,11 +10,6 @@
 #include <string>
 #include <vector>
 
-#include "gtest/gtest.h"
-#include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/StringRef.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -26,6 +21,11 @@
 #include "shuttle/Transforms/Passes.h"
 #include "stablehlo/dialect/Register.h"
 #include "tools/cpp/runfiles/runfiles.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
+#include "gtest/gtest.h"
 
 namespace {
 
@@ -56,8 +56,7 @@ std::optional<std::string> fixtureSource() {
 }
 
 std::unique_ptr<BuiltModule>
-buildAbi19Exp(llvm::StringRef source,
-              mlir::shuttle::NumericalPolicy policy,
+buildAbi19Exp(llvm::StringRef source, mlir::shuttle::NumericalPolicy policy,
               bool buildBundle = true) {
   mlir::DialectRegistry registry;
   mlir::stablehlo::registerAllDialects(registry);
@@ -74,12 +73,14 @@ buildAbi19Exp(llvm::StringRef source,
   manager.addPass(mlir::shuttle::createAnnotateSourcePass());
   manager.addPass(mlir::shuttle::createFormStructuralRegionsPass(
       policy,
-      policy == mlir::shuttle::NumericalPolicy::Fast ? kFastOptions.str()
-                                                     : kSourceOrderedOptions.str(),
+      policy == mlir::shuttle::NumericalPolicy::Fast
+          ? kFastOptions.str()
+          : kSourceOrderedOptions.str(),
       kDefaultTuning.str()));
   manager.addPass(mlir::shuttle::createConvertStablehloToAlgebraPass());
   manager.addPass(mlir::shuttle::createPlanRowFoldMaterializationPass());
   manager.addPass(mlir::shuttle::createPlanSimt32RowFoldSchedulePass());
+  manager.addPass(mlir::shuttle::createPlanSourceEventLoweringPass());
   if (buildBundle) {
     manager.addPass(mlir::shuttle::createBuildGpuExecutableBundlePass());
     manager.addPass(mlir::shuttle::createVerifyGpuExecutableBundlePass());
@@ -123,8 +124,9 @@ std::vector<TaggedPtx> ptxSlices(mlir::ModuleOp module) {
         schedule.getBody().front().getOps<mlir::shuttle::ScheduleTaskOp>());
     llvm::SmallVector<mlir::shuttle::MaterializationTaskOp>
         materializationTasks(
-            materialization.getBody().front().getOps<
-                mlir::shuttle::MaterializationTaskOp>());
+            materialization.getBody()
+                .front()
+                .getOps<mlir::shuttle::MaterializationTaskOp>());
     llvm::ArrayRef<int8_t> code = device.getCode();
     for (mlir::shuttle::DeviceEntryOp entry :
          device.getBody().front().getOps<mlir::shuttle::DeviceEntryOp>()) {
@@ -311,8 +313,7 @@ testing::AssertionResult hasExpResultStoreDataflow(llvm::StringRef ptx) {
 }
 
 testing::AssertionResult isClosedPtx(llvm::StringRef ptx) {
-  if (!ptx.starts_with(
-          ".version 8.0\n.target sm_90\n.address_size 64\n"))
+  if (!ptx.starts_with(".version 8.0\n.target sm_90\n.address_size 64\n"))
     return testing::AssertionFailure() << "wrong PTX target preamble";
   if (ptx.contains(".extern .func"))
     return testing::AssertionFailure() << "unresolved device function";
@@ -417,9 +418,8 @@ TEST(Abi19LibdeviceContractTest, ClosedPtxOracleRejectsSemanticMutations) {
   EXPECT_FALSE(isClosedDefaultExpPtx(
       replaceOnce(ptx, "call.uni (__exp_return), __nv_expf, (__exp_input);",
                   "mov.f32 %f2, %f1;")));
-  EXPECT_FALSE(isClosedDefaultExpPtx(
-      replaceOnce(ptx, "cvt.rn.bf16.f32 %rs1, %f2;",
-                  "cvt.rn.bf16.f32 %rs1, %f1;")));
+  EXPECT_FALSE(isClosedDefaultExpPtx(replaceOnce(
+      ptx, "cvt.rn.bf16.f32 %rs1, %f2;", "cvt.rn.bf16.f32 %rs1, %f1;")));
   EXPECT_FALSE(isClosedDefaultExpPtx(replaceOnce(
       ptx, "call.uni (__exp_return), __nv_expf, (__exp_input);",
       "call.uni (__exp_return), __shuttle_missing, (__exp_input);")));
@@ -450,8 +450,8 @@ TEST(Abi19LibdeviceContractTest,
     ASSERT_FALSE(firstPtx.empty());
     ASSERT_EQ(firstPtx, secondPtx);
 
-    std::string renamed = replaceOnce(*source, "@abi19_exp_contract",
-                                      "@anonymous_module");
+    std::string renamed =
+        replaceOnce(*source, "@abi19_exp_contract", "@anonymous_module");
     renamed = replaceOnce(renamed, "@main", "@anonymous_entry");
     auto renamedBuild = buildAbi19Exp(renamed, policy);
     ASSERT_TRUE(renamedBuild);
@@ -471,10 +471,10 @@ TEST(Abi19LibdeviceContractTest,
           replaceOnce(ptx, ".version 8.0", ".version 8.1")));
       EXPECT_FALSE(isClosedDefaultExpPtx(
           replaceOnce(ptx, ".target sm_90", ".target sm_100")));
-      EXPECT_FALSE(isClosedDefaultExpPtx(
-          replaceOnce(ptx, ".address_size 64\n",
-                      ".address_size 64\n.extern .func "
-                      "__shuttle_unresolved();\n")));
+      EXPECT_FALSE(
+          isClosedDefaultExpPtx(replaceOnce(ptx, ".address_size 64\n",
+                                            ".address_size 64\n.extern .func "
+                                            "__shuttle_unresolved();\n")));
     }
     EXPECT_EQ(exponentialEntries, 2);
   }

@@ -4,11 +4,12 @@
 """Executable CPU index-plane plans for routed relations."""
 
 from dataclasses import dataclass
+from enum import StrEnum
+from typing import Protocol
 
 import numpy as np
 
 from shuttle.ir import DType
-from tile_lifetime.expert_parallel_plan import ExpertParallelPlan
 from tile_lifetime.tile_program import (
     TileOp,
     TilePrimitive,
@@ -24,6 +25,178 @@ class RelationPlanError(ValueError):
     def __init__(self, reasons: tuple[str, ...]):
         self.reasons = reasons
         super().__init__("; ".join(reasons))
+
+
+@dataclass(frozen=True)
+class RelationPlacement:
+    """Explicit item placement, independent of item numbering."""
+
+    rank_count: int
+    rank_by_item: tuple[int, ...]
+    local_item_by_item: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if self.rank_count <= 0:
+            raise ValueError("relation placement must contain at least one rank")
+        if len(self.rank_by_item) == 0 or len(self.local_item_by_item) != len(self.rank_by_item):
+            raise ValueError("relation placement must cover a non-empty item domain")
+        rank = np.asarray(self.rank_by_item)
+        local = np.asarray(self.local_item_by_item)
+        if np.any(rank < 0) or np.any(rank >= self.rank_count) or np.any(local < 0):
+            raise ValueError("relation placement coordinates are outside the declared domains")
+        pairs = np.stack((rank, local), axis=1)
+        if np.unique(pairs, axis=0).shape[0] != pairs.shape[0]:
+            raise ValueError("relation placement rank/local coordinates must be unique")
+        for owner in range(self.rank_count):
+            actual = np.sort(local[rank == owner])
+            expected = np.arange(actual.size, dtype=actual.dtype)
+            if not np.array_equal(actual, expected):
+                raise ValueError(f"relation placement local coordinates for rank {owner} must cover [0, count)")
+
+    @property
+    def destination_count(self) -> int:
+        return len(self.rank_by_item)
+
+    @property
+    def item_count_by_rank(self) -> tuple[int, ...]:
+        counts = np.bincount(np.asarray(self.rank_by_item), minlength=self.rank_count)
+        return tuple(int(count) for count in counts)
+
+    def coordinate(self, destination_item: int) -> tuple[int, int]:
+        if destination_item < 0 or destination_item >= self.destination_count:
+            raise ValueError(f"destination item {destination_item} is outside the placement domain")
+        return int(self.rank_by_item[destination_item]), int(self.local_item_by_item[destination_item])
+
+
+def uniform_relation_placement(*, destination_count: int, rank_count: int) -> RelationPlacement:
+    """Return one explicit contiguous candidate for an evenly sharded destination domain."""
+    if destination_count <= 0 or rank_count <= 0 or destination_count % rank_count:
+        raise ValueError("uniform relation placement requires a positive destination domain divisible by rank count")
+    local_count = destination_count // rank_count
+    return RelationPlacement(
+        rank_count=rank_count,
+        rank_by_item=tuple(destination // local_count for destination in range(destination_count)),
+        local_item_by_item=tuple(destination % local_count for destination in range(destination_count)),
+    )
+
+
+class RelationProjectionAxis(StrEnum):
+    """Logical relation coordinate used to define a physical row projection."""
+
+    LOGICAL_EDGE = "logical_edge"
+    SOURCE_ITEM = "source_item"
+    ROUTE_SLOT = "route_slot"
+    DESTINATION_ITEM = "destination_item"
+    DESTINATION_RANK = "destination_rank"
+    DESTINATION_LOCAL_ITEM = "destination_local_item"
+
+
+@dataclass(frozen=True)
+class RelationProjectionSpec:
+    """Compiler-selected grouping and payload map for physical relation rows."""
+
+    grouping_axes: tuple[RelationProjectionAxis, ...]
+    payload_axis: RelationProjectionAxis
+
+    def __post_init__(self) -> None:
+        if not self.grouping_axes or len(set(self.grouping_axes)) != len(self.grouping_axes):
+            raise ValueError("relation projection grouping axes must be non-empty and unique")
+        if any(not isinstance(axis, RelationProjectionAxis) for axis in (*self.grouping_axes, self.payload_axis)):
+            raise ValueError("relation projection axes must use RelationProjectionAxis")
+        if self.payload_axis not in self.grouping_axes and RelationProjectionAxis.LOGICAL_EDGE not in self.grouping_axes:
+            raise ValueError("relation projection payload coordinate must be determined by its grouping axes")
+
+    def maximum_row_extent(self, *, source_items: int, route_slots: int, placement: RelationPlacement) -> int:
+        """Return a routing-independent upper bound for this projection."""
+        extents = {
+            RelationProjectionAxis.LOGICAL_EDGE: source_items * route_slots,
+            RelationProjectionAxis.SOURCE_ITEM: source_items,
+            RelationProjectionAxis.ROUTE_SLOT: route_slots,
+            RelationProjectionAxis.DESTINATION_ITEM: placement.destination_count,
+            RelationProjectionAxis.DESTINATION_RANK: placement.rank_count,
+            RelationProjectionAxis.DESTINATION_LOCAL_ITEM: max(placement.item_count_by_rank, default=0),
+        }
+        if RelationProjectionAxis.LOGICAL_EDGE in self.grouping_axes:
+            return source_items * route_slots
+        if RelationProjectionAxis.SOURCE_ITEM in self.grouping_axes:
+            per_source = 1
+            for axis in self.grouping_axes:
+                if axis is not RelationProjectionAxis.SOURCE_ITEM:
+                    per_source *= extents[axis]
+            return source_items * min(route_slots, per_source)
+        result = 1
+        for axis in self.grouping_axes:
+            result *= extents[axis]
+        return min(source_items * route_slots, result)
+
+
+@dataclass(frozen=True)
+class RelationRowProjection:
+    """Concrete logical-edge to physical-row map with an exact inverse relation."""
+
+    spec: RelationProjectionSpec
+    logical_shape: tuple[int, int]
+    logical_edge_to_physical_row: np.ndarray
+    physical_row_edge_offsets: np.ndarray
+    physical_row_edges: np.ndarray
+    physical_row_valid: np.ndarray
+    physical_row_payload_coordinate: np.ndarray
+
+    @property
+    def physical_row_extent(self) -> int:
+        return int(self.physical_row_valid.shape[0])
+
+    def gather_payload(self, payload: np.ndarray) -> np.ndarray:
+        """Gather one payload value for each valid physical row."""
+        if payload.ndim == 0 or np.max(self.physical_row_payload_coordinate, initial=-1) >= payload.shape[0]:
+            raise ValueError("projection payload does not cover every physical-row coordinate")
+        output = np.zeros((self.physical_row_extent, *payload.shape[1:]), dtype=payload.dtype)
+        output[self.physical_row_valid] = payload[self.physical_row_payload_coordinate[self.physical_row_valid]]
+        return output
+
+    def expand_rows(self, rows: np.ndarray, *, fill_value: int | float = 0) -> np.ndarray:
+        """Expand physical rows back to the rectangular logical edge domain."""
+        if rows.ndim == 0 or rows.shape[0] != self.physical_row_extent:
+            raise ValueError("projected rows do not match the physical row extent")
+        source_items, route_slots = self.logical_shape
+        output = np.full((source_items * route_slots, *rows.shape[1:]), fill_value, dtype=rows.dtype)
+        valid_edges = np.flatnonzero(self.logical_edge_to_physical_row >= 0)
+        output[valid_edges] = rows[self.logical_edge_to_physical_row[valid_edges]]
+        return output.reshape(source_items, route_slots, *rows.shape[1:])
+
+
+class _RelationSegmentsContract(Protocol):
+    padding_quantum: int
+
+
+class _RelationCapacityContract(Protocol):
+    receiver_assignment_capacity: int
+    padded_local_capacity: int
+
+
+class _RelationPlanContract(Protocol):
+    """Structural inputs needed to instantiate a routed relation."""
+
+    placement: RelationPlacement
+    segments: _RelationSegmentsContract
+    capacity: _RelationCapacityContract
+
+
+def build_expert_parallel_relation_plan(
+    plan: _RelationPlanContract,
+    destination_indices: np.ndarray,
+    weights: np.ndarray,
+) -> "RelationPlan":
+    """Instantiate a relation from a plan's explicit placement contract."""
+    return build_relation_plan(
+        destination_indices,
+        weights,
+        destination_rank_by_item=np.asarray(plan.placement.rank_by_item, dtype=np.int32),
+        destination_local_item_by_item=np.asarray(plan.placement.local_item_by_item, dtype=np.int32),
+        padding_quantum=plan.segments.padding_quantum,
+        max_routes_per_rank=plan.capacity.receiver_assignment_capacity,
+        max_padded_rows_per_rank=plan.capacity.padded_local_capacity,
+    )
 
 
 @dataclass(frozen=True)
@@ -114,6 +287,8 @@ class RelationPlan:
     route_slots: int
     destination_count: int
     destination_rank_count: int
+    placement: RelationPlacement
+    source_placement: RelationPlacement
     merge_order: str
     edge_valid: np.ndarray
     source_item: np.ndarray
@@ -238,6 +413,63 @@ class RelationPlan:
         return "\n".join(lines)
 
 
+def project_relation_rows(
+    relation: RelationPlan,
+    spec: RelationProjectionSpec,
+    *,
+    physical_row_extent: int | None = None,
+) -> RelationRowProjection:
+    """Compile one explicit physical row grouping from a logical relation."""
+    valid_edges = np.flatnonzero(relation.edge_valid.reshape(-1)).astype(np.int32, copy=False)
+    axis_values = {
+        RelationProjectionAxis.LOGICAL_EDGE: np.arange(relation.source_item.shape[0], dtype=np.int32),
+        RelationProjectionAxis.SOURCE_ITEM: relation.source_item,
+        RelationProjectionAxis.ROUTE_SLOT: relation.route_slot,
+        RelationProjectionAxis.DESTINATION_ITEM: relation.destination_item,
+        RelationProjectionAxis.DESTINATION_RANK: relation.destination_rank,
+        RelationProjectionAxis.DESTINATION_LOCAL_ITEM: relation.destination_local_item,
+    }
+    keys = np.stack(tuple(axis_values[axis][valid_edges] for axis in spec.grouping_axes), axis=1)
+    if valid_edges.size:
+        _, edge_to_compact_row = np.unique(keys, axis=0, return_inverse=True)
+        compact_row_count = int(np.max(edge_to_compact_row)) + 1
+    else:
+        edge_to_compact_row = np.empty(0, dtype=np.int64)
+        compact_row_count = 0
+    if physical_row_extent is None:
+        physical_row_extent = compact_row_count
+    if physical_row_extent < compact_row_count:
+        raise ValueError(
+            f"relation projection requires {compact_row_count} rows but physical extent is {physical_row_extent}"
+        )
+
+    logical_to_physical = np.full(relation.source_item.shape[0], -1, dtype=np.int32)
+    logical_to_physical[valid_edges] = edge_to_compact_row.astype(np.int32, copy=False)
+    physical_row_valid = np.arange(physical_row_extent) < compact_row_count
+    order = np.argsort(edge_to_compact_row, kind="stable")
+    physical_row_edges = valid_edges[order]
+    row_counts = np.bincount(edge_to_compact_row, minlength=physical_row_extent).astype(np.int32, copy=False)
+    physical_row_edge_offsets = np.concatenate((np.zeros(1, dtype=np.int32), np.cumsum(row_counts, dtype=np.int32)))
+
+    payload_values = axis_values[spec.payload_axis]
+    physical_row_payload_coordinate = np.full(physical_row_extent, -1, dtype=np.int32)
+    for row in range(compact_row_count):
+        row_edges = physical_row_edges[physical_row_edge_offsets[row] : physical_row_edge_offsets[row + 1]]
+        coordinates = np.unique(payload_values[row_edges])
+        if coordinates.size != 1:
+            raise ValueError("relation projection grouped edges with different payload coordinates")
+        physical_row_payload_coordinate[row] = coordinates[0]
+    return RelationRowProjection(
+        spec=spec,
+        logical_shape=(relation.source_item_count, relation.route_slots),
+        logical_edge_to_physical_row=logical_to_physical,
+        physical_row_edge_offsets=physical_row_edge_offsets,
+        physical_row_edges=physical_row_edges,
+        physical_row_valid=physical_row_valid,
+        physical_row_payload_coordinate=physical_row_payload_coordinate,
+    )
+
+
 def build_relation_plan(
     destination_indices: np.ndarray,
     weights: np.ndarray,
@@ -245,6 +477,7 @@ def build_relation_plan(
     edge_valid: np.ndarray | None = None,
     destination_rank_by_item: np.ndarray,
     destination_local_item_by_item: np.ndarray,
+    source_placement: RelationPlacement | None = None,
     padding_quantum: int,
     max_routes_per_rank: int | None = None,
     max_padded_rows_per_rank: int | None = None,
@@ -256,6 +489,7 @@ def build_relation_plan(
         edge_valid=edge_valid,
         destination_rank_by_item=destination_rank_by_item,
         destination_local_item_by_item=destination_local_item_by_item,
+        source_placement=source_placement,
         padding_quantum=padding_quantum,
         max_routes_per_rank=max_routes_per_rank,
         max_padded_rows_per_rank=max_padded_rows_per_rank,
@@ -271,6 +505,7 @@ def build_fixed_capacity_relation_plan(
     edge_valid: np.ndarray | None = None,
     destination_rank_by_item: np.ndarray,
     destination_local_item_by_item: np.ndarray,
+    source_placement: RelationPlacement | None = None,
     destination_capacity: int,
 ) -> RelationPlan:
     """Build a routing-independent bounded relation layout.
@@ -288,6 +523,7 @@ def build_fixed_capacity_relation_plan(
         edge_valid=edge_valid,
         destination_rank_by_item=destination_rank_by_item,
         destination_local_item_by_item=destination_local_item_by_item,
+        source_placement=source_placement,
         padding_quantum=1,
         max_routes_per_rank=None,
         max_padded_rows_per_rank=None,
@@ -303,6 +539,7 @@ def _build_relation_plan(
     edge_valid: np.ndarray | None,
     destination_rank_by_item: np.ndarray,
     destination_local_item_by_item: np.ndarray,
+    source_placement: RelationPlacement | None,
     padding_quantum: int,
     max_routes_per_rank: int | None,
     max_padded_rows_per_rank: int | None,
@@ -331,6 +568,14 @@ def _build_relation_plan(
         raise RelationPlanError(reasons)
 
     source_item_count, route_slots = destination_indices.shape
+    if source_placement is None:
+        source_placement = RelationPlacement(
+            rank_count=1,
+            rank_by_item=(0,) * source_item_count,
+            local_item_by_item=tuple(range(source_item_count)),
+        )
+    elif source_placement.destination_count != source_item_count:
+        raise RelationPlanError(("source placement must cover the relation source-item domain",))
     source_item = np.repeat(np.arange(source_item_count, dtype=np.int32), route_slots)
     route_slot = np.tile(np.arange(route_slots, dtype=np.int32), source_item_count)
     destination_item = destination_indices.reshape(-1).astype(np.int32, copy=False)
@@ -394,6 +639,11 @@ def _build_relation_plan(
     row_weight[row_valid] = flat_weight[valid_routes]
 
     rank_count = int(np.max(destination_rank_by_item)) + 1
+    placement = RelationPlacement(
+        rank_count=rank_count,
+        rank_by_item=tuple(int(value) for value in destination_rank_by_item),
+        local_item_by_item=tuple(int(value) for value in destination_local_item_by_item),
+    )
     exchange_pairs = np.stack((destination_rank[valid_route_indices], source_item[valid_route_indices]), axis=1)
     if dense_exchange:
         unique_pairs = np.stack(
@@ -428,6 +678,8 @@ def _build_relation_plan(
         route_slots=route_slots,
         destination_count=destination_rank_by_item.shape[0],
         destination_rank_count=rank_count,
+        placement=placement,
+        source_placement=source_placement,
         merge_order="source_item ascending, then route_slot ascending, FP32 accumulation",
         edge_valid=edge_valid,
         source_item=source_item,
@@ -455,26 +707,6 @@ def _build_relation_plan(
         exchange_source_item=unique_pairs[:, 1].astype(np.int32, copy=False),
         exchange_destination_rank=unique_pairs[:, 0].astype(np.int32, copy=False),
         route_to_exchange_row=route_to_exchange_row,
-    )
-
-
-def build_expert_parallel_relation_plan(
-    plan: ExpertParallelPlan,
-    destination_indices: np.ndarray,
-    weights: np.ndarray,
-) -> RelationPlan:
-    """Instantiate the generic index plane from an expert-parallel plan contract."""
-    global_experts = plan.ownership.global_expert_count
-    local_experts = plan.ownership.local_expert_count
-    destination_items = np.arange(global_experts, dtype=np.int32)
-    return build_relation_plan(
-        destination_indices,
-        weights,
-        destination_rank_by_item=destination_items // local_experts,
-        destination_local_item_by_item=destination_items % local_experts,
-        padding_quantum=plan.segments.padding_quantum,
-        max_routes_per_rank=plan.capacity.receiver_assignment_capacity,
-        max_padded_rows_per_rank=plan.capacity.padded_local_capacity,
     )
 
 

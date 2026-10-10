@@ -1,35 +1,363 @@
+diff --git a/quack/epilogue/frontend.py b/quack/epilogue/frontend.py
+index 6417d2b..7529a27 100644
+--- a/quack/epilogue/frontend.py
++++ b/quack/epilogue/frontend.py
+@@ -723,7 +723,9 @@ class EpiMod:
+             transform_key,
+             # one slot for the transform's sf-side tensor: the W4 SF strip
+             # (owned) or the runtime-operand view (value mods with args)
+-            tensor_key(transform_sf if arg_sf is None else arg_sf),
++            tuple(tensor_key(value) for value in arg_sf)
++            if isinstance(arg_sf, tuple)
++            else tensor_key(transform_sf if arg_sf is None else arg_sf),
+             # Per-op host arg keys: dtypes/ranks/static widths that the
+             # compiled kernel specializes on (host_arg_key's documented
+             # role). Without these, a same-shape call with e.g. a different
+diff --git a/quack/gemm_sm90.py b/quack/gemm_sm90.py
+index 351a35c..ff0d0e1 100644
+--- a/quack/gemm_sm90.py
++++ b/quack/gemm_sm90.py
+@@ -32,6 +32,25 @@ from quack.pipeline import PipelineAsync as QuackPipelineAsync, make_pipeline_st
+ import quack.copy_utils as copy_utils
+ import quack.sm90_utils as quack_sm90_utils
+
++
++def _constant_source_tile_copy(copy_fn):
++    def copy(_source_index, destination_index, **kwargs):
++        return copy_fn(0, destination_index, **kwargs)
++
++    return copy
++
++
++def _aux_smem_struct(aux_operands, layouts):
++    if not aux_operands:
++        return cute.struct.MemRange[Int32, 0]
++    fields = {}
++    for index, (aux, layout) in enumerate(zip(aux_operands, layouts)):
++        size = cute.cosize(layout)
++        assert size * aux.dtype.width // 8 % 128 == 0, "aux staged allocations require 128-byte size"
++        fields[f"operand_{index}"] = cute.struct.Align[cute.struct.MemRange[aux.dtype, size], 128]
++    AuxSharedStorage = type("AuxSharedStorage", (), {"__annotations__": fields})
++    return cute.struct(AuxSharedStorage)
++
+ """
+ A high-performance batched dense GEMM (C = A * B) example for the NVIDIA Hopper architecture
+ using CUTE DSL.
+@@ -292,7 +311,7 @@ class GemmSm90(GemmTmaBase):
+         # install an aux A-side operand (per-stage strip riding the AB
+         # pipeline); the aux facility itself is transform-agnostic.
+         self.transform_a = None
+-        self.aux_a = None
++        self.aux_a = ()
+         if transform_a is not None:
+             self.transform_a = transform_a(self)
+             self.aux_a = self.transform_a.aux
+@@ -419,7 +438,7 @@ class GemmSm90(GemmTmaBase):
+             ),
+             # aux A-side operand (e.g. a scale strip): rides the AB stages
+             ab_extra_bytes_per_stage=(
+-                self.aux_a.bytes_per_stage() if self.aux_a is not None else 0
++                sum(aux.bytes_per_stage() for aux in self.aux_a)
+             ),
+         )
+         self.sched_stage = 2 if self.pingpong else 1
+@@ -448,8 +467,8 @@ class GemmSm90(GemmTmaBase):
+             # the transform owns A's smem layout (its storage format, not
+             # the (tile_M, tile_K) shape)
+             self.a_smem_layout_staged = self.transform_a.make_a_smem_layout_staged(self.ab_stage)
+-        self.aux_a_smem_layout_staged = (
+-            self.aux_a.make_smem_layout_staged(self.ab_stage) if self.aux_a is not None else None
++        self.aux_a_smem_layout_staged = tuple(
++            aux.make_smem_layout_staged(self.ab_stage) for aux in self.aux_a
+         )
+
+     @cute.jit
+@@ -489,14 +508,14 @@ class GemmSm90(GemmTmaBase):
+         # plain GEMMs. For layout-owning transforms blob is the repacked
+         # storage; for value transforms it is the plain (M, K) operand and
+         # continues down the standard path below.
+-        mAuxA = None
++        mAuxA = ()
+         if const_expr(isinstance(mA, TransformAOperand)):
+             assert self.transform_a is not None, "TransformAOperand requires a transform_a"
+-            mA, mAuxA = mA.blob, mA.sf
+-        if const_expr(self.aux_a is not None):
+-            assert mAuxA is not None, "the transform's aux operand needs mA.sf"
++            mA, mAuxA = mA.blob, mA.aux
++        if const_expr(bool(self.aux_a)):
++            assert len(mAuxA) == len(self.aux_a), "the transform needs one tensor per aux operand"
+         elif const_expr(self.transform_a is not None and self.transform_a.aux_raw):
+-            assert mAuxA is not None, "the transform's raw aux operand (e.g. seed) needs mA.sf"
++            assert len(mAuxA) == 1, "the transform's raw aux operand needs one bundled tensor"
+         if const_expr(not a_owned):
+             # Tensors arrive batch-first: rotate (l, x, y) -> (x, y, l) at trace time.
+             # Dense rank-2 operands get a trivial batch mode appended instead.
+@@ -582,14 +601,15 @@ class GemmSm90(GemmTmaBase):
+         if const_expr(not self.gather_A):
+             self.num_tma_load_bytes += cute.size_in_bytes(self.a_dtype, a_smem_layout)
+
+-        tma_atom_aux_a, tma_tensor_aux_a = None, None
+-        if const_expr(self.aux_a is not None):
+-            tma_atom_aux_a, tma_tensor_aux_a = self.aux_a.make_tma(mAuxA)
+-            self.num_tma_load_bytes += self.aux_a.bytes_per_stage()
++        tma_aux_a = tuple(aux.make_tma(value) for aux, value in zip(self.aux_a, mAuxA))
++        tma_atoms_aux_a = tuple(item[0] for item in tma_aux_a)
++        tma_tensors_aux_a = tuple(item[1] for item in tma_aux_a)
++        if const_expr(bool(self.aux_a)):
++            self.num_tma_load_bytes += sum(aux.bytes_per_stage() for aux in self.aux_a)
+         elif const_expr(self.transform_a is not None and self.transform_a.aux_raw):
+             # raw aux operand (e.g. a dropout seed): crosses to the kernel in
+             # the mAuxA slot untouched — no TMA atom, no smem, no pipeline
+-            tma_tensor_aux_a = mAuxA
++            tma_tensors_aux_a = mAuxA
+
+         if const_expr(self.split_k > 1):
+             assert mD is not None, "split_k requires an output tensor D"
+@@ -624,9 +644,7 @@ class GemmSm90(GemmTmaBase):
+
+         epi_smem_size = cute.cosize(self.epi_smem_layout_staged) if mD is not None else 0
+         epi_c_smem_size = cute.cosize(self.epi_c_smem_layout_staged) if mC is not None else 0
+-        aux_a_smem_size = 0
+-        if const_expr(self.aux_a is not None):
+-            aux_a_smem_size = cute.cosize(self.aux_a_smem_layout_staged)
++        aux_smem_struct = _aux_smem_struct(self.aux_a, self.aux_a_smem_layout_staged)
+
+         @cute.struct
+         class SharedStorage:
+@@ -651,12 +669,7 @@ class GemmSm90(GemmTmaBase):
+                 cute.struct.MemRange[self.b_dtype, cute.cosize(self.b_smem_layout_staged)],
+                 self.buffer_align_bytes,
+             ]
+-            sAuxA: cute.struct.Align[
+-                cute.struct.MemRange[
+-                    self.aux_a.dtype if self.aux_a is not None else Int32, aux_a_smem_size
+-                ],
+-                128,
+-            ]
++            sAuxA: aux_smem_struct
+
+         self.shared_storage = SharedStorage
+
+@@ -678,8 +691,8 @@ class GemmSm90(GemmTmaBase):
+             self.b_smem_layout_staged,
+             self.epi_smem_layout_staged,
+             self.epi_c_smem_layout_staged,
+-            tma_atom_aux_a,
+-            tma_tensor_aux_a,
++            tma_atoms_aux_a,
++            tma_tensors_aux_a,
+             self.aux_a_smem_layout_staged,
+             tile_sched_params,
+             TileSchedulerCls,
+@@ -716,9 +729,9 @@ class GemmSm90(GemmTmaBase):
+         b_smem_layout: cute.ComposedLayout,
+         epi_smem_layout: cute.ComposedLayout,
+         epi_c_smem_layout: cute.ComposedLayout,
+-        tma_atom_aux_a: Optional[cute.CopyAtom],
+-        mAuxA_mkl: Optional[cute.Tensor],
+-        aux_a_smem_layout: Optional[cute.Layout],
++        tma_atoms_aux_a,
++        mAuxA_mkl,
++        aux_a_smem_layout,
+         tile_sched_params,
+         TileSchedulerCls: cutlass.Constexpr[Callable],
+     ):
+@@ -764,7 +777,7 @@ class GemmSm90(GemmTmaBase):
+
+         # Prefetch Tma desc
+         if warp_idx == self.ab_load_warp_id:
+-            for tma_atom in (tma_atom_a, tma_atom_b, tma_atom_d, tma_atom_c, tma_atom_aux_a):
++            for tma_atom in (tma_atom_a, tma_atom_b, tma_atom_d, tma_atom_c, *tma_atoms_aux_a):
+                 if const_expr(tma_atom is not None):
+                     cpasync.prefetch_descriptor(tma_atom)
+
+@@ -813,9 +826,12 @@ class GemmSm90(GemmTmaBase):
+             # make_copy_block
+             sA = storage.sA.get_tensor(a_smem_layout)
+         sB = storage.sB.get_tensor(b_smem_layout.outer, swizzle=b_smem_layout.inner)
+-        sAuxA = None
+-        if const_expr(self.aux_a is not None):
+-            sAuxA = storage.sAuxA.get_tensor(aux_a_smem_layout)
++        sAuxA = ()
++        if const_expr(bool(self.aux_a)):
++            sAuxA = tuple(
++                getattr(storage.sAuxA, f"operand_{index}").get_tensor(layout)
++                for index, layout in enumerate(aux_a_smem_layout)
++                )
+         sD = None
+         if const_expr(has_D):
+             sD = storage.sD.get_tensor(epi_smem_layout.outer, swizzle=epi_smem_layout.inner)
+@@ -930,20 +946,25 @@ class GemmSm90(GemmTmaBase):
+                         copy_A, prefetch_A = self._make_gather_A_copy(
+                             mA_mkl, sA, varlen_manager, tile_coord_mnkl, batch_idx
+                         )
+-                    copy_AuxA = None
+-                    if const_expr(self.aux_a is not None):
+-                        # aux A-side operand: one box per k-tile alongside A/B
+-                        gAux = self.aux_a.gmem_slice(mAuxA_mkl, tile_coord_mnkl, batch_idx)
+-                        copy_AuxA = copy_utils.tma_get_block_copy_fn(
+-                            tma_atom_aux_a,
+-                            src_tensor=gAux,
+-                            dst_tensor=sAuxA,
+-                            # small-box aux operands (e.g. 128 B scale strips)
+-                            # may opt out of the A-side multicast: each CTA
+-                            # loads its own copy instead of splitting the box
+-                            tma_multicast=a_tma_multicast
+-                            if const_expr(getattr(self.aux_a, "multicast", True))
+-                            else None,
++                    copy_AuxA = []
++                    for aux, mAux, sAux, tma_atom in zip(
++                        self.aux_a, mAuxA_mkl, sAuxA, tma_atoms_aux_a
++                    ):
++                        # Each independently typed aux box arrives beside A/B
++                        # under the shared AB transaction barrier.
++                        gAux = aux.gmem_slice(mAux, tile_coord_mnkl, batch_idx)
++                        copy_aux = copy_utils.tma_get_block_copy_fn(
++                                tma_atom,
++                                src_tensor=gAux,
++                                dst_tensor=sAux,
++                                tma_multicast=(
++                                    a_tma_multicast
++                                    if const_expr(getattr(aux, "multicast", True))
++                                    else None
++                                ),
++                            )
++                        copy_AuxA.append(
++                            copy_aux if aux.stream_k_tiles else _constant_source_tile_copy(copy_aux)
+                         )
+                     # (bN, bK, RestK)
+                     gB_nk = cute.local_tile(
+@@ -967,7 +988,7 @@ class GemmSm90(GemmTmaBase):
+                         ab_producer_state = self.load_tma(
+                             ab_pipeline,
+                             ab_producer_state,
+-                            [copy_A, copy_B, copy_AuxA],
++                            [copy_A, copy_B, *copy_AuxA],
+                             k_tile_cnt,
+                             k_tile_start=k_tile_start,
+                         )
+@@ -1039,7 +1060,7 @@ class GemmSm90(GemmTmaBase):
+                         tidx,
+                         warp_group_idx,
+                         sAux=sAuxA,
+-                        mAux=mAuxA_mkl if const_expr(self.transform_a.aux_raw) else None,
++                        mAux=mAuxA_mkl[0] if const_expr(self.transform_a.aux_raw) else None,
+                     )
+                     if const_expr(transform_promote):
+                         # slow-accum transform: WGMMAs write acc as the
+diff --git a/quack/operand_transform/frontend.py b/quack/operand_transform/frontend.py
+index 82aead1..16fcf23 100644
+--- a/quack/operand_transform/frontend.py
++++ b/quack/operand_transform/frontend.py
+@@ -236,7 +236,7 @@ class TransformModBase:
+             # blob = plain (m, k) A for keys/validation, sf = the operand
+             # view (must have been built with THIS call's tile_M/tile_K; a
+             # mismatch fails at trace against the kind's fake).
+-            return ResolvedOperands(A, B, A.blob, arg_sf=A.sf, tile_k=tile_k)
++            return ResolvedOperands(A, B, A.blob, arg_sf=A.aux, tile_k=tile_k)
+         # Layout-owning: caller A = activations, caller B = the repacked blob.
+         from quack.operand_transform.host import w4_operand_views
+
+diff --git a/quack/operand_transform/host.py b/quack/operand_transform/host.py
+index 047b52f..bbcb559 100644
+--- a/quack/operand_transform/host.py
++++ b/quack/operand_transform/host.py
+@@ -141,9 +141,9 @@ def pick_w4a8_cfg(m_act: int, n_full: int) -> tuple:
+
+ def transform_a_operand(mod, A, values: dict, tile_m: int, tile_k: int = 64) -> TransformAOperand:
+     """The kernel's A operand for a value transform with runtime operands: a
+-    TransformAOperand bundle of the plain (M, K) A and the operand views the
+-    mod's ``args`` declare (kind-dispatched; one aux-delivered operand for
+-    now). ``values`` maps fn param name -> tensor; ``tile_m``/``tile_k`` must
++    TransformAOperand bundle of the plain (M, K) A and the ordered operand
++    views the mod's ``args`` declare. ``values`` maps fn param name -> tensor;
++    ``tile_m``/``tile_k`` must
+     match the launched config."""
+     args = getattr(mod, "args", ())
+     assert args, f"{getattr(mod, 'name', mod)!r} declares no runtime operands (args=)"
+@@ -151,17 +151,15 @@ def transform_a_operand(mod, A, values: dict, tile_m: int, tile_k: int = 64) ->
+         f"operand values {set(values)} must match the declared args {[n for n, _ in args]}"
+     )
+     assert A.ndim == 2, "runtime operands support the plain dense path"
+-    views = [ARG_KINDS[kind].host_view(A, values[name], tile_m, tile_k) for name, kind in args]
+-    assert len(views) == 1, "one aux-delivered operand per transform (single aux slot)"
+-    return TransformAOperand(A, views[0])
++    views = tuple(ARG_KINDS[kind].host_view(A, values[name], tile_m, tile_k) for name, kind in args)
++    return TransformAOperand(A, views)
+
+
+ def transform_a_fake_operand(mod, mA_fake, a_dtype, tile_m: int, tile_k: int) -> TransformAOperand:
+     """Trace-time counterpart of :func:`transform_a_operand`."""
+     args = getattr(mod, "args", ())
+-    fakes = [ARG_KINDS[kind].host_fake(a_dtype, tile_m, tile_k) for _name, kind in args]
+-    assert len(fakes) == 1, "one aux-delivered operand per transform (single aux slot)"
+-    return TransformAOperand(mA_fake, fakes[0])
++    fakes = tuple(ARG_KINDS[kind].host_fake(a_dtype, tile_m, tile_k) for _name, kind in args)
++    return TransformAOperand(mA_fake, fakes)
+
+
+ # ---- W4 blob / strip geometry ----------------------------------------------
+@@ -194,7 +192,8 @@ def w4_operand_views(fmt: DecodeFormat, blob, sf, tile_m: int) -> TransformAOper
+     )
+     blob_u8 = blob.view(torch.uint8) if blob.dtype != torch.uint8 else blob
+     sf_u8 = sf.view(torch.uint8) if sf is not None else None
+-    return TransformAOperand(*_w4_views(fmt, blob_u8, sf_u8, tile_m))
++    blob_view, sf_view = _w4_views(fmt, blob_u8, sf_u8, tile_m)
++    return TransformAOperand(blob_view, () if sf_view is None else (sf_view,))
+
+
+ def w4_fake_operands(fmt: DecodeFormat, n_full: int, k: int, tile_m: int) -> TransformAOperand:
+@@ -217,4 +216,5 @@ def w4_fake_operands(fmt: DecodeFormat, n_full: int, k: int, tile_m: int) -> Tra
+     fake = lambda t: cute.runtime.make_fake_tensor(
+         cutlass.Uint8, tuple(t.shape), stride=tuple(t.stride()), assumed_align=16
+     )
+-    return TransformAOperand(fake(mA_m), fake(mSFA_m) if mSFA_m is not None else None)
++    aux = () if mSFA_m is None else (fake(mSFA_m),)
++    return TransformAOperand(fake(mA_m), aux)
 diff --git a/quack/operand_transform/kinds.py b/quack/operand_transform/kinds.py
-index 4d8b01d..d7d95f1 100644
+index 4d8b01d..1687621 100644
 --- a/quack/operand_transform/kinds.py
 +++ b/quack/operand_transform/kinds.py
-@@ -64,10 +64,10 @@ class _StripAux:
+@@ -64,10 +64,12 @@ class _StripAux:
 
      multicast = False  # small boxes: dup loads beat mcast box-splitting
 
 -    def __init__(self, gemm, gran_m, gran_k):
-+    def __init__(self, gemm, gran_m, gran_k, dtype=None):
++    def __init__(self, gemm, gran_m, gran_k, dtype=None, compact_axis=None):
          self.gemm = gemm
          self.gran_m, self.gran_k = gran_m, gran_k
 -        self.dtype = gemm.mma_a_dtype
 +        self.dtype = gemm.mma_a_dtype if dtype is None else dtype
++        self.compact_axis = compact_axis
++        self.stream_k_tiles = compact_axis != "m"
 
      def _geometry(self):
          # resolved LAZILY — tile_K is 0 at transform-ctor time when the ctor
-@@ -114,10 +114,11 @@ class _StripArg:
+@@ -97,7 +99,8 @@ class _StripAux:
+
+     def gmem_slice(self, mAux, tile_coord_mnkl, batch_idx):
+         # (inner, outer, Gm, RestK, L) -> (inner, outer, RestK)
+-        return mAux[None, None, tile_coord_mnkl[0], None, batch_idx]
++        m_tile = 0 if self.compact_axis == "k" else tile_coord_mnkl[0]
++        return mAux[None, None, m_tile, None, batch_idx]
+
+
+ class _StripArg:
+@@ -114,10 +117,11 @@ class _StripArg:
      slots share a value falls out of the layout composition — any
      granularities dividing the tile work, including quad-varying ones."""
 
 -    def __init__(self, gemm, gran_m, gran_k):
-+    def __init__(self, gemm, gran_m, gran_k, dtype=None):
++    def __init__(self, gemm, gran_m, gran_k, dtype=None, compact_axis=None):
          self.gemm = gemm
          self.gran_m, self.gran_k = gran_m, gran_k  # geometry resolves lazily
 -        self.aux = _StripAux(gemm, gran_m, gran_k)
 +        self.value_dtype = gemm.mma_a_dtype if dtype is None else dtype
-+        self.aux = _StripAux(gemm, gran_m, gran_k, self.value_dtype)
++        self.aux = _StripAux(gemm, gran_m, gran_k, self.value_dtype, compact_axis)
          self._tCsS = None
          self._rvals = None
 
-@@ -148,7 +149,7 @@ class _StripArg:
+@@ -148,7 +152,7 @@ class _StripArg:
          # (duplicates share a register) and compacts the rest, so the cache
          # holds exactly the per-lane distinct values
          self._rvals = cute.make_rmem_tensor(
@@ -38,22 +366,23 @@ index 4d8b01d..d7d95f1 100644
          )
 
      @cute.jit
-@@ -188,11 +189,12 @@ class StripKind:
+@@ -188,11 +192,13 @@ class StripKind:
 
      fn_facing = True
 
 -    def __init__(self, gran_m, gran_k):
-+    def __init__(self, gran_m, gran_k, dtype=None):
++    def __init__(self, gran_m, gran_k, dtype=None, compact_axis=None):
          self.gran_m, self.gran_k = gran_m, gran_k
 +        self.dtype = dtype
++        self.compact_axis = compact_axis
 
      def device_arg(self, gemm):
 -        return _StripArg(gemm, self.gran_m, self.gran_k)
-+        return _StripArg(gemm, self.gran_m, self.gran_k, self.dtype)
++        return _StripArg(gemm, self.gran_m, self.gran_k, self.dtype, self.compact_axis)
 
      def host_view(self, A, value, tile_m, tile_k):
          """The user tensor is (outer-groups, inner-groups) row-major with the
-@@ -204,7 +206,13 @@ class StripKind:
+@@ -204,9 +210,22 @@ class StripKind:
          k-tile) — see :class:`_StripAux`)."""
          granm, g_m, grank, g_k, k_inner = strip_geometry(self.gran_m, self.gran_k, tile_m, tile_k)
          m, k = A.shape
@@ -67,30 +396,145 @@ index 4d8b01d..d7d95f1 100644
 +        assert value.element_size() == (A.element_size() if self.dtype is None else 4)
          assert value.is_contiguous(), "strip operands need a contiguous (outer, inner) tensor"
          assert m % tile_m == 0, f"M ({m}) must be divisible by tile_M ({tile_m})"
++        if self.compact_axis == "m":
++            assert value.shape == torch.Size((m,)), f"compact M-vector shape must be ({m},)"
++            return value.view(m // tile_m, tile_m).permute(1, 0).unsqueeze(1).unsqueeze(3).unsqueeze(4)
++        if self.compact_axis == "k":
++            assert k % tile_k == 0, f"compact K-vector requires K ({k}) divisible by tile_K ({tile_k})"
++            assert value.shape == torch.Size((k,)), f"compact K-vector shape must be ({k},)"
++            return value.view(k // tile_k, tile_k).permute(1, 0).unsqueeze(1).unsqueeze(2).unsqueeze(-1)
          rk = -(-k // tile_k)
-@@ -236,7 +244,8 @@ class StripKind:
+         mg, kg = m // granm, rk * g_k
+         shape = (mg, kg) if k_inner else (kg, mg)
+@@ -232,11 +251,20 @@ class StripKind:
+         _granm, g_m, _grank, g_k, k_inner = strip_geometry(self.gran_m, self.gran_k, tile_m, tile_k)
+         gm, rk = cute.sym_int(), cute.sym_int()
+         sym8 = lambda: cute.sym_int64(divisibility=8)
++        dtype = a_dtype if self.dtype is None else self.dtype
++        if self.compact_axis == "m":
++            return cute.runtime.make_fake_tensor(
++                dtype, (tile_m, 1, gm, 1, 1), stride=(1, sym8(), tile_m, 1, 1), assumed_align=16
++            )
++        if self.compact_axis == "k":
++            return cute.runtime.make_fake_tensor(
++                dtype, (tile_k, 1, 1, rk, 1), stride=(1, sym8(), sym8(), tile_k, 1), assumed_align=16
++            )
+         if k_inner:
              shape, stride = (g_k, g_m, gm, rk, 1), (1, sym8(), sym8(), g_k, 1)
          else:
              shape, stride = (g_m, g_k, gm, rk, 1), (1, sym8(), g_m, sym8(), 1)
 -        return cute.runtime.make_fake_tensor(a_dtype, shape, stride=stride, assumed_align=16)
-+        dtype = a_dtype if self.dtype is None else self.dtype
 +        return cute.runtime.make_fake_tensor(dtype, shape, stride=stride, assumed_align=16)
 
 
  class SeedKind:
-@@ -266,5 +275,7 @@ ARG_KINDS = {
+@@ -266,5 +294,11 @@ ARG_KINDS = {
      "colvec_k32": StripKind(gran_m=1, gran_k=32),
      "colvec_k16": StripKind(gran_m=1, gran_k=16),
      "kvec_m64": StripKind(gran_m=64, gran_k=1),
++    "mvec_bf16": StripKind(gran_m=1, gran_k=None, compact_axis="m"),
++    "mvec_fp32": StripKind(gran_m=1, gran_k=None, dtype=cutlass.Float32, compact_axis="m"),
++    "kvec_bf16": StripKind(gran_m=None, gran_k=1, compact_axis="k"),
++    "kvec_fp32": StripKind(gran_m=None, gran_k=1, dtype=cutlass.Float32, compact_axis="k"),
 +    "colvec_ktile_fp32": StripKind(gran_m=1, gran_k=None, dtype=cutlass.Float32),
 +    "kvec_mtile_fp32": StripKind(gran_m=None, gran_k=1, dtype=cutlass.Float32),
      "seed_i64x2": SeedKind(),
  }
 diff --git a/quack/operand_transform/transform.py b/quack/operand_transform/transform.py
-index 3a73d57..f34c669 100644
+index 3a73d57..907967b 100644
 --- a/quack/operand_transform/transform.py
 +++ b/quack/operand_transform/transform.py
-@@ -445,7 +445,7 @@ class TransformAValue(TransformA):
+@@ -30,7 +30,7 @@ seam's global ``k_tile``). There is deliberately no k-invariant colvec kind
+ layout transform.
+ """
+
+-from typing import NamedTuple, Optional
++from typing import NamedTuple
+
+ import cutlass
+ import cutlass.cute as cute
+@@ -47,13 +47,12 @@ class TransformAOperand(NamedTuple):
+     boundary as ONE bundled argument in the mA slot — the mainloop analogue
+     of EpilogueArguments: the host layer never learns the bundle's anatomy,
+     and the GEMM signature arity stays fixed for plain GEMMs. ``blob`` is
+-    the repacked storage; ``sf`` the optional aux strip (TMA'd per k-tile
+-    alongside A under the same mbarrier — see AuxOperandA). Future transform
+-    runtime operands (colvec scales, dropout seeds) become new optional
+-    fields here, not new kernel parameters."""
++    the repacked or dense storage; ``aux`` is an ordered tuple of independently
++    typed operand views. Each TMA-delivered view owns a descriptor and shared
++    buffer while all arrive under the same AB transaction barrier."""
+
+     blob: cute.Tensor
+-    sf: Optional[cute.Tensor] = None
++    aux: tuple = ()
+
+
+ class AuxOperandA:
+@@ -96,8 +95,8 @@ class TransformA:
+         ``a_bytes_per_stage``), TMA (``make_a_tma``) and gmem slicing
+         (``a_gmem_slice``), and the kernel skips (M, K)-based checks, batch
+         rotation and length derivation (M comes from D).
+-      - ``aux``: optional :class:`AuxOperandA` installed by this transform;
+-        its smem arrives in ``make_copy_block`` as ``sAux``. The aux facility
++      - ``aux``: tuple of :class:`AuxOperandA` values installed by this transform;
++        their smem arrives in ``make_copy_block`` as ``sAux``. The aux facility
+         is transform-agnostic (per-row scales for a plain bf16 GEMM could
+         ride it without any transform); a transform merely *installs* one
+         (W4's scale-factor strip).
+@@ -115,7 +114,7 @@ class TransformA:
+         WGMMA(b) and WGMMA(b+1), slot-0 preload of the next k-tile during
+         the last block) — per-block work only; the schedule is never the
+         transform's.
+-      - ``aux_raw``: the bundle's ``sf`` tensor is NOT an AuxOperandA TMA
++      - ``aux_raw``: the bundle's sole ``aux`` tensor is NOT an AuxOperandA TMA
+         operand but a small raw gmem tensor (e.g. a dropout seed) handed to
+         ``make_copy_block`` as ``mAux`` untouched — no smem, no pipeline.
+       - ``uses_work_tile``: the mainloop calls ``on_work_tile(tile_coord_mnkl)``
+@@ -138,7 +137,7 @@ class TransformA:
+     a_major_mode = cute.nvgpu.OperandMajorMode.K
+     tile_k = None  # None -> kernel default
+     owns_a_layout = False
+-    aux = None
++    aux = ()
+     aux_raw = False
+     uses_work_tile = False
+     promote = False
+@@ -233,7 +232,7 @@ class TransformAW4(TransformA):
+         if self.fmt.sf_words > 0:
+             # the format's SF words: a compressed colvec-per-k-group instance
+             # of the k-tile strip geometry, consumed inside decode_k16
+-            self.aux = AuxKTileStrip(gemm, self.fmt.sf_bytes)
++            self.aux = (AuxKTileStrip(gemm, self.fmt.sf_bytes),)
+         if const_expr(gemm.cta_tile_shape_mnk[1] <= 32):
+             # Small-N (decode) shapes are latency-bound: consumers need few
+             # regs (small acc + A frag), so shrink budgets to fit 2 CTAs/SM
+@@ -402,8 +401,8 @@ class TransformAValue(TransformA):
+     ``mod.args`` ((param_name, kind) pairs): runtime operands — the fn's
+     parameters between x and consts, each staged per element by its kind
+     (see quack.operand_transform.kinds.ARG_KINDS). At
+-    most one aux-delivered operand for now (the bundle has a single aux
+-    slot); the host passes A as a ``TransformAOperand(A, view)`` bundle
++    Each argument has its own typed aux delivery; the host passes A as a
++    ``TransformAOperand(A, views)`` bundle
+     built by :func:`quack.operand_transform.host.transform_a_operand`."""
+
+     def __init__(self, gemm, mod):
+@@ -417,10 +416,9 @@ class TransformAValue(TransformA):
+         self._arg_impls = [
+             ARG_KINDS[kind].device_arg(gemm) for _name, kind in getattr(mod, "args", ()) or ()
+         ]
+-        aux_impls = [impl for impl in self._arg_impls if getattr(impl, "aux", None) is not None]
+-        assert len(aux_impls) <= 1, "one aux-delivered operand per transform (single aux slot)"
+-        if aux_impls:
+-            self.aux = aux_impls[0].aux
++        self.aux = tuple(
++            impl.aux for impl in self._arg_impls if getattr(impl, "aux", None) is not None
++        )
+
+     @cute.jit
+     def _apply_block(self, buf, b, mma_m, consts):
+@@ -445,7 +443,7 @@ class TransformAValue(TransformA):
                      # per-element operand values, staged from the kind's
                      # register cache (folds to selects; fragment dtype so
                      # the fn math stays packed)
@@ -99,3 +543,25 @@ index 3a73d57..f34c669 100644
                      for i in cutlass.range_constexpr(vec):
                          sv[i] = impl.element(coords[c * vec + i], m, b)
                      args.append(sv.load())
+@@ -468,8 +466,11 @@ class TransformAValue(TransformA):
+             consts = self.mod.consts()  # hoisted: once per kernel
+         load_block = canonical_a_load_s2r(tiled_mma, sA, tidx, tCrA, position_independent=True)
+         mma_m = const_expr(cute.size(tCrA.shape[1]))
++        aux_index = 0
+         for impl in self._arg_impls:
+-            impl.setup(tiled_mma, tidx, mma_m, sAux)
++            impl_aux = getattr(impl, "aux", None)
++            impl.setup(tiled_mma, tidx, mma_m, sAux[aux_index] if impl_aux is not None else None)
++            aux_index += int(impl_aux is not None)
+
+         def copy_block(stage_idx, b, k_tile=None):
+             for impl in self._arg_impls:
+@@ -564,7 +565,7 @@ class TransformADropout(TransformA):
+         gemm = self.gemm
+         tile_m, tile_k = gemm.cta_tile_shape_mnk[0], gemm.cta_tile_shape_mnk[2]
+         assert tile_k % 32 == 0, "dropout groups span 32 k"
+-        assert mAux is not None, "dropout needs the (2,) int64 [seed, offset] via mA.sf"
++        assert mAux is not None, "dropout needs the (2,) int64 [seed, offset] via mA.aux"
+         load_block = canonical_a_load_s2r(tiled_mma, sA, tidx, tCrA, position_independent=True)
+         base = rng.b16_base_pattern(gemm.mma_a_dtype)
+         t = self.mod.threshold

@@ -36,6 +36,15 @@ struct GpuRunnerResources {
   uint64_t temporaryBytes;
 };
 
+// Host stage durations in nanoseconds. Enqueue includes FFI argument
+// preparation and kernel submission; completion is the remaining wait for the
+// stream.
+struct GpuRunnerHostProfile {
+  int64_t frameNanoseconds;
+  int64_t enqueueNanoseconds;
+  int64_t completionNanoseconds;
+};
+
 // Owns one prepared and initialized target-bound Shuttle GPU invocation.
 // The caller-owned allocator and stream must outlive the runner.
 class GpuRunner {
@@ -59,9 +68,12 @@ public:
   absl::Status Execute(llvm::ArrayRef<GpuRunnerBuffer> operands,
                        llvm::ArrayRef<GpuRunnerBuffer> results);
   // Measures only the stream interval containing the sealed launch graph.
-  absl::StatusOr<int64_t>
-  ExecuteTimed(llvm::ArrayRef<GpuRunnerBuffer> operands,
-               llvm::ArrayRef<GpuRunnerBuffer> results);
+  absl::StatusOr<int64_t> ExecuteTimed(llvm::ArrayRef<GpuRunnerBuffer> operands,
+                                       llvm::ArrayRef<GpuRunnerBuffer> results);
+  // Profiles the synchronous host path without inserting device timer events.
+  absl::StatusOr<GpuRunnerHostProfile>
+  ExecuteProfiled(llvm::ArrayRef<GpuRunnerBuffer> operands,
+                  llvm::ArrayRef<GpuRunnerBuffer> results);
   // Retries a failed Execute completion fence without enqueueing new work.
   absl::Status AwaitCompletion();
   const GpuRunnerResources &resources() const;

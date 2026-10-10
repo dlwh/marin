@@ -3,13 +3,21 @@
 
 #include "shuttle/IR/ShuttleDialect.h"
 
+#include <array>
 #include <cstddef>
 #include <limits>
+#include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
+#include "mlir/Analysis/FlatLinearValueConstraints.h"
+#include "mlir/Analysis/Presburger/IntegerRelation.h"
+#include "mlir/Analysis/Presburger/Matrix.h"
+#include "mlir/Analysis/Presburger/PWMAFunction.h"
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -73,6 +81,92 @@ std::optional<int64_t> optionalIntegerAttribute(Operation *operation,
 
 SmallVector<int64_t> integerArray(DenseI64ArrayAttr attribute) {
   return SmallVector<int64_t>(attribute.asArrayRef());
+}
+
+FailureOr<presburger::IntegerPolyhedron>
+boundedEventDomain(ArrayRef<int64_t> shape,
+                   std::optional<IntegerSet> predicate) {
+  if (shape.empty() ||
+      llvm::any_of(shape, [](int64_t extent) { return extent <= 0; }))
+    return failure();
+  presburger::IntegerPolyhedron domain(
+      presburger::PresburgerSpace::getSetSpace(shape.size()));
+  for (auto [axis, extent] : llvm::enumerate(shape)) {
+    domain.addBound(presburger::BoundType::LB, axis, 0);
+    domain.addBound(presburger::BoundType::UB, axis, extent - 1);
+  }
+  if (!predicate)
+    return domain;
+  if (predicate->getNumDims() != shape.size() ||
+      predicate->getNumSymbols() != 0)
+    return failure();
+  std::vector<SmallVector<int64_t, 8>> flattened;
+  FlatLinearConstraints localConstraints;
+  if (failed(
+          getFlattenedAffineExprs(*predicate, &flattened, &localConstraints)))
+    return failure();
+  FlatLinearValueConstraints predicateConstraints(*predicate);
+  return domain.intersect(predicateConstraints);
+}
+
+FailureOr<presburger::MultiAffineFunction> multiAffineFunction(AffineMap map) {
+  presburger::MultiAffineFunction function(
+      presburger::PresburgerSpace::getRelationSpace(),
+      presburger::IntMatrix(/*rows=*/0, /*columns=*/1));
+  if (failed(getMultiAffineFunctionFromMap(map, function)))
+    return failure();
+  return function;
+}
+
+FailureOr<bool> affineMapIsInBounds(AffineMap map,
+                                    const presburger::IntegerPolyhedron &domain,
+                                    ArrayRef<int64_t> rangeShape) {
+  if (map.getNumDims() != domain.getNumDimVars() || map.getNumSymbols() != 0 ||
+      map.getNumResults() != rangeShape.size() || rangeShape.empty() ||
+      llvm::any_of(rangeShape, [](int64_t extent) { return extent <= 0; }))
+    return failure();
+  FailureOr<presburger::MultiAffineFunction> function =
+      multiAffineFunction(map);
+  if (failed(function))
+    return failure();
+  presburger::IntegerRelation graph = function->getAsRelation();
+  graph.intersectDomain(domain);
+  presburger::IntegerPolyhedron image = graph.getRangeSet();
+  presburger::IntegerPolyhedron bounds(
+      presburger::PresburgerSpace::getSetSpace(rangeShape.size()));
+  for (auto [axis, extent] : llvm::enumerate(rangeShape)) {
+    bounds.addBound(presburger::BoundType::LB, axis, 0);
+    bounds.addBound(presburger::BoundType::UB, axis, extent - 1);
+  }
+  return image.isSubsetOf(bounds);
+}
+
+LogicalResult verifyEventIndexAndSlotRanges(EventTensorOp event,
+                                            ScheduleTaskOp producer,
+                                            ScheduleTaskOp consumer) {
+  FailureOr<presburger::IntegerPolyhedron> domain = boundedEventDomain(
+      event.getRelationDomainShape(), event.getRelationPredicate());
+  if (failed(domain))
+    return event.emitOpError("has an unsupported or unbounded relation domain");
+  FailureOr<bool> producerInBounds = affineMapIsInBounds(
+      event.getProducerIndices(), *domain, producer.getGridShape());
+  if (failed(producerInBounds) || !*producerInBounds)
+    return event.emitOpError("producer index map escapes the producer grid");
+  FailureOr<bool> consumerInBounds = affineMapIsInBounds(
+      event.getConsumerIndices(), *domain, consumer.getGridShape());
+  if (failed(consumerInBounds) || !*consumerInBounds)
+    return event.emitOpError("consumer index map escapes the consumer grid");
+  const uint64_t storageCapacity = event.getStorageCapacity();
+  if (storageCapacity == 0 ||
+      storageCapacity >
+          static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+    return event.emitOpError("requires positive Event storage capacity");
+  std::array<int64_t, 1> storageShape{static_cast<int64_t>(storageCapacity)};
+  FailureOr<bool> slotInBounds =
+      affineMapIsInBounds(event.getStorageSlot(), *domain, storageShape);
+  if (failed(slotInBounds) || !*slotInBounds)
+    return event.emitOpError("storage-slot map escapes Event storage");
+  return success();
 }
 
 LogicalResult verifyStringArray(Operation *owner, ArrayAttr values,
@@ -211,6 +305,30 @@ LogicalResult verifyMapIndexingMaps(MapOp map, TypeRange indexedTypes) {
   SmallVector<std::pair<unsigned, int64_t>> boundedZeroDivisors;
   bool hasRankedTensor = false;
   bool resultMapProjectsDomain = false;
+  AffineMap expectedReshapeInput;
+  if (map.getSemantics() == MapSemantics::Reshape) {
+    auto input = dyn_cast<RankedTensorType>(map.getInputs().front().getType());
+    auto result =
+        dyn_cast<RankedTensorType>(map.getResults().front().getType());
+    if (!input || !result || !input.hasStaticShape() ||
+        !result.hasStaticShape() ||
+        input.getNumElements() != result.getNumElements()) {
+      return map.emitOpError("requires equal-size static reshape types");
+    }
+    MLIRContext *context = map.getContext();
+    AffineExpr linear = getAffineConstantExpr(0, context);
+    for (auto [dimension, extent] : llvm::enumerate(result.getShape()))
+      linear = linear * extent + getAffineDimExpr(dimension, context);
+    SmallVector<AffineExpr> coordinates(input.getRank());
+    int64_t stride = 1;
+    for (int64_t dimension = input.getRank() - 1; dimension >= 0; --dimension) {
+      int64_t extent = input.getDimSize(dimension);
+      coordinates[dimension] = linear.floorDiv(stride) % extent;
+      stride *= extent;
+    }
+    expectedReshapeInput =
+        AffineMap::get(result.getRank(), 0, coordinates, context);
+  }
   size_t mapPosition = 0;
   for (auto [mapAttribute, indexedType] :
        llvm::zip_equal(indexingMaps, indexedTypes)) {
@@ -239,6 +357,12 @@ LogicalResult verifyMapIndexingMaps(MapOp map, TypeRange indexedTypes) {
     }
 
     hasRankedTensor = true;
+    if (!isResultMap && map.getSemantics() == MapSemantics::Reshape) {
+      if (indexingMap != expectedReshapeInput)
+        return map.emitOpError(
+            "reshape input indexing must preserve contiguous linear order");
+      continue;
+    }
     for (auto [resultPosition, expression] :
          llvm::enumerate(indexingMap.getResults())) {
       auto dimension = dyn_cast<AffineDimExpr>(expression);
@@ -381,6 +505,88 @@ LogicalResult verifyContractMaps(ContractOp contract, TypeRange indexedTypes) {
   return success();
 }
 
+LogicalResult verifyFoldIndexingMaps(FoldOp fold, TypeRange indexedTypes) {
+  ArrayAttr indexingMaps = fold.getIndexingMaps();
+  if (failed(verifyIndexingMaps(fold, indexingMaps, indexedTypes))) {
+    return failure();
+  }
+  if (indexingMaps.empty()) {
+    return fold.emitOpError("requires non-empty indexing maps");
+  }
+
+  AffineMap domain = cast<AffineMapAttr>(indexingMaps[0]).getValue();
+  llvm::SmallDenseSet<int64_t> reductionDimensions;
+  for (int64_t dimension : fold.getReductionDimensions()) {
+    if (dimension < 0 ||
+        dimension >= static_cast<int64_t>(domain.getNumDims()) ||
+        !reductionDimensions.insert(dimension).second) {
+      return fold.emitOpError(
+          "reduction dimensions must be unique dimensions of the indexing "
+          "domain");
+    }
+  }
+
+  SmallVector<int64_t> domainExtents(domain.getNumDims(), ShapedType::kDynamic);
+  const size_t inputCount = fold.getInputs().size();
+  size_t position = 0;
+  for (auto [mapAttribute, indexedTypeValue] :
+       llvm::zip_equal(indexingMaps, indexedTypes)) {
+    auto indexedType = dyn_cast<RankedTensorType>(indexedTypeValue);
+    AffineMap map = cast<AffineMapAttr>(mapAttribute).getValue();
+    if (!indexedType) {
+      return fold.emitOpError("requires ranked tensor inputs and results");
+    }
+    if (map.getNumSymbols() != 0 || !map.isProjectedPermutation()) {
+      return fold.emitOpError(
+          "indexing maps must be projected permutations of direct domain "
+          "dimensions without symbols");
+    }
+
+    llvm::SmallDenseSet<unsigned> mappedDimensions;
+    for (auto [resultPosition, expression] :
+         llvm::enumerate(map.getResults())) {
+      auto dimension = dyn_cast<AffineDimExpr>(expression);
+      if (!dimension ||
+          !mappedDimensions.insert(dimension.getPosition()).second) {
+        return fold.emitOpError(
+            "indexing maps must contain each direct domain dimension at "
+            "most once");
+      }
+      const int64_t extent = indexedType.getDimSize(resultPosition);
+      if (ShapedType::isDynamic(extent)) {
+        continue;
+      }
+      int64_t &knownExtent = domainExtents[dimension.getPosition()];
+      if (!ShapedType::isDynamic(knownExtent) && knownExtent != extent) {
+        return fold.emitOpError(
+            "indexing maps bind one domain dimension to inconsistent static "
+            "extents");
+      }
+      knownExtent = extent;
+    }
+
+    const bool isInput = position < inputCount;
+    for (unsigned dimension = 0; dimension < domain.getNumDims(); ++dimension) {
+      const bool isReduction = reductionDimensions.contains(dimension);
+      const bool isMapped = mappedDimensions.contains(dimension);
+      if (isInput && isReduction && !isMapped) {
+        return fold.emitOpError(
+            "each input indexing map must cover every reduction dimension");
+      }
+      if (!isInput && isReduction && isMapped) {
+        return fold.emitOpError(
+            "result indexing maps must project every reduction dimension");
+      }
+      if (!isInput && !isReduction && !isMapped) {
+        return fold.emitOpError(
+            "result indexing maps must cover every non-reduction dimension");
+      }
+    }
+    ++position;
+  }
+  return success();
+}
+
 bool mapContainsDimension(AffineMap map, unsigned dimension) {
   return llvm::any_of(map.getResults(), [dimension](AffineExpr expression) {
     auto dimExpression = dyn_cast<AffineDimExpr>(expression);
@@ -442,11 +648,15 @@ LogicalResult verifyDotGeneralElementTypes(ContractOp contract) {
     return contract.emitOpError(
         "dot_general supports only bf16 or f32 operand elements");
   }
-  if (!accumulator.isF32()) {
-    return contract.emitOpError("dot_general requires an f32 accumulator");
+  if (!resultElement.isF32() && !resultElement.isBF16()) {
+    return contract.emitOpError(
+        "dot_general supports only bf16 or f32 result elements");
   }
-  if (!resultElement.isF32()) {
-    return contract.emitOpError("dot_general requires f32 result elements");
+  // This is the source accumulation declaration. A physical implementation's
+  // accumulation precision belongs to its separately checked realization.
+  if (accumulator != resultElement) {
+    return contract.emitOpError(
+        "dot_general source accumulator type must match result elements");
   }
   return success();
 }
@@ -490,6 +700,173 @@ LogicalResult RegionOp::verifyRegions() {
   }
   if (getSourceRefs().empty()) {
     return emitOpError("requires at least one declared source reference");
+  }
+  return success();
+}
+
+LogicalResult ScanOp::verifyRegions() {
+  if (failed(verifySingleBlockRegion(*this, getBody()))) {
+    return failure();
+  }
+  if (getExtent() <= 0) {
+    return emitOpError("requires a positive ordered extent");
+  }
+  if (getAxis() < 0) {
+    return emitOpError("requires a nonnegative logical axis identifier");
+  }
+  if (getStateOperands().empty()) {
+    return emitOpError("requires at least one carried state");
+  }
+  if (getStateOperands().size() != getStateBodyArguments().size() ||
+      getStateOperands().size() != getStateBodyResults().size() ||
+      getStateOperands().size() != getStateResults().size()) {
+    return emitOpError("state boundary bindings must align");
+  }
+  if (getInvariantOperands().size() != getInvariantBodyArguments().size()) {
+    return emitOpError("invariant boundary bindings must align");
+  }
+  if (getScannedOperands().size() != getScannedBodyArguments().size() ||
+      getScannedOperands().size() != getScannedDimensions().size()) {
+    return emitOpError("scanned boundary bindings must align");
+  }
+  if (getEmittedResults().size() != getEmittedBodyResults().size() ||
+      getEmittedResults().size() != getEmittedDimensions().size()) {
+    return emitOpError("emitted boundary bindings must align");
+  }
+
+  auto verifyPartition = [&](ArrayRef<int64_t> first,
+                             ArrayRef<int64_t> second,
+                             ArrayRef<int64_t> third, int64_t size,
+                             StringRef description) -> LogicalResult {
+    SmallVector<bool> seen(size, false);
+    for (ArrayRef<int64_t> group : {first, second, third}) {
+      for (int64_t index : group) {
+        if (index < 0 || index >= size || seen[index]) {
+          return emitOpError() << description
+                               << " bindings must be a disjoint in-range partition";
+        }
+        seen[index] = true;
+      }
+    }
+    if (llvm::is_contained(seen, false)) {
+      return emitOpError() << description
+                           << " bindings must cover every value";
+    }
+    return success();
+  };
+  if (failed(verifyPartition(getStateOperands(), getInvariantOperands(),
+                             getScannedOperands(), getInputs().size(),
+                             "input")) ||
+      failed(verifyPartition(getStateResults(), getEmittedResults(), {},
+                             getResults().size(), "result"))) {
+    return failure();
+  }
+
+  for (Attribute source : getSources()) {
+    if (!isa<SourceRefAttr>(source)) {
+      return emitOpError(
+          "sources must contain only #shuttle.source_ref attributes");
+    }
+  }
+  if (getSources().empty()) {
+    return emitOpError("requires complete nonempty source provenance");
+  }
+  if (auto resultSources = getResultSourcesAttr()) {
+    if (resultSources.size() != getResults().size()) {
+      return emitOpError("result_sources must align with Scan results");
+    }
+    for (Attribute source : resultSources) {
+      if (!isa<SourceRefAttr>(source) ||
+          !llvm::is_contained(getSources(), source)) {
+        return emitOpError(
+            "result_sources must be source references contained in sources");
+      }
+    }
+  }
+  if (auto erased = getErasedTerminatorRecordsAttr()) {
+    for (Attribute attribute : erased) {
+      auto record = dyn_cast<DictionaryAttr>(attribute);
+      if (!record || !record.get("operation_ref") ||
+          !record.getAs<ArrayAttr>("operands") ||
+          !record.getAs<DictionaryAttr>("fingerprint")) {
+        return emitOpError(
+            "erased_terminator_records must contain structural provenance records");
+      }
+    }
+  }
+
+  Block &body = getBody().front();
+  auto yield = cast<YieldOp>(body.getTerminator());
+  if (failed(verifyPartition(getStateBodyArguments(),
+                             getInvariantBodyArguments(),
+                             getScannedBodyArguments(),
+                             body.getNumArguments(), "body argument")) ||
+      failed(verifyPartition(getStateBodyResults(), getEmittedBodyResults(),
+                             {}, yield.getValues().size(), "body result"))) {
+    return failure();
+  }
+
+  for (auto [operandIndex, bodyArgumentIndex, bodyResultIndex, resultIndex] :
+       llvm::zip_equal(getStateOperands(), getStateBodyArguments(),
+                       getStateBodyResults(), getStateResults())) {
+    Type initialType = getInputs()[operandIndex].getType();
+    if (initialType != getResults()[resultIndex].getType() ||
+        initialType != body.getArgument(bodyArgumentIndex).getType() ||
+        initialType != yield.getValues()[bodyResultIndex].getType()) {
+      return emitOpError(
+          "carried-state types must agree across the Scan boundary");
+    }
+  }
+  for (auto [operandIndex, bodyArgumentIndex] :
+       llvm::zip_equal(getInvariantOperands(), getInvariantBodyArguments())) {
+    if (getInputs()[operandIndex].getType() !=
+        body.getArgument(bodyArgumentIndex).getType()) {
+      return emitOpError("invariant body argument type must equal its input type");
+    }
+  }
+
+  auto sliceType = [&](Type outerType,
+                       int64_t dimension) -> RankedTensorType {
+    auto outer = dyn_cast<RankedTensorType>(outerType);
+    if (!outer || !outer.hasStaticShape() || dimension < 0 ||
+        dimension >= outer.getRank() ||
+        outer.getDimSize(dimension) != getExtent()) {
+      return {};
+    }
+    SmallVector<int64_t> shape(outer.getShape());
+    shape.erase(shape.begin() + dimension);
+    return RankedTensorType::get(shape, outer.getElementType(),
+                                 outer.getEncoding());
+  };
+  for (auto [operandIndex, bodyArgumentIndex, dimension] : llvm::zip_equal(
+           getScannedOperands(), getScannedBodyArguments(),
+           getScannedDimensions())) {
+    RankedTensorType expected =
+        sliceType(getInputs()[operandIndex].getType(), dimension);
+    if (!expected || expected != body.getArgument(bodyArgumentIndex).getType()) {
+      return emitOpError(
+          "scanned body argument must remove one ordered input dimension");
+    }
+  }
+  for (auto [bodyResultIndex, resultIndex, dimension] : llvm::zip_equal(
+           getEmittedBodyResults(), getEmittedResults(),
+           getEmittedDimensions())) {
+    RankedTensorType expected =
+        sliceType(getResults()[resultIndex].getType(), dimension);
+    if (!expected || expected != yield.getValues()[bodyResultIndex].getType()) {
+      return emitOpError(
+          "emitted body value must remove one ordered result dimension");
+    }
+  }
+
+  for (Operation &operation : body.without_terminator()) {
+    if (!isa<MapOp, FoldOp, ContractOp, RelationOp, SelectionOp>(operation)) {
+      return operation.emitOpError(
+          "is not a generic algebra operation supported in a Scan body");
+    }
+    if (!isMemoryEffectFree(&operation)) {
+      return operation.emitOpError("must have proven no memory effects");
+    }
   }
   return success();
 }
@@ -558,6 +935,16 @@ LogicalResult ContractOp::verify() {
   if (getPrecision().size() != getInputs().size()) {
     return emitOpError("requires one precision entry per input");
   }
+  if (auto form = (*this)->getAttrOfType<StringAttr>("source_precision_form")) {
+    if ((form.getValue() != "omitted" && form.getValue() != "empty") ||
+        llvm::any_of(getPrecision(), [](Attribute precision) {
+          return cast<StringAttr>(precision).getValue() != "DEFAULT";
+        })) {
+      return emitOpError(
+          "source precision form must be omitted or empty with DEFAULT "
+          "precision for every input");
+    }
+  }
   if (getAlgorithm() != "dot_general") {
     return emitOpError("supports only the 'dot_general' algorithm");
   }
@@ -587,15 +974,18 @@ LogicalResult RelationOp::verify() {
     }
     inputs.push_back(inputType);
   }
-  const size_t expectedInputs = (getSemantics() == RelationSemantics::Iota ||
-                                 getSemantics() == RelationSemantics::Constant)
-                                    ? 0
-                                : (getSemantics() == RelationSemantics::Add ||
-                                   getSemantics() == RelationSemantics::Compare)
-                                    ? 2
-                                : getSemantics() == RelationSemantics::Select
-                                    ? 3
-                                    : 1;
+  const size_t expectedInputs =
+      (getSemantics() == RelationSemantics::Iota ||
+       getSemantics() == RelationSemantics::Constant)
+          ? 0
+      : (getSemantics() == RelationSemantics::Add ||
+         getSemantics() == RelationSemantics::Compare ||
+         getSemantics() == RelationSemantics::Multiply ||
+         getSemantics() == RelationSemantics::Gather ||
+         getSemantics() == RelationSemantics::IndexedContributions)
+          ? 2
+      : getSemantics() == RelationSemantics::Select ? 3
+                                                    : 1;
   if (getInputs().size() != expectedInputs) {
     return emitOpError("has input arity inconsistent with its semantics");
   }
@@ -606,7 +996,12 @@ LogicalResult RelationOp::verify() {
       : getSemantics() == RelationSemantics::BroadcastInDim
           ? cast<RankedTensorType>(getInputs().front().getType()).getRank()
       : getSemantics() == RelationSemantics::Compare ? 2
-                                                     : 0;
+      : getSemantics() == RelationSemantics::Slice   ? 3
+      : (getSemantics() == RelationSemantics::Transpose ||
+         getSemantics() == RelationSemantics::Gather ||
+         getSemantics() == RelationSemantics::IndexedContributions)
+          ? 1
+          : 0;
   if (getParameters().size() != expectedParameters) {
     return emitOpError("has parameter arity inconsistent with its semantics");
   }
@@ -626,9 +1021,10 @@ LogicalResult RelationOp::verify() {
     }
   } else if (getSemantics() == RelationSemantics::Constant) {
     auto value = integerParameter(0);
-    if (result.getRank() != 0 || !result.getElementType().isInteger(32) ||
+    if ((!result.getElementType().isInteger(32) &&
+         !result.getElementType().isInteger(1)) ||
         !value || value.getType() != result.getElementType()) {
-      return emitOpError("requires one scalar i32 constant value");
+      return emitOpError("requires one splat i32 or i1 constant value");
     }
   } else if (getSemantics() == RelationSemantics::Reshape) {
     if (!inputs[0].hasStaticShape() || !result.hasStaticShape() ||
@@ -658,7 +1054,8 @@ LogicalResult RelationOp::verify() {
         return emitOpError("has a non-broadcast-compatible dimension");
       }
     }
-  } else if (getSemantics() == RelationSemantics::Add) {
+  } else if (getSemantics() == RelationSemantics::Add ||
+             getSemantics() == RelationSemantics::Multiply) {
     if (inputs[0] != inputs[1] || inputs[0] != result ||
         !result.getElementType().isInteger(32)) {
       return emitOpError("requires same-shaped i32 inputs and result");
@@ -686,8 +1083,308 @@ LogicalResult RelationOp::verify() {
   } else if (getSemantics() == RelationSemantics::Select) {
     if (inputs[0].getShape() != result.getShape() ||
         !inputs[0].getElementType().isInteger(1) || inputs[1] != result ||
-        inputs[2] != result || !result.getElementType().isF32()) {
-      return emitOpError("requires an i1 predicate and same-shaped f32 values");
+        inputs[2] != result ||
+        (!result.getElementType().isF32() &&
+         !result.getElementType().isInteger(32))) {
+      return emitOpError(
+          "requires an i1 predicate and same-shaped f32 or i32 values");
+    }
+  } else if (getSemantics() == RelationSemantics::Slice) {
+    auto starts = dyn_cast<DenseI64ArrayAttr>(getParameters()[0]);
+    auto limits = dyn_cast<DenseI64ArrayAttr>(getParameters()[1]);
+    auto strides = dyn_cast<DenseI64ArrayAttr>(getParameters()[2]);
+    if (!inputs[0].hasStaticShape() || !result.hasStaticShape() ||
+        !inputs[0].getElementType().isInteger(32) ||
+        result.getElementType() != inputs[0].getElementType() || !starts ||
+        !limits || !strides ||
+        starts.size() != static_cast<size_t>(inputs[0].getRank()) ||
+        limits.size() != starts.size() || strides.size() != starts.size()) {
+      return emitOpError("requires a static i32 slice with full rank metadata");
+    }
+    for (auto [dimension, start, limit, stride] : llvm::zip_equal(
+             llvm::seq<int64_t>(0, inputs[0].getRank()), starts.asArrayRef(),
+             limits.asArrayRef(), strides.asArrayRef())) {
+      if (start < 0 || limit < start ||
+          limit > inputs[0].getDimSize(dimension) || stride <= 0 ||
+          result.getDimSize(dimension) !=
+              (limit - start + stride - 1) / stride) {
+        return emitOpError("has invalid static slice bounds or result shape");
+      }
+    }
+  } else if (getSemantics() == RelationSemantics::Transpose) {
+    auto permutation = dyn_cast<DenseI64ArrayAttr>(getParameters()[0]);
+    if (!inputs[0].hasStaticShape() || !result.hasStaticShape() ||
+        !inputs[0].getElementType().isInteger(32) ||
+        result.getElementType() != inputs[0].getElementType() ||
+        inputs[0].getRank() != result.getRank() || !permutation ||
+        permutation.size() != static_cast<size_t>(inputs[0].getRank())) {
+      return emitOpError("requires a static rank-preserving i32 transpose");
+    }
+    llvm::SmallDenseSet<int64_t> dimensions;
+    for (auto [resultDimension, inputDimension] :
+         llvm::enumerate(permutation.asArrayRef())) {
+      if (inputDimension < 0 || inputDimension >= inputs[0].getRank() ||
+          !dimensions.insert(inputDimension).second ||
+          result.getDimSize(resultDimension) !=
+              inputs[0].getDimSize(inputDimension)) {
+        return emitOpError("has an invalid transpose permutation or shape");
+      }
+    }
+  } else if (getSemantics() == RelationSemantics::Gather) {
+    auto metadata = dyn_cast<DictionaryAttr>(getParameters()[0]);
+    auto offsetDims = metadata
+                          ? metadata.getAs<DenseI64ArrayAttr>("offset_dims")
+                          : DenseI64ArrayAttr{};
+    auto collapsedSliceDims =
+        metadata ? metadata.getAs<DenseI64ArrayAttr>("collapsed_slice_dims")
+                 : DenseI64ArrayAttr{};
+    auto operandBatchingDims =
+        metadata ? metadata.getAs<DenseI64ArrayAttr>("operand_batching_dims")
+                 : DenseI64ArrayAttr{};
+    auto startIndicesBatchingDims =
+        metadata
+            ? metadata.getAs<DenseI64ArrayAttr>("start_indices_batching_dims")
+            : DenseI64ArrayAttr{};
+    auto startIndexMap =
+        metadata ? metadata.getAs<DenseI64ArrayAttr>("start_index_map")
+                 : DenseI64ArrayAttr{};
+    auto indexVectorDim = metadata
+                              ? metadata.getAs<IntegerAttr>("index_vector_dim")
+                              : IntegerAttr{};
+    auto sliceSizes = metadata
+                          ? metadata.getAs<DenseI64ArrayAttr>("slice_sizes")
+                          : DenseI64ArrayAttr{};
+    auto indicesAreSorted =
+        metadata ? metadata.getAs<BoolAttr>("indices_are_sorted") : BoolAttr{};
+    auto validUniqueDimensions = [](DenseI64ArrayAttr values, int64_t rank) {
+      llvm::SmallDenseSet<int64_t> unique;
+      return values && llvm::all_of(values.asArrayRef(), [&](int64_t value) {
+               return value >= 0 && value < rank && unique.insert(value).second;
+             });
+    };
+    if (!metadata || metadata.size() != 8 || !inputs[0].hasStaticShape() ||
+        !inputs[1].hasStaticShape() || !result.hasStaticShape() ||
+        inputs[0].getElementType() != result.getElementType() ||
+        !inputs[1].getElementType().isInteger(32) || !indexVectorDim ||
+        indexVectorDim.getInt() < 0 ||
+        indexVectorDim.getInt() > inputs[1].getRank() || !indicesAreSorted ||
+        !validUniqueDimensions(offsetDims, result.getRank()) ||
+        !validUniqueDimensions(collapsedSliceDims, inputs[0].getRank()) ||
+        !validUniqueDimensions(operandBatchingDims, inputs[0].getRank()) ||
+        !validUniqueDimensions(startIndicesBatchingDims, inputs[1].getRank()) ||
+        !validUniqueDimensions(startIndexMap, inputs[0].getRank()) ||
+        !sliceSizes ||
+        sliceSizes.size() != static_cast<size_t>(inputs[0].getRank()) ||
+        operandBatchingDims.size() != startIndicesBatchingDims.size()) {
+      return emitOpError(
+          "requires complete, in-range static gather relation metadata");
+    }
+    const int64_t indexVectorSize =
+        indexVectorDim.getInt() == inputs[1].getRank()
+            ? 1
+            : inputs[1].getDimSize(indexVectorDim.getInt());
+    if (startIndexMap.size() != static_cast<size_t>(indexVectorSize)) {
+      return emitOpError(
+          "requires start_index_map to match the index-vector extent");
+    }
+    if (offsetDims.size() + collapsedSliceDims.size() +
+            operandBatchingDims.size() !=
+        static_cast<size_t>(inputs[0].getRank())) {
+      return emitOpError(
+          "requires offset, collapsed-slice, and operand-batching dimensions "
+          "to partition the operand rank");
+    }
+    if (!llvm::is_sorted(offsetDims.asArrayRef()) ||
+        !llvm::is_sorted(collapsedSliceDims.asArrayRef()) ||
+        !llvm::is_sorted(operandBatchingDims.asArrayRef())) {
+      return emitOpError(
+          "requires sorted offset, collapsed-slice, and operand-batching "
+          "dimensions");
+    }
+    auto intersects = [](DenseI64ArrayAttr lhs, DenseI64ArrayAttr rhs) {
+      return llvm::any_of(lhs.asArrayRef(), [&](int64_t value) {
+        return llvm::is_contained(rhs.asArrayRef(), value);
+      });
+    };
+    if (intersects(collapsedSliceDims, operandBatchingDims) ||
+        intersects(startIndexMap, operandBatchingDims)) {
+      return emitOpError(
+          "requires collapsed-slice and start-index dimensions disjoint from "
+          "operand-batching dimensions");
+    }
+    if (llvm::is_contained(startIndicesBatchingDims.asArrayRef(),
+                           indexVectorDim.getInt())) {
+      return emitOpError(
+          "requires start-indices batching dimensions to exclude the "
+          "index-vector dimension");
+    }
+    for (auto [operandDimension, indicesDimension] :
+         llvm::zip_equal(operandBatchingDims.asArrayRef(),
+                         startIndicesBatchingDims.asArrayRef())) {
+      if (inputs[0].getDimSize(operandDimension) !=
+          inputs[1].getDimSize(indicesDimension)) {
+        return emitOpError("requires paired gather batching extents to match");
+      }
+    }
+    for (auto [dimension, size] : llvm::enumerate(sliceSizes.asArrayRef())) {
+      if (size < 0 || size > inputs[0].getDimSize(dimension)) {
+        return emitOpError("has an invalid gather slice size");
+      }
+    }
+    for (int64_t dimension : collapsedSliceDims.asArrayRef()) {
+      if (sliceSizes.asArrayRef()[dimension] > 1) {
+        return emitOpError(
+            "requires collapsed gather slice dimensions no larger than one");
+      }
+    }
+    for (int64_t dimension : operandBatchingDims.asArrayRef()) {
+      if (sliceSizes.asArrayRef()[dimension] > 1) {
+        return emitOpError(
+            "requires operand-batching gather slice dimensions no larger "
+            "than one");
+      }
+    }
+    const int64_t expandedIndicesRank =
+        inputs[1].getRank() +
+        (indexVectorDim.getInt() == inputs[1].getRank() ? 1 : 0);
+    const int64_t inferredResultRank =
+        offsetDims.size() + expandedIndicesRank - 1;
+    if (result.getRank() != inferredResultRank) {
+      return emitOpError("has a gather result with an incorrect rank");
+    }
+    SmallVector<int64_t> windowExtents;
+    for (int64_t operandDimension = 0; operandDimension < inputs[0].getRank();
+         ++operandDimension) {
+      if (!llvm::is_contained(collapsedSliceDims.asArrayRef(),
+                              operandDimension) &&
+          !llvm::is_contained(operandBatchingDims.asArrayRef(),
+                              operandDimension)) {
+        windowExtents.push_back(sliceSizes.asArrayRef()[operandDimension]);
+      }
+    }
+    SmallVector<int64_t> batchExtents;
+    for (int64_t indicesDimension = 0; indicesDimension < expandedIndicesRank;
+         ++indicesDimension) {
+      if (indicesDimension != indexVectorDim.getInt()) {
+        batchExtents.push_back(inputs[1].getDimSize(indicesDimension));
+      }
+    }
+    size_t windowIndex = 0;
+    size_t batchIndex = 0;
+    for (int64_t resultDimension = 0; resultDimension < result.getRank();
+         ++resultDimension) {
+      const bool isOffset =
+          llvm::is_contained(offsetDims.asArrayRef(), resultDimension);
+      const int64_t expectedExtent =
+          isOffset ? windowExtents[windowIndex++] : batchExtents[batchIndex++];
+      if (result.getDimSize(resultDimension) != expectedExtent) {
+        return emitOpError("has a gather result with an incorrect shape");
+      }
+    }
+  } else if (getSemantics() == RelationSemantics::IndexedContributions) {
+    auto metadata = dyn_cast<DictionaryAttr>(getParameters()[0]);
+    auto outputShape = metadata
+                           ? metadata.getAs<DenseI64ArrayAttr>("output_shape")
+                           : DenseI64ArrayAttr{};
+    auto updateWindowDims =
+        metadata ? metadata.getAs<DenseI64ArrayAttr>("update_window_dims")
+                 : DenseI64ArrayAttr{};
+    auto insertedWindowDims =
+        metadata ? metadata.getAs<DenseI64ArrayAttr>("inserted_window_dims")
+                 : DenseI64ArrayAttr{};
+    auto inputBatchingDims =
+        metadata ? metadata.getAs<DenseI64ArrayAttr>("input_batching_dims")
+                 : DenseI64ArrayAttr{};
+    auto indicesBatchingDims =
+        metadata
+            ? metadata.getAs<DenseI64ArrayAttr>("scatter_indices_batching_dims")
+            : DenseI64ArrayAttr{};
+    auto scatterDims =
+        metadata
+            ? metadata.getAs<DenseI64ArrayAttr>("scatter_dims_to_operand_dims")
+            : DenseI64ArrayAttr{};
+    auto indexVectorDim = metadata
+                              ? metadata.getAs<IntegerAttr>("index_vector_dim")
+                              : IntegerAttr{};
+    auto sorted =
+        metadata ? metadata.getAs<BoolAttr>("indices_are_sorted") : BoolAttr{};
+    auto unique =
+        metadata ? metadata.getAs<BoolAttr>("unique_indices") : BoolAttr{};
+    auto conflict = metadata ? metadata.getAs<StringAttr>("conflict_resolution")
+                             : StringAttr{};
+    if (!metadata || metadata.size() != 10 || !outputShape ||
+        !updateWindowDims || !insertedWindowDims || !inputBatchingDims ||
+        !indicesBatchingDims || !scatterDims || !indexVectorDim || !sorted ||
+        !unique || !conflict || conflict.getValue() != "source_ordered_add" ||
+        !inputs[0].hasStaticShape() || !inputs[1].hasStaticShape() ||
+        !result.hasStaticShape() ||
+        inputs[0].getElementType() != result.getElementType() ||
+        !inputs[1].getElementType().isInteger(32) ||
+        result.getRank() <= static_cast<int64_t>(outputShape.size()) ||
+        !llvm::equal(result.getShape().take_front(outputShape.size()),
+                     outputShape.asArrayRef())) {
+      return emitOpError(
+          "requires typed additive indexed-contribution metadata and a "
+          "result prefixed by the destination shape");
+    }
+  }
+  return success();
+}
+
+LogicalResult SelectionOp::verify() {
+  auto input = dyn_cast<RankedTensorType>(getInput().getType());
+  auto values = dyn_cast<RankedTensorType>(getSelectedValues().getType());
+  auto indices = dyn_cast<RankedTensorType>(getSelectedIndices().getType());
+  if (!input || !values || !indices || !input.hasStaticShape() ||
+      !values.hasStaticShape() || !indices.hasStaticShape()) {
+    return emitOpError("requires static ranked tensor input and results");
+  }
+  if (!isa<FloatType, IntegerType>(input.getElementType()) ||
+      values.getElementType() != input.getElementType() ||
+      !indices.getElementType().isInteger(32)) {
+    return emitOpError(
+        "requires selected values to preserve a numeric input element type "
+        "and selected indices to use i32");
+  }
+  if (!getStable() ||
+      getTieBreak() != SelectionTieBreak::SourceIndexAscending) {
+    return emitOpError("requires stable source-index-ascending tie breaking");
+  }
+  const int64_t dimension = getDimension();
+  const int64_t count = getCount();
+  if (dimension < 0 || dimension >= input.getRank() || count <= 0 ||
+      count > input.getDimSize(dimension)) {
+    return emitOpError(
+        "requires an in-range selection dimension and a positive count no "
+        "larger than that dimension");
+  }
+  SmallVector<int64_t> expectedShape(input.getShape());
+  expectedShape[dimension] = count;
+  if (values.getShape() != ArrayRef<int64_t>(expectedShape) ||
+      indices.getShape() != ArrayRef<int64_t>(expectedShape)) {
+    return emitOpError(
+        "requires result shapes equal to the input shape with the selection "
+        "dimension replaced by count");
+  }
+  if (getSources().size() != 2) {
+    return emitOpError("requires one source reference per result");
+  }
+  SourceRefAttr first;
+  for (auto [resultNumber, attribute] : llvm::enumerate(getSources())) {
+    auto source = dyn_cast<SourceRefAttr>(attribute);
+    if (!source || source.getResultOrdinal() != resultNumber) {
+      return emitOpError(
+          "requires ordered source references matching result ordinals");
+    }
+    if (!first) {
+      first = source;
+      continue;
+    }
+    if (source.getFunctionOrdinal() != first.getFunctionOrdinal() ||
+        source.getBlockOrdinal() != first.getBlockOrdinal() ||
+        source.getOperationOrdinal() != first.getOperationOrdinal()) {
+      return emitOpError(
+          "requires both results to originate at one source operation");
     }
   }
   return success();
@@ -741,46 +1438,11 @@ LogicalResult FoldOp::verifyRegions() {
   if (getReductionDimensions().empty()) {
     return emitOpError("requires at least one reduction dimension");
   }
-  llvm::SmallDenseSet<int64_t> dimensions;
-  for (int64_t dimension : getReductionDimensions()) {
-    if (dimension < 0 || !dimensions.insert(dimension).second) {
-      return emitOpError(
-          "reduction dimensions must be non-negative and unique");
-    }
-  }
-  SmallVector<RankedTensorType> inputTypes;
-  SmallVector<RankedTensorType> resultTypes;
-  for (auto [input, result] : llvm::zip_equal(getInputs(), getResults())) {
-    auto inputType = dyn_cast<RankedTensorType>(input.getType());
-    auto resultType = dyn_cast<RankedTensorType>(result.getType());
-    if (!inputType || inputType.getRank() == 0 || !resultType) {
-      return emitOpError(
-          "requires positive-rank tensor inputs and ranked tensor results");
-    }
-    inputTypes.push_back(inputType);
-    resultTypes.push_back(resultType);
-    for (int64_t dimension : dimensions) {
-      if (dimension >= inputType.getRank()) {
-        return emitOpError("reduction dimension is outside an input rank");
-      }
-    }
-    SmallVector<int64_t> expectedShape;
-    for (int64_t dimension = 0; dimension < inputType.getRank(); ++dimension) {
-      if (!dimensions.contains(dimension)) {
-        expectedShape.push_back(inputType.getDimSize(dimension));
-      }
-    }
-    if (resultType.getShape() != ArrayRef<int64_t>(expectedShape)) {
-      return emitOpError("result shape must equal the input shape with reduced "
-                         "dimensions removed");
-    }
-  }
-  for (size_t index = 1; index < inputTypes.size(); ++index) {
-    if (!haveCompatibleShapes(inputTypes.front(), inputTypes[index]) ||
-        !haveCompatibleShapes(resultTypes.front(), resultTypes[index])) {
-      return emitOpError(
-          "multi-input folds require compatible input and result shapes");
-    }
+  SmallVector<Type> indexedTypes;
+  llvm::append_range(indexedTypes, getInputs().getTypes());
+  llvm::append_range(indexedTypes, getResults().getTypes());
+  if (failed(verifyFoldIndexingMaps(*this, indexedTypes))) {
+    return failure();
   }
   Block &combiner = getCombiner().front();
   const size_t resultCount = getResults().size();
@@ -821,6 +1483,9 @@ std::string materializationPlanFingerprint(MaterializationPlanOp plan) {
   llvm::raw_string_ostream stream(normalized);
   stream << "schema=" << plan.getSchemaVersion() << ';';
   Attribute(plan.getPolicyAttr()).print(stream);
+  if (plan.getComponentized()) {
+    stream << ";componentized=true";
+  }
   stream << '\n';
   for (Operation &operation : plan.getBody().front()) {
     if (isa<MaterializationPlanYieldOp>(operation)) {
@@ -842,7 +1507,7 @@ std::string materializationPlanFingerprint(MaterializationPlanOp plan) {
 
 SmallVector<unsigned> projectedDomainMasks(RankedTensorType type,
                                            ArrayRef<int64_t> domain,
-                                           unsigned reductionAxis) {
+                                           ArrayRef<int64_t> reductionAxes) {
   SmallVector<unsigned> masks{0};
   for (int64_t extent : type.getShape()) {
     llvm::SmallDenseSet<unsigned> next;
@@ -856,23 +1521,26 @@ SmallVector<unsigned> projectedDomainMasks(RankedTensorType type,
     }
     masks.assign(next.begin(), next.end());
   }
-  llvm::erase_if(masks, [reductionAxis](unsigned mask) {
-    return (mask & (1u << reductionAxis)) == 0;
+  llvm::erase_if(masks, [reductionAxes](unsigned mask) {
+    return llvm::any_of(reductionAxes, [mask](int64_t axis) {
+      return (mask & (1u << axis)) == 0;
+    });
   });
   return masks;
 }
 
 bool inputShapesBindContractDomain(RankedTensorType lhs, RankedTensorType rhs,
-                                   ArrayRef<int64_t> domain) {
+                                   ArrayRef<int64_t> domain,
+                                   ArrayRef<int64_t> reductionAxes) {
   if (domain.size() < 3 || domain.size() > 9 || lhs.getRank() < 2 ||
-      rhs.getRank() < 2 || lhs.getRank() > 8 || rhs.getRank() > 8) {
+      rhs.getRank() < 2 || lhs.getRank() > 8 || rhs.getRank() > 8 ||
+      reductionAxes.empty()) {
     return false;
   }
-  const unsigned reductionAxis = domain.size() - 1;
   SmallVector<unsigned> lhsMasks =
-      projectedDomainMasks(lhs, domain, reductionAxis);
+      projectedDomainMasks(lhs, domain, reductionAxes);
   SmallVector<unsigned> rhsMasks =
-      projectedDomainMasks(rhs, domain, reductionAxis);
+      projectedDomainMasks(rhs, domain, reductionAxes);
   const unsigned fullMask = (1u << domain.size()) - 1;
   return llvm::any_of(lhsMasks, [&](unsigned lhsMask) {
     return llvm::any_of(rhsMasks, [&](unsigned rhsMask) {
@@ -945,6 +1613,9 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
   unsigned contractCount = 0;
   unsigned foldRegionCount = 0;
   unsigned contractRegionCount = 0;
+  unsigned statefulContractFoldCount = 0;
+  unsigned indexedAccumulationCount = 0;
+  unsigned scanCount = 0;
   int64_t contractFoldCompositionTask = -1;
   int64_t mapContractCompositionTask = -1;
   SmallVector<SmallVector<int64_t>> actualConsumers(buffers.size());
@@ -960,19 +1631,25 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
           "requires a positive static ranked tensor type");
     std::optional<int64_t> producer =
         optionalIntegerAttribute(buffer, "producer");
+    std::optional<int64_t> sourceArgument =
+        optionalIntegerAttribute(buffer, "source_argument");
     if (buffer.getLiveIn() != !producer.has_value()) {
       return buffer.emitOpError(
           "live-in status must exactly identify producer-free buffers");
     }
+    if (sourceArgument && (!buffer.getLiveIn() || *sourceArgument < 0)) {
+      return buffer.emitOpError(
+          "source argument must be a nonnegative live-in binding");
+    }
     const bool external =
         buffer.getStorage() == MaterializationStorage::External;
     Type elementType = tensorType.getElementType();
-    const bool externalElement = elementType.isF32() || elementType.isBF16();
-    const bool logicalTemporary =
-        elementType.isInteger(1) || elementType.isInteger(32);
-    if ((!externalElement && !(logicalTemporary && !external)))
+    const bool supportedElement = elementType.isF32() || elementType.isBF16() ||
+                                  elementType.isInteger(1) ||
+                                  elementType.isInteger(32);
+    if (!supportedElement)
       return buffer.emitOpError(
-          "requires bf16/f32 external data or i1/i32 logical temporaries");
+          "requires a bf16/f32/i1/i32 materialization element type");
     if (external != (buffer.getLiveIn() || buffer.getLiveOut())) {
       return buffer.emitOpError(
           "external storage must exactly identify live-in or live-out buffers");
@@ -1001,6 +1678,27 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
     if (llvm::any_of(task.getDomainShape(),
                      [](int64_t extent) { return extent <= 0; })) {
       return task.emitOpError("requires a positive static task domain");
+    }
+    auto sourceGroup = task->getAttrOfType<ArrayAttr>("source_group");
+    if (task.getKind() == MaterializationTaskKind::Selection) {
+      auto first = sourceGroup && sourceGroup.size() == 2
+                       ? dyn_cast<SourceRefAttr>(sourceGroup[0])
+                       : SourceRefAttr{};
+      auto second = sourceGroup && sourceGroup.size() == 2
+                        ? dyn_cast<SourceRefAttr>(sourceGroup[1])
+                        : SourceRefAttr{};
+      if (!sourceGroup || sourceGroup.size() != 2 || !first || !second ||
+          first != task.getSource() || first.getResultOrdinal() != 0 ||
+          second.getResultOrdinal() != 1 ||
+          first.getFunctionOrdinal() != second.getFunctionOrdinal() ||
+          first.getBlockOrdinal() != second.getBlockOrdinal() ||
+          first.getOperationOrdinal() != second.getOperationOrdinal()) {
+        return task.emitOpError(
+            "Selection tasks require two ordered source bindings");
+      }
+    } else if (sourceGroup) {
+      return task.emitOpError(
+          "source groups are reserved for multi-result Selection tasks");
     }
     llvm::SmallDenseSet<int64_t> outputSet;
     llvm::SmallDenseSet<int64_t> dependencySet;
@@ -1070,12 +1768,36 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
     auto compositionKind = task->getAttrOfType<StringAttr>("composition_kind");
     auto compositionSources =
         task->getAttrOfType<ArrayAttr>("composition_sources");
+    auto sourceExpansionGroup =
+        task->getAttrOfType<ArrayAttr>("source_expansion_group");
     auto compositionRecomputedSources =
         task->getAttrOfType<ArrayAttr>("composition_recomputed_sources");
     auto compositionCost =
         task->getAttrOfType<DictionaryAttr>("composition_cost");
+    auto compositionOwnerDimensions =
+        task->getAttrOfType<DenseI64ArrayAttr>("composition_owner_dimensions");
+    auto compositionStreamDimensions =
+        task->getAttrOfType<DenseI64ArrayAttr>("composition_stream_dimensions");
+    auto compositionStateInputs =
+        task->getAttrOfType<DenseI64ArrayAttr>("composition_state_inputs");
+    auto compositionStateOutputs =
+        task->getAttrOfType<DenseI64ArrayAttr>("composition_state_outputs");
+    auto producerContractionDimensions = task->getAttrOfType<DenseI64ArrayAttr>(
+        "composition_producer_contraction_dimensions");
+    auto consumerContractionDimensions = task->getAttrOfType<DenseI64ArrayAttr>(
+        "composition_consumer_contraction_dimensions");
+    const bool statefulContractFold =
+        !compositionKind && compositionSources && compositionOwnerDimensions &&
+        compositionStreamDimensions && producerContractionDimensions &&
+        consumerContractionDimensions;
+    statefulContractFoldCount += statefulContractFold;
+    const bool hasStructuralComposition =
+        compositionOwnerDimensions || compositionStreamDimensions ||
+        compositionStateInputs || compositionStateOutputs ||
+        producerContractionDimensions || consumerContractionDimensions;
     const bool hasComposition = compositionKind || compositionSources ||
-                                compositionRecomputedSources || compositionCost;
+                                compositionRecomputedSources ||
+                                compositionCost || hasStructuralComposition;
     if ((hasFoldRegionPhases || hasFoldRegionOutputSources ||
          hasFoldRegionBoundaryUses || hasFoldRegionRecomputedSources) &&
         !hasFoldRegionSources) {
@@ -1105,9 +1827,15 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
           compositionKind && compositionKind.getValue() == "contract_fold";
       const bool mapContract =
           compositionKind && compositionKind.getValue() == "map_contract";
-      const bool online = compositionKind &&
-                          compositionKind.getValue() ==
-                              "online_normalized_exponential_weighted_contract";
+      const bool indexedAccumulation =
+          compositionKind &&
+          compositionKind.getValue() == "indexed_accumulation";
+      const bool integerRelation =
+          compositionKind && compositionKind.getValue() == "integer_relation";
+      const bool relationGather =
+          compositionKind && compositionKind.getValue() == "relation_gather";
+      const bool scan =
+          compositionKind && compositionKind.getValue() == "scan";
       const bool legacyMetadata =
           task->hasAttr("fused_sources") ||
           task->hasAttr("composed_input_maps") ||
@@ -1120,13 +1848,24 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
           hasContractRegionBoundary || hasContractRegionEpilogue ||
           hasContractRegionOperand || hasContractRegionCost ||
           hasContractRegionRecomputed;
-      if (getSchemaVersion() != 2 || !compositionKind || !compositionSources ||
-          (contractFold && compositionSources.size() != 2) ||
-          (mapContract && compositionSources.size() != 2 &&
-           compositionSources.size() != 3) ||
-          (online && compositionSources.empty()) ||
-          (compositionRecomputedSources && !online) ||
-          (!contractFold && !mapContract && !online) || legacyMetadata ||
+      if (getSchemaVersion() != 2 || !compositionSources ||
+          ((contractFold || mapContract || indexedAccumulation ||
+            integerRelation || relationGather || scan) &&
+           compositionSources.empty()) ||
+          (statefulContractFold && compositionSources.empty()) ||
+          (compositionRecomputedSources && !statefulContractFold &&
+           !indexedAccumulation && !mapContract) ||
+          (!contractFold && !mapContract && !indexedAccumulation &&
+           !integerRelation && !relationGather && !scan &&
+           !statefulContractFold) ||
+          (hasStructuralComposition && !statefulContractFold &&
+           !indexedAccumulation && !scan) ||
+          (scan && task.getKind() != MaterializationTaskKind::Scan) ||
+          (indexedAccumulation &&
+           (!sourceExpansionGroup ||
+            sourceExpansionGroup.size() != compositionSources.size() ||
+            task.getKind() != MaterializationTaskKind::Fold)) ||
+          (!indexedAccumulation && sourceExpansionGroup) || legacyMetadata ||
           llvm::any_of(
               compositionSources,
               [](Attribute source) { return !isa<SourceRefAttr>(source); }) ||
@@ -1141,112 +1880,224 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
             "schema-v2 generic composition provenance must be complete and "
             "exclusive");
       }
-      if (online) {
-        constexpr StringLiteral costFields[] = {
-            "baseline_launches",
-            "candidate_launches",
-            "baseline_temporary_bytes",
-            "candidate_temporary_bytes",
-            "baseline_temporary_traffic_bytes",
-            "candidate_temporary_traffic_bytes",
-            "contract_evaluations"};
-        if (!compositionCost ||
-            compositionCost.size() != std::size(costFields) ||
-            (task.getKind() != MaterializationTaskKind::Fold &&
-             task.getKind() != MaterializationTaskKind::Contract) ||
-            task.getOutputBuffers().empty() || task.getDomainShape().size() > 9)
+      if (statefulContractFold) {
+        auto validAxes = [&](DenseI64ArrayAttr dimensions) {
+          llvm::SmallDenseSet<int64_t> seen;
+          return dimensions && !dimensions.empty() &&
+                 llvm::all_of(dimensions.asArrayRef(), [&](int64_t dimension) {
+                   return dimension >= 0 &&
+                          dimension < static_cast<int64_t>(
+                                          task.getDomainShape().size()) &&
+                          seen.insert(dimension).second;
+                 });
+        };
+        auto validBuffers = [&](DenseI64ArrayAttr state,
+                                ArrayRef<int64_t> taskBuffers) {
+          llvm::SmallDenseSet<int64_t> seen;
+          return !state ||
+                 llvm::all_of(state.asArrayRef(), [&](int64_t buffer) {
+                   return llvm::is_contained(taskBuffers, buffer) &&
+                          seen.insert(buffer).second;
+                 });
+        };
+        auto vectorDimensions = task.getOnlineVectorDimensionsAttr();
+        llvm::SmallDenseSet<int64_t> partitionedDimensions;
+        auto addPartition = [&](DenseI64ArrayAttr dimensions) {
+          return dimensions &&
+                 llvm::all_of(dimensions.asArrayRef(), [&](int64_t dimension) {
+                   return partitionedDimensions.insert(dimension).second;
+                 });
+        };
+        if (task.getKind() != MaterializationTaskKind::Contract ||
+            task.getDomainShape().empty() || task.getDomainShape().size() > 9 ||
+            !validAxes(compositionOwnerDimensions) ||
+            !validAxes(vectorDimensions) ||
+            !validAxes(compositionStreamDimensions) ||
+            !validAxes(producerContractionDimensions) ||
+            !validAxes(consumerContractionDimensions) ||
+            !addPartition(compositionOwnerDimensions) ||
+            !addPartition(vectorDimensions) ||
+            !addPartition(compositionStreamDimensions) ||
+            partitionedDimensions.size() != task.getDomainShape().size() ||
+            compositionStreamDimensions.asArrayRef() !=
+                task.getReductionDimensions() ||
+            !validBuffers(compositionStateInputs, task.getInputBuffers()) ||
+            !validBuffers(compositionStateOutputs, task.getOutputBuffers()))
           return task.emitOpError(
-              "online composition requires abstract Fold/Contract state, "
-              "outputs, and closed relative cost");
-        SmallVector<int64_t> costs;
-        for (StringRef field : costFields) {
-          auto value = compositionCost.getAs<IntegerAttr>(field);
-          if (!value || value.getInt() < 0)
+              "stateful Contract/Fold composition requires explicit valid "
+              "owner, vector, stream, state, and producer/consumer "
+              "contraction dimensions");
+        const bool directOnline =
+            !compositionStateInputs && !compositionStateOutputs;
+        if (directOnline) {
+          constexpr StringLiteral costFields[] = {
+              "baseline_launches",
+              "candidate_launches",
+              "baseline_temporary_bytes",
+              "candidate_temporary_bytes",
+              "baseline_temporary_traffic_bytes",
+              "candidate_temporary_traffic_bytes",
+              "contract_evaluations"};
+          if (!compositionCost ||
+              compositionCost.size() != std::size(costFields) ||
+              task.getOutputBuffers().empty() ||
+              task.getDomainShape().size() > 9)
             return task.emitOpError(
-                "online composition cost fields must be nonnegative i64");
-          costs.push_back(value.getInt());
-        }
-        if (costs[1] > costs[0] || costs[3] >= costs[2] ||
-            costs[5] >= costs[4] || costs[6] <= 0)
+                "online composition requires abstract Contract state, "
+                "outputs, and closed relative cost");
+          SmallVector<int64_t> costs;
+          for (StringRef field : costFields) {
+            auto value = compositionCost.getAs<IntegerAttr>(field);
+            if (!value || value.getInt() < 0)
+              return task.emitOpError(
+                  "online composition cost fields must be nonnegative i64");
+            costs.push_back(value.getInt());
+          }
+          if (costs[1] > costs[0] || costs[3] >= costs[2] ||
+              costs[5] >= costs[4] || costs[6] <= 0)
+            return task.emitOpError(
+                "online composition must improve bytes and traffic without "
+                "increasing launch cost");
+        } else if (compositionCost ||
+                   (!compositionStateInputs && !compositionStateOutputs)) {
           return task.emitOpError(
-              "online composition must improve bytes and traffic without "
-              "increasing launch cost");
-        if (task.getKind() == MaterializationTaskKind::Fold)
-          ++foldCount;
-        else
-          ++contractCount;
+              "stateful pullback composition requires state flow and no "
+              "relative-cost claim");
+        }
+        ++contractCount;
+        continue;
+      }
+      if (indexedAccumulation) {
+        llvm::SmallDenseSet<int64_t> axes;
+        auto addAxes = [&](DenseI64ArrayAttr dimensions) {
+          return dimensions &&
+                 llvm::all_of(dimensions.asArrayRef(), [&](int64_t axis) {
+                   return axis >= 0 &&
+                          axis < static_cast<int64_t>(
+                                     task.getDomainShape().size()) &&
+                          axes.insert(axis).second;
+                 });
+        };
+        bool validExpansion = sourceExpansionGroup.size() == 4;
+        for (auto [member, attribute] : llvm::enumerate(sourceExpansionGroup)) {
+          auto expansion = dyn_cast<DictionaryAttr>(attribute);
+          auto actualMember = expansion ? expansion.getAs<IntegerAttr>("member")
+                                        : IntegerAttr{};
+          auto size =
+              expansion ? expansion.getAs<IntegerAttr>("size") : IntegerAttr{};
+          validExpansion &=
+              actualMember && size &&
+              actualMember.getInt() == static_cast<int64_t>(member) &&
+              size.getInt() == 4;
+        }
+        if (!validExpansion || compositionCost ||
+            task.getInputBuffers().empty() || task.getOutputBuffers().empty() ||
+            task.getDomainShape().empty() || task.getDomainShape().size() > 8 ||
+            task.getReductionDimensions().empty() ||
+            task.getOrderFree().value_or(true) ||
+            !addAxes(compositionOwnerDimensions) ||
+            !addAxes(compositionStreamDimensions) ||
+            axes.size() != task.getDomainShape().size() ||
+            compositionStreamDimensions.asArrayRef() !=
+                task.getReductionDimensions()) {
+          return task.emitOpError(
+              "indexed accumulation requires one source-ordered Fold task "
+              "with complete owner/stream axes and four ordered expansion "
+              "members");
+        }
+        ++foldCount;
+        ++indexedAccumulationCount;
+        continue;
+      }
+      if (integerRelation) {
+        if (compositionCost || hasStructuralComposition ||
+            sourceExpansionGroup ||
+            task.getKind() != MaterializationTaskKind::Relation ||
+            task.getInputBuffers().empty() ||
+            task.getOutputBuffers().size() != 1 || task.getOrderFree() ||
+            !task.getReductionDimensions().empty() ||
+            task.getDomainShape().empty() || task.getDomainShape().size() > 8)
+          return task.emitOpError(
+              "Relation composition requires one bounded non-reducing "
+              "Relation task with explicit inputs and one output");
+        continue;
+      }
+      if (relationGather) {
+        if (compositionCost || hasStructuralComposition ||
+            sourceExpansionGroup ||
+            task.getKind() != MaterializationTaskKind::Relation ||
+            task.getInputBuffers().empty() ||
+            (task.getOutputBuffers().size() != 1 &&
+             task.getOutputBuffers().size() != 2) ||
+            task.getOrderFree() ||
+            !task.getReductionDimensions().empty() ||
+            task.getDomainShape().empty() || task.getDomainShape().size() > 8)
+          return task.emitOpError(
+              "Relation-to-Gather composition requires one bounded "
+              "non-reducing Relation task with explicit inputs and one or "
+              "two outputs");
+        continue;
+      }
+      if (scan) {
+        auto validStateBuffers = [](DenseI64ArrayAttr state,
+                                    ArrayRef<int64_t> taskBuffers) {
+          llvm::SmallDenseSet<int64_t> seen;
+          return state && !state.empty() &&
+                 llvm::all_of(state.asArrayRef(), [&](int64_t buffer) {
+                   return llvm::is_contained(taskBuffers, buffer) &&
+                          seen.insert(buffer).second;
+                 });
+        };
+        if (compositionCost || sourceExpansionGroup ||
+            task.getKind() != MaterializationTaskKind::Scan ||
+            task.getInputBuffers().empty() || task.getOutputBuffers().empty() ||
+            task.getDomainShape().size() != 1 ||
+            !task.getReductionDimensions().empty() || task.getOrderFree() ||
+            !compositionOwnerDimensions ||
+            !compositionOwnerDimensions.empty() ||
+            !compositionStreamDimensions ||
+            compositionStreamDimensions.asArrayRef() != ArrayRef<int64_t>({0}) ||
+            !producerContractionDimensions ||
+            !producerContractionDimensions.empty() ||
+            !consumerContractionDimensions ||
+            !consumerContractionDimensions.empty() ||
+            !validStateBuffers(compositionStateInputs,
+                               task.getInputBuffers()) ||
+            !validStateBuffers(compositionStateOutputs,
+                               task.getOutputBuffers()))
+          return task.emitOpError(
+              "Scan composition requires one bounded ordered task with explicit state flow");
+        ++scanCount;
         continue;
       }
       if (contractFold) {
         if (contractFoldCompositionTask >= 0 || compositionCost ||
             task.getKind() != MaterializationTaskKind::Fold ||
-            task.getInputBuffers().size() != 3 ||
-            task.getOutputBuffers().size() != 2 ||
+            task.getInputBuffers().empty() || task.getOutputBuffers().empty() ||
             !task.getOrderFree().value_or(false) ||
-            task.getDomainShape().size() < 2 ||
-            task.getDomainShape().size() > 8 ||
-            task.getReductionDimensions() !=
-                ArrayRef<int64_t>(
-                    {static_cast<int64_t>(task.getDomainShape().size()) - 1})) {
+            task.getDomainShape().empty() || task.getDomainShape().size() > 8 ||
+            task.getReductionDimensions().empty()) {
           return task.emitOpError(
-              "Contract-to-Fold composition must bind one final-axis Fold "
-              "with three inputs and the ordered full and compact outputs");
-        }
-        auto lhs = cast<RankedTensorType>(
-            buffers[task.getInputBuffers()[0]].getTensorType());
-        auto rhs = cast<RankedTensorType>(
-            buffers[task.getInputBuffers()[1]].getTensorType());
-        auto initializer = cast<RankedTensorType>(
-            buffers[task.getInputBuffers()[2]].getTensorType());
-        auto full = cast<RankedTensorType>(
-            buffers[task.getOutputBuffers()[0]].getTensorType());
-        auto compact = cast<RankedTensorType>(
-            buffers[task.getOutputBuffers()[1]].getTensorType());
-        if (!lhs.getElementType().isF32() || !rhs.getElementType().isF32() ||
-            initializer.getRank() != 0 ||
-            !initializer.getElementType().isF32() ||
-            full.getShape() != task.getDomainShape() ||
-            !full.getElementType().isF32() ||
-            compact.getShape() != full.getShape().drop_back() ||
-            !compact.getElementType().isF32()) {
-          return task.emitOpError(
-              "Contract-to-Fold buffers must preserve f32 operands, scalar "
-              "initializer, full result, and compact statistic");
+              "producer-to-Fold composition requires one Fold task with "
+              "nonempty inputs, reductions, and live-across outputs");
         }
         contractFoldCompositionTask = ordinal;
         ++foldCount;
         continue;
       }
-      if (mapContractCompositionTask >= 0 || !compositionCost ||
-          task.getKind() != MaterializationTaskKind::Contract ||
-          task.getInputBuffers().size() != 3 ||
-          task.getOutputBuffers().size() != 1 || task.getOrderFree() ||
-          task.getDomainShape().size() < 3 ||
+      if ((contractFoldCompositionTask >= 0 &&
+           mapContractCompositionTask >= 0) ||
+          !compositionCost ||
+          (task.getKind() != MaterializationTaskKind::Contract &&
+           task.getKind() != MaterializationTaskKind::Map) ||
+          task.getInputBuffers().empty() || task.getOutputBuffers().empty() ||
+          task.getOrderFree() || task.getDomainShape().empty() ||
           task.getDomainShape().size() > 9 ||
-          task.getReductionDimensions() !=
-              ArrayRef<int64_t>(
-                  {static_cast<int64_t>(task.getDomainShape().size()) - 1})) {
+          (task.getKind() == MaterializationTaskKind::Contract) !=
+              !task.getReductionDimensions().empty()) {
         return task.emitOpError(
-            "Map-to-Contract composition must bind one final-axis Contract "
-            "with the ordered full, compact, and projection inputs");
-      }
-      auto full = cast<RankedTensorType>(
-          buffers[task.getInputBuffers()[0]].getTensorType());
-      auto compact = cast<RankedTensorType>(
-          buffers[task.getInputBuffers()[1]].getTensorType());
-      auto projection = cast<RankedTensorType>(
-          buffers[task.getInputBuffers()[2]].getTensorType());
-      auto result = cast<RankedTensorType>(
-          buffers[task.getOutputBuffers()[0]].getTensorType());
-      if (!full.getElementType().isF32() ||
-          compact.getShape() != full.getShape().drop_back() ||
-          !compact.getElementType().isF32() ||
-          !projection.getElementType().isF32() ||
-          result.getShape() != task.getDomainShape().drop_back() ||
-          !result.getElementType().isF32()) {
-        return task.emitOpError(
-            "Map-to-Contract buffers must preserve the f32 full and compact "
-            "boundary and public result");
+            "Fold-dependent composition requires one terminal Map or Contract "
+            "task with nonempty inputs and outputs");
       }
       constexpr StringLiteral costFields[] = {
           "baseline_launches",
@@ -1272,7 +2123,7 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
       if (costs[1] > costs[0] || costs[3] > costs[2] || costs[5] > costs[4] ||
           !(costs[1] < costs[0] || costs[3] < costs[2] ||
             costs[5] < costs[4]) ||
-          costs[6] != 1) {
+          costs[6] < 0) {
         return task.emitOpError(
             "generic composition cost must strictly dominate its baseline");
       }
@@ -1406,27 +2257,21 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
           task->getAttrOfType<ArrayAttr>("fold_epilogue_sources"));
       const int64_t domainRank = task.getDomainShape().size();
       ArrayRef<int64_t> reductionDimensions = task.getReductionDimensions();
-      const int64_t reductionAxis =
-          reductionDimensions.size() == 1 ? reductionDimensions.front() : -1;
-      const bool singleAxisFold = domainRank >= 1 && domainRank <= 8 &&
-                                  reductionAxis >= 0 &&
-                                  reductionAxis < domainRank;
-      const bool fullPrefixRankNFold =
-          domainRank >= 3 && domainRank <= 8 &&
-          reductionDimensions.size() == static_cast<size_t>(domainRank - 1) &&
-          llvm::all_of(llvm::enumerate(reductionDimensions),
-                       [](auto indexedAxis) {
-                         return indexedAxis.value() ==
-                                static_cast<int64_t>(indexedAxis.index());
-                       });
-      if ((!singleAxisFold && !fullPrefixRankNFold) ||
-          !task.getOrderFree().value_or(false) ||
+      llvm::SmallDenseSet<int64_t> uniqueReductionDimensions;
+      const bool validReductionDimensions =
+          domainRank >= 1 && domainRank <= 8 && !reductionDimensions.empty() &&
+          reductionDimensions.size() <= static_cast<size_t>(domainRank) &&
+          llvm::all_of(reductionDimensions, [&](int64_t axis) {
+            return axis >= 0 && axis < domainRank &&
+                   uniqueReductionDimensions.insert(axis).second;
+          });
+      if (!validReductionDimensions || !task.getOrderFree().has_value() ||
           (hasEpilogue ? task.getInputBuffers().size() < 2
                        : task.getInputBuffers().size() != 2) ||
           task.getOutputBuffers().size() != 1) {
         return task.emitOpError(
-            "Fold tasks require an in-range single-axis or full-prefix "
-            "reduction and order_free=true");
+            "Fold tasks require nonempty unique in-range reduction dimensions "
+            "and a declared reduction order");
       }
       auto inputType = cast<RankedTensorType>(
           buffers[task.getInputBuffers()[0]].getTensorType());
@@ -1454,21 +2299,22 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
           resultType.getShape() == ArrayRef<int64_t>(expectedResultShape) ||
           (hasEpilogue &&
            isSingletonInsertion(expectedResultShape, resultType.getShape()));
+      Type elementType = inputType.getElementType();
       if (inputType.getShape() != task.getDomainShape() ||
-          !inputType.getElementType().isF32() ||
-          initializerType.getRank() != 0 ||
-          !initializerType.getElementType().isF32() || !resultShapeMatches ||
-          !resultType.getElementType().isF32() ||
+          !isa<FloatType>(elementType) || initializerType.getRank() != 0 ||
+          initializerType.getElementType() != elementType ||
+          !resultShapeMatches || resultType.getElementType() != elementType ||
           (hasEpilogue &&
            llvm::any_of(task.getInputBuffers().drop_front(2),
                         [&](int64_t bufferOrdinal) {
                           auto type = cast<RankedTensorType>(
                               buffers[bufferOrdinal].getTensorType());
                           return !type.hasStaticShape() ||
-                                 !type.getElementType().isF32();
+                                 type.getElementType() != elementType;
                         }))) {
         return task.emitOpError(
-            "Fold buffer types must match its f32 domain and accumulator");
+            "Fold buffer element types must match its floating-point domain "
+            "and accumulator");
       }
     } else if (task.getKind() == MaterializationTaskKind::Contract) {
       ++contractCount;
@@ -1657,14 +2503,25 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
         continue;
       }
       ArrayRef<int64_t> domain = task.getDomainShape();
-      const int64_t reductionAxis = domain.size() - 1;
-      if (domain.size() < 3 || domain.size() > 9 ||
-          task.getReductionDimensions() != ArrayRef<int64_t>({reductionAxis}) ||
-          task.getOrderFree() || task.getInputBuffers().size() != 2 ||
+      ArrayRef<int64_t> reductionAxes = task.getReductionDimensions();
+      llvm::SmallDenseSet<int64_t> uniqueReductionAxes;
+      const bool validReductionAxes =
+          !reductionAxes.empty() &&
+          llvm::all_of(reductionAxes, [&](int64_t axis) {
+            return axis >= 0 && axis < static_cast<int64_t>(domain.size()) &&
+                   uniqueReductionAxes.insert(axis).second;
+          });
+      const bool scalarInnerProduct =
+          domain.size() == 1 && reductionAxes.size() == 1 &&
+          reductionAxes.front() == 0;
+      if ((!scalarInnerProduct && domain.size() < 3) || domain.size() > 9 ||
+          !validReductionAxes || task.getOrderFree() ||
+          task.getInputBuffers().size() != 2 ||
           task.getOutputBuffers().size() != 1) {
         return task.emitOpError()
-               << "Contract tasks require rank-three through rank-nine "
-                  "domain, final reduction dimension, two inputs, and one "
+               << "Contract tasks require a scalar inner product or a "
+                  "rank-three through rank-nine "
+                  "domain, explicit reduction dimensions, two inputs, and one "
                   "output";
       }
       auto lhs = cast<RankedTensorType>(
@@ -1673,18 +2530,71 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
           buffers[task.getInputBuffers()[1]].getTensorType());
       auto result = cast<RankedTensorType>(
           buffers[task.getOutputBuffers()[0]].getTensorType());
-      ArrayRef<int64_t> expectedResultShape = domain.drop_back();
-      if (result.getRank() < 2 || result.getRank() > 8 ||
+      SmallVector<int64_t> expectedResultShape;
+      for (auto [axis, extent] : llvm::enumerate(domain))
+        if (!uniqueReductionAxes.contains(axis))
+          expectedResultShape.push_back(extent);
+      const bool scalarBuffers =
+          scalarInnerProduct && lhs.getShape() == domain &&
+          rhs.getShape() == domain && result.getRank() == 0;
+      if ((!scalarBuffers && (result.getRank() < 2 || result.getRank() > 8)) ||
           lhs.getElementType() != rhs.getElementType() ||
           (!lhs.getElementType().isBF16() && !lhs.getElementType().isF32()) ||
           !result.getElementType().isF32() ||
-          !inputShapesBindContractDomain(lhs, rhs, domain) ||
-          result.getShape() != expectedResultShape) {
-        return task.emitOpError()
-               << "Contract buffers must bind "
-               << cardinalName(domain.size() - 1)
-               << " distinct parallel axes and one reduction axis with "
-                  "equal bf16 or f32 input types";
+          (!scalarBuffers &&
+           !inputShapesBindContractDomain(lhs, rhs, domain, reductionAxes)) ||
+          result.getShape() != ArrayRef<int64_t>(expectedResultShape)) {
+        return task.emitOpError() << "Contract buffers must bind "
+                                  << cardinalName(expectedResultShape.size())
+                                  << " distinct parallel axes and the declared "
+                                     "reduction axes with "
+                                     "equal bf16 or f32 input types";
+      }
+    } else if (task.getKind() == MaterializationTaskKind::Selection) {
+      ArrayRef<int64_t> domain = task.getDomainShape();
+      ArrayRef<int64_t> reductionAxes = task.getReductionDimensions();
+      if (domain.empty() || domain.size() > 8 || reductionAxes.size() != 1 ||
+          reductionAxes.front() < 0 ||
+          reductionAxes.front() >= static_cast<int64_t>(domain.size()) ||
+          task.getOrderFree() || task.getInputBuffers().size() != 1 ||
+          task.getOutputBuffers().size() != 2) {
+        return task.emitOpError(
+            "Selection tasks require one bounded reduction axis, one input, "
+            "and two outputs");
+      }
+      auto input = cast<RankedTensorType>(
+          buffers[task.getInputBuffers().front()].getTensorType());
+      auto values = cast<RankedTensorType>(
+          buffers[task.getOutputBuffers().front()].getTensorType());
+      auto indices = cast<RankedTensorType>(
+          buffers[task.getOutputBuffers().back()].getTensorType());
+      SmallVector<int64_t> resultShape(values.getShape());
+      const int64_t reductionAxis = reductionAxes.front();
+      const bool validResultExtent =
+          resultShape[reductionAxis] > 0 &&
+          resultShape[reductionAxis] <= domain[reductionAxis];
+      resultShape[reductionAxis] = domain[reductionAxis];
+      if (input.getShape() != domain || values.getRank() != input.getRank() ||
+          indices.getShape() != values.getShape() || !validResultExtent ||
+          ArrayRef<int64_t>(resultShape) != domain ||
+          values.getElementType() != input.getElementType() ||
+          !indices.getElementType().isInteger(32)) {
+        return task.emitOpError(
+            "Selection buffers must preserve the input domain and replace "
+            "the bounded axis equally in value and i32 index outputs");
+      }
+    } else if (task.getKind() == MaterializationTaskKind::Relation) {
+      if (!task.getReductionDimensions().empty() || task.getOrderFree() ||
+          task.getOutputBuffers().size() != 1) {
+        return task.emitOpError(
+            "Relation tasks require one result and no reduction or ordering "
+            "metadata");
+      }
+      auto result = cast<RankedTensorType>(
+          buffers[task.getOutputBuffers().front()].getTensorType());
+      if (result.getShape() != task.getDomainShape()) {
+        return task.emitOpError(
+            "Relation result must exactly define its task domain");
       }
     } else {
       if (!task.getReductionDimensions().empty() || task.getOrderFree()) {
@@ -1703,23 +2613,42 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
       }
     }
   }
+  if (contractFoldCompositionTask < 0 && mapContractCompositionTask >= 0) {
+    MaterializationTaskOp consumer = tasks[mapContractCompositionTask];
+    for (auto [ordinal, task] : llvm::enumerate(tasks)) {
+      if (!task->hasAttr("fold_region_sources") ||
+          !llvm::is_contained(consumer.getDependencies(), ordinal) ||
+          consumer.getInputBuffers().take_front(task.getOutputBuffers().size()) !=
+              task.getOutputBuffers())
+        continue;
+      if (contractFoldCompositionTask >= 0)
+        return emitOpError(
+            "generic composition has multiple Fold-region boundary producers");
+      contractFoldCompositionTask = ordinal;
+    }
+    // `map_contract` is also the generic same-domain Contract/Map component.
+    // It participates in this two-task Fold boundary only when an actual Fold
+    // producer is connected by the ordered SSA cut.
+    if (contractFoldCompositionTask < 0)
+      mapContractCompositionTask = -1;
+  }
   const bool hasCompositionTasks =
       contractFoldCompositionTask >= 0 || mapContractCompositionTask >= 0;
   if (hasCompositionTasks) {
     if (contractFoldCompositionTask < 0 || mapContractCompositionTask < 0 ||
         contractFoldCompositionTask >= mapContractCompositionTask) {
       return emitOpError(
-          "generic composition requires the ordered Contract-to-Fold and "
-          "Map-to-Contract semantic groups");
+          "generic composition requires ordered producer-to-Fold and "
+          "Fold-dependent task groups");
     }
     MaterializationTaskOp producer = tasks[contractFoldCompositionTask];
     MaterializationTaskOp consumer = tasks[mapContractCompositionTask];
     ArrayRef<int64_t> boundary = producer.getOutputBuffers();
-    if (consumer.getInputBuffers().take_front(2) != boundary ||
+    if (consumer.getInputBuffers().take_front(boundary.size()) != boundary ||
         consumer.getDependencies() !=
             ArrayRef<int64_t>({contractFoldCompositionTask})) {
       return emitOpError(
-          "generic composition must preserve the ordered full and compact "
+          "generic composition must preserve its ordered live-across SSA "
           "boundary edge");
     }
     for (int64_t bufferOrdinal : boundary) {
@@ -1737,42 +2666,43 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
       }
     }
   }
-  if (foldCount == 0 && contractCount == 0) {
-    if (tasks.size() < 2) {
-      return emitOpError("requires at least two Map tasks");
-    }
-    bool hasTemporary = false;
+  const bool containsOnlyMaps =
+      llvm::all_of(tasks, [](MaterializationTaskOp task) {
+        return task.getKind() == MaterializationTaskKind::Map;
+      });
+  const bool standaloneMap = tasks.size() == 1;
+  if (containsOnlyMaps && !standaloneMap &&
+      !getComponentized().value_or(false)) {
     for (MaterializationBufferOp buffer : buffers) {
       auto type = cast<RankedTensorType>(buffer.getTensorType());
-      if (buffer.getStorage() == MaterializationStorage::External) {
-        if (type.getRank() < 1 || type.getRank() > 8 ||
-            !type.getElementType().isBF16()) {
-          return buffer.emitOpError(
-              "Map-only external buffers require rank-one through rank-eight "
-              "bf16 tensors");
-        }
-        continue;
+      if (type.getRank() > 8 ||
+          (type.getRank() == 0 && type.getElementType().isBF16()) ||
+          (!type.getElementType().isF32() && !type.getElementType().isBF16())) {
+        return buffer.emitOpError(
+            "Map-only buffers require rank-zero through rank-eight f32 "
+            "or rank-one through rank-eight bf16 tensors");
       }
-      if (!type.getElementType().isF32()) {
-        return buffer.emitOpError("Map-only temporary buffers require f32");
-      }
-      hasTemporary = true;
-    }
-    if (!hasTemporary) {
-      return emitOpError("Map-only plans require a temporary f32 buffer");
     }
   }
   bool compactContractRegion = false;
   for (MaterializationTaskOp task : tasks) {
     auto strategy = task->getAttrOfType<StringAttr>("contract_region_strategy");
-    compactContractRegion |= strategy && strategy.getValue() == "compact_stat";
+      compactContractRegion |= strategy && strategy.getValue() == "compact_stat";
   }
+  const bool hybridFoldComposition = contractFoldCompositionTask >= 0 &&
+                                     mapContractCompositionTask >= 0;
   if (contractRegionCount > 1 ||
       (contractCount != contractRegionCount && foldRegionCount != 0 &&
-       !compactContractRegion) ||
-      (foldRegionCount != 0 && !compactContractRegion && contractCount != 0) ||
-      getSchemaVersion() !=
-          (contractCount != 0 || foldRegionCount != 0 ? 2 : 1)) {
+       !compactContractRegion && !hybridFoldComposition &&
+       contractCount != statefulContractFoldCount) ||
+      (foldRegionCount != 0 && !compactContractRegion && contractCount != 0 &&
+       !hybridFoldComposition &&
+       contractCount != statefulContractFoldCount) ||
+      getSchemaVersion() != (contractCount != 0 || foldRegionCount != 0 ||
+                                     indexedAccumulationCount != 0 ||
+                                     scanCount != 0
+                                 ? 2
+                                 : 1)) {
     return emitOpError(
         "materialization schema must equal the admitted task family");
   }
@@ -1789,13 +2719,19 @@ LogicalResult MaterializationPlanOp::verifyRegions() {
     }
     if (buffer.getLiveOut()) {
       expectedEnd = tasks.size();
-    } else if (consumers.empty() && !buffer.getLiveIn()) {
-      return buffer.emitOpError(
-          "produced buffers require a consumer or live-out use");
     }
     if (buffer.getLifetimeEnd() != expectedEnd) {
       return buffer.emitOpError(
           "lifetime end must equal the final consumer or plan exit");
+    }
+  }
+  for (MaterializationTaskOp task : tasks) {
+    if (llvm::none_of(task.getOutputBuffers(), [&](int64_t output) {
+          return buffers[output].getLiveOut() ||
+                 !actualConsumers[output].empty();
+        })) {
+      return task.emitOpError(
+          "requires at least one consumed or live-out result");
     }
   }
 
@@ -1858,13 +2794,106 @@ struct Simt32Geometry {
   int64_t subgroupSize;
   int64_t scratchBytes;
   std::optional<int64_t> reductionAxis;
+  SmallVector<int64_t> reductionMergeGrid;
+  SmallVector<int64_t> reductionMergeTile;
+  int64_t reductionMergeSerialTiles = 0;
+  SmallVector<int64_t> reductionPartialBufferShape;
 };
 
-FailureOr<Simt32Geometry> simt32Geometry(ScheduleTaskKind kind,
-                                         ArrayRef<int64_t> domain,
-                                         NumericalPolicy policy) {
+FailureOr<Simt32Geometry>
+multiPhaseGeometry(ScheduleTaskOp task, ArrayAttr records) {
+  if (records.empty())
+    return failure();
+  int64_t nextOffset = 0;
+  int64_t maximumTile = 0;
+  int64_t maximumThreads = 0;
+  int64_t maximumSerialTiles = 1;
+  for (auto [phaseOrdinal, attribute] : llvm::enumerate(records)) {
+    auto record = dyn_cast<DictionaryAttr>(attribute);
+    auto phase = record ? record.getAs<IntegerAttr>("phase") : IntegerAttr{};
+    auto offset =
+        record ? record.getAs<IntegerAttr>("grid_offset") : IntegerAttr{};
+    auto count =
+        record ? record.getAs<IntegerAttr>("grid_count") : IntegerAttr{};
+    auto elements =
+        record ? record.getAs<IntegerAttr>("element_count") : IntegerAttr{};
+    auto tile =
+        record ? record.getAs<IntegerAttr>("tile_elements") : IntegerAttr{};
+    auto serial =
+        record ? record.getAs<IntegerAttr>("serial_tiles") : IntegerAttr{};
+    auto domain =
+        record ? record.getAs<DenseI64ArrayAttr>("domain_shape")
+               : DenseI64ArrayAttr{};
+    auto reductions =
+        record ? record.getAs<DenseI64ArrayAttr>("reduction_dimensions")
+               : DenseI64ArrayAttr{};
+    if (!record || record.size() != 8 || !phase || !offset || !count ||
+        !elements || !tile || !serial || !domain || !reductions ||
+        phase.getInt() != static_cast<int64_t>(phaseOrdinal) ||
+        offset.getInt() != nextOffset || count.getInt() <= 0 ||
+        elements.getInt() <= 0 || tile.getInt() <= 0 ||
+        tile.getInt() > elements.getInt() || serial.getInt() <= 0 ||
+        count.getInt() !=
+            ceilDivPositive(elements.getInt(), tile.getInt()) ||
+        llvm::any_of(domain.asArrayRef(),
+                     [](int64_t extent) { return extent <= 0; }))
+      return failure();
+    FailureOr<int64_t> domainElements =
+        staticElementCount(domain.asArrayRef());
+    int64_t expectedSerial = 1;
+    if (!reductions.empty()) {
+      if (reductions.size() > domain.size())
+        return failure();
+      const int64_t reductionStart =
+          static_cast<int64_t>(domain.size() - reductions.size());
+      SmallVector<int64_t> reductionShape;
+      for (auto [ordinal, axis] : llvm::enumerate(reductions.asArrayRef())) {
+        if (axis != reductionStart + static_cast<int64_t>(ordinal))
+          return failure();
+        reductionShape.push_back(domain.asArrayRef()[axis]);
+      }
+      FailureOr<int64_t> reductionElements =
+          staticElementCount(reductionShape);
+      if (failed(reductionElements))
+        return failure();
+      expectedSerial = *reductionElements;
+    }
+    if (failed(domainElements) ||
+        *domainElements != elements.getInt() * serial.getInt() ||
+        serial.getInt() != expectedSerial)
+      return failure();
+    nextOffset += count.getInt();
+    maximumTile = std::max(maximumTile, tile.getInt());
+    maximumThreads =
+        std::max(maximumThreads, roundUpToSubgroup(tile.getInt()));
+    maximumSerialTiles = std::max(maximumSerialTiles, serial.getInt());
+  }
+  return Simt32Geometry{{nextOffset},
+                        {maximumTile},
+                        maximumSerialTiles,
+                        maximumThreads,
+                        32,
+                        0,
+                        task.getReductionAxis()};
+}
+
+FailureOr<Simt32Geometry>
+simt32Geometry(ScheduleTaskKind kind, ArrayRef<int64_t> domain,
+               NumericalPolicy policy,
+               std::optional<int64_t> foldReductionAxis = std::nullopt) {
   constexpr int64_t kSubgroup = 32;
   constexpr int64_t kMaxThreads = 256;
+  if (kind == ScheduleTaskKind::OrderedState) {
+    if (domain.size() != 1 || domain.front() <= 0)
+      return failure();
+    return Simt32Geometry{{1},
+                          {domain.front()},
+                          1,
+                          128,
+                          kSubgroup,
+                          0,
+                          std::nullopt};
+  }
   if (kind == ScheduleTaskKind::Scalar) {
     if (!domain.empty()) {
       return failure();
@@ -1886,6 +2915,14 @@ FailureOr<Simt32Geometry> simt32Geometry(ScheduleTaskKind kind,
                           std::nullopt};
   }
   if (kind == ScheduleTaskKind::Contract) {
+    if (domain.size() == 1 && domain.front() > 0) {
+      const int64_t tile = std::min(domain.front(), kMaxThreads);
+      const int64_t threads = roundUpToSubgroup(tile);
+      return Simt32Geometry{
+          {1},     {tile},    ceilDivPositive(domain.front(), tile),
+          threads, kSubgroup, threads * static_cast<int64_t>(sizeof(float)),
+          0};
+    }
     if (domain.size() < 3 || domain.size() > 9) {
       return failure();
     }
@@ -1913,6 +2950,29 @@ FailureOr<Simt32Geometry> simt32Geometry(ScheduleTaskKind kind,
                           0,
                           reductionAxis};
   }
+  if (kind == ScheduleTaskKind::AllAxisFold) {
+    if (domain.empty() || domain.size() > 8)
+      return failure();
+    FailureOr<int64_t> reduction = staticElementCount(domain);
+    if (failed(reduction))
+      return failure();
+    constexpr int64_t kItemsPerThread = 16;
+    constexpr int64_t kPartialTile = kMaxThreads * kItemsPerThread;
+    constexpr int64_t kMaximumMergeTiles = kMaxThreads;
+    const int64_t partialCount = ceilDivPositive(*reduction, kPartialTile);
+    const int64_t partialSerialTiles =
+        ceilDivPositive(*reduction, partialCount * kMaxThreads);
+    const int64_t mergeSerialTiles = ceilDivPositive(partialCount, kMaxThreads);
+    if (mergeSerialTiles > kMaximumMergeTiles)
+      return failure();
+    return Simt32Geometry{
+        {partialCount},     {kPartialTile},
+        partialSerialTiles, kMaxThreads,
+        kSubgroup,          kMaxThreads * static_cast<int64_t>(sizeof(float)),
+        std::nullopt,       {1},
+        {kMaxThreads},      mergeSerialTiles,
+        {partialCount}};
+  }
   if (domain.size() < 2 || domain.size() > 8 ||
       llvm::any_of(domain, [](int64_t extent) { return extent <= 0; })) {
     return failure();
@@ -1922,11 +2982,19 @@ FailureOr<Simt32Geometry> simt32Geometry(ScheduleTaskKind kind,
   if (!rowFold && !columnFold) {
     return failure();
   }
-  const int64_t reductionAxis = rowFold ? domain.size() - 1 : 0;
+  const int64_t reductionAxis = rowFold && foldReductionAxis
+                                    ? *foldReductionAxis
+                                    : (rowFold ? domain.size() - 1 : 0);
+  if (reductionAxis < 0 || reductionAxis >= static_cast<int64_t>(domain.size()))
+    return failure();
+  SmallVector<int64_t> ownerShape;
+  for (auto [axis, extent] : llvm::enumerate(domain))
+    if (static_cast<int64_t>(axis) != reductionAxis)
+      ownerShape.push_back(extent);
   FailureOr<int64_t> reduction = rowFold
-                                     ? FailureOr<int64_t>(domain.back())
+                                     ? FailureOr<int64_t>(domain[reductionAxis])
                                      : staticElementCount(domain.drop_back());
-  FailureOr<int64_t> outputs = rowFold ? staticElementCount(domain.drop_back())
+  FailureOr<int64_t> outputs = rowFold ? staticElementCount(ownerShape)
                                        : FailureOr<int64_t>(domain.back());
   if (failed(reduction) || failed(outputs) || *outputs > UINT32_MAX) {
     return failure();
@@ -1942,6 +3010,39 @@ FailureOr<Simt32Geometry> simt32Geometry(ScheduleTaskKind kind,
                         kSubgroup,
                         threads * static_cast<int64_t>(sizeof(float)),
                         reductionAxis};
+}
+
+FailureOr<Simt32Geometry> indexedAccumulationGeometry(ScheduleTaskOp task) {
+  ArrayRef<int64_t> domain = task.getDomainShape();
+  auto reductions = task.getReductionDimensionsAttr();
+  if (domain.empty() || !reductions || reductions.empty())
+    return failure();
+  llvm::SmallDenseSet<int64_t> reductionSet;
+  SmallVector<int64_t> ownerShape;
+  SmallVector<int64_t> reductionShape;
+  SmallVector<int64_t> tileShape(domain.size(), 1);
+  for (int64_t axis : reductions.asArrayRef()) {
+    if (axis < 0 || axis >= static_cast<int64_t>(domain.size()) ||
+        !reductionSet.insert(axis).second)
+      return failure();
+    tileShape[axis] = domain[axis];
+    reductionShape.push_back(domain[axis]);
+  }
+  for (auto [axis, extent] : llvm::enumerate(domain))
+    if (!reductionSet.contains(axis))
+      ownerShape.push_back(extent);
+  FailureOr<int64_t> owners = staticElementCount(ownerShape);
+  FailureOr<int64_t> reduction = staticElementCount(reductionShape);
+  if (failed(owners) || failed(reduction) || *owners > UINT32_MAX)
+    return failure();
+  constexpr int64_t kThreads = 32;
+  return Simt32Geometry{{*owners},
+                        std::move(tileShape),
+                        ceilDivPositive(*reduction, kThreads),
+                        kThreads,
+                        kThreads,
+                        kThreads * 4,
+                        reductions.asArrayRef().back()};
 }
 
 FailureOr<Simt32Geometry> contractRegionGeometry(ScheduleTaskOp task,
@@ -1987,14 +3088,98 @@ FailureOr<Simt32Geometry> onlineStateGeometry(ScheduleTaskOp task) {
   constexpr int64_t kOnlineMmaSharedMemoryBytes = 64 * 1024;
   constexpr int64_t kMaximumOnlineVectorElements = 128;
   constexpr int64_t kMaximumOnlineReductionElements = 2048;
-  auto protocol = task.getOnlineStateProtocolAttr();
+  auto ownerDimensions = task.getCompositionOwnerDimensionsAttr();
+  auto streamDimensions = task.getCompositionStreamDimensionsAttr();
+  auto stateInputs = task.getCompositionStateInputsAttr();
+  auto stateOutputs = task.getCompositionStateOutputsAttr();
+  auto producerContractions =
+      task.getCompositionProducerContractionDimensionsAttr();
+  auto consumerContractions =
+      task.getCompositionConsumerContractionDimensionsAttr();
   auto reductionAxis = task.getReductionAxis();
   auto vectorDimensions = task.getOnlineVectorDimensions();
   ArrayRef<int64_t> domain = task.getDomainShape();
-  if (!protocol ||
-      protocol.getValue() !=
-          "online_normalized_exponential_weighted_contract" ||
-      !reductionAxis || *reductionAxis < 0 ||
+  if (!ownerDimensions || !streamDimensions || !producerContractions ||
+      !consumerContractions || ownerDimensions.empty() ||
+      streamDimensions.empty() || producerContractions.empty() ||
+      consumerContractions.empty())
+    return failure();
+  if (stateInputs || stateOutputs) {
+    constexpr int64_t kThreads = 384;
+    constexpr int64_t kOwnerAdjointTile = 64;
+    constexpr int64_t kStreamedAdjointTile = 128;
+    constexpr int64_t kOwnerStreamTile = 128;
+    constexpr int64_t kAdjointStreamTile = 64;
+    constexpr int64_t kSupportedVectorElements = 128;
+    constexpr int64_t kScratchBytes = 194 * 1024;
+    const bool hasStateInputs = stateInputs && !stateInputs.empty();
+    const bool hasStateOutputs = stateOutputs && !stateOutputs.empty();
+    const bool forward = !hasStateInputs && hasStateOutputs;
+    const bool ownerAdjoint = hasStateInputs && hasStateOutputs;
+    const bool streamedAdjoint = hasStateInputs && !hasStateOutputs;
+    ArrayRef<int64_t> reductions = streamDimensions.asArrayRef();
+    if (!vectorDimensions || vectorDimensions->empty() || domain.empty() ||
+        domain.size() > 8 ||
+        llvm::any_of(domain, [](int64_t extent) { return extent <= 0; }) ||
+        (!forward && !ownerAdjoint && !streamedAdjoint) ||
+        ((forward || ownerAdjoint) && reductions.size() != 1) ||
+        (streamedAdjoint && reductions.size() != 2))
+      return failure();
+
+    llvm::SmallDenseSet<int64_t> partitionedDimensions;
+    int64_t vectorElements = 1;
+    auto addDimensions = [&](ArrayRef<int64_t> dimensions,
+                             bool countVectorElements) -> LogicalResult {
+      for (int64_t axis : dimensions) {
+        if (axis < 0 || axis >= static_cast<int64_t>(domain.size()) ||
+            !partitionedDimensions.insert(axis).second)
+          return failure();
+        if (countVectorElements) {
+          if (vectorElements > kSupportedVectorElements / domain[axis])
+            return failure();
+          vectorElements *= domain[axis];
+        }
+      }
+      return success();
+    };
+    if (failed(addDimensions(ownerDimensions.asArrayRef(), false)) ||
+        failed(addDimensions(*vectorDimensions, true)) ||
+        failed(addDimensions(reductions, false)) ||
+        partitionedDimensions.size() != domain.size() ||
+        vectorElements != kSupportedVectorElements)
+      return failure();
+
+    const int64_t ownerAxis = ownerDimensions.asArrayRef().back();
+    const int64_t finalStream = reductions.back();
+    SmallVector<int64_t> tile(domain.size(), 1);
+    for (int64_t axis : *vectorDimensions)
+      tile[axis] = domain[axis];
+    for (int64_t axis : reductions.drop_back())
+      tile[axis] = domain[axis];
+    tile[ownerAxis] =
+        std::min(domain[ownerAxis],
+                 streamedAdjoint ? kStreamedAdjointTile : kOwnerAdjointTile);
+    tile[finalStream] =
+        std::min(domain[finalStream],
+                 streamedAdjoint ? kAdjointStreamTile : kOwnerStreamTile);
+
+    int64_t grid = 1;
+    for (int64_t axis : ownerDimensions.asArrayRef().drop_back()) {
+      if (grid > std::numeric_limits<int64_t>::max() / domain[axis])
+        return failure();
+      grid *= domain[axis];
+    }
+    const int64_t rowTiles =
+        ceilDivPositive(domain[ownerAxis], tile[ownerAxis]);
+    if (grid > std::numeric_limits<int64_t>::max() / rowTiles)
+      return failure();
+    grid *= rowTiles;
+    const int64_t serialTiles =
+        ceilDivPositive(domain[finalStream], tile[finalStream]);
+    return Simt32Geometry{{grid}, std::move(tile), serialTiles, kThreads,
+                          32,     kScratchBytes,   finalStream};
+  }
+  if (!reductionAxis || *reductionAxis < 0 ||
       *reductionAxis >= static_cast<int64_t>(domain.size()) ||
       !vectorDimensions || vectorDimensions->empty() || domain.empty() ||
       domain.size() > 8)
@@ -2010,10 +3195,14 @@ FailureOr<Simt32Geometry> onlineStateGeometry(ScheduleTaskOp task) {
     vectorElements *= domain[axis];
   }
   SmallVector<int64_t> outputShape;
-  for (auto [axis, extent] : llvm::enumerate(domain))
-    if (static_cast<int64_t>(axis) != *reductionAxis &&
-        !vectorAxes.contains(axis))
-      outputShape.push_back(extent);
+  llvm::SmallDenseSet<int64_t> ownerAxes;
+  for (int64_t axis : ownerDimensions.asArrayRef()) {
+    if (axis < 0 || axis >= static_cast<int64_t>(domain.size()) ||
+        axis == *reductionAxis || vectorAxes.contains(axis) ||
+        !ownerAxes.insert(axis).second)
+      return failure();
+    outputShape.push_back(domain[axis]);
+  }
   FailureOr<int64_t> outputs = staticElementCount(outputShape);
   const int64_t reduction = domain[*reductionAxis];
   if (failed(outputs) || *outputs > UINT32_MAX || reduction <= 0 ||
@@ -2071,10 +3260,12 @@ LogicalResult SchedulePlanOp::verifyRegions() {
 
   SmallVector<ScheduleBufferOp> buffers;
   SmallVector<ScheduleTaskOp> tasks;
-  bool sawTask = false;
+  SmallVector<EventTensorOp> events;
+  enum class ScheduleBodyPhase { Buffers, Tasks, Events };
+  ScheduleBodyPhase phase = ScheduleBodyPhase::Buffers;
   for (Operation &operation : body.front().without_terminator()) {
     if (auto buffer = dyn_cast<ScheduleBufferOp>(operation)) {
-      if (sawTask) {
+      if (phase != ScheduleBodyPhase::Buffers) {
         return buffer.emitOpError("schedule buffers must precede tasks");
       }
       if (!buffer->getDiscardableAttrs().empty()) {
@@ -2084,17 +3275,72 @@ LogicalResult SchedulePlanOp::verifyRegions() {
       continue;
     }
     if (auto task = dyn_cast<ScheduleTaskOp>(operation)) {
-      sawTask = true;
+      if (phase > ScheduleBodyPhase::Tasks)
+        return task.emitOpError("schedule tasks must precede events");
+      phase = ScheduleBodyPhase::Tasks;
       if (!task->getDiscardableAttrs().empty()) {
         return task.emitOpError("does not permit discardable attributes");
       }
       tasks.push_back(task);
       continue;
     }
-    return emitOpError("body may contain only schedule buffers and tasks");
+    if (auto event = dyn_cast<EventTensorOp>(operation)) {
+      if (phase > ScheduleBodyPhase::Events)
+        return event.emitOpError(
+            "Event Tensors must precede their realizations");
+      phase = ScheduleBodyPhase::Events;
+      if (!event->getDiscardableAttrs().empty())
+        return event.emitOpError("does not permit discardable attributes");
+      events.push_back(event);
+      continue;
+    }
+    return emitOpError(
+        "body may contain only schedule buffers, tasks, and Event Tensors");
   }
   if (buffers.empty() || tasks.empty()) {
     return emitOpError("requires at least one schedule buffer and task");
+  }
+  llvm::SmallDenseSet<std::pair<int64_t, int64_t>> parametricEdges;
+  if (ArrayAttr programs = getParametricDependenciesAttr()) {
+    for (Attribute attribute : programs) {
+      auto program = dyn_cast<DictionaryAttr>(attribute);
+      auto dependency = program
+                            ? program.getAs<IntegerAttr>("dependency_ordinal")
+                            : IntegerAttr{};
+      auto producer =
+          program ? program.getAs<IntegerAttr>("producer_task") : IntegerAttr{};
+      auto consumer =
+          program ? program.getAs<IntegerAttr>("consumer_task") : IntegerAttr{};
+      auto source = program ? program.getAs<SourceRefAttr>("relation_source")
+                            : SourceRefAttr{};
+      auto semantics =
+          program ? program.getAs<RelationSemanticsAttr>("relation_semantics")
+                  : RelationSemanticsAttr{};
+      auto shared = program ? program.getAs<DenseI64ArrayAttr>("shared_buffers")
+                            : DenseI64ArrayAttr{};
+      auto derivation =
+          program ? program.getAs<StringAttr>("derivation") : StringAttr{};
+      auto capacity = program ? program.getAs<IntegerAttr>("storage_capacity")
+                              : IntegerAttr{};
+      auto generations =
+          program ? program.getAs<IntegerAttr>("generations") : IntegerAttr{};
+      if (!program || program.size() != 9 || !dependency ||
+          dependency.getInt() < 0 || !producer || !consumer || !source ||
+          !semantics || semantics.getValue() != RelationSemantics::Gather ||
+          !shared || shared.empty() || !derivation ||
+          derivation.getValue() != "exact_consumer" || !capacity ||
+          capacity.getInt() <= 0 || !generations || generations.getInt() <= 0 ||
+          producer.getInt() < 0 || consumer.getInt() < 0 ||
+          producer.getInt() >= static_cast<int64_t>(tasks.size()) ||
+          consumer.getInt() >= static_cast<int64_t>(tasks.size()) ||
+          !llvm::is_contained(tasks[consumer.getInt()].getDependencies(),
+                              producer.getInt()) ||
+          !parametricEdges.insert({producer.getInt(), consumer.getInt()})
+               .second)
+        return emitOpError(
+            "runtime-parametric dependencies require unique bounded Gather "
+            "program records");
+    }
   }
   if (!body.front().getTerminator()->getDiscardableAttrs().empty()) {
     return body.front().getTerminator()->emitOpError(
@@ -2110,9 +3356,11 @@ LogicalResult SchedulePlanOp::verifyRegions() {
     auto type = dyn_cast<RankedTensorType>(buffer.getTensorType());
     if (!type || !type.hasStaticShape() ||
         failed(staticElementCount(type.getShape())) ||
-        (!type.getElementType().isBF16() && !type.getElementType().isF32())) {
+        (!type.getElementType().isBF16() && !type.getElementType().isF32() &&
+         !type.getElementType().isInteger(1) &&
+         !type.getElementType().isInteger(32))) {
       return buffer.emitOpError(
-          "requires a positive static bf16 or f32 tensor type");
+          "requires a positive static bf16, f32, i1, or i32 tensor type");
     }
     ScheduleBufferIndexing expectedIndexing =
         type.getRank() == 0 ? ScheduleBufferIndexing::Scalar
@@ -2161,21 +3409,179 @@ LogicalResult SchedulePlanOp::verifyRegions() {
             "dependencies must be unique earlier schedule tasks");
       }
     }
+    auto indexDomainSource =
+        task->getAttrOfType<SourceRefAttr>("composition_index_domain_source");
+    auto indexDomainShape = task->getAttrOfType<DenseI64ArrayAttr>(
+        "composition_index_domain_shape");
+    auto indexDomainMap =
+        task->getAttrOfType<AffineMapAttr>("composition_index_domain_map");
+    const bool hasIndexDomain =
+        indexDomainSource && indexDomainShape && indexDomainMap;
+    if (hasIndexDomain != static_cast<bool>(indexDomainSource) ||
+        hasIndexDomain != static_cast<bool>(indexDomainShape) ||
+        hasIndexDomain != static_cast<bool>(indexDomainMap)) {
+      return task.emitOpError(
+          "composition index-domain provenance must be complete");
+    }
+    if (hasIndexDomain) {
+      AffineMap map = indexDomainMap.getValue();
+      if (llvm::any_of(indexDomainShape.asArrayRef(),
+                       [](int64_t extent) { return extent <= 0; }) ||
+          map.getNumSymbols() != 0 ||
+          map.getNumDims() != task.getDomainShape().size() ||
+          map.getNumResults() != indexDomainShape.size()) {
+        return task.emitOpError(
+            "composition index-domain map must map the task domain to the "
+            "positive index-domain shape");
+      }
+    }
+    auto orderedIndexSource =
+        task->getAttrOfType<SourceRefAttr>("composition_ordered_index_source");
+    auto orderedIndexDimensions = task->getAttrOfType<DenseI64ArrayAttr>(
+        "composition_ordered_index_dimensions");
+    auto orderedIndexInclusive =
+        task->getAttrOfType<BoolAttr>("composition_ordered_index_inclusive");
+    const bool hasOrderedIndex =
+        orderedIndexSource && orderedIndexDimensions && orderedIndexInclusive;
+    if (hasOrderedIndex != static_cast<bool>(orderedIndexSource) ||
+        hasOrderedIndex != static_cast<bool>(orderedIndexDimensions) ||
+        hasOrderedIndex != static_cast<bool>(orderedIndexInclusive) ||
+        (hasOrderedIndex &&
+         (!hasIndexDomain || orderedIndexDimensions.size() != 2 ||
+          llvm::any_of(orderedIndexDimensions.asArrayRef(), [&](int64_t axis) {
+            return axis < 0 || axis >= indexDomainShape.size();
+          })))) {
+      return task.emitOpError(
+          "ordered index provenance must completely reference two "
+          "index-domain dimensions");
+    }
+    auto stateAccessBuffers = task->getAttrOfType<DenseI64ArrayAttr>(
+        "composition_state_access_buffers");
+    auto stateAccessMaps =
+        task->getAttrOfType<ArrayAttr>("composition_state_access_maps");
+    if (static_cast<bool>(stateAccessBuffers) !=
+        static_cast<bool>(stateAccessMaps)) {
+      return task.emitOpError(
+          "composition state buffer accesses require buffers and maps");
+    }
+    if (stateAccessBuffers) {
+      if (!hasIndexDomain ||
+          stateAccessBuffers.size() != stateAccessMaps.size())
+        return task.emitOpError(
+            "composition state buffer accesses require matching index-domain "
+            "metadata");
+      llvm::SmallDenseSet<int64_t> stateBuffers;
+      llvm::SmallDenseSet<int64_t> declaredStateBuffers;
+      for (StringRef name :
+           {"composition_state_inputs", "composition_state_outputs"}) {
+        if (auto attr = task->getAttrOfType<DenseI64ArrayAttr>(name))
+          declaredStateBuffers.insert(attr.asArrayRef().begin(),
+                                      attr.asArrayRef().end());
+      }
+      for (auto [bufferOrdinal, mapAttr] :
+           llvm::zip_equal(stateAccessBuffers.asArrayRef(), stateAccessMaps)) {
+        auto map = dyn_cast<AffineMapAttr>(mapAttr);
+        if (bufferOrdinal < 0 ||
+            bufferOrdinal >= static_cast<int64_t>(buffers.size()) || !map ||
+            !stateBuffers.insert(bufferOrdinal).second ||
+            !declaredStateBuffers.contains(bufferOrdinal)) {
+          return task.emitOpError(
+              "composition state access must uniquely reference a declared "
+              "state buffer");
+        }
+        auto bufferType =
+            dyn_cast<RankedTensorType>(buffers[bufferOrdinal].getTensorType());
+        if (!bufferType || map.getValue().getNumSymbols() != 0 ||
+            map.getValue().getNumDims() != task.getDomainShape().size() ||
+            map.getValue().getNumResults() != bufferType.getRank()) {
+          return task.emitOpError(
+              "composition state access map must map the task domain to the "
+              "state buffer rank");
+        }
+      }
+    }
     const bool isFold = task.getKind() == ScheduleTaskKind::RowFold ||
-                        task.getKind() == ScheduleTaskKind::ColumnFold;
+                        task.getKind() == ScheduleTaskKind::ColumnFold ||
+                        task.getKind() == ScheduleTaskKind::AllAxisFold;
     const bool isContract = task.getKind() == ScheduleTaskKind::Contract;
-    const bool isOnline = static_cast<bool>(task.getOnlineStateProtocolAttr());
-    const int64_t expectedFoldAxis =
-        task.getKind() == ScheduleTaskKind::RowFold
-            ? static_cast<int64_t>(task.getDomainShape().size()) - 1
-            : 0;
-    if (isFold && !isOnline && task.getReductionAxis() != expectedFoldAxis) {
+    const bool isSelection = task.getSelectionDimension().has_value();
+    const bool hasSelectionMetadata =
+        task.getSelectionCount().has_value() ||
+        task.getSelectionOrder().has_value() ||
+        task.getSelectionComparison().has_value() ||
+        task.getSelectionStable().has_value() ||
+        task.getSelectionTieBreak().has_value();
+    const bool completeSelectionMetadata =
+        task.getSelectionCount().has_value() &&
+        task.getSelectionOrder().has_value() &&
+        task.getSelectionComparison().has_value() &&
+        task.getSelectionStable().has_value() &&
+        task.getSelectionTieBreak().has_value();
+    if (hasSelectionMetadata != completeSelectionMetadata ||
+        isSelection != completeSelectionMetadata ||
+        (isSelection &&
+         (!isFold || *task.getSelectionDimension() < 0 ||
+          *task.getSelectionDimension() >=
+              static_cast<int64_t>(task.getDomainShape().size()) ||
+          *task.getSelectionDimension() != *task.getReductionAxis() ||
+          *task.getSelectionCount() <= 0 || !*task.getSelectionStable())))
+      return task.emitOpError(
+          "Selection schedule metadata must completely bind a stable bounded "
+          "reduction");
+    const bool hasRelationSemantics = task.getRelationSemantics().has_value();
+    const bool hasRelationParameters = task.getRelationParameters().has_value();
+    if (hasRelationSemantics != hasRelationParameters ||
+        (hasRelationSemantics && task.getKind() != ScheduleTaskKind::Scalar &&
+         task.getKind() != ScheduleTaskKind::Elementwise))
+      return task.emitOpError(
+          "Relation schedule metadata requires a scalar or elementwise task");
+    const bool isOnline =
+        isContract && task.getCompositionOwnerDimensionsAttr() &&
+        task.getCompositionStreamDimensionsAttr() &&
+        task.getCompositionProducerContractionDimensionsAttr() &&
+        task.getCompositionConsumerContractionDimensionsAttr();
+    const bool isIndexedAccumulation =
+        isFold && task.getCompositionOwnerDimensionsAttr() &&
+        task.getCompositionStreamDimensionsAttr() && !isOnline;
+    std::optional<int64_t> stateBytes = task.getReductionStateBytesPerThread();
+    if (stateBytes && (!isFold || isOnline || *stateBytes <= 0)) {
+      return task.emitOpError(
+          "reduction state storage requires a positive ordinary Fold value");
+    }
+    const std::optional<int64_t> foldAxis = task.getReductionAxis();
+    auto foldDimensions = task.getReductionDimensions();
+    const bool genericFoldComposition = stateBytes.has_value();
+    if (task.getKind() == ScheduleTaskKind::AllAxisFold &&
+        (foldAxis || !foldDimensions ||
+         foldDimensions->size() != task.getDomainShape().size() ||
+         llvm::any_of(llvm::enumerate(*foldDimensions), [](auto entry) {
+           return entry.value() != static_cast<int64_t>(entry.index());
+         }))) {
+      return task.emitOpError(
+          "all-axis Fold must reduce every domain dimension exactly once");
+    }
+    if (isFold && task.getKind() != ScheduleTaskKind::AllAxisFold &&
+        foldDimensions && !isIndexedAccumulation) {
+      return task.emitOpError(
+          "single-axis Fold must not carry multi-axis reduction metadata");
+    }
+    if (isFold && !isOnline && !isIndexedAccumulation &&
+        task.getKind() != ScheduleTaskKind::AllAxisFold &&
+        (!foldAxis || *foldAxis < 0 ||
+         *foldAxis >= static_cast<int64_t>(task.getDomainShape().size()) ||
+         (task.getKind() == ScheduleTaskKind::ColumnFold && *foldAxis != 0) ||
+         (!genericFoldComposition &&
+          task.getKind() == ScheduleTaskKind::RowFold &&
+          *foldAxis !=
+              static_cast<int64_t>(task.getDomainShape().size()) - 1))) {
       return task.emitOpError(
           "Fold schedule kind must match its reduction axis");
     }
     std::optional<ScheduleReductionOrder> expectedOrder;
     if (isOnline) {
       expectedOrder = ScheduleReductionOrder::LeafOrderFree;
+    } else if (isSelection) {
+      expectedOrder = ScheduleReductionOrder::StableTotalOrderLeafOrderFixed;
     } else if (isFold) {
       expectedOrder = ScheduleReductionOrder::TreeAssociationFreeLeafOrderFixed;
     } else if (isContract) {
@@ -2196,12 +3602,27 @@ LogicalResult SchedulePlanOp::verifyRegions() {
       return task.emitOpError(
           "Contract-region schedule metadata requires a Contract task");
     }
+    auto phaseSchedules =
+        task->getAttrOfType<ArrayAttr>("composition_phase_schedules");
     FailureOr<Simt32Geometry> expected =
-        isOnline ? onlineStateGeometry(task)
+        phaseSchedules          ? multiPhaseGeometry(task, phaseSchedules)
+        : isOnline                ? onlineStateGeometry(task)
+        : isIndexedAccumulation ? indexedAccumulationGeometry(task)
         : hasContractStrategy
             ? contractRegionGeometry(task, getPolicy())
-            : simt32Geometry(task.getKind(), task.getDomainShape(),
-                             getPolicy());
+            : simt32Geometry(task.getKind(), task.getDomainShape(), getPolicy(),
+                             genericFoldComposition ? foldAxis : std::nullopt);
+    if (succeeded(expected) && stateBytes) {
+      if (expected->workgroupThreads >
+          std::numeric_limits<int64_t>::max() / *stateBytes) {
+        return task.emitOpError("reduction state scratch size overflows i64");
+      }
+      expected->scratchBytes = expected->workgroupThreads * *stateBytes;
+      if (expected->scratchBytes > 96 * 1024) {
+        return task.emitOpError(
+            "reduction state scratch exceeds the bounded SM90 allocation");
+      }
+    }
     if (failed(expected) ||
         task.getGridShape() != ArrayRef<int64_t>(expected->grid) ||
         task.getTileShape() != ArrayRef<int64_t>(expected->tile) ||
@@ -2209,7 +3630,28 @@ LogicalResult SchedulePlanOp::verifyRegions() {
         task.getWorkgroupThreads() != expected->workgroupThreads ||
         task.getSubgroupSize() != expected->subgroupSize ||
         task.getScratchBytes() != expected->scratchBytes ||
-        task.getReductionAxis() != expected->reductionAxis) {
+        task.getReductionAxis() != expected->reductionAxis ||
+        task.getReductionMergeGridShapeAttr() !=
+            (expected->reductionMergeGrid.empty()
+                 ? DenseI64ArrayAttr()
+                 : DenseI64ArrayAttr::get(task.getContext(),
+                                          expected->reductionMergeGrid)) ||
+        task.getReductionMergeTileShapeAttr() !=
+            (expected->reductionMergeTile.empty()
+                 ? DenseI64ArrayAttr()
+                 : DenseI64ArrayAttr::get(task.getContext(),
+                                          expected->reductionMergeTile)) ||
+        task.getReductionMergeSerialTiles() !=
+            (expected->reductionMergeSerialTiles == 0
+                 ? std::optional<int64_t>()
+                 : std::optional<int64_t>(
+                       expected->reductionMergeSerialTiles)) ||
+        task.getReductionPartialBufferShapeAttr() !=
+            (expected->reductionPartialBufferShape.empty()
+                 ? DenseI64ArrayAttr()
+                 : DenseI64ArrayAttr::get(
+                       task.getContext(),
+                       expected->reductionPartialBufferShape))) {
       return task.emitOpError(
           "schedule geometry must equal the SIMT32 derivation");
     }
@@ -2219,18 +3661,689 @@ LogicalResult SchedulePlanOp::verifyRegions() {
       ++contractCount;
     }
   }
-  if (foldCount == 0 && contractCount == 0 && tasks.size() < 2) {
-    return emitOpError("requires at least two Map schedule tasks");
-  }
   if ((contractCount != 0 && getSchemaVersion() != 2) ||
       (contractCount == 0 && getSchemaVersion() != 1 &&
        getSchemaVersion() != 2)) {
     return emitOpError("schedule schema must equal the admitted task family");
   }
+  const bool eventized = getEventized().value_or(false);
+  const bool hasTaskDependencies = llvm::any_of(tasks, [](ScheduleTaskOp task) {
+    return !task.getDependencies().empty();
+  });
+  const bool hasLocalReduction = llvm::any_of(tasks, [](ScheduleTaskOp task) {
+    return task.getKind() == ScheduleTaskKind::AllAxisFold;
+  });
+  if (eventized != (hasTaskDependencies || hasLocalReduction))
+    return emitOpError(
+        "eventized must exactly indicate whether task dependencies exist");
+  if (!eventized && !events.empty())
+    return emitOpError("Event Tensors require an eventized schedule plan");
+  llvm::SmallDenseSet<std::pair<int64_t, int64_t>> eventEdges;
+  for (auto [ordinal, event] : llvm::enumerate(events)) {
+    const int64_t producer = event.getProducerTask();
+    const int64_t consumer = event.getConsumerTask();
+    const bool hasPhase = event.getProducerPhase().has_value() ||
+                          event.getConsumerPhase().has_value();
+    const bool localReduction =
+        event.getProducerPhase() == "partial" &&
+        event.getConsumerPhase() == "merge" && producer == consumer &&
+        producer >= 0 && producer < static_cast<int64_t>(tasks.size()) &&
+        tasks[producer].getKind() == ScheduleTaskKind::AllAxisFold;
+    if (event.getOrdinal() != static_cast<int64_t>(ordinal) || producer < 0 ||
+        hasPhase != localReduction ||
+        (!localReduction && consumer <= producer) ||
+        consumer >= static_cast<int64_t>(tasks.size()) ||
+        (!localReduction &&
+         !llvm::is_contained(tasks[consumer].getDependencies(), producer)) ||
+        (!localReduction && parametricEdges.contains({producer, consumer})) ||
+        !eventEdges.insert({producer, consumer}).second) {
+      return event.emitOpError(
+          "must uniquely eventize one ordered schedule-task dependency");
+    }
+    ArrayRef<int64_t> producerGrid = tasks[producer].getGridShape();
+    ArrayRef<int64_t> consumerGrid =
+        localReduction ? *tasks[consumer].getReductionMergeGridShape()
+                       : tasks[consumer].getGridShape();
+    ArrayRef<int64_t> relationDomain = event.getRelationDomainShape();
+    AffineMap producerIndices = event.getProducerIndices();
+    AffineMap consumerIndices = event.getConsumerIndices();
+    std::optional<IntegerSet> relationPredicate = event.getRelationPredicate();
+    FailureOr<int64_t> expectedStorageCapacity =
+        staticElementCount(relationDomain);
+    AffineExpr expectedStorageSlot = getAffineConstantExpr(0, getContext());
+    for (auto [axis, extent] : llvm::enumerate(relationDomain))
+      expectedStorageSlot =
+          expectedStorageSlot * extent + getAffineDimExpr(axis, getContext());
+    const AffineMap expectedStorageSlotMap = AffineMap::get(
+        relationDomain.size(), 0, expectedStorageSlot, getContext());
+    const AffineMap expectedGenerationMap =
+        AffineMap::get(relationDomain.size(), 0,
+                       getAffineConstantExpr(0, getContext()), getContext());
+    if (relationDomain.empty() || failed(expectedStorageCapacity) ||
+        producerIndices.getNumDims() != relationDomain.size() ||
+        producerIndices.getNumSymbols() != 0 ||
+        producerIndices.getNumResults() != producerGrid.size() ||
+        consumerIndices.getNumDims() != relationDomain.size() ||
+        consumerIndices.getNumSymbols() != 0 ||
+        consumerIndices.getNumResults() != consumerGrid.size() ||
+        (relationPredicate &&
+         (relationPredicate->getNumDims() != relationDomain.size() ||
+          relationPredicate->getNumSymbols() != 0)) ||
+        event.getStorageCapacity() != *expectedStorageCapacity ||
+        event.getStorageSlot() != expectedStorageSlotMap ||
+        event.getGenerationIndex() != expectedGenerationMap) {
+      return event.emitOpError(
+          "scheduled relation must have bounded lexicographic "
+          "generation-zero storage and maps into both task grids");
+    }
+    if (failed(verifyEventIndexAndSlotRanges(event, tasks[producer],
+                                             tasks[consumer])))
+      return failure();
+    if (event.getGenerations() != 1 || event.getNotifyCount() != 1 ||
+        event.getScope() != EventScope::Device || !event.getRelease() ||
+        !event.getAcquire()) {
+      return event.emitOpError(
+          "scheduled task relation requires one generation, one "
+          "notification per relation point, and device release/acquire");
+    }
+    if (localReduction && (relationDomain.size() != 1 ||
+                           relationDomain.front() != producerGrid.front() ||
+                           event.getStorageCapacity() != producerGrid.front()))
+      return event.emitOpError(
+          "partial-to-merge Event must cover every private partial exactly "
+          "once");
+  }
+  if (eventized) {
+    for (auto [consumer, task] : llvm::enumerate(tasks)) {
+      for (int64_t producer : task.getDependencies())
+        if (!eventEdges.contains({producer, static_cast<int64_t>(consumer)}) &&
+            !parametricEdges.contains(
+                {producer, static_cast<int64_t>(consumer)}))
+          return task.emitOpError(
+              "dependency is missing its exact Event Tensor");
+      if (task.getKind() == ScheduleTaskKind::AllAxisFold &&
+          !eventEdges.contains(
+              {static_cast<int64_t>(consumer), static_cast<int64_t>(consumer)}))
+        return task.emitOpError(
+            "hierarchical Fold is missing its partial-to-merge Event Tensor");
+    }
+  }
   if (getFingerprint() != schedulePlanFingerprint(*this)) {
     return emitOpError("fingerprint does not match the closed schedule plan");
   }
   return success();
+}
+
+std::string eventLoweringPlanFingerprint(EventLoweringPlanOp plan) {
+  std::string normalized;
+  llvm::raw_string_ostream stream(normalized);
+  stream << "shuttle.event_lowering_plan.v1\n"
+         << "schema_version=" << plan.getSchemaVersion() << '\n'
+         << "source_schedule_fingerprint="
+         << plan.getSourceScheduleFingerprint() << '\n';
+  if (std::optional<StringRef> physicalFingerprint =
+          plan.getPhysicalLaunchRecipeFingerprint())
+    stream << "physical_launch_recipe_fingerprint=" << *physicalFingerprint
+           << '\n';
+  else
+    stream << "source_bound_imperative=true\n";
+  for (Operation &operation : plan.getBody().front()) {
+    if (isa<EventLoweringPlanYieldOp>(operation))
+      continue;
+    stream << operation.getName() << '{';
+    for (NamedAttribute attribute : operation.getAttrs()) {
+      stream << attribute.getName() << '=';
+      attribute.getValue().print(stream);
+      stream << ',';
+    }
+    stream << "}\n";
+  }
+  stream.flush();
+  llvm::SHA256 digest;
+  digest.update(normalized);
+  return llvm::toHex(digest.final(), true);
+}
+
+LogicalResult EventLoweringPlanOp::verifyRegions() {
+  if (!getOperation()->getDiscardableAttrs().empty())
+    return emitOpError("does not permit discardable attributes");
+  std::optional<StringRef> physicalFingerprint =
+      getPhysicalLaunchRecipeFingerprint();
+  if (getSchemaVersion() != 1 ||
+      !isLowerHexDigest(getSourceScheduleFingerprint()) ||
+      (physicalFingerprint && !isLowerHexDigest(*physicalFingerprint)) ||
+      !isLowerHexDigest(getFingerprint()))
+    return emitOpError(
+        "requires schema 1, SHA-256 schedule and plan bindings, and a "
+        "SHA-256 launch-recipe binding when physically bound");
+  Region &body = getBody();
+  if (body.empty() || !llvm::hasSingleElement(body) ||
+      !isa<EventLoweringPlanYieldOp>(body.front().getTerminator()))
+    return emitOpError(
+        "requires one block terminated by shuttle.event_lowering_plan_yield");
+  llvm::SmallDenseSet<int64_t> events;
+  llvm::SmallDenseMap<int64_t, ImperativeEventNotifyOp> notifications;
+  llvm::SmallDenseMap<int64_t, ImperativeEventWaitOp> waits;
+  for (Operation &operation : body.front().without_terminator()) {
+    auto realization = dyn_cast<EventRealizationOp>(operation);
+    if (!realization) {
+      if (auto notification = dyn_cast<ImperativeEventNotifyOp>(operation)) {
+        if (!notification->getDiscardableAttrs().empty())
+          return notification.emitOpError(
+              "does not permit discardable attributes");
+        if (notification.getEvent() < 0 ||
+            !notifications.try_emplace(notification.getEvent(), notification)
+                 .second)
+          return notification.emitOpError(
+              "must uniquely reference one nonnegative Event Tensor ordinal");
+        continue;
+      }
+      if (auto wait = dyn_cast<ImperativeEventWaitOp>(operation)) {
+        if (!wait->getDiscardableAttrs().empty())
+          return wait.emitOpError("does not permit discardable attributes");
+        if (wait.getEvent() < 0 ||
+            !waits.try_emplace(wait.getEvent(), wait).second)
+          return wait.emitOpError(
+              "must uniquely reference one nonnegative Event Tensor ordinal");
+        continue;
+      }
+      return emitOpError(
+          "body may contain only event realizations and imperative Event "
+          "wait/notify operations");
+    }
+    if (!realization->getDiscardableAttrs().empty())
+      return realization.emitOpError("does not permit discardable attributes");
+    if (realization.getEvent() < 0 ||
+        !events.insert(realization.getEvent()).second)
+      return realization.emitOpError(
+          "must uniquely reference one nonnegative Event Tensor ordinal");
+    ArrayRef<int64_t> order = realization.getCoveringLaunchOrder();
+    const bool imperative =
+        realization.getKind() == EventRealizationKind::ImperativeWaitNotify;
+    const bool physicalMechanism =
+        realization.getKind() == EventRealizationKind::MBarrier ||
+        realization.getKind() == EventRealizationKind::Pipeline ||
+        realization.getKind() == EventRealizationKind::Queue;
+    if (imperative && !order.empty())
+      return realization.emitOpError(
+          "imperative wait/notify realization cannot claim erasure witnesses");
+    if (physicalMechanism && !physicalFingerprint)
+      return realization.emitOpError(
+          "physical Event mechanism requires a launch-recipe binding");
+    if (physicalMechanism && !order.empty())
+      return realization.emitOpError(
+          "physical Event mechanism cannot claim erasure witnesses");
+    if (!imperative && !physicalMechanism &&
+        (order.empty() || order.size() % 4 != 0))
+      return realization.emitOpError(
+          "requires producer-launch, producer owner-local phase, "
+          "consumer-launch, and consumer owner-local phase witnesses");
+    if (imperative || physicalMechanism)
+      continue;
+    const bool algebraicRefinement =
+        realization.getKind() ==
+        EventRealizationKind::AlgebraicRefinementErased;
+    bool crossesLaunch = false;
+    for (size_t index = 0; index < order.size(); index += 4) {
+      const int64_t producerLaunch = order[index];
+      const int64_t producerPosition = order[index + 1];
+      const int64_t consumerLaunch = order[index + 2];
+      const int64_t consumerPosition = order[index + 3];
+      if (producerLaunch < 0 || producerPosition < 0 || consumerLaunch < 0 ||
+          consumerPosition < 0 || producerLaunch > consumerLaunch)
+        return realization.emitOpError(
+            "physical witnesses must order each producer before its consumer");
+      if (algebraicRefinement) {
+        if (producerLaunch != consumerLaunch)
+          return realization.emitOpError(
+              "algebraic refinement must fuse both Event endpoints into one "
+              "physical launch");
+      } else if (producerLaunch == consumerLaunch &&
+                 producerPosition >= consumerPosition) {
+        return realization.emitOpError(
+            "physical witnesses must order each producer before its consumer");
+      }
+      crossesLaunch |= producerLaunch < consumerLaunch;
+    }
+    if (algebraicRefinement)
+      continue;
+    if (realization.getKind() == EventRealizationKind::ProgramOrderErased) {
+      if (crossesLaunch)
+        return realization.emitOpError(
+            "program-order erasure requires same-launch witnesses");
+      continue;
+    }
+    if (realization.getKind() == EventRealizationKind::StreamOrderErased) {
+      if (!crossesLaunch)
+        return realization.emitOpError(
+            "stream-order erasure requires at least one cross-launch witness");
+      continue;
+    }
+    return realization.emitOpError(
+        "requires an erased Event Tensor or explicit imperative wait/notify "
+        "realization");
+  }
+  for (int64_t event : events) {
+    auto notification = notifications.find(event);
+    auto wait = waits.find(event);
+    EventRealizationOp realization;
+    for (EventRealizationOp candidate :
+         body.front().getOps<EventRealizationOp>())
+      if (candidate.getEvent() == event) {
+        realization = candidate;
+        break;
+      }
+    const bool imperative =
+        realization &&
+        realization.getKind() == EventRealizationKind::ImperativeWaitNotify;
+    if (!imperative) {
+      if (notification != notifications.end() || wait != waits.end())
+        return emitOpError(
+            "erased Event Tensor cannot retain imperative wait/notify "
+            "operations");
+      continue;
+    }
+    if (notification == notifications.end() || wait == waits.end())
+      return realization.emitOpError(
+          "requires exactly one matching imperative notify and wait");
+    for (NamedAttribute attribute : notification->second->getAttrs()) {
+      StringRef name = attribute.getName().strref();
+      if (name == "release")
+        continue;
+      if (wait->second->getAttr(attribute.getName()) != attribute.getValue())
+        return realization.emitOpError(
+            "requires wait and notify to carry identical exact Event "
+            "metadata");
+    }
+    ArrayRef<int64_t> shape = notification->second.getRelationDomainShape();
+    const int64_t dimensions = shape.size();
+    FailureOr<presburger::IntegerPolyhedron> domain =
+        boundedEventDomain(shape, notification->second.getRelationPredicate());
+    if (failed(domain) ||
+        notification->second.getProducerIndices().getNumDims() != dimensions ||
+        notification->second.getProducerIndices().getNumSymbols() != 0 ||
+        notification->second.getConsumerIndices().getNumDims() != dimensions ||
+        notification->second.getConsumerIndices().getNumSymbols() != 0 ||
+        notification->second.getProducerIndices().getNumResults() == 0 ||
+        notification->second.getConsumerIndices().getNumResults() == 0)
+      return notification->second.emitOpError(
+          "requires symbol-free endpoint maps over a bounded exact relation");
+    if (notification->second.getStorageCapacity() == 0 ||
+        notification->second.getStorageCapacity() >
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+        notification->second.getGenerations() == 0 ||
+        notification->second.getGenerations() >
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+        notification->second.getNotifyCount() <= 0)
+      return notification->second.emitOpError(
+          "requires positive storage capacity, generations, and notify count");
+    std::array<int64_t, 1> storageShape{
+        static_cast<int64_t>(notification->second.getStorageCapacity())};
+    std::array<int64_t, 1> generationShape{
+        static_cast<int64_t>(notification->second.getGenerations())};
+    FailureOr<bool> slotInBounds = affineMapIsInBounds(
+        notification->second.getStorageSlot(), *domain, storageShape);
+    FailureOr<bool> generationInBounds = affineMapIsInBounds(
+        notification->second.getGenerationIndex(), *domain, generationShape);
+    if (failed(slotInBounds) || !*slotInBounds || failed(generationInBounds) ||
+        !*generationInBounds)
+      return notification->second.emitOpError(
+          "storage-slot or generation map escapes its bounded Event range");
+  }
+  if (notifications.size() != waits.size() ||
+      notifications.size() > events.size())
+    return emitOpError("contains orphan imperative Event operations");
+  for (auto [event, notification] : notifications)
+    if (!events.contains(event))
+      return notification.emitOpError(
+          "references an Event Tensor without a realization");
+  if (!physicalFingerprint)
+    for (EventRealizationOp realization :
+         body.front().getOps<EventRealizationOp>())
+      if (realization.getKind() != EventRealizationKind::ImperativeWaitNotify)
+        return realization.emitOpError(
+            "source-bound Event lowering plan without a physical launch "
+            "recipe must retain every Event as exact imperative wait/notify");
+  if (!body.front().getTerminator()->getDiscardableAttrs().empty())
+    return body.front().getTerminator()->emitOpError(
+        "does not permit discardable attributes");
+  if (getFingerprint() != eventLoweringPlanFingerprint(*this))
+    return emitOpError(
+        "fingerprint does not match the closed event lowering plan");
+  return success();
+}
+
+LogicalResult InternalEventPlanOp::verifyRegions() {
+  if (!getOperation()->getDiscardableAttrs().empty())
+    return emitOpError("does not permit discardable attributes");
+  if (getSchemaVersion() != 1 ||
+      !isLowerHexDigest(getPhysicalScheduleFingerprint()) ||
+      !isLowerHexDigest(getPhysicalLaunchRecipeFingerprint()) ||
+      !isLowerHexDigest(getCanonicalScheduleDigest()) ||
+      !isLowerHexDigest(getFingerprint()))
+    return emitOpError(
+        "requires schema 1 and SHA-256 schedule, launch-recipe, canonical, "
+        "and provenance fingerprints");
+  llvm::SHA256 scheduleDigest;
+  scheduleDigest.update(getCanonicalSchedule());
+  if (llvm::toHex(scheduleDigest.final(), true) != getCanonicalScheduleDigest())
+    return emitOpError("canonical schedule digest does not match its payload");
+  llvm::SHA256 provenanceDigest;
+  provenanceDigest.update(getPhysicalScheduleFingerprint());
+  provenanceDigest.update(getPhysicalLaunchRecipeFingerprint());
+  provenanceDigest.update(getCanonicalScheduleDigest());
+  if (llvm::toHex(provenanceDigest.final(), true) != getFingerprint())
+    return emitOpError("fingerprint does not bind the internal schedule and "
+                       "physical launch recipe");
+  if (getBody().empty() || !llvm::hasSingleElement(getBody()) ||
+      !isa<InternalEventPlanYieldOp>(getBody().front().getTerminator()))
+    return emitOpError("requires one body block terminated by "
+                       "shuttle.internal_event_plan_yield");
+  for (Operation &operation : getBody().front()) {
+    if (!isa<InternalEventTaskOp, InternalEventTensorOp,
+             InternalEventAllocationOp, InternalEventRealizationOp,
+             InternalEventNotifyOp, InternalEventWaitOp,
+             InternalEventPlanYieldOp>(operation))
+      return operation.emitOpError(
+          "is not a structured refined internal Event plan record");
+    if (!operation.getDiscardableAttrs().empty())
+      return operation.emitOpError("does not permit discardable attributes");
+  }
+
+  using RecordKey = std::pair<int64_t, int64_t>;
+  std::map<RecordKey, InternalEventTaskOp> tasks;
+  std::map<RecordKey, InternalEventAllocationOp> allocations;
+  std::set<std::tuple<int64_t, int64_t, int64_t>> notifications;
+  std::set<std::tuple<int64_t, int64_t, int64_t>> waits;
+  for (InternalEventTaskOp task :
+       getBody().front().getOps<InternalEventTaskOp>())
+    if (!tasks.emplace(RecordKey{task.getRegion(), task.getOrdinal()}, task)
+             .second)
+      return task.emitOpError("duplicates an internal task ordinal");
+  for (InternalEventAllocationOp allocation :
+       getBody().front().getOps<InternalEventAllocationOp>()) {
+    if (!allocations
+             .emplace(
+                 RecordKey{allocation.getRegion(), allocation.getOrdinal()},
+                 allocation)
+             .second)
+      return allocation.emitOpError(
+          "duplicates an internal allocation ordinal");
+    const bool hasTransactions =
+        static_cast<bool>(allocation.getTransactionBytesByCoordinateAttr());
+    const StringRef legalization = allocation.getLegalization();
+    const bool valid = (allocation.getScope() == "cta" && !hasTransactions &&
+                        (legalization == "cta_mbarrier" ||
+                         legalization == "cta_async_completion_queue")) ||
+                       (allocation.getScope() == "cta" && hasTransactions &&
+                        legalization == "cta_transaction_mbarrier") ||
+                       (allocation.getScope() == "device" && !hasTransactions &&
+                        legalization == "device_semaphore_queue");
+    if (!valid)
+      return allocation.emitOpError(
+          "legalization does not match scope and transaction mode");
+  }
+
+  auto taskMatchesRelation = [&](int64_t region, int64_t taskOrdinal,
+                                 DictionaryAttr relation) {
+    auto task = tasks.find(RecordKey{region, taskOrdinal});
+    StringAttr family = relation.getAs<StringAttr>("task_family");
+    return task != tasks.end() && family &&
+           task->second.getName() == family.getValue();
+  };
+  auto verifyMechanismBinding =
+      [&](Operation *operation, InternalEventAllocationOp allocation,
+          int64_t coordinateOrdinal) -> LogicalResult {
+    ArrayAttr coordinates = allocation.getMechanismCoordinates();
+    ArrayAttr owners = allocation.getAllocationOwners();
+    ArrayRef<int64_t> slots = allocation.getSlots();
+    ArrayRef<int64_t> generations = allocation.getGenerations();
+    ArrayRef<int64_t> initialCounts = allocation.getInitialCounts();
+    if (coordinateOrdinal < 0 ||
+        coordinateOrdinal >= static_cast<int64_t>(coordinates.size()) ||
+        coordinates.size() != owners.size() ||
+        coordinates.size() != slots.size() ||
+        coordinates.size() != generations.size() ||
+        coordinates.size() != initialCounts.size())
+      return operation->emitOpError(
+          "references an invalid internal mechanism coordinate");
+    const size_t index = coordinateOrdinal;
+    if (operation->getAttr("mechanism_coordinate") != coordinates[index] ||
+        operation->getAttr("allocation_owner") != owners[index] ||
+        operation->getAttrOfType<IntegerAttr>("slot").getInt() !=
+            slots[index] ||
+        operation->getAttrOfType<IntegerAttr>("generation").getInt() !=
+            generations[index] ||
+        operation->getAttrOfType<IntegerAttr>("generation_count").getInt() !=
+            allocation.getGenerationCount() ||
+        operation->getAttr("scope") != allocation.getScopeAttr() ||
+        operation->getAttr("legalization") != allocation.getLegalizationAttr())
+      return operation->emitOpError(
+          "does not equal its bounded internal mechanism allocation");
+    return success();
+  };
+
+  for (InternalEventNotifyOp notification :
+       getBody().front().getOps<InternalEventNotifyOp>()) {
+    RecordKey allocationKey{notification.getRegion(),
+                            notification.getAllocation()};
+    auto allocation = allocations.find(allocationKey);
+    if (allocation == allocations.end())
+      return notification.emitOpError(
+          "references an unknown internal allocation");
+    ArrayAttr relations = allocation->second.getNotifyRelations();
+    if (notification.getRelation() < 0 ||
+        notification.getRelation() >= static_cast<int64_t>(relations.size()))
+      return notification.emitOpError(
+          "references an unknown notification relation");
+    auto relation = cast<DictionaryAttr>(relations[notification.getRelation()]);
+    auto taskCoordinate = relation.getAs<DenseI64ArrayAttr>("task_coordinate");
+    auto mechanismCoordinate =
+        relation.getAs<DenseI64ArrayAttr>("mechanism_coordinate");
+    if (failed(verifyMechanismBinding(
+            notification, allocation->second,
+            notification.getMechanismCoordinateOrdinal())))
+      return failure();
+    if (!taskMatchesRelation(notification.getRegion(), notification.getTask(),
+                             relation) ||
+        notification.getTaskCoordinateAttr() != taskCoordinate ||
+        notification.getMechanismCoordinateAttr() != mechanismCoordinate ||
+        notification.getArrivalCount() != 1 ||
+        notification.getInitialCount() !=
+            allocation->second.getInitialCounts()
+                [notification.getMechanismCoordinateOrdinal()] ||
+        notification.getRelease() != allocation->second.getRelease())
+      return notification.emitOpError(
+          "does not equal its exact internal notification relation");
+    DenseI64ArrayAttr transactionBytes =
+        allocation->second.getTransactionBytesByCoordinateAttr();
+    IntegerAttr operationTransaction = notification.getTransactionBytesAttr();
+    if (static_cast<bool>(transactionBytes) !=
+            static_cast<bool>(operationTransaction) ||
+        (transactionBytes &&
+         operationTransaction.getInt() !=
+             transactionBytes
+                 .asArrayRef()[notification.getMechanismCoordinateOrdinal()]))
+      return notification.emitOpError(
+          "does not equal its internal notification transaction size");
+    if (!notifications
+             .insert({notification.getRegion(), notification.getAllocation(),
+                      notification.getRelation()})
+             .second)
+      return notification.emitOpError(
+          "duplicates an internal notification relation");
+  }
+  for (InternalEventWaitOp wait :
+       getBody().front().getOps<InternalEventWaitOp>()) {
+    RecordKey allocationKey{wait.getRegion(), wait.getAllocation()};
+    auto allocation = allocations.find(allocationKey);
+    if (allocation == allocations.end())
+      return wait.emitOpError("references an unknown internal allocation");
+    ArrayAttr relations = allocation->second.getWaitRelations();
+    if (wait.getRelation() < 0 ||
+        wait.getRelation() >= static_cast<int64_t>(relations.size()))
+      return wait.emitOpError("references an unknown wait relation");
+    auto relation = cast<DictionaryAttr>(relations[wait.getRelation()]);
+    auto taskCoordinate = relation.getAs<DenseI64ArrayAttr>("task_coordinate");
+    auto mechanismCoordinate =
+        relation.getAs<DenseI64ArrayAttr>("mechanism_coordinate");
+    if (failed(verifyMechanismBinding(wait, allocation->second,
+                                      wait.getMechanismCoordinateOrdinal())))
+      return failure();
+    if (!taskMatchesRelation(wait.getRegion(), wait.getTask(), relation) ||
+        wait.getTaskCoordinateAttr() != taskCoordinate ||
+        wait.getMechanismCoordinateAttr() != mechanismCoordinate ||
+        wait.getRequiredCount() !=
+            allocation->second
+                .getInitialCounts()[wait.getMechanismCoordinateOrdinal()] ||
+        wait.getAcquire() != allocation->second.getAcquire())
+      return wait.emitOpError(
+          "does not equal its exact internal wait relation");
+    if (!waits
+             .insert(
+                 {wait.getRegion(), wait.getAllocation(), wait.getRelation()})
+             .second)
+      return wait.emitOpError("duplicates an internal wait relation");
+  }
+  for (auto &[key, allocation] : allocations) {
+    for (int64_t relation = 0;
+         relation <
+         static_cast<int64_t>(allocation.getNotifyRelations().size());
+         ++relation)
+      if (!notifications.count({key.first, key.second, relation}))
+        return allocation.emitOpError(
+            "is missing an imperative internal notification relation");
+    for (int64_t relation = 0;
+         relation < static_cast<int64_t>(allocation.getWaitRelations().size());
+         ++relation)
+      if (!waits.count({key.first, key.second, relation}))
+        return allocation.emitOpError(
+            "is missing an imperative internal wait relation");
+  }
+  return success();
+}
+
+namespace {
+
+bool imperativeOperationMatchesEvent(Operation *operation,
+                                     EventTensorOp event) {
+  auto eventOrdinal = operation->getAttrOfType<IntegerAttr>("event");
+  if (!eventOrdinal || eventOrdinal.getInt() != event.getOrdinal())
+    return false;
+  for (NamedAttribute attribute : event->getAttrs()) {
+    if (attribute.getName().strref() == "ordinal")
+      continue;
+    if (attribute.getName().strref() == "release" &&
+        isa<ImperativeEventWaitOp>(operation))
+      continue;
+    if (attribute.getName().strref() == "acquire" &&
+        isa<ImperativeEventNotifyOp>(operation))
+      continue;
+    if (operation->getAttr(attribute.getName()) != attribute.getValue())
+      return false;
+  }
+  return true;
+}
+
+} // namespace
+
+LogicalResult verifyEventLoweringPlanAgainstSchedule(SchedulePlanOp schedule,
+                                                     EventLoweringPlanOp plan) {
+  if (failed(schedule.verifyRegions()) || failed(plan.verifyRegions()))
+    return failure();
+  if (plan.getSourceScheduleFingerprint() != schedule.getFingerprint())
+    return plan.emitOpError("does not bind its source schedule");
+  SmallVector<EventTensorOp> events(
+      schedule.getBody().front().getOps<EventTensorOp>());
+  SmallVector<EventRealizationOp> realizations(
+      plan.getBody().front().getOps<EventRealizationOp>());
+  if (events.size() != realizations.size())
+    return plan.emitOpError("must realize every exact Event Tensor once");
+  for (auto [ordinal, event, realization] :
+       llvm::enumerate(events, realizations)) {
+    if (event.getOrdinal() != static_cast<int64_t>(ordinal) ||
+        realization.getEvent() != static_cast<int64_t>(ordinal))
+      return realization.emitOpError(
+          "does not correspond to the source Event Tensor ordinal");
+    if (realization.getKind() != EventRealizationKind::ImperativeWaitNotify)
+      continue;
+    ImperativeEventNotifyOp notification;
+    ImperativeEventWaitOp wait;
+    for (Operation &operation : plan.getBody().front().without_terminator()) {
+      if (auto candidate = dyn_cast<ImperativeEventNotifyOp>(operation);
+          candidate && candidate.getEvent() == realization.getEvent())
+        notification = candidate;
+      if (auto candidate = dyn_cast<ImperativeEventWaitOp>(operation);
+          candidate && candidate.getEvent() == realization.getEvent())
+        wait = candidate;
+    }
+    if (!notification || !wait ||
+        !imperativeOperationMatchesEvent(notification, event) ||
+        !imperativeOperationMatchesEvent(wait, event))
+      return realization.emitOpError(
+          "imperative wait/notify metadata does not equal the exact source "
+          "Event Tensor");
+  }
+  return success();
+}
+
+void createImperativeEventLowering(OpBuilder &builder, Location location,
+                                   EventTensorOp event) {
+  OperationState realizationState(location,
+                                  EventRealizationOp::getOperationName());
+  realizationState.addAttribute("event",
+                                builder.getI64IntegerAttr(event.getOrdinal()));
+  realizationState.addAttribute(
+      "kind",
+      EventRealizationKindAttr::get(
+          builder.getContext(), EventRealizationKind::ImperativeWaitNotify));
+  realizationState.addAttribute(
+      "covering_launch_order",
+      DenseI64ArrayAttr::get(builder.getContext(), {}));
+  builder.create(realizationState);
+
+  SmallVector<NamedAttribute> notifyAttributes;
+  SmallVector<NamedAttribute> waitAttributes;
+  notifyAttributes.push_back(builder.getNamedAttr(
+      "event", builder.getI64IntegerAttr(event.getOrdinal())));
+  waitAttributes.push_back(builder.getNamedAttr(
+      "event", builder.getI64IntegerAttr(event.getOrdinal())));
+  for (NamedAttribute attribute : event->getAttrs()) {
+    StringRef name = attribute.getName().strref();
+    if (name == "ordinal")
+      continue;
+    if (name != "acquire")
+      notifyAttributes.push_back(attribute);
+    if (name != "release")
+      waitAttributes.push_back(attribute);
+  }
+  OperationState notificationState(location,
+                                   ImperativeEventNotifyOp::getOperationName());
+  notificationState.addAttributes(notifyAttributes);
+  builder.create(notificationState);
+  OperationState waitState(location, ImperativeEventWaitOp::getOperationName());
+  waitState.addAttributes(waitAttributes);
+  builder.create(waitState);
+}
+
+EventLoweringPlanOp createSourceBoundImperativeEventLoweringPlan(
+    OpBuilder &builder, Location location, SchedulePlanOp schedule) {
+  OperationState planState(location, EventLoweringPlanOp::getOperationName());
+  planState.addAttribute("schema_version", builder.getI64IntegerAttr(1));
+  planState.addAttribute("source_schedule_fingerprint",
+                         schedule.getFingerprintAttr());
+  planState.addAttribute("fingerprint",
+                         builder.getStringAttr(std::string(64, '0')));
+  planState.addRegion();
+  auto plan = cast<EventLoweringPlanOp>(builder.create(planState));
+  plan.getBody().push_back(new Block());
+  OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointToEnd(&plan.getBody().front());
+  for (EventTensorOp event : schedule.getBody().front().getOps<EventTensorOp>())
+    createImperativeEventLowering(builder, location, event);
+  builder.create<EventLoweringPlanYieldOp>(location);
+  plan.setFingerprint(eventLoweringPlanFingerprint(plan));
+  return plan;
 }
 
 namespace {
@@ -2294,6 +4407,10 @@ FailureOr<int64_t> executableElementBytes(Type elementType) {
   if (elementType.isF32()) {
     return 4;
   }
+  if (auto integerType = dyn_cast<IntegerType>(elementType);
+      integerType && integerType.getWidth() <= 32) {
+    return std::max<int64_t>(1, (integerType.getWidth() + 7) / 8);
+  }
   return failure();
 }
 
@@ -2314,6 +4431,11 @@ std::string deviceModuleFingerprint(DeviceModuleOp module) {
     version = "shuttle.device_module.v3";
   } else if (module.getCodeFormat() == ExecutableCodeFormat::CudaPtxSm100V1) {
     version = "shuttle.device_module.v4";
+  } else if (module.getCodeFormat() == ExecutableCodeFormat::CudaFatbinSm90V1) {
+    version = "shuttle.device_module.v5";
+  } else if (module.getCodeFormat() ==
+             ExecutableCodeFormat::CudaFatbinSm100V1) {
+    version = "shuttle.device_module.v6";
   }
   return executablePlanFingerprint<DeviceModuleOp, DeviceModuleYieldOp>(
       module, version);
@@ -2343,7 +4465,11 @@ LogicalResult DeviceModuleOp::verifyRegions() {
       (getSchemaVersion() == 3 &&
        getCodeFormat() == ExecutableCodeFormat::CudaPtxSm90V1) ||
       (getSchemaVersion() == 4 &&
-       getCodeFormat() == ExecutableCodeFormat::CudaPtxSm100V1);
+       getCodeFormat() == ExecutableCodeFormat::CudaPtxSm100V1) ||
+      (getSchemaVersion() == 5 &&
+       getCodeFormat() == ExecutableCodeFormat::CudaFatbinSm90V1) ||
+      (getSchemaVersion() == 6 &&
+       getCodeFormat() == ExecutableCodeFormat::CudaFatbinSm100V1);
   if (!validVersionPair) {
     return emitOpError(
         "requires a matching device-module and executable-code version");
@@ -2352,8 +4478,12 @@ LogicalResult DeviceModuleOp::verifyRegions() {
       getPolicy() != NumericalPolicy::SourceOrdered) {
     return emitOpError("requires source_ordered policy for CPU bytecode v2");
   }
-  const bool gpu = getCodeFormat() == ExecutableCodeFormat::CudaPtxSm90V1 ||
+  const bool ptx = getCodeFormat() == ExecutableCodeFormat::CudaPtxSm90V1 ||
                    getCodeFormat() == ExecutableCodeFormat::CudaPtxSm100V1;
+  const bool fatbin =
+      getCodeFormat() == ExecutableCodeFormat::CudaFatbinSm90V1 ||
+      getCodeFormat() == ExecutableCodeFormat::CudaFatbinSm100V1;
+  const bool gpu = ptx || fatbin;
   if (!isLowerHexDigest(getSourceScheduleFingerprint()) ||
       !isLowerHexDigest(getCodeDigest()) ||
       !isLowerHexDigest(getFingerprint())) {
@@ -2367,6 +4497,63 @@ LogicalResult DeviceModuleOp::verifyRegions() {
       !isa<DeviceModuleYieldOp>(body.front().getTerminator())) {
     return emitOpError(
         "requires one block terminated by shuttle.device_module_yield");
+  }
+  if (fatbin) {
+    auto transport = getNativeTransportAttr();
+    auto requestFingerprint = getPhysicalRequestFingerprintAttr();
+    auto compileRequestFingerprint = getPhysicalCompileRequestFingerprintAttr();
+    auto launchRecipeFingerprint = getPhysicalLaunchRecipeFingerprintAttr();
+    if (!transport || transport.empty() || !requestFingerprint ||
+        !isLowerHexDigest(requestFingerprint.getValue()) ||
+        !compileRequestFingerprint ||
+        !isLowerHexDigest(compileRequestFingerprint.getValue()) ||
+        !launchRecipeFingerprint ||
+        !isLowerHexDigest(launchRecipeFingerprint.getValue())) {
+      return emitOpError(
+          "fatbin device module requires source-bound and physical-request "
+          "native transport provenance");
+    }
+    if (!body.front().without_terminator().empty()) {
+      return emitOpError(
+          "fatbin launch entries are carried by the native transport");
+    }
+    if (ArrayAttr certificates = getOperation()->getAttrOfType<ArrayAttr>(
+            "trusted_source_event_certificates")) {
+      int64_t previousEvent = -1;
+      for (Attribute attribute : certificates) {
+        auto record = dyn_cast<DictionaryAttr>(attribute);
+        auto event =
+            record ? record.getAs<IntegerAttr>("event") : IntegerAttr{};
+        auto digest = record ? record.getAs<StringAttr>("compiler_ir_digest")
+                             : StringAttr{};
+        if (!event || event.getInt() <= previousEvent || !digest ||
+            !isLowerHexDigest(digest.getValue()))
+          return emitOpError("trusted source Event certificates must be "
+                             "ordered unique event/digest records");
+        previousEvent = event.getInt();
+      }
+    }
+    if (ArrayAttr snapshots = getDeviceIrSnapshotDigestsAttr()) {
+      if (snapshots.empty() || llvm::any_of(snapshots, [](Attribute attribute) {
+            auto digest = dyn_cast<StringAttr>(attribute);
+            return !digest || !isLowerHexDigest(digest.getValue());
+          }))
+        return emitOpError(
+            "device IR snapshots must be nonempty arrays of SHA-256 digests");
+    }
+    if (getFingerprint() != deviceModuleFingerprint(*this)) {
+      return emitOpError("fingerprint does not match the closed device module");
+    }
+    return success();
+  }
+  if (getNativeTransportAttr() || getPhysicalRequestFingerprintAttr() ||
+      getPhysicalCompileRequestFingerprintAttr() ||
+      getPhysicalLaunchRecipeFingerprintAttr() ||
+      getOperation()->hasAttr("trusted_source_event_certificates") ||
+      getOperation()->hasAttr("trusted_internal_event_certificates") ||
+      getDeviceIrSnapshotDigestsAttr()) {
+    return emitOpError(
+        "native transport is permitted only for CUDA fatbin modules");
   }
   int64_t expectedOffset = 0;
   int64_t ordinal = 0;
@@ -2392,7 +4579,7 @@ LogicalResult DeviceModuleOp::verifyRegions() {
     expectedOffset += entry.getCodeLength();
     ArrayRef<int8_t> entryCode =
         getCode().slice(entry.getCodeOffset(), entry.getCodeLength());
-    if (gpu && entry.getCodeDigest() != executableCodeDigest(entryCode)) {
+    if (ptx && entry.getCodeDigest() != executableCodeDigest(entryCode)) {
       return entry.emitOpError("entrypoint code SHA-256 is invalid");
     }
     if (!gpu && entry.getCodeDigest() != getCodeDigest()) {
@@ -2442,7 +4629,7 @@ LogicalResult DeviceModuleOp::verifyRegions() {
         entry.getPredication() != ExecutablePredication::DomainBounds) {
       return entry.emitOpError("uses an unsupported predication policy");
     }
-    if (!gpu) {
+    if (!ptx) {
       if (entry.getGrid() || entry.getBlock() ||
           entry.getDynamicSharedBytes() || entry.getKernelArity()) {
         return entry.emitOpError(
@@ -2469,7 +4656,8 @@ LogicalResult DeviceModuleOp::verifyRegions() {
       threads *= extent;
     }
     if (*entry.getDynamicSharedBytes() < 0 ||
-        *entry.getDynamicSharedBytes() > 96 * 1024 ||
+        static_cast<uint64_t>(*entry.getDynamicSharedBytes()) >
+            kMaximumGpuDynamicSharedMemoryBytes ||
         *entry.getKernelArity() !=
             static_cast<int64_t>(entry.getInputBuffers().size() +
                                  entry.getOutputBuffers().size())) {
@@ -2482,10 +4670,9 @@ LogicalResult DeviceModuleOp::verifyRegions() {
           "online state protocol requires logical coordinate maps");
     if (onlineProtocol) {
       if (getPolicy() != NumericalPolicy::Fast ||
-          onlineProtocol.getValue() !=
-              "online_normalized_exponential_weighted_contract" ||
+          onlineProtocol.getValue() != "stateful_contract_fold" ||
           entry.getReductionOrder() != ScheduleReductionOrder::LeafOrderFree ||
-          logicalMaps.empty() || logicalMaps.size() > 8)
+          logicalMaps.size() > 8)
         return entry.emitOpError(
             "online state entry requires FAST merge-order semantics");
       for (Attribute attribute : logicalMaps) {
@@ -2553,6 +4740,7 @@ LogicalResult InvocationAbiOp::verifyRegions() {
   llvm::SmallDenseSet<int64_t> aliasGroups;
   llvm::SmallDenseSet<int64_t> operandBindings;
   llvm::SmallDenseSet<int64_t> resultBindings;
+  llvm::SmallDenseSet<int64_t> sourceBuffers;
   for (Operation &operation : body.front().without_terminator()) {
     auto slot = dyn_cast<InvocationSlotOp>(operation);
     if (!slot) {
@@ -2561,10 +4749,20 @@ LogicalResult InvocationAbiOp::verifyRegions() {
     if (!slot->getDiscardableAttrs().empty()) {
       return slot.emitOpError("does not permit discardable attributes");
     }
-    if (slot.getOrdinal() != ordinal || slot.getSourceBuffer() != ordinal++) {
-      return slot.emitOpError(
-          "slot and source buffer ordinals must be contiguous");
-    }
+    if (slot.getOrdinal() != ordinal)
+      return slot.emitOpError("slot ordinals must be contiguous");
+    const int64_t sourceBuffer = slot.getSourceBuffer();
+    const bool physicalPrivate = sourceBuffer == -1;
+    if (sourceBuffer < -1)
+      return slot.emitOpError("source buffer ")
+             << sourceBuffer
+             << " must be nonnegative or -1 for physical-private storage";
+    if (physicalPrivate &&
+        slot.getStorage() != MaterializationStorage::Temporary)
+      return slot.emitOpError("physical-private slot must be a temporary");
+    if (!physicalPrivate && !sourceBuffers.insert(sourceBuffer).second)
+      return slot.emitOpError("source buffer projection must be unique");
+    ++ordinal;
     auto type = dyn_cast<RankedTensorType>(slot.getTensorType());
     FailureOr<int64_t> elementBytes =
         type ? executableElementBytes(type.getElementType())
@@ -2574,7 +4772,8 @@ LogicalResult InvocationAbiOp::verifyRegions() {
     if (!type || !type.hasStaticShape() || failed(elementBytes) ||
         failed(elements) ||
         *elements > std::numeric_limits<int64_t>::max() / *elementBytes) {
-      return slot.emitOpError("requires a bounded static bf16 or f32 tensor");
+      return slot.emitOpError("requires a bounded static bf16, f32, or "
+                              "up-to-32-bit integer tensor");
     }
     const int64_t requiredBytes = *elements * *elementBytes;
     SmallVector<int64_t> strides(type.getRank());
@@ -2591,15 +4790,19 @@ LogicalResult InvocationAbiOp::verifyRegions() {
     const ExecutableAddressSpace expectedAddressSpace =
         getSchemaVersion() == 3 ? ExecutableAddressSpace::Device
                                 : ExecutableAddressSpace::Host;
-    if (slot.getOffset() != 0 || slot.getAlignment() != *elementBytes ||
+    const int64_t alignment = slot.getAlignment();
+    const bool hasNaturalAlignment = alignment >= *elementBytes &&
+                                     alignment <= 256 &&
+                                     (alignment & (alignment - 1)) == 0;
+    if (slot.getOffset() != 0 || !hasNaturalAlignment ||
         slot.getAddressSpace() != expectedAddressSpace) {
       if (getSchemaVersion() == 3)
         return slot.emitOpError(
             "closed GPU ABI requires device storage, zero offset, and "
-            "natural alignment");
+            "power-of-two alignment sufficient for the element type");
       return slot.emitOpError(
-          "closed CPU ABI requires host storage, zero offset, and natural "
-          "alignment");
+          "closed CPU ABI requires host storage, zero offset, and "
+          "power-of-two alignment sufficient for the element type");
     }
     if (!aliasGroups.insert(slot.getAliasGroup()).second ||
         slot.getAliasGroup() != slot.getOrdinal())
@@ -2667,9 +4870,12 @@ LogicalResult ExecutableBundleOp::verify() {
   }
   const bool validVersion =
       (getSchemaVersion() == 1 &&
-       getCompletion() == ExecutableCompletion::Synchronous) ||
+       getCompletion() == ExecutableCompletion::Synchronous &&
+       !getEventLoweringPlanFingerprint()) ||
       (getSchemaVersion() == 2 &&
-       getCompletion() == ExecutableCompletion::StreamOrdered);
+       getCompletion() == ExecutableCompletion::StreamOrdered &&
+       getEventLoweringPlanFingerprint() &&
+       isLowerHexDigest(*getEventLoweringPlanFingerprint()));
   if (!validVersion || !isLowerHexDigest(getSourceScheduleFingerprint()) ||
       !isLowerHexDigest(getDeviceModuleFingerprint()) ||
       !isLowerHexDigest(getInvocationAbiFingerprint()) ||
@@ -2708,11 +4914,35 @@ LogicalResult ExecutableBundleOp::verify() {
     return emitOpError(getSchemaVersion() == 1
                            ? "invalid closed CPU executable bundle"
                            : "invalid closed GPU executable bundle");
+  EventLoweringPlanOp eventPlan;
+  if (getEventLoweringPlanFingerprint()) {
+    for (EventLoweringPlanOp candidate : module.getOps<EventLoweringPlanOp>()) {
+      if (candidate.getFingerprint() != *getEventLoweringPlanFingerprint())
+        continue;
+      if (eventPlan)
+        return emitOpError("event-lowering-plan fingerprint is not unique");
+      eventPlan = candidate;
+    }
+    if (!eventPlan)
+      return emitOpError("invalid closed GPU executable bundle");
+  }
+  std::optional<StringRef> expectedPhysicalFingerprint;
+  if (eventPlan) {
+    expectedPhysicalFingerprint =
+        deviceModule.getPhysicalLaunchRecipeFingerprint()
+            ? deviceModule.getPhysicalLaunchRecipeFingerprint()
+            : std::optional<StringRef>(deviceModule.getFingerprint());
+  }
   if (getSourceScheduleFingerprint() !=
           deviceModule.getSourceScheduleFingerprint() ||
       getSourceScheduleFingerprint() != abi.getSourceScheduleFingerprint() ||
       getDeviceModuleFingerprint() != deviceModule.getFingerprint() ||
       getInvocationAbiFingerprint() != abi.getFingerprint() ||
+      (eventPlan && getSourceScheduleFingerprint() !=
+                        eventPlan.getSourceScheduleFingerprint()) ||
+      (eventPlan && (!eventPlan.getPhysicalLaunchRecipeFingerprint() ||
+                     eventPlan.getPhysicalLaunchRecipeFingerprint() !=
+                         expectedPhysicalFingerprint)) ||
       getFingerprint() != executableBundleFingerprint(*this)) {
     return emitOpError(getSchemaVersion() == 1
                            ? "invalid closed CPU executable bundle"
@@ -2720,7 +4950,9 @@ LogicalResult ExecutableBundleOp::verify() {
   }
   const bool gpuBundle = getSchemaVersion() == 2;
   const bool gpuDevice = deviceModule.getSchemaVersion() == 3 ||
-                         deviceModule.getSchemaVersion() == 4;
+                         deviceModule.getSchemaVersion() == 4 ||
+                         deviceModule.getSchemaVersion() == 5 ||
+                         deviceModule.getSchemaVersion() == 6;
   if (gpuBundle != gpuDevice || gpuBundle != (abi.getSchemaVersion() == 3)) {
     return emitOpError("bundle schema does not match its device and ABI roots");
   }

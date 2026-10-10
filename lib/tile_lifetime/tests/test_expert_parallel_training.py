@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from shuttle.ir import DType
-from tile_lifetime import ExpertParallelConfig, NumericalPolicy
+from tile_lifetime import ExpertParallelConfig, NumericalPolicy, uniform_relation_placement
 from tile_lifetime.cuda_expert_parallel_training_codegen import (
     expert_parallel_training_scalar_program,
     render_cuda_expert_parallel_training_include,
@@ -53,7 +53,7 @@ def _primary_forward_plan():
             "routed_down_weight",
         ),
         gemm_accumulation_dtype=DType.FP32,
-        config=ExpertParallelConfig(expert_parallel_size=4),
+        config=ExpertParallelConfig(placement=uniform_relation_placement(destination_count=384, rank_count=4)),
         numerical_policy=NumericalPolicy.ALLOW_ROUNDING_REORDER,
     )
 

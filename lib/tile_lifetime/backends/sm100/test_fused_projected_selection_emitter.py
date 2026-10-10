@@ -29,4 +29,6 @@ def test_direct_emitter_instantiates_contract_fold_without_public_kernel_call() 
     }
     assert "shuttle_projected_contract_maximum_fold_kernel" in sources.instantiation_source
     assert "run_shuttle_projected_contract_maximum_fold_bf16_m256n128k128" in sources.binding_source
-    assert sources.source_sha256 == {"upstream-template": "pinned-digest"}
+    assert "candidate_key == selected_key && candidate < selected_index[slot]" in sources.stable_selection_source
+    assert sources.source_sha256["upstream-template"] == "pinned-digest"
+    assert len(sources.source_sha256["generated_stable_selection"]) == 64

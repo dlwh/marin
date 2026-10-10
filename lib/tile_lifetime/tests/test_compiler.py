@@ -13,21 +13,19 @@ from tile_lifetime import (
     MaterializationDisposition,
     NumericalPolicy,
     ReductionSkeleton,
-    StreamingAttentionSkeleton,
     TransformSkeleton,
     compile_erased_dense_program,
     compile_gemm_program,
     erase_dense_semantics,
     execute_tensor_program,
     validate_erased_tensor_program,
-    validate_plan_semantic_erasure,
 )
 from tile_lifetime.attention import compile_reference_attention_region
 from tile_lifetime.compiler import RowScalePlacement, compile_reference_region
 from tile_lifetime.gemm_program import GENERIC_H100_GEMM_BACKEND
 from tile_lifetime.ir import TensorGraph
-from tile_lifetime.plan import NumericalEquivalence
-from tile_lifetime.semantic_erasure import SemanticErasureError
+from tile_lifetime.plan import NumericalEquivalence, ReferenceAttentionSkeleton
+from tile_lifetime.semantic_erasure import SemanticErasureError, validate_reference_plan_semantic_erasure
 from tile_lifetime.tensor_program import MapPrimitive, ScalarExpressionKind, scalar_binary, scalar_constant
 from tile_lifetime.tile_program import TilePrimitive, TileProgramStage
 
@@ -151,7 +149,7 @@ def test_centered_affine_normalization_uses_consumer_preparation_under_reassocia
         "feature",
         "feature",
     )
-    validate_plan_semantic_erasure(plan)
+    validate_reference_plan_semantic_erasure(plan)
 
 
 def test_centered_affine_normalization_delayed_output_has_column_corrections() -> None:
@@ -187,7 +185,7 @@ def test_centered_affine_normalization_delayed_output_has_column_corrections() -
     for skeleton in (gamma_projection, beta_projection, consumer):
         assert isinstance(skeleton, GemmSkeleton)
         compile_gemm_program(skeleton)
-    validate_plan_semantic_erasure(plan)
+    validate_reference_plan_semantic_erasure(plan)
 
 
 def test_changed_centered_variance_map_uses_same_generic_placement() -> None:
@@ -379,7 +377,7 @@ def test_dense_frontend_names_erase_before_candidate_selection() -> None:
         "Fold",
         "Map",
     }
-    validate_plan_semantic_erasure(plan)
+    validate_reference_plan_semantic_erasure(plan)
 
 
 def test_erased_dense_program_matches_independent_materialized_reference() -> None:
@@ -428,7 +426,7 @@ def test_changed_row_scalar_expression_uses_same_generic_placement() -> None:
     assert isinstance(reduction, ReductionSkeleton)
     assert reduction.operator.endswith("* 0.5")
     assert [attachment.operation for attachment in plan.skeletons[2].prologue] == ["scale_row"]
-    validate_plan_semantic_erasure(plan)
+    validate_reference_plan_semantic_erasure(plan)
 
 
 def test_semantic_erasure_validator_rejects_named_scheduling_key() -> None:
@@ -512,7 +510,7 @@ def test_reference_attention_region_streams_exact_causal_gqa() -> None:
 
     assert len(plan.skeletons) == 1
     skeleton = plan.skeletons[0]
-    assert isinstance(skeleton, StreamingAttentionSkeleton)
+    assert isinstance(skeleton, ReferenceAttentionSkeleton)
     assert skeleton.causal
     assert skeleton.query_heads // skeleton.key_value_heads == 4
     assert skeleton.backend == "official_flashattention_3_hopper"

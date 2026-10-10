@@ -9,14 +9,74 @@ struct ScheduledGeometry {
   int64_t subgroupSize;
   int64_t scratchBytes;
   std::optional<int64_t> reductionAxis;
+  SmallVector<int64_t> reductionMergeGrid;
+  SmallVector<int64_t> reductionMergeTile;
+  int64_t reductionMergeSerialTiles = 0;
+  SmallVector<int64_t> reductionPartialBufferShape;
 };
 
-constexpr llvm::StringLiteral kOnlineStateProtocol =
-    "online_normalized_exponential_weighted_contract";
+constexpr int64_t kGenericSimt32MaximumScratchBytes = 96 * 1024;
+
+DenseI64ArrayAttr structuralDimensions(MaterializationTaskOp task,
+                                       StringRef name) {
+  return task->getAttrOfType<DenseI64ArrayAttr>(name);
+}
+
+bool isStatefulContractFoldTask(MaterializationTaskOp task) {
+  return !task->hasAttr("composition_kind") &&
+         task->hasAttr("composition_sources") &&
+         structuralDimensions(task, "composition_owner_dimensions") &&
+         structuralDimensions(task, "composition_stream_dimensions") &&
+         structuralDimensions(task,
+                              "composition_producer_contraction_dimensions") &&
+         structuralDimensions(task,
+                              "composition_consumer_contraction_dimensions");
+}
 
 bool isOnlineStateTask(MaterializationTaskOp task) {
-  auto kind = task->getAttrOfType<StringAttr>("composition_kind");
-  return kind && kind.getValue() == kOnlineStateProtocol;
+  return isStatefulContractFoldTask(task) &&
+         task.getOnlineVectorDimensionsAttr() &&
+         !task->hasAttr("composition_state_inputs") &&
+         !task->hasAttr("composition_state_outputs");
+}
+
+bool isReverseStateTask(MaterializationTaskOp task) {
+  return isStatefulContractFoldTask(task) &&
+         task.getOnlineVectorDimensionsAttr() &&
+         (task->hasAttr("composition_state_inputs") ||
+          task->hasAttr("composition_state_outputs"));
+}
+
+bool isCertifiedReverseStatePlan(MaterializationPlanOp plan) {
+  if (plan.getPolicy() != NumericalPolicy::Fast ||
+      !plan.getStatefulContractFoldPullback().value_or(false))
+    return false;
+  unsigned forwardTasks = 0;
+  unsigned ownerAdjointTasks = 0;
+  unsigned streamedAdjointTasks = 0;
+  for (MaterializationTaskOp task :
+       plan.getBody().front().getOps<MaterializationTaskOp>()) {
+    if (!isReverseStateTask(task))
+      return false;
+    auto owner = structuralDimensions(task, "composition_owner_dimensions");
+    auto stream = structuralDimensions(task, "composition_stream_dimensions");
+    auto vector = task.getOnlineVectorDimensionsAttr();
+    if (!owner || owner.empty() || !stream || !vector || vector.empty() ||
+        stream.asArrayRef() != task.getReductionDimensions())
+      return false;
+    const bool hasStateInputs = task->hasAttr("composition_state_inputs");
+    const bool hasStateOutputs = task->hasAttr("composition_state_outputs");
+    if (!hasStateInputs && hasStateOutputs && stream.size() == 1)
+      ++forwardTasks;
+    else if (hasStateInputs && hasStateOutputs && stream.size() == 1)
+      ++ownerAdjointTasks;
+    else if (hasStateInputs && !hasStateOutputs && stream.size() == 2)
+      ++streamedAdjointTasks;
+    else
+      return false;
+  }
+  return forwardTasks <= 1 && ownerAdjointTasks == 1 &&
+         streamedAdjointTasks == 1;
 }
 
 bool isCertifiedOnlineStatePlan(MaterializationPlanOp plan) {
@@ -50,9 +110,23 @@ int64_t scheduleThreads(int64_t tile) {
 
 FailureOr<ScheduledGeometry> deriveSimt32Geometry(ScheduleTaskKind kind,
                                                   ArrayRef<int64_t> domain,
-                                                  NumericalPolicy policy) {
+                                                  NumericalPolicy policy,
+                                                  std::optional<int64_t>
+                                                      foldReductionAxis =
+                                                          std::nullopt) {
   constexpr int64_t kSubgroup = 32;
   constexpr int64_t kMaxThreads = 256;
+  if (kind == ScheduleTaskKind::OrderedState) {
+    if (domain.size() != 1 || domain.front() <= 0)
+      return failure();
+    return ScheduledGeometry{{1},
+                             {domain.front()},
+                             1,
+                             128,
+                             kSubgroup,
+                             0,
+                             std::nullopt};
+  }
   if (kind == ScheduleTaskKind::Scalar) {
     if (!domain.empty()) {
       return failure();
@@ -74,6 +148,17 @@ FailureOr<ScheduledGeometry> deriveSimt32Geometry(ScheduleTaskKind kind,
                              std::nullopt};
   }
   if (kind == ScheduleTaskKind::Contract) {
+    if (domain.size() == 1 && domain.front() > 0) {
+      const int64_t tile = std::min(domain.front(), kMaxThreads);
+      const int64_t threads = scheduleThreads(tile);
+      return ScheduledGeometry{{1},
+                               {tile},
+                               ceilDivPositive(domain.front(), tile),
+                               threads,
+                               kSubgroup,
+                               threads * static_cast<int64_t>(sizeof(float)),
+                               0};
+    }
     if (domain.size() < 3 || domain.size() > 9) {
       return failure();
     }
@@ -101,6 +186,34 @@ FailureOr<ScheduledGeometry> deriveSimt32Geometry(ScheduleTaskKind kind,
                              0,
                              reductionAxis};
   }
+  if (kind == ScheduleTaskKind::AllAxisFold) {
+    if (domain.empty() || domain.size() > 8)
+      return failure();
+    FailureOr<int64_t> reduction = scheduleElementCount(domain);
+    if (failed(reduction))
+      return failure();
+    constexpr int64_t kItemsPerThread = 16;
+    constexpr int64_t kPartialTile = kMaxThreads * kItemsPerThread;
+    constexpr int64_t kMaximumMergeTiles = kMaxThreads;
+    const int64_t partialCount = ceilDivPositive(*reduction, kPartialTile);
+    const int64_t partialSerialTiles =
+        ceilDivPositive(*reduction, partialCount * kMaxThreads);
+    const int64_t mergeSerialTiles =
+        ceilDivPositive(partialCount, kMaxThreads);
+    if (mergeSerialTiles > kMaximumMergeTiles)
+      return failure();
+    return ScheduledGeometry{{partialCount},
+                             {kPartialTile},
+                             partialSerialTiles,
+                             kMaxThreads,
+                             kSubgroup,
+                             kMaxThreads * static_cast<int64_t>(sizeof(float)),
+                             std::nullopt,
+                             {1},
+                             {kMaxThreads},
+                             mergeSerialTiles,
+                             {partialCount}};
+  }
   if (domain.size() < 2 || domain.size() > 8 ||
       llvm::any_of(domain, [](int64_t extent) { return extent <= 0; })) {
     return failure();
@@ -110,13 +223,21 @@ FailureOr<ScheduledGeometry> deriveSimt32Geometry(ScheduleTaskKind kind,
   if (!rowFold && !columnFold) {
     return failure();
   }
-  const int64_t reductionAxis = rowFold ? domain.size() - 1 : 0;
-  FailureOr<int64_t> reduction = rowFold
-                                     ? FailureOr<int64_t>(domain.back())
-                                     : scheduleElementCount(domain.drop_back());
-  FailureOr<int64_t> outputs = rowFold
-                                   ? scheduleElementCount(domain.drop_back())
-                                   : FailureOr<int64_t>(domain.back());
+  const int64_t reductionAxis =
+      rowFold && foldReductionAxis ? *foldReductionAxis
+                                   : (rowFold ? domain.size() - 1 : 0);
+  if (reductionAxis < 0 || reductionAxis >= static_cast<int64_t>(domain.size()))
+    return failure();
+  SmallVector<int64_t> ownerShape;
+  for (auto [axis, extent] : llvm::enumerate(domain))
+    if (static_cast<int64_t>(axis) != reductionAxis)
+      ownerShape.push_back(extent);
+  FailureOr<int64_t> reduction =
+      rowFold ? FailureOr<int64_t>(domain[reductionAxis])
+              : scheduleElementCount(domain.drop_back());
+  FailureOr<int64_t> outputs =
+      rowFold ? scheduleElementCount(ownerShape)
+              : FailureOr<int64_t>(domain.back());
   if (failed(reduction) || failed(outputs) || *outputs > UINT32_MAX) {
     return failure();
   }
@@ -149,10 +270,16 @@ deriveOnlineStateGeometry(MaterializationTaskOp task) {
   ArrayRef<int64_t> domain = task.getDomainShape();
   ArrayRef<int64_t> reductions = task.getReductionDimensions();
   auto vectorDimensions = task.getOnlineVectorDimensions();
+  auto ownerDimensions =
+      structuralDimensions(task, "composition_owner_dimensions");
+  auto streamDimensions =
+      structuralDimensions(task, "composition_stream_dimensions");
   if (!isOnlineStateTask(task) || domain.empty() || domain.size() > 8 ||
       reductions.size() != 1 || reductions.front() < 0 ||
       reductions.front() >= static_cast<int64_t>(domain.size()) ||
-      !vectorDimensions || vectorDimensions->empty())
+      !vectorDimensions || vectorDimensions->empty() || !ownerDimensions ||
+      ownerDimensions.empty() || !streamDimensions ||
+      streamDimensions.asArrayRef() != reductions)
     return failure();
   const int64_t reductionAxis = reductions.front();
   const int64_t reduction = domain[reductionAxis];
@@ -166,11 +293,15 @@ deriveOnlineStateGeometry(MaterializationTaskOp task) {
       return failure();
     vectorElements *= domain[axis];
   }
+  llvm::SmallDenseSet<int64_t> ownerAxes;
   SmallVector<int64_t> outputShape;
-  for (auto [axis, extent] : llvm::enumerate(domain))
-    if (static_cast<int64_t>(axis) != reductionAxis &&
-        !vectorAxes.contains(axis))
-      outputShape.push_back(extent);
+  for (int64_t axis : ownerDimensions.asArrayRef()) {
+    if (axis < 0 || axis >= static_cast<int64_t>(domain.size()) ||
+        axis == reductionAxis || vectorAxes.contains(axis) ||
+        !ownerAxes.insert(axis).second)
+      return failure();
+    outputShape.push_back(domain[axis]);
+  }
   FailureOr<int64_t> outputs = scheduleElementCount(outputShape);
   if (failed(outputs) || *outputs > UINT32_MAX || reduction <= 0 ||
       reduction > kMaximumOnlineReductionElements)
@@ -200,8 +331,96 @@ deriveOnlineStateGeometry(MaterializationTaskOp task) {
       kOnlineWarpsPerBlock * kOnlineWarpSize,
       kOnlineWarpSize,
       onlineMma ? kOnlineMmaSharedMemoryBytes
-                : static_cast<int64_t>(kMaximumGpuDynamicSharedMemoryBytes),
+                : kGenericSimt32MaximumScratchBytes,
       reductionAxis};
+}
+
+FailureOr<ScheduledGeometry>
+deriveReverseStateGeometry(MaterializationTaskOp task) {
+  constexpr int64_t kThreads = 384;
+  constexpr int64_t kOwnerAdjointTile = 64;
+  constexpr int64_t kStreamedAdjointTile = 128;
+  constexpr int64_t kOwnerStreamTile = 128;
+  constexpr int64_t kAdjointStreamTile = 64;
+  constexpr int64_t kSupportedVectorElements = 128;
+  // The SM90 D=128 reverse schedule keeps two streamed Q/dO stages, K/V,
+  // two dS stages, the query-gradient exchange, and row state in shared
+  // memory.  Keep this in sync with the independently verified schedule
+  // geometry in ShuttleDialect.cc.
+  constexpr int64_t kScratchBytes = 194 * 1024;
+  ArrayRef<int64_t> domain = task.getDomainShape();
+  ArrayRef<int64_t> reductions = task.getReductionDimensions();
+  auto ownerDimensions =
+      structuralDimensions(task, "composition_owner_dimensions");
+  auto streamDimensions =
+      structuralDimensions(task, "composition_stream_dimensions");
+  auto vectorDimensions = task.getOnlineVectorDimensionsAttr();
+  if (!isReverseStateTask(task) || domain.empty() || domain.size() > 8 ||
+      llvm::any_of(domain, [](int64_t extent) { return extent <= 0; }) ||
+      reductions.empty() || !ownerDimensions || ownerDimensions.empty() ||
+      !vectorDimensions || vectorDimensions.empty() || !streamDimensions ||
+      streamDimensions.asArrayRef() != reductions)
+    return failure();
+  const bool hasStateInputs = task->hasAttr("composition_state_inputs");
+  const bool hasStateOutputs = task->hasAttr("composition_state_outputs");
+  const bool forward = !hasStateInputs && hasStateOutputs;
+  const bool ownerAdjoint = hasStateInputs && hasStateOutputs;
+  const bool streamedAdjoint = hasStateInputs && !hasStateOutputs;
+  if ((!forward && !ownerAdjoint && !streamedAdjoint) ||
+      ((forward || ownerAdjoint) && reductions.size() != 1) ||
+      (streamedAdjoint && reductions.size() != 2))
+    return failure();
+
+  llvm::SmallDenseSet<int64_t> partitionedDimensions;
+  int64_t vectorElements = 1;
+  auto addDimensions = [&](ArrayRef<int64_t> dimensions,
+                           bool countVectorElements) -> LogicalResult {
+    for (int64_t axis : dimensions) {
+      if (axis < 0 || axis >= static_cast<int64_t>(domain.size()) ||
+          !partitionedDimensions.insert(axis).second)
+        return failure();
+      if (countVectorElements) {
+        if (vectorElements > kSupportedVectorElements / domain[axis])
+          return failure();
+        vectorElements *= domain[axis];
+      }
+    }
+    return success();
+  };
+  if (failed(addDimensions(ownerDimensions.asArrayRef(), false)) ||
+      failed(addDimensions(vectorDimensions.asArrayRef(), true)) ||
+      failed(addDimensions(reductions, false)) ||
+      partitionedDimensions.size() != domain.size() ||
+      vectorElements != kSupportedVectorElements)
+    return failure();
+
+  const int64_t owner = ownerDimensions.asArrayRef().back();
+  const int64_t finalStream = reductions.back();
+  SmallVector<int64_t> tile(domain.size(), 1);
+  for (int64_t axis : vectorDimensions.asArrayRef())
+    tile[axis] = domain[axis];
+  for (int64_t axis : ArrayRef<int64_t>(reductions).drop_back())
+    tile[axis] = domain[axis];
+  tile[owner] = std::min(domain[owner], streamedAdjoint ? kStreamedAdjointTile
+                                                        : kOwnerAdjointTile);
+  tile[finalStream] =
+      std::min(domain[finalStream],
+               streamedAdjoint ? kAdjointStreamTile : kOwnerStreamTile);
+
+  int64_t grid = 1;
+  for (int64_t axis : ownerDimensions.asArrayRef().drop_back()) {
+    if (grid > std::numeric_limits<int64_t>::max() / domain[axis])
+      return failure();
+    grid *= domain[axis];
+  }
+  const int64_t rowTiles = ceilDivPositive(domain[owner], tile[owner]);
+  if (grid > std::numeric_limits<int64_t>::max() / rowTiles)
+    return failure();
+  grid *= rowTiles;
+  const int64_t serialTiles =
+      ceilDivPositive(domain[finalStream], tile[finalStream]);
+  return ScheduledGeometry{{grid}, std::move(tile), serialTiles, kThreads,
+                           32,     kScratchBytes,   finalStream};
 }
 
 FailureOr<ScheduledGeometry>
@@ -230,7 +449,7 @@ deriveContractRegionGeometry(MaterializationTaskOp task,
                                     static_cast<int64_t>(sizeof(float))
                               : std::min<int64_t>(reduction.getInt(), 256) * 2;
   if (threads <= 0 || threads > 1024 || scratch < 0 ||
-      scratch > kMaximumGpuDynamicSharedMemoryBytes)
+      scratch > kGenericSimt32MaximumScratchBytes)
     return failure();
   return ScheduledGeometry{
       {rows.getInt(), tiles.getInt()},

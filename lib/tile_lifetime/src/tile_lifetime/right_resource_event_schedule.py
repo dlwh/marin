@@ -162,6 +162,7 @@ def derive_right_resource_fold_event_schedule(
         producer=resource_stage,
         uses=(resource_to_body.relation,),
         capacity=descriptor.resource_buffer_depth,
+        allocation_owner_for={coordinate: () for coordinate in resource_stage.coordinates},
         slot_for=slots,
         generation_for=generations,
         visibility=cluster_visibility,

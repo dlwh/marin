@@ -8,6 +8,7 @@ from enum import StrEnum
 
 import numpy as np
 
+from tile_lifetime.normalized_exp_contract_region import NormalizedExpContractProgram
 from tile_lifetime.plan import (
     BoundedBuffer,
     PersistentTaskPlacement,
@@ -16,7 +17,7 @@ from tile_lifetime.plan import (
     ReadinessEvent,
 )
 from tile_lifetime.relation import RelationPlan
-from tile_lifetime.streaming_attention import AttentionScoreAxis, StreamingAttentionProgram
+from tile_lifetime.streaming_attention import AttentionScoreAxis, StreamingTileSchedule
 
 
 class RoutedAttentionOrientation(StrEnum):
@@ -116,7 +117,7 @@ class RoutedAttentionPhysicalPlan:
 class RoutedStreamingAttentionCompilation:
     """One semantic online-attention program scheduled over a sparse relation."""
 
-    program: StreamingAttentionProgram
+    program: NormalizedExpContractProgram[StreamingTileSchedule]
     relation: RelationPlan
     candidates: tuple[RoutedAttentionPhysicalPlan, RoutedAttentionPhysicalPlan]
 
@@ -254,14 +255,14 @@ def query_major_block_index_plan(relation: RelationPlan) -> QueryMajorBlockIndex
 
 
 def compile_routed_streaming_attention_candidates(
-    program: StreamingAttentionProgram,
+    program: NormalizedExpContractProgram[StreamingTileSchedule],
     relation: RelationPlan,
     config: RoutedAttentionPlanConfig,
 ) -> RoutedStreamingAttentionCompilation:
     """Schedule derived Contract/Map/Fold attention in both relation orientations."""
-    query = program.qk.inputs[0]
-    key = program.qk.inputs[1]
-    value = program.pv.inputs[1]
+    query = program.region.producer.inputs[0]
+    key = program.region.producer.inputs[1]
+    value = program.region.consumer.inputs[1]
     query_axis = next((axis for axis in query.axes if axis.label == AttentionScoreAxis.QUERY.value), None)
     key_axis = next((axis for axis in key.axes if axis.label == AttentionScoreAxis.KEY.value), None)
     query_head_axis = next((axis for axis in query.axes if axis.label == AttentionScoreAxis.HEAD.value), None)

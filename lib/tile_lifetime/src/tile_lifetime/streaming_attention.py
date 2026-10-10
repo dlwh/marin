@@ -10,6 +10,11 @@ import numpy as np
 
 from shuttle.ir import DType
 from tile_lifetime.ir import ScaledDotProductAttentionOp
+from tile_lifetime.normalized_exp_contract_region import (
+    NormalizedExpContractProgram,
+    derive_forward_ownership_plan,
+    normalized_exp_contract_region,
+)
 from tile_lifetime.tensor_program import (
     AxisIndexMap,
     ContractPrimitive,
@@ -347,29 +352,6 @@ class StreamingTileSchedule:
 
 
 @dataclass(frozen=True)
-class OnlineAttentionState:
-    """Derived bounded state replacing materialized scores and probabilities."""
-
-    row_max: ProgramValue
-    row_sum_exp: ProgramValue
-    weighted_value_accumulator: ProgramValue
-
-
-@dataclass(frozen=True)
-class StreamingAttentionProgram:
-    """Derived streaming program ready for a Triton, CuTe, or CPU emitter."""
-
-    source: TensorProgram
-    qk: ContractPrimitive
-    score_map: MapPrimitive
-    pv: ContractPrimitive
-    finalize: MapPrimitive
-    state: OnlineAttentionState
-    schedule: StreamingTileSchedule
-    materialized_values: tuple[ProgramValue, ...]
-
-
-@dataclass(frozen=True)
 class StreamingAttentionExecution:
     """Materialized output and bounded normalized-exponential state."""
 
@@ -382,7 +364,7 @@ def streaming_attention_from_semantic_operation(
     operation: ScaledDotProductAttentionOp,
     *,
     schedule: StreamingTileSchedule,
-) -> StreamingAttentionProgram:
+) -> NormalizedExpContractProgram[StreamingTileSchedule]:
     """Lower a recovered semantic attention operation through tensor algebra."""
     score_map = scaled_score_map(operation.scale)
     if operation.causal:
@@ -406,49 +388,25 @@ def derive_streaming_attention(
     program: TensorProgram,
     *,
     schedule: StreamingTileSchedule,
-) -> StreamingAttentionProgram:
+) -> NormalizedExpContractProgram[StreamingTileSchedule]:
     """Recognize a cascaded softmax reduction and synthesize bounded online state."""
-    if len(program.operations) != 8:
-        raise ValueError("streaming attention expects an eight-operation Contract/Map/Fold normal form")
-    qk, score_map, row_max, center, exponentiate, row_sum, pv, finalize = program.operations
-    if not isinstance(qk, ContractPrimitive) or not isinstance(pv, ContractPrimitive):
-        raise ValueError("streaming attention requires QK and PV contractions")
-    if not isinstance(score_map, MapPrimitive) or not isinstance(center, MapPrimitive):
-        raise ValueError("streaming attention requires explicit score maps")
-    if not isinstance(exponentiate, MapPrimitive) or not isinstance(finalize, MapPrimitive):
-        raise ValueError("streaming attention requires explicit exponentiation and finalization maps")
-    if not isinstance(row_max, FoldPrimitive) or row_max.reducer is not FoldReducer.MAXIMUM:
-        raise ValueError("streaming attention requires a row-maximum fold")
-    if not isinstance(row_sum, FoldPrimitive) or row_sum.reducer is not FoldReducer.SUM:
-        raise ValueError("streaming attention requires a row-sum fold")
-    if qk.output not in score_map.inputs or row_max.input != score_map.output:
-        raise ValueError("score map must consume QK and feed the maximum fold")
-    if row_max.reduction_axes != row_sum.reduction_axes or qk.reduction_axes == row_max.reduction_axes:
+    region = normalized_exp_contract_region(program)
+    if region.dimensions.producer_features == region.dimensions.normalized_axes:
         raise ValueError("softmax folds must share a key axis distinct from the QK reduction axis")
-    _expect_expression(center.expression, ScalarExpressionKind.SUBTRACT, (score_map.output.name, row_max.output.name))
-    _expect_expression(exponentiate.expression, ScalarExpressionKind.EXP, (center.output.name,))
-    if row_sum.input != exponentiate.output or pv.inputs[0] != exponentiate.output:
-        raise ValueError("softmax exponentials must feed both the sum fold and PV contraction")
-    if pv.reduction_axes != row_sum.reduction_axes:
-        raise ValueError("PV must reduce the same key axis as softmax")
-    _expect_expression(finalize.expression, ScalarExpressionKind.DIVIDE, (pv.output.name, row_sum.output.name))
-    if finalize.output not in program.outputs:
+    _expect_expression(
+        region.finalizer.expression,
+        ScalarExpressionKind.DIVIDE,
+        (region.consumer.output.name, region.fold_state.normalizer.output.name),
+    )
+    if region.finalizer.output not in program.outputs:
         raise ValueError("normalized attention value must be a tensor-program output")
 
-    state = OnlineAttentionState(
-        row_max=row_max.output,
-        row_sum_exp=row_sum.output,
-        weighted_value_accumulator=pv.output,
-    )
-    return StreamingAttentionProgram(
+    return NormalizedExpContractProgram(
         source=program,
-        qk=qk,
-        score_map=score_map,
-        pv=pv,
-        finalize=finalize,
-        state=state,
+        region=region,
+        ownership=derive_forward_ownership_plan(region),
         schedule=schedule,
-        materialized_values=(finalize.output,),
+        materialized_values=(region.finalizer.output,),
     )
 
 
@@ -487,7 +445,7 @@ def execute_tensor_program(
 
 
 def execute_streaming_attention(
-    program: StreamingAttentionProgram,
+    program: NormalizedExpContractProgram[StreamingTileSchedule],
     inputs: dict[str, np.ndarray],
 ) -> np.ndarray:
     """Execute derived online-softmax state without sequence-squared materialization."""
@@ -495,23 +453,24 @@ def execute_streaming_attention(
 
 
 def execute_streaming_attention_with_state(
-    program: StreamingAttentionProgram,
+    program: NormalizedExpContractProgram[StreamingTileSchedule],
     inputs: dict[str, np.ndarray],
 ) -> StreamingAttentionExecution:
     """Execute streaming attention and retain its generic Fold state."""
     values = _validated_inputs(program.source, inputs)
-    query_value, key_value = program.qk.inputs
-    value_value = program.pv.inputs[1]
+    region = program.region
+    query_value, key_value = region.producer.inputs
+    value_value = region.consumer.inputs[1]
     query = values[query_value.name]
     key = values[key_value.name]
     value = values[value_value.name]
     query_axis = next(axis for axis in query_value.axes if axis.label == AttentionScoreAxis.QUERY.value)
     key_axis = next(axis for axis in key_value.axes if axis.label == AttentionScoreAxis.KEY.value)
-    row_axes = program.state.row_max.axes
-    accumulator_axes = program.state.weighted_value_accumulator.axes
-    output = np.empty(program.finalize.output.shape, dtype=np.float32)
-    saved_row_max = np.empty(program.state.row_max.shape, dtype=np.float32)
-    saved_row_sum_exp = np.empty(program.state.row_sum_exp.shape, dtype=np.float32)
+    row_axes = region.fold_state.row_max.axes
+    accumulator_axes = region.consumer.output.axes
+    output = np.empty(region.finalizer.output.shape, dtype=np.float32)
+    saved_row_max = np.empty(region.fold_state.row_max.shape, dtype=np.float32)
+    saved_row_sum_exp = np.empty(region.fold_state.row_sum_exp.shape, dtype=np.float32)
 
     for query_start in range(0, query_axis.extent, program.schedule.query_tile_size):
         query_stop = min(query_start + program.schedule.query_tile_size, query_axis.extent)
@@ -533,13 +492,13 @@ def execute_streaming_attention_with_state(
             }
             key_tile = _slice_array(key, key_value, tile_slices)
             value_tile = _slice_array(value, value_value, tile_slices)
-            raw_score = _contract(program.qk, (query_tile, key_tile))
-            score_bindings = {program.qk.output.name: raw_score}
-            for score_input in program.score_map.inputs[1:]:
+            raw_score = _contract(region.producer, (query_tile, key_tile))
+            score_bindings = {region.producer.output.name: raw_score}
+            for score_input in region.score_map.inputs[1:]:
                 score_bindings[score_input.name] = _slice_array(values[score_input.name], score_input, tile_slices)
-            scores = _evaluate_map(program.score_map, score_bindings)
+            scores = _evaluate_map(region.score_map, score_bindings)
 
-            key_reduction_axis = program.qk.output.axes.index(key_axis)
+            key_reduction_axis = region.producer.output.axes.index(key_axis)
             tile_max = np.max(scores, axis=key_reduction_axis)
             next_max = np.maximum(row_max, tile_max)
             previous_scale = np.zeros_like(row_sum_exp)
@@ -547,12 +506,12 @@ def execute_streaming_attention_with_state(
             previous_scale[populated] = np.exp(row_max[populated] - next_max[populated])
             centered = np.full(scores.shape, -np.inf, dtype=np.float32)
             finite_rows = np.isfinite(next_max)
-            next_max_in_scores = _align_array(next_max, row_axes, program.qk.output.axes)
-            finite_rows_in_scores = _align_array(finite_rows, row_axes, program.qk.output.axes)
+            next_max_in_scores = _align_array(next_max, row_axes, region.producer.output.axes)
+            finite_rows_in_scores = _align_array(finite_rows, row_axes, region.producer.output.axes)
             np.subtract(scores, next_max_in_scores, out=centered, where=finite_rows_in_scores)
             probabilities = np.exp(centered)
             tile_sum = np.sum(probabilities, axis=key_reduction_axis)
-            tile_weighted = _contract(program.pv, (probabilities, value_tile))
+            tile_weighted = _contract(region.consumer, (probabilities, value_tile))
             previous_scale_in_accumulator = _align_array(previous_scale, row_axes, accumulator_axes)
             accumulator = previous_scale_in_accumulator * accumulator + tile_weighted
             row_sum_exp = previous_scale * row_sum_exp + tile_sum
@@ -562,19 +521,20 @@ def execute_streaming_attention_with_state(
             rows = np.argwhere(row_sum_exp <= 0)
             raise ValueError(f"attention rows have no valid keys at tile-local indices {rows.tolist()}")
         normalized = _evaluate_map(
-            program.finalize,
+            region.finalizer,
             {
-                program.state.weighted_value_accumulator.name: accumulator,
-                program.state.row_sum_exp.name: row_sum_exp,
+                region.consumer.output.name: accumulator,
+                region.fold_state.row_sum_exp.name: row_sum_exp,
             },
         )
         output_slices = tuple(
             slice(query_start, query_stop) if axis == query_axis else slice(None)
-            for axis in program.finalize.output.axes
+            for axis in region.finalizer.output.axes
         )
         output[output_slices] = normalized
         row_slices = tuple(
-            slice(query_start, query_stop) if axis == query_axis else slice(None) for axis in program.state.row_max.axes
+            slice(query_start, query_stop) if axis == query_axis else slice(None)
+            for axis in region.fold_state.row_max.axes
         )
         saved_row_max[row_slices] = row_max
         saved_row_sum_exp[row_slices] = row_sum_exp

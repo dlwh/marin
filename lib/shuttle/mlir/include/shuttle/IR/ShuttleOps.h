@@ -12,6 +12,7 @@
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/IntegerSet.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "shuttle/IR/ShuttleAttrs.h"
@@ -30,6 +31,17 @@ inline int64_t ceilDivPositive(int64_t numerator, int64_t denominator) {
 std::string materializationPlanFingerprint(MaterializationPlanOp plan);
 
 std::string schedulePlanFingerprint(SchedulePlanOp plan);
+
+std::string eventLoweringPlanFingerprint(EventLoweringPlanOp plan);
+
+LogicalResult verifyEventLoweringPlanAgainstSchedule(SchedulePlanOp schedule,
+                                                     EventLoweringPlanOp plan);
+
+void createImperativeEventLowering(OpBuilder &builder, Location location,
+                                   EventTensorOp event);
+
+EventLoweringPlanOp createSourceBoundImperativeEventLoweringPlan(
+    OpBuilder &builder, Location location, SchedulePlanOp schedule);
 
 std::string executableCodeDigest(ArrayRef<int8_t> code);
 

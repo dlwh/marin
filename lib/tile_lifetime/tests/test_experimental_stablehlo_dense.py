@@ -14,7 +14,6 @@ from tile_lifetime import (
     GemmSkeleton,
     NumericalPolicy,
     ReductionSkeleton,
-    StreamingAttentionSkeleton,
     TransformSkeleton,
 )
 from tile_lifetime.compiler import RowScalePlacement
@@ -27,6 +26,7 @@ from tile_lifetime.experimental_pipeline import (
 )
 from tile_lifetime.experimental_semantic_recovery import recover_dense_transformer_region
 from tile_lifetime.gemm_program import GENERIC_H100_GEMM_BACKEND
+from tile_lifetime.plan import ReferenceAttentionSkeleton
 from tile_lifetime.reference import DENSE_REGION_INPUT_NAMES, DenseDebugConfig, export_debug_dense_region
 from tile_lifetime.semantic_erasure import SemanticErasureError
 
@@ -116,7 +116,7 @@ def test_experimental_dense_stablehlo_path_selects_eight_skeleton_plan() -> None
     assert compilation.provenance.source_operation_ids == tuple(range(184))
     assert [type(skeleton) for skeleton in plan.skeletons] == [
         GemmSkeleton,
-        StreamingAttentionSkeleton,
+        ReferenceAttentionSkeleton,
         GemmSkeleton,
         ReductionSkeleton,
         GemmSkeleton,

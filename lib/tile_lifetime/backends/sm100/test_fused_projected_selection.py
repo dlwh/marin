@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -16,7 +17,12 @@ from fused_projected_selection import (  # noqa: E402
     audit_fused_projected_selection_source,
 )
 
-from tile_lifetime.routed_attention import IndexDomainRestriction, ProjectedBlockSelectionProgram  # noqa: E402
+from tile_lifetime.routed_attention import (  # noqa: E402
+    IndexDomainRestriction,
+    ProjectedBlockSelectionProgram,
+    SelectionOutputOrder,
+    SelectionSemantics,
+)
 from tile_lifetime.sm100_selection_lowering import (  # noqa: E402
     default_sm100_selection_schedules,
     lower_sm100_projected_selection,
@@ -41,6 +47,7 @@ def _lowering(*, scale: float = 128**-0.5, offset: int = 16128, selected_count: 
             predicate="left_greater_equal_right",
         ),
         force_local_block=True,
+        selection_semantics=SelectionSemantics(output_order=SelectionOutputOrder.RIGHT_INDEX_ASCENDING),
         right_source_input="key_value_hidden",
         right_source_feature_count=128,
         right_count=16384,
@@ -84,13 +91,20 @@ def test_direct_runtime_audit_has_only_generic_low_level_calls() -> None:
 
     assert audit.clean
     assert audit.forbidden_or_opaque_calls == ()
-    assert set(audit.required_low_level_calls) == {
-        "_fmha_sm100_plan",
-        "get_sparse_topk_module",
-        "sparse_topk_select",
-    }
+    assert set(audit.required_low_level_calls) == {"_fmha_sm100_plan"}
 
 
 def test_fused_adapter_rejects_unsupported_top_k_variant() -> None:
     with pytest.raises(ValueError, match="top-k 16"):
         adapter_plan_from_lowering(_lowering(selected_count=8))
+
+
+def test_fused_adapter_rejects_an_output_order_it_does_not_emit() -> None:
+    lowering = _lowering()
+    program = replace(
+        lowering.program,
+        selection_semantics=SelectionSemantics(output_order=SelectionOutputOrder.SCORE_DESCENDING),
+    )
+
+    with pytest.raises(ValueError, match="right-index-ascending slots"):
+        adapter_plan_from_lowering(lower_sm100_projected_selection(program, lowering.schedule))

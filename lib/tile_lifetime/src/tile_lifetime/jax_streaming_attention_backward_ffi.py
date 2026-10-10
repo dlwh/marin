@@ -1,12 +1,15 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Lower generated streaming-attention reverse programs to JAX typed FFI.
+"""Quarantined typed-FFI adapter for the legacy fixed Triton benchmark kernels.
 
-The semantic input to this module is a reverse program recovered from ordinary
-JAX VJP StableHLO.  Triton is used only as an ahead-of-time compiler for the
-bounded physical skeleton.  The registered runtime library embeds the emitted
-CUBINs and depends on neither Torch nor Triton.
+This module preserves previously recorded AOT evidence for benchmark sources
+whose signatures expose scale, score-cap, and triangular-domain switches. It
+is not the canonical physical compiler. New SM90 lowering goes through the
+generic scalar-AST and domain-predicate boundaries in
+``physical_normalized_exp_contract_compiler`` and
+``streaming_attention_executable``. The registered legacy runtime library
+embeds the emitted CUBINs and depends on neither Torch nor Triton.
 """
 
 from __future__ import annotations
@@ -170,7 +173,9 @@ class CompiledStreamingAttentionBackwardFfi:
 
 
 @dataclass(frozen=True)
-class _ScoreMapParameters:
+class _LegacyFixedKernelScoreParameters:
+    """Parameters required only by the quarantined fixed benchmark ABI."""
+
     scale: float
     softcap: float | None
     causal: bool
@@ -199,13 +204,14 @@ def generate_streaming_attention_backward_ffi(
     ):
         raise ValueError("forward-plus-gradient result requires a recomputed forward state in the same boundary")
 
-    query, key = program.forward.qk.inputs
-    value = program.forward.pv.inputs[1]
+    region = program.forward.region
+    query, key = region.producer.inputs
+    value = region.consumer.inputs[1]
     query_shape = query.shape
     key_shape = key.shape
     value_shape = value.shape
-    output_shape = program.forward.finalize.output.shape
-    parameters = _score_map_parameters(program.forward.score_map.expression, program.forward.qk.output.name)
+    output_shape = region.finalizer.output.shape
+    parameters = _legacy_fixed_kernel_score_parameters(region.score_map.expression, region.producer.output.name)
     handler_symbol = target_name.replace(".", "_")
     inputs = [
         StreamingAttentionBackwardFfiBuffer("query", DType.BF16, query_shape),
@@ -241,34 +247,51 @@ def generate_streaming_attention_backward_ffi(
     )
     forward_output_strides = _contiguous_strides(output_shape)
     kernels: list[TritonAotKernelPlan] = []
-    if state_policy is StreamingAttentionBackwardStatePolicy.RECOMPUTE:
-        output_by_name = {output.name: output for output in outputs}
-        if result_policy is StreamingAttentionBackwardResultPolicy.FORWARD_OUTPUT_AND_GRADIENTS:
-            forward_output_strides = output_by_name["forward_output"].strides
-        kernels.append(
-            _forward_aot_plan(
+    two_kernel_recompute = (
+        state_policy is StreamingAttentionBackwardStatePolicy.RECOMPUTE
+        and result_policy is StreamingAttentionBackwardResultPolicy.GRADIENTS_ONLY
+    )
+    if two_kernel_recompute:
+        kernels.extend(
+            _recompute_reverse_aot_plans(
                 query_shape,
                 key_shape,
-                forward_output_strides,
                 parameters,
+                program.output_scale,
                 schedule,
+                outputs=outputs,
                 num_warps=num_warps,
                 num_stages=num_stages,
             )
         )
-    kernels.extend(
-        _reverse_aot_plans(
-            query_shape,
-            key_shape,
-            parameters,
-            program.output_scale,
-            schedule,
-            outputs=outputs,
-            forward_output_strides=forward_output_strides,
-            num_warps=num_warps,
-            num_stages=num_stages,
+    else:
+        if state_policy is StreamingAttentionBackwardStatePolicy.RECOMPUTE:
+            output_by_name = {output.name: output for output in outputs}
+            forward_output_strides = output_by_name["forward_output"].strides
+            kernels.append(
+                _forward_aot_plan(
+                    query_shape,
+                    key_shape,
+                    forward_output_strides,
+                    parameters,
+                    schedule,
+                    num_warps=num_warps,
+                    num_stages=num_stages,
+                )
+            )
+        kernels.extend(
+            _reverse_aot_plans(
+                query_shape,
+                key_shape,
+                parameters,
+                program.output_scale,
+                schedule,
+                outputs=outputs,
+                forward_output_strides=forward_output_strides,
+                num_warps=num_warps,
+                num_stages=num_stages,
+            )
         )
-    )
     semantic_fingerprint = _semantic_fingerprint(program, schedule, state_policy, result_policy, outputs)
     handler_template = _handler_template(
         handler_symbol=handler_symbol,
@@ -440,16 +463,24 @@ def compile_streaming_attention_backward_ffi(
         "shuttle_streaming_forward": 9,
         "shuttle_streaming_dq": 8,
         "shuttle_streaming_dkdv": 8,
+        "shuttle_normalized_exponential_reverse_query": 8,
+        "shuttle_normalized_exponential_reverse_key_value": 9,
     }
     aot_declarations = "\n".join(
         _aot_launcher_declarations(launcher, pointer_counts[output_name]) for output_name, launcher in launchers.items()
     )
+    query_launcher = launchers.get("shuttle_normalized_exponential_reverse_query")
+    if query_launcher is None:
+        query_launcher = launchers["shuttle_streaming_dq"]
+    key_value_launcher = launchers.get("shuttle_normalized_exponential_reverse_key_value")
+    if key_value_launcher is None:
+        key_value_launcher = launchers["shuttle_streaming_dkdv"]
     handler_source = generated.handler_template
     substitutions = {
         "{aot_declarations}": aot_declarations,
         "{forward_launcher}": launchers.get("shuttle_streaming_forward", ""),
-        "{dq_launcher}": launchers["shuttle_streaming_dq"],
-        "{dkdv_launcher}": launchers["shuttle_streaming_dkdv"],
+        "{dq_launcher}": query_launcher,
+        "{dkdv_launcher}": key_value_launcher,
     }
     for marker, replacement in substitutions.items():
         handler_source = handler_source.replace(marker, replacement)
@@ -542,8 +573,9 @@ def _validate_program(
     if program.maximum_vjp is not StreamingAttentionBackwardMaximumVJP.NORMALIZED_EXP_INVARIANT:
         raise ValueError("AOT reverse requires the explicit normalized-exp maximum-VJP rewrite")
     verify_streaming_attention_backward_score_map_vjp(program)
-    query, key = program.forward.qk.inputs
-    value = program.forward.pv.inputs[1]
+    region = program.forward.region
+    query, key = region.producer.inputs
+    value = region.consumer.inputs[1]
     if any(value.dtype is not DType.BF16 for value in (query, key, value)):
         raise ValueError("AOT streaming reverse requires BF16 Q/K/V")
     if query.shape[0] != key.shape[0] or key.shape != value.shape:
@@ -558,7 +590,7 @@ def _validate_program(
         raise ValueError("physical head packing disagrees with the recovered Contract index relation")
     if query.shape[1] % schedule.query_tile_size or key.shape[1] % schedule.key_value_tile_size:
         raise ValueError("AOT streaming reverse requires tile-aligned sequence lengths")
-    parameters = _score_map_parameters(program.forward.score_map.expression, program.forward.qk.output.name)
+    parameters = _legacy_fixed_kernel_score_parameters(region.score_map.expression, region.producer.output.name)
     expected_domain = (
         StreamingAttentionBackwardDomainTraversal.LOWER_TRIANGULAR
         if parameters.causal
@@ -574,7 +606,7 @@ def _forward_aot_plan(
     query_shape: tuple[int, ...],
     key_shape: tuple[int, ...],
     output_strides: tuple[int, ...],
-    parameters: _ScoreMapParameters,
+    parameters: _LegacyFixedKernelScoreParameters,
     schedule: StreamingAttentionBackwardTileSchedule,
     *,
     num_warps: int,
@@ -638,10 +670,104 @@ def _forward_aot_plan(
     )
 
 
+def _recompute_reverse_aot_plans(
+    query_shape: tuple[int, ...],
+    key_shape: tuple[int, ...],
+    parameters: _LegacyFixedKernelScoreParameters,
+    output_scale: float,
+    schedule: StreamingAttentionBackwardTileSchedule,
+    *,
+    outputs: tuple[StreamingAttentionBackwardFfiBuffer, ...],
+    num_warps: int,
+    num_stages: int,
+) -> tuple[TritonAotKernelPlan, TritonAotKernelPlan]:
+    batch, sequence, query_heads, dimension = query_shape
+    key_value_heads = key_shape[2]
+    block_m, block_n = _aot_tile_extents(schedule)
+    q_strides = _contiguous_strides(query_shape)
+    k_strides = _contiguous_strides(key_shape)
+    output_by_name = {output.name: output for output in outputs}
+    scalar = (
+        str(sequence),
+        str(query_heads),
+        str(key_value_heads),
+        _float_token(parameters.scale),
+        _float_token(parameters.scale * LOG2_E),
+        _float_token(parameters.softcap or 1.0),
+        _float_token(output_scale),
+    )
+    query_signature = (
+        "*bf16:16",
+        "*bf16:16",
+        "*bf16:16",
+        "*bf16:16",
+        "*bf16:16",
+        "*fp32:16",
+        "*fp32:16",
+        "*fp32:16",
+        *scalar,
+        *(str(value) for value in q_strides),
+        *(str(value) for value in k_strides),
+        *(str(value) for value in k_strides),
+        *(str(value) for value in q_strides),
+        *(str(value) for value in output_by_name["query_cotangent"].strides),
+        str(block_m),
+        str(block_n),
+        str(dimension),
+        str(schedule.query_heads_per_key_value_tile),
+        str(int(parameters.causal)),
+        str(int(parameters.softcap is not None)),
+    )
+    key_value_signature = (
+        "*bf16:16",
+        "*bf16:16",
+        "*bf16:16",
+        "*bf16:16",
+        "*fp32:16",
+        "*fp32:16",
+        "*fp32:16",
+        "*bf16:16",
+        "*bf16:16",
+        *scalar,
+        *(str(value) for value in q_strides),
+        *(str(value) for value in k_strides),
+        *(str(value) for value in k_strides),
+        *(str(value) for value in q_strides),
+        *(str(value) for value in output_by_name["key_cotangent"].strides),
+        *(str(value) for value in output_by_name["value_cotangent"].strides),
+        str(block_m),
+        str(block_n),
+        str(dimension),
+        str(schedule.query_heads_per_key_value_tile),
+        str(int(parameters.causal)),
+        str(int(parameters.softcap is not None)),
+    )
+    return (
+        TritonAotKernelPlan(
+            source=REVERSE_KERNEL_SOURCE,
+            kernel_name="_normalized_exponential_reverse_query_kernel",
+            output_name="shuttle_normalized_exponential_reverse_query",
+            signature=query_signature,
+            grid=((sequence + block_m - 1) // block_m, batch * key_value_heads, 1),
+            num_warps=num_warps,
+            num_stages=num_stages,
+        ),
+        TritonAotKernelPlan(
+            source=REVERSE_KERNEL_SOURCE,
+            kernel_name="_normalized_exponential_reverse_key_value_kernel",
+            output_name="shuttle_normalized_exponential_reverse_key_value",
+            signature=key_value_signature,
+            grid=((sequence + block_n - 1) // block_n, batch * key_value_heads, 1),
+            num_warps=num_warps,
+            num_stages=num_stages,
+        ),
+    )
+
+
 def _reverse_aot_plans(
     query_shape: tuple[int, ...],
     key_shape: tuple[int, ...],
-    parameters: _ScoreMapParameters,
+    parameters: _LegacyFixedKernelScoreParameters,
     output_scale: float,
     schedule: StreamingAttentionBackwardTileSchedule,
     *,
@@ -773,20 +899,63 @@ def _handler_template(
     output_bindings = "\n".join(
         f"      .Ret<ffi::Buffer<{_ffi_dtype(value.dtype)}, {len(value.shape)}>>()" for value in outputs
     )
-    batch, sequence, query_heads, dimension = query_shape
-    output_elements = batch * sequence * query_heads * dimension
+    batch, sequence, query_heads, _ = query_shape
     state_elements = batch * query_heads * sequence
-    if state_policy is StreamingAttentionBackwardStatePolicy.RECOMPUTE:
-        if result_policy is StreamingAttentionBackwardResultPolicy.FORWARD_OUTPUT_AND_GRADIENTS:
+    two_kernel_recompute = (
+        state_policy is StreamingAttentionBackwardStatePolicy.RECOMPUTE
+        and result_policy is StreamingAttentionBackwardResultPolicy.GRADIENTS_ONLY
+    )
+    if two_kernel_recompute:
+        iota_source = ""
+        state_setup = f"""
+  auto maximum_storage = scratch.Allocate(sizeof(float) * {state_elements}, alignof(float));
+  auto exponential_sum_storage = scratch.Allocate(sizeof(float) * {state_elements}, alignof(float));
+  auto centered_product_sum_storage = scratch.Allocate(sizeof(float) * {state_elements}, alignof(float));
+  if (!maximum_storage || !exponential_sum_storage || !centered_product_sum_storage) {{
+    return ffi::Error::Internal("failed to allocate normalized-exponential reverse state");
+  }}
+  auto* row_maximum = static_cast<float*>(*maximum_storage);
+  auto* row_exponential_sum = static_cast<float*>(*exponential_sum_storage);
+  auto* row_centered_product_sum = static_cast<float*>(*centered_product_sum_storage);
+  CUresult driver_status = CUDA_SUCCESS;
+"""
+        launches = """
+  driver_status = {dq_launcher}(
+      reinterpret_cast<CUstream>(stream),
+      reinterpret_cast<CUdeviceptr>(query),
+      reinterpret_cast<CUdeviceptr>(key),
+      reinterpret_cast<CUdeviceptr>(value),
+      reinterpret_cast<CUdeviceptr>(output_cotangent),
+      reinterpret_cast<CUdeviceptr>(query_cotangent_pointer),
+      reinterpret_cast<CUdeviceptr>(row_maximum),
+      reinterpret_cast<CUdeviceptr>(row_exponential_sum),
+      reinterpret_cast<CUdeviceptr>(row_centered_product_sum));
+  if (driver_status != CUDA_SUCCESS) return DriverError("reverse query", driver_status);
+  driver_status = {dkdv_launcher}(
+      reinterpret_cast<CUstream>(stream),
+      reinterpret_cast<CUdeviceptr>(query),
+      reinterpret_cast<CUdeviceptr>(key),
+      reinterpret_cast<CUdeviceptr>(value),
+      reinterpret_cast<CUdeviceptr>(output_cotangent),
+      reinterpret_cast<CUdeviceptr>(row_maximum),
+      reinterpret_cast<CUdeviceptr>(row_exponential_sum),
+      reinterpret_cast<CUdeviceptr>(row_centered_product_sum),
+      reinterpret_cast<CUdeviceptr>(key_cotangent_pointer),
+      reinterpret_cast<CUdeviceptr>(value_cotangent_pointer));
+  if (driver_status != CUDA_SUCCESS) return DriverError("reverse key/value", driver_status);
+"""
+    else:
+        iota_source = """
+__global__ void ShuttleIotaKernel(int32_t* output, int extent) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index < extent) output[index] = index;
+}
+"""
+        if state_policy is StreamingAttentionBackwardStatePolicy.RECOMPUTE:
             output_allocation = ""
             output_allocation_check = ""
             output_pointer = "  auto* output = forward_output_pointer;"
-        else:
-            output_allocation = f"""  auto output_storage = scratch.Allocate(
-      sizeof(__nv_bfloat16) * {output_elements}, alignof(__nv_bfloat16));"""
-            output_allocation_check = "!output_storage || "
-            output_pointer = "  auto* output = static_cast<__nv_bfloat16*>(*output_storage);"
-        state_setup = f"""
+            state_setup = f"""
 {output_allocation}
   auto lse_storage = scratch.Allocate(sizeof(float) * {state_elements}, alignof(float));
   auto position_storage = scratch.Allocate(sizeof(int32_t) * {sequence}, alignof(int32_t));
@@ -816,8 +985,36 @@ def _handler_template(
       reinterpret_cast<CUdeviceptr>(positions));
   if (driver_status != CUDA_SUCCESS) return DriverError("streaming forward", driver_status);
 """
-    else:
-        state_setup = "  CUresult driver_status = CUDA_SUCCESS;\n"
+        else:
+            state_setup = "  CUresult driver_status = CUDA_SUCCESS;\n"
+        state_setup += f"""  auto dot_storage = scratch.Allocate(sizeof(float) * {state_elements}, alignof(float));
+  if (!dot_storage) return ffi::Error::Internal("failed to allocate streaming reverse output-dot state");
+  auto* output_dot = static_cast<float*>(*dot_storage);
+"""
+        launches = """
+  driver_status = {dq_launcher}(
+      reinterpret_cast<CUstream>(stream),
+      reinterpret_cast<CUdeviceptr>(query),
+      reinterpret_cast<CUdeviceptr>(key),
+      reinterpret_cast<CUdeviceptr>(value),
+      reinterpret_cast<CUdeviceptr>(output),
+      reinterpret_cast<CUdeviceptr>(output_cotangent),
+      reinterpret_cast<CUdeviceptr>(log_sum_exp),
+      reinterpret_cast<CUdeviceptr>(output_dot),
+      reinterpret_cast<CUdeviceptr>(query_cotangent_pointer));
+  if (driver_status != CUDA_SUCCESS) return DriverError("query cotangent", driver_status);
+  driver_status = {dkdv_launcher}(
+      reinterpret_cast<CUstream>(stream),
+      reinterpret_cast<CUdeviceptr>(query),
+      reinterpret_cast<CUdeviceptr>(key),
+      reinterpret_cast<CUdeviceptr>(value),
+      reinterpret_cast<CUdeviceptr>(output_cotangent),
+      reinterpret_cast<CUdeviceptr>(log_sum_exp),
+      reinterpret_cast<CUdeviceptr>(output_dot),
+      reinterpret_cast<CUdeviceptr>(key_cotangent_pointer),
+      reinterpret_cast<CUdeviceptr>(value_cotangent_pointer));
+  if (driver_status != CUDA_SUCCESS) return DriverError("key/value cotangents", driver_status);
+"""
     return f"""// Generated from generic Contract/Fold/DomainRestriction reverse semantics; do not edit.
 #include <atomic>
 #include <cstdint>
@@ -836,10 +1033,7 @@ namespace ffi = xla::ffi;
 namespace {{
 std::atomic<int> call_count{{0}};
 
-__global__ void ShuttleIotaKernel(int32_t* output, int extent) {{
-  const int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index < extent) output[index] = index;
-}}
+{iota_source}
 
 ffi::Error DriverError(const char* stage, CUresult result) {{
   const char* name = nullptr;
@@ -854,32 +1048,8 @@ ffi::Error ShuttleStreamingAttentionBackward(
     {output_arguments}) {{
 {input_pointers}
 {output_pointers}
-  auto dot_storage = scratch.Allocate(sizeof(float) * {state_elements}, alignof(float));
-  if (!dot_storage) return ffi::Error::Internal("failed to allocate streaming reverse output-dot state");
-  auto* output_dot = static_cast<float*>(*dot_storage);
 {state_setup}
-  driver_status = {{dq_launcher}}(
-      reinterpret_cast<CUstream>(stream),
-      reinterpret_cast<CUdeviceptr>(query),
-      reinterpret_cast<CUdeviceptr>(key),
-      reinterpret_cast<CUdeviceptr>(value),
-      reinterpret_cast<CUdeviceptr>(output),
-      reinterpret_cast<CUdeviceptr>(output_cotangent),
-      reinterpret_cast<CUdeviceptr>(log_sum_exp),
-      reinterpret_cast<CUdeviceptr>(output_dot),
-      reinterpret_cast<CUdeviceptr>(query_cotangent_pointer));
-  if (driver_status != CUDA_SUCCESS) return DriverError("query cotangent", driver_status);
-  driver_status = {{dkdv_launcher}}(
-      reinterpret_cast<CUstream>(stream),
-      reinterpret_cast<CUdeviceptr>(query),
-      reinterpret_cast<CUdeviceptr>(key),
-      reinterpret_cast<CUdeviceptr>(value),
-      reinterpret_cast<CUdeviceptr>(output_cotangent),
-      reinterpret_cast<CUdeviceptr>(log_sum_exp),
-      reinterpret_cast<CUdeviceptr>(output_dot),
-      reinterpret_cast<CUdeviceptr>(key_cotangent_pointer),
-      reinterpret_cast<CUdeviceptr>(value_cotangent_pointer));
-  if (driver_status != CUDA_SUCCESS) return DriverError("key/value cotangents", driver_status);
+{launches}
   call_count.fetch_add(1, std::memory_order_relaxed);
   return ffi::Error::Success();
 }}
@@ -929,7 +1099,11 @@ def _validated_arrays(
     return tuple(ordered)
 
 
-def _score_map_parameters(expression: ScalarExpression, raw_score_name: str) -> _ScoreMapParameters:
+def _legacy_fixed_kernel_score_parameters(
+    expression: ScalarExpression,
+    raw_score_name: str,
+) -> _LegacyFixedKernelScoreParameters:
+    """Decode only expressions representable by the quarantined Triton ABI."""
     causal = False
     softcap: float | None = None
 
@@ -968,7 +1142,7 @@ def _score_map_parameters(expression: ScalarExpression, raw_score_name: str) -> 
     scale = visit(expression)
     if not np.isfinite(scale):
         raise ValueError("score scale must be finite")
-    return _ScoreMapParameters(scale=scale, softcap=softcap, causal=causal)
+    return _LegacyFixedKernelScoreParameters(scale=scale, softcap=softcap, causal=causal)
 
 
 def _semantic_fingerprint(
@@ -979,10 +1153,10 @@ def _semantic_fingerprint(
     outputs: tuple[StreamingAttentionBackwardFfiBuffer, ...],
 ) -> str:
     payload = {
-        "query": program.forward.qk.inputs[0].shape,
-        "key": program.forward.qk.inputs[1].shape,
-        "value": program.forward.pv.inputs[1].shape,
-        "score_map": json.loads(serialize_scalar_expression(program.forward.score_map.expression)),
+        "query": program.forward.region.producer.inputs[0].shape,
+        "key": program.forward.region.producer.inputs[1].shape,
+        "value": program.forward.region.consumer.inputs[1].shape,
+        "score_map": json.loads(serialize_scalar_expression(program.forward.region.score_map.expression)),
         "score_map_vjp": json.loads(serialize_scalar_expression(program.score_map_vjp.expression)),
         "output_scale": program.output_scale,
         "maximum_vjp": program.maximum_vjp.value,

@@ -5,6 +5,9 @@
 
 from dataclasses import dataclass
 
+import jax
+from jax import Array
+
 from tile_lifetime.gemm_program import GENERIC_H100_GEMM_BACKEND
 from tile_lifetime.ir import (
     LinearOp,
@@ -23,7 +26,7 @@ from tile_lifetime.plan import (
     MaterializationRecord,
     NumericalEquivalence,
     NumericalPolicy,
-    RegionPlan,
+    ReferenceRegionPlan,
     RewriteExplanation,
     TransformSkeleton,
 )
@@ -39,7 +42,12 @@ class _SwiGLURegion:
     mainloop_output_width: int
 
 
-def compile_reference_swiglu_region(graph: TensorGraph, *, numerical_policy: NumericalPolicy) -> RegionPlan:
+def silu_product(gate: Array, up: Array) -> Array:
+    """Evaluate the pointwise Map normally used between two Contracts."""
+    return jax.nn.silu(gate) * up
+
+
+def compile_reference_swiglu_region(graph: TensorGraph, *, numerical_policy: NumericalPolicy) -> ReferenceRegionPlan:
     """Compile one hand-built named SwiGLU graph for reference tests."""
     region, rejection_reasons = _find_swiglu_region(graph, numerical_policy=numerical_policy)
     if region is None:
@@ -138,7 +146,7 @@ def _find_swiglu_region(
     )
 
 
-def _swiglu_plan(region: _SwiGLURegion) -> RegionPlan:
+def _swiglu_plan(region: _SwiGLURegion) -> ReferenceRegionPlan:
     activation = region.activation
     first_projection = region.projections[0]
     down = region.down_projection
@@ -231,7 +239,7 @@ def _swiglu_plan(region: _SwiGLURegion) -> RegionPlan:
             "materialized BF16 gate and up tensors"
         ),
     )
-    return RegionPlan(
+    return ReferenceRegionPlan(
         skeletons=(gate_up, down_gemm),
         materializations=materializations,
         rewrites=(explanation,),
@@ -242,7 +250,7 @@ def _materialized_swiglu_fallback(
     graph: TensorGraph,
     *,
     rejection_reasons: tuple[str, ...],
-) -> RegionPlan:
+) -> ReferenceRegionPlan:
     skeletons = tuple(_fallback_skeleton(operation) for operation in graph.operations)
     materializations = tuple(
         MaterializationRecord(
@@ -266,7 +274,7 @@ def _materialized_swiglu_fallback(
         numerical_effect="none",
         rejection_reasons=rejection_reasons,
     )
-    return RegionPlan(skeletons=skeletons, materializations=materializations, rewrites=(explanation,))
+    return ReferenceRegionPlan(skeletons=skeletons, materializations=materializations, rewrites=(explanation,))
 
 
 def _fallback_skeleton(operation: SemanticOp) -> GemmSkeleton | TransformSkeleton:

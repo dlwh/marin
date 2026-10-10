@@ -1,7 +1,12 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""CPU-testable validation and dispatch for the bounded dense region plan."""
+"""Reference-only runtime for the historical eight-skeleton dense replay.
+
+This runtime is intentionally disjoint from the canonical task/EventTensor
+compiler.  It exists only for old comparison artifacts and does not accept an
+``ExecutablePhysicalRequest``.
+"""
 
 import math
 from collections.abc import Mapping
@@ -18,8 +23,8 @@ from tile_lifetime.plan import (
     MaterializationDisposition,
     MaterializationRecord,
     ReductionSkeleton,
-    RegionPlan,
-    StreamingAttentionSkeleton,
+    ReferenceAttentionSkeleton,
+    ReferenceRegionPlan,
 )
 from tile_lifetime.tile_program import TilePrimitive, TileProgramError, TileProgramStage
 
@@ -52,12 +57,12 @@ class RuntimeDiagnostic:
     actual: str | None = None
 
 
-class PlanRuntimeError(ValueError):
+class ReferencePlanRuntimeError(ValueError):
     """Raised with structured diagnostics when a plan cannot be dispatched."""
 
     def __init__(self, diagnostics: tuple[RuntimeDiagnostic, ...]):
         if not diagnostics:
-            raise ValueError("PlanRuntimeError requires at least one diagnostic")
+            raise ValueError("ReferencePlanRuntimeError requires at least one diagnostic")
         self.diagnostics = diagnostics
         super().__init__("; ".join(diagnostic.message for diagnostic in diagnostics))
 
@@ -80,8 +85,8 @@ class TensorBinding:
     dtype: DType
 
 
-class RegionBackend(Protocol):
-    """Injected physical backend used by the CPU-independent plan runtime."""
+class ReferenceDenseBackend(Protocol):
+    """Injected backend used only by the historical reference-plan runtime."""
 
     def allocate(self, spec: RuntimeBufferSpec) -> TensorBinding:
         """Allocate one materialized or partial-statistic buffer."""
@@ -94,10 +99,10 @@ class RegionBackend(Protocol):
 
     def run_attention(
         self,
-        skeleton: StreamingAttentionSkeleton,
+        skeleton: ReferenceAttentionSkeleton,
         bindings: Mapping[str, TensorBinding],
     ) -> None:
-        """Dispatch one validated streaming-attention skeleton."""
+        """Dispatch one validated opaque reference-oracle skeleton."""
 
     def run_reduction(self, skeleton: ReductionSkeleton, bindings: Mapping[str, TensorBinding]) -> None:
         """Dispatch one validated auxiliary reduction."""
@@ -112,7 +117,7 @@ class RuntimeResult:
 
 EXPECTED_SKELETON_TYPES = (
     GemmSkeleton,
-    StreamingAttentionSkeleton,
+    ReferenceAttentionSkeleton,
     GemmSkeleton,
     ReductionSkeleton,
     GemmSkeleton,
@@ -121,11 +126,16 @@ EXPECTED_SKELETON_TYPES = (
     GemmSkeleton,
 )
 H100_GEMM_TILE_SHAPE = (128, 256, 64)
-GENERATED_STREAMING_BACKEND = "h100_streaming_contract_fold"
+REFERENCE_STREAMING_BACKEND = "reference_online_fold_oracle"
 
 
-def validate_region_plan(plan: RegionPlan) -> None:
-    """Validate the exact dense H100 skeleton, backend, layout, and attachment contracts."""
+def validate_reference_dense_plan(plan: ReferenceRegionPlan) -> None:
+    """Validate the exact historical dense replay contract."""
+    if not isinstance(plan, ReferenceRegionPlan):
+        raise TypeError(
+            "the historical dense replay accepts only ReferenceRegionPlan; "
+            "canonical lowering uses ExecutablePhysicalRequest"
+        )
     diagnostics: list[RuntimeDiagnostic] = []
     if len(plan.skeletons) != len(EXPECTED_SKELETON_TYPES):
         diagnostics.append(
@@ -153,11 +163,11 @@ def validate_region_plan(plan: RegionPlan) -> None:
                 )
             )
     if diagnostics:
-        raise PlanRuntimeError(tuple(diagnostics))
+        raise ReferencePlanRuntimeError(tuple(diagnostics))
 
     first_qkv, attention, output_projection, mlp_reduction, gate_up, down, next_reduction, next_qkv = plan.skeletons
     assert isinstance(first_qkv, GemmSkeleton)
-    assert isinstance(attention, StreamingAttentionSkeleton)
+    assert isinstance(attention, ReferenceAttentionSkeleton)
     assert isinstance(output_projection, GemmSkeleton)
     assert isinstance(mlp_reduction, ReductionSkeleton)
     assert isinstance(gate_up, GemmSkeleton)
@@ -176,7 +186,7 @@ def validate_region_plan(plan: RegionPlan) -> None:
     _expect(
         diagnostics,
         attention.backend,
-        GENERATED_STREAMING_BACKEND,
+        REFERENCE_STREAMING_BACKEND,
         code=RuntimeDiagnosticCode.BACKEND_CONTRACT,
         index=1,
         field="backend",
@@ -308,22 +318,22 @@ def validate_region_plan(plan: RegionPlan) -> None:
             )
         )
     if diagnostics:
-        raise PlanRuntimeError(tuple(diagnostics))
+        raise ReferencePlanRuntimeError(tuple(diagnostics))
 
 
-def required_input_specs(plan: RegionPlan) -> Mapping[str, RuntimeBufferSpec]:
-    """Return the exact named inputs required by a validated dense plan."""
-    validate_region_plan(plan)
+def reference_required_input_specs(plan: ReferenceRegionPlan) -> Mapping[str, RuntimeBufferSpec]:
+    """Return inputs required by a validated historical dense replay plan."""
+    validate_reference_dense_plan(plan)
     return _required_input_specs_unchecked(plan)
 
 
-def execute_region_plan(
-    plan: RegionPlan,
+def execute_reference_dense_plan(
+    plan: ReferenceRegionPlan,
     inputs: Mapping[str, TensorBinding],
-    backend: RegionBackend,
+    backend: ReferenceDenseBackend,
 ) -> RuntimeResult:
-    """Validate, allocate, bind aliases, and dispatch a dense region in dependency order."""
-    validate_region_plan(plan)
+    """Execute a historical dense replay plan in dependency order."""
+    validate_reference_dense_plan(plan)
     required = _required_input_specs_unchecked(plan)
     diagnostics: list[RuntimeDiagnostic] = []
     for name, spec in required.items():
@@ -348,7 +358,7 @@ def execute_region_plan(
                 )
             )
     if diagnostics:
-        raise PlanRuntimeError(tuple(diagnostics))
+        raise ReferencePlanRuntimeError(tuple(diagnostics))
 
     bindings = dict(inputs)
     records = {record.value: record for record in plan.materializations}
@@ -373,7 +383,7 @@ def execute_region_plan(
         required_names, produced_names = _dispatch_dependencies(skeleton, records)
         missing = tuple(sorted(required_names - available))
         if missing:
-            raise PlanRuntimeError(
+            raise ReferencePlanRuntimeError(
                 (
                     RuntimeDiagnostic(
                         code=RuntimeDiagnosticCode.DEPENDENCY_ORDER,
@@ -386,7 +396,7 @@ def execute_region_plan(
             )
         if isinstance(skeleton, GemmSkeleton):
             backend.run_gemm(skeleton, bindings)
-        elif isinstance(skeleton, StreamingAttentionSkeleton):
+        elif isinstance(skeleton, ReferenceAttentionSkeleton):
             backend.run_attention(skeleton, bindings)
         else:
             assert isinstance(skeleton, ReductionSkeleton)
@@ -539,7 +549,7 @@ def _expect(
         )
 
 
-def _validate_materializations(plan: RegionPlan, diagnostics: list[RuntimeDiagnostic]) -> None:
+def _validate_materializations(plan: ReferenceRegionPlan, diagnostics: list[RuntimeDiagnostic]) -> None:
     names = [record.value for record in plan.materializations]
     duplicates = sorted({name for name in names if names.count(name) > 1})
     if duplicates:
@@ -615,7 +625,7 @@ def _qkv_cluster_shape(output_width: int) -> tuple[int, int, int]:
     return 1, 2 if output_width >= 6_144 else 1, 1
 
 
-def _required_input_specs_unchecked(plan: RegionPlan) -> Mapping[str, RuntimeBufferSpec]:
+def _required_input_specs_unchecked(plan: ReferenceRegionPlan) -> Mapping[str, RuntimeBufferSpec]:
     first_qkv = plan.skeletons[0]
     attention = plan.skeletons[1]
     output_projection = plan.skeletons[2]
@@ -623,7 +633,7 @@ def _required_input_specs_unchecked(plan: RegionPlan) -> Mapping[str, RuntimeBuf
     down = plan.skeletons[5]
     next_qkv = plan.skeletons[7]
     assert isinstance(first_qkv, GemmSkeleton)
-    assert isinstance(attention, StreamingAttentionSkeleton)
+    assert isinstance(attention, ReferenceAttentionSkeleton)
     assert isinstance(output_projection, GemmSkeleton)
     assert isinstance(gate_up, GemmSkeleton)
     assert isinstance(down, GemmSkeleton)
@@ -654,7 +664,7 @@ def _required_input_specs_unchecked(plan: RegionPlan) -> Mapping[str, RuntimeBuf
 
 def _validated_backend_binding(binding: TensorBinding, spec: RuntimeBufferSpec) -> TensorBinding:
     if binding.shape != spec.shape or binding.dtype is not spec.dtype:
-        raise PlanRuntimeError(
+        raise ReferencePlanRuntimeError(
             (
                 RuntimeDiagnostic(
                     code=RuntimeDiagnosticCode.BACKEND_RESULT,
@@ -669,10 +679,10 @@ def _validated_backend_binding(binding: TensorBinding, spec: RuntimeBufferSpec) 
 
 
 def _resolve_aliases(
-    plan: RegionPlan,
+    plan: ReferenceRegionPlan,
     bindings: dict[str, TensorBinding],
     available: set[str],
-    backend: RegionBackend,
+    backend: ReferenceDenseBackend,
 ) -> None:
     for record in plan.materializations:
         if record.disposition is not MaterializationDisposition.ALIAS or record.value in available:
@@ -686,10 +696,10 @@ def _resolve_aliases(
 
 
 def _dispatch_dependencies(
-    skeleton: GemmSkeleton | StreamingAttentionSkeleton | ReductionSkeleton,
+    skeleton: GemmSkeleton | ReferenceAttentionSkeleton | ReductionSkeleton,
     records: Mapping[str, MaterializationRecord],
 ) -> tuple[set[str], set[str]]:
-    if isinstance(skeleton, StreamingAttentionSkeleton):
+    if isinstance(skeleton, ReferenceAttentionSkeleton):
         return {skeleton.query, skeleton.key, skeleton.value}, {skeleton.output}
     if isinstance(skeleton, ReductionSkeleton):
         return {skeleton.input, *skeleton.auxiliary_inputs}, {skeleton.output}

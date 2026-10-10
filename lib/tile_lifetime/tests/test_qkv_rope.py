@@ -8,11 +8,11 @@ from tile_lifetime import (
     GemmSkeleton,
     MaterializationDisposition,
     NumericalPolicy,
-    StreamingAttentionSkeleton,
     TransformSkeleton,
 )
 from tile_lifetime.gemm_program import GENERIC_H100_GEMM_BACKEND
 from tile_lifetime.ir import TensorGraph
+from tile_lifetime.plan import ReferenceAttentionSkeleton
 from tile_lifetime.qkv_rope import compile_reference_qkv_rope_attention_region
 
 BATCH = 1
@@ -66,11 +66,11 @@ def test_qkv_rope_plan_feeds_selected_fa3_layout_without_conversion() -> None:
         numerical_policy=NumericalPolicy.ALLOW_ROUNDING_REORDER,
     )
 
-    assert [type(skeleton) for skeleton in plan.skeletons] == [GemmSkeleton, StreamingAttentionSkeleton]
+    assert [type(skeleton) for skeleton in plan.skeletons] == [GemmSkeleton, ReferenceAttentionSkeleton]
     qkv = plan.skeletons[0]
     attention = plan.skeletons[1]
     assert isinstance(qkv, GemmSkeleton)
-    assert isinstance(attention, StreamingAttentionSkeleton)
+    assert isinstance(attention, ReferenceAttentionSkeleton)
     assert qkv.backend == GENERIC_H100_GEMM_BACKEND
     assert qkv.shape == (BATCH * SEQUENCE, 768, HIDDEN)
     assert qkv.output_layout == attention.input_layout == "fa3_bshd_last_dimension_contiguous"

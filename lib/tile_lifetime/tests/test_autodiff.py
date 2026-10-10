@@ -2,8 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+from dataclasses import replace
 
+import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from shuttle.ir import DType
 from tile_lifetime import (
@@ -21,7 +24,22 @@ from tile_lifetime import (
     scalar_expression_vjp,
 )
 from tile_lifetime.cuda_map_fold_codegen import evaluate_scalar_expression
-from tile_lifetime.tensor_program import scalar_binary, scalar_constant, scalar_input, scalar_unary
+from tile_lifetime.tensor_program import (
+    ContractOperandPrecision,
+    OperandIndexing,
+    RelationPrimitive,
+    ScalarConversionSemantics,
+    index_axis,
+    index_constant,
+    scalar_binary,
+    scalar_constant,
+    scalar_convert,
+    scalar_input,
+    scalar_unary,
+)
+from tile_lifetime.tensor_program import (
+    execute_tensor_program as execute_generic_tensor_program,
+)
 
 
 def _silu_product(gate_name: str, up_name: str):
@@ -142,8 +160,22 @@ def _rms_contract_program() -> TensorProgram:
     )
 
 
-def test_generic_contract_map_fold_reverse_mode_matches_rmsnorm_gemm_adjoint() -> None:
+@pytest.mark.parametrize(
+    "precision",
+    (
+        (ContractOperandPrecision.DEFAULT, ContractOperandPrecision.DEFAULT),
+        (ContractOperandPrecision.HIGH, ContractOperandPrecision.HIGHEST),
+    ),
+)
+def test_generic_contract_map_fold_reverse_mode_matches_rmsnorm_gemm_adjoint(precision) -> None:
     source = _rms_contract_program()
+    source = replace(
+        source,
+        operations=tuple(
+            replace(operation, operand_precision=precision) if isinstance(operation, ContractPrimitive) else operation
+            for operation in source.operations
+        ),
+    )
     differentiated = differentiate_tensor_program(source, with_respect_to=("x", "gamma", "weight"))
     rng = np.random.default_rng(7)
     x = rng.normal(size=(2, 3)).astype(np.float32)
@@ -237,3 +269,138 @@ def test_backward_extraction_rejects_unknown_or_duplicate_saved_values() -> None
         extract_backward_tensor_program(differentiated, saved_values=("not-a-value",))
     with np.testing.assert_raises_regex(ValueError, "must be unique"):
         extract_backward_tensor_program(differentiated, saved_values=("gate", "gate"))
+
+
+def test_finite_precision_convert_uses_declared_straight_through_tangent() -> None:
+    axis = TensorAxis(8, 3, "element")
+    source = ProgramValue("source", (axis,), DType.FP32)
+    rounded = ProgramValue("rounded", (axis,), DType.BF16)
+    program = TensorProgram(
+        inputs=(source,),
+        operations=(
+            MapPrimitive(
+                "round",
+                (source,),
+                rounded,
+                scalar_convert(
+                    scalar_input(source.name),
+                    result_dtype=DType.BF16,
+                    semantics=ScalarConversionSemantics.ROUND_NEAREST_EVEN,
+                ),
+            ),
+        ),
+        outputs=(rounded,),
+    )
+    differentiated = differentiate_tensor_program(program, with_respect_to=(source.name,))
+    cotangent = np.asarray(jnp.asarray([0.3, -1.2, 2.1], dtype=jnp.bfloat16))
+    actual = execute_generic_tensor_program(
+        differentiated.program,
+        {source.name: np.ones(3, dtype=np.float32), differentiated.output_cotangents[0].name: cotangent},
+    )
+    np.testing.assert_array_equal(actual[differentiated.input_gradients[0].name], cotangent.astype(np.float32))
+
+
+def test_injective_relation_adjoint_inverts_the_index_relation() -> None:
+    row = TensorAxis(9, 2, "row")
+    column = TensorAxis(10, 3, "column")
+    source = ProgramValue("source", (row, column), DType.FP32)
+    transposed = ProgramValue("transposed", (column, row), DType.FP32)
+    relation = RelationPrimitive(
+        "transpose",
+        (source,),
+        (transposed,),
+        transposed.axes,
+        (OperandIndexing(source, transposed.axes, (index_axis(row), index_axis(column))),),
+        result_sources=(source,),
+    )
+    differentiated = differentiate_tensor_program(
+        TensorProgram((source,), (relation,), (transposed,)), with_respect_to=(source.name,)
+    )
+    cotangent = np.arange(6, dtype=np.float32).reshape(3, 2)
+    actual = execute_generic_tensor_program(
+        differentiated.program,
+        {source.name: np.zeros((2, 3), dtype=np.float32), differentiated.output_cotangents[0].name: cotangent},
+    )
+    np.testing.assert_array_equal(actual[differentiated.input_gradients[0].name], cotangent.T)
+
+
+def test_broadcast_relation_adjoint_is_an_explicit_fold() -> None:
+    row = TensorAxis(11, 2, "row")
+    column = TensorAxis(12, 3, "column")
+    source = ProgramValue("source", (column,), DType.FP32)
+    broadcast = ProgramValue("broadcast", (row, column), DType.FP32)
+    relation = RelationPrimitive(
+        "broadcast",
+        (source,),
+        (broadcast,),
+        broadcast.axes,
+        (OperandIndexing(source, broadcast.axes, (index_axis(column),)),),
+        result_sources=(source,),
+    )
+    differentiated = differentiate_tensor_program(
+        TensorProgram((source,), (relation,), (broadcast,)), with_respect_to=(source.name,)
+    )
+    reverse = differentiated.program.operations[1:]
+    assert any(isinstance(operation, FoldPrimitive) for operation in reverse)
+    cotangent = np.arange(6, dtype=np.float32).reshape(2, 3)
+    actual = execute_generic_tensor_program(
+        differentiated.program,
+        {source.name: np.zeros(3, dtype=np.float32), differentiated.output_cotangents[0].name: cotangent},
+    )
+    np.testing.assert_array_equal(actual[differentiated.input_gradients[0].name], cotangent.sum(axis=0))
+
+
+def test_non_injective_relation_with_no_explicit_reduction_is_rejected() -> None:
+    row = TensorAxis(13, 2, "row")
+    source = ProgramValue("source", (row,), DType.FP32)
+    repeated = ProgramValue("repeated", (row,), DType.FP32)
+    relation = RelationPrimitive(
+        "repeat first",
+        (source,),
+        (repeated,),
+        repeated.axes,
+        (OperandIndexing(source, repeated.axes, (index_constant(0),)),),
+        result_sources=(source,),
+    )
+    with pytest.raises(NotImplementedError, match="non-injective Relation"):
+        differentiate_tensor_program(TensorProgram((source,), (relation,), (repeated,)), with_respect_to=(source.name,))
+
+
+def test_nary_adjoint_preserves_retained_operand_precision_for_nonfirst_target() -> None:
+    axis = TensorAxis(0, 3)
+    inputs = tuple(ProgramValue(name, (axis,), DType.FP32) for name in ("left", "middle", "right"))
+    output = ProgramValue("output", (), DType.FP32)
+    contract = ContractPrimitive(
+        "triple product",
+        inputs,
+        output,
+        (axis,),
+        DType.FP32,
+        operand_precision=(
+            ContractOperandPrecision.HIGHEST,
+            ContractOperandPrecision.DEFAULT,
+            ContractOperandPrecision.HIGH,
+        ),
+    )
+    source = TensorProgram(inputs, (contract,), (output,))
+    differentiated = differentiate_tensor_program(source, with_respect_to=("middle",))
+    gradient = differentiated.input_gradients[0]
+    adjoint = next(
+        operation
+        for operation in differentiated.program.operations
+        if isinstance(operation, ContractPrimitive) and operation.output == gradient
+    )
+    assert adjoint.inputs[1:] == (inputs[0], inputs[2])
+    assert adjoint.operand_precision == (
+        ContractOperandPrecision.HIGHEST,
+        ContractOperandPrecision.HIGHEST,
+        ContractOperandPrecision.HIGH,
+    )
+    arrays = {
+        "left": np.array([1.0, 2.0, 3.0], np.float32),
+        "middle": np.array([4.0, 5.0, 6.0], np.float32),
+        "right": np.array([7.0, 8.0, 9.0], np.float32),
+        "cotangent.output": np.array(2.0, np.float32),
+    }
+    result = execute_tensor_program(differentiated.program, arrays)
+    np.testing.assert_array_equal(result[gradient.name], arrays["left"] * arrays["right"] * 2)

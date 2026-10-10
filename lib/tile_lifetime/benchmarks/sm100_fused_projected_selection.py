@@ -29,7 +29,12 @@ import torch
 from shuttle.ir import DType
 from tile_lifetime import StreamingTileSchedule, build_attention_tensor_program
 from tile_lifetime.relation import build_relation_plan
-from tile_lifetime.routed_attention import IndexDomainRestriction, ProjectedBlockSelectionProgram
+from tile_lifetime.routed_attention import (
+    IndexDomainRestriction,
+    ProjectedBlockSelectionProgram,
+    SelectionOutputOrder,
+    SelectionSemantics,
+)
 from tile_lifetime.sm100_routed_lowering import (
     default_sm100_routed_schedules,
     lower_sm100_routed_streaming_program,
@@ -200,7 +205,10 @@ def _selection_reference(
     ranked_score, _ = torch.topk(block_score, min(top_k + 1, block_score.shape[-1]), dim=-1, sorted=True)
     finite_margin = torch.isfinite(ranked_score[..., top_k - 1]) & torch.isfinite(ranked_score[..., top_k])
     margins = ranked_score[..., top_k - 1] - ranked_score[..., top_k]
-    selected_score, selected = torch.topk(block_score, top_k, dim=-1, sorted=False)
+    # Stable descending order visits the right-block domain in ascending source
+    # order on ties, matching the Selection primitive's declared total order.
+    selected = torch.argsort(block_score, dim=-1, descending=True, stable=True)[..., :top_k]
+    selected_score = torch.take_along_dim(block_score, selected, dim=-1)
     selected = torch.where(torch.isfinite(selected_score) | torch.isposinf(selected_score), selected, -1)
     sentinel = torch.full_like(selected, right_count // block_size)
     canonical = torch.where(selected >= 0, selected, sentinel).sort(-1).values
@@ -371,6 +379,7 @@ def main() -> None:
             predicate="left_greater_equal_right",
         ),
         force_local_block=True,
+        selection_semantics=SelectionSemantics(output_order=SelectionOutputOrder.RIGHT_INDEX_ASCENDING),
         right_source_input="key_value_hidden",
         right_source_feature_count=hidden_count,
         right_count=right_count,
@@ -514,7 +523,6 @@ def main() -> None:
             args.msa_root,
             payload_lowering,
             partial_value_dtype=payload_backend.PartialValueDType.BF16,
-            partial_merge_schedule=payload_backend.PartialMergeScheduleKind.TILED_PIPELINED,
             build_directory=args.build_directory,
         )
         payload_sources = generated_payload.generated_sources

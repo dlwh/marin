@@ -31,4 +31,13 @@ Print the example plan with:
 uv run --frozen --package marin-tile-lifetime python lib/tile_lifetime/examples/rms_region.py
 ```
 
+The generic H100 composition compiler requires an admitted physical provider for
+every Contract, either for a whole component or a canonical phase. Unlowered
+Contracts raise `UnsupportedContractLoweringError` with operation ordinals,
+shapes and component/phase context. There is no scalar Contract fallback or
+small-shape exception. The generic primitive entry point supports non-Contract
+operations only; NumPy/JAX reference evaluation remains available. Provider
+admission must preserve source precision and rounding, including explicit
+HIGH/HIGHEST requests.
+
 The project specification and research brief live under `.agents/projects/tile_lifetime_compiler/`.

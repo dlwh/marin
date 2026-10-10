@@ -7,6 +7,11 @@
 // RUN: shuttle-test-opt %S/Inputs/jax-0.10.1-f32-causal-relation-max-axis4.mlir --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-verify-source-coverage --shuttle-verify-semantic-erasure --mlir-print-op-generic | FileCheck %s --check-prefix=AXIS4
 // RUN: shuttle-test-opt %S/Inputs/jax-0.10.1-f32-offset-causal-softcap-max-axis1.mlir --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-verify-source-coverage --shuttle-verify-semantic-erasure --mlir-print-op-generic | FileCheck %s --check-prefix=AXIS1
 // RUN: shuttle-test-opt %S/Inputs/jax-0.10.1-f32-offset-causal-softcap-max-axis1-mutation.mlir --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-verify-source-coverage --shuttle-verify-semantic-erasure --mlir-print-op-generic | FileCheck %s --check-prefix=AXIS1
+// RUN: shuttle-test-opt %S/Inputs/jax-0.10.1-f32-maximum-vjp-tie-map.mlir --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-verify-source-coverage --shuttle-verify-semantic-erasure --mlir-print-op-generic | FileCheck %s --check-prefix=FLOAT-COMPARE
+// RUN: shuttle-test-opt %S/Inputs/jax-0.10.1-f32-maximum-vjp-tie-map.mlir --shuttle-test-report-normalized-fingerprint -o /dev/null > %t.float-compare-source
+// RUN: shuttle-test-opt %S/Inputs/jax-0.10.1-f32-maximum-vjp-tie-map.mlir --shuttle-stablehlo-source-ordered-pipeline --shuttle-test-report-normalized-fingerprint -o /dev/null > %t.float-compare-roundtrip
+// RUN: diff %t.float-compare-source %t.float-compare-roundtrip
+// RUN: shuttle-test-opt %S/Inputs/jax-0.10.1-f32-normalized-exponential-pullback-2x3x8.mlir --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-verify-source-coverage --shuttle-verify-semantic-erasure --shuttle-test-set-fast-region-policy --shuttle-test-set-prefer-fusion-tuning --shuttle-plan-row-fold-materialization --shuttle-verify-materialization-plan --mlir-print-op-generic | FileCheck %s --check-prefix=PULLBACK
 
 // Complete coverage is not enough if selected semantics are dead. Require the
 // union of transitive public-output dependencies to equal manifest.complete.
@@ -74,6 +79,24 @@
 
 // DEPENDENCIES: output_dependency_coverage = complete
 // DEAD: covered source results do not form a complete public-output dependency trace
+
+// FLOAT-COMPARE-DAG: "shuttle.map"
+// FLOAT-COMPARE-DAG: "arith.cmpf"
+// FLOAT-COMPARE-DAG: "shuttle.relation"{{.*}}#shuttle.relation_semantics<convert>
+// FLOAT-COMPARE-DAG: "shuttle.fold"{{.*}}reduction_dimensions = array<i64: 3>
+// FLOAT-COMPARE-DAG: excluded = []
+
+// This fixture is a standalone normalized-exponential Map/Fold pullback. It
+// must produce a valid FAST plan without claiming Contract ownership or
+// contraction dimensions that are absent from the source algebra.
+// PULLBACK: "shuttle.materialization_plan"() <{{.*}}policy = #shuttle.policy<fast>
+// PULLBACK: "shuttle.materialization_task"
+// PULLBACK: "shuttle.materialization_plan_yield"
+// PULLBACK-NOT: stateful_contract_fold_pullback
+// PULLBACK-NOT: composition_owner_dimensions
+// PULLBACK-NOT: composition_stream_dimensions
+// PULLBACK-NOT: composition_producer_contraction_dimensions
+// PULLBACK-NOT: composition_consumer_contraction_dimensions
 
 // AXIS4-BOUNDARY: func.func public @main
 // AXIS4-BOUNDARY-SAME: tensor<1x2x2x17x17xf32>

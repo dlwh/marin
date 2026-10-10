@@ -1,10 +1,21 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Plan the dense region exclusively from erased Flow operations."""
+"""Generic task planning plus a quarantined historical dense replay planner.
 
+``derive_composed_task_plan`` and ``physical_request_for_composed_tasks`` are
+the canonical executable path.  The ``compile_reference_*`` entrypoint below
+retains the old eight-skeleton replay solely for comparison tests and the
+explicit FA3 oracle benchmark.
+"""
+
+from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from graphlib import CycleError, TopologicalSorter
+from math import ceil, prod
 
+from shuttle.ir import DType
 from tile_lifetime.compiler import RowScalePlacement
 from tile_lifetime.dense_flow import (
     ErasedDenseFlowProgram,
@@ -16,7 +27,52 @@ from tile_lifetime.dense_flow import (
     FlowValue,
     validate_erased_dense_flow,
 )
+from tile_lifetime.event_buffering import physical_event_realization, verify_event_realizations
+from tile_lifetime.event_dataflow import (
+    EventDataflowProgram,
+    EventGenerationPolicy,
+    EventMemoryScope,
+    EventSchedulingMode,
+    EventStorageBinding,
+    MemoryVisibility,
+    TaskAxis,
+    TaskDependence,
+    TaskFamily,
+    TaskRelation,
+    derive_event_tensor_plan,
+)
 from tile_lifetime.gemm_program import GENERIC_H100_GEMM_BACKEND
+from tile_lifetime.physical_task_contract import (
+    BoundedTaskCoordinate,
+    CanonicalTaskPlan,
+    DependenceRuntimeBinding,
+    EventRealizationProof,
+    EventTensorAllocation,
+    ExecutablePhysicalRequest,
+    ParametricEventDerivation,
+    ParametricEventRealization,
+    ParametricEventTensorPlan,
+    PhaseEdgeConstraint,
+    PhysicalNumericalPolicy,
+    PhysicalPhase,
+    PhysicalPhaseEdge,
+    PhysicalSchedule,
+    PhysicalScheduleFamily,
+    PhysicalTarget,
+    PhysicalTaskConstraint,
+    PhysicalTaskStructure,
+    RelationAccessClass,
+    TaskAxisTile,
+    TaskCapability,
+    TaskDependenceProgram,
+    TaskOperationKind,
+    TaskResourceEstimate,
+    TaskTraversal,
+    TaskValueAccess,
+    TaskValueAccessKind,
+    TiledTask,
+    physical_phase_iteration_space,
+)
 from tile_lifetime.plan import (
     Attachment,
     AttachmentSite,
@@ -25,15 +81,44 @@ from tile_lifetime.plan import (
     MaterializationRecord,
     NumericalEquivalence,
     ReductionSkeleton,
-    RegionPlan,
+    ReferenceAttentionSkeleton,
+    ReferenceRegionPlan,
     RewriteExplanation,
-    StreamingAttentionSkeleton,
 )
-from tile_lifetime.semantic_erasure import validate_plan_semantic_erasure
-from tile_lifetime.tensor_program import ScalarExpression, ScalarExpressionKind, serialize_scalar_expression
+from tile_lifetime.semantic_erasure import validate_reference_plan_semantic_erasure
+from tile_lifetime.tensor_program import (
+    AxisIndexMap,
+    ContractPrimitive,
+    EvaluationOrder,
+    FoldPrimitive,
+    IndexExpression,
+    IndexExpressionKind,
+    IndexPredicate,
+    IndexPredicateKind,
+    MapPrimitive,
+    NumericalPolicy,
+    ProgramValue,
+    RelationPrimitive,
+    ScalarExpression,
+    ScalarExpressionKind,
+    ScanPrimitive,
+    SelectionPrimitive,
+    TensorAxis,
+    TensorPrimitive,
+    TensorProgram,
+    index_axis,
+    index_binary,
+    index_constant,
+    primitive_inputs,
+    primitive_outputs,
+    serialize_scalar_expression,
+    tensor_program_value_ordinals,
+)
 
 H100_GEMM_TILE_SHAPE = (128, 256, 64)
-GENERATED_STREAMING_BACKEND = "h100_streaming_contract_fold"
+REFERENCE_STREAMING_BACKEND = "reference_online_fold_oracle"
+MAXIMUM_FUSED_PHASES = 64
+MAXIMUM_FUSED_REGISTERS_PER_THREAD = 128
 
 
 @dataclass(frozen=True)
@@ -74,19 +159,19 @@ class _ErasedDenseRegion:
     next_pair_maps: tuple[FlowMap, FlowMap]
 
 
-def compile_erased_dense_transformer_region(
+def compile_reference_erased_dense_transformer_region(
     erased: ErasedDenseFlowProgram,
     *,
     row_scale_placement: RowScalePlacement,
-) -> RegionPlan:
-    """Generate the eight-skeleton plan after machine-checking semantic erasure."""
+) -> ReferenceRegionPlan:
+    """Build the historical eight-skeleton reference replay plan."""
     validate_erased_dense_flow(erased)
     region = _recover_erased_region(erased.operations)
     plan = replace(
         _plan_erased_region(region, row_scale_placement=row_scale_placement),
         semantic_erasure_report=erased.report,
     )
-    validate_plan_semantic_erasure(plan)
+    validate_reference_plan_semantic_erasure(plan)
     return plan
 
 
@@ -458,7 +543,7 @@ def _validate_generic_dataflow(
         raise ValueError("following pair transforms are not generic adjacent-pair Maps")
 
 
-def _plan_erased_region(region: _ErasedDenseRegion, *, row_scale_placement: RowScalePlacement) -> RegionPlan:
+def _plan_erased_region(region: _ErasedDenseRegion, *, row_scale_placement: RowScalePlacement) -> ReferenceRegionPlan:
     initial_projection = _projection_pairwise_linear_contract(
         region.initial_projection,
         region.initial_partition,
@@ -467,7 +552,7 @@ def _plan_erased_region(region: _ErasedDenseRegion, *, row_scale_placement: RowS
         input_layout="bsh_contiguous",
         cluster_shape=_projection_cluster_shape(region.initial_projection.output.shape[-1]),
     )
-    streaming = _streaming_skeleton(region)
+    streaming = _reference_attention_oracle_skeleton(region)
 
     first_scaled = region.first_feature_scale.outputs[0]
     first_partials = f"{region.first_square.inputs[0].name}.fold_partials"
@@ -579,7 +664,7 @@ def _plan_erased_region(region: _ErasedDenseRegion, *, row_scale_placement: RowS
         _explanation("derive_streaming_normalized_weighted_fold"),
         _explanation("place_maps_and_partial_folds_around_contracts"),
     )
-    return RegionPlan(skeletons, materializations, rewrites)
+    return ReferenceRegionPlan(skeletons, materializations, rewrites)
 
 
 def _projection_pairwise_linear_contract(
@@ -635,18 +720,19 @@ def _projection_pairwise_linear_contract(
     )
 
 
-def _streaming_skeleton(region: _ErasedDenseRegion) -> StreamingAttentionSkeleton:
+def _reference_attention_oracle_skeleton(region: _ErasedDenseRegion) -> ReferenceAttentionSkeleton:
+    """Adapt generic Flow to the fixed fields required by the FA3 oracle API."""
     query, key = region.score_contract.inputs
     value = region.value_contract.inputs[1]
     output = region.normalize_map.outputs[0]
-    scale = _score_scale(region.score_map.expressions[0], region.score_contract.output.name)
+    scale = _reference_score_scale(region.score_map.expressions[0], region.score_contract.output.name)
     causal = region.score_domain.predicate.kind is ScalarExpressionKind.LESS_EQUAL
     head_dimension = query.shape[-1]
     query_block_size = 192 if head_dimension == 64 else 128
     key_value_block_size = 128 if causal else (192 if head_dimension == 64 else 176)
     query_heads = query.shape[2]
     key_value_heads = key.shape[2]
-    return StreamingAttentionSkeleton(
+    return ReferenceAttentionSkeleton(
         name="streaming_normalized_weighted_fold",
         query=query.name,
         key=key.name,
@@ -661,7 +747,7 @@ def _streaming_skeleton(region: _ErasedDenseRegion) -> StreamingAttentionSkeleto
         key_value_heads=key_value_heads,
         causal=causal,
         scale=scale,
-        backend=GENERATED_STREAMING_BACKEND,
+        backend=REFERENCE_STREAMING_BACKEND,
         input_layout="fa3_bshd_last_dimension_contiguous",
         output_layout="bshd_contiguous",
         pipeline_stages=2,
@@ -925,7 +1011,8 @@ def _prologue_cluster_shape(output_width: int) -> tuple[int, int, int]:
     return (1, 2 if output_width >= 16_384 else 1, 1)
 
 
-def _score_scale(expression: ScalarExpression, score_name: str) -> float:
+def _reference_score_scale(expression: ScalarExpression, score_name: str) -> float:
+    """Recover the scalar accepted by the historical FA3 oracle interface."""
     if expression.kind is not ScalarExpressionKind.MULTIPLY:
         raise ValueError("score Map must multiply the score Contract by a scalar")
     left, right = expression.operands
@@ -974,4 +1061,1399 @@ def _explanation(name: str) -> RewriteExplanation:
         "avoid activation-sized intermediates",
         NumericalEquivalence.ALGEBRAICALLY_EXACT,
         "finite-precision order is controlled by the selected row-scale policy",
+    )
+
+
+@dataclass(frozen=True)
+class DenseCompositionExecutable:
+    """Executable-reference boundaries for one generic tensor composition."""
+
+    program: TensorProgram
+    task_plan: CanonicalTaskPlan
+    event_program: EventDataflowProgram
+    physical_request: ExecutablePhysicalRequest
+
+
+def derive_composed_task_plan(
+    program: TensorProgram,
+    *,
+    tile_extent_by_axis: Mapping[int, int],
+    numerical_policy: PhysicalNumericalPolicy,
+    fusion_boundary_values: tuple[ProgramValue, ...] = (),
+) -> CanonicalTaskPlan:
+    """Fuse local generic regions and derive ownership-indexed task families."""
+    operation_index = {id(operation): index for index, operation in enumerate(program.operations)}
+    producer_by_value = {
+        output.name: operation for operation in program.operations for output in primitive_outputs(operation)
+    }
+    consumers_by_value: dict[str, list[TensorPrimitive]] = defaultdict(list)
+    for operation in program.operations:
+        for value in primitive_inputs(operation):
+            consumers_by_value[value.name].append(operation)
+
+    predecessors = {
+        ordinal: {
+            operation_index[id(producer_by_value[value.name])]
+            for value in primitive_inputs(operation)
+            if value.name in producer_by_value
+        }
+        for ordinal, operation in enumerate(program.operations)
+    }
+    groups: list[set[int]] = []
+    assigned: set[int] = set()
+
+    for value in fusion_boundary_values:
+        producer = producer_by_value.get(value.name)
+        if producer is None:
+            continue
+        ordinal = operation_index[id(producer)]
+        if ordinal in assigned:
+            continue
+        groups.append({ordinal})
+        assigned.add(ordinal)
+
+    for terminal_ordinal, terminal in enumerate(program.operations):
+        if not isinstance(terminal, ContractPrimitive):
+            continue
+        candidate = _contract_fold_bridge_candidate(
+            terminal_ordinal,
+            program=program,
+            producer_by_value=producer_by_value,
+            consumers_by_value=consumers_by_value,
+            operation_index=operation_index,
+            forbidden=assigned,
+        )
+        if candidate is None or candidate & assigned:
+            continue
+        if not _fusion_preserves_acyclic_quotient(groups, candidate, predecessors):
+            continue
+        groups.append(candidate)
+        assigned.update(candidate)
+
+    for ordinal, operation in enumerate(program.operations):
+        if ordinal in assigned or not isinstance(operation, FoldPrimitive):
+            continue
+        group = {ordinal}
+        _include_map_ancestry_until_contract(
+            operation.input,
+            producer_by_value=producer_by_value,
+            operation_index=operation_index,
+            forbidden=assigned,
+            group=group,
+        )
+        if not _within_fusion_resource_bounds(group, program):
+            group = {ordinal}
+        elif not _is_dependency_convex(
+            group,
+            program=program,
+            producer_by_value=producer_by_value,
+            consumers_by_value=consumers_by_value,
+            operation_index=operation_index,
+        ):
+            group = {ordinal}
+        if not _fusion_preserves_acyclic_quotient(groups, group, predecessors):
+            group = {ordinal}
+        groups.append(group)
+        assigned.update(group)
+
+    for ordinal, operation in enumerate(program.operations):
+        if ordinal in assigned or not isinstance(operation, ContractPrimitive):
+            continue
+        group = {ordinal}
+        for value in operation.inputs:
+            _include_map_ancestry(
+                value,
+                producer_by_value=producer_by_value,
+                operation_index=operation_index,
+                forbidden=assigned,
+                group=group,
+            )
+        if not _within_fusion_resource_bounds(group, program):
+            group = {ordinal}
+        elif not _is_dependency_convex(
+            group,
+            program=program,
+            producer_by_value=producer_by_value,
+            consumers_by_value=consumers_by_value,
+            operation_index=operation_index,
+        ):
+            group = {ordinal}
+        if not _fusion_preserves_acyclic_quotient(groups, group, predecessors):
+            group = {ordinal}
+        groups.append(group)
+        assigned.update(group)
+
+    groups.extend({ordinal} for ordinal in range(len(program.operations)) if ordinal not in assigned)
+    ordered_groups = tuple(tuple(sorted(group)) for group in sorted(groups, key=min))
+    value_id = _value_ids(program)
+    task_for_operation: dict[int, int] = {}
+    tasks: list[TiledTask] = []
+    for task_id, ordinals in enumerate(ordered_groups):
+        for ordinal in ordinals:
+            task_for_operation[ordinal] = task_id
+        tasks.append(
+            _tiled_task(
+                task_id,
+                ordinals,
+                program,
+                consumers_by_value=consumers_by_value,
+                operation_index=operation_index,
+                value_id=value_id,
+                tile_extent_by_axis=tile_extent_by_axis,
+                numerical_policy=numerical_policy,
+            )
+        )
+
+    dependences = _exact_task_dependences(
+        program,
+        tuple(tasks),
+        task_for_operation=task_for_operation,
+    )
+    task_plan = CanonicalTaskPlan(tuple(tasks), dependences)
+    return materialize_runtime_relation_dependences(
+        program,
+        task_plan,
+        tile_extent_by_axis=tile_extent_by_axis,
+    )
+
+
+@dataclass(frozen=True)
+class RuntimeRelationDependenceSite:
+    """One algebraic runtime Relation edge and its task-level realization."""
+
+    relation_operation_ordinal: int
+    source_value_ordinal: int
+    source_task_id: int
+    target_task_id: int
+    dependence_program_index: int | None
+
+    @property
+    def internalized(self) -> bool:
+        """Return whether fusion makes this exact dependence intra-task."""
+        return self.dependence_program_index is None
+
+    @property
+    def canonical_record(self) -> dict[str, int | bool | None]:
+        """Return stable provenance for this runtime-dependence proof."""
+        return {
+            "relation_operation": self.relation_operation_ordinal,
+            "source_value": self.source_value_ordinal,
+            "source_task": self.source_task_id,
+            "target_task": self.target_task_id,
+            "dependence_program": self.dependence_program_index,
+            "internalized": self.internalized,
+        }
+
+
+def materialize_runtime_relation_dependences(
+    program: TensorProgram,
+    task_plan: CanonicalTaskPlan,
+    *,
+    tile_extent_by_axis: Mapping[int, int],
+) -> CanonicalTaskPlan:
+    """Replace tensor-indexed Relation edges with exact runtime programs."""
+    task_for_operation = {ordinal: task.id for task in task_plan.tasks for ordinal in task.operation_ordinals}
+    producer_for_value = {
+        output: ordinal
+        for ordinal, operation in enumerate(program.operations)
+        for output in primitive_outputs(operation)
+    }
+    value_ordinals = tensor_program_value_ordinals(program)
+    tasks = list(task_plan.tasks)
+    staged_inputs: dict[ProgramValue, int] = {}
+
+    def source_task_id(value: ProgramValue) -> int:
+        producer = producer_for_value.get(value)
+        if producer is not None:
+            return task_for_operation[producer]
+        if value not in program.inputs:
+            raise ValueError(f"runtime Relation source {value.name!r} has no producer")
+        existing = staged_inputs.get(value)
+        if existing is not None:
+            return existing
+        task_id = len(tasks)
+        owner_axes = tuple(
+            TaskAxisTile(axis.id, axis.extent, min(axis.extent, tile_extent_by_axis.get(axis.id, axis.extent)))
+            for axis in value.axes
+        )
+        structure = PhysicalTaskStructure(
+            principal_kind=TaskOperationKind.INPUT_STAGE,
+            phases=(PhysicalPhase(0, TaskCapability.INPUT_STAGING, (), value.shape, ()),),
+            phase_edges=(),
+            owner_axes=owner_axes,
+            streamed_axes=(),
+            reduction_axes=(),
+            contraction_axes=(),
+            traversal=TaskTraversal.SOURCE_ORDERED,
+            element_types=(value.dtype.value,),
+            layout_classes=("logical_row_major",),
+            resources=TaskResourceEstimate(8, 0, 0),
+        )
+        family = TaskFamily(
+            f"task.input_stage.{program.inputs.index(value)}",
+            tuple(TaskAxis(f"axis.{axis.axis_id}", ceil(axis.extent / axis.tile_extent)) for axis in owner_axes),
+        )
+        tasks.append(
+            TiledTask(
+                task_id,
+                family,
+                (),
+                (TaskOperationKind.INPUT_STAGE,),
+                structure,
+                (
+                    TaskValueAccess(
+                        value_ordinals[value],
+                        TaskValueAccessKind.LIVE_OUT,
+                        0,
+                        RelationAccessClass.BOUNDED_DYNAMIC,
+                        {
+                            "input_axes": tuple(axis.id for axis in value.axes),
+                            "input_shape": value.shape,
+                            "layout": "logical_row_major",
+                        },
+                    ),
+                ),
+            )
+        )
+        staged_inputs[value] = task_id
+        return task_id
+
+    crossing_values: dict[tuple[int, int], set[ProgramValue]] = defaultdict(set)
+    for consumer_ordinal, operation in enumerate(program.operations):
+        target_task_id = task_for_operation[consumer_ordinal]
+        for value in primitive_inputs(operation):
+            producer = producer_for_value.get(value)
+            if producer is None:
+                continue
+            source_id = task_for_operation[producer]
+            if source_id != target_task_id:
+                crossing_values[(source_id, target_task_id)].add(value)
+
+    dependence_programs = list(task_plan.dependence_programs)
+    dynamically_covered: dict[tuple[int, int], set[ProgramValue]] = defaultdict(set)
+    visibility = MemoryVisibility(EventMemoryScope.DEVICE)
+    for target_ordinal, operation in enumerate(program.operations):
+        if not isinstance(operation, RelationPrimitive):
+            continue
+        target_task = tasks[task_for_operation[target_ordinal]]
+        for indexing in operation.input_indexing:
+            runtime_values = set().union(
+                *(_index_expression_values(expression) for expression in indexing.indices),
+                set(),
+            )
+            if indexing.predicate is not None:
+                runtime_values.update(_index_predicate_values(indexing.predicate))
+            if operation.predicate is not None:
+                runtime_values.update(_index_predicate_values(operation.predicate))
+            if not runtime_values:
+                continue
+            runtime_inputs = tuple(value for value in operation.inputs if value in runtime_values)
+            source_id = source_task_id(indexing.operand)
+            if source_id == target_task.id:
+                continue
+            source_task = tasks[source_id]
+            dependence_programs.append(
+                _runtime_relation_dependence_program(
+                    operation,
+                    runtime_inputs=runtime_inputs,
+                    runtime_value_ordinals=value_ordinals,
+                    source_task=source_task,
+                    target_task=target_task,
+                    source_shape=indexing.operand.shape,
+                    source_expressions=indexing.indices,
+                    validity=_predicate_conjunction(indexing.predicate, operation.predicate),
+                    visibility=visibility,
+                )
+            )
+            dynamically_covered[(source_id, target_task.id)].add(indexing.operand)
+
+    if not dependence_programs and not staged_inputs:
+        return task_plan
+    task_id_for_family_name = {task.family.name: task.id for task in tasks}
+    static_dependences = tuple(
+        dependence
+        for dependence in task_plan.dependences
+        if not (
+            (
+                edge := (
+                    task_id_for_family_name[dependence.relation.source.name],
+                    task_id_for_family_name[dependence.relation.target.name],
+                )
+            )
+            in dynamically_covered
+            and crossing_values[edge] <= dynamically_covered[edge]
+        )
+    )
+    return CanonicalTaskPlan(
+        tuple(tasks),
+        static_dependences,
+        task_plan.bounded_buffers,
+        tuple(dependence_programs),
+    )
+
+
+def audit_runtime_relation_dependences(
+    program: TensorProgram,
+    task_plan: CanonicalTaskPlan,
+) -> tuple[RuntimeRelationDependenceSite, ...]:
+    """Prove every dynamic Relation source is parametric or intra-task."""
+    task_for_operation = {ordinal: task.id for task in task_plan.tasks for ordinal in task.operation_ordinals}
+    producer_for_value = {
+        output: ordinal
+        for ordinal, operation in enumerate(program.operations)
+        for output in primitive_outputs(operation)
+    }
+    value_ordinals = tensor_program_value_ordinals(program)
+    staged_input_tasks = {
+        access.value_id: task.id
+        for task in task_plan.tasks
+        if task.operation_kinds == (TaskOperationKind.INPUT_STAGE,)
+        for access in task.accesses
+        if access.kind is TaskValueAccessKind.LIVE_OUT
+    }
+    available_programs = set(range(len(task_plan.dependence_programs)))
+    sites: list[RuntimeRelationDependenceSite] = []
+    for target_ordinal, operation in enumerate(program.operations):
+        if not isinstance(operation, RelationPrimitive):
+            continue
+        target_task_id = task_for_operation[target_ordinal]
+        for indexing in operation.input_indexing:
+            runtime_values = set().union(
+                *(_index_expression_values(expression) for expression in indexing.indices),
+                set(),
+            )
+            if indexing.predicate is not None:
+                runtime_values.update(_index_predicate_values(indexing.predicate))
+            if operation.predicate is not None:
+                runtime_values.update(_index_predicate_values(operation.predicate))
+            if not runtime_values:
+                continue
+            producer = producer_for_value.get(indexing.operand)
+            source_value_ordinal = value_ordinals[indexing.operand]
+            source_task_id = (
+                task_for_operation[producer] if producer is not None else staged_input_tasks[source_value_ordinal]
+            )
+            if source_task_id == target_task_id:
+                sites.append(
+                    RuntimeRelationDependenceSite(
+                        target_ordinal,
+                        source_value_ordinal,
+                        source_task_id,
+                        target_task_id,
+                        None,
+                    )
+                )
+                continue
+            runtime_binding_ordinals = tuple(
+                value_ordinals[value] for value in operation.inputs if value in runtime_values
+            )
+            candidates = tuple(
+                index
+                for index in available_programs
+                if (dependence := task_plan.dependence_programs[index]).source_task_id == source_task_id
+                and dependence.target_task_id == target_task_id
+                and tuple(binding.algebra_value_ordinal for binding in dependence.runtime_bindings)
+                == runtime_binding_ordinals
+            )
+            if len(candidates) != 1:
+                raise ValueError("runtime Relation edge does not have one exact parametric dependence program")
+            program_index = candidates[0]
+            available_programs.remove(program_index)
+            sites.append(
+                RuntimeRelationDependenceSite(
+                    target_ordinal,
+                    source_value_ordinal,
+                    source_task_id,
+                    target_task_id,
+                    program_index,
+                )
+            )
+    if available_programs:
+        raise ValueError("task plan contains parametric dependence programs without runtime Relation provenance")
+    return tuple(sites)
+
+
+def _runtime_relation_dependence_program(
+    relation: RelationPrimitive,
+    *,
+    runtime_inputs: tuple[ProgramValue, ...],
+    runtime_value_ordinals: Mapping[ProgramValue, int],
+    source_task: TiledTask,
+    target_task: TiledTask,
+    source_shape: tuple[int, ...],
+    source_expressions: tuple[IndexExpression, ...],
+    validity: IndexPredicate | None,
+    visibility: MemoryVisibility,
+) -> TaskDependenceProgram:
+    domain_axis = {axis.id: axis for axis in relation.domain_axes}
+
+    def coordinate_values(task: TiledTask, prefix: str) -> tuple[ProgramValue, ...]:
+        return tuple(
+            ProgramValue(f"{prefix}.{position}", relation.domain_axes, DType.INT32)
+            for position, _ in enumerate(task.structure.owner_axes)
+        )
+
+    def target_expressions() -> tuple[IndexExpression, ...]:
+        expressions = []
+        for owned in target_task.structure.owner_axes:
+            axis = domain_axis.get(owned.axis_id)
+            if axis is None:
+                raise ValueError("runtime Relation dependence cannot project a target owner axis outside its domain")
+            expression = index_axis(axis)
+            if owned.tile_extent != 1:
+                expression = index_binary(
+                    IndexExpressionKind.FLOOR_DIVIDE,
+                    expression,
+                    index_constant(owned.tile_extent),
+                )
+            expressions.append(expression)
+        return tuple(expressions)
+
+    source_owner_axes = source_task.structure.owner_axes
+    if len(source_expressions) != len(source_owner_axes):
+        singleton_owner = all(axis.extent == 1 for axis in source_task.family.axes)
+        flattened_source = (
+            len(source_owner_axes) == 1
+            and source_owner_axes[0].extent == prod(source_shape)
+            and len(source_expressions) == len(source_shape)
+        )
+        if singleton_owner:
+            source_expressions = tuple(index_constant(0) for _ in source_owner_axes)
+        elif not flattened_source:
+            raise ValueError("runtime Relation source indexing rank does not match the producer task's owned axes")
+        else:
+            linearized = index_constant(0)
+            for expression, extent in zip(source_expressions, source_shape, strict=True):
+                linearized = index_binary(
+                    IndexExpressionKind.ADD,
+                    index_binary(IndexExpressionKind.MULTIPLY, linearized, index_constant(extent)),
+                    expression,
+                )
+            source_expressions = (linearized,)
+    source_expressions = tuple(
+        (
+            index_binary(IndexExpressionKind.FLOOR_DIVIDE, expression, index_constant(axis.tile_extent))
+            if axis.tile_extent != 1
+            else expression
+        )
+        for expression, axis in zip(source_expressions, source_owner_axes, strict=True)
+    )
+    source_values = coordinate_values(source_task, "source")
+    target_values = coordinate_values(target_task, "target")
+    validity_value = None if validity is None else ProgramValue("validity", relation.domain_axes, DType.BOOL)
+    input_indexing = {indexing.operand: indexing for indexing in relation.input_indexing}
+    result_expressions = (*source_expressions, *target_expressions(), *((validity,) if validity is not None else ()))
+    relation_operation = RelationPrimitive(
+        "runtime.task_relation",
+        runtime_inputs,
+        (*source_values, *target_values, *((validity_value,) if validity_value is not None else ())),
+        relation.domain_axes,
+        tuple(input_indexing[value] for value in runtime_inputs),
+        result_expressions=result_expressions,
+        order=EvaluationOrder.ORDER_FREE,
+    )
+    relation_program = TensorProgram(
+        runtime_inputs,
+        (relation_operation,),
+        relation_operation.outputs,
+        NumericalPolicy.SOURCE_ORDERED,
+    )
+
+    def bounded(values: tuple[ProgramValue, ...], task: TiledTask) -> tuple[BoundedTaskCoordinate, ...]:
+        return tuple(
+            BoundedTaskCoordinate(value, 0, ceil(axis.extent / axis.tile_extent))
+            for value, axis in zip(values, task.structure.owner_axes, strict=True)
+        )
+
+    return TaskDependenceProgram(
+        source_task.id,
+        target_task.id,
+        relation_program,
+        tuple(DependenceRuntimeBinding(value, runtime_value_ordinals[value]) for value in runtime_inputs),
+        bounded(source_values, source_task),
+        bounded(target_values, target_task),
+        validity_value,
+        visibility,
+    )
+
+
+def _index_predicate_values(predicate: IndexPredicate) -> set[ProgramValue]:
+    values = set().union(*(_index_expression_values(expression) for expression in predicate.expressions), set())
+    for nested in predicate.predicates:
+        values.update(_index_predicate_values(nested))
+    return values
+
+
+def _index_expression_values(expression: IndexExpression) -> set[ProgramValue]:
+    values = {expression.tensor} if expression.tensor is not None else set()
+    for operand in expression.operands:
+        values.update(_index_expression_values(operand))
+    if expression.predicate is not None:
+        values.update(_index_predicate_values(expression.predicate))
+    return values
+
+
+def _predicate_conjunction(left: IndexPredicate | None, right: IndexPredicate | None) -> IndexPredicate | None:
+    if left is None:
+        return right
+    if right is None:
+        return left
+    return IndexPredicate(IndexPredicateKind.AND, predicates=(left, right))
+
+
+def eventize_composed_task_plan(task_plan: CanonicalTaskPlan) -> EventDataflowProgram:
+    """Factor every exact inter-task dependence into one EventTensor."""
+    event_plans = tuple(
+        derive_event_tensor_plan(
+            dependence,
+            name=f"event.{ordinal}",
+            memory_scope=EventMemoryScope.DEVICE,
+            scheduling_mode=EventSchedulingMode.STATIC,
+        )
+        for ordinal, dependence in enumerate(task_plan.dependences)
+    )
+    return EventDataflowProgram(task_plan.task_families, task_plan.dependences, event_plans)
+
+
+def physical_request_for_composed_tasks(
+    *,
+    algebra_record,
+    algebra_fingerprint: str,
+    task_plan: CanonicalTaskPlan,
+    event_program: EventDataflowProgram,
+    target: PhysicalTarget,
+    numerical_policy: PhysicalNumericalPolicy,
+) -> ExecutablePhysicalRequest:
+    """Create a canonical request without using a workload identity as dispatch."""
+    schedules = tuple(
+        PhysicalSchedule(
+            PhysicalScheduleFamily(
+                f"{task.structure.principal_kind.value}_phase_dag",
+                target,
+                (_constraint_for_task(task),),
+            ),
+            (task.id,),
+            {"pipeline_depth": 1},
+        )
+        for task in task_plan.tasks
+    )
+    realizations = verify_event_realizations(
+        event_program,
+        tuple(
+            physical_event_realization(
+                plan,
+                mechanism="bounded_counter",
+                reason="no selected physical order has yet proved this exact inter-task dependence redundant",
+            )
+            for plan in event_program.event_plans
+        ),
+    )
+    allocations = tuple(
+        EventTensorAllocation(
+            EventStorageBinding(
+                plan.domain,
+                tuple(range(len(plan.domain.coordinates))),
+                (0,) * len(plan.domain.coordinates),
+            ),
+            capacity=len(plan.domain.coordinates),
+            generation_count=1,
+        )
+        for plan in event_program.event_plans
+    )
+    event_programs = tuple(
+        ParametricEventTensorPlan(
+            dependence_program_index=index,
+            derivation=ParametricEventDerivation.EXACT_CONSUMER,
+            capacity=len(task_plan.tasks[dependence.target_task_id].family.coordinates),
+            slots=tuple(range(len(task_plan.tasks[dependence.target_task_id].family.coordinates))),
+            generations=(0,) * len(task_plan.tasks[dependence.target_task_id].family.coordinates),
+            generation_count=1,
+            memory_scope=EventMemoryScope.DEVICE,
+            generation_policy=EventGenerationPolicy.PER_INVOCATION,
+            scheduling_mode=EventSchedulingMode.DYNAMIC,
+            realization=ParametricEventRealization.IMPERATIVE_WAIT_NOTIFY,
+        )
+        for index, dependence in enumerate(task_plan.dependence_programs)
+    )
+    return ExecutablePhysicalRequest(
+        algebra_record=algebra_record,
+        algebra_fingerprint=algebra_fingerprint,
+        task_plan=task_plan,
+        event_plans=event_program.event_plans,
+        event_allocations=allocations,
+        target=target,
+        numerical_policy=numerical_policy,
+        schedules=schedules,
+        event_realizations=EventRealizationProof(realizations, ()),
+        provenance={"source_boundary": "ordinary_jax", "differentiation_owner": "jax"},
+        event_programs=event_programs,
+    )
+
+
+def _contract_fold_bridge_candidate(
+    terminal_ordinal: int,
+    *,
+    program: TensorProgram,
+    producer_by_value: Mapping[str, TensorPrimitive],
+    consumers_by_value: Mapping[str, list[TensorPrimitive]],
+    operation_index: Mapping[int, int],
+    forbidden: set[int],
+) -> set[int] | None:
+    terminal = program.operations[terminal_ordinal]
+    assert isinstance(terminal, ContractPrimitive)
+    candidate = {terminal_ordinal}
+    upstream_contracts: set[int] = set()
+    for value in terminal.inputs:
+        _collect_map_fold_ancestry(
+            value,
+            producer_by_value=producer_by_value,
+            operation_index=operation_index,
+            group=candidate,
+            boundary_contracts=upstream_contracts,
+            crossed_phase=False,
+        )
+    folds = tuple(
+        program.operations[ordinal] for ordinal in candidate if isinstance(program.operations[ordinal], FoldPrimitive)
+    )
+    if not upstream_contracts or not folds:
+        return None
+    terminal_reductions = set(terminal.reduction_axes)
+    if not any(terminal_reductions & set(fold.reduction_axes) for fold in folds):
+        return None
+
+    candidate.update(upstream_contracts)
+    for upstream_ordinal in upstream_contracts:
+        upstream = program.operations[upstream_ordinal]
+        assert isinstance(upstream, ContractPrimitive)
+        for value in upstream.inputs:
+            _include_map_ancestry(
+                value,
+                producer_by_value=producer_by_value,
+                operation_index=operation_index,
+                forbidden=forbidden,
+                group=candidate,
+            )
+    candidate = _include_closed_map_fold_consumers(
+        candidate,
+        program=program,
+        producer_by_value=producer_by_value,
+        operation_index=operation_index,
+        forbidden=forbidden,
+    )
+
+    if not _within_fusion_resource_bounds(candidate, program):
+        return None
+    boundary_outputs = _boundary_outputs(
+        tuple(program.operations[ordinal] for ordinal in sorted(candidate)),
+        program=program,
+        ordinal_set=candidate,
+        consumers_by_value=consumers_by_value,
+        operation_index=operation_index,
+    )
+    if not boundary_outputs or not _common_axes(boundary_outputs):
+        return None
+    owner_axes, streamed_axes, reduction_axes, contraction_axes = _fusion_axis_roles(
+        tuple(program.operations[ordinal] for ordinal in sorted(candidate)),
+        boundary_outputs,
+    )
+    roles = (*owner_axes, *streamed_axes, *reduction_axes, *contraction_axes)
+    if len(roles) != len(set(roles)):
+        return None
+    if not _is_dependency_convex(
+        candidate,
+        program=program,
+        producer_by_value=producer_by_value,
+        consumers_by_value=consumers_by_value,
+        operation_index=operation_index,
+    ):
+        return None
+    return candidate
+
+
+def _include_closed_map_fold_consumers(
+    candidate: set[int],
+    *,
+    program: TensorProgram,
+    producer_by_value: Mapping[str, TensorPrimitive],
+    operation_index: Mapping[int, int],
+    forbidden: set[int],
+) -> set[int]:
+    """Absorb scalar/fold consumers whose produced inputs are all local."""
+    result = set(candidate)
+    changed = True
+    while changed:
+        changed = False
+        for ordinal, operation in enumerate(program.operations):
+            if (
+                ordinal in result
+                or ordinal in forbidden
+                or not isinstance(
+                    operation,
+                    (MapPrimitive, FoldPrimitive),
+                )
+            ):
+                continue
+            input_producers = tuple(producer_by_value.get(value.name) for value in primitive_inputs(operation))
+            produced_inputs = tuple(producer for producer in input_producers if producer is not None)
+            if not produced_inputs or not any(operation_index[id(producer)] in result for producer in produced_inputs):
+                continue
+            # This expansion is deliberately a *closed* continuation of the
+            # candidate.  A Map that also consumes a live-in belongs at the
+            # component boundary: absorbing it would make an otherwise valid
+            # Contract/Fold region depend on an unrelated downstream input
+            # (for example the cotangent used by a scalar training loss).
+            if len(produced_inputs) != len(input_producers):
+                continue
+            if any(operation_index[id(producer)] not in result for producer in produced_inputs):
+                continue
+            tentative = {*result, ordinal}
+            if not _within_fusion_resource_bounds(tentative, program):
+                continue
+            result = tentative
+            changed = True
+    return result
+
+
+def _fusion_preserves_acyclic_quotient(
+    groups: list[set[int]],
+    candidate: set[int],
+    predecessors: Mapping[int, set[int]],
+) -> bool:
+    # Convexity in the original DAG is insufficient: two disjoint convex
+    # groups can have edges in both directions after contraction.
+    representative = {ordinal: ordinal for ordinal in predecessors}
+    for group in (*groups, candidate):
+        representative.update(dict.fromkeys(group, min(group)))
+    quotient: dict[int, set[int]] = defaultdict(set)
+    for ordinal, sources in predecessors.items():
+        target = representative[ordinal]
+        quotient[target].update(representative[source] for source in sources if representative[source] != target)
+    try:
+        TopologicalSorter(quotient).prepare()
+    except CycleError:
+        return False
+    return True
+
+
+def _is_dependency_convex(
+    ordinals: set[int],
+    *,
+    program: TensorProgram,
+    producer_by_value: Mapping[str, TensorPrimitive],
+    consumers_by_value: Mapping[str, list[TensorPrimitive]],
+    operation_index: Mapping[int, int],
+) -> bool:
+    ancestors = set(ordinals)
+    ancestor_frontier = list(ordinals)
+    while ancestor_frontier:
+        ordinal = ancestor_frontier.pop()
+        for value in primitive_inputs(program.operations[ordinal]):
+            producer = producer_by_value.get(value.name)
+            if producer is None:
+                continue
+            producer_ordinal = operation_index[id(producer)]
+            if producer_ordinal not in ancestors:
+                ancestors.add(producer_ordinal)
+                ancestor_frontier.append(producer_ordinal)
+
+    descendants = set(ordinals)
+    descendant_frontier = list(ordinals)
+    while descendant_frontier:
+        ordinal = descendant_frontier.pop()
+        for output in primitive_outputs(program.operations[ordinal]):
+            for consumer in consumers_by_value[output.name]:
+                consumer_ordinal = operation_index[id(consumer)]
+                if consumer_ordinal not in descendants:
+                    descendants.add(consumer_ordinal)
+                    descendant_frontier.append(consumer_ordinal)
+    return not ((ancestors & descendants) - ordinals)
+
+
+def _collect_map_fold_ancestry(
+    value: ProgramValue,
+    *,
+    producer_by_value: Mapping[str, TensorPrimitive],
+    operation_index: Mapping[int, int],
+    group: set[int],
+    boundary_contracts: set[int],
+    crossed_phase: bool,
+) -> None:
+    producer = producer_by_value.get(value.name)
+    if producer is None:
+        return
+    ordinal = operation_index[id(producer)]
+    if ordinal in group or ordinal in boundary_contracts:
+        return
+    if isinstance(producer, ContractPrimitive):
+        if crossed_phase:
+            boundary_contracts.add(ordinal)
+        return
+    if not isinstance(producer, (MapPrimitive, FoldPrimitive)):
+        return
+    group.add(ordinal)
+    for input_value in primitive_inputs(producer):
+        _collect_map_fold_ancestry(
+            input_value,
+            producer_by_value=producer_by_value,
+            operation_index=operation_index,
+            group=group,
+            boundary_contracts=boundary_contracts,
+            crossed_phase=True,
+        )
+
+
+def _within_fusion_resource_bounds(ordinals: set[int], program: TensorProgram) -> bool:
+    operations = tuple(program.operations[ordinal] for ordinal in ordinals)
+    return len(operations) <= MAXIMUM_FUSED_PHASES and _estimated_registers(operations) <= (
+        MAXIMUM_FUSED_REGISTERS_PER_THREAD
+    )
+
+
+def _estimated_registers(operations: tuple[TensorPrimitive, ...]) -> int:
+    """Estimate scalar/register pressure by algebraic capability.
+
+    Index-only Relations change addressing without retaining a tensor-sized
+    value. Contracts and Folds retain accumulators, while scalar Maps add only
+    short-lived scalar state. This is intentionally an algebra estimate rather
+    than a count of frontend equations: inserting reshape or broadcast
+    relations must not by itself make the same physical region unfusible.
+    """
+    return 32 + sum(
+        (
+            8
+            if isinstance(operation, ContractPrimitive)
+            else (4 if isinstance(operation, FoldPrimitive) else 2 if isinstance(operation, MapPrimitive) else 0)
+        )
+        for operation in operations
+    )
+
+
+def _include_map_ancestry_until_contract(
+    value: ProgramValue,
+    *,
+    producer_by_value: Mapping[str, TensorPrimitive],
+    operation_index: Mapping[int, int],
+    forbidden: set[int],
+    group: set[int],
+) -> None:
+    producer = producer_by_value.get(value.name)
+    if producer is None:
+        return
+    ordinal = operation_index[id(producer)]
+    if ordinal in forbidden or ordinal in group:
+        return
+    if isinstance(producer, ContractPrimitive):
+        group.add(ordinal)
+        return
+    if not isinstance(producer, MapPrimitive):
+        return
+    group.add(ordinal)
+    for input_value in primitive_inputs(producer):
+        _include_map_ancestry_until_contract(
+            input_value,
+            producer_by_value=producer_by_value,
+            operation_index=operation_index,
+            forbidden=forbidden,
+            group=group,
+        )
+
+
+def _include_map_ancestry(
+    value: ProgramValue,
+    *,
+    producer_by_value: Mapping[str, TensorPrimitive],
+    operation_index: Mapping[int, int],
+    forbidden: set[int],
+    group: set[int],
+) -> None:
+    producer = producer_by_value.get(value.name)
+    if not isinstance(producer, MapPrimitive) and not _is_identity_relation(producer):
+        return
+    ordinal = operation_index[id(producer)]
+    if ordinal in forbidden or ordinal in group:
+        return
+    group.add(ordinal)
+    for input_value in primitive_inputs(producer):
+        _include_map_ancestry(
+            input_value,
+            producer_by_value=producer_by_value,
+            operation_index=operation_index,
+            forbidden=forbidden,
+            group=group,
+        )
+
+
+def _is_identity_relation(operation: TensorPrimitive | None) -> bool:
+    """Whether a Relation only renames values in the same logical index space."""
+    if not isinstance(operation, RelationPrimitive) or operation.predicate is not None:
+        return False
+    if any(output.axes != operation.domain_axes for output in operation.outputs):
+        return False
+    for indexing in operation.input_indexing:
+        if indexing.predicate is not None or indexing.operand.axes != operation.domain_axes:
+            return False
+        if any(
+            expression.kind is not IndexExpressionKind.AXIS or expression.axis != axis
+            for expression, axis in zip(indexing.indices, indexing.operand.axes, strict=True)
+        ):
+            return False
+    return all(
+        source is not None and source.axes == output.axes
+        for source, output in zip(operation.resolved_result_sources, operation.outputs, strict=True)
+    )
+
+
+def _tiled_task(
+    task_id: int,
+    ordinals: tuple[int, ...],
+    program: TensorProgram,
+    *,
+    consumers_by_value: Mapping[str, list[TensorPrimitive]],
+    operation_index: Mapping[int, int],
+    value_id: Mapping[str, int],
+    tile_extent_by_axis: Mapping[int, int],
+    numerical_policy: PhysicalNumericalPolicy,
+) -> TiledTask:
+    operations = tuple(program.operations[ordinal] for ordinal in ordinals)
+    ordinal_set = set(ordinals)
+    external_outputs = _boundary_outputs(
+        operations,
+        program=program,
+        ordinal_set=ordinal_set,
+        consumers_by_value=consumers_by_value,
+        operation_index=operation_index,
+    )
+    if not external_outputs:
+        external_outputs = primitive_outputs(operations[-1])
+    owner_axes, streamed_axes, reduction_axes, contraction_axes = _fusion_axis_roles(operations, external_outputs)
+    owner_tiles = _axis_tiles(owner_axes, tile_extent_by_axis)
+    structure = PhysicalTaskStructure(
+        principal_kind=_operation_kind(
+            next((operation for operation in operations if isinstance(operation, ContractPrimitive)), operations[-1])
+        ),
+        phases=tuple(
+            PhysicalPhase(
+                index,
+                _capability(operation),
+                (ordinal,),
+                *physical_phase_iteration_space(operation),
+            )
+            for index, (ordinal, operation) in enumerate(zip(ordinals, operations, strict=True))
+        ),
+        phase_edges=_phase_edges(operations),
+        owner_axes=owner_tiles,
+        streamed_axes=_axis_tiles(streamed_axes, tile_extent_by_axis),
+        reduction_axes=_axis_tiles(reduction_axes, tile_extent_by_axis),
+        contraction_axes=_axis_tiles(contraction_axes, tile_extent_by_axis),
+        traversal=(
+            TaskTraversal.SOURCE_ORDERED
+            if numerical_policy is PhysicalNumericalPolicy.SOURCE_ORDERED
+            else TaskTraversal.UNORDERED
+        ),
+        element_types=tuple(
+            dict.fromkeys(output.dtype.value for operation in operations for output in primitive_outputs(operation))
+        ),
+        layout_classes=("logical_row_major",),
+        resources=TaskResourceEstimate(_estimated_registers(operations), 0, 0),
+    )
+    family = TaskFamily(
+        f"task.{task_id}",
+        tuple(TaskAxis(f"axis.{axis.axis_id}", ceil(axis.extent / axis.tile_extent)) for axis in owner_tiles),
+        placement=None,
+    )
+    accesses = task_value_accesses(program, ordinals)
+    return TiledTask(
+        task_id,
+        family,
+        ordinals,
+        tuple(_operation_kind(operation) for operation in operations),
+        structure,
+        accesses,
+    )
+
+
+def _common_axes(values: tuple[ProgramValue, ...]) -> tuple[TensorAxis, ...]:
+    common = set(values[0].axes)
+    for value in values[1:]:
+        common.intersection_update(value.axes)
+    return tuple(axis for axis in values[0].axes if axis in common)
+
+
+def _boundary_outputs(
+    operations: tuple[TensorPrimitive, ...],
+    *,
+    program: TensorProgram,
+    ordinal_set: set[int],
+    consumers_by_value: Mapping[str, list[TensorPrimitive]],
+    operation_index: Mapping[int, int],
+) -> tuple[ProgramValue, ...]:
+    program_outputs = {value.name for value in program.outputs}
+    return tuple(
+        output
+        for operation in operations
+        for output in primitive_outputs(operation)
+        if output.name in program_outputs
+        or any(operation_index[id(consumer)] not in ordinal_set for consumer in consumers_by_value[output.name])
+    )
+
+
+def _fusion_axis_roles(
+    operations: tuple[TensorPrimitive, ...],
+    boundary_outputs: tuple[ProgramValue, ...],
+) -> tuple[tuple[TensorAxis, ...], tuple[TensorAxis, ...], tuple[TensorAxis, ...], tuple[TensorAxis, ...]]:
+    fold_axes = tuple(
+        dict.fromkeys(
+            axis for operation in operations if isinstance(operation, FoldPrimitive) for axis in operation.reduction_axes
+        )
+    )
+    contract_axes = tuple(
+        dict.fromkeys(
+            axis
+            for operation in operations
+            if isinstance(operation, ContractPrimitive)
+            for axis in operation.reduction_axes
+        )
+    )
+    fold_axis_set = set(fold_axes)
+    contract_axis_set = set(contract_axes)
+    streamed_axes = tuple(axis for axis in fold_axes if axis in contract_axis_set)
+    reduction_axes = tuple(axis for axis in fold_axes if axis not in contract_axis_set)
+    contraction_axes = tuple(axis for axis in contract_axes if axis not in fold_axis_set)
+    non_owner_axes = {*streamed_axes, *reduction_axes, *contraction_axes}
+    owner_axes = tuple(axis for axis in _common_axes(boundary_outputs) if axis not in non_owner_axes)
+    return owner_axes, streamed_axes, reduction_axes, contraction_axes
+
+
+def _axis_tiles(axes: tuple[TensorAxis, ...], tile_extent_by_axis: Mapping[int, int]) -> tuple[TaskAxisTile, ...]:
+    return tuple(
+        TaskAxisTile(axis.id, axis.extent, min(axis.extent, tile_extent_by_axis.get(axis.id, axis.extent)))
+        for axis in axes
+    )
+
+
+def _operation_kind(operation: TensorPrimitive) -> TaskOperationKind:
+    if isinstance(operation, ContractPrimitive):
+        return TaskOperationKind.CONTRACT
+    if isinstance(operation, FoldPrimitive):
+        return TaskOperationKind.FOLD
+    if isinstance(operation, MapPrimitive):
+        return TaskOperationKind.MAP
+    if isinstance(operation, SelectionPrimitive):
+        return TaskOperationKind.SELECTION
+    if isinstance(operation, ScanPrimitive):
+        return TaskOperationKind.SCAN
+    if isinstance(operation, RelationPrimitive):
+        return TaskOperationKind.RELATION
+    return TaskOperationKind.TRANSPORT
+
+
+def _capability(operation: TensorPrimitive) -> TaskCapability:
+    if isinstance(operation, ContractPrimitive):
+        return TaskCapability.MATRIX_CONTRACT
+    if isinstance(operation, FoldPrimitive):
+        return TaskCapability.ASSOCIATIVE_FOLD
+    if isinstance(operation, MapPrimitive):
+        return TaskCapability.SCALAR_MAP
+    if isinstance(operation, SelectionPrimitive):
+        return TaskCapability.BOUNDED_SELECTION
+    if isinstance(operation, ScanPrimitive):
+        return TaskCapability.ORDERED_STATE
+    if isinstance(operation, RelationPrimitive):
+        return TaskCapability.INDEX_RELATION
+    return TaskCapability.DATA_TRANSPORT
+
+
+def _phase_edges(operations: tuple[TensorPrimitive, ...]) -> tuple[PhysicalPhaseEdge, ...]:
+    producer_phase = {
+        output.name: phase for phase, operation in enumerate(operations) for output in primitive_outputs(operation)
+    }
+    edges = {
+        PhysicalPhaseEdge(
+            producer_phase[value.name],
+            phase,
+            _input_relation_class(operation, value),
+        )
+        for phase, operation in enumerate(operations)
+        for value in primitive_inputs(operation)
+        if value.name in producer_phase
+    }
+    return tuple(sorted(edges))
+
+
+def _value_ids(program: TensorProgram) -> dict[str, int]:
+    values = (*program.inputs, *(output for operation in program.operations for output in primitive_outputs(operation)))
+    return {value.name: index for index, value in enumerate(values)}
+
+
+def task_value_accesses(
+    program: TensorProgram,
+    operation_ordinals: tuple[int, ...],
+) -> tuple[TaskValueAccess, ...]:
+    """Derive the exact live/temporary value boundary for one task component."""
+    if not operation_ordinals or len(set(operation_ordinals)) != len(operation_ordinals):
+        raise ValueError("task component operation ordinals must be nonempty and unique")
+    if any(ordinal < 0 or ordinal >= len(program.operations) for ordinal in operation_ordinals):
+        raise ValueError("task component operation ordinal is outside the algebra program")
+    operation_index = {id(operation): index for index, operation in enumerate(program.operations)}
+    consumers_by_value: dict[str, list[TensorPrimitive]] = defaultdict(list)
+    for operation in program.operations:
+        for value in primitive_inputs(operation):
+            consumers_by_value[value.name].append(operation)
+    operations = tuple(program.operations[ordinal] for ordinal in operation_ordinals)
+    return _task_accesses(
+        operations,
+        ordinal_set=set(operation_ordinals),
+        consumers_by_value=consumers_by_value,
+        operation_index=operation_index,
+        value_id=_value_ids(program),
+        output_names={value.name for value in program.outputs},
+    )
+
+
+def _task_accesses(
+    operations: tuple[TensorPrimitive, ...],
+    *,
+    ordinal_set: set[int],
+    consumers_by_value: Mapping[str, list[TensorPrimitive]],
+    operation_index: Mapping[int, int],
+    value_id: Mapping[str, int],
+    output_names: set[str],
+) -> tuple[TaskValueAccess, ...]:
+    producer_phase = {
+        output.name: phase for phase, operation in enumerate(operations) for output in primitive_outputs(operation)
+    }
+    accesses: list[TaskValueAccess] = []
+    seen_inputs: set[tuple[str, int]] = set()
+    for phase, operation in enumerate(operations):
+        for value in primitive_inputs(operation):
+            if value.name in producer_phase or (value.name, phase) in seen_inputs:
+                continue
+            seen_inputs.add((value.name, phase))
+            accesses.append(
+                TaskValueAccess(
+                    value_id[value.name],
+                    TaskValueAccessKind.LIVE_IN,
+                    phase,
+                    _input_relation_class(operation, value),
+                    _input_relation_record(operation, value, primitive_outputs(operation)[0]),
+                )
+            )
+        for output in primitive_outputs(operation):
+            outside = output.name in output_names or any(
+                operation_index[id(consumer)] not in ordinal_set for consumer in consumers_by_value[output.name]
+            )
+            kind = TaskValueAccessKind.LIVE_OUT if outside else TaskValueAccessKind.TEMPORARY
+            accesses.append(
+                TaskValueAccess(
+                    value_id[output.name],
+                    kind,
+                    phase,
+                    RelationAccessClass.IDENTITY,
+                    _value_relation_record(output, output),
+                )
+            )
+    return tuple(accesses)
+
+
+def _input_relation_class(operation: TensorPrimitive, value: ProgramValue) -> RelationAccessClass:
+    if isinstance(operation, ContractPrimitive):
+        input_index = operation.inputs.index(value)
+        if operation.index_maps_for_input(input_index):
+            return RelationAccessClass.AFFINE
+    if isinstance(operation, RelationPrimitive):
+        indexing = operation.input_indexing[operation.inputs.index(value)]
+        runtime_values = set().union(
+            *(_index_expression_values(expression) for expression in indexing.indices),
+            set(),
+        )
+        if indexing.predicate is not None:
+            runtime_values.update(_index_predicate_values(indexing.predicate))
+        if operation.predicate is not None:
+            runtime_values.update(_index_predicate_values(operation.predicate))
+        if runtime_values:
+            return RelationAccessClass.BOUNDED_DYNAMIC
+    return (
+        RelationAccessClass.IDENTITY
+        if any(value.axes == output.axes for output in primitive_outputs(operation))
+        else RelationAccessClass.AFFINE
+    )
+
+
+def _input_relation_record(
+    operation: TensorPrimitive,
+    value: ProgramValue,
+    target: ProgramValue,
+) -> dict[str, object]:
+    record = _value_relation_record(value, target)
+    if not isinstance(operation, ContractPrimitive):
+        return record
+    mappings = operation.index_maps_for_input(operation.inputs.index(value))
+    if not mappings:
+        return record
+    return {
+        **record,
+        "index_maps": tuple(
+            {
+                "domain_axis": mapping.domain_axis.id,
+                "operand_axis": mapping.operand_axis.id,
+                "divisor": mapping.divisor,
+                "offset": mapping.offset,
+                "modulus": mapping.modulus,
+            }
+            for mapping in mappings
+        ),
+    }
+
+
+def _value_relation_record(source: ProgramValue, target: ProgramValue) -> dict[str, object]:
+    return {
+        "source_axes": tuple(axis.id for axis in source.axes),
+        "target_axes": tuple(axis.id for axis in target.axes),
+        "source_shape": tuple(axis.extent for axis in source.axes),
+        "target_shape": tuple(axis.extent for axis in target.axes),
+    }
+
+
+def _exact_task_dependences(
+    program: TensorProgram,
+    tasks: tuple[TiledTask, ...],
+    *,
+    task_for_operation: Mapping[int, int],
+) -> tuple[TaskDependence, ...]:
+    producer_ordinal = {
+        output.name: ordinal
+        for ordinal, operation in enumerate(program.operations)
+        for output in primitive_outputs(operation)
+    }
+    pairs_by_tasks: dict[tuple[int, int], set[tuple[tuple[int, ...], tuple[int, ...]]]] = defaultdict(set)
+    for consumer_ordinal, operation in enumerate(program.operations):
+        consumer_task_id = task_for_operation[consumer_ordinal]
+        for value in primitive_inputs(operation):
+            source_ordinal = producer_ordinal.get(value.name)
+            if source_ordinal is None:
+                continue
+            producer_task_id = task_for_operation[source_ordinal]
+            if producer_task_id == consumer_task_id:
+                continue
+            producer_task = tasks[producer_task_id]
+            consumer_task = tasks[consumer_task_id]
+            pairs_by_tasks[(producer_task_id, consumer_task_id)].update(
+                _value_task_pairs(producer_task, consumer_task, operation=operation, value=value)
+            )
+    visibility = MemoryVisibility(EventMemoryScope.DEVICE)
+    return tuple(
+        TaskDependence(
+            TaskRelation.from_pairs(tasks[source].family, tasks[target].family, tuple(sorted(pairs))),
+            visibility,
+        )
+        for (source, target), pairs in sorted(pairs_by_tasks.items())
+    )
+
+
+def _value_task_pairs(
+    producer: TiledTask,
+    consumer: TiledTask,
+    *,
+    operation: TensorPrimitive,
+    value: ProgramValue,
+) -> tuple[tuple[tuple[int, ...], tuple[int, ...]], ...]:
+    producer_axis_position = {axis.axis_id: index for index, axis in enumerate(producer.structure.owner_axes)}
+    consumer_axis_position = {axis.axis_id: index for index, axis in enumerate(consumer.structure.owner_axes)}
+    index_maps = ()
+    if isinstance(operation, ContractPrimitive):
+        index_maps = operation.index_maps_for_input(operation.inputs.index(value))
+    mapped_operand_axes = {mapping.operand_axis.id for mapping in index_maps}
+    common_axes = (set(producer_axis_position) & set(consumer_axis_position)) - mapped_operand_axes
+    return tuple(
+        (source, target)
+        for source in producer.family.coordinates
+        for target in consumer.family.coordinates
+        if all(source[producer_axis_position[axis]] == target[consumer_axis_position[axis]] for axis in common_axes)
+        and all(
+            _mapped_tiles_intersect(
+                mapping,
+                producer,
+                consumer,
+                source,
+                target,
+                producer_axis_position,
+                consumer_axis_position,
+            )
+            for mapping in index_maps
+            if mapping.operand_axis.id in producer_axis_position and mapping.domain_axis.id in consumer_axis_position
+        )
+    )
+
+
+def _mapped_tiles_intersect(
+    mapping: AxisIndexMap,
+    producer: TiledTask,
+    consumer: TiledTask,
+    source: tuple[int, ...],
+    target: tuple[int, ...],
+    producer_axis_position: Mapping[int, int],
+    consumer_axis_position: Mapping[int, int],
+) -> bool:
+    source_position = producer_axis_position[mapping.operand_axis.id]
+    target_position = consumer_axis_position[mapping.domain_axis.id]
+    source_axis = producer.structure.owner_axes[source_position]
+    target_axis = consumer.structure.owner_axes[target_position]
+    source_start = source[source_position] * source_axis.tile_extent
+    source_stop = min(source_start + source_axis.tile_extent, source_axis.extent)
+    target_start = target[target_position] * target_axis.tile_extent
+    target_stop = min(target_start + target_axis.tile_extent, target_axis.extent)
+    # Floor division maps a contiguous domain tile onto a contiguous integer
+    # interval.  Test that interval directly instead of materializing the full
+    # axis map once for every producer/consumer tile pair.
+    mapped_start = target_start // mapping.divisor + mapping.offset
+    mapped_stop = (target_stop - 1) // mapping.divisor + mapping.offset + 1
+    if mapping.modulus is None:
+        return mapped_start < source_stop and source_start < mapped_stop
+
+    source_start = max(source_start, 0)
+    source_stop = min(source_stop, mapping.modulus)
+    if source_start >= source_stop:
+        return False
+    # Find the first integer in the mapped interval whose residue lies in the
+    # operand tile.  This is exact even when the interval wraps modulo N.
+    residue = mapped_start % mapping.modulus
+    if source_start <= residue < source_stop:
+        first_intersection = mapped_start
+    elif residue < source_start:
+        first_intersection = mapped_start + source_start - residue
+    else:
+        first_intersection = mapped_start + mapping.modulus - residue + source_start
+    return first_intersection < mapped_stop
+
+
+def _constraint_for_task(task: TiledTask) -> PhysicalTaskConstraint:
+    structure = task.structure
+    relation_classes = tuple(
+        dict.fromkeys(
+            (
+                *(access.relation_class for access in task.accesses),
+                *(edge.relation_class for edge in structure.phase_edges),
+            )
+        )
+    ) or (RelationAccessClass.AFFINE,)
+    return PhysicalTaskConstraint(
+        principal_kind=structure.principal_kind,
+        required_capabilities=tuple(phase.capability for phase in structure.phases),
+        supported_capabilities=tuple(dict.fromkeys(phase.capability for phase in structure.phases)),
+        required_edges=tuple(
+            PhaseEdgeConstraint(
+                structure.phases[edge.source_phase].capability,
+                structure.phases[edge.target_phase].capability,
+                edge.relation_class,
+            )
+            for edge in structure.phase_edges
+        ),
+        owner_rank=len(structure.owner_axes),
+        streamed_rank=len(structure.streamed_axes),
+        reduction_rank=len(structure.reduction_axes),
+        contraction_rank=len(structure.contraction_axes),
+        supported_relation_classes=relation_classes,
+        supported_element_types=structure.element_types,
+        supported_layout_classes=structure.layout_classes,
+        maximum_resources=structure.resources,
     )

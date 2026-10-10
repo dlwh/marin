@@ -16,14 +16,14 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from backends.h100.cuda_kv_reuse_emitter import compile_h100_bounded_kv_reuse_program
-from backends.h100.cute_routed_streaming_emitter import compile_h100_routed_streaming_program
 
 from tile_lifetime import (
     RoutedAttentionOrientation,
     RoutedAttentionPlanConfig,
     StreamingTileSchedule,
 )
+from tile_lifetime.backends.h100.cuda_kv_reuse_emitter import compile_h100_bounded_kv_reuse_program
+from tile_lifetime.backends.h100.cute_routed_streaming_emitter import compile_h100_routed_streaming_program
 from tile_lifetime.experimental_pipeline import compile_experimental_stablehlo_routed_attention_program
 from tile_lifetime.routed_attention_frontend import (
     ROUTED_ATTENTION_INPUT_NAMES,

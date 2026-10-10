@@ -73,12 +73,10 @@ from tile_lifetime.dense_flow import (
     pairwise_silu_product_expression,
     validate_erased_dense_flow,
 )
-from tile_lifetime.dense_flow_planner import compile_erased_dense_transformer_region
 from tile_lifetime.expert_parallel import (
     ExpertParallelConfig,
 )
 from tile_lifetime.expert_parallel_plan import (
-    ExchangeRowMode,
     ExpertMaterializationSchedule,
     ExpertOverlapPolicy,
     ExpertParallelPlan,
@@ -105,6 +103,13 @@ from tile_lifetime.expert_parallel_training_runtime import (
     verify_distributed_expert_backward_abi,
 )
 from tile_lifetime.ffi_command_buffer import DirectLaunchFfiPhysicalCandidate
+from tile_lifetime.fold_map_contract_training_provider import (
+    AxisFoldRegionBinding,
+    AxisFoldStageBinding,
+    AxisFoldValueBinding,
+    FoldMapContractTrainingProvider,
+    provide_fold_map_contract_training,
+)
 from tile_lifetime.fold_placement import (
     FoldAttachment,
     FoldAttachmentSite,
@@ -118,6 +123,16 @@ from tile_lifetime.gemm_program import (
     GemmProgram,
     compile_gemm_program,
 )
+from tile_lifetime.h100_normalized_exp_backward_lowering import (
+    H100NormalizedExpBackwardLowering,
+    lower_h100_normalized_exp_backward,
+)
+from tile_lifetime.h100_streaming_lowering import (
+    Sm90BackwardAccumulatorSchedule,
+    Sm90ContractSchedule,
+    Sm90ForwardPipelineSchedule,
+    lower_normalized_exp_score_map,
+)
 from tile_lifetime.jax_collective_transport import (
     JaxCollectiveExecutionPlan,
     build_jax_collective_execution_plan,
@@ -128,6 +143,10 @@ from tile_lifetime.jax_contract_map_chain_ffi import (
     call_cuda_contract_map_chain_reverse_ffi,
     register_cuda_contract_map_chain_ffi,
 )
+from tile_lifetime.jax_fold_map_contract_training import (
+    execute_fold_map_contract_training_jax,
+    execute_jax_tensor_program_values,
+)
 from tile_lifetime.jax_normalized_exp_contract_forward_ffi import (
     call_cuda_normalized_exp_contract_forward_ffi,
     register_cuda_normalized_exp_contract_forward_ffi,
@@ -136,26 +155,14 @@ from tile_lifetime.jax_normalized_exp_contract_reverse_ffi import (
     call_cuda_normalized_exp_contract_reverse_ffi,
     register_cuda_normalized_exp_contract_reverse_ffi,
 )
-from tile_lifetime.jax_streaming_attention_backward_ffi import (
-    CompiledStreamingAttentionBackwardFfi,
-    GeneratedStreamingAttentionBackwardFfi,
-    StreamingAttentionBackwardFfiBuffer,
-    StreamingAttentionBackwardResultPolicy,
-    StreamingAttentionBackwardStatePolicy,
-    TritonAotKernelPlan,
-    call_streaming_attention_backward_ffi,
-    call_streaming_attention_training_ffi,
-    compile_streaming_attention_backward_ffi,
-    generate_streaming_attention_backward_ffi,
-    register_streaming_attention_backward_ffi,
-)
-from tile_lifetime.jax_streaming_attention_forward_ffi import (
-    CompiledStreamingAttentionForwardFfi,
-    GeneratedStreamingAttentionForwardFfi,
-    call_streaming_attention_forward_ffi,
-    compile_streaming_attention_forward_ffi,
-    generate_streaming_attention_forward_ffi,
-    register_streaming_attention_forward_ffi,
+from tile_lifetime.jax_sm90_function import (
+    CompiledJaxSm90Function,
+    CompleteRequestArtifact,
+    CompleteRequestArtifactCompiler,
+    JaxSm90Toolchain,
+    PreparedJaxSm90Function,
+    compile_prepared_jax_sm90_function,
+    prepare_jax_sm90_function,
 )
 from tile_lifetime.linear_pair_map import (
     LinearPairMapTrainingProgram,
@@ -166,6 +173,29 @@ from tile_lifetime.linear_pair_map import (
     pair_silu_product_expression,
     pair_tanh_product_expression,
 )
+from tile_lifetime.normalized_exp_contract_region import (
+    ContractDomainTraversal,
+    ForwardOwnershipPlan,
+    NormalizedExpContractionDimensions,
+    NormalizedExpContractProgram,
+    NormalizedExpContractPullback,
+    NormalizedExpContractPullbackProgram,
+    NormalizedExpContractRegion,
+    NormalizedExpFoldState,
+    ReverseContractFoldOrder,
+    ReverseOwnershipPlan,
+    TerminalGradientContract,
+    derive_forward_ownership_plan,
+    derive_normalized_exp_contract_pullback,
+    derive_reverse_ownership_plan,
+    normalized_exp_contract_pullback_program,
+    normalized_exp_contract_region,
+    normalized_exp_finalizer_scale,
+    normalized_exp_post_finalizer_expression,
+    relation_group_size,
+    verify_normalized_exp_finalizer_vjp,
+    verify_normalized_exp_score_map_vjp,
+)
 from tile_lifetime.normalized_exp_contract_training import (
     IndexedFoldSelection,
     NormalizedExpContractTrainingExecution,
@@ -173,6 +203,24 @@ from tile_lifetime.normalized_exp_contract_training import (
     build_normalized_exp_contract_training_program,
     execute_normalized_exp_contract_training,
     tanh_soft_cap_score_expression,
+)
+from tile_lifetime.physical_artifact_compiler import (
+    GpuPhysicalArtifactCompiler,
+    GpuPhysicalArtifactRequest,
+    ShuttleBlockRecord,
+    ShuttleExactEventRequirement,
+    ShuttleOperationRecord,
+    ShuttleTypeRecord,
+    ShuttleValueRecord,
+    decode_gpu_physical_artifact_request,
+    register_gpu_physical_artifact_compiler,
+)
+from tile_lifetime.physical_normalized_exp_contract import (
+    NormalizedExpContractGeometry,
+    PhysicalNormalizedExpContractRegion,
+    SourceBoundBuffer,
+    physical_normalized_exp_contract_region,
+    source_bound_buffers,
 )
 from tile_lifetime.plan import (
     AttachmentSite,
@@ -187,17 +235,22 @@ from tile_lifetime.plan import (
     StatefulScanExecutionForm,
     StatefulScanSkeleton,
     StateTransitionStructure,
-    StreamingAttentionSkeleton,
     TransformSkeleton,
 )
 from tile_lifetime.relation import (
     OrderedRelationFoldProgram,
+    RelationPlacement,
     RelationPlan,
     RelationPlanError,
+    RelationProjectionAxis,
+    RelationProjectionSpec,
+    RelationRowProjection,
     build_expert_parallel_relation_plan,
     build_partitioned_merge_rows,
     build_relation_plan,
     compile_ordered_relation_fold,
+    project_relation_rows,
+    uniform_relation_placement,
 )
 from tile_lifetime.routed_attention import (
     IndexDomainRestriction,
@@ -231,18 +284,17 @@ from tile_lifetime.routed_attention_plan import (
     query_major_block_index_plan,
 )
 from tile_lifetime.row_normalization_training import (
+    FoldMapContractRegion,
+    FoldMapContractTrainingPlan,
     GeneratedContractSkeleton,
     GeneratedFoldSkeleton,
     GeneratedMapSkeleton,
-    RowNormalizationAxisFoldPrograms,
-    RowNormalizationSavePolicy,
-    RowNormalizationTrainingPlan,
-    RowStatisticKind,
-    RowStatisticScalePlacement,
-    build_row_normalization_axis_fold_programs,
-    build_row_normalized_contract_program,
-    compile_row_normalization_training,
-    lower_row_normalization_axis_folds,
+    GeneratedRelationSkeleton,
+    ReverseMaterializationPolicy,
+    build_one_fold_contract_fixture,
+    build_two_fold_contract_fixture,
+    compile_fold_map_contract_training,
+    derive_fold_map_contract_region,
 )
 from tile_lifetime.semantic_erasure import (
     ErasedTensorProgram,
@@ -251,7 +303,6 @@ from tile_lifetime.semantic_erasure import (
     semantic_erasure_errors,
     tensor_program_scheduling_keys,
     validate_erased_tensor_program,
-    validate_plan_semantic_erasure,
 )
 from tile_lifetime.shared_reverse_fusion import (
     OwnerComputeComponent,
@@ -310,11 +361,9 @@ from tile_lifetime.stateful_scan_recovery import (
 )
 from tile_lifetime.streaming_attention import (
     AttentionScoreAxis,
-    OnlineAttentionState,
     ScoreInputSpec,
     ScoreMapSpec,
     StreamingAttentionExecution,
-    StreamingAttentionProgram,
     StreamingAttentionStage,
     StreamingTileSchedule,
     add_score_bias,

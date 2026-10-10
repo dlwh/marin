@@ -143,7 +143,7 @@ module @jit_mixed_map_value_and_gradient attributes {mhlo.num_partitions = 1 : i
 }
 )mlir";
 
-constexpr llvm::StringLiteral kUnsupportedMapBodyProgram = R"mlir(
+constexpr llvm::StringLiteral kTanhMapBodyProgram = R"mlir(
 module @jit__lambda {
   func.func public @main(%arg0: tensor<2x3xbf16>) -> tensor<2x3xbf16> {
     %0 = stablehlo.convert %arg0 : (tensor<2x3xbf16>) -> tensor<2x3xf32>
@@ -846,26 +846,32 @@ TEST(TrackOneMapWiringTest,
   }
 }
 
-TEST(TrackOneMapWiringTest, LateMapCodegenFailureLeavesTheJaxGraphUnchanged) {
+TEST(TrackOneMapWiringTest, TanhMapBodyCompilesThroughTheGenericScalarPath) {
   auto observer = std::make_shared<RecordingObserver>();
   auto subscription = mlir::shuttle::subscribeShuttlePipelineObserver(observer);
   mlir::MLIRContext context;
   mlir::OwningOpRef<mlir::ModuleOp> module =
-      parseModule(context, kUnsupportedMapBodyProgram);
+      parseModule(context, kTanhMapBodyProgram);
   ASSERT_TRUE(module);
   std::string before = moduleText(*module);
 
   absl::Status status = mlir::shuttle::runShuttleXlaTransform(
       *module, kAbi21GpuSourceOrderedOptions.str());
 
-  EXPECT_EQ(status.code(), absl::StatusCode::kInternal);
-  EXPECT_EQ(moduleText(*module), before);
+  ASSERT_TRUE(status.ok()) << status;
+  std::string transformed = moduleText(*module);
+  EXPECT_NE(transformed, before);
+  EXPECT_NE(transformed.find("stablehlo.custom_call"), std::string::npos);
+  EXPECT_EQ(transformed.find("stablehlo.tanh"), std::string::npos);
   auto events = observer->snapshot();
-  ASSERT_EQ(events.size(), 2);
+  ASSERT_EQ(events.size(), 3);
   EXPECT_EQ(events[0].phase(),
             mlir::shuttle::ShuttlePipelinePhase::AlgebraCoverage);
-  EXPECT_EQ(events[1].phase(), mlir::shuttle::ShuttlePipelinePhase::Failure);
-  EXPECT_EQ(events[1].failurePass(), "shuttle-build-gpu-executable-bundle");
+  EXPECT_EQ(events[1].phase(),
+            mlir::shuttle::ShuttlePipelinePhase::GeneratedBundle);
+  EXPECT_EQ(events[2].phase(),
+            mlir::shuttle::ShuttlePipelinePhase::FinalErasure);
+  EXPECT_TRUE(events[2].noShuttleSemantics());
 }
 
 TEST(TrackOneMapWiringTest,

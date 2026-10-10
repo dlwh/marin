@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import ceil, prod
+from typing import Protocol, TypeVar
 
 from shuttle.ir import DType
 from tile_lifetime.collective_transport import CollectiveCompletionPlan
@@ -23,10 +24,11 @@ from tile_lifetime.event_dataflow import (
     TaskRelation,
     derive_event_tensor_plan,
 )
+from tile_lifetime.normalized_exp_contract_region import NormalizedExpContractProgram
 from tile_lifetime.relation import RelationPlan
 from tile_lifetime.right_resource_event_schedule import RightResourcePipelineDescriptor
 from tile_lifetime.sm100_routed_lowering import SM100RoutedStreamingLowering
-from tile_lifetime.streaming_attention import AttentionScoreAxis, StreamingAttentionProgram
+from tile_lifetime.streaming_attention import StreamingTileSchedule
 from tile_lifetime.streaming_event_schedule import StreamingContractFoldDescriptor
 
 _DTYPE_BYTES = {
@@ -34,6 +36,22 @@ _DTYPE_BYTES = {
     DType.FP32: 4,
     DType.FP64: 8,
 }
+
+
+class ContractFoldPhysicalSchedule(Protocol):
+    """Tile geometry required to derive physical Contract/Fold events."""
+
+    @property
+    def tile_m(self) -> int: ...
+
+    @property
+    def tile_n(self) -> int: ...
+
+    @property
+    def stages(self) -> int: ...
+
+
+PhysicalScheduleT = TypeVar("PhysicalScheduleT", bound=ContractFoldPhysicalSchedule)
 
 
 def sm100_routed_right_resource_descriptor(
@@ -123,52 +141,68 @@ class CollectiveCompletionTaskDataflow:
 
 
 def streaming_contract_fold_event_descriptor(
-    program: StreamingAttentionProgram,
+    program: NormalizedExpContractProgram[PhysicalScheduleT],
 ) -> StreamingContractFoldDescriptor:
     """Erase normalized-attention names into a generic physical descriptor."""
-    query_axes = tuple(axis for axis in program.qk.output.axes if axis.label == AttentionScoreAxis.QUERY.value)
-    fold_axes = tuple(axis for axis in program.qk.output.axes if axis.label == AttentionScoreAxis.KEY.value)
-    if len(query_axes) != 1 or len(fold_axes) != 1:
+    region = program.region
+    first, second = region.producer.inputs
+    projected_second_axes = set(second.axes)
+    for relation in region.producer.index_maps_for_input(1):
+        projected_second_axes.remove(relation.operand_axis)
+        projected_second_axes.add(relation.domain_axis)
+    relation_group_axes = set(region.dimensions.relation_group_axes)
+    resident_axes = tuple(
+        axis
+        for axis in program.ownership.owner_axes
+        if axis in first.axes and axis not in projected_second_axes and axis not in relation_group_axes
+    )
+    fold_axes = program.ownership.streamed_axes
+    if len(resident_axes) != 1 or len(fold_axes) != 1:
         raise ValueError("streaming Contract/Fold adaptation requires one resident and one Fold axis")
-    query, key = program.qk.inputs
-    value = program.pv.inputs[1]
-    dtypes = (query.dtype, key.dtype, value.dtype)
+    consumer_operand = region.consumer.inputs[1]
+    dtypes = (first.dtype, second.dtype, consumer_operand.dtype)
     if len(set(dtypes)) != 1:
         raise ValueError("streaming Contract/Fold operands must share one physical element type")
     try:
-        element_bytes = _DTYPE_BYTES[query.dtype]
+        element_bytes = _DTYPE_BYTES[first.dtype]
     except KeyError as error:
-        raise ValueError(f"streaming Contract/Fold has unsupported physical dtype {query.dtype.value}") from error
+        raise ValueError(f"streaming Contract/Fold has unsupported physical dtype {first.dtype.value}") from error
     return StreamingContractFoldDescriptor(
-        first_contract_name=program.qk.name,
+        first_contract_name=region.producer.name,
         fold_update_name="streaming_fold_update",
-        second_contract_name=program.pv.name,
-        finalize_name=program.finalize.name,
+        second_contract_name=region.consumer.name,
+        finalize_name=region.finalizer.name,
         fold_extent=fold_axes[0].extent,
-        resident_tile_size=program.schedule.query_tile_size,
-        streamed_tile_size=program.schedule.key_value_tile_size,
-        pipeline_depth=program.schedule.pipeline_depth,
-        resident_reduction_dimension=query.shape[-1],
-        streamed_reduction_dimension=key.shape[-1],
-        output_dimension=value.shape[-1],
+        resident_tile_size=program.schedule.tile_m,
+        streamed_tile_size=program.schedule.tile_n,
+        pipeline_depth=program.schedule.stages,
+        resident_reduction_dimension=region.dimensions.producer_features[0].extent,
+        streamed_reduction_dimension=region.dimensions.producer_features[0].extent,
+        output_dimension=region.dimensions.consumer_features[0].extent,
         element_bytes=element_bytes,
     )
 
 
 def streaming_fold_task_dataflow(
-    program: StreamingAttentionProgram,
+    program: NormalizedExpContractProgram[StreamingTileSchedule],
     *,
     visibility_scope: EventMemoryScope = EventMemoryScope.CTA,
 ) -> StreamingFoldTaskDataflow:
     """Mechanically tile a streaming normalized weighted Fold into task families."""
-    row_axes = program.state.row_max.axes
-    query_axes = tuple(axis for axis in row_axes if axis.label == AttentionScoreAxis.QUERY.value)
-    if len(query_axes) != 1:
-        raise ValueError("streaming Fold task derivation requires one query axis")
-    fold_axes = tuple(axis for axis in program.qk.output.axes if axis not in row_axes)
+    region = program.region
+    row_axes = region.fold_state.row_max.axes
+    first, second = region.producer.inputs
+    projected_second_axes = set(second.axes)
+    for relation in region.producer.index_maps_for_input(1):
+        projected_second_axes.remove(relation.operand_axis)
+        projected_second_axes.add(relation.domain_axis)
+    resident_axes = tuple(axis for axis in row_axes if axis in first.axes and axis not in projected_second_axes)
+    if len(resident_axes) != 1:
+        raise ValueError("streaming Fold task derivation requires one resident owner axis")
+    fold_axes = program.ownership.streamed_axes
     if len(fold_axes) != 1:
         raise ValueError("streaming Fold task derivation requires one Fold axis")
-    query_axis = query_axes[0]
+    query_axis = resident_axes[0]
     fold_axis = fold_axes[0]
     row_tile_count = prod(
         ceil(axis.extent / program.schedule.query_tile_size) if axis == query_axis else axis.extent for axis in row_axes
@@ -177,10 +211,10 @@ def streaming_fold_task_dataflow(
     tiled_axes = (TaskAxis("row_tile", row_tile_count), TaskAxis("fold_partition", fold_partition_count))
     row_axis = (TaskAxis("row_tile", row_tile_count),)
     key_value_stage = TaskFamily("key_value_stage", tiled_axes, placement="transfer_workers")
-    qk_contract = TaskFamily(program.qk.name, tiled_axes, placement="matrix_workers")
+    qk_contract = TaskFamily(region.producer.name, tiled_axes, placement="matrix_workers")
     fold_partial = TaskFamily("normalized_exp_fold_partial", tiled_axes, placement="reduction_workers")
-    pv_contract = TaskFamily(program.pv.name, tiled_axes, placement="matrix_workers")
-    finalize = TaskFamily(program.finalize.name, row_axis, placement="reduction_workers")
+    pv_contract = TaskFamily(region.consumer.name, tiled_axes, placement="matrix_workers")
+    finalize = TaskFamily(region.finalizer.name, row_axis, placement="reduction_workers")
     visibility = MemoryVisibility(visibility_scope)
     pointwise = tuple(
         ((row_tile, partition), (row_tile, partition))
@@ -222,11 +256,9 @@ def streaming_fold_task_dataflow(
         program=initial_program,
         producer=key_value_stage,
         uses=(stage_to_qk.relation, stage_to_pv.relation),
-        capacity=row_tile_count * program.schedule.pipeline_depth,
-        slot_for={
-            coordinate: coordinate[0] * program.schedule.pipeline_depth + coordinate[1] % program.schedule.pipeline_depth
-            for coordinate in item_coordinates
-        },
+        capacity=program.schedule.pipeline_depth,
+        allocation_owner_for={coordinate: (coordinate[0],) for coordinate in item_coordinates},
+        slot_for={coordinate: coordinate[1] % program.schedule.pipeline_depth for coordinate in item_coordinates},
         generation_for={coordinate: coordinate[1] // program.schedule.pipeline_depth for coordinate in item_coordinates},
         visibility=visibility,
     )

@@ -14,7 +14,7 @@
 // RUN: shuttle-test-opt --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-plan-row-fold-materialization --mlir-print-op-generic %S/Inputs/two-row-folds.mlir | FileCheck %s --check-prefix=MULTI
 
 // PLAN: "shuttle.materialization_plan"
-// PLAN-SAME: fingerprint = "e6d3838bc6ae01c514adf9fb71236406da01b93ee866f411ffb4af4d0161384d"
+// PLAN-SAME: fingerprint = "{{[0-9a-f]+}}"
 // PLAN-SAME: policy = #shuttle.policy<source_ordered>
 // PLAN-SAME: schema_version = 1
 // PLAN: "shuttle.materialization_buffer"

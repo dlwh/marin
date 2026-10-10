@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+from shuttle.ir import DType
 from tile_lifetime.expert_parallel_plan import MapFoldSemantics
 from tile_lifetime.tensor_program import (
     ScalarExpression,
@@ -178,7 +179,7 @@ def render_cuda_scalar_program_include(
     ]
     for function in program.functions:
         arguments = ", ".join(f"float {argument}" for argument in function.arguments)
-        expression = _cuda_expression(
+        expression = render_cuda_scalar_expression(
             function.expression,
             {argument: argument for argument in function.arguments},
             function.arithmetic_mode,
@@ -260,11 +261,12 @@ def _serialized_program(program: CudaMapFoldProgram) -> str:
     return json.dumps(encoded, sort_keys=True, separators=(",", ":"))
 
 
-def _cuda_expression(
+def render_cuda_scalar_expression(
     expression: ScalarExpression,
     inputs: Mapping[str, str],
-    mode: CudaArithmeticMode,
+    mode: CudaArithmeticMode = CudaArithmeticMode.CUDA_EXPRESSION,
 ) -> str:
+    """Render a typed scalar Map AST as a CUDA expression."""
     kind = expression.kind
     if kind is ScalarExpressionKind.INPUT:
         assert expression.input_name is not None
@@ -274,7 +276,19 @@ def _cuda_expression(
         if isinstance(expression.constant, bool):
             return "true" if expression.constant else "false"
         return _cuda_float(float(expression.constant))
-    operands = tuple(_cuda_expression(operand, inputs, mode) for operand in expression.operands)
+    operands = tuple(render_cuda_scalar_expression(operand, inputs, mode) for operand in expression.operands)
+    if kind is ScalarExpressionKind.CONVERT:
+        assert expression.result_dtype is not None
+        cast = {
+            DType.BOOL: "bool",
+            DType.INT32: "int32_t",
+            DType.BF16: "__nv_bfloat16",
+            DType.FP32: "float",
+            DType.FP64: "double",
+        }[expression.result_dtype]
+        if expression.result_dtype is DType.BF16:
+            return f"__float2bfloat16_rn(static_cast<float>({operands[0]}))"
+        return f"static_cast<{cast}>({operands[0]})"
     if kind in {
         ScalarExpressionKind.ADD,
         ScalarExpressionKind.SUBTRACT,
@@ -303,16 +317,31 @@ def _cuda_expression(
         return f"rsqrtf({operands[0]})"
     if kind is ScalarExpressionKind.TANH:
         return f"tanhf({operands[0]})"
-    if kind is ScalarExpressionKind.LESS_EQUAL:
-        return f"({operands[0]} <= {operands[1]})"
+    if kind is ScalarExpressionKind.NEGATE:
+        return f"(-({operands[0]}))"
+    if kind in {ScalarExpressionKind.MAXIMUM, ScalarExpressionKind.MINIMUM}:
+        function = "fmaxf" if kind is ScalarExpressionKind.MAXIMUM else "fminf"
+        return f"{function}({operands[0]}, {operands[1]})"
+    comparisons = {
+        ScalarExpressionKind.LESS: "<",
+        ScalarExpressionKind.LESS_EQUAL: "<=",
+        ScalarExpressionKind.GREATER: ">",
+        ScalarExpressionKind.GREATER_EQUAL: ">=",
+        ScalarExpressionKind.EQUAL: "==",
+        ScalarExpressionKind.NOT_EQUAL: "!=",
+    }
+    if kind in comparisons:
+        return f"({operands[0]} {comparisons[kind]} {operands[1]})"
     if kind is ScalarExpressionKind.SELECT:
         return f"({operands[0]} ? {operands[1]} : {operands[2]})"
     raise AssertionError(f"unhandled scalar expression kind {kind}")
 
 
 def _cuda_float(value: float) -> str:
-    if not math.isfinite(value):
-        raise ValueError("CUDA scalar literals must be finite")
+    if math.isinf(value):
+        return "INFINITY" if value > 0 else "-INFINITY"
+    if math.isnan(value):
+        raise ValueError("CUDA scalar literals cannot be NaN")
     rendered = repr(value)
     if "." not in rendered and "e" not in rendered:
         rendered += ".0"

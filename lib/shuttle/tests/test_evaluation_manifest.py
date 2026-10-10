@@ -18,7 +18,9 @@ from shuttle.evaluation_manifest import (
 
 SOURCE_ROOT = Path(__file__).parents[3]
 MANIFEST = SOURCE_ROOT / ".agents/projects/tile_lifetime_compiler/shuttle_evaluation_manifest_v1.json"
-BASELINE_COMMIT = "92b5dd7da84492d3766a51b8cb915a08b2a9e56a"
+BASELINE_COMMIT = "fccc9e10f71b9eb6405bf84c4c9ed09efc89f6de"
+EXCLUDED_SOURCE_COMMIT = "92b5dd7da84492d3766a51b8cb915a08b2a9e56a"
+EXCLUDED_RECORD_COMMIT = "0eea7949ad2e7376fefa9ad80deeb67f570cf71a"
 
 
 def _document() -> dict[str, object]:
@@ -53,8 +55,8 @@ def test_checked_in_scorecard_covers_the_complete_current_matrix_without_promoti
     assert all(cell.status is Status.PARTIAL for cell in cpu_cells)
     excluded_evidence = manifest.excluded_evidence[0].evidence
     assert excluded_evidence.architecture_conformance is ArchitectureConformance.NONCONFORMING
-    assert excluded_evidence.source_commit == BASELINE_COMMIT
-    assert excluded_evidence.record_commit == BASELINE_COMMIT
+    assert excluded_evidence.source_commit == EXCLUDED_SOURCE_COMMIT
+    assert excluded_evidence.record_commit == EXCLUDED_RECORD_COMMIT
     assert all(excluded_evidence.id not in cell.evidence_ids for cell in manifest.cells)
     target_one = next(target for target in manifest.targets if target.id == 1)
     target_one_shape = next(shape for shape in manifest.shapes if shape.id == "rmsnorm_bf16_2048x4096")
@@ -83,6 +85,46 @@ def test_checked_in_scorecard_covers_the_complete_current_matrix_without_promoti
         for cell in target_one_cells
     )
     assert all("pending" not in cell.identity.shape for cell in target_one_cells)
+
+
+def test_target_three_cells_use_declared_attention_shape_without_promotion() -> None:
+    document = _document()
+    raw_cells = document["cells"]
+    assert isinstance(raw_cells, list)
+    cells = [cell for cell in raw_cells if isinstance(cell, dict) and cell["target_id"] == 3]
+
+    assert len(cells) == 12
+    assert {cell["shape"] for cell in cells} == {"dot_product_attention_bf16_b1_s2048_hq32_hkv8_dqk128_dv128_causal"}
+    assert all(cell["status"] == "blocked" for cell in cells)
+    assert all(cell["evidence_ids"] == [] for cell in cells)
+    assert all("representative_shape_not_declared" not in cell["blockers"] for cell in cells)
+
+
+def test_target_five_declares_measured_scan_shape_without_promoting_uncommitted_evidence() -> None:
+    manifest = load_evaluation_manifest(MANIFEST, source_root=SOURCE_ROOT)
+    shape_id = "stateful_scan_bf16_b1_t4_h2_k16_v16_r1_scalar_exp"
+    target = next(item for item in manifest.targets if item.id == 5)
+    shape = next(item for item in manifest.shapes if item.id == shape_id)
+    cells = [cell for cell in manifest.cells if cell.identity.target_id == 5]
+
+    assert target.status is Status.BLOCKED
+    assert target.required_shapes == (shape_id,)
+    assert shape.declaration_status is Status.ACCEPTED
+    assert len(cells) == 12
+    assert all(cell.identity.shape == shape_id for cell in cells)
+    assert all(cell.status is Status.BLOCKED for cell in cells)
+    assert all(cell.evidence_ids == () for cell in cells)
+    h100_source_ordered = {
+        cell.identity.boundary.value: cell
+        for cell in cells
+        if cell.identity.hardware is Hardware.H100 and cell.identity.policy.value == "source_ordered"
+    }
+    assert {blocker.value for blocker in h100_source_ordered["forward"].blockers} == {"performance_evidence_missing"}
+    for boundary in ("backward", "composed_forward_backward"):
+        assert {blocker.value for blocker in h100_source_ordered[boundary].blockers} == {
+            "oracle_not_pinned",
+            "performance_evidence_missing",
+        }
 
 
 @pytest.mark.parametrize(

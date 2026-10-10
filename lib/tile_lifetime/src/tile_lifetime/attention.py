@@ -16,9 +16,9 @@ from tile_lifetime.plan import (
     MaterializationRecord,
     NumericalEquivalence,
     NumericalPolicy,
-    RegionPlan,
+    ReferenceAttentionSkeleton,
+    ReferenceRegionPlan,
     RewriteExplanation,
-    StreamingAttentionSkeleton,
     TransformSkeleton,
 )
 
@@ -214,7 +214,7 @@ def select_reference_hopper_attention_config(
     )
 
 
-def compile_reference_attention_region(graph: TensorGraph, *, numerical_policy: NumericalPolicy) -> RegionPlan:
+def compile_reference_attention_region(graph: TensorGraph, *, numerical_policy: NumericalPolicy) -> ReferenceRegionPlan:
     """Compile one named attention operation through the historical physical planner."""
     operations = tuple(operation for operation in graph.operations if isinstance(operation, ScaledDotProductAttentionOp))
     if len(operations) != 1:
@@ -235,7 +235,7 @@ def compile_reference_attention_region(graph: TensorGraph, *, numerical_policy: 
     scores = f"{operation.output.name}.scores"
     probabilities = f"{operation.output.name}.probabilities"
 
-    skeleton = StreamingAttentionSkeleton(
+    skeleton = ReferenceAttentionSkeleton(
         name=f"{operation.output.name}.streaming_attention",
         query=operation.query.name,
         key=operation.key.name,
@@ -355,15 +355,15 @@ def compile_reference_attention_region(graph: TensorGraph, *, numerical_policy: 
         numerical_equivalence=NumericalEquivalence.ALGEBRAICALLY_EXACT,
         numerical_effect="changes floating-point reduction order while preserving exact real-number attention semantics",
     )
-    return RegionPlan(skeletons=(skeleton,), materializations=materializations, rewrites=(rewrite,))
+    return ReferenceRegionPlan(skeletons=(skeleton,), materializations=materializations, rewrites=(rewrite,))
 
 
-def _materialized_attention_plan(operation: ScaledDotProductAttentionOp) -> RegionPlan:
+def _materialized_attention_plan(operation: ScaledDotProductAttentionOp) -> ReferenceRegionPlan:
     batch, query_length, query_heads, _ = operation.output.shape
     score_shape = (batch, query_heads, query_length, operation.key.shape[1])
     scores = f"{operation.output.name}.scores"
     probabilities = f"{operation.output.name}.probabilities"
-    return RegionPlan(
+    return ReferenceRegionPlan(
         skeletons=(
             TransformSkeleton(
                 name=f"{operation.output.name}.materialized_attention",

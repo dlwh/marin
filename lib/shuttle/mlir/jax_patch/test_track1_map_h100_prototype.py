@@ -125,6 +125,14 @@ def _document() -> dict[str, object]:
         "schema": "track1_map_h100_prototype_authorization",
         "schema_version": 1,
         "subjects": {
+            "attention": {
+                "boundaries": ["forward", "value_and_grad"],
+                "dimension": 128,
+                "gpu_target": "sm_90",
+                "index_relations": ["floor_division_head_group", "offset_causal_domain"],
+                "numerics": "fast",
+                "score_maps": ["scaled_identity", "scaled_tanh_softcap"],
+            },
             "generic_composition": {
                 "disabled_jax_role": "required_diagnostic_never_numerical_gate",
                 "enabled_numerical_gates": [
@@ -176,19 +184,7 @@ def _document() -> dict[str, object]:
             },
             "rmsnorm_contract": {
                 "boundaries": ["primal", "composed"],
-                "composed_bundle_shapes": {
-                    "5x19x257": {
-                        "launches": 40,
-                        "temporary_bytes": 79016,
-                        "temporaries": 37,
-                    },
-                    "5x19x7": {
-                        "launches": 39,
-                        "temporary_bytes": 6996,
-                        "temporaries": 36,
-                    },
-                },
-                "composed_topology": "reviewed_hybrid_exact_nonperformance_contract",
+                "composed_topology": "telemetry_non_normative",
                 "coordinate_order": "all_primal_before_any_composed",
                 "disabled_jax_reference": True,
                 "disabled_jax_role": "diagnostic_only_never_threshold_gated",
@@ -241,12 +237,15 @@ def _document() -> dict[str, object]:
             },
             "python_package": {
                 "dependency_resolution": False,
-                "dependency_site_packages": "/opt/h100-evidence-runtime/lib/python3.12/site-packages",
-                "dependency_source": "immutable_base_image_runtime",
+                "dependency_requirements": {
+                    "path": prototype.SM90_RUNTIME_REQUIREMENTS_RELATIVE.as_posix(),
+                    "sha256": prototype.SM90_RUNTIME_REQUIREMENTS_SHA256,
+                },
+                "dependency_source": "authorization_bound_hashed_requirements",
                 "distribution": "jax",
                 "expected_base_version": "0.10.1",
-                "install_method": "site-packages-pth",
-                "network": False,
+                "install_method": "uv_require_hashes_then_offline_custom_jax",
+                "network": "hydration_only",
                 "runtime_isolation": "venv_without_system_site_packages",
                 "source": "pinned_hydrated_checkout",
             },
@@ -306,8 +305,8 @@ def _authorization(tmp_path: Path) -> tuple[Path, str, Authorization]:
         (("toolchain", "cuda", "physical_tools_root"), "/usr/local/cuda"),
         (("toolchain", "python_package", "dependency_resolution"), True),
         (
-            ("toolchain", "python_package", "dependency_site_packages"),
-            "/usr/local/lib/python3.12/site-packages",
+            ("toolchain", "python_package", "dependency_requirements"),
+            {"path": "requirements.txt", "sha256": "0" * 64},
         ),
         (("toolchain", "python_package", "dependency_source"), "system"),
         (("toolchain", "python_package", "distribution"), "jax-nightly"),
@@ -365,7 +364,11 @@ def test_checked_in_source_manifest_matches_the_live_iris_bundle_closure(
     approved_sha256 = hashlib.sha256(raw).hexdigest()
     authorization = load_authorization(AUTHORIZATION_PATH, approved_sha256)
 
-    assert require_source_bundle(MARIN_REPOSITORY, authorization) == source_bundle_document(MARIN_REPOSITORY)
+    document = source_bundle_document(MARIN_REPOSITORY)
+    assert require_source_bundle(MARIN_REPOSITORY, authorization) == document
+    requirements_path = prototype.SM90_RUNTIME_REQUIREMENTS_RELATIVE.as_posix()
+    requirements_entry = next(entry for entry in document["entries"] if entry["path"] == requirements_path)
+    assert requirements_entry["sha256"] == prototype.SM90_RUNTIME_REQUIREMENTS_SHA256
 
     changed_document = deepcopy(authorization.document)
     changed_document["integration"]["source_manifest_sha256"] = "f" * 64  # type: ignore[index]
@@ -396,23 +399,38 @@ def test_dry_run_renders_one_network_hydration_then_offline_build_and_five_worke
     assert rendered["workspace"] == str(workspace)
     phases = rendered["phases"]
     assert [phase["name"] for phase in phases] == [
+        "create_runtime",
+        "hydrate_sm90_runtime",
         "fetch_jax",
         "fetch_xla",
         "fetch_bazel",
         "hydrate_bazel_repositories",
         "offline_wheel_build",
-        "create_runtime",
         "install_wheels",
         "install_jax_source",
         "verify_jax_runtime",
+        "install_tile_lifetime_source",
+        "verify_tile_lifetime_runtime",
+        "attention_canaries",
         "populate",
         "reuse",
         "rmsnorm",
         "rmsnorm_contract",
         "generic_composition",
     ]
-    hydration = phases[3]["argv"]
-    offline = phases[4]["argv"]
+    sm90_hydration = phases[1]["argv"]
+    hydration = phases[5]["argv"]
+    offline = phases[6]["argv"]
+    assert sm90_hydration == [
+        str(prototype.UV),
+        "pip",
+        "install",
+        "--python",
+        str(workspace / "runtime/bin/python"),
+        "--require-hashes",
+        "--requirements",
+        str(Path("/app") / prototype.SM90_RUNTIME_REQUIREMENTS_RELATIVE),
+    ]
     assert "--cuda_version=13.0.0" in hydration
     assert "--cuda_version=13.0.0" in offline
     assert "--cuda_compute_capabilities=9.0" in hydration
@@ -421,22 +439,25 @@ def test_dry_run_renders_one_network_hydration_then_offline_build_and_five_worke
     assert all("LOCAL_CUDA_PATH" not in argument for argument in offline)
     assert "--bazel_options=--repository_disable_download" not in hydration
     assert "--bazel_options=--repository_disable_download" in offline
-    assert "--disable-pip-version-check" in phases[6]["argv"]
-    assert "--system-site-packages" not in phases[5]["argv"]
-    assert "--no-deps" in phases[6]["argv"]
-    assert "--no-index" in phases[6]["argv"]
-    assert phases[7]["argv"][-4:] == [
-        "install",
-        str(workspace / "jax"),
-        "--dependency-site-packages",
-        "/opt/h100-evidence-runtime/lib/python3.12/site-packages",
+    assert "--disable-pip-version-check" in phases[7]["argv"]
+    assert "--system-site-packages" not in phases[0]["argv"]
+    assert "--force-reinstall" in phases[7]["argv"]
+    assert "--no-deps" in phases[7]["argv"]
+    assert "--no-index" in phases[7]["argv"]
+    assert phases[8]["argv"][-2:] == ["install", str(workspace / "jax")]
+    assert phases[9]["argv"][-2:] == ["verify", str(workspace / "jax")]
+    assert all("http" not in argument for argument in phases[7]["argv"])
+    assert phases[10]["argv"][-2:] == ["install", "/app/lib/tile_lifetime"]
+    assert phases[11]["argv"][-2:] == ["verify", "/app/lib/tile_lifetime"]
+    assert phases[12]["argv"][-3:] == [
+        "--canary-only",
+        "--output",
+        str(workspace / "attention-canaries.json"),
     ]
-    assert phases[8]["argv"][-2:] == ["verify", str(workspace / "jax")]
-    assert all("pip" not in argument and "http" not in argument for argument in phases[7]["argv"])
-    assert phases[9]["argv"][phases[9]["argv"].index("--role") + 1] == "populate"
-    assert phases[10]["argv"][phases[10]["argv"].index("--role") + 1] == "reuse"
-    assert phases[11]["argv"][-2:] == ["--output", str(workspace / "rmsnorm.json")]
-    assert phases[12]["argv"][-4:] == [
+    assert phases[13]["argv"][phases[13]["argv"].index("--role") + 1] == "populate"
+    assert phases[14]["argv"][phases[14]["argv"].index("--role") + 1] == "reuse"
+    assert phases[15]["argv"][-2:] == ["--output", str(workspace / "rmsnorm.json")]
+    assert phases[16]["argv"][-4:] == [
         "--output",
         str(workspace / "rmsnorm-contract.json"),
         "--primal-checkpoint",
@@ -574,9 +595,9 @@ def _rmsnorm_contract_document() -> dict[str, object]:
                         ({7: (1, 0), 257: (2, 1)}[shape[-1]] + ("normative_primal",))
                         if boundary == "primal"
                         else (
-                            ({7: 39, 257: 40}[shape[-1]]),
-                            ({7: 36, 257: 37}[shape[-1]]),
-                            "reviewed_hybrid_exact",
+                            ({7: 7, 257: 11}[shape[-1]]),
+                            ({7: 3, 257: 5}[shape[-1]]),
+                            "telemetry_non_normative",
                         )
                     )
                     observer = {
@@ -619,9 +640,13 @@ def _rmsnorm_contract_document() -> dict[str, object]:
     }
 
 
-def test_rmsnorm_contract_result_requires_oracle_roles_repeatability_and_topology() -> None:
+def test_rmsnorm_contract_result_requires_oracle_roles_repeatability_and_primal_topology() -> None:
     document = _rmsnorm_contract_document()
     assert validate_rmsnorm_contract_result(document) == document
+
+    changed_telemetry = deepcopy(document)
+    changed_telemetry["coordinates"][7]["observer"]["launch_count"] = 42
+    assert validate_rmsnorm_contract_result(changed_telemetry) == changed_telemetry
 
     for mutation in (
         "role",
@@ -630,7 +655,7 @@ def test_rmsnorm_contract_result_requires_oracle_roles_repeatability_and_topolog
         "observer",
         "primal_topology",
         "primal_topology_type",
-        "composed_topology",
+        "composed_topology_status",
         "composed_topology_type",
     ):
         changed = deepcopy(document)
@@ -646,8 +671,8 @@ def test_rmsnorm_contract_result_requires_oracle_roles_repeatability_and_topolog
             changed["coordinates"][1]["observer"]["launch_count"] = 2
         elif mutation == "primal_topology_type":
             changed["coordinates"][1]["observer"]["launch_count"] = 1.0
-        elif mutation == "composed_topology":
-            changed["coordinates"][7]["observer"]["launch_count"] = 42
+        elif mutation == "composed_topology_status":
+            changed["coordinates"][7]["observer"]["topology_status"] = "normative"
         else:
             changed["coordinates"][7]["observer"]["temporary_count"] = 36.0
         with pytest.raises(ValueError, match="RMSNorm Contract"):
@@ -948,9 +973,14 @@ def test_wheel_set_requires_exact_regular_three_wheel_output(tmp_path: Path) -> 
 def test_source_bundle_manifest_rejects_missing_extra_symlink_and_hash_mutations(
     tmp_path: Path,
 ) -> None:
-    for root in (tmp_path / "lib/shuttle/mlir", tmp_path / "lib/shuttle/src/shuttle"):
+    roots = (tmp_path / "lib/shuttle/mlir", tmp_path / "lib/shuttle/src/shuttle")
+    for root in roots:
         root.mkdir(parents=True)
         root.joinpath("source.py").write_text(f"{root.name}\n")
+    for relative in prototype.SOURCE_FILES:
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{relative.name}\n")
     document = source_bundle_document(tmp_path)
     manifest = tmp_path / "scripts/shuttle/track1_map_h100_source_manifest.json"
     manifest.parent.mkdir(parents=True)
@@ -963,9 +993,14 @@ def test_source_bundle_manifest_rejects_missing_extra_symlink_and_hash_mutations
 
     for name in ("missing", "extra", "symlink"):
         case = tmp_path / name
-        for root in (case / "lib/shuttle/mlir", case / "lib/shuttle/src/shuttle"):
+        case_roots = (case / "lib/shuttle/mlir", case / "lib/shuttle/src/shuttle")
+        for root in case_roots:
             root.mkdir(parents=True)
             root.joinpath("source.py").write_text(f"{root.name}\n")
+        for relative in prototype.SOURCE_FILES:
+            path = case / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"{relative.name}\n")
         case_manifest = case / "scripts/shuttle/track1_map_h100_source_manifest.json"
         case_manifest.parent.mkdir(parents=True)
         case_manifest.write_bytes(canonical_json(source_bundle_document(case)))
@@ -985,6 +1020,7 @@ def test_source_bundle_manifest_rejects_missing_extra_symlink_and_hash_mutations
     (
         "observed_bazel_sha256",
         "mutate_during_hydration",
+        "mutate_runtime_inventory",
         "hydration_failure",
         "expected_error",
     ),
@@ -992,17 +1028,20 @@ def test_source_bundle_manifest_rejects_missing_extra_symlink_and_hash_mutations
         (
             MISMATCHED_BAZEL_SHA256,
             False,
+            False,
             None,
             f"expected {EXPECTED_BAZEL_SHA256}, observed {MISMATCHED_BAZEL_SHA256}",
         ),
         (
             EXPECTED_BAZEL_SHA256,
             True,
+            False,
             None,
             "network hydration changed patched JAX or XLA source",
         ),
         (
             EXPECTED_BAZEL_SHA256,
+            False,
             False,
             "secrets",
             r"(?s)phase hydrate_bazel_repositories exited with status 23.*final useful failure",
@@ -1010,8 +1049,16 @@ def test_source_bundle_manifest_rejects_missing_extra_symlink_and_hash_mutations
         (
             EXPECTED_BAZEL_SHA256,
             False,
+            False,
             "long_line",
             r"(?s)phase hydrate_bazel_repositories exited with status 23.*final useful failure",
+        ),
+        (
+            EXPECTED_BAZEL_SHA256,
+            False,
+            True,
+            None,
+            "hydrated tool identities changed before the offline build",
         ),
     ],
 )
@@ -1020,12 +1067,14 @@ def test_execute_rejects_bazel_or_hydration_failure_before_offline_build(
     monkeypatch: pytest.MonkeyPatch,
     observed_bazel_sha256: str,
     mutate_during_hydration: bool,
+    mutate_runtime_inventory: bool,
     hydration_failure: str | None,
     expected_error: str,
 ) -> None:
     _, _, authorization = _authorization(tmp_path)
     workspace = tmp_path / "workspace"
     offline_started = False
+    inventory_reads = 0
 
     def initialize_repository(path: Path, url: str, commit: str, log: Path) -> None:
         del url, commit, log
@@ -1127,14 +1176,15 @@ def test_execute_rejects_bazel_or_hydration_failure_before_offline_build(
                 phase=phase,
             )
             return
-        if mutate_during_hydration:
+        if mutate_during_hydration and command[0].endswith("build/build.py"):
             (workspace / "jax/source.cc").write_text("network hydration mutation\n")
 
     original_is_file = Path.is_file
     original_access = os.access
-    cuda_tools = {
+    executable_tools = {
         Path("/usr/local/cuda-13.2/bin/nvcc"),
         Path("/usr/local/cuda-13.2/bin/ptxas"),
+        prototype.UV,
     }
     monkeypatch.setattr(prototype.platform, "system", lambda: "Linux")
     monkeypatch.setattr(prototype, "require_source_bundle", lambda root, value: {"schema_version": 1})
@@ -1144,6 +1194,15 @@ def test_execute_rejects_bazel_or_hydration_failure_before_offline_build(
     monkeypatch.setattr(prototype, "require_offline_build_inputs", lambda *args, **kwargs: None)
     monkeypatch.setattr(prototype, "apply_source_patches", apply_patches)
     monkeypatch.setattr(prototype, "_run", run)
+
+    def installed_distribution_versions(runtime_python: Path) -> tuple[dict[str, str], ...]:
+        nonlocal inventory_reads
+        del runtime_python
+        inventory_reads += 1
+        torch_version = "2.12.0" if mutate_runtime_inventory and inventory_reads > 1 else "2.11.0+cu128"
+        return ({"name": "torch", "version": torch_version},)
+
+    monkeypatch.setattr(prototype, "_installed_distribution_versions", installed_distribution_versions)
     monkeypatch.setattr(
         prototype,
         "_identity",
@@ -1153,18 +1212,24 @@ def test_execute_rejects_bazel_or_hydration_failure_before_offline_build(
         prototype,
         "_sha256_file",
         lambda path: (
-            observed_bazel_sha256 if path.name.startswith("bazel-") else hashlib.sha256(path.name.encode()).hexdigest()
+            observed_bazel_sha256
+            if path.name.startswith("bazel-")
+            else (
+                prototype.SM90_RUNTIME_REQUIREMENTS_SHA256
+                if path == MARIN_REPOSITORY / prototype.SM90_RUNTIME_REQUIREMENTS_RELATIVE
+                else hashlib.sha256(path.name.encode()).hexdigest()
+            )
         ),
     )
     monkeypatch.setattr(
         Path,
         "is_file",
-        lambda path: True if path in cuda_tools else original_is_file(path),
+        lambda path: True if path in executable_tools else original_is_file(path),
     )
     monkeypatch.setattr(
         os,
         "access",
-        lambda path, mode: (True if Path(path) in cuda_tools else original_access(path, mode)),
+        lambda path, mode: (True if Path(path) in executable_tools else original_access(path, mode)),
     )
 
     with pytest.raises(RuntimeError, match=expected_error) as raised:

@@ -105,7 +105,7 @@ def test_boundary_function_matches_public_primal_and_vjp_role_order_on_host() ->
             assert tuple(validated.results) == roles
 
 
-def test_observer_requires_exact_primal_and_reviewed_hybrid_topology() -> None:
+def test_observer_requires_exact_primal_and_records_composed_topology_as_telemetry() -> None:
     primal_inline = Coordinate((5, 19, 7), Boundary.PRIMAL, Mode.SOURCE_ORDERED)
     primal_compact = Coordinate((5, 19, 257), Boundary.PRIMAL, Mode.FAST)
     composed_inline = Coordinate((5, 19, 7), Boundary.COMPOSED, Mode.SOURCE_ORDERED)
@@ -113,25 +113,25 @@ def test_observer_requires_exact_primal_and_reviewed_hybrid_topology() -> None:
 
     inline = subject.validate_observer_snapshot(primal_inline, _observer_snapshot(primal_inline, 1, 0))
     compact = subject.validate_observer_snapshot(primal_compact, _observer_snapshot(primal_compact, 2, 1))
-    hybrid_inline = subject.validate_observer_snapshot(composed_inline, _observer_snapshot(composed_inline, 39, 36))
-    hybrid_compact = subject.validate_observer_snapshot(composed_compact, _observer_snapshot(composed_compact, 40, 37))
+    hybrid_inline = subject.validate_observer_snapshot(composed_inline, _observer_snapshot(composed_inline, 7, 3))
+    hybrid_compact = subject.validate_observer_snapshot(composed_compact, _observer_snapshot(composed_compact, 11, 5))
     assert (inline.launch_count, inline.temporary_count, inline.topology_status) == (1, 0, "normative_primal")
     assert (compact.launch_count, compact.temporary_count, compact.topology_status) == (2, 1, "normative_primal")
     assert (hybrid_inline.launch_count, hybrid_inline.temporary_count, hybrid_inline.topology_status) == (
-        39,
-        36,
-        "reviewed_hybrid_exact",
+        7,
+        3,
+        "telemetry_non_normative",
     )
     assert (hybrid_compact.launch_count, hybrid_compact.temporary_count, hybrid_compact.topology_status) == (
-        40,
-        37,
-        "reviewed_hybrid_exact",
+        11,
+        5,
+        "telemetry_non_normative",
     )
 
     with pytest.raises(ValueError, match="primal bundle topology"):
         subject.validate_observer_snapshot(primal_inline, _observer_snapshot(primal_inline, 2, 1))
-    with pytest.raises(ValueError, match="composed bundle topology"):
-        subject.validate_observer_snapshot(composed_inline, _observer_snapshot(composed_inline, 42, 38))
+    with pytest.raises(ValueError, match="nonnegative integer telemetry"):
+        subject.validate_observer_snapshot(composed_inline, _observer_snapshot(composed_inline, 0, 0))
 
 
 def test_validate_coordinate_rejects_repeat_nonfinite_role_and_threshold_drift() -> None:

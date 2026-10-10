@@ -17,10 +17,26 @@ dependencies = [
     "numpy>=2.0",
 ]
 
+[project.entry-points."shuttle.gpu_physical_artifact_compilers"]
+sm90_normalized_exp_contract = "tile_lifetime.backends.h100.provider:compile_normalized_exp_contract_artifact"
+
 [project.optional-dependencies]
 cuda13 = [
     "jax[cuda13]==0.10.1",
+    "torch @ https://download.pytorch.org/whl/cu128/torch-2.11.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl ; python_version == '3.12' and sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "torch @ https://download.pytorch.org/whl/cu128/torch-2.11.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl ; python_version == '3.12' and sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "nvidia-cutlass-dsl[cu13]==4.6.0.dev0; sys_platform == 'linux'",
+    "quack-kernels==0.5.3; sys_platform == 'linux'",
+    "flash-attn-4[cu13]>=4.0.0b19,<4.1; sys_platform == 'linux'",
 ]
+
+[tool.uv.sources]
+nvidia-cutlass-dsl = { index = "nvidia" }
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+explicit = true
 
 [dependency-groups]
 test = [

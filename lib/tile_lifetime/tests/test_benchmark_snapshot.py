@@ -12,7 +12,7 @@ from typing import Any
 
 import numpy as np
 
-from tile_lifetime import ExpertParallelConfig
+from tile_lifetime import ExpertParallelConfig, uniform_relation_placement
 
 SNAPSHOT_ROOT = Path(__file__).resolve().parents[1] / "benchmarks" / "artifacts" / "gb200_moe_v1"
 STATEFUL_SCAN_ROOT = Path(__file__).resolve().parents[1] / "benchmarks" / "artifacts" / "stateful_scan_h100_v0"
@@ -100,7 +100,7 @@ def test_gb200_route_fixture_and_selected_plan_match_snapshot_contract() -> None
 
     candidate_space = _json(SNAPSHOT_ROOT / "candidate_space.json")
     selected = candidate_space["selected"]
-    config = ExpertParallelConfig(expert_parallel_size=4)
+    config = ExpertParallelConfig(placement=uniform_relation_placement(destination_count=384, rank_count=4))
     assert config.exchange_workers == selected["exchange_workers"]
     assert config.gate_up_layout.value == selected["gate_up_layout"]
     assert config.overlap_policy.value == selected["overlap_policy"]
@@ -212,7 +212,7 @@ def test_stateful_scan_snapshot_preserves_numerical_contract_evidence() -> None:
 
 def test_generated_scan_snapshot_preserves_mutation_and_backend_boundary() -> None:
     checksum_lines = (GENERATED_SCAN_ROOT / "SHA256SUMS").read_text().splitlines()
-    assert len(checksum_lines) == 11
+    assert len(checksum_lines) == 6
     for line in checksum_lines:
         expected, relative_path = line.split("  ", maxsplit=1)
         assert _sha256(GENERATED_SCAN_ROOT / relative_path) == expected

@@ -1,7 +1,13 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Inspectable execution-plan representation."""
+"""Historical named-graph execution plans retained for oracle comparisons.
+
+These records are not part of the executable Shuttle compiler boundary.  New
+lowering must use ``TensorProgram`` and ``ExecutablePhysicalRequest``; keeping
+the types reference-named prevents this prototype skeleton model from being
+mistaken for canonical physical semantics.
+"""
 
 from dataclasses import dataclass
 from enum import StrEnum
@@ -113,8 +119,8 @@ class ReductionSkeleton:
 
 
 @dataclass(frozen=True)
-class StreamingAttentionSkeleton:
-    """Finite-family exact online-softmax attention skeleton."""
+class ReferenceAttentionSkeleton:
+    """Opaque online-softmax configuration for historical oracle replay."""
 
     name: str
     query: str
@@ -336,10 +342,10 @@ class OpaqueMoKOracleSkeleton:
     backend_revision: str
 
 
-ExecutionSkeleton = (
+ReferenceExecutionSkeleton = (
     GemmSkeleton
     | ReductionSkeleton
-    | StreamingAttentionSkeleton
+    | ReferenceAttentionSkeleton
     | TransformSkeleton
     | StatefulScanSkeleton
     | OpaqueMoKOracleSkeleton
@@ -375,10 +381,14 @@ class RewriteExplanation:
 
 
 @dataclass(frozen=True)
-class RegionPlan:
-    """Selected skeleton sequence, materializations, and rewrite evidence."""
+class ReferenceRegionPlan:
+    """Reference-only named skeleton sequence and rewrite evidence.
 
-    skeletons: tuple[ExecutionSkeleton, ...]
+    This type deliberately cannot be passed to the canonical task/EventTensor
+    physical compiler, whose input is ``ExecutablePhysicalRequest``.
+    """
+
+    skeletons: tuple[ReferenceExecutionSkeleton, ...]
     materializations: tuple[MaterializationRecord, ...]
     rewrites: tuple[RewriteExplanation, ...]
     semantic_erasure_report: SemanticErasureReport | None = None
@@ -398,7 +408,7 @@ class RegionPlan:
         values = {
             value
             for skeleton in self.skeletons
-            if isinstance(skeleton, StreamingAttentionSkeleton)
+            if isinstance(skeleton, ReferenceAttentionSkeleton)
             for value in (skeleton.score_value, skeleton.probability_value)
         }
         return tuple(

@@ -1,14 +1,28 @@
 # Pinned JAX jaxlib composition overlay
 
-This patch applies to JAX 0.10.1 commit
+These patches apply to JAX 0.10.1 commit
 `619764c15117fbefc4ba13ab941871cb514c23f6`. That release pins XLA commit
 `9b635916ecc6df6efee62d8e4b0c7ef87ef84d69`.
 
-The patch adds the always-linked `@shuttle_mlir//:ShuttleXlaRegistryAdapter`
-library to the final `//jaxlib:_jax` extension. The adapter depends on XLA's
-public generic StableHLO transform registry and registers the `shuttle` key at
-static initialization. XLA's registry and `mlir_to_hlo` targets do not depend
-on Shuttle.
+Patch `0001` adds the always-linked
+`@shuttle_mlir//:ShuttleXlaRegistryAdapter` and
+`@shuttle_mlir//:ShuttlePythonPhysicalArtifactBridge` libraries to the final
+`//jaxlib:_jax` extension. Patch `0004` registers both at module initialization.
+The adapter depends on XLA's public generic StableHLO transform registry. XLA's
+registry and `mlir_to_hlo` targets do not depend on Shuttle.
+
+The production patch also links `ShuttlePythonPhysicalArtifactBridge`. When
+`shuttle.compiler_options` selects GPU executable output, Shuttle discovers
+installed providers from the `shuttle.gpu_physical_artifact_compilers` Python
+entry-point group and binds their composite callback to the single-assignment
+`_jax._shuttle_physical_artifact.register` hook. Applications do not import or
+register a workload compiler. Each provider receives a canonical structured
+record of generic Shuttle algebra plus its verified materialization and
+schedule plans, and returns native fatbin transport bytes or `None` when it has
+no legal physical schedule. Native code re-parses and source-validates that
+transport before it can replace the algebra region. Provider discovery is
+lazy: CUDA compiler dependencies are imported only after XLA submits a physical
+artifact request.
 
 The second patch contains an acceptance-only configuration selected with
 `--define=SHUTTLE_TEST_OBSERVER=1`. It compiles a guarded private
@@ -16,14 +30,16 @@ The second patch contains an acceptance-only configuration selected with
 external observer bridge. Without that define, the binding and bridge target
 are absent. The registry adapter remains linked in both configurations.
 
-Apply the XLA patches from `../xla_patch` to an exact pinned XLA checkout, then
-build in JAX's default WORKSPACE mode with both local repositories injected at
-the command line:
+Apply the XLA patches from `../xla_patch` to an exact pinned XLA checkout. Apply
+both production JAX patches, then build in JAX's default WORKSPACE mode with
+the local repositories injected at the command line:
 
 ```bash
 test "$(git rev-parse HEAD)" = 619764c15117fbefc4ba13ab941871cb514c23f6
 git apply --check /path/to/0001-link-shuttle-xla-registry-adapter.patch
 git apply /path/to/0001-link-shuttle-xla-registry-adapter.patch
+git apply --check /path/to/0004-register-shuttle-at-module-init.patch
+git apply /path/to/0004-register-shuttle-at-module-init.patch
 bazel build \
   --override_repository=xla=/path/to/patched/xla \
   --override_repository=shuttle_mlir=/path/to/marin/lib/shuttle/mlir \
@@ -235,3 +251,154 @@ dependency query against the exact JAX release and patched XLA revision proves
 the final `_jax` target reaches the always-linked adapter. This checkpoint only
 claims the CPU jaxlib composition path. Dynamically loaded GPU PJRT plugins
 require their own explicit adapter linkage and registration proof.
+
+## Standalone native CUDA runner
+
+`build_native_gpu_runner.py` builds
+`@shuttle_mlir//:gpu_fatbin_h100_test` against the pinned XLA revision above.
+This executable exercises the native `GpuRunner` directly. It does not require
+a rebuilt JAX wheel or CUDA PJRT plugin.
+
+Run from the Marin repository root on Linux x86-64 with uv, Python 3.12, Git,
+Curl, a host C++ compiler, and `ldd`. The directory passed to `--workspace` must
+not exist. Outside Iris, replace `/iris/outputs` with a writable output path. Build on a
+CPU worker; the validated resource allocation was 32 CPUs, 128 GB memory, and
+100 GB scratch with a 60-minute job limit.
+
+```bash
+uv run --no-project --python 3.12 python \
+  lib/shuttle/mlir/jax_patch/build_native_gpu_runner.py \
+  --workspace /tmp/shuttle-native-v12 \
+  --output /iris/outputs \
+  --bazel-url https://github.com/bazelbuild/bazel/releases/download/7.7.0/bazel-7.7.0-linux-x86_64 \
+  --bazel-sha256 fe7e799cbc9140f986b063e06800a3d4c790525075c877d00a7112669824acbf \
+  --cuda-version 12.9.1 \
+  --jobs 32 \
+  --ram-mb 98304
+```
+
+The helper verifies Bazel's digest and checks out XLA at
+`9b635916ecc6df6efee62d8e4b0c7ef87ef84d69`. It applies
+`track2_xla_workspace.patch`, overrides the Shuttle repository with the current
+source tree, and explicitly selects hermetic Python 3.12, CUDA 12.9.1, and
+compute capability 9.0. Bazel analysis downloads the pinned toolchain before
+compilation. The helper then compiles two independent fatbins from
+`../test/gpu-fatbin-duplicate-symbol.cu` before building the native executable.
+
+NVCC host preprocessing uses the sysroot selected by XLA's
+`sysroot_linux_x86_64` repository. The validated build selected
+`sysroot_linux_x86_64_glibc_2_27`. Passing that sysroot through
+`--compiler-options=--sysroot=...` avoids mixing CUDA 12.9 headers with newer
+host glibc declarations of `cospi`, `sinpi`, `cospif`, and `sinpif`. The helper
+records the selected repository and its alias hash. It does not modify CUDA
+or system headers.
+
+The output directory contains the executable, `image0.fatbin`,
+`image1.fatbin`, required workspace shared libraries under `lib/`, `ldd.txt`,
+phase logs, `build-plan.json`, and `build-result.json`. The result records
+commands, XLA and Bazel identities, source hashes, NVCC and image hashes, and
+the executable hash. `status: built` is written after all these steps pass.
+On a CPU worker, only unresolved `libcuda.so.1` is permitted: the manifest
+records that the GPU worker must provide this driver library. Other unresolved
+libraries fail packaging. Preserve the output directory together when moving
+the executable to a GPU worker in the same region.
+
+On an H100 worker with a driver supporting CUDA 12.9.1, set `native_output`
+to the extracted build output directory:
+
+```bash
+native_output=/path/to/native-build-output
+export LD_LIBRARY_PATH="$native_output/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+SHUTTLE_TEST_FIRST_IMAGE="$native_output/image0.fatbin" \
+SHUTTLE_TEST_SECOND_IMAGE="$native_output/image1.fatbin" \
+  "$native_output/gpu_fatbin_h100_test" \
+  --gtest_filter=GpuFatbinH100Test.ResolvesDuplicateKernelNamesPerImageWithScalarResult
+```
+
+Both images export `shuttle_shared_symbol`. Their launches compute `(3 + 1) * 2`
+and must return the rank-zero scalar `8`. The test checks image-specific symbol
+resolution through the public native runner.
+
+The dense benchmark exporter produces fixtures for scalar loss and all
+parameter/input gradients. For example, export a pair using the package's
+CUDA benchmark dependencies on an H100 worker:
+
+```bash
+python lib/tile_lifetime/benchmarks/setup_h100_composition_runtime.py \
+  --directory /tmp/shuttle-supported-runtime \
+  --manifest /path/to/runtime-manifest.json
+/tmp/shuttle-supported-runtime/venv/bin/python \
+  lib/tile_lifetime/benchmarks/h100_dense_composition_training.py \
+  --same-coordinate-ssa \
+  --native-fixture-directory /path/to/native-fixtures \
+  --output /path/to/dense-export.json
+```
+
+Here `baseline` uses recursive fused-expression evaluation and `generated`
+uses SSA values for shared expressions at the same output coordinate. The
+exporter retains source/input identities and comparison results in the output
+JSON. Fixture export follows numerical acceptance. Set `fixture_root` to the
+exported directory, then run each variant separately:
+
+```bash
+fixture_root=/path/to/native-fixtures
+SHUTTLE_TEST_COMPOSED_FIXTURE_DIRECTORY="$fixture_root/baseline" \
+  "$native_output/gpu_fatbin_h100_test" \
+  --gtest_filter=GpuFatbinH100Test.ExecutesExportedComposedPublicBoundary
+SHUTTLE_TEST_COMPOSED_FIXTURE_DIRECTORY="$fixture_root/generated" \
+  "$native_output/gpu_fatbin_h100_test" \
+  --gtest_filter=GpuFatbinH100Test.ExecutesExportedComposedPublicBoundary
+```
+
+Each directory contains `manifest.json`, `bundle.bin`, and raw input and
+expected-output files. Manifest `inputs` and `expected_outputs` arrays list
+filenames in public binding-index order; `bundle` names the transport file,
+and `max_absolute_error` supplies the numerical gate. The runner derives shapes,
+dtypes, and byte counts from the bundle and checks every public BF16/F32 output,
+including scalar loss and gradients. Nonfinite values fail acceptance. The
+dense fixture gate is `6.103515625e-05`; expected outputs are default JAX outputs
+cast to each declared output dtype.
+
+`GpuRunner` builds its FFI call frame once during creation. Execution validates
+the current public buffers and rebinds their addresses with XLA's
+`CallFrame::UpdateWithBuffers` under the runner mutex. Bundle bytes, their digest,
+attributes, and tensor shapes remain owned by the frame. A failed completion
+fence still prevents another invocation until `AwaitCompletion` succeeds.
+
+After numerical acceptance, the harness retains 30 raw host and stream timing
+samples after 10 warmup calls. `ExecuteProfiled` separately measures host frame
+setup, FFI enqueue, and the remaining completion wait without inserting device
+timer events. Enqueue includes both argument preparation and kernel submission.
+Its stages exclude time waiting for the runner mutex; the ordinary host samples
+cover the full synchronous call. The `ExecuteTimed` stream interval can include
+host submission gaps and is not summed kernel time. On the September 17 paired
+H100 replay, frame reuse reduces SSA native host median from 5.218 to 0.457 ms,
+with unchanged numerical errors. The
+[dispatch artifact](../../../../.agents/artifacts/shuttle-native-dispatch-20260917-v0/README.md)
+retains the raw measurements and comparison protocol.
+
+For an export discrepancy, add
+`--first-forward-fixture-directory /path/to/forward-fixture`. This writes the
+first physical component's inputs and canonical outputs and captures its actual
+CUDA graph kernel arguments. Used alone, the option stops before timing; used
+with `--native-fixture-directory`, it also produces the full benchmark fixtures.
+The isolated fixture lives in the `forward` subdirectory and uses Python's
+intermediate component outputs as its reference, rather than full-program JAX
+outputs. Run it through the same native fixture test.
+
+The captured argument report compares parameter contents and launch dimensions.
+Public pointer bindings are checked; unknown temporary addresses are inferred
+consistently and do not prove storage identity. Raw differences can include
+uninitialized padding or opaque descriptor bytes, so inspect the affected fields
+before treating a byte mismatch as a numerical cause. Parameter count and width
+checks alone cannot detect a swapped TMA dimension or an incorrect shape field.
+See the [native export incident](https://marina.oa.dev/echo/wiki/344).
+
+The successful CPU build is recorded in
+[the source and toolchain manifest](../../../../.agents/artifacts/shuttle-native-runtime-20260905-v0/native-r3-build-result.json)
+and [Iris job shuttle-native-multiimage-build-0905-r3](https://iris.oa.dev/#/job/%2Fdlwh%2Fshuttle-native-multiimage-build-0905-r3).
+The manifest's executable SHA-256 is
+`bf5bfb9f0d958beebe3089b5de268b742c876411a2dbe3edaf4ec8f2383a9b3c`.
+
+The [CPU build incident](https://marina.oa.dev/echo/wiki/345) records the
+sysroot and driver-packaging failures that led to this procedure.

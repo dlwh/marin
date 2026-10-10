@@ -13,24 +13,23 @@ from tile_lifetime import (
     GemmSkeleton,
     NumericalPolicy,
     ReductionSkeleton,
-    StreamingAttentionSkeleton,
 )
 from tile_lifetime.compiler import RowScalePlacement
 from tile_lifetime.experimental_pipeline import compile_experimental_stablehlo_dense_transformer_region
-from tile_lifetime.plan import RegionPlan
+from tile_lifetime.plan import ReferenceAttentionSkeleton, ReferenceRegionPlan
 from tile_lifetime.reference import (
     DENSE_REGION_INPUT_NAMES,
     DenseDebugConfig,
     export_debug_dense_region,
 )
 from tile_lifetime.runtime import (
-    PlanRuntimeError,
+    ReferencePlanRuntimeError,
     RuntimeBufferSpec,
     RuntimeDiagnosticCode,
     TensorBinding,
-    execute_region_plan,
-    required_input_specs,
-    validate_region_plan,
+    execute_reference_dense_plan,
+    reference_required_input_specs,
+    validate_reference_dense_plan,
 )
 
 FIXTURE = Path(__file__).parent / "fixtures" / "stablehlo" / "dense_region_v1_14_1.mlir.bc.b64"
@@ -55,7 +54,7 @@ class RecordingBackend:
 
     def run_attention(
         self,
-        skeleton: StreamingAttentionSkeleton,
+        skeleton: ReferenceAttentionSkeleton,
         bindings: Mapping[str, TensorBinding],
     ) -> None:
         self.calls.append(("attention", skeleton.name))
@@ -64,7 +63,7 @@ class RecordingBackend:
         self.calls.append(("reduction", skeleton.name))
 
 
-def _plan(placement: RowScalePlacement = RowScalePlacement.CONSUMER_PROLOGUE) -> RegionPlan:
+def _plan(placement: RowScalePlacement = RowScalePlacement.CONSUMER_PROLOGUE) -> ReferenceRegionPlan:
     artifact = base64.b64decode(FIXTURE.read_text())
     return compile_experimental_stablehlo_dense_transformer_region(
         artifact,
@@ -75,11 +74,16 @@ def _plan(placement: RowScalePlacement = RowScalePlacement.CONSUMER_PROLOGUE) ->
     ).plan
 
 
-def _inputs(plan: RegionPlan) -> dict[str, TensorBinding]:
+def _inputs(plan: ReferenceRegionPlan) -> dict[str, TensorBinding]:
     return {
         name: TensorBinding(handle=("input", name), shape=spec.shape, dtype=spec.dtype)
-        for name, spec in required_input_specs(plan).items()
+        for name, spec in reference_required_input_specs(plan).items()
     }
+
+
+def test_reference_runtime_rejects_canonical_physical_request_boundary() -> None:
+    with pytest.raises(TypeError, match="canonical lowering uses ExecutablePhysicalRequest"):
+        validate_reference_dense_plan(object())  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
@@ -90,7 +94,7 @@ def test_runtime_dispatches_connected_plan_in_dependency_order(placement: RowSca
     plan = _plan(placement)
     backend = RecordingBackend()
 
-    result = execute_region_plan(plan, _inputs(plan), backend)
+    result = execute_reference_dense_plan(plan, _inputs(plan), backend)
 
     gate_name = f"contract_{placement.value}_row_scale_pairwise_map"
     assert backend.calls == [
@@ -133,7 +137,7 @@ def test_runtime_validates_primary_shape_contract_and_reduces_one_partial_per_n_
     ).plan
     backend = RecordingBackend()
 
-    execute_region_plan(plan, _inputs(plan), backend)
+    execute_reference_dense_plan(plan, _inputs(plan), backend)
 
     assert plan.skeletons[0].cluster_shape == (1, 2, 1)
     assert plan.skeletons[4].cluster_shape == (1, 2, 1)
@@ -166,8 +170,8 @@ def test_runtime_rejects_unsupported_backend_layout_attachment_and_resources() -
 
     for mutated, code, field in mutations:
         rejected = replace(plan, skeletons=(mutated, *plan.skeletons[1:]))
-        with pytest.raises(PlanRuntimeError) as exc_info:
-            validate_region_plan(rejected)
+        with pytest.raises(ReferencePlanRuntimeError) as exc_info:
+            validate_reference_dense_plan(rejected)
         assert any(
             diagnostic.code is code and diagnostic.skeleton_index == 0 and diagnostic.field == field
             for diagnostic in exc_info.value.diagnostics
@@ -181,8 +185,8 @@ def test_runtime_reports_missing_and_mismatched_input_bindings() -> None:
     qkv_weight = inputs["qkv_weight"]
     inputs["qkv_weight"] = replace(qkv_weight, shape=(1,))
 
-    with pytest.raises(PlanRuntimeError) as exc_info:
-        execute_region_plan(plan, inputs, RecordingBackend())
+    with pytest.raises(ReferencePlanRuntimeError) as exc_info:
+        execute_reference_dense_plan(plan, inputs, RecordingBackend())
 
     diagnostics = exc_info.value.diagnostics
     assert any(
@@ -203,8 +207,8 @@ def test_runtime_rejects_mismatched_rms_placement_families() -> None:
         skeletons=(*prologue_plan.skeletons[:7], epilogue_plan.skeletons[7]),
     )
 
-    with pytest.raises(PlanRuntimeError) as exc_info:
-        validate_region_plan(mixed)
+    with pytest.raises(ReferencePlanRuntimeError) as exc_info:
+        validate_reference_dense_plan(mixed)
 
     assert any(
         diagnostic.code is RuntimeDiagnosticCode.BACKEND_CONTRACT and diagnostic.field == "rms_scale_placement"

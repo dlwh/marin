@@ -16,7 +16,7 @@ from tile_lifetime.compiler import RowScalePlacement, compile_reference_region
 from tile_lifetime.experimental_semantic_recovery import recover_attention_region
 from tile_lifetime.expert_parallel import ExpertParallelConfig, compile_expert_parallel_region
 from tile_lifetime.expert_parallel_plan import ExpertParallelPlan
-from tile_lifetime.plan import NumericalPolicy, RegionPlan
+from tile_lifetime.plan import NumericalPolicy, ReferenceRegionPlan
 from tile_lifetime.reference_moe_recovery import RecoveredMoERegion, recover_moe_region
 from tile_lifetime.reference_semantic_recovery import recover_reference_rms_region
 
@@ -61,7 +61,7 @@ def compile_reference_stablehlo_rms_region(
     gemm_accumulation_dtype: DType,
     numerical_policy: NumericalPolicy,
     rms_scale_placement: RowScalePlacement = RowScalePlacement.CONSUMER_EPILOGUE,
-) -> RegionPlan:
+) -> ReferenceRegionPlan:
     """Run the historical named RMS/GEMM planner for reference tests."""
     graph = import_stablehlo(artifact, input_names=input_names)
     recovered = recover_reference_rms_region(
@@ -82,7 +82,7 @@ def compile_reference_stablehlo_attention_region(
     input_names: tuple[str, ...],
     output_name: str,
     numerical_policy: NumericalPolicy,
-) -> RegionPlan:
+) -> ReferenceRegionPlan:
     """Run the historical named attention planner for reference tests."""
     graph = import_stablehlo(artifact, input_names=input_names)
     recovered = recover_attention_region(graph, output_name=output_name)
@@ -98,7 +98,7 @@ def compile_reference_stablehlo_rms_attention_program(
     gemm_accumulation_dtype: DType,
     numerical_policy: NumericalPolicy,
     rms_scale_placement: RowScalePlacement = RowScalePlacement.CONSUMER_EPILOGUE,
-) -> RegionPlan:
+) -> ReferenceRegionPlan:
     """Run the historical combined named RMS and attention planners."""
     graph = import_stablehlo(artifact, input_names=input_names)
     recovered_rms = recover_reference_rms_region(
@@ -121,7 +121,7 @@ def compile_reference_stablehlo_rms_attention_program(
         recovered_attention.graph,
         numerical_policy=numerical_policy,
     )
-    return RegionPlan(
+    return ReferenceRegionPlan(
         skeletons=(*rms_plan.skeletons, *attention_plan.skeletons),
         materializations=(*rms_plan.materializations, *attention_plan.materializations),
         rewrites=(*rms_plan.rewrites, *attention_plan.rewrites),

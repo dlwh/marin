@@ -30,7 +30,8 @@ module @eligible_projected_input attributes {
       ^bb0(%element: f32, %accumulator: f32):
         %sum = arith.addf %element, %accumulator : f32
         "shuttle.yield"(%sum) : (f32) -> ()
-      }) {accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 2>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
+      }) {
+indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0)>],accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 2>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
       "shuttle.yield"(%folded) : (tensor<2xf32>) -> ()
     }) {policy = #shuttle.policy<source_ordered>, source_refs = [#shuttle.source_ref<0, 0, 0, 0>, #shuttle.source_ref<0, 0, 0, 1>, #shuttle.source_ref<0, 0, 0, 2>]} : (tensor<1x4xf32>, tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
     return %result : tensor<2xf32>
@@ -77,7 +78,8 @@ module @eligible_rank5_composition attributes {
       ^bb0(%element: f32, %accumulator: f32):
         %sum = arith.addf %element, %accumulator : f32
         "shuttle.yield"(%sum) : (f32) -> ()
-      }) {accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 4>, source = #shuttle.source_ref<0, 0, 0, 2>} : (tensor<3x2x5x11x263xf32>, tensor<f32>) -> tensor<3x2x5x11xf32>
+      }) {
+indexing_maps = [affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3, d4)>, affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3)>],accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 4>, source = #shuttle.source_ref<0, 0, 0, 2>} : (tensor<3x2x5x11x263xf32>, tensor<f32>) -> tensor<3x2x5x11xf32>
       "shuttle.yield"(%folded) : (tensor<3x2x5x11xf32>) -> ()
     }) {policy = #shuttle.policy<source_ordered>, source_refs = [#shuttle.source_ref<0, 0, 0, 0>, #shuttle.source_ref<0, 0, 0, 1>, #shuttle.source_ref<0, 0, 0, 2>]} : (tensor<1x1x1x1x263xf32>, tensor<3x2x5x11x263xf32>, tensor<f32>) -> tensor<3x2x5x11xf32>
     return %result : tensor<3x2x5x11xf32>
@@ -132,7 +134,8 @@ module @fanout_boundary attributes {
       ^bb0(%element: f32, %accumulator: f32):
         %sum = arith.addf %element, %accumulator : f32
         "shuttle.yield"(%sum) : (f32) -> ()
-      }) {accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 4>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
+      }) {
+indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0)>],accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 4>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
       "shuttle.yield"(%folded) : (tensor<2xf32>) -> ()
     }) {policy = #shuttle.policy<source_ordered>, source_refs = [#shuttle.source_ref<0, 0, 0, 0>, #shuttle.source_ref<0, 0, 0, 1>, #shuttle.source_ref<0, 0, 0, 2>, #shuttle.source_ref<0, 0, 0, 3>, #shuttle.source_ref<0, 0, 0, 4>]} : (tensor<1x4xf32>, tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
     return %result : tensor<2xf32>
@@ -181,7 +184,8 @@ module @disconnected_same_domain_sibling attributes {
       ^bb0(%element: f32, %accumulator: f32):
         %sum = arith.addf %element, %accumulator : f32
         "shuttle.yield"(%sum) : (f32) -> ()
-      }) {accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 3>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
+      }) {
+indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0)>],accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 3>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
       "shuttle.yield"(%unrelated, %folded) : (tensor<2x4xf32>, tensor<2xf32>) -> ()
     }) {policy = #shuttle.policy<source_ordered>, source_refs = [#shuttle.source_ref<0, 0, 0, 0>, #shuttle.source_ref<0, 0, 0, 1>, #shuttle.source_ref<0, 0, 0, 2>, #shuttle.source_ref<0, 0, 0, 3>]} : (tensor<2x4xf32>, tensor<f32>) -> (tensor<2x4xf32>, tensor<2xf32>)
     return %sibling, %result : tensor<2x4xf32>, tensor<2xf32>
@@ -225,7 +229,8 @@ module @duplicate_use_boundary attributes {
       ^bb0(%element: f32, %accumulator: f32):
         %sum = arith.addf %element, %accumulator : f32
         "shuttle.yield"(%sum) : (f32) -> ()
-      }) {accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 2>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
+      }) {
+indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0)>],accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 2>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
       "shuttle.yield"(%folded) : (tensor<2xf32>) -> ()
     }) {policy = #shuttle.policy<source_ordered>, source_refs = [#shuttle.source_ref<0, 0, 0, 0>, #shuttle.source_ref<0, 0, 0, 1>, #shuttle.source_ref<0, 0, 0, 2>]} : (tensor<1x4xf32>, tensor<f32>) -> tensor<2xf32>
     return %result : tensor<2xf32>
@@ -264,7 +269,8 @@ module @public_result_boundary attributes {
       ^bb0(%element: f32, %accumulator: f32):
         %sum = arith.addf %element, %accumulator : f32
         "shuttle.yield"(%sum) : (f32) -> ()
-      }) {accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 2>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
+      }) {
+indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0)>],accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 2>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
       "shuttle.yield"(%expanded, %folded) : (tensor<2x4xf32>, tensor<2xf32>) -> ()
     }) {policy = #shuttle.policy<source_ordered>, source_refs = [#shuttle.source_ref<0, 0, 0, 0>, #shuttle.source_ref<0, 0, 0, 1>, #shuttle.source_ref<0, 0, 0, 2>]} : (tensor<1x4xf32>, tensor<2x4xf32>, tensor<f32>) -> (tensor<2x4xf32>, tensor<2xf32>)
     return %broadcast, %fold : tensor<2x4xf32>, tensor<2xf32>
@@ -303,7 +309,8 @@ module @nonidentity_cross_domain_boundary attributes {
       ^bb0(%element: f32, %accumulator: f32):
         %sum = arith.addf %element, %accumulator : f32
         "shuttle.yield"(%sum) : (f32) -> ()
-      }) {accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 2>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
+      }) {
+indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0)>],accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 2>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
       "shuttle.yield"(%folded) : (tensor<2xf32>) -> ()
     }) {policy = #shuttle.policy<source_ordered>, source_refs = [#shuttle.source_ref<0, 0, 0, 0>, #shuttle.source_ref<0, 0, 0, 1>, #shuttle.source_ref<0, 0, 0, 2>]} : (tensor<1x4xf32>, tensor<f32>) -> tensor<2xf32>
     return %result : tensor<2xf32>
@@ -342,7 +349,8 @@ module @permuted_producer_result_boundary attributes {
       ^bb0(%element: f32, %accumulator: f32):
         %sum = arith.addf %element, %accumulator : f32
         "shuttle.yield"(%sum) : (f32) -> ()
-      }) {accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 2>} : (tensor<2x2xf32>, tensor<f32>) -> tensor<2xf32>
+      }) {
+indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0)>],accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 2>} : (tensor<2x2xf32>, tensor<f32>) -> tensor<2xf32>
       "shuttle.yield"(%folded) : (tensor<2xf32>) -> ()
     }) {policy = #shuttle.policy<source_ordered>, source_refs = [#shuttle.source_ref<0, 0, 0, 0>, #shuttle.source_ref<0, 0, 0, 1>, #shuttle.source_ref<0, 0, 0, 2>]} : (tensor<2x2xf32>, tensor<f32>) -> tensor<2xf32>
     return %result : tensor<2xf32>
@@ -381,7 +389,8 @@ module @permuted_consumer_result_boundary attributes {
       ^bb0(%element: f32, %accumulator: f32):
         %sum = arith.addf %element, %accumulator : f32
         "shuttle.yield"(%sum) : (f32) -> ()
-      }) {accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 2>} : (tensor<2x2xf32>, tensor<f32>) -> tensor<2xf32>
+      }) {
+indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0)>],accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 2>} : (tensor<2x2xf32>, tensor<f32>) -> tensor<2xf32>
       "shuttle.yield"(%folded) : (tensor<2xf32>) -> ()
     }) {policy = #shuttle.policy<source_ordered>, source_refs = [#shuttle.source_ref<0, 0, 0, 0>, #shuttle.source_ref<0, 0, 0, 1>, #shuttle.source_ref<0, 0, 0, 2>]} : (tensor<2x2xf32>, tensor<f32>) -> tensor<2xf32>
     return %result : tensor<2xf32>
@@ -419,7 +428,8 @@ module @bf16_boundary attributes {
       ^bb0(%element: f32, %accumulator: f32):
         %sum = arith.addf %element, %accumulator : f32
         "shuttle.yield"(%sum) : (f32) -> ()
-      }) {accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 2>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
+      }) {
+indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0)>],accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 2>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
       "shuttle.yield"(%folded) : (tensor<2xf32>) -> ()
     }) {policy = #shuttle.policy<source_ordered>, source_refs = [#shuttle.source_ref<0, 0, 0, 0>, #shuttle.source_ref<0, 0, 0, 1>, #shuttle.source_ref<0, 0, 0, 2>]} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
     return %result : tensor<2xf32>
@@ -462,7 +472,8 @@ module @contract_adjacency_boundary attributes {
       ^bb0(%element: f32, %accumulator: f32):
         %sum = arith.addf %element, %accumulator : f32
         "shuttle.yield"(%sum) : (f32) -> ()
-      }) {accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 3>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
+      }) {
+indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0)>],accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 3>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
       "shuttle.yield"(%folded) : (tensor<2xf32>) -> ()
     }) {policy = #shuttle.policy<source_ordered>, source_refs = [#shuttle.source_ref<0, 0, 0, 0>, #shuttle.source_ref<0, 0, 0, 1>, #shuttle.source_ref<0, 0, 0, 2>, #shuttle.source_ref<0, 0, 0, 3>]} : (tensor<2x3xf32>, tensor<3x4xf32>, tensor<f32>) -> tensor<2xf32>
     return %result : tensor<2xf32>
@@ -507,7 +518,8 @@ module @multi_result_map_boundary attributes {
       ^bb0(%element: f32, %accumulator: f32):
         %sum = arith.addf %element, %accumulator : f32
         "shuttle.yield"(%sum) : (f32) -> ()
-      }) {accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 2>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
+      }) {
+indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0)>],accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 2>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
       "shuttle.yield"(%folded) : (tensor<2xf32>) -> ()
     }) {policy = #shuttle.policy<source_ordered>, source_refs = [#shuttle.source_ref<0, 0, 0, 0>, #shuttle.source_ref<0, 0, 0, 1>, #shuttle.source_ref<0, 0, 0, 2>]} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
     return %result : tensor<2xf32>

@@ -27,14 +27,14 @@ from tile_lifetime.plan import (
     NumericalEquivalence,
     NumericalPolicy,
     ReductionSkeleton,
-    RegionPlan,
+    ReferenceRegionPlan,
     RewriteExplanation,
     TransformSkeleton,
 )
 from tile_lifetime.semantic_erasure import (
     ErasedTensorProgram,
     validate_erased_tensor_program,
-    validate_plan_semantic_erasure,
+    validate_reference_plan_semantic_erasure,
 )
 from tile_lifetime.tensor_program import (
     ContractPrimitive,
@@ -101,7 +101,7 @@ def compile_reference_region(
     *,
     numerical_policy: NumericalPolicy,
     rms_scale_placement: RowScalePlacement = RowScalePlacement.CONSUMER_EPILOGUE,
-) -> RegionPlan:
+) -> ReferenceRegionPlan:
     """Compile a hand-built named TensorGraph for historical reference tests."""
     erased: ErasedTensorProgram | None = None
     try:
@@ -126,7 +126,7 @@ def compile_erased_dense_program(
     *,
     numerical_policy: NumericalPolicy,
     scale_placement: RowScalePlacement = RowScalePlacement.CONSUMER_EPILOGUE,
-) -> RegionPlan:
+) -> ReferenceRegionPlan:
     """Select placements using only generic dataflow and algebraic properties."""
     validate_erased_tensor_program(erased)
     centered_region, centered_reasons = _find_centered_fold_scale_contract_region(
@@ -138,7 +138,7 @@ def compile_erased_dense_program(
             _centered_fold_scale_contract_plan(centered_region, scale_placement=scale_placement),
             semantic_erasure_report=erased.report,
         )
-        validate_plan_semantic_erasure(plan)
+        validate_reference_plan_semantic_erasure(plan)
         return plan
     region, reasons = _find_fold_scale_contract_region(
         erased.program.operations,
@@ -150,7 +150,7 @@ def compile_erased_dense_program(
         _fold_scale_contract_plan(region, scale_placement=scale_placement),
         semantic_erasure_report=erased.report,
     )
-    validate_plan_semantic_erasure(plan)
+    validate_reference_plan_semantic_erasure(plan)
     return plan
 
 
@@ -424,7 +424,7 @@ def _fold_scale_contract_plan(
     region: _FoldScaleContractRegion,
     *,
     scale_placement: RowScalePlacement,
-) -> RegionPlan:
+) -> ReferenceRegionPlan:
     first = region.producer_contract
     second = region.consumer_contract
     fold_source = region.squared.inputs[0]
@@ -631,14 +631,16 @@ def _fold_scale_contract_plan(
         numerical_equivalence=NumericalEquivalence.ALGEBRAICALLY_EXACT,
         numerical_effect=numerical_effect,
     )
-    return RegionPlan(skeletons=(gemm_0, reduction, gemm_1), materializations=materializations, rewrites=(explanation,))
+    return ReferenceRegionPlan(
+        skeletons=(gemm_0, reduction, gemm_1), materializations=materializations, rewrites=(explanation,)
+    )
 
 
 def _centered_fold_scale_contract_plan(
     region: _CenteredFoldScaleContractRegion,
     *,
     scale_placement: RowScalePlacement,
-) -> RegionPlan:
+) -> ReferenceRegionPlan:
     """Place a generic centered affine normalization around a right contraction."""
     first = region.producer_contract
     second = region.consumer_contract
@@ -961,7 +963,7 @@ def _centered_fold_scale_contract_plan(
         numerical_equivalence=NumericalEquivalence.ALGEBRAICALLY_EXACT,
         numerical_effect=numerical_effect,
     )
-    return RegionPlan(
+    return ReferenceRegionPlan(
         skeletons=(gemm_0, mean_reduction, inverse_reduction, *auxiliary_skeletons, gemm_1),
         materializations=tuple(records),
         rewrites=(explanation,),
@@ -1060,7 +1062,7 @@ def _render_scalar_expression(
     return f"select({', '.join(operands)})"
 
 
-def _materialized_fallback(graph: TensorGraph, *, rejection_reasons: tuple[str, ...]) -> RegionPlan:
+def _materialized_fallback(graph: TensorGraph, *, rejection_reasons: tuple[str, ...]) -> ReferenceRegionPlan:
     skeletons = tuple(_fallback_skeleton(operation) for operation in graph.operations)
     materializations = tuple(
         MaterializationRecord(
@@ -1084,7 +1086,7 @@ def _materialized_fallback(graph: TensorGraph, *, rejection_reasons: tuple[str, 
         numerical_effect="none",
         rejection_reasons=rejection_reasons,
     )
-    return RegionPlan(skeletons=skeletons, materializations=materializations, rewrites=(explanation,))
+    return ReferenceRegionPlan(skeletons=skeletons, materializations=materializations, rewrites=(explanation,))
 
 
 def _fallback_skeleton(operation: SemanticOp) -> GemmSkeleton | TransformSkeleton:

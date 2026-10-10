@@ -62,6 +62,41 @@ ABI and the private LLVM/StableHLO revisions embedded in a jaxlib wheel are not
 a supported extension interface. The root Marin `uv` workflow does not build
 LLVM or these targets.
 
+## Native device-image transport
+
+Fatbin transport version 12 carries a table of device images and an image index
+for every launch. Kernel symbols are scoped to their selected image. Each image
+has a SHA-256 digest; the transport digest covers the image table, mapping,
+launch arguments, storage, and Event records. The decoder retains the 8 MiB
+aggregate code and 16 MiB transport limits. Single-image producers use the same
+format with one image and index zero. Version-11 fatbin packets must be
+regenerated; the older PTX format remains a separate transport.
+
+`GpuFfi` initializes each kernel from its selected image and executes the
+existing launch recipe with its scratch allocation, descriptors, and module
+cache. Public scalar slots retain rank zero. The native compiler's IR image
+attachment still accepts one image; multi-image bundles enter through native
+transport rather than that attachment API.
+Scalar Events also retain zero-dimensional covers and relations. Refined Event
+provenance uses the typed Event schedule schemas: generic physical schedule
+metadata belongs in the compile request, not in the refined-region records.
+Composition derives stream-order Events from actual slot reads, writes, and
+explicit scratch reuse, including partial-to-merge launches.
+
+Build the CPU inspector and transport tests inside the pinned XLA checkout:
+
+```bash
+bazel build @shuttle_mlir//:shuttle-gpu-inspect
+bazel test @shuttle_mlir//:gpu_fatbin_executable_test @shuttle_mlir//:gpu_transport_v2_test
+bazel-bin/external/shuttle_mlir/shuttle-gpu-inspect /path/to/bundle.bin
+```
+
+The inspector emits image digests, launch bindings, and typed slot shapes as
+JSON. It validates decoding without loading CUDA modules; actual GPU execution
+requires the CUDA-enabled standalone runtime test or linked PJRT plugin.
+
+## Compiler behavior
+
 Current implemented behavior is deliberately narrow:
 
 - `shuttle-annotate-source` attaches rename-invariant

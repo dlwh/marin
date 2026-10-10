@@ -21,7 +21,7 @@ from tile_lifetime.jax_routed_reverse_ffi import (
     call_cuda_segmented_input_adjoint_ffi,
     call_cuda_source_indexed_fold_ffi,
 )
-from tile_lifetime.relation import RelationPlan, build_fixed_capacity_relation_plan
+from tile_lifetime.relation import RelationPlacement, RelationPlan, build_fixed_capacity_relation_plan
 from tile_lifetime.xla_hlo_recovery import EntryRegionValue
 from tile_lifetime.xla_relation_program_recovery import (
     RoutedInputAdjointTypedFfiCodegenPlan,
@@ -178,11 +178,15 @@ def plan_distributed_expert_jax_module(
     target_prefix: str,
 ) -> DistributedExpertJaxModulePlan:
     """Instantiate every generic reverse family at a routing-independent shape."""
-    if relation.source_item_count != config.source_items_per_rank * relation.destination_rank_count:
-        raise ValueError("global source domain must partition evenly across JAX expert ranks")
-    local_experts, remainder = divmod(relation.destination_count, relation.destination_rank_count)
-    if remainder:
+    source_counts = relation.source_placement.item_count_by_rank
+    if len(source_counts) != relation.destination_rank_count or any(
+        count != config.source_items_per_rank for count in source_counts
+    ):
+        raise ValueError("source placement must provide the configured number of items for every expert rank")
+    destination_counts = relation.placement.item_count_by_rank
+    if len(destination_counts) != relation.destination_rank_count or len(set(destination_counts)) != 1:
         raise ValueError("destination groups must partition evenly across JAX expert ranks")
+    local_experts = destination_counts[0]
     capacities = np.unique(relation.group_padded_count)
     if capacities.size != 1:
         raise ValueError("distributed JAX module requires one fixed capacity for every destination")
@@ -353,6 +357,7 @@ def build_natural_router_relation(
     route_slots: int,
     destination_rank_by_item: np.ndarray,
     destination_local_item_by_item: np.ndarray,
+    source_placement: RelationPlacement | None = None,
     destination_capacity: int,
 ) -> RelationPlan:
     """Run ordinary JAX router algebra, then materialize its bounded index plane."""
@@ -364,6 +369,7 @@ def build_natural_router_relation(
         np.asarray(route_weights, dtype=np.float32),
         destination_rank_by_item=destination_rank_by_item,
         destination_local_item_by_item=destination_local_item_by_item,
+        source_placement=source_placement,
         destination_capacity=destination_capacity,
     )
 
@@ -577,7 +583,6 @@ def lower_shard_mapped_handler_module_stablehlo(
     source_finalize = _local_source_finalize_function(plan)
     local_sources = plan.config.source_items_per_rank
     route_slots = plan.relation.route_slots
-    local_experts = plan.local_expert_count
     local_edges = local_sources * route_slots
     hidden = plan.config.hidden
 
@@ -617,10 +622,12 @@ def lower_shard_mapped_handler_module_stablehlo(
             up_weight[0],
         )
         valid = row_valid[0]
-        source_rank = jnp.where(valid, row_source_item[0] // local_sources, rank_count)
+        source_rank_by_item = jnp.asarray(plan.relation.source_placement.rank_by_item, dtype=jnp.int32)
+        source_local_item_by_item = jnp.asarray(plan.relation.source_placement.local_item_by_item, dtype=jnp.int32)
+        source_rank = jnp.where(valid, source_rank_by_item[row_source_item[0]], rank_count)
         source_edge = jnp.where(
             valid,
-            (row_source_item[0] % local_sources) * route_slots + row_route_slot[0],
+            source_local_item_by_item[row_source_item[0]] * route_slots + row_route_slot[0],
             local_edges,
         )
         packed_input = (
@@ -634,7 +641,8 @@ def lower_shard_mapped_handler_module_stablehlo(
         received_input = jax_payload_all_to_all(packed_input, axis_name="expert")
         packed_route = route_weight_cotangent.reshape(rank_count, local_sources, route_slots)
         received_route = jax_payload_all_to_all(packed_route, axis_name="expert")
-        destination_rank = route_indices[0] // local_experts
+        destination_rank_by_item = jnp.asarray(plan.relation.placement.rank_by_item, dtype=jnp.int32)
+        destination_rank = destination_rank_by_item[route_indices[0]]
         flat_destination = destination_rank.reshape(-1)
         returned_input_edges = received_input[flat_destination, jnp.arange(local_edges, dtype=jnp.int32)]
         returned_route_cotangent = jnp.take_along_axis(
@@ -872,7 +880,11 @@ def _shard_mapped_handler_arguments(plan: DistributedExpertJaxModulePlan) -> tup
     sources = plan.config.source_items_per_rank
     route_slots = plan.relation.route_slots
     return_metadata = build_relation_return_metadata(plan)
-    route_indices = plan.relation.destination_item.reshape(rank_count, sources, route_slots)
+    source_rank = np.asarray(plan.relation.source_placement.rank_by_item)
+    source_local = np.asarray(plan.relation.source_placement.local_item_by_item)
+    source_order = np.lexsort((source_local, source_rank))
+    route_indices = plan.relation.destination_item.reshape(plan.relation.source_item_count, route_slots)[source_order]
+    route_indices = route_indices.reshape(rank_count, sources, route_slots)
     return (
         jnp.zeros((rank_count, rank_count, sources, hidden), dtype=jnp.bfloat16),
         jnp.asarray(np.stack(tuple(rank.metadata.route_padded_rows for rank in plan.composition.ranks))),

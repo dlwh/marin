@@ -38,7 +38,7 @@ backend allocation choices. The generated payload body is unchanged.
 ## SM90 streaming Contract/Fold inventory
 
 The high-throughput implementation is
-`backends/h100/cute_streaming_sm90.py`. It uses TMA and WGMMA through CuTe.
+`src/tile_lifetime/backends/h100/cute_streaming_sm90.py`. It uses TMA and WGMMA through CuTe.
 
 | Quantity or edge | Previous source | Derivation | Attachment status |
 | --- | --- | --- | --- |

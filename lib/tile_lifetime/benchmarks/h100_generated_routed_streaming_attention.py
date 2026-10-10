@@ -15,7 +15,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from backends.h100.cute_routed_streaming_emitter import compile_h100_routed_streaming_program
 
 from shuttle.ir import DType
 from tile_lifetime import (
@@ -32,6 +31,7 @@ from tile_lifetime import (
     query_major_block_index_plan,
     scaled_score_map,
 )
+from tile_lifetime.backends.h100.cute_routed_streaming_emitter import compile_h100_routed_streaming_program
 
 
 def _non_monotone_relation(sequence: int, block: int, slots: int, seed: int) -> tuple[np.ndarray, np.ndarray]:

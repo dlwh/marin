@@ -18,6 +18,7 @@ from tile_lifetime import (
     ExpertParallelStageKind,
     NumericalPolicy,
     TransportSemantics,
+    uniform_relation_placement,
 )
 from tile_lifetime.cuda_map_fold_codegen import render_cuda_map_fold_include, shuttle_map_fold_program
 from tile_lifetime.ir import (
@@ -103,7 +104,7 @@ def test_public_stablehlo_path_compiles_generic_expert_parallel_plan() -> None:
         input_names=MOE_REGION_INPUT_NAMES,
         gemm_accumulation_dtype=DType.FP32,
         config=ExpertParallelConfig(
-            expert_parallel_size=2,
+            placement=uniform_relation_placement(destination_count=4, rank_count=2),
             segment_padding=2,
             minibatch_size=8,
             macrobatch_size=8,
@@ -113,8 +114,8 @@ def test_public_stablehlo_path_compiles_generic_expert_parallel_plan() -> None:
 
     assert plan.route_relation.token_count == 8
     assert plan.route_relation.slots_per_token == 2
-    assert plan.ownership.global_expert_count == 4
-    assert plan.ownership.local_expert_count == 2
+    assert plan.placement.destination_count == 4
+    assert plan.placement.item_count_by_rank == (2, 2)
     assert plan.schedule.forward_transport.semantics is TransportSemantics.PAYLOAD_PERMUTATION
     assert plan.schedule.reverse_transport.semantics is TransportSemantics.PAYLOAD_PERMUTATION
     assert plan.schedule.merge_implementation == "generated_source_ordered_fold"
@@ -140,14 +141,14 @@ def test_primary_benchmark_fixture_compiles_without_route_metadata() -> None:
         base64.b64decode(PRIMARY_FIXTURE.read_text()),
         input_names=MOE_REGION_INPUT_NAMES,
         gemm_accumulation_dtype=DType.FP32,
-        config=ExpertParallelConfig(expert_parallel_size=4),
+        config=ExpertParallelConfig(placement=uniform_relation_placement(destination_count=384, rank_count=4)),
         numerical_policy=NumericalPolicy.ALLOW_ROUNDING_REORDER,
     )
 
     assert plan.route_relation.token_count == 2048
     assert plan.route_relation.slots_per_token == 6
-    assert plan.ownership.global_expert_count == 384
-    assert plan.ownership.local_expert_count == 96
+    assert plan.placement.destination_count == 384
+    assert plan.placement.item_count_by_rank == (96, 96, 96, 96)
     assert plan.schedule.merge_implementation == "generated_source_ordered_fold"
 
 

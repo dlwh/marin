@@ -284,7 +284,7 @@ def generate_cuda_axis_fold(program: AxisFoldProgram) -> GeneratedCudaAxisFold:
     local_reductions = "\n".join(f"  float local_{value.name} = 0.0f;" for value in program.reductions)
     contribution_updates = "\n".join(
         f"    local_{value.name} = __fadd_rn(local_{value.name}, "
-        f"{_cuda_expression(value.contribution, _input_aliases(program.inputs, 'row', 'column'))});"
+        f"{render_cuda_scalar_expression(value.contribution, _input_aliases(program.inputs, 'row', 'column'))});"
         for value in program.reductions
     )
     shared_declarations = "\n".join(f"  __shared__ float shared_{value.name}[kThreads];" for value in program.reductions)
@@ -527,7 +527,7 @@ def _generate_tiled_row_axis_fold(program: AxisFoldProgram) -> GeneratedCudaAxis
     local_reductions = "\n".join(f"  float local_{value.name}[kOutputsPerGroup] = {{}};" for value in program.reductions)
     contribution_updates = "\n".join(
         f"        local_{value.name}[output_lane] = __fadd_rn(local_{value.name}[output_lane], "
-        f"{_cuda_expression(value.contribution, _input_aliases(program.inputs, 'row', 'column'))});"
+        f"{render_cuda_scalar_expression(value.contribution, _input_aliases(program.inputs, 'row', 'column'))});"
         for value in program.reductions
     )
     shared_declarations = "\n".join(
@@ -543,7 +543,7 @@ def _generate_tiled_row_axis_fold(program: AxisFoldProgram) -> GeneratedCudaAxis
     )
     reduction_aliases = {value.name: f"shared_{value.name}[shared_index]" for value in program.reductions}
     output_aliases = _reduced_output_aliases(program.inputs, program.reduction_axis, "group") | reduction_aliases
-    output_expression = _cuda_expression(program.output_expression, output_aliases)
+    output_expression = render_cuda_scalar_expression(program.output_expression, output_aliases)
     output_store = _output_store(program.output_dtype, "group", output_expression)
     if program.tiled_reduction_strategy is AxisFoldTiledReductionStrategy.WARP_FINALIZE:
         warp_reductions = "\n".join(
@@ -561,7 +561,7 @@ def _generate_tiled_row_axis_fold(program: AxisFoldProgram) -> GeneratedCudaAxis
         warp_output = _output_store(
             program.output_dtype,
             "group",
-            _cuda_expression(program.output_expression, warp_aliases),
+            render_cuda_scalar_expression(program.output_expression, warp_aliases),
         )
         reduction_body = f"""  __syncthreads();
   if (threadIdx.x < kGroupsPerBlock) {{
@@ -893,6 +893,7 @@ def _ffi_axis_fold_group_launch(
             stage.program,
             index=index,
             output_pointer=exposed_data.get(stage.output_name, stage.output_name),
+            input_pointers=exposed_data,
         )
     first_index, second_index = group.stage_indices
     first = pipeline.stages[first_index]
@@ -900,7 +901,7 @@ def _ffi_axis_fold_group_launch(
     inputs = _coalesced_stage_inputs(first, second)
     arguments = ",\n      ".join(
         (
-            *(value.name for value in inputs),
+            *(exposed_data.get(value.name, value.name) for value in inputs),
             exposed_data.get(first.output_name, first.output_name),
             exposed_data.get(second.output_name, second.output_name),
         )
@@ -975,12 +976,12 @@ def _ffi_coalesced_row_axis_fold_kernel(
     second_aliases.pop(first.output_name, None)
     first_updates = "\n".join(
         f"    local_stage{first_index}_{value.name} = __fadd_rn(local_stage{first_index}_{value.name}, "
-        f"{_cuda_expression(value.contribution, first_aliases)});"
+        f"{render_cuda_scalar_expression(value.contribution, first_aliases)});"
         for value in first_program.reductions
     )
     second_updates = "\n".join(
         f"    local_stage{second_index}_{value.name} = __fadd_rn(local_stage{second_index}_{value.name}, "
-        f"{_cuda_expression(value.contribution, second_aliases)});"
+        f"{render_cuda_scalar_expression(value.contribution, second_aliases)});"
         for value in second_program.reductions
     )
     first_initialization = "\n".join(
@@ -1010,7 +1011,7 @@ def _ffi_coalesced_row_axis_fold_kernel(
         _ffi_reduced_output_aliases(first_program.inputs, first_program.reduction_axis, "group")
         | first_reduction_aliases
     )
-    first_expression = _cuda_expression(first_program.output_expression, first_output_aliases)
+    first_expression = render_cuda_scalar_expression(first_program.output_expression, first_output_aliases)
     first_value = (
         first_expression
         if first_program.output_dtype is DType.FP32
@@ -1022,7 +1023,7 @@ def _ffi_coalesced_row_axis_fold_kernel(
     }
     second_output_aliases = _ffi_input_aliases(second_program.inputs, "row", "column", columns)
     second_output_aliases[first.output_name] = "first_value"
-    second_expression = _cuda_expression(
+    second_expression = render_cuda_scalar_expression(
         second_program.output_expression,
         second_output_aliases | second_reduction_aliases,
     )
@@ -1110,7 +1111,8 @@ def _ffi_axis_fold_kernel(program: AxisFoldProgram, *, symbol: str, prefix: str)
     )
     aliases = _ffi_input_aliases(program.inputs, "row", "column", columns)
     contribution_updates = "\n".join(
-        f"    local_{value.name} = __fadd_rn(local_{value.name}, {_cuda_expression(value.contribution, aliases)});"
+        f"    local_{value.name} = __fadd_rn(local_{value.name}, "
+        f"{render_cuda_scalar_expression(value.contribution, aliases)});"
         for value in program.reductions
     )
     shared_updates = "\n".join(
@@ -1167,7 +1169,7 @@ def _ffi_tiled_row_axis_fold_kernel(
     aliases = _ffi_input_aliases(program.inputs, "row", "column", columns)
     contribution_updates = "\n".join(
         f"        local_{value.name}[output_lane] = __fadd_rn(local_{value.name}[output_lane], "
-        f"{_cuda_expression(value.contribution, aliases)});"
+        f"{render_cuda_scalar_expression(value.contribution, aliases)});"
         for value in program.reductions
     )
     shared_updates = "\n".join(
@@ -1177,7 +1179,7 @@ def _ffi_tiled_row_axis_fold_kernel(
     )
     reduction_aliases = {value.name: f"shared_{value.name}[shared_index]" for value in program.reductions}
     output_aliases = _ffi_reduced_output_aliases(program.inputs, program.reduction_axis, "group") | reduction_aliases
-    output_expression = _cuda_expression(program.output_expression, output_aliases)
+    output_expression = render_cuda_scalar_expression(program.output_expression, output_aliases)
     output_store = _output_store(program.output_dtype, "group", output_expression)
     local_reductions = "\n".join(f"  float local_{value.name}[{outputs}] = {{}};" for value in program.reductions)
     shared_declarations = "\n".join(
@@ -1202,7 +1204,7 @@ def _ffi_tiled_row_axis_fold_kernel(
         warp_output = _output_store(
             program.output_dtype,
             "group",
-            _cuda_expression(program.output_expression, warp_aliases),
+            render_cuda_scalar_expression(program.output_expression, warp_aliases),
         )
         reduction_body = f"""  __syncthreads();
   if (threadIdx.x < {groups}) {{
@@ -1319,13 +1321,13 @@ def _ffi_output_body(
 ) -> str:
     if program.output_kind is AxisFoldOutputKind.REDUCED:
         aliases = _ffi_reduced_output_aliases(program.inputs, program.reduction_axis, "group") | reduction_aliases
-        expression = _cuda_expression(program.output_expression, aliases)
+        expression = render_cuda_scalar_expression(program.output_expression, aliases)
         return f"  if (threadIdx.x == 0) {{\n    {_output_store(program.output_dtype, 'group', expression)}\n  }}"
     element_extent = rows if program.reduction_axis is AxisFoldDirection.ROWS else columns
     row = "element" if program.reduction_axis is AxisFoldDirection.ROWS else "group"
     column = "group" if program.reduction_axis is AxisFoldDirection.ROWS else "element"
     aliases = _ffi_input_aliases(program.inputs, row, column, columns) | reduction_aliases
-    expression = _cuda_expression(program.output_expression, aliases)
+    expression = render_cuda_scalar_expression(program.output_expression, aliases)
     return (
         f"  for (int element = threadIdx.x; element < {element_extent}; element += blockDim.x) {{\n"
         f"    const int row = {row};\n"
@@ -1339,7 +1341,13 @@ def _ffi_axis_fold_launch(program: AxisFoldProgram, *, index: int, output: CudaA
     return _ffi_axis_fold_launch_to_pointer(program, index=index, output_pointer=f"{output.name}_data")
 
 
-def _ffi_axis_fold_launch_to_pointer(program: AxisFoldProgram, *, index: int, output_pointer: str) -> str:
+def _ffi_axis_fold_launch_to_pointer(
+    program: AxisFoldProgram,
+    *,
+    index: int,
+    output_pointer: str,
+    input_pointers: dict[str, str] | None = None,
+) -> str:
     prefix = f"Program{index}"
     blocks = (
         f"(k{prefix}Columns + k{prefix}GroupsPerBlock * k{prefix}OutputsPerGroup - 1) / "
@@ -1347,7 +1355,10 @@ def _ffi_axis_fold_launch_to_pointer(program: AxisFoldProgram, *, index: int, ou
         if program.groups_per_block > 1
         else (f"k{prefix}Columns" if program.reduction_axis is AxisFoldDirection.ROWS else f"k{prefix}Rows")
     )
-    arguments = ",\n      ".join((*tuple(value.name for value in program.inputs), output_pointer))
+    pointers = {} if input_pointers is None else input_pointers
+    arguments = ",\n      ".join(
+        (*tuple(pointers.get(value.name, value.name) for value in program.inputs), output_pointer)
+    )
     return f"""
   ShuttleAxisFoldKernel{index}<<<{blocks}, k{prefix}Threads, 0, stream>>>(
       {arguments});
@@ -1492,7 +1503,7 @@ def _wrapper_check(value: AxisFoldInput, program: AxisFoldProgram) -> str:
 
 def _element_output_body(program: AxisFoldProgram, reduction_aliases: dict[str, str]) -> str:
     aliases = _input_aliases(program.inputs, "row", "column") | reduction_aliases
-    expression = _cuda_expression(program.output_expression, aliases)
+    expression = render_cuda_scalar_expression(program.output_expression, aliases)
     store = _output_store(program.output_dtype, "row * kColumns + column", expression)
     element_extent = "kRows" if program.reduction_axis is AxisFoldDirection.ROWS else "kColumns"
     row = "element" if program.reduction_axis is AxisFoldDirection.ROWS else "group"
@@ -1509,7 +1520,7 @@ def _element_output_body(program: AxisFoldProgram, reduction_aliases: dict[str, 
 
 def _reduced_output_body(program: AxisFoldProgram, reduction_aliases: dict[str, str]) -> str:
     aliases = _reduced_output_aliases(program.inputs, program.reduction_axis, "group") | reduction_aliases
-    expression = _cuda_expression(program.output_expression, aliases)
+    expression = render_cuda_scalar_expression(program.output_expression, aliases)
     store = _output_store(program.output_dtype, "group", expression)
     return f"""
   if (threadIdx.x == 0) {{
@@ -1528,7 +1539,8 @@ def _output_store_to(pointer: str, dtype: DType, index: str, expression: str) ->
     return f"{pointer}[{index}] = {expression};"
 
 
-def _cuda_expression(expression: ScalarExpression, aliases: dict[str, str]) -> str:
+def render_cuda_scalar_expression(expression: ScalarExpression, aliases: dict[str, str]) -> str:
+    """Render one supported scalar AST with explicit physical input bindings."""
     kind = expression.kind
     if kind is ScalarExpressionKind.INPUT:
         assert expression.input_name is not None
@@ -1541,7 +1553,14 @@ def _cuda_expression(expression: ScalarExpression, aliases: dict[str, str]) -> s
         if isinstance(expression.constant, bool):
             return "true" if expression.constant else "false"
         return _cuda_float(float(expression.constant))
-    operands = tuple(_cuda_expression(operand, aliases) for operand in expression.operands)
+    operands = tuple(render_cuda_scalar_expression(operand, aliases) for operand in expression.operands)
+    if kind is ScalarExpressionKind.CONVERT:
+        if expression.result_dtype is DType.BF16:
+            return f"__bfloat162float(__float2bfloat16_rn({operands[0]}))"
+        if expression.result_dtype is DType.FP32:
+            return f"static_cast<float>({operands[0]})"
+        assert expression.result_dtype is not None
+        raise ValueError(f"unsupported axis-Fold scalar conversion to {expression.result_dtype.value}")
     if kind is ScalarExpressionKind.ADD:
         return f"__fadd_rn({operands[0]}, {operands[1]})"
     if kind is ScalarExpressionKind.SUBTRACT:

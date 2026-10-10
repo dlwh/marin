@@ -1,20 +1,11 @@
 --- a/jaxlib/jax.cc
 +++ b/jaxlib/jax.cc
-@@ -135,7 +135,8 @@
- #include "tsl/platform/platform.h"
-
- #ifdef SHUTTLE_TEST_OBSERVER
- #include "shuttle/Testing/PythonObserverTestBridge.h"
- #endif
+@@ -134,2 +134,4 @@
+ #include "xla/tsl/platform/status.h"
++#include "shuttle/Transforms/PythonPhysicalArtifactBridge.h"
 +#include "shuttle/Transforms/XlaRegistration.h"
-
- // TODO(phawkins): remove host_id properties after JAX is update to avoid them.
-@@ -302,7 +303,8 @@ NB_MODULE(_jax, m) {
-   nb::register_exception_translator(translate_xla_runtime_error);
-
- #ifdef SHUTTLE_TEST_OBSERVER
-   mlir::shuttle::testing::registerShuttleObserverTestBindings(m);
- #endif
+ #include "tsl/platform/platform.h"
+@@ -300,1 +302,3 @@ NB_MODULE(_jax, m) {
++  mlir::shuttle::registerShuttlePhysicalArtifactBindings(m);
 +  xla::ThrowIfError(mlir::shuttle::registerShuttleXlaTransform());
-
    // Must be before PyClient.compile.

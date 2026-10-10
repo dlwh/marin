@@ -3,12 +3,14 @@
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 
 from shuttle.ir import DType
 from tile_lifetime.event_dataflow_adapters import streaming_contract_fold_event_descriptor
+from tile_lifetime.h100_streaming_lowering import Sm90ForwardPipelineSchedule, select_sm90_contract_schedule
 from tile_lifetime.relation import build_relation_plan
 from tile_lifetime.segmented_grouped_contract_event_schedule import (
     derive_same_stream_segmented_grouped_contract_schedule,
@@ -59,7 +61,22 @@ def test_sm90_streaming_attachment_artifact_matches_the_derived_schedule_boundar
             pipeline_depth=result["schedule"]["stages"],
         ),
     )
-    schedule = derive_streaming_physical_event_schedule(streaming_contract_fold_event_descriptor(program))
+    physical_program = replace(
+        program,
+        schedule=Sm90ForwardPipelineSchedule(
+            contract=select_sm90_contract_schedule(
+                owner_extent=result["shape"]["sequence"],
+                streamed_extent=result["shape"]["sequence"],
+                producer_feature_extent=result["shape"]["head_dimension"],
+                consumer_feature_extent=result["shape"]["head_dimension"],
+                threads=result["schedule"]["threads"],
+                owner_tile=result["schedule"]["tile_m"],
+                streamed_tile=result["schedule"]["tile_n"],
+            ),
+            stages=result["schedule"]["stages"],
+        ),
+    )
+    schedule = derive_streaming_physical_event_schedule(streaming_contract_fold_event_descriptor(physical_program))
 
     assert result["environment"]["hardware"] == "NVIDIA H100 80GB HBM3"
     assert schedule.first_streamed_input_stages == schedule.second_streamed_input_stages == result["schedule"]["stages"]

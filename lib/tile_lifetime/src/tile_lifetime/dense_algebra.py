@@ -1,12 +1,14 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Erase dense frontend names into generic Contract/Map/Fold algebra."""
+"""Build generic dense algebra and retain historical semantic erasure."""
 
+from shuttle.ir import DType
 from tile_lifetime.ir import LayerNormOp, LinearOp, ResidualAddOp, RMSNormOp, TensorGraph, TensorValue
 from tile_lifetime.plan import SemanticLoweringStep
 from tile_lifetime.semantic_erasure import ErasedTensorProgram, build_tensor_erasure_report
 from tile_lifetime.tensor_program import (
+    AxisIndexMap,
     ContractPrimitive,
     FoldPrimitive,
     FoldReducer,
@@ -18,12 +20,357 @@ from tile_lifetime.tensor_program import (
     scalar_binary,
     scalar_constant,
     scalar_input,
+    scalar_select,
     scalar_unary,
+)
+from tile_lifetime.tensor_program import (
+    NumericalPolicy as TensorNumericalPolicy,
 )
 
 
 class DenseSemanticErasureError(ValueError):
     """The recovered dense graph is outside the generic prototype vocabulary."""
+
+
+def dense_composition_tensor_program(
+    *,
+    batch_size: int,
+    sequence_length: int,
+    model_dimension: int,
+    heads: int,
+    query_key_dimension: int,
+    value_dimension: int,
+    feed_forward_dimension: int,
+    epsilon: float = 1e-6,
+    causal: bool = True,
+    dtype: DType = DType.FP32,
+    accumulation_dtype: DType = DType.FP32,
+    numerical_policy: TensorNumericalPolicy = TensorNumericalPolicy.SOURCE_ORDERED,
+) -> TensorProgram:
+    """Build one transformer-like composition from generic tensor algebra.
+
+    The adapter name describes the test program; every operation in the
+    returned program is a generic Contract, Map, or Fold. Contraction feature
+    axes and the normalized-exponential reduction axis remain distinct.
+    """
+    extents = (
+        batch_size,
+        sequence_length,
+        model_dimension,
+        heads,
+        query_key_dimension,
+        value_dimension,
+        feed_forward_dimension,
+    )
+    if any(extent <= 0 for extent in extents) or epsilon <= 0:
+        raise ValueError("dense composition extents and epsilon must be positive")
+
+    batch = TensorAxis(0, batch_size, "batch")
+    query_token = TensorAxis(1, sequence_length, "query_token")
+    key_token = TensorAxis(2, sequence_length, "key_token")
+    model = TensorAxis(3, model_dimension, "model_feature")
+    head = TensorAxis(4, heads, "head")
+    query_key = TensorAxis(5, query_key_dimension, "query_key_feature")
+    value_feature = TensorAxis(6, value_dimension, "value_feature")
+    feed_forward = TensorAxis(7, feed_forward_dimension, "feed_forward_feature")
+
+    source = ProgramValue("source", (batch, query_token, model), dtype)
+    input_scale = ProgramValue("input_scale", (model,), dtype)
+    query_weight = ProgramValue("query_weight", (model, head, query_key), dtype)
+    key_weight = ProgramValue("key_weight", (model, head, query_key), dtype)
+    value_weight = ProgramValue("value_weight", (model, head, value_feature), dtype)
+    output_weight = ProgramValue("output_weight", (head, value_feature, model), dtype)
+    mlp_scale = ProgramValue("mlp_scale", (model,), dtype)
+    gate_weight = ProgramValue("gate_weight", (model, feed_forward), dtype)
+    up_weight = ProgramValue("up_weight", (model, feed_forward), dtype)
+    down_weight = ProgramValue("down_weight", (feed_forward, model), dtype)
+    query_position = ProgramValue("query_position", (query_token,), DType.INT32)
+    key_position = ProgramValue("key_position", (key_token,), DType.INT32)
+
+    operations: list[ContractPrimitive | MapPrimitive | FoldPrimitive] = []
+
+    def mapped(
+        name: str,
+        inputs: tuple[ProgramValue, ...],
+        output: ProgramValue,
+        expression,
+    ) -> ProgramValue:
+        operations.append(MapPrimitive(name, inputs, output, expression))
+        return output
+
+    square = mapped(
+        "input.square",
+        (source,),
+        ProgramValue("input.square", source.axes, accumulation_dtype),
+        scalar_binary(ScalarExpressionKind.MULTIPLY, scalar_input(source.name), scalar_input(source.name)),
+    )
+    sum_squares = ProgramValue("input.sum_squares", (batch, query_token), accumulation_dtype)
+    operations.append(
+        FoldPrimitive(
+            "input.fold",
+            square,
+            sum_squares,
+            (model,),
+            FoldReducer.SUM,
+            accumulation_dtype,
+        )
+    )
+    inverse_scale = mapped(
+        "input.finalize_fold",
+        (sum_squares,),
+        ProgramValue("input.inverse_scale", sum_squares.axes, accumulation_dtype),
+        scalar_unary(
+            ScalarExpressionKind.RSQRT,
+            scalar_binary(
+                ScalarExpressionKind.ADD,
+                scalar_binary(
+                    ScalarExpressionKind.DIVIDE,
+                    scalar_input(sum_squares.name),
+                    scalar_constant(float(model_dimension)),
+                ),
+                scalar_constant(epsilon),
+            ),
+        ),
+    )
+    feature_scaled = mapped(
+        "input.feature_scale",
+        (source, input_scale),
+        ProgramValue("input.feature_scaled", source.axes, dtype),
+        scalar_binary(
+            ScalarExpressionKind.MULTIPLY,
+            scalar_input(source.name),
+            scalar_input(input_scale.name),
+        ),
+    )
+    normalized = mapped(
+        "input.apply_fold",
+        (feature_scaled, inverse_scale),
+        ProgramValue("input.normalized", source.axes, dtype),
+        scalar_binary(
+            ScalarExpressionKind.MULTIPLY,
+            scalar_input(feature_scaled.name),
+            scalar_input(inverse_scale.name),
+        ),
+    )
+
+    query = ProgramValue("query", (batch, query_token, head, query_key), accumulation_dtype)
+    key = ProgramValue("key", (batch, key_token, head, query_key), accumulation_dtype)
+    value = ProgramValue("value", (batch, key_token, head, value_feature), accumulation_dtype)
+    operations.append(
+        ContractPrimitive("project.query", (normalized, query_weight), query, (model,), accumulation_dtype)
+    )
+    token_view = AxisIndexMap(domain_axis=key_token, operand_axis=query_token)
+    operations.extend(
+        (
+            ContractPrimitive(
+                "project.key",
+                (normalized, key_weight),
+                key,
+                (model,),
+                accumulation_dtype,
+                input_index_maps=((token_view,), ()),
+            ),
+            ContractPrimitive(
+                "project.value",
+                (normalized, value_weight),
+                value,
+                (model,),
+                accumulation_dtype,
+                input_index_maps=((token_view,), ()),
+            ),
+        )
+    )
+
+    raw_score = ProgramValue("score.raw", (batch, head, query_token, key_token), accumulation_dtype)
+    operations.append(ContractPrimitive("score.contract", (query, key), raw_score, (query_key,), accumulation_dtype))
+    scaled_score_expression = scalar_binary(
+        ScalarExpressionKind.MULTIPLY,
+        scalar_input(raw_score.name),
+        scalar_constant(query_key_dimension**-0.5),
+    )
+    score_inputs: tuple[ProgramValue, ...] = (raw_score,)
+    if causal:
+        scaled_score_expression = scalar_select(
+            scalar_binary(
+                ScalarExpressionKind.LESS_EQUAL,
+                scalar_input(key_position.name),
+                scalar_input(query_position.name),
+            ),
+            scaled_score_expression,
+            scalar_constant(float("-inf")),
+        )
+        score_inputs = (raw_score, query_position, key_position)
+    mapped_score = mapped(
+        "score.map",
+        score_inputs,
+        ProgramValue("score.mapped", raw_score.axes, accumulation_dtype),
+        scaled_score_expression,
+    )
+    row_axes = (batch, head, query_token)
+    row_max = ProgramValue("score.row_max", row_axes, accumulation_dtype)
+    operations.append(
+        FoldPrimitive("score.maximum", mapped_score, row_max, (key_token,), FoldReducer.MAXIMUM, accumulation_dtype)
+    )
+    centered = mapped(
+        "score.center",
+        (mapped_score, row_max),
+        ProgramValue("score.centered", raw_score.axes, accumulation_dtype),
+        scalar_binary(
+            ScalarExpressionKind.SUBTRACT,
+            scalar_input(mapped_score.name),
+            scalar_input(row_max.name),
+        ),
+    )
+    exponential = mapped(
+        "score.exponential",
+        (centered,),
+        ProgramValue("score.exponential", raw_score.axes, accumulation_dtype),
+        scalar_unary(ScalarExpressionKind.EXP, scalar_input(centered.name)),
+    )
+    row_sum = ProgramValue("score.row_sum", row_axes, accumulation_dtype)
+    operations.append(
+        FoldPrimitive("score.sum", exponential, row_sum, (key_token,), FoldReducer.SUM, accumulation_dtype)
+    )
+    weighted = ProgramValue("weighted", (batch, query_token, head, value_feature), accumulation_dtype)
+    operations.append(
+        ContractPrimitive("value.contract", (exponential, value), weighted, (key_token,), accumulation_dtype)
+    )
+    attended = mapped(
+        "value.normalize",
+        (weighted, row_sum),
+        ProgramValue("attended", weighted.axes, dtype),
+        scalar_binary(
+            ScalarExpressionKind.DIVIDE,
+            scalar_input(weighted.name),
+            scalar_input(row_sum.name),
+        ),
+    )
+    projected = ProgramValue("projected", source.axes, accumulation_dtype)
+    operations.append(
+        ContractPrimitive(
+            "output.contract", (attended, output_weight), projected, (head, value_feature), accumulation_dtype
+        )
+    )
+    residual = mapped(
+        "residual.add",
+        (source, projected),
+        ProgramValue("residual", source.axes, dtype),
+        scalar_binary(ScalarExpressionKind.ADD, scalar_input(source.name), scalar_input(projected.name)),
+    )
+
+    mlp_square = mapped(
+        "mlp.square",
+        (residual,),
+        ProgramValue("mlp.square", residual.axes, accumulation_dtype),
+        scalar_binary(ScalarExpressionKind.MULTIPLY, scalar_input(residual.name), scalar_input(residual.name)),
+    )
+    mlp_sum_squares = ProgramValue("mlp.sum_squares", (batch, query_token), accumulation_dtype)
+    operations.append(
+        FoldPrimitive(
+            "mlp.fold",
+            mlp_square,
+            mlp_sum_squares,
+            (model,),
+            FoldReducer.SUM,
+            accumulation_dtype,
+        )
+    )
+    mlp_inverse_scale = mapped(
+        "mlp.finalize_fold",
+        (mlp_sum_squares,),
+        ProgramValue("mlp.inverse_scale", mlp_sum_squares.axes, accumulation_dtype),
+        scalar_unary(
+            ScalarExpressionKind.RSQRT,
+            scalar_binary(
+                ScalarExpressionKind.ADD,
+                scalar_binary(
+                    ScalarExpressionKind.DIVIDE,
+                    scalar_input(mlp_sum_squares.name),
+                    scalar_constant(float(model_dimension)),
+                ),
+                scalar_constant(epsilon),
+            ),
+        ),
+    )
+    mlp_feature_scaled = mapped(
+        "mlp.feature_scale",
+        (residual, mlp_scale),
+        ProgramValue("mlp.feature_scaled", residual.axes, dtype),
+        scalar_binary(
+            ScalarExpressionKind.MULTIPLY,
+            scalar_input(residual.name),
+            scalar_input(mlp_scale.name),
+        ),
+    )
+    mlp_input = mapped(
+        "mlp.apply_fold",
+        (mlp_feature_scaled, mlp_inverse_scale),
+        ProgramValue("mlp.input", residual.axes, dtype),
+        scalar_binary(
+            ScalarExpressionKind.MULTIPLY,
+            scalar_input(mlp_feature_scaled.name),
+            scalar_input(mlp_inverse_scale.name),
+        ),
+    )
+    gate = ProgramValue("gate", (batch, query_token, feed_forward), accumulation_dtype)
+    up = ProgramValue("up", gate.axes, accumulation_dtype)
+    operations.extend(
+        (
+            ContractPrimitive("gate.contract", (mlp_input, gate_weight), gate, (model,), accumulation_dtype),
+            ContractPrimitive("up.contract", (mlp_input, up_weight), up, (model,), accumulation_dtype),
+        )
+    )
+    sigmoid_gate = scalar_binary(
+        ScalarExpressionKind.DIVIDE,
+        scalar_input(gate.name),
+        scalar_binary(
+            ScalarExpressionKind.ADD,
+            scalar_constant(1.0),
+            scalar_unary(
+                ScalarExpressionKind.EXP,
+                scalar_binary(
+                    ScalarExpressionKind.SUBTRACT,
+                    scalar_constant(0.0),
+                    scalar_input(gate.name),
+                ),
+            ),
+        ),
+    )
+    hidden = mapped(
+        "activation.map",
+        (gate, up),
+        ProgramValue("hidden", gate.axes, dtype),
+        scalar_binary(ScalarExpressionKind.MULTIPLY, sigmoid_gate, scalar_input(up.name)),
+    )
+    down = ProgramValue("down", source.axes, accumulation_dtype)
+    operations.append(
+        ContractPrimitive("down.contract", (hidden, down_weight), down, (feed_forward,), accumulation_dtype)
+    )
+    output = mapped(
+        "output.add",
+        (residual, down),
+        ProgramValue("output", source.axes, dtype),
+        scalar_binary(ScalarExpressionKind.ADD, scalar_input(residual.name), scalar_input(down.name)),
+    )
+    inputs = (
+        source,
+        input_scale,
+        query_weight,
+        key_weight,
+        value_weight,
+        output_weight,
+        mlp_scale,
+        gate_weight,
+        up_weight,
+        down_weight,
+        *((query_position, key_position) if causal else ()),
+    )
+    return TensorProgram(
+        inputs=inputs,
+        operations=tuple(operations),
+        outputs=(output,),
+        numerical_policy=numerical_policy,
+    )
 
 
 def erase_dense_semantics(graph: TensorGraph) -> ErasedTensorProgram:
@@ -152,7 +499,7 @@ def erase_dense_semantics(graph: TensorGraph) -> ErasedTensorProgram:
                                 scalar_binary(
                                     ScalarExpressionKind.DIVIDE,
                                     scalar_input(summed.name),
-                                    scalar_constant(reduction_axis.extent),
+                                    scalar_constant(float(reduction_axis.extent)),
                                 ),
                                 scalar_constant(operation.epsilon),
                             ),
@@ -233,7 +580,7 @@ def erase_dense_semantics(graph: TensorGraph) -> ErasedTensorProgram:
                         expression=scalar_binary(
                             ScalarExpressionKind.DIVIDE,
                             scalar_input(summed.name),
-                            scalar_constant(reduction_axis.extent),
+                            scalar_constant(float(reduction_axis.extent)),
                         ),
                     ),
                     MapPrimitive(
@@ -249,7 +596,7 @@ def erase_dense_semantics(graph: TensorGraph) -> ErasedTensorProgram:
                                     scalar_binary(
                                         ScalarExpressionKind.DIVIDE,
                                         scalar_input(sum_squares.name),
-                                        scalar_constant(reduction_axis.extent),
+                                        scalar_constant(float(reduction_axis.extent)),
                                     ),
                                     scalar_binary(
                                         ScalarExpressionKind.MULTIPLY,

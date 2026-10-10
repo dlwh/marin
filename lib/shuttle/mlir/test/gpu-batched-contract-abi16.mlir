@@ -76,7 +76,7 @@
 // FAST-SCHEDULE: domain_shape = array<i64: 2, 3, 5, 11, 7>{{.*}}grid_shape = array<i64: 42>{{.*}}kind = #shuttle.schedule_task_kind<contract>{{.*}}reduction_axis = 4{{.*}}reduction_order = #shuttle.schedule_reduction_order<leaf_order_free>{{.*}}serial_tiles = 1{{.*}}tile_shape = array<i64: 8>{{.*}}workgroup_threads = 256
 // SOURCE-SCHEDULE-B: domain_shape = array<i64: 3, 2, 4, 6, 13>{{.*}}grid_shape = array<i64: 1>{{.*}}kind = #shuttle.schedule_task_kind<contract>{{.*}}reduction_axis = 4{{.*}}reduction_order = #shuttle.schedule_reduction_order<serial_ascending_fma_rn_f32>{{.*}}serial_tiles = 13{{.*}}tile_shape = array<i64: 144>{{.*}}workgroup_threads = 160
 // FAST-SCHEDULE-B: domain_shape = array<i64: 3, 2, 4, 6, 13>{{.*}}grid_shape = array<i64: 18>{{.*}}kind = #shuttle.schedule_task_kind<contract>{{.*}}reduction_axis = 4{{.*}}reduction_order = #shuttle.schedule_reduction_order<leaf_order_free>{{.*}}serial_tiles = 1{{.*}}tile_shape = array<i64: 8>{{.*}}workgroup_threads = 256
-// MATERIALIZATION-MUTATION: Contract buffers must bind four distinct parallel axes and one reduction axis with equal bf16 or f32 input types
+// MATERIALIZATION-MUTATION: Contract buffers must bind four distinct parallel axes and the declared reduction axes with equal bf16 or f32 input types
 // SCHEDULE-MUTATION: schedule geometry must equal the SIMT32 derivation
 
 // FORWARD: %[[CALL:[0-9]+]] = stablehlo.custom_call @shuttle.gpu.executable_bundle.v2

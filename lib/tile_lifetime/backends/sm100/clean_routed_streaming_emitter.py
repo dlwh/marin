@@ -33,6 +33,8 @@ import numpy as np
 from shuttle.ir import DType
 from tile_lifetime.event_dataflow_adapters import sm100_routed_right_resource_descriptor
 from tile_lifetime.ffi_command_buffer import finalize_ffi_handler_source
+from tile_lifetime.h100_scalar_ast import factor_uniform_multiplicative_constant
+from tile_lifetime.normalized_exp_contract_region import ContractDomainTraversal
 from tile_lifetime.right_resource_event_schedule import (
     RightResourceFoldEventSchedule,
     derive_right_resource_fold_event_schedule,
@@ -120,6 +122,13 @@ class PartialMergeScheduleKind(StrEnum):
     ROW_BLOCK = "row_block"
     WARP_ROWS = "warp_rows"
     TILED_PIPELINED = "tiled_pipelined"
+
+
+TILED_FOLD_FEATURE_TILE = 128
+TILED_FOLD_VECTOR_BYTES = 16
+TILED_FOLD_PIPELINE_STAGES = 4
+TILED_FOLD_PIPELINE_BUFFERS = 2
+TILED_FOLD_SHARED_MEMORY_LIMIT_BYTES = 48 * 1024
 
 
 @dataclass(frozen=True)
@@ -364,24 +373,32 @@ def emitter_plan_from_lowering(
     *,
     paged_key_value: bool,
     partial_value_dtype: PartialValueDType = PartialValueDType.BF16,
-    partial_merge_schedule: PartialMergeScheduleKind = PartialMergeScheduleKind.ROW_BLOCK,
+    partial_merge_schedule: PartialMergeScheduleKind | None = None,
 ) -> SM100EmitterPlan:
     """Erase routed-attention names into generic Fold/Contract physical inputs."""
     if lowering.schedule.orientation is not SM100RelationOrientation.RIGHT_MAJOR:
         raise ValueError("the first extracted SM100 template implements only right-major relation traversal")
     if lowering.schedule.partial_state_representation != "log_normalizer_normalized_value":
         raise ValueError("the first compiler-owned SM100 merge accepts normalized-value partial state")
-    if lowering.score_map.softcap is not None:
-        raise ValueError("the first extracted SM100 template does not generate a score softcap")
-
-    restriction_kind = DomainRestrictionKind.CAUSAL if lowering.score_map.causal else DomainRestrictionKind.UNRESTRICTED
+    score_expression, score_scale = factor_uniform_multiplicative_constant(lowering.score_map.expression)
+    if (
+        score_expression.kind is not ScalarExpressionKind.INPUT
+        or score_expression.input_name != lowering.score_map.score_input
+    ):
+        raise ValueError("the first extracted SM100 score hook requires a scaled identity scalar AST")
+    restriction_kind = {
+        ContractDomainTraversal.FULL: DomainRestrictionKind.UNRESTRICTED,
+        ContractDomainTraversal.LOWER_TRIANGULAR: DomainRestrictionKind.CAUSAL,
+    }[lowering.score_map.domain_traversal]
     restriction = DomainRestrictionProgram(kind=restriction_kind, apply_sequence_bounds=True)
     fold = NormalizedExpFoldProgram(
-        score_scale=lowering.score_map.scale,
+        score_scale=score_scale,
         accumulator_dtype="fp32",
         state_fields=("row_max", "row_sum_exp", "weighted_value_accumulator"),
         exponential_base=2,
     )
+    if partial_merge_schedule is None:
+        partial_merge_schedule = select_partial_merge_schedule(lowering, partial_value_dtype)
     generic_program = None
     if partial_merge_schedule is PartialMergeScheduleKind.TILED_PIPELINED:
         axes = TiledFoldAxes(
@@ -398,12 +415,12 @@ def emitter_plan_from_lowering(
                 axes=axes,
                 partial_addressing=FoldPartialAddressing.DENSE,
                 row_tile=lowering.schedule.partial_merge_tile_rows,
-                feature_tile=128,
-                vector_bytes=16,
-                shared_stages=4,
+                feature_tile=TILED_FOLD_FEATURE_TILE,
+                vector_bytes=TILED_FOLD_VECTOR_BYTES,
+                shared_stages=TILED_FOLD_PIPELINE_STAGES,
                 threads=lowering.schedule.partial_merge_threads,
                 partial_lanes=32,
-                shared_buffers=2,
+                shared_buffers=TILED_FOLD_PIPELINE_BUFFERS,
                 input_layout=TiledFoldInputLayout(
                     addressing=FoldPartialAddressing.DENSE,
                     value_axis_order=(
@@ -464,6 +481,35 @@ def emitter_plan_from_lowering(
         },
         external_semantic_kernels=(),
     )
+
+
+def select_partial_merge_schedule(
+    lowering: SM100RoutedStreamingLowering,
+    partial_value_dtype: PartialValueDType,
+) -> PartialMergeScheduleKind:
+    """Choose a Fold finalizer from typed geometry and its bounded resource envelope."""
+    schedule = lowering.schedule
+    row_count = lowering.query_length * lowering.key_value_heads * lowering.head_group_size
+    element_bytes = 2 if partial_value_dtype is PartialValueDType.BF16 else 4
+    staged_value_bytes = (
+        schedule.partial_merge_tile_rows
+        * TILED_FOLD_PIPELINE_BUFFERS
+        * TILED_FOLD_PIPELINE_STAGES
+        * TILED_FOLD_FEATURE_TILE
+        * element_bytes
+    )
+    tiled_envelope_fits = (
+        partial_value_dtype is PartialValueDType.BF16
+        and row_count > 0
+        and schedule.partial_merge_tile_rows == 8
+        and schedule.partial_merge_threads == 256
+        and lowering.selected_count <= 32
+        and TILED_FOLD_FEATURE_TILE * element_bytes % TILED_FOLD_VECTOR_BYTES == 0
+        and staged_value_bytes <= TILED_FOLD_SHARED_MEMORY_LIMIT_BYTES
+    )
+    if tiled_envelope_fits:
+        return PartialMergeScheduleKind.TILED_PIPELINED
+    return PartialMergeScheduleKind.ROW_BLOCK
 
 
 def q2k_indices_from_lowering(lowering: SM100RoutedStreamingLowering) -> np.ndarray:
@@ -1661,7 +1707,7 @@ def extract_clean_sm100_sources(
     *,
     paged_key_value: bool = True,
     partial_value_dtype: PartialValueDType = PartialValueDType.BF16,
-    partial_merge_schedule: PartialMergeScheduleKind = PartialMergeScheduleKind.ROW_BLOCK,
+    partial_merge_schedule: PartialMergeScheduleKind | None = None,
 ) -> ExtractedSM100Sources:
     """Extract and audit the first generic physical source family."""
     root = msa_root.resolve()
@@ -1779,7 +1825,7 @@ def extract_clean_sm100_sources(
                 "partial_normalized_value": partial_value_dtype.value,
                 "partial_merge_accumulator": "fp32",
                 "partial_merge_order": "ascending_partial_slot",
-                "partial_merge_schedule": partial_merge_schedule.value,
+                "partial_merge_schedule": plan.partial_merge.schedule_kind.value,
             },
         },
     )

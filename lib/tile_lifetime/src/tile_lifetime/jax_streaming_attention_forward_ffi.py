@@ -1,13 +1,12 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Expose a generated streaming Contract/Fold forward as JAX typed FFI.
+"""Quarantined forward adapter for the legacy fixed Triton benchmark kernel.
 
-JAX remains responsible for differentiation.  This module owns only the early
-physical realization of the recovered QK Contract, score Map,
-DomainRestriction, normalized-exponential Fold, and PV Contract.  It returns
-the natural BF16 output together with the minimal FP32 log-normalizer state
-consumed by a separately scheduled generated reverse.
+The fixed source signature is retained for historical AOT evidence. New SM90
+lowering uses the generic scalar-AST/domain-predicate compiler path. JAX remains
+responsible for differentiation here, and this adapter returns BF16 output with
+the FP32 log-normalizer state consumed by its paired legacy reverse.
 """
 
 from __future__ import annotations
@@ -37,8 +36,8 @@ from tile_lifetime.jax_streaming_attention_backward_ffi import (
     TritonAotKernelPlan,
     _aot_launcher_declarations,
     _forward_aot_plan,
+    _legacy_fixed_kernel_score_parameters,
     _run_triton_aot_compile,
-    _score_map_parameters,
     _validate_program,
     _validated_output_layouts,
 )
@@ -93,9 +92,10 @@ def generate_streaming_attention_forward_ffi(
     if num_warps not in (4, 8) or num_stages not in (2, 3, 4):
         raise ValueError("streaming forward AOT schedule requires 4/8 warps and 2-4 stages")
 
-    query, key = program.forward.qk.inputs
-    value = program.forward.pv.inputs[1]
-    output_shape = program.forward.finalize.output.shape
+    region = program.forward.region
+    query, key = region.producer.inputs
+    value = region.consumer.inputs[1]
+    output_shape = region.finalizer.output.shape
     log_sum_exp_shape = (query.shape[0], query.shape[2], query.shape[1])
     inputs = (
         StreamingAttentionBackwardFfiBuffer("query", DType.BF16, query.shape),
@@ -113,7 +113,7 @@ def generate_streaming_attention_forward_ffi(
             layout_by_name["log_sum_exp"],
         ),
     )
-    parameters = _score_map_parameters(program.forward.score_map.expression, program.forward.qk.output.name)
+    parameters = _legacy_fixed_kernel_score_parameters(region.score_map.expression, region.producer.output.name)
     kernel = _forward_aot_plan(
         query.shape,
         key.shape,
@@ -127,7 +127,7 @@ def generate_streaming_attention_forward_ffi(
         "query": query.shape,
         "key": key.shape,
         "value": value.shape,
-        "score_map": json.loads(serialize_scalar_expression(program.forward.score_map.expression)),
+        "score_map": json.loads(serialize_scalar_expression(region.score_map.expression)),
         "fold_state": ("maximum", "sum_exp", "weighted_value"),
         "saved_state": "log_sum_exp",
         "output_layouts": {output.name: output.layout for output in outputs},

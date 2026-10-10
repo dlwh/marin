@@ -7,11 +7,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import StrEnum
+from typing import Generic, TypeVar
 
 import numpy as np
 
 from shuttle.ir import DType
-from tile_lifetime.autodiff import differentiate_scalar_expression
+from tile_lifetime.autodiff import scalar_expression_vjp
 from tile_lifetime.event_dataflow import TaskAxis, TaskFamily, TaskRelation
 from tile_lifetime.fold_placement import (
     FoldAttachment,
@@ -19,12 +20,23 @@ from tile_lifetime.fold_placement import (
     OwnerTileAvailability,
     attach_fold_to_owner_preparation,
 )
+from tile_lifetime.normalized_exp_contract_region import (
+    ContractDomainTraversal,
+    NormalizedExpContractProgram,
+    NormalizedExpContractPullback,
+    ReverseContractFoldOrder,
+    ReverseOwnershipPlan,
+    derive_normalized_exp_contract_pullback,
+    derive_reverse_ownership_plan,
+    normalized_exp_finalizer_scale,
+    relation_group_size,
+)
 from tile_lifetime.plan import NumericalPolicy
 from tile_lifetime.shared_reverse_fusion import SharedReverseFusionPlan, plan_shared_producer_reverse_fusion
 from tile_lifetime.streaming_attention import (
     AttentionScoreAxis,
     StreamingAttentionExecution,
-    StreamingAttentionProgram,
+    StreamingTileSchedule,
     _align_array,
     _contract,
     _evaluate_map,
@@ -34,14 +46,10 @@ from tile_lifetime.streaming_attention import (
 )
 from tile_lifetime.tensor_program import (
     FoldPrimitive,
-    FoldReducer,
     MapPrimitive,
     ProgramValue,
-    ScalarExpressionKind,
     TensorProgram,
-    scalar_binary,
     scalar_expression_inputs,
-    scalar_input,
 )
 
 
@@ -79,17 +87,13 @@ class StreamingAttentionBackwardProvenance(StrEnum):
     JAX_VJP_HLO_RECOVERY = "jax_vjp_hlo_recovery"
 
 
-class StreamingAttentionBackwardDomainTraversal(StrEnum):
-    """Physical traversal selected from the score-domain restriction."""
-
-    FULL = "full"
-    LOWER_TRIANGULAR = "lower_triangular"
+StreamingAttentionBackwardDomainTraversal = ContractDomainTraversal
 
 
-class StreamingAttentionBackwardFoldOrder(StrEnum):
-    """Explicit finite-precision order for the key/value gradient Fold."""
+StreamingAttentionBackwardFoldOrder = ReverseContractFoldOrder
 
-    QUERY_ROW_MAJOR_MAPPED_HEAD_MINOR_TREE = "query_row_major_mapped_head_minor_tree"
+
+ForwardScheduleT = TypeVar("ForwardScheduleT")
 
 
 @dataclass(frozen=True)
@@ -107,6 +111,7 @@ class StreamingAttentionBackwardTileSchedule:
     query_heads_per_key_value_tile: int
     domain_traversal: StreamingAttentionBackwardDomainTraversal
     key_value_fold_order: StreamingAttentionBackwardFoldOrder
+    ownership: ReverseOwnershipPlan
     query_owner_attachments: tuple[FoldAttachment, ...] = ()
 
     def __post_init__(self) -> None:
@@ -117,6 +122,24 @@ class StreamingAttentionBackwardTileSchedule:
         )
         if any(extent <= 0 for extent in extents):
             raise ValueError("streaming backward tile extents must be positive")
+        if self.domain_traversal is not self.ownership.traversal:
+            raise ValueError("reverse tile traversal must match the relation-derived ownership plan")
+
+    @property
+    def contract_tile_m(self) -> int:
+        return self.query_tile_size
+
+    @property
+    def contract_tile_n(self) -> int:
+        return self.key_value_tile_size
+
+    @property
+    def index_relation_group_size(self) -> int:
+        return self.query_heads_per_key_value_tile
+
+    @property
+    def right_owner_fold_order(self) -> ReverseContractFoldOrder:
+        return self.key_value_fold_order
 
 
 @dataclass(frozen=True)
@@ -157,7 +180,7 @@ class StreamingAttentionBackwardWorkEstimate:
 
 
 @dataclass(frozen=True)
-class StreamingAttentionBackwardProgram:
+class StreamingAttentionBackwardProgram(Generic[ForwardScheduleT]):
     """A reverse stream with visible scalar and contraction algebra.
 
     Accepted end-to-end paths recover this structure from JAX VJP HLO.  The
@@ -165,18 +188,34 @@ class StreamingAttentionBackwardProgram:
     work until that recovery boundary is connected.
     """
 
-    forward: StreamingAttentionProgram
-    output_cotangent: ProgramValue
-    output_dot_map: MapPrimitive
-    output_dot_fold: FoldPrimitive
-    score_map_vjp: MapPrimitive
-    output_scale: float
+    forward: NormalizedExpContractProgram[ForwardScheduleT]
+    pullback: NormalizedExpContractPullback
     stages: tuple[StreamingAttentionBackwardStage, ...]
     materialized_values: tuple[ProgramValue, ...]
     provenance: StreamingAttentionBackwardProvenance
     accumulation_dtype: DType = DType.FP32
     reassociation: StreamingAttentionBackwardReassociation = StreamingAttentionBackwardReassociation.DETERMINISTIC_TREE
     maximum_vjp: StreamingAttentionBackwardMaximumVJP = StreamingAttentionBackwardMaximumVJP.NORMALIZED_EXP_INVARIANT
+
+    @property
+    def output_cotangent(self) -> ProgramValue:
+        return self.pullback.output_cotangent
+
+    @property
+    def output_dot_map(self) -> MapPrimitive:
+        return self.pullback.output_product
+
+    @property
+    def output_dot_fold(self) -> FoldPrimitive:
+        return self.pullback.output_dependent_fold
+
+    @property
+    def score_map_vjp(self) -> MapPrimitive:
+        return self.pullback.score_map_vjp
+
+    @property
+    def output_scale(self) -> float:
+        return self.pullback.output_scale
 
 
 @dataclass(frozen=True)
@@ -189,70 +228,16 @@ class StreamingAttentionBackwardExecution:
 
 
 def derive_streaming_attention_backward(
-    forward: StreamingAttentionProgram,
-) -> StreamingAttentionBackwardProgram:
+    forward: NormalizedExpContractProgram[ForwardScheduleT],
+) -> StreamingAttentionBackwardProgram[ForwardScheduleT]:
     """Build a reference reverse program used to validate JAX-VJP recovery."""
-    query, key = forward.qk.inputs
-    value = forward.pv.inputs[1]
-    output_cotangent = ProgramValue(
-        "cotangent.streaming_output",
-        forward.finalize.output.axes,
-        DType.FP32,
-    )
-    output_product = ProgramValue(
-        "streaming_output_times_cotangent",
-        forward.finalize.output.axes,
-        DType.FP32,
-    )
-    output_dot = ProgramValue(
-        "streaming_output_dot_cotangent",
-        forward.finalize.output.axes[:-1],
-        DType.FP32,
-    )
-    output_dot_map = MapPrimitive(
-        name="multiply output by output cotangent",
-        inputs=(forward.finalize.output, output_cotangent),
-        output=output_product,
-        expression=scalar_binary(
-            ScalarExpressionKind.MULTIPLY,
-            scalar_input(forward.finalize.output.name),
-            scalar_input(output_cotangent.name),
-        ),
-    )
-    output_dot_fold = FoldPrimitive(
-        name="fold output feature products",
-        input=output_product,
-        output=output_dot,
-        reduction_axes=(forward.finalize.output.axes[-1],),
-        reducer=FoldReducer.SUM,
-        accumulation_dtype=DType.FP32,
-    )
-    score_map_derivative = differentiate_scalar_expression(
-        forward.score_map.expression,
-        forward.qk.output.name,
-    )
-    derivative_input_names = scalar_expression_inputs(score_map_derivative)
-    score_map_vjp = MapPrimitive(
-        name="generated score Map derivative",
-        inputs=tuple(value for value in forward.score_map.inputs if value.name in derivative_input_names),
-        output=forward.score_map.output,
-        expression=score_map_derivative,
-    )
-    output_scale = _normalized_output_scale(forward)
-    cotangents = (
-        ProgramValue("cotangent.query", query.axes, DType.FP32),
-        ProgramValue("cotangent.key", key.axes, DType.FP32),
-        ProgramValue("cotangent.value", value.axes, DType.FP32),
-    )
+    pullback = derive_normalized_exp_contract_pullback(forward.region)
+    cotangents = tuple(gradient.destination for gradient in pullback.terminal_gradients)
     return StreamingAttentionBackwardProgram(
         forward=forward,
-        output_cotangent=output_cotangent,
-        output_dot_map=output_dot_map,
-        output_dot_fold=output_dot_fold,
-        score_map_vjp=score_map_vjp,
-        output_scale=output_scale,
+        pullback=pullback,
         stages=tuple(StreamingAttentionBackwardStage),
-        materialized_values=(*cotangents, output_dot),
+        materialized_values=(*cotangents, pullback.output_dependent_fold.output),
         provenance=StreamingAttentionBackwardProvenance.REFERENCE_SYMBOLIC_VJP,
     )
 
@@ -292,10 +277,11 @@ def verify_streaming_attention_backward_score_map_vjp(
     program. This check keeps the semantic mutation boundary explicit before a
     backend binds the scalar derivative into its tile schedule.
     """
-    forward_map = program.forward.score_map
-    expected_expression = differentiate_scalar_expression(
+    forward_map = program.forward.region.score_map
+    expected_expression = scalar_expression_vjp(
         forward_map.expression,
-        program.forward.qk.output.name,
+        input_name=program.forward.region.producer.output.name,
+        cotangent_name=program.pullback.normalized_exp_pullback.output.name,
     )
     if program.score_map_vjp.expression != expected_expression:
         raise ValueError("score Map VJP is not the derivative of the recovered forward scalar AST")
@@ -306,7 +292,7 @@ def verify_streaming_attention_backward_score_map_vjp(
             "score Map VJP inputs do not match its derived scalar expression: "
             f"expected {tuple(sorted(expected_inputs))}, found {actual_inputs}"
         )
-    if program.score_map_vjp.output != forward_map.output:
+    if program.score_map_vjp.output.axes != forward_map.output.axes:
         raise ValueError("score Map VJP must preserve the forward score Map output domain")
 
 
@@ -318,19 +304,8 @@ def derive_streaming_attention_backward_tile_schedule(
     domain_traversal: StreamingAttentionBackwardDomainTraversal,
 ) -> StreamingAttentionBackwardTileSchedule:
     """Coalesce query heads that share one operand through a Contract index map."""
-    query, key = program.forward.qk.inputs
-    query_head = next(axis for axis in query.axes if axis.label == AttentionScoreAxis.HEAD.value)
-    key_value_head = next(axis for axis in key.axes if axis.label == "key_value_head")
-    matching_maps = tuple(
-        index_map
-        for index_map in program.forward.qk.index_maps_for_input(1)
-        if index_map.domain_axis == query_head and index_map.operand_axis == key_value_head
-    )
-    if len(matching_maps) != 1:
-        raise ValueError("streaming backward requires one query-head to K/V-head index relation")
-    index_map = matching_maps[0]
-    if query_head.extent != key_value_head.extent * index_map.divisor:
-        raise ValueError("query-head index relation must partition query heads evenly")
+    matching_maps = program.forward.region.producer.index_maps_for_input(1)
+    group_size = relation_group_size(matching_maps)
     output_dot_attachment = attach_fold_to_owner_preparation(
         program.output_dot_map,
         program.output_dot_fold,
@@ -344,10 +319,11 @@ def derive_streaming_attention_backward_tile_schedule(
     return StreamingAttentionBackwardTileSchedule(
         query_tile_size=query_tile_size,
         key_value_tile_size=key_value_tile_size,
-        query_heads_per_key_value_tile=index_map.divisor,
+        query_heads_per_key_value_tile=group_size,
         domain_traversal=domain_traversal,
-        key_value_fold_order=StreamingAttentionBackwardFoldOrder.QUERY_ROW_MAJOR_MAPPED_HEAD_MINOR_TREE,
+        key_value_fold_order=ReverseContractFoldOrder.STREAMED_AXES_MAJOR_MAPPED_RELATION_MINOR_TREE,
         query_owner_attachments=(output_dot_attachment,),
+        ownership=derive_reverse_ownership_plan(program.pullback, traversal=domain_traversal),
     )
 
 
@@ -356,7 +332,7 @@ def estimate_streaming_attention_backward_work(
     schedule: StreamingAttentionBackwardTileSchedule,
 ) -> StreamingAttentionBackwardWorkEstimate:
     """Count physical reverse Contracts without executing a target backend."""
-    query, key = program.forward.qk.inputs
+    query, key = program.forward.region.producer.inputs
     query_axis = next(axis for axis in query.axes if axis.label == AttentionScoreAxis.QUERY.value)
     key_axis = next(axis for axis in key.axes if axis.label == AttentionScoreAxis.KEY.value)
     batch_axis = next(axis for axis in query.axes if axis.label == AttentionScoreAxis.BATCH.value)
@@ -421,7 +397,7 @@ def derive_streaming_attention_backward_fusion_plan(
     accumulator frontier cannot remain local; it never inserts atomics or
     partial-gradient materialization implicitly.
     """
-    query, key = program.forward.qk.inputs
+    query, key = program.forward.region.producer.inputs
     query_axis = next(axis for axis in query.axes if axis.label == AttentionScoreAxis.QUERY.value)
     key_axis = next(axis for axis in key.axes if axis.label == AttentionScoreAxis.KEY.value)
     batch_axis = next(axis for axis in query.axes if axis.label == AttentionScoreAxis.BATCH.value)
@@ -483,32 +459,65 @@ def execute_streaming_attention_backward(
     forward_execution: StreamingAttentionExecution,
     output_cotangent: np.ndarray,
 ) -> StreamingAttentionBackwardExecution:
-    """Execute the reverse stream without score/probability materialization."""
+    """Execute the reference reverse, recomputing primal state for the generic finalizer VJP."""
     forward = program.forward
+    region = forward.region
     values = _validated_inputs(forward.source, inputs)
-    query_value, key_value = forward.qk.inputs
-    value_value = forward.pv.inputs[1]
+    query_value, key_value = region.producer.inputs
+    value_value = region.consumer.inputs[1]
     query = values[query_value.name]
     key = values[key_value.name]
     value = values[value_value.name]
-    if output_cotangent.shape != forward.finalize.output.shape:
+    if output_cotangent.shape != region.finalizer.output.shape:
         raise ValueError(
-            f"output cotangent has shape {output_cotangent.shape}, expected {forward.finalize.output.shape}"
+            f"output cotangent has shape {output_cotangent.shape}, expected {region.finalizer.output.shape}"
         )
-    if forward_execution.output.shape != forward.finalize.output.shape:
+    if forward_execution.output.shape != region.finalizer.output.shape:
         raise ValueError("saved streaming output has the wrong shape")
-    if forward_execution.row_max.shape != forward.state.row_max.shape:
+    if forward_execution.row_max.shape != region.fold_state.row_max.shape:
         raise ValueError("saved row maximum has the wrong shape")
-    if forward_execution.row_sum_exp.shape != forward.state.row_sum_exp.shape:
+    if forward_execution.row_sum_exp.shape != region.fold_state.row_sum_exp.shape:
         raise ValueError("saved row sum-exp has the wrong shape")
 
     query_axis = next(axis for axis in query_value.axes if axis.label == AttentionScoreAxis.QUERY.value)
     key_axis = next(axis for axis in key_value.axes if axis.label == AttentionScoreAxis.KEY.value)
-    row_axes = forward.state.row_max.axes
-    score_axes = forward.qk.output.axes
+    row_axes = region.fold_state.row_max.axes
+    score_axes = region.producer.output.axes
     query_cotangent = np.zeros(query_value.shape, dtype=np.float32)
     key_cotangent = np.zeros(key_value.shape, dtype=np.float32)
     value_cotangent = np.zeros(value_value.shape, dtype=np.float32)
+    unnormalized_state = execute_tensor_program(
+        TensorProgram(
+            inputs=forward.source.inputs,
+            operations=tuple(
+                operation for operation in forward.source.operations if operation.output != region.finalizer.output
+            ),
+            outputs=(region.consumer.output, region.fold_state.row_sum_exp),
+        ),
+        inputs,
+    )
+    normalized_output = execute_tensor_program(
+        TensorProgram(
+            inputs=program.pullback.normalized_output.inputs,
+            operations=(program.pullback.normalized_output,),
+            outputs=(program.pullback.normalized_output.output,),
+        ),
+        {
+            region.consumer.output.name: unnormalized_state[region.consumer.output.name],
+            region.fold_state.row_sum_exp.name: unnormalized_state[region.fold_state.row_sum_exp.name],
+        },
+    )[program.pullback.normalized_output.output.name]
+    finalizer_vjp_bindings = {program.output_cotangent.name: output_cotangent}
+    if program.pullback.normalized_output.output in program.pullback.post_normalization_vjp.inputs:
+        finalizer_vjp_bindings[program.pullback.normalized_output.output.name] = normalized_output
+    normalized_output_cotangent = execute_tensor_program(
+        TensorProgram(
+            inputs=program.pullback.post_normalization_vjp.inputs,
+            operations=(program.pullback.post_normalization_vjp,),
+            outputs=(program.pullback.post_normalization_vjp.output,),
+        ),
+        finalizer_vjp_bindings,
+    )[program.pullback.post_normalization_vjp.output.name]
     output_dot_state = execute_tensor_program(
         TensorProgram(
             inputs=program.output_dot_map.inputs,
@@ -516,8 +525,8 @@ def execute_streaming_attention_backward(
             outputs=(program.output_dot_fold.output,),
         ),
         {
-            forward.finalize.output.name: forward_execution.output,
-            program.output_cotangent.name: output_cotangent,
+            program.pullback.normalized_output.output.name: normalized_output,
+            program.pullback.post_normalization_vjp.output.name: normalized_output_cotangent,
         },
     )[program.output_dot_fold.output.name]
 
@@ -525,7 +534,11 @@ def execute_streaming_attention_backward(
         query_stop = min(query_start + forward.schedule.query_tile_size, query_axis.extent)
         query_slices = {query_axis: slice(query_start, query_stop)}
         query_tile = _slice_array(query, query_value, query_slices).astype(np.float32)
-        output_cotangent_tile = _slice_array(output_cotangent, forward.finalize.output, query_slices).astype(np.float32)
+        normalized_output_cotangent_tile = _slice_array(
+            normalized_output_cotangent,
+            program.pullback.post_normalization_vjp.output,
+            query_slices,
+        ).astype(np.float32)
         row_slices = tuple(slice(query_start, query_stop) if axis == query_axis else slice(None) for axis in row_axes)
         output_dot_slices = tuple(
             slice(query_start, query_stop) if axis == query_axis else slice(None)
@@ -543,7 +556,7 @@ def execute_streaming_attention_backward(
             current_query_tile: np.ndarray,
             current_row_max: np.ndarray,
             current_row_sum_exp: np.ndarray,
-            current_output_cotangent: np.ndarray,
+            current_normalized_output_cotangent: np.ndarray,
         ):
             key_stop = min(key_start + forward.schedule.key_value_tile_size, key_axis.extent)
             tile_slices = {
@@ -552,23 +565,22 @@ def execute_streaming_attention_backward(
             }
             key_tile = _slice_array(key, key_value, tile_slices).astype(np.float32)
             value_tile = _slice_array(value, value_value, tile_slices).astype(np.float32)
-            raw_score = _contract(forward.qk, (current_query_tile, key_tile))
-            score_bindings = {forward.qk.output.name: raw_score}
-            for score_input in forward.score_map.inputs[1:]:
+            raw_score = _contract(region.producer, (current_query_tile, key_tile))
+            score_bindings = {region.producer.output.name: raw_score}
+            for score_input in region.score_map.inputs[1:]:
                 score_bindings[score_input.name] = _slice_array(
                     values[score_input.name],
                     score_input,
                     tile_slices,
                 )
-            mapped_score = _evaluate_map(forward.score_map, score_bindings)
+            mapped_score = _evaluate_map(region.score_map, score_bindings)
             exponential = np.exp(mapped_score - _align_array(current_row_max, row_axes, score_axes))
             probability = exponential / _align_array(current_row_sum_exp, row_axes, score_axes)
-            key_head_map = forward.qk.index_maps_for_input(1)[0]
+            key_head_map = region.producer.index_maps_for_input(1)[0]
             head_indices = key_head_map.indices()
             key_expanded = np.take(key_tile, head_indices, axis=key_value.axes.index(key_head_map.operand_axis))
             value_expanded = np.take(value_tile, head_indices, axis=value_value.axes.index(key_head_map.operand_axis))
-            d_probability = np.einsum("bqhv,bkhv->bhqk", current_output_cotangent, value_expanded)
-            d_probability *= program.output_scale
+            d_probability = np.einsum("bqhv,bkhv->bhqk", current_normalized_output_cotangent, value_expanded)
             return (
                 key_stop,
                 score_bindings,
@@ -597,7 +609,7 @@ def execute_streaming_attention_backward(
                     query_tile,
                     row_max,
                     row_sum_exp,
-                    output_cotangent_tile,
+                    normalized_output_cotangent_tile,
                 )
                 global_d_sum += np.sum(
                     -d_probability * exponential / np.square(aligned_sum),
@@ -614,7 +626,7 @@ def execute_streaming_attention_backward(
                     query_tile,
                     row_max,
                     row_sum_exp,
-                    output_cotangent_tile,
+                    normalized_output_cotangent_tile,
                 )
                 d_centered = (d_probability / aligned_sum + global_d_sum) * exponential
                 global_d_maximum -= np.sum(d_centered, axis=-1, keepdims=True)
@@ -638,7 +650,7 @@ def execute_streaming_attention_backward(
                 query_tile,
                 row_max,
                 row_sum_exp,
-                output_cotangent_tile,
+                normalized_output_cotangent_tile,
             )
             if program.maximum_vjp is StreamingAttentionBackwardMaximumVJP.JAX_EQUAL_SPLIT:
                 assert global_d_sum is not None
@@ -651,14 +663,15 @@ def execute_streaming_attention_backward(
                 d_mapped_score = d_centered + maximum_ties * (global_d_maximum / global_tie_count)
             else:
                 d_mapped_score = probability * (d_probability - output_dot[:, :, :, None].transpose(0, 2, 1, 3))
-            score_derivative = _evaluate_map(program.score_map_vjp, score_bindings)
-            d_raw_score = d_mapped_score * score_derivative
+            score_vjp_bindings = dict(score_bindings)
+            score_vjp_bindings[program.pullback.normalized_exp_pullback.output.name] = d_mapped_score
+            d_raw_score = _evaluate_map(program.score_map_vjp, score_vjp_bindings)
             query_gradient_tile += np.einsum("bhqk,bkhd->bqhd", d_raw_score, key_expanded)
             d_key_expanded = np.einsum("bhqk,bqhd->bkhd", d_raw_score, query_tile)
-            d_value_expanded = program.output_scale * np.einsum(
+            d_value_expanded = np.einsum(
                 "bhqk,bqhv->bkhv",
                 probability,
-                output_cotangent_tile,
+                normalized_output_cotangent_tile,
             )
             key_axis_index = key_value.axes.index(key_axis)
             key_destination = [slice(None)] * key_cotangent.ndim
@@ -680,27 +693,5 @@ def execute_streaming_attention_backward(
     )
 
 
-def _normalized_output_scale(forward: StreamingAttentionProgram) -> float:
-    expression = forward.finalize.expression
-    scale = 1.0
-    if expression.kind is ScalarExpressionKind.MULTIPLY:
-        left, right = expression.operands
-        if left.constant is not None:
-            scale = float(left.constant)
-            expression = right
-        elif right.constant is not None:
-            scale = float(right.constant)
-            expression = left
-        else:
-            raise ValueError("normalized-exp finalization scale must be a scalar constant")
-    if expression.kind is not ScalarExpressionKind.DIVIDE:
-        raise ValueError("streaming backward requires normalized weighted-value finalization")
-    numerator, denominator = expression.operands
-    if (
-        numerator.input_name != forward.state.weighted_value_accumulator.name
-        or denominator.input_name != forward.state.row_sum_exp.name
-    ):
-        raise ValueError("streaming backward finalization does not reference the derived Fold state")
-    if not np.isfinite(scale):
-        raise ValueError("streaming backward output scale must be finite")
-    return scale
+def _normalized_output_scale(forward: NormalizedExpContractProgram[StreamingTileSchedule]) -> float:
+    return normalized_exp_finalizer_scale(forward.region)

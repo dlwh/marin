@@ -3,7 +3,7 @@
 
 """Emit and benchmark a compiler-owned H100 streaming-attention skeleton.
 
-The semantic input is a :class:`StreamingAttentionProgram` derived from
+The semantic input is a :class:`NormalizedExpContractProgram` derived from
 Contract/Map/Fold tensor math.  This file deliberately does not import an
 attention operator from Torch, FlashAttention, or another kernel package.  Its
 Triton kernel is a Q-resident online-softmax skeleton adapted from the public
@@ -35,9 +35,9 @@ import triton.language as tl
 from shuttle.ir import DType
 from tile_lifetime import (
     AttentionScoreAxis,
+    NormalizedExpContractProgram,
     ScalarExpression,
     ScalarExpressionKind,
-    StreamingAttentionProgram,
     StreamingTileSchedule,
     add_score_bias,
     apply_arbitrary_score_mask,
@@ -69,7 +69,7 @@ class LoweredScoreMap:
         return self.query_position_name is not None
 
 
-def lower_score_map(program: StreamingAttentionProgram) -> LoweredScoreMap:
+def lower_score_map(program: NormalizedExpContractProgram[StreamingTileSchedule]) -> LoweredScoreMap:
     """Lower the supported scalar-expression subset without naming attention variants."""
     scale: float | None = None
     softcap: float | None = None
@@ -109,11 +109,11 @@ def lower_score_map(program: StreamingAttentionProgram) -> LoweredScoreMap:
             left, right = expression.operands
             left_name = input_name(left)
             right_name = input_name(right)
-            if left_name is not None and left_name != program.qk.output.name:
+            if left_name is not None and left_name != program.region.producer.output.name:
                 bias_name = left_name
                 visit(right)
                 return
-            if right_name is not None and right_name != program.qk.output.name:
+            if right_name is not None and right_name != program.region.producer.output.name:
                 bias_name = right_name
                 visit(left)
                 return
@@ -133,13 +133,13 @@ def lower_score_map(program: StreamingAttentionProgram) -> LoweredScoreMap:
                 return
             raw_name = input_name(left) or input_name(right)
             scalar = right_literal if input_name(left) is not None else left_literal
-            if raw_name != program.qk.output.name or scalar is None:
+            if raw_name != program.region.producer.output.name or scalar is None:
                 raise ValueError("raw QK scores must be multiplied by one scalar")
             scale = float(scalar)
             return
         raise ValueError(f"unsupported H100 score-map expression {expression.kind.value}")
 
-    visit(program.score_map.expression)
+    visit(program.region.score_map.expression)
     if scale is None:
         raise ValueError("score map does not contain a scalar QK scale")
     return LoweredScoreMap(
@@ -825,13 +825,13 @@ def _streaming_grouped_query_forward(
 
 
 def _aligned_score_strides(
-    program: StreamingAttentionProgram,
+    program: NormalizedExpContractProgram[StreamingTileSchedule],
     name: str | None,
     tensor: torch.Tensor,
 ) -> tuple[int, int, int, int]:
     if name is None:
         return (0, 0, 0, 0)
-    value = next(value for value in program.score_map.inputs if value.name == name)
+    value = next(value for value in program.region.score_map.inputs if value.name == name)
     stride_by_axis = {axis.label: stride for axis, stride in zip(value.axes, tensor.stride(), strict=True)}
     return tuple(
         stride_by_axis.get(axis.value, 0)
@@ -845,7 +845,7 @@ def _aligned_score_strides(
 
 
 def emit_streaming_attention(
-    program: StreamingAttentionProgram,
+    program: NormalizedExpContractProgram[StreamingTileSchedule],
     inputs: dict[str, torch.Tensor],
     output: torch.Tensor,
     log_sum_exp: torch.Tensor,
@@ -857,9 +857,9 @@ def emit_streaming_attention(
     num_stages: int,
 ) -> torch.Tensor:
     """Execute one generated H100 program without an opaque attention call."""
-    query = inputs[program.qk.inputs[0].name]
-    key = inputs[program.qk.inputs[1].name]
-    value = inputs[program.pv.inputs[1].name]
+    query = inputs[program.region.producer.inputs[0].name]
+    key = inputs[program.region.producer.inputs[1].name]
+    value = inputs[program.region.consumer.inputs[1].name]
     if query.dtype is not torch.bfloat16 or key.dtype is not torch.bfloat16 or value.dtype is not torch.bfloat16:
         raise ValueError("the first H100 emitter supports BF16 Q/K/V")
     if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
@@ -870,8 +870,8 @@ def emit_streaming_attention(
         raise ValueError("the first H100 emitter supports equal Q/K/V dimensions 64 or 128")
     if query.shape[2] % key.shape[2]:
         raise ValueError("query heads must be an integer multiple of key/value heads")
-    key_map = program.qk.index_maps_for_input(1)
-    value_map = program.pv.index_maps_for_input(1)
+    key_map = program.region.producer.index_maps_for_input(1)
+    value_map = program.region.consumer.index_maps_for_input(1)
     expected_divisor = query.shape[2] // key.shape[2]
     if len(key_map) != 1 or len(value_map) != 1 or key_map[0].divisor != expected_divisor:
         raise ValueError("the semantic contractions do not expose the physical grouped-head relation")
@@ -957,7 +957,7 @@ def _program(
     *,
     score_scale: float,
     mutation: str,
-) -> StreamingAttentionProgram:
+) -> NormalizedExpContractProgram[StreamingTileSchedule]:
     score_map = scaled_score_map(score_scale)
     if mutation == "causal":
         score_map = apply_causal_score_mask(score_map)
@@ -986,14 +986,18 @@ def _program(
     )
 
 
-def _inputs(program: StreamingAttentionProgram, *, mutation: str) -> dict[str, torch.Tensor]:
+def _inputs(
+    program: NormalizedExpContractProgram[StreamingTileSchedule],
+    *,
+    mutation: str,
+) -> dict[str, torch.Tensor]:
     torch.manual_seed(17)
     inputs = {
-        "query": torch.randn(program.qk.inputs[0].shape, dtype=torch.bfloat16, device="cuda"),
-        "key": torch.randn(program.qk.inputs[1].shape, dtype=torch.bfloat16, device="cuda"),
-        "value": torch.randn(program.pv.inputs[1].shape, dtype=torch.bfloat16, device="cuda"),
+        "query": torch.randn(program.region.producer.inputs[0].shape, dtype=torch.bfloat16, device="cuda"),
+        "key": torch.randn(program.region.producer.inputs[1].shape, dtype=torch.bfloat16, device="cuda"),
+        "value": torch.randn(program.region.consumer.inputs[1].shape, dtype=torch.bfloat16, device="cuda"),
     }
-    sequence_length = program.qk.inputs[0].shape[1]
+    sequence_length = program.region.producer.inputs[0].shape[1]
     if mutation in ("causal", "softcap"):
         inputs["query.position"] = torch.arange(sequence_length, dtype=torch.int32, device="cuda")
         inputs["key.position"] = torch.arange(sequence_length, dtype=torch.int32, device="cuda")
@@ -1040,7 +1044,7 @@ def _hardware_state() -> str:
 
 
 def _correctness_reference(
-    program: StreamingAttentionProgram,
+    program: NormalizedExpContractProgram[StreamingTileSchedule],
     inputs: dict[str, torch.Tensor],
     *,
     query_rows: int,
@@ -1187,7 +1191,7 @@ def main() -> None:
         "emitter_source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "config": vars(args) | {"json_output": str(args.json_output) if args.json_output else None},
         "score_lowering": asdict(lower_score_map(program)),
-        "semantic_head_index_divisor": program.qk.index_maps_for_input(1)[0].divisor,
+        "semantic_head_index_divisor": program.region.producer.index_maps_for_input(1)[0].divisor,
         "generated_samples_ms": generated_samples,
         "generated_median_ms": statistics.median(generated_samples),
         "generated_minimum_ms": min(generated_samples),

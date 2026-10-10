@@ -8,9 +8,9 @@
 // RUN: shuttle-test-opt --shuttle-stablehlo-source-ordered-pipeline --shuttle-test-report-normalized-fingerprint %S/Inputs/f32-map-shape-ops.mlir | FileCheck %s --check-prefix=HASH
 // RUN: shuttle-test-opt --shuttle-stablehlo-fast-pipeline --shuttle-test-report-normalized-fingerprint %S/Inputs/f32-map-shape-ops.mlir | FileCheck %s --check-prefix=HASH
 
-// ALGEBRA: affine_map<(d0, d1) -> (d1)>
-// ALGEBRA: affine_map<(d0) -> (0, d0)>
-// ALGEBRA: affine_map<(d0, d1, d2) -> (d0, d2)>
+// ALGEBRA: affine_map<(d0, d1) -> (d1 mod 3)>
+// ALGEBRA: affine_map<(d0) -> (0, d0 mod 3)>
+// ALGEBRA: affine_map<(d0, d1, d2) -> ((d0 + d1 + d2 floordiv 2) mod 2, d2 mod 2)>
 // ALGEBRA: #shuttle.map_semantics<reshape>
 // ALGEBRA: #shuttle.map_semantics<reshape>
 // ALGEBRA: #shuttle.map_semantics<reshape>

@@ -18,6 +18,7 @@ from shuttle.experimental.stablehlo_import import (
     StableHLOGraph,
     StableHLOOperation,
 )
+from tile_lifetime.normalized_exp_contract_region import NormalizedExpContractProgram
 from tile_lifetime.plan import SemanticErasureReport, SemanticLoweringStep
 from tile_lifetime.relation import RelationPlan
 from tile_lifetime.routed_attention import (
@@ -33,7 +34,6 @@ from tile_lifetime.routed_attention_plan import (
 )
 from tile_lifetime.semantic_erasure import semantic_erasure_errors, tensor_program_scheduling_keys
 from tile_lifetime.streaming_attention import (
-    StreamingAttentionProgram,
     StreamingTileSchedule,
     apply_causal_score_mask,
     build_attention_tensor_program,
@@ -81,7 +81,7 @@ class NaturalRoutedAttentionCompilation:
 
     recovered: RecoveredRoutedAttentionProgram
     relation: RelationPlan
-    streaming_program: StreamingAttentionProgram
+    streaming_program: NormalizedExpContractProgram[StreamingTileSchedule]
     scheduled: RoutedStreamingAttentionCompilation
 
 

@@ -13,6 +13,10 @@
 #include <vector>
 
 #include "ObserverInternal.h"
+#include "mlir/Analysis/FlatLinearValueConstraints.h"
+#include "mlir/Analysis/Presburger/Matrix.h"
+#include "mlir/Analysis/Presburger/PWMAFunction.h"
+#include "mlir/Analysis/Presburger/PresburgerRelation.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -45,6 +49,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/JSON.h"
 #include "llvm/Support/SHA256.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -63,6 +68,7 @@ namespace mlir::shuttle {
 #define GEN_PASS_DEF_SHUTTLEVERIFYMATERIALIZATIONPLANPASS
 #define GEN_PASS_DEF_SHUTTLEPLANSIMT32ROWFOLDSCHEDULEPASS
 #define GEN_PASS_DEF_SHUTTLEVERIFYSIMT32ROWFOLDSCHEDULEPASS
+#define GEN_PASS_DEF_SHUTTLEPLANSOURCEEVENTLOWERINGPASS
 #define GEN_PASS_DEF_SHUTTLEBUILDGPUEXECUTABLEBUNDLEPASS
 #define GEN_PASS_DEF_SHUTTLEVERIFYGPUEXECUTABLEBUNDLEPASS
 #define GEN_PASS_DEF_SHUTTLEREPLACEWITHGPUEXECUTABLEBUNDLEPASS
@@ -85,12 +91,29 @@ constexpr llvm::StringLiteral kSelectedAttribute = "shuttle.selected";
 constexpr llvm::StringLiteral kFunctionOrdinalAttribute =
     "shuttle.function_ordinal";
 constexpr llvm::StringLiteral kOperationRefAttribute = "shuttle.operation_ref";
+constexpr llvm::StringLiteral kOperationRefGroupsAttribute =
+    "shuttle.operation_ref_groups";
 constexpr llvm::StringLiteral kCoverageManifestAttribute =
     "shuttle.coverage_manifest";
 constexpr llvm::StringLiteral kRegionResultSourcesAttribute =
     "shuttle.result_source_refs";
+constexpr llvm::StringLiteral kScanResultSourcesAttribute = "result_sources";
+constexpr llvm::StringLiteral kScanErasedTerminatorRecordsAttribute =
+    "erased_terminator_records";
 constexpr llvm::StringLiteral kDefaultCanonicalTuning =
     R"json({"cluster_shape":[],"materialization":"automatic","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json";
+
+std::string
+physicalEventProvenanceFingerprint(StringRef scheduleFingerprint,
+                                   StringRef launchRecipeFingerprint,
+                                   StringRef canonicalScheduleDigest) {
+  llvm::SHA256 digest;
+  digest.update(scheduleFingerprint);
+  digest.update(launchRecipeFingerprint);
+  digest.update(canonicalScheduleDigest);
+  return llvm::toHex(digest.final(), true);
+}
+
 constexpr llvm::StringLiteral kFusionCanonicalTuning =
     R"json({"cluster_shape":[],"materialization":"prefer_fusion","maximum_candidates":1,"pipeline_stages":1,"tile_sizes":[]})json";
 constexpr llvm::StringLiteral kMaterializationCanonicalTuning =
@@ -192,13 +215,33 @@ DictionaryAttr sourceAttributes(Operation *operation) {
     StringRef name = attribute.getName().strref();
     if (name == kSourceRefsAttribute || name == kSelectedAttribute ||
         name == kFunctionOrdinalAttribute || name == kOperationRefAttribute ||
+        name == kOperationRefGroupsAttribute ||
         name == kCoverageManifestAttribute ||
-        name == kRegionResultSourcesAttribute) {
+        name == kRegionResultSourcesAttribute ||
+        name == kScanResultSourcesAttribute ||
+        name == kScanErasedTerminatorRecordsAttribute) {
       continue;
     }
     attributes.push_back(attribute);
   }
   return DictionaryAttr::get(operation->getContext(), attributes);
+}
+
+bool isCompositeDecompositionFunction(func::FuncOp function, ModuleOp module) {
+  bool referenced = false;
+  module.walk([&](Operation *operation) {
+    if (operation->getName().getStringRef() != "stablehlo.composite")
+      return WalkResult::advance();
+    auto decomposition =
+        operation->getAttrOfType<FlatSymbolRefAttr>("decomposition");
+    if (decomposition && SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
+                             operation, decomposition) == function) {
+      referenced = true;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return referenced;
 }
 
 DictionaryAttr normalizedOperationFingerprint(Operation *operation) {
@@ -282,6 +325,13 @@ Attribute valueAnchor(Value value) {
     return {};
   }
   Operation *owner = result.getOwner();
+  if (isa<ScanOp>(owner)) {
+    if (auto refs = owner->getAttrOfType<ArrayAttr>(
+            kScanResultSourcesAttribute);
+        refs && result.getResultNumber() < refs.size()) {
+      return refs[result.getResultNumber()];
+    }
+  }
   ArrayAttr refs = sourceRefs(owner);
   if (!refs) {
     refs = owner->getAttrOfType<ArrayAttr>(kRegionResultSourcesAttribute);
@@ -323,6 +373,17 @@ bool hasValidBroadcastDimensions(Operation *operation,
   return true;
 }
 
+bool enclosingFunctionContainsScatter(Operation *operation) {
+  auto function = operation->getParentOfType<func::FuncOp>();
+  bool found = false;
+  if (function)
+    function.walk([&](Operation *candidate) {
+      found |= candidate->getName().getStringRef() ==
+               stablehlo::ScatterOp::getOperationName();
+    });
+  return found;
+}
+
 bool isSupportedAffineBroadcast(Operation *operation) {
   if (operation->getNumOperands() != 1 || operation->getNumResults() != 1) {
     return false;
@@ -332,9 +393,12 @@ bool isSupportedAffineBroadcast(Operation *operation) {
   auto dimensions =
       operation->getAttrOfType<DenseI64ArrayAttr>("broadcast_dimensions");
   DictionaryAttr attributes = sourceAttributes(operation);
-  if (!input || !result || !input.getElementType().isF32() ||
-      !result.getElementType().isF32() || !input.hasStaticShape() ||
-      !result.hasStaticShape() || !dimensions ||
+  if (!input || !result ||
+      !(input.getElementType().isF32() || input.getElementType().isBF16()) ||
+      input.getElementType() != result.getElementType() ||
+      (input.getElementType().isBF16() &&
+       !enclosingFunctionContainsScatter(operation)) ||
+      !input.hasStaticShape() || !result.hasStaticShape() || !dimensions ||
       dimensions.size() != static_cast<size_t>(input.getRank()) ||
       attributes.size() != 1 || !attributes.get("broadcast_dimensions") ||
       input == result || !hasValidBroadcastDimensions(operation, dimensions)) {
@@ -362,25 +426,45 @@ bool isSupportedAffineBroadcast(Operation *operation) {
   return (rankTwoExpansion && expandingSingletons == 1) || rankNExpansion;
 }
 
-bool isCopyFreeSingletonReshape(Operation *operation) {
+FailureOr<AffineMap> contiguousReshapeInputMap(RankedTensorType input,
+                                               RankedTensorType result) {
+  if (!input.hasStaticShape() || !result.hasStaticShape() ||
+      input.getNumElements() != result.getNumElements() ||
+      input.getRank() > 8 || result.getRank() > 8 ||
+      llvm::any_of(input.getShape(),
+                   [](int64_t extent) { return extent <= 0; }) ||
+      llvm::any_of(result.getShape(),
+                   [](int64_t extent) { return extent <= 0; })) {
+    return failure();
+  }
+  MLIRContext *context = input.getContext();
+  AffineExpr linear = getAffineConstantExpr(0, context);
+  for (auto [dimension, extent] : llvm::enumerate(result.getShape())) {
+    linear = linear * extent + getAffineDimExpr(dimension, context);
+  }
+  SmallVector<AffineExpr> inputCoordinates(input.getRank());
+  int64_t stride = 1;
+  for (int64_t dimension = input.getRank() - 1; dimension >= 0; --dimension) {
+    const int64_t extent = input.getDimSize(dimension);
+    inputCoordinates[dimension] = linear.floorDiv(stride) % extent;
+    stride *= extent;
+  }
+  return AffineMap::get(result.getRank(), 0, inputCoordinates, context);
+}
+
+bool isCopyFreeStaticReshape(Operation *operation) {
   if (operation->getNumOperands() != 1 || operation->getNumResults() != 1 ||
       !sourceAttributes(operation).empty()) {
     return false;
   }
   auto input = dyn_cast<RankedTensorType>(operation->getOperand(0).getType());
   auto result = dyn_cast<RankedTensorType>(operation->getResult(0).getType());
-  if (!input || !result || !input.getElementType().isF32() ||
-      !result.getElementType().isF32() || !input.hasStaticShape() ||
-      !result.hasStaticShape()) {
+  if (!input || !result || input.getElementType() != result.getElementType() ||
+      (!input.getElementType().isF32() && !input.getElementType().isBF16()) ||
+      input == result) {
     return false;
   }
-  SmallVector<int64_t> inputNonSingleton;
-  SmallVector<int64_t> resultNonSingleton;
-  llvm::copy_if(input.getShape(), std::back_inserter(inputNonSingleton),
-                [](int64_t extent) { return extent != 1; });
-  llvm::copy_if(result.getShape(), std::back_inserter(resultNonSingleton),
-                [](int64_t extent) { return extent != 1; });
-  return inputNonSingleton == resultNonSingleton && input != result;
+  return succeeded(contiguousReshapeInputMap(input, result));
 }
 
 bool hasDefaultDotPrecision(Operation *operation) {
@@ -392,6 +476,20 @@ bool hasDefaultDotPrecision(Operation *operation) {
          llvm::all_of(precision, [](Attribute attribute) {
            auto value = dyn_cast<stablehlo::PrecisionAttr>(attribute);
            return value && value.getValue() == stablehlo::Precision::DEFAULT;
+         });
+}
+
+bool hasSupportedDotPrecision(Operation *operation) {
+  auto precision = operation->getAttrOfType<ArrayAttr>("precision_config");
+  if (!precision || precision.empty()) {
+    return true;
+  }
+  return precision.size() == operation->getNumOperands() &&
+         llvm::all_of(precision, [](Attribute attribute) {
+           auto value = dyn_cast<stablehlo::PrecisionAttr>(attribute);
+           return value && (value.getValue() == stablehlo::Precision::DEFAULT ||
+                            value.getValue() == stablehlo::Precision::HIGH ||
+                            value.getValue() == stablehlo::Precision::HIGHEST);
          });
 }
 
@@ -459,6 +557,170 @@ bool isSupportedStablehloReduce(Operation *operation) {
          terminator.getOperand(0) == combiner.getResult(0);
 }
 
+bool isSupportedStablehloSelection(Operation *operation) {
+  if (operation->getName().getStringRef() != "stablehlo.composite" ||
+      operation->getNumOperands() != 1 || operation->getNumResults() != 2 ||
+      operation->getNumRegions() != 0) {
+    return false;
+  }
+  auto name = operation->getAttrOfType<StringAttr>("name");
+  auto attributes =
+      operation->getAttrOfType<DictionaryAttr>("composite_attributes");
+  auto decomposition =
+      operation->getAttrOfType<FlatSymbolRefAttr>("decomposition");
+  auto version = operation->getAttrOfType<IntegerAttr>("version");
+  auto input = dyn_cast<RankedTensorType>(operation->getOperand(0).getType());
+  auto values = dyn_cast<RankedTensorType>(operation->getResult(0).getType());
+  auto indices = dyn_cast<RankedTensorType>(operation->getResult(1).getType());
+  auto count = attributes ? attributes.getAs<IntegerAttr>("k") : IntegerAttr{};
+  if (!name || name.getValue() != "chlo.top_k" || !attributes ||
+      attributes.size() != 1 || !decomposition || !version ||
+      version.getInt() != 1 || !count || !count.getType().isInteger(64) ||
+      !input || !values || !indices || !input.hasStaticShape() ||
+      !values.hasStaticShape() || !indices.hasStaticShape() ||
+      input.getRank() == 0 ||
+      !(input.getElementType().isF32() || input.getElementType().isBF16()) ||
+      values.getElementType() != input.getElementType() ||
+      !indices.getElementType().isInteger(32)) {
+    return false;
+  }
+  const int64_t dimension = input.getRank() - 1;
+  const int64_t selectedCount = count.getInt();
+  if (selectedCount <= 0 || selectedCount > input.getDimSize(dimension)) {
+    return false;
+  }
+  SmallVector<int64_t> expectedShape(input.getShape());
+  expectedShape[dimension] = selectedCount;
+  if (values.getShape() != ArrayRef<int64_t>(expectedShape) ||
+      indices.getShape() != ArrayRef<int64_t>(expectedShape) ||
+      sourceAttributes(operation).size() != 4) {
+    return false;
+  }
+
+  func::FuncOp implementation =
+      SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(operation,
+                                                         decomposition);
+  if (!implementation || !implementation.isPrivate() ||
+      implementation.getNumArguments() != 1 ||
+      implementation.getNumResults() != 2 ||
+      implementation.getArgumentTypes()[0] != input ||
+      implementation.getResultTypes()[0] != values ||
+      implementation.getResultTypes()[1] != indices ||
+      !llvm::hasSingleElement(implementation.getBody())) {
+    return false;
+  }
+  Block &body = implementation.getBody().front();
+  SmallVector<Operation *> bodyOperations;
+  for (Operation &bodyOperation : body) {
+    bodyOperations.push_back(&bodyOperation);
+  }
+  if (bodyOperations.size() != 5) {
+    return false;
+  }
+  Operation *iota = bodyOperations[0];
+  Operation *sort = bodyOperations[1];
+  Operation *valuesSlice = bodyOperations[2];
+  Operation *indicesSlice = bodyOperations[3];
+  Operation *returnOp = bodyOperations[4];
+
+  auto fullIndexType = RankedTensorType::get(
+      input.getShape(), IntegerType::get(input.getContext(), 32));
+  auto iotaDimension = iota->getAttrOfType<IntegerAttr>("iota_dimension");
+  auto sortDimension = sort->getAttrOfType<IntegerAttr>("dimension");
+  auto sortStable = sort->getAttrOfType<BoolAttr>("is_stable");
+  if (iota->getName().getStringRef() != stablehlo::IotaOp::getOperationName() ||
+      iota->getNumOperands() != 0 || iota->getNumResults() != 1 ||
+      iota->getResult(0).getType() != fullIndexType || !iotaDimension ||
+      iotaDimension.getInt() != dimension ||
+      sourceAttributes(iota).size() != 1 ||
+      sort->getName().getStringRef() != stablehlo::SortOp::getOperationName() ||
+      sort->getNumOperands() != 2 ||
+      sort->getOperand(0) != body.getArgument(0) ||
+      sort->getOperand(1) != iota->getResult(0) || sort->getNumResults() != 2 ||
+      sort->getResult(0).getType() != input ||
+      sort->getResult(1).getType() != fullIndexType || !sortDimension ||
+      sortDimension.getInt() != dimension || !sortStable ||
+      !sortStable.getValue() || sourceAttributes(sort).size() != 2 ||
+      sort->getNumRegions() != 1 ||
+      !llvm::hasSingleElement(sort->getRegion(0))) {
+    return false;
+  }
+
+  Block &comparator = sort->getRegion(0).front();
+  SmallVector<Operation *> comparatorOperations;
+  for (Operation &comparatorOperation : comparator) {
+    comparatorOperations.push_back(&comparatorOperation);
+  }
+  auto scalarValueType = RankedTensorType::get({}, input.getElementType());
+  auto scalarIndexType =
+      RankedTensorType::get({}, fullIndexType.getElementType());
+  if (comparator.getNumArguments() != 4 ||
+      comparator.getArgument(0).getType() != scalarValueType ||
+      comparator.getArgument(1).getType() != scalarValueType ||
+      comparator.getArgument(2).getType() != scalarIndexType ||
+      comparator.getArgument(3).getType() != scalarIndexType ||
+      comparatorOperations.size() != 2 ||
+      !comparator.getArgument(2).use_empty() ||
+      !comparator.getArgument(3).use_empty()) {
+    return false;
+  }
+  Operation *compare = comparatorOperations[0];
+  Operation *comparatorReturn = comparatorOperations[1];
+  auto direction = compare->getAttrOfType<stablehlo::ComparisonDirectionAttr>(
+      "comparison_direction");
+  auto comparisonType =
+      compare->getAttrOfType<stablehlo::ComparisonTypeAttr>("compare_type");
+  if (compare->getName().getStringRef() !=
+          stablehlo::CompareOp::getOperationName() ||
+      compare->getNumOperands() != 2 ||
+      compare->getOperand(0) != comparator.getArgument(0) ||
+      compare->getOperand(1) != comparator.getArgument(1) ||
+      compare->getNumResults() != 1 ||
+      compare->getResult(0).getType() !=
+          RankedTensorType::get({}, IntegerType::get(input.getContext(), 1)) ||
+      !direction || !comparisonType ||
+      direction.getValue() != stablehlo::ComparisonDirection::GT ||
+      comparisonType.getValue() != stablehlo::ComparisonType::TOTALORDER ||
+      sourceAttributes(compare).size() != 2 ||
+      comparatorReturn->getName().getStringRef() !=
+          stablehlo::ReturnOp::getOperationName() ||
+      comparatorReturn->getNumOperands() != 1 ||
+      comparatorReturn->getOperand(0) != compare->getResult(0) ||
+      comparatorReturn->getNumResults() != 0 ||
+      !sourceAttributes(comparatorReturn).empty()) {
+    return false;
+  }
+
+  auto isLeadingSelectionSlice = [&](Operation *slice, Value sorted,
+                                     RankedTensorType resultType) {
+    auto starts = slice->getAttrOfType<DenseI64ArrayAttr>("start_indices");
+    auto limits = slice->getAttrOfType<DenseI64ArrayAttr>("limit_indices");
+    auto strides = slice->getAttrOfType<DenseI64ArrayAttr>("strides");
+    SmallVector<int64_t> expectedStarts(input.getRank(), 0);
+    SmallVector<int64_t> expectedLimits(input.getShape());
+    SmallVector<int64_t> expectedStrides(input.getRank(), 1);
+    expectedLimits[dimension] = selectedCount;
+    return slice->getName().getStringRef() ==
+               stablehlo::SliceOp::getOperationName() &&
+           slice->getNumOperands() == 1 && slice->getOperand(0) == sorted &&
+           slice->getNumResults() == 1 &&
+           slice->getResult(0).getType() == resultType && starts && limits &&
+           strides &&
+           starts.asArrayRef() == ArrayRef<int64_t>(expectedStarts) &&
+           limits.asArrayRef() == ArrayRef<int64_t>(expectedLimits) &&
+           strides.asArrayRef() == ArrayRef<int64_t>(expectedStrides) &&
+           sourceAttributes(slice).size() == 3;
+  };
+  return isLeadingSelectionSlice(valuesSlice, sort->getResult(0), values) &&
+         isLeadingSelectionSlice(indicesSlice, sort->getResult(1), indices) &&
+         returnOp->getName().getStringRef() ==
+             func::ReturnOp::getOperationName() &&
+         returnOp->getNumOperands() == 2 &&
+         returnOp->getOperand(0) == valuesSlice->getResult(0) &&
+         returnOp->getOperand(1) == indicesSlice->getResult(0) &&
+         returnOp->getNumResults() == 0 && sourceAttributes(returnOp).empty();
+}
+
 bool isSupportedStablehloRelation(Operation *operation) {
   StringRef name = operation->getName().getStringRef();
   if (operation->getNumResults() != 1 || operation->getNumRegions() != 0 ||
@@ -479,9 +741,10 @@ bool isSupportedStablehloRelation(Operation *operation) {
   }
   if (name == stablehlo::ConstantOp::getOperationName()) {
     auto value = operation->getAttrOfType<DenseElementsAttr>("value");
-    return operation->getNumOperands() == 0 && result.getRank() == 0 &&
-           result.getElementType().isInteger(32) && value && value.isSplat() &&
-           attributes.size() == 1;
+    return operation->getNumOperands() == 0 &&
+           (result.getElementType().isInteger(32) ||
+            result.getElementType().isInteger(1)) &&
+           value && value.isSplat() && attributes.size() == 1;
   }
   if (operation->getNumOperands() == 1) {
     auto input = dyn_cast<RankedTensorType>(operation->getOperand(0).getType());
@@ -494,14 +757,34 @@ bool isSupportedStablehloRelation(Operation *operation) {
              input.getNumElements() == result.getNumElements();
     }
     if (name == stablehlo::BroadcastInDimOp::getOperationName()) {
-      auto dimensions = operation->getAttrOfType<DenseI64ArrayAttr>(
-          "broadcast_dimensions");
+      auto dimensions =
+          operation->getAttrOfType<DenseI64ArrayAttr>("broadcast_dimensions");
       return dimensions && attributes.size() == 1 &&
              dimensions.size() == static_cast<size_t>(input.getRank()) &&
              input.getElementType() == result.getElementType() &&
              (result.getElementType().isInteger(32) ||
               result.getElementType().isInteger(1)) &&
              hasValidBroadcastDimensions(operation, dimensions);
+    }
+    if (name == stablehlo::SliceOp::getOperationName()) {
+      auto starts =
+          operation->getAttrOfType<DenseI64ArrayAttr>("start_indices");
+      auto limits =
+          operation->getAttrOfType<DenseI64ArrayAttr>("limit_indices");
+      auto strides = operation->getAttrOfType<DenseI64ArrayAttr>("strides");
+      return input.getElementType().isInteger(32) &&
+             result.getElementType().isInteger(32) && starts && limits &&
+             strides && starts.size() == static_cast<size_t>(input.getRank()) &&
+             limits.size() == starts.size() &&
+             strides.size() == starts.size() && attributes.size() == 3;
+    }
+    if (name == stablehlo::TransposeOp::getOperationName()) {
+      auto permutation =
+          operation->getAttrOfType<DenseI64ArrayAttr>("permutation");
+      return input.getElementType().isInteger(32) &&
+             result.getElementType().isInteger(32) && permutation &&
+             permutation.size() == static_cast<size_t>(input.getRank()) &&
+             attributes.size() == 1;
     }
     return name == stablehlo::ConvertOp::getOperationName() &&
            attributes.empty() && input.getShape() == result.getShape() &&
@@ -513,8 +796,7 @@ bool isSupportedStablehloRelation(Operation *operation) {
     auto lhs = dyn_cast<RankedTensorType>(operation->getOperand(0).getType());
     auto rhs = dyn_cast<RankedTensorType>(operation->getOperand(1).getType());
     auto comparisonType =
-        operation->getAttrOfType<stablehlo::ComparisonTypeAttr>(
-            "compare_type");
+        operation->getAttrOfType<stablehlo::ComparisonTypeAttr>("compare_type");
     auto direction =
         operation->getAttrOfType<stablehlo::ComparisonDirectionAttr>(
             "comparison_direction");
@@ -523,11 +805,30 @@ bool isSupportedStablehloRelation(Operation *operation) {
            lhs.getElementType().isInteger(32) &&
            result.getElementType().isInteger(1) && attributes.size() == 2;
   }
-  if (name == stablehlo::AddOp::getOperationName() &&
+  if ((name == stablehlo::AddOp::getOperationName() ||
+       name == stablehlo::MulOp::getOperationName()) &&
       operation->getNumOperands() == 2 && attributes.empty()) {
     return operation->getOperand(0).getType() == result &&
            operation->getOperand(1).getType() == result &&
            result.getElementType().isInteger(32);
+  }
+  if (name == stablehlo::GatherOp::getOperationName() &&
+      operation->getNumOperands() == 2) {
+    auto operand =
+        dyn_cast<RankedTensorType>(operation->getOperand(0).getType());
+    auto indices =
+        dyn_cast<RankedTensorType>(operation->getOperand(1).getType());
+    auto dimensions =
+        operation->getAttrOfType<stablehlo::GatherDimensionNumbersAttr>(
+            "dimension_numbers");
+    auto sliceSizes =
+        operation->getAttrOfType<DenseI64ArrayAttr>("slice_sizes");
+    return operand && indices && operand.hasStaticShape() &&
+           indices.hasStaticShape() &&
+           operand.getElementType() == result.getElementType() &&
+           indices.getElementType().isInteger(32) && dimensions && sliceSizes &&
+           sliceSizes.size() == static_cast<size_t>(operand.getRank()) &&
+           (attributes.size() == 2 || attributes.size() == 3);
   }
   if (name == stablehlo::SelectOp::getOperationName() &&
       operation->getNumOperands() == 3 && attributes.empty()) {
@@ -537,17 +838,487 @@ bool isSupportedStablehloRelation(Operation *operation) {
            predicate.getShape() == result.getShape() &&
            operation->getOperand(1).getType() == result &&
            operation->getOperand(2).getType() == result &&
-           result.getElementType().isF32();
+           (result.getElementType().isF32() ||
+            result.getElementType().isInteger(32));
   }
   return false;
 }
 
+bool isSupportedStablehloScatter(Operation *operation) {
+  if (operation->getName().getStringRef() !=
+          stablehlo::ScatterOp::getOperationName() ||
+      operation->getNumOperands() != 3 || operation->getNumResults() != 1 ||
+      operation->getNumRegions() != 1 ||
+      !llvm::hasSingleElement(operation->getRegion(0))) {
+    return false;
+  }
+  auto operand = dyn_cast<RankedTensorType>(operation->getOperand(0).getType());
+  auto indices = dyn_cast<RankedTensorType>(operation->getOperand(1).getType());
+  auto updates = dyn_cast<RankedTensorType>(operation->getOperand(2).getType());
+  auto result = dyn_cast<RankedTensorType>(operation->getResult(0).getType());
+  auto dimensions =
+      operation->getAttrOfType<stablehlo::ScatterDimensionNumbersAttr>(
+          "scatter_dimension_numbers");
+  if (!operand || !indices || !updates || !result || !dimensions ||
+      !operand.hasStaticShape() || !indices.hasStaticShape() ||
+      !updates.hasStaticShape() || result != operand ||
+      updates.getElementType() != operand.getElementType() ||
+      (!operand.getElementType().isF32() &&
+       !operand.getElementType().isBF16()) ||
+      !indices.getElementType().isInteger(32) || indices.getRank() == 0 ||
+      dimensions.getIndexVectorDim() != indices.getRank() - 1 ||
+      indices.getDimSize(indices.getRank() - 1) != 1 ||
+      dimensions.getInsertedWindowDims().size() != 1 ||
+      dimensions.getScatterDimsToOperandDims().size() != 1 ||
+      dimensions.getInsertedWindowDims().front() !=
+          dimensions.getScatterDimsToOperandDims().front() ||
+      dimensions.getInputBatchingDims().size() !=
+          dimensions.getScatterIndicesBatchingDims().size()) {
+    return false;
+  }
+  llvm::SmallDenseSet<int64_t> updateWindowDims(
+      dimensions.getUpdateWindowDims().begin(),
+      dimensions.getUpdateWindowDims().end());
+  llvm::SmallDenseSet<int64_t> batchedUpdateDims;
+  for (int64_t indexBatch : dimensions.getScatterIndicesBatchingDims()) {
+    if (indexBatch < 0 || indexBatch >= indices.getRank() - 1)
+      return false;
+    batchedUpdateDims.insert(indexBatch);
+  }
+  SmallVector<int64_t> routeDims;
+  for (int64_t dimension = 0; dimension < updates.getRank(); ++dimension)
+    if (!updateWindowDims.contains(dimension) &&
+        !batchedUpdateDims.contains(dimension))
+      routeDims.push_back(dimension);
+  if (routeDims.empty() || routeDims.size() + batchedUpdateDims.size() !=
+                               static_cast<size_t>(indices.getRank() - 1))
+    return false;
+  Block &body = operation->getRegion(0).front();
+  if (body.getNumArguments() != 2 || body.getOperations().size() != 2)
+    return false;
+  Operation &combiner = body.front();
+  Operation &terminator = body.back();
+  auto scalar = RankedTensorType::get({}, operand.getElementType());
+  return body.getArgument(0).getType() == scalar &&
+         body.getArgument(1).getType() == scalar &&
+         combiner.getName().getStringRef() ==
+             stablehlo::AddOp::getOperationName() &&
+         combiner.getNumOperands() == 2 && combiner.getNumResults() == 1 &&
+         combiner.getOperand(0) == body.getArgument(0) &&
+         combiner.getOperand(1) == body.getArgument(1) &&
+         combiner.getResult(0).getType() == scalar &&
+         sourceAttributes(&combiner).empty() &&
+         terminator.getName().getStringRef() ==
+             stablehlo::ReturnOp::getOperationName() &&
+         terminator.getNumOperands() == 1 &&
+         terminator.getOperand(0) == combiner.getResult(0) &&
+         sourceAttributes(&terminator).empty();
+}
+
+struct CountedScanDescription {
+  int64_t induction = -1;
+  int64_t extent = 0;
+  ScanDirection direction = ScanDirection::Forward;
+  SmallVector<int64_t> state;
+  SmallVector<int64_t> invariants;
+  SmallVector<int64_t> scanned;
+  SmallVector<int64_t> scannedDimensions;
+  SmallVector<int64_t> emitted;
+  SmallVector<int64_t> emittedDimensions;
+  SmallVector<Value> scannedValues;
+  SmallVector<Value> emittedValues;
+  Operation *step = nullptr;
+};
+
+std::optional<int64_t> stablehloSplatInteger(Value value) {
+  if (auto argument = dyn_cast<BlockArgument>(value)) {
+    if (auto region = dyn_cast_or_null<RegionOp>(
+            argument.getOwner()->getParentOp())) {
+      value = region.getInputs()[argument.getArgNumber()];
+    }
+  }
+  Operation *constant = value.getDefiningOp();
+  if (auto region = dyn_cast_or_null<RegionOp>(constant)) {
+    if (region.getInputs().empty() && region.getResults().size() == 1 &&
+        llvm::hasSingleElement(region.getBody())) {
+      auto yield = dyn_cast<YieldOp>(region.getBody().front().getTerminator());
+      if (yield && yield.getValues().size() == 1)
+        return stablehloSplatInteger(yield.getValues().front());
+    }
+  }
+  if (!constant || constant->getName().getStringRef() !=
+                       stablehlo::ConstantOp::getOperationName())
+    return std::nullopt;
+  auto elements = constant->getAttrOfType<DenseIntElementsAttr>("value");
+  if (!elements || !elements.isSplat())
+    return std::nullopt;
+  return elements.getSplatValue<APInt>().getSExtValue();
+}
+
+func::FuncOp calledFunction(Operation *operation) {
+  if (operation->getName().getStringRef() !=
+      func::CallOp::getOperationName())
+    return {};
+  auto callee = operation->getAttrOfType<FlatSymbolRefAttr>("callee");
+  if (!callee)
+    return {};
+  if (func::FuncOp function =
+          SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(operation,
+                                                             callee))
+    return function;
+  if (ModuleOp module = operation->getParentOfType<ModuleOp>())
+    return module.lookupSymbol<func::FuncOp>(callee.getValue());
+  return {};
+}
+
+std::optional<int64_t> indexedSliceDimension(Operation *call,
+                                             Value source,
+                                             Value index) {
+  func::FuncOp function = calledFunction(call);
+  if (!function || call->getNumOperands() != 2 ||
+      call->getOperand(0) != source || call->getOperand(1) != index ||
+      function.getNumArguments() != 2 || function.getNumResults() != 1 ||
+      !llvm::hasSingleElement(function.getBody()))
+    return std::nullopt;
+  Block &body = function.getBody().front();
+  Operation *slice = nullptr;
+  for (Operation &candidate : body)
+    if (candidate.getName().getStringRef() ==
+        stablehlo::DynamicSliceOp::getOperationName()) {
+      if (slice)
+        return std::nullopt;
+      slice = &candidate;
+    }
+  if (!slice || slice->getNumOperands() < 2 ||
+      slice->getOperand(0) != body.getArgument(0))
+    return std::nullopt;
+  int64_t indexed = -1;
+  for (auto [dimension, start] :
+       llvm::enumerate(slice->getOperands().drop_front())) {
+    if (start == body.getArgument(1)) {
+      if (indexed >= 0)
+        return std::nullopt;
+      indexed = dimension;
+      continue;
+    }
+    if (stablehloSplatInteger(start) != 0)
+      return std::nullopt;
+  }
+  if (indexed < 0)
+    return std::nullopt;
+  auto sourceType = dyn_cast<RankedTensorType>(source.getType());
+  auto resultType = dyn_cast<RankedTensorType>(call->getResult(0).getType());
+  if (!sourceType || !resultType || !sourceType.hasStaticShape() ||
+      !resultType.hasStaticShape() ||
+      sourceType.getRank() != resultType.getRank() + 1)
+    return std::nullopt;
+  SmallVector<int64_t> expected(sourceType.getShape());
+  expected.erase(expected.begin() + indexed);
+  if (resultType.getShape() != ArrayRef<int64_t>(expected))
+    return std::nullopt;
+  return indexed;
+}
+
+std::optional<int64_t> indexedUpdateDimension(Operation *call,
+                                              Value destination,
+                                              Value index,
+                                              Value *update) {
+  func::FuncOp function = calledFunction(call);
+  if (!function || call->getNumOperands() != 3 ||
+      call->getOperand(0) != destination || call->getOperand(2) != index ||
+      function.getNumArguments() != 3 || function.getNumResults() != 1 ||
+      !llvm::hasSingleElement(function.getBody()))
+    return std::nullopt;
+  Block &body = function.getBody().front();
+  Operation *dynamicUpdate = nullptr;
+  for (Operation &candidate : body)
+    if (candidate.getName().getStringRef() ==
+        stablehlo::DynamicUpdateSliceOp::getOperationName()) {
+      if (dynamicUpdate)
+        return std::nullopt;
+      dynamicUpdate = &candidate;
+    }
+  if (!dynamicUpdate || dynamicUpdate->getNumOperands() < 3 ||
+      dynamicUpdate->getOperand(0) != body.getArgument(0))
+    return std::nullopt;
+  int64_t indexed = -1;
+  for (auto [dimension, start] :
+       llvm::enumerate(dynamicUpdate->getOperands().drop_front(2))) {
+    if (start == body.getArgument(2)) {
+      if (indexed >= 0)
+        return std::nullopt;
+      indexed = dimension;
+      continue;
+    }
+    if (stablehloSplatInteger(start) != 0)
+      return std::nullopt;
+  }
+  if (indexed < 0)
+    return std::nullopt;
+  auto destinationType = dyn_cast<RankedTensorType>(destination.getType());
+  auto updateType = dyn_cast<RankedTensorType>(call->getOperand(1).getType());
+  if (!destinationType || !updateType || !destinationType.hasStaticShape() ||
+      !updateType.hasStaticShape() ||
+      destinationType.getRank() != updateType.getRank() + 1)
+    return std::nullopt;
+  SmallVector<int64_t> expected(destinationType.getShape());
+  expected.erase(expected.begin() + indexed);
+  if (updateType.getShape() != ArrayRef<int64_t>(expected))
+    return std::nullopt;
+  *update = call->getOperand(1);
+  return indexed;
+}
+
+std::optional<ScanDirection>
+scanAccessDirection(Value index, Value induction, int64_t extent,
+                    ScanDirection loopDirection, Value loopBound,
+                    Value unitStep) {
+  if (index == induction)
+    return loopDirection;
+  Operation *subtractOne = index.getDefiningOp();
+  if (!subtractOne || subtractOne->getName().getStringRef() !=
+                          stablehlo::SubtractOp::getOperationName() ||
+      subtractOne->getNumOperands() != 2 ||
+      (subtractOne->getOperand(1) != unitStep &&
+       stablehloSplatInteger(subtractOne->getOperand(1)) != 1))
+    return std::nullopt;
+  Operation *subtractInduction = subtractOne->getOperand(0).getDefiningOp();
+  if (!subtractInduction || subtractInduction->getName().getStringRef() !=
+                               stablehlo::SubtractOp::getOperationName() ||
+      subtractInduction->getNumOperands() != 2 ||
+      (subtractInduction->getOperand(0) != loopBound &&
+       stablehloSplatInteger(subtractInduction->getOperand(0)) != extent) ||
+      subtractInduction->getOperand(1) != induction)
+    return std::nullopt;
+  return loopDirection == ScanDirection::Forward ? ScanDirection::Reverse
+                                                  : ScanDirection::Forward;
+}
+
+FailureOr<CountedScanDescription> describeCountedScan(Operation *operation) {
+  if (operation->getName().getStringRef() !=
+          stablehlo::WhileOp::getOperationName() ||
+      operation->getNumRegions() != 2 || operation->getNumOperands() == 0 ||
+      operation->getNumOperands() != operation->getNumResults() ||
+      !llvm::hasSingleElement(operation->getRegion(0)) ||
+      !llvm::hasSingleElement(operation->getRegion(1)))
+    return failure();
+  Block &condition = operation->getRegion(0).front();
+  Block &body = operation->getRegion(1).front();
+  if (condition.getNumArguments() != operation->getNumOperands() ||
+      body.getNumArguments() != operation->getNumOperands() ||
+      condition.getOperations().size() != 2 || body.empty())
+    return failure();
+  Operation &compare = condition.front();
+  Operation &conditionReturn = condition.back();
+  auto direction = compare.getAttrOfType<stablehlo::ComparisonDirectionAttr>(
+      "comparison_direction");
+  if (compare.getName().getStringRef() !=
+          stablehlo::CompareOp::getOperationName() ||
+      compare.getNumOperands() != 2 || compare.getNumResults() != 1 ||
+      conditionReturn.getName().getStringRef() !=
+          stablehlo::ReturnOp::getOperationName() ||
+      conditionReturn.getNumOperands() != 1 ||
+      conditionReturn.getOperand(0) != compare.getResult(0) || !direction)
+    return failure();
+  auto inductionArgument = dyn_cast<BlockArgument>(compare.getOperand(0));
+  if (!inductionArgument || inductionArgument.getOwner() != &condition)
+    return failure();
+  int64_t induction = inductionArgument.getArgNumber();
+  auto bodyReturn = dyn_cast<stablehlo::ReturnOp>(body.getTerminator());
+  if (!bodyReturn || bodyReturn.getNumOperands() != operation->getNumOperands())
+    return failure();
+  CountedScanDescription description;
+  description.induction = induction;
+  auto cachedExtent =
+      operation->getAttrOfType<IntegerAttr>("shuttle.scan_extent");
+  if (cachedExtent && cachedExtent.getInt() > 0 &&
+      direction.getValue() == stablehlo::ComparisonDirection::LT) {
+    description.extent = cachedExtent.getInt();
+    description.direction = ScanDirection::Forward;
+  } else if (cachedExtent && cachedExtent.getInt() > 0 &&
+             direction.getValue() == stablehlo::ComparisonDirection::GE) {
+    description.extent = cachedExtent.getInt();
+    description.direction = ScanDirection::Reverse;
+  } else {
+    std::optional<int64_t> bound =
+        stablehloSplatInteger(compare.getOperand(1));
+    std::optional<int64_t> initial =
+        stablehloSplatInteger(operation->getOperand(induction));
+    Value nextInduction = bodyReturn.getOperand(induction);
+    Operation *increment = nextInduction.getDefiningOp();
+    if (!bound || !initial || !increment ||
+        increment->getNumOperands() != 2 ||
+        increment->getOperand(0) != body.getArgument(induction))
+      return failure();
+    std::optional<int64_t> step =
+        stablehloSplatInteger(increment->getOperand(1));
+    if (direction.getValue() == stablehlo::ComparisonDirection::LT &&
+        step == 1 && *initial == 0 && *bound > 0) {
+      description.extent = *bound;
+      description.direction = ScanDirection::Forward;
+    } else if (direction.getValue() == stablehlo::ComparisonDirection::GE &&
+               step == -1 && *bound == 0 && *initial >= 0) {
+      description.extent = *initial + 1;
+      description.direction = ScanDirection::Reverse;
+    } else {
+      return failure();
+    }
+  }
+
+  llvm::SmallDenseSet<Operation *> framingCalls;
+  std::optional<ScanDirection> accessDirection;
+  Value loopBound = compare.getOperand(1);
+  Operation *increment = bodyReturn.getOperand(induction).getDefiningOp();
+  Value unitStep = increment && increment->getNumOperands() == 2
+                       ? increment->getOperand(1)
+                       : Value{};
+  auto acceptAccessIndex = [&](Value index) {
+    std::optional<ScanDirection> candidate = scanAccessDirection(
+        index, body.getArgument(induction), description.extent,
+        description.direction, loopBound, unitStep);
+    if (!candidate || (accessDirection && *accessDirection != *candidate))
+      return false;
+    accessDirection = candidate;
+    return true;
+  };
+  for (int64_t index = 0; index < static_cast<int64_t>(body.getNumArguments());
+       ++index) {
+    if (index == induction)
+      continue;
+    Value argument = body.getArgument(index);
+    Value yielded = bodyReturn.getOperand(index);
+    if (yielded == argument) {
+      Operation *sliceCall = nullptr;
+      std::optional<int64_t> sliceDimension;
+      for (Operation *user : argument.getUsers()) {
+        if (!calledFunction(user) || user->getNumOperands() != 2 ||
+            !acceptAccessIndex(user->getOperand(1)))
+          continue;
+        std::optional<int64_t> candidate = indexedSliceDimension(
+            user, argument, user->getOperand(1));
+        if (!candidate)
+          continue;
+        if (sliceCall)
+          return failure();
+        sliceCall = user;
+        sliceDimension = candidate;
+      }
+      if (sliceCall) {
+        description.scanned.push_back(index);
+        description.scannedDimensions.push_back(*sliceDimension);
+        description.scannedValues.push_back(sliceCall->getResult(0));
+        framingCalls.insert(sliceCall);
+      } else {
+        description.invariants.push_back(index);
+      }
+      continue;
+    }
+    Value update;
+    if (Operation *call = yielded.getDefiningOp()) {
+      std::optional<int64_t> updateDimension;
+      if (call->getNumOperands() == 3 && acceptAccessIndex(call->getOperand(2)))
+        updateDimension = indexedUpdateDimension(call, argument,
+                                                 call->getOperand(2), &update);
+      if (updateDimension) {
+        description.emitted.push_back(index);
+        description.emittedDimensions.push_back(*updateDimension);
+        description.emittedValues.push_back(update);
+        framingCalls.insert(call);
+        continue;
+      }
+    }
+    description.state.push_back(index);
+  }
+  if (description.state.empty() || description.scanned.empty())
+    return failure();
+  if (accessDirection)
+    description.direction = *accessDirection;
+
+  llvm::SmallDenseSet<Operation *> roots;
+  for (int64_t index : description.state)
+    if (Operation *root = bodyReturn.getOperand(index).getDefiningOp())
+      roots.insert(root);
+  for (Value value : description.emittedValues)
+    if (Operation *root = value.getDefiningOp())
+      roots.insert(root);
+  for (Operation *root : roots) {
+    if (framingCalls.contains(root) || !calledFunction(root))
+      continue;
+    if (description.step && description.step != root)
+      return failure();
+    description.step = root;
+  }
+  if (!description.step)
+    return failure();
+  return description;
+}
+
+bool isSupportedStablehloScan(Operation *operation) {
+  return succeeded(describeCountedScan(operation));
+}
+
+constexpr llvm::StringLiteral kScanHelperAttribute = "shuttle.scan_helper";
+
+bool isScanHelperFunction(func::FuncOp function) {
+  return function->hasAttr(kScanHelperAttribute);
+}
+
+void markCountedScanHelpers(ModuleOp module) {
+  module.walk([&](Operation *operation) {
+    FailureOr<CountedScanDescription> description =
+        describeCountedScan(operation);
+    if (failed(description))
+      return;
+    operation->setAttr("shuttle.scan_extent",
+                       IntegerAttr::get(IntegerType::get(module.getContext(), 64),
+                                        description->extent));
+    operation->setAttr("shuttle.scan_direction",
+                       ScanDirectionAttr::get(module.getContext(),
+                                              description->direction));
+    Block &body = operation->getRegion(1).front();
+    for (Operation &nested : body)
+      if (func::FuncOp function = calledFunction(&nested))
+        function->setAttr(kScanHelperAttribute,
+                          UnitAttr::get(module.getContext()));
+  });
+}
+
 bool isSupportedStablehlo(Operation *operation) {
+  if (isSupportedStablehloScan(operation)) {
+    return true;
+  }
+  if (isSupportedStablehloSelection(operation)) {
+    return true;
+  }
   if (isSupportedStablehloRelation(operation)) {
+    return true;
+  }
+  if (isSupportedStablehloScatter(operation)) {
     return true;
   }
   if (isSupportedStablehloReduce(operation)) {
     return true;
+  }
+  if (operation->getName().getStringRef() ==
+          stablehlo::CompareOp::getOperationName() &&
+      operation->getNumOperands() == 2 && operation->getNumResults() == 1 &&
+      operation->getNumRegions() == 0 && isMemoryEffectFree(operation)) {
+    auto lhs = dyn_cast<RankedTensorType>(operation->getOperand(0).getType());
+    auto rhs = dyn_cast<RankedTensorType>(operation->getOperand(1).getType());
+    auto result = dyn_cast<RankedTensorType>(operation->getResult(0).getType());
+    auto comparisonType =
+        operation->getAttrOfType<stablehlo::ComparisonTypeAttr>("compare_type");
+    auto direction =
+        operation->getAttrOfType<stablehlo::ComparisonDirectionAttr>(
+            "comparison_direction");
+    return lhs && rhs && result && lhs == rhs && lhs.hasStaticShape() &&
+           result.hasStaticShape() && lhs.getShape() == result.getShape() &&
+           lhs.getElementType().isF32() &&
+           result.getElementType().isInteger(1) && comparisonType &&
+           comparisonType.getValue() == stablehlo::ComparisonType::FLOAT &&
+           direction &&
+           direction.getValue() == stablehlo::ComparisonDirection::EQ &&
+           sourceAttributes(operation).size() == 2;
   }
   if (operation->getNumRegions() != 0 || !isMemoryEffectFree(operation) ||
       !hasOnlyRankedSupportedFloats(operation->getOperands()) ||
@@ -558,17 +1329,26 @@ bool isSupportedStablehlo(Operation *operation) {
   StringRef name = operation->getName().getStringRef();
   if (name == stablehlo::DotGeneralOp::getOperationName()) {
     if (operation->getNumOperands() != 2 || operation->getNumResults() != 1 ||
-        operation->hasAttr("algorithm") || !hasDefaultDotPrecision(operation)) {
+        operation->hasAttr("algorithm") ||
+        !hasSupportedDotPrecision(operation)) {
+      return false;
+    }
+    auto dimensions =
+        operation->getAttrOfType<stablehlo::DotDimensionNumbersAttr>(
+            "dot_dimension_numbers");
+    // Dots without reduction iterators use a separate Map representation.
+    // Keep that representation's existing type and precision boundary.
+    if (!dimensions || (dimensions.getLhsContractingDimensions().empty() &&
+                        (!hasDefaultDotPrecision(operation) ||
+                         !elementType(operation->getResult(0)).isF32()))) {
       return false;
     }
     return elementType(operation->getOperand(0)) ==
                elementType(operation->getOperand(1)) &&
            (elementType(operation->getOperand(0)).isF32() ||
             elementType(operation->getOperand(0)).isBF16()) &&
-           elementType(operation->getResult(0)).isF32() &&
-           static_cast<bool>(
-               operation->getAttrOfType<stablehlo::DotDimensionNumbersAttr>(
-                   "dot_dimension_numbers"));
+           (elementType(operation->getResult(0)).isF32() ||
+            elementType(operation->getResult(0)).isBF16());
   }
   if (name == stablehlo::ConvertOp::getOperationName()) {
     if (operation->getNumOperands() != 1 || operation->getNumResults() != 1 ||
@@ -589,17 +1369,20 @@ bool isSupportedStablehlo(Operation *operation) {
            operation->getNumResults() == 1 &&
            !operation->hasAttr("result_accuracy") &&
            sourceAttributes(operation).empty() &&
-           elementType(operation->getOperand(0)).isF32() &&
+           (elementType(operation->getOperand(0)).isF32() ||
+            elementType(operation->getOperand(0)).isBF16()) &&
            operation->getOperand(0).getType() ==
                operation->getResult(0).getType();
   }
   if (name == stablehlo::AddOp::getOperationName() ||
       name == stablehlo::MulOp::getOperationName() ||
+      name == stablehlo::MaxOp::getOperationName() ||
       name == stablehlo::SubtractOp::getOperationName() ||
       name == stablehlo::DivOp::getOperationName()) {
     return operation->getNumOperands() == 2 &&
            operation->getNumResults() == 1 &&
-           elementType(operation->getOperand(0)).isF32() &&
+           (elementType(operation->getOperand(0)).isF32() ||
+            elementType(operation->getOperand(0)).isBF16()) &&
            operation->getOperand(0).getType() ==
                operation->getOperand(1).getType() &&
            operation->getOperand(0).getType() ==
@@ -609,9 +1392,12 @@ bool isSupportedStablehlo(Operation *operation) {
     auto permutation =
         operation->getAttrOfType<DenseI64ArrayAttr>("permutation");
     auto input = cast<RankedTensorType>(operation->getOperand(0).getType());
+    auto result = cast<RankedTensorType>(operation->getResult(0).getType());
     return operation->getNumOperands() == 1 &&
            operation->getNumResults() == 1 && permutation &&
-           elementType(operation->getOperand(0)).isF32() &&
+           input.getElementType() == result.getElementType() &&
+           (input.getElementType().isF32() ||
+            input.getElementType().isBF16()) &&
            permutation.size() == static_cast<size_t>(input.getRank());
   }
   if (name == stablehlo::ConstantOp::getOperationName()) {
@@ -619,13 +1405,16 @@ bool isSupportedStablehlo(Operation *operation) {
     auto result = cast<RankedTensorType>(operation->getResult(0).getType());
     return operation->getNumOperands() == 0 &&
            operation->getNumResults() == 1 && result.getRank() == 0 &&
-           result.getElementType().isF32() && value && value.isSplat();
+           (result.getElementType().isF32() ||
+            (result.getElementType().isBF16() &&
+             enclosingFunctionContainsScatter(operation))) &&
+           value && value.isSplat();
   }
   if (name == stablehlo::BroadcastInDimOp::getOperationName()) {
     return isSupportedAffineBroadcast(operation);
   }
   if (name == stablehlo::ReshapeOp::getOperationName()) {
-    return isCopyFreeSingletonReshape(operation);
+    return isCopyFreeStaticReshape(operation);
   }
   return false;
 }
@@ -714,8 +1503,7 @@ bool isFullPrefixRankNAdditiveReduce(Operation *operation) {
     return false;
   }
   auto input = cast<RankedTensorType>(operation->getOperand(0).getType());
-  auto dimensions =
-      operation->getAttrOfType<DenseI64ArrayAttr>("dimensions");
+  auto dimensions = operation->getAttrOfType<DenseI64ArrayAttr>("dimensions");
   return input.hasStaticShape() && input.getRank() >= 3 &&
          input.getRank() <= 8 &&
          llvm::all_of(input.getShape(),
@@ -733,8 +1521,7 @@ bool isRankTwoAdditiveReduce(Operation *operation) {
     return false;
   }
   auto input = cast<RankedTensorType>(operation->getOperand(0).getType());
-  auto dimensions =
-      operation->getAttrOfType<DenseI64ArrayAttr>("dimensions");
+  auto dimensions = operation->getAttrOfType<DenseI64ArrayAttr>("dimensions");
   return input.hasStaticShape() && input.getRank() == 2 &&
          llvm::all_of(input.getShape(),
                       [](int64_t extent) { return extent > 0; }) &&
@@ -757,8 +1544,7 @@ bool isClosedRankOneBf16Result(
   return producer && componentOperations.contains(producer) &&
          (isFullPrefixRankNAdditiveReduce(producer) ||
           isRankTwoAdditiveReduce(producer)) &&
-         input && result &&
-         input.hasStaticShape() && result.hasStaticShape() &&
+         input && result && input.hasStaticShape() && result.hasStaticShape() &&
          input.getRank() == 1 && result.getRank() == 1 &&
          input.getShape() == result.getShape() &&
          input.getElementType().isF32() && result.getElementType().isBF16() &&
@@ -782,6 +1568,7 @@ bool isClosedDirectStablehloMap(Operation *operation) {
          name == stablehlo::NegOp::getOperationName() ||
          name == stablehlo::AddOp::getOperationName() ||
          name == stablehlo::MulOp::getOperationName() ||
+         name == stablehlo::MaxOp::getOperationName() ||
          name == stablehlo::SubtractOp::getOperationName() ||
          name == stablehlo::DivOp::getOperationName() ||
          name == stablehlo::TransposeOp::getOperationName() ||
@@ -832,8 +1619,8 @@ bool isProjectedBf16ParameterConversion(Operation *operation,
          input.getRank() >= 1 && input.getRank() < expansionRank &&
          input.getShape() == result.getShape() &&
          input.getElementType().isBF16() && result.getElementType().isF32() &&
-         llvm::all_of(input.getShape(),
-                      [](int64_t extent) { return extent > 0; });
+         llvm::all_of(
+             input.getShape(), [](int64_t extent) { return extent > 0; });
 }
 
 bool isExpansionDrivenByProjectedParameter(
@@ -848,8 +1635,7 @@ bool isExpansionDrivenByProjectedParameter(
         !visited.insert(producer).second) {
       return false;
     }
-    if (isProjectedBf16ParameterConversion(producer,
-                                           expansionType.getRank())) {
+    if (isProjectedBf16ParameterConversion(producer, expansionType.getRank())) {
       return true;
     }
     if (!isProjectedParameterInsertionStep(producer) ||
@@ -882,26 +1668,45 @@ bool hasUnclosedRankOneResult(const CandidateComponent &component) {
     return llvm::any_of(operation->getResults(), [&](Value result) {
       auto type = dyn_cast<RankedTensorType>(result.getType());
       SmallVector<Operation *> outsideUsers;
-      llvm::copy_if(result.getUsers(), std::back_inserter(outsideUsers),
-                    [&](Operation *user) {
-                      return !componentOperations.contains(user);
-                    });
-      if (!type || type.getRank() != 1 ||
-          !type.getElementType().isBF16() || outsideUsers.empty()) {
+      llvm::copy_if(
+          result.getUsers(), std::back_inserter(outsideUsers),
+          [&](Operation *user) { return !componentOperations.contains(user); });
+      if (!type || type.getRank() != 1 || !type.getElementType().isBF16() ||
+          outsideUsers.empty()) {
         return false;
       }
       return !isClosedRankOneBf16Result(operation, componentOperations) ||
-             !llvm::all_of(outsideUsers,
-                           [](Operation *user) {
-                             return isa<func::ReturnOp>(user);
-                           });
+             !llvm::all_of(outsideUsers, [](Operation *user) {
+               return isa<func::ReturnOp>(user);
+             });
     });
   });
+}
+
+bool isTrailingConversionOfUnsupportedOperation(
+    const CandidateComponent &component) {
+  if (component.operations.size() != 1 ||
+      component.operations.front()->getName().getStringRef() !=
+          stablehlo::ConvertOp::getOperationName() ||
+      component.operations.front()->getNumOperands() != 1) {
+    return false;
+  }
+  Operation *producer =
+      component.operations.front()->getOperand(0).getDefiningOp();
+  return producer && !isSupportedStablehlo(producer);
 }
 
 SmallVector<CandidateComponent> candidateComponents(ModuleOp module) {
   SmallVector<CandidateComponent> components;
   for (func::FuncOp function : module.getOps<func::FuncOp>()) {
+    if (isCompositeDecompositionFunction(function, module) ||
+        isScanHelperFunction(function)) {
+      continue;
+    }
+    bool hasIndexedAccumulation = false;
+    function.walk([&](Operation *operation) {
+      hasIndexedAccumulation |= isSupportedStablehloScatter(operation);
+    });
     for (Block &block : function.getBody()) {
       SmallVector<Operation *> interval;
       auto flushInterval = [&]() {
@@ -910,8 +1715,10 @@ SmallVector<CandidateComponent> candidateComponents(ModuleOp module) {
         }
         for (CandidateComponent &component :
              partitionSupportedInterval(interval)) {
-          if (!hasRankNExpansionWithoutClosedAnchor(component) &&
-              !hasUnclosedRankOneResult(component)) {
+          if (!isTrailingConversionOfUnsupportedOperation(component) &&
+              (hasIndexedAccumulation ||
+              (!hasRankNExpansionWithoutClosedAnchor(component) &&
+               !hasUnclosedRankOneResult(component)))) {
             components.push_back(std::move(component));
           }
         }
@@ -934,11 +1741,15 @@ ArrayAttr operationSourceRefs(Operation *operation) {
   return sourceRefs(operation);
 }
 
-DictionaryAttr zeroResultRecord(Operation *operation) {
+DictionaryAttr zeroResultRecord(Operation *operation, Attribute operationRef,
+                                ArrayRef<int64_t> operandIndices) {
   MLIRContext *context = operation->getContext();
   SmallVector<Attribute> operands;
-  operands.reserve(operation->getNumOperands());
-  for (Value operand : operation->getOperands()) {
+  operands.reserve(operandIndices.size());
+  for (int64_t index : operandIndices) {
+    if (index < 0 || index >= static_cast<int64_t>(operation->getNumOperands()))
+      return {};
+    Value operand = operation->getOperand(index);
     Attribute anchor = valueAnchor(operand);
     if (!anchor) {
       return {};
@@ -953,12 +1764,18 @@ DictionaryAttr zeroResultRecord(Operation *operation) {
                                        : "zero_result_operation")),
       NamedAttribute(StringAttr::get(context, "fingerprint"),
                      normalizedOperationFingerprint(operation)),
-      NamedAttribute(StringAttr::get(context, "operation_ref"),
-                     operation->getAttr(kOperationRefAttribute)),
+      NamedAttribute(StringAttr::get(context, "operation_ref"), operationRef),
       NamedAttribute(StringAttr::get(context, "operands"),
                      ArrayAttr::get(context, operands)),
   };
   return DictionaryAttr::get(context, fields);
+}
+
+DictionaryAttr zeroResultRecord(Operation *operation) {
+  SmallVector<int64_t> operandIndices(operation->getNumOperands());
+  std::iota(operandIndices.begin(), operandIndices.end(), 0);
+  return zeroResultRecord(operation, operation->getAttr(kOperationRefAttribute),
+                          operandIndices);
 }
 
 FailureOr<DictionaryAttr>
@@ -1002,6 +1819,10 @@ buildCoverageManifest(ModuleOp module, ArrayRef<CandidateComponent> components,
   SmallVector<Attribute> zeroResultOperations;
   SmallVector<Attribute> functionResults;
   for (func::FuncOp function : module.getOps<func::FuncOp>()) {
+    if (isCompositeDecompositionFunction(function, module) ||
+        isScanHelperFunction(function)) {
+      continue;
+    }
     auto functionOrdinal =
         function->getAttrOfType<IntegerAttr>(kFunctionOrdinalAttribute);
     LogicalResult sourceWalk =
@@ -1151,6 +1972,9 @@ struct AnnotateSourcePass
   void runOnOperation() override {
     uint64_t functionOrdinal = 0;
     for (func::FuncOp function : getOperation().getOps<func::FuncOp>()) {
+      if (isCompositeDecompositionFunction(function, getOperation())) {
+        continue;
+      }
       function->setAttr(
           kFunctionOrdinalAttribute,
           IntegerAttr::get(IntegerType::get(function.getContext(), 64),
@@ -1177,7 +2001,12 @@ struct FormStructuralRegionsPass
       signalPassFailure();
       return;
     }
+    markCountedScanHelpers(module);
     for (func::FuncOp function : module.getOps<func::FuncOp>()) {
+      if (isCompositeDecompositionFunction(function, module) ||
+          isScanHelperFunction(function)) {
+        continue;
+      }
       if (!function->hasAttr(kFunctionOrdinalAttribute)) {
         function.emitOpError(
             "requires shuttle-annotate-source before region formation");
@@ -1410,32 +2239,13 @@ FailureOr<SmallVector<AffineMap>> mapIndexingMaps(Operation *operation) {
   if (operation->getName().getStringRef() ==
       stablehlo::ReshapeOp::getOperationName()) {
     auto inputType = cast<RankedTensorType>(operation->getOperand(0).getType());
-    SmallVector<unsigned> resultNonSingleton;
-    for (auto [position, extent] : llvm::enumerate(resultType.getShape())) {
-      if (extent != 1) {
-        resultNonSingleton.push_back(position);
-      }
-    }
-    SmallVector<AffineExpr> inputExpressions;
-    unsigned nextNonSingleton = 0;
-    for (int64_t extent : inputType.getShape()) {
-      if (extent == 1) {
-        inputExpressions.push_back(getAffineConstantExpr(0, context));
-        continue;
-      }
-      if (nextNonSingleton >= resultNonSingleton.size()) {
-        operation->emitOpError("has incompatible singleton reshape shapes");
-        return failure();
-      }
-      inputExpressions.push_back(
-          getAffineDimExpr(resultNonSingleton[nextNonSingleton++], context));
-    }
-    if (nextNonSingleton != resultNonSingleton.size()) {
-      operation->emitOpError("has incompatible singleton reshape shapes");
+    FailureOr<AffineMap> inputMap =
+        contiguousReshapeInputMap(inputType, resultType);
+    if (failed(inputMap)) {
+      operation->emitOpError("has incompatible contiguous reshape shapes");
       return failure();
     }
-    return SmallVector<AffineMap>{
-        AffineMap::get(rank, 0, inputExpressions, context), identity};
+    return SmallVector<AffineMap>{*inputMap, identity};
   }
   if (operation->getName().getStringRef() ==
       stablehlo::BroadcastInDimOp::getOperationName()) {
@@ -1515,10 +2325,27 @@ Operation *createScalarOperation(OpBuilder &builder, Operation *operation,
     scalarName = arith::MulFOp::getOperationName();
   } else if (stablehloName == stablehlo::AddOp::getOperationName()) {
     scalarName = arith::AddFOp::getOperationName();
+  } else if (stablehloName == stablehlo::MaxOp::getOperationName()) {
+    scalarName = arith::MaximumFOp::getOperationName();
   } else if (stablehloName == stablehlo::SubtractOp::getOperationName()) {
     scalarName = arith::SubFOp::getOperationName();
   } else if (stablehloName == stablehlo::DivOp::getOperationName()) {
     scalarName = arith::DivFOp::getOperationName();
+  } else if (stablehloName == stablehlo::CompareOp::getOperationName()) {
+    auto comparisonType =
+        operation->getAttrOfType<stablehlo::ComparisonTypeAttr>("compare_type");
+    auto direction =
+        operation->getAttrOfType<stablehlo::ComparisonDirectionAttr>(
+            "comparison_direction");
+    if (!comparisonType ||
+        comparisonType.getValue() != stablehlo::ComparisonType::FLOAT ||
+        !direction ||
+        direction.getValue() != stablehlo::ComparisonDirection::EQ ||
+        arguments.size() != 2) {
+      return nullptr;
+    }
+    return builder.create<arith::CmpFOp>(location, arith::CmpFPredicate::OEQ,
+                                         arguments[0], arguments[1]);
   } else if (stablehloName == stablehlo::ConvertOp::getOperationName()) {
     OperationState state(location, ScalarConvertOp::getOperationName());
     state.addOperands(arguments);
@@ -1626,6 +2453,42 @@ LogicalResult convertContractOperation(Operation *operation) {
   }
   const unsigned domainRank = maps->front().getNumDims();
   const unsigned parallelRank = maps->back().getNumResults();
+  if (domainRank == parallelRank) {
+    if (operation->getNumOperands() != 2)
+      return failure();
+    OpBuilder builder(operation);
+    auto resultType = cast<RankedTensorType>(operation->getResult(0).getType());
+    OperationState state(operation->getLoc(), MapOp::getOperationName());
+    state.addOperands(operation->getOperands());
+    state.addTypes(operation->getResultTypes());
+    state.addAttribute("indexing_maps",
+                       affineMapsAttr(operation->getContext(), *maps));
+    state.addAttribute("semantics",
+                       MapSemanticsAttr::get(operation->getContext(),
+                                             MapSemantics::Pointwise));
+    state.addAttribute("source", source);
+    state.addRegion();
+    auto map = cast<MapOp>(builder.create(state));
+    Block *body = new Block();
+    map.getBody().push_back(body);
+    for (Value operand : operation->getOperands())
+      body->addArgument(elementType(operand), operation->getLoc());
+    builder.setInsertionPointToEnd(body);
+    SmallVector<Value> scalars;
+    for (BlockArgument argument : body->getArguments()) {
+      Value scalar = argument;
+      if (argument.getType() != resultType.getElementType())
+        scalar = builder.create<arith::ExtFOp>(
+            operation->getLoc(), resultType.getElementType(), argument);
+      scalars.push_back(scalar);
+    }
+    Value product = builder.create<arith::MulFOp>(operation->getLoc(),
+                                                  scalars[0], scalars[1]);
+    builder.create<YieldOp>(operation->getLoc(), product);
+    operation->getResult(0).replaceAllUsesWith(map.getResult(0));
+    operation->erase();
+    return success();
+  }
   OpBuilder builder(operation);
   SmallVector<Attribute> iteratorKinds;
   for (unsigned dimension = 0; dimension < domainRank; ++dimension) {
@@ -1634,6 +2497,15 @@ LogicalResult convertContractOperation(Operation *operation) {
   }
   SmallVector<Attribute> precision(operation->getNumOperands(),
                                    builder.getStringAttr("DEFAULT"));
+  auto sourcePrecision =
+      operation->getAttrOfType<ArrayAttr>("precision_config");
+  if (sourcePrecision && !sourcePrecision.empty()) {
+    precision.clear();
+    for (Attribute attribute : sourcePrecision) {
+      precision.push_back(builder.getStringAttr(stablehlo::stringifyPrecision(
+          cast<stablehlo::PrecisionAttr>(attribute).getValue())));
+    }
+  }
   auto resultType = cast<RankedTensorType>(operation->getResult(0).getType());
 
   OperationState state(operation->getLoc(), ContractOp::getOperationName());
@@ -1649,6 +2521,11 @@ LogicalResult convertContractOperation(Operation *operation) {
                      {TypeAttr::get(resultType.getElementType())}));
   state.addAttribute("precision",
                      ArrayAttr::get(operation->getContext(), precision));
+  if (!sourcePrecision || sourcePrecision.empty()) {
+    state.addAttribute(
+        "source_precision_form",
+        builder.getStringAttr(sourcePrecision ? "empty" : "omitted"));
+  }
   state.addAttribute("algorithm", builder.getStringAttr("dot_general"));
   state.addAttribute("source", source);
   Operation *contract = builder.create(state);
@@ -1679,6 +2556,14 @@ LogicalResult convertRelationOperation(Operation *operation) {
                 RelationSemantics::Convert)
           .Case(stablehlo::SelectOp::getOperationName(),
                 RelationSemantics::Select)
+          .Case(stablehlo::SliceOp::getOperationName(),
+                RelationSemantics::Slice)
+          .Case(stablehlo::TransposeOp::getOperationName(),
+                RelationSemantics::Transpose)
+          .Case(stablehlo::MulOp::getOperationName(),
+                RelationSemantics::Multiply)
+          .Case(stablehlo::GatherOp::getOperationName(),
+                RelationSemantics::Gather)
           .Default(failure());
   if (failed(semantics) || !isSupportedStablehloRelation(operation)) {
     return operation->emitOpError("has no lossless Relation conversion");
@@ -1693,19 +2578,17 @@ LogicalResult convertRelationOperation(Operation *operation) {
   if (*semantics == RelationSemantics::Iota) {
     parameters.push_back(operation->getAttr("iota_dimension"));
   } else if (*semantics == RelationSemantics::Constant) {
-    parameters.push_back(
-        operation->getAttrOfType<DenseElementsAttr>("value")
-            .getSplatValue<Attribute>());
+    parameters.push_back(operation->getAttrOfType<DenseElementsAttr>("value")
+                             .getSplatValue<Attribute>());
   } else if (*semantics == RelationSemantics::BroadcastInDim) {
-    auto dimensions = operation->getAttrOfType<DenseI64ArrayAttr>(
-        "broadcast_dimensions");
+    auto dimensions =
+        operation->getAttrOfType<DenseI64ArrayAttr>("broadcast_dimensions");
     for (int64_t dimension : dimensions.asArrayRef()) {
       parameters.push_back(builder.getI64IntegerAttr(dimension));
     }
   } else if (*semantics == RelationSemantics::Compare) {
     auto comparisonType =
-        operation->getAttrOfType<stablehlo::ComparisonTypeAttr>(
-            "compare_type");
+        operation->getAttrOfType<stablehlo::ComparisonTypeAttr>("compare_type");
     auto comparisonDirection =
         operation->getAttrOfType<stablehlo::ComparisonDirectionAttr>(
             "comparison_direction");
@@ -1713,6 +2596,46 @@ LogicalResult convertRelationOperation(Operation *operation) {
         stringifyComparisonType(comparisonType.getValue())));
     parameters.push_back(builder.getStringAttr(
         stringifyComparisonDirection(comparisonDirection.getValue())));
+  } else if (*semantics == RelationSemantics::Slice) {
+    parameters.push_back(operation->getAttr("start_indices"));
+    parameters.push_back(operation->getAttr("limit_indices"));
+    parameters.push_back(operation->getAttr("strides"));
+  } else if (*semantics == RelationSemantics::Transpose) {
+    parameters.push_back(operation->getAttr("permutation"));
+  } else if (*semantics == RelationSemantics::Gather) {
+    auto dimensions =
+        operation->getAttrOfType<stablehlo::GatherDimensionNumbersAttr>(
+            "dimension_numbers");
+    NamedAttribute fields[] = {
+        builder.getNamedAttr(
+            "offset_dims", DenseI64ArrayAttr::get(operation->getContext(),
+                                                  dimensions.getOffsetDims())),
+        builder.getNamedAttr(
+            "collapsed_slice_dims",
+            DenseI64ArrayAttr::get(operation->getContext(),
+                                   dimensions.getCollapsedSliceDims())),
+        builder.getNamedAttr(
+            "operand_batching_dims",
+            DenseI64ArrayAttr::get(operation->getContext(),
+                                   dimensions.getOperandBatchingDims())),
+        builder.getNamedAttr(
+            "start_indices_batching_dims",
+            DenseI64ArrayAttr::get(operation->getContext(),
+                                   dimensions.getStartIndicesBatchingDims())),
+        builder.getNamedAttr(
+            "start_index_map",
+            DenseI64ArrayAttr::get(operation->getContext(),
+                                   dimensions.getStartIndexMap())),
+        builder.getNamedAttr(
+            "index_vector_dim",
+            builder.getI64IntegerAttr(dimensions.getIndexVectorDim())),
+        builder.getNamedAttr("slice_sizes", operation->getAttr("slice_sizes")),
+        builder.getNamedAttr("indices_are_sorted",
+                             operation->getAttr("indices_are_sorted")
+                                 ? operation->getAttr("indices_are_sorted")
+                                 : builder.getBoolAttr(false)),
+    };
+    parameters.push_back(DictionaryAttr::get(operation->getContext(), fields));
   }
   state.addAttribute("parameters",
                      ArrayAttr::get(operation->getContext(), parameters));
@@ -1720,6 +2643,280 @@ LogicalResult convertRelationOperation(Operation *operation) {
   Operation *relation = builder.create(state);
   operation->getResult(0).replaceAllUsesWith(relation->getResult(0));
   operation->erase();
+  return success();
+}
+
+DictionaryAttr algebraSourceGroup(OpBuilder &builder, int64_t member,
+                                  int64_t size) {
+  return builder.getDictionaryAttr(
+      {builder.getNamedAttr("member", builder.getI64IntegerAttr(member)),
+       builder.getNamedAttr("size", builder.getI64IntegerAttr(size))});
+}
+
+LogicalResult convertScatterOperation(Operation *operation) {
+  if (!isSupportedStablehloScatter(operation))
+    return operation->emitOpError(
+        "requires a static additive full-window indexed update");
+  SourceRefAttr source = singleSourceRef(operation);
+  if (!source)
+    return operation->emitOpError("requires exactly one source result");
+  auto operand = cast<RankedTensorType>(operation->getOperand(0).getType());
+  auto indices = cast<RankedTensorType>(operation->getOperand(1).getType());
+  auto updates = cast<RankedTensorType>(operation->getOperand(2).getType());
+  auto dimensions =
+      operation->getAttrOfType<stablehlo::ScatterDimensionNumbersAttr>(
+          "scatter_dimension_numbers");
+  Block &sourceBody = operation->getRegion(0).front();
+  Operation &sourceCombiner = sourceBody.front();
+  Operation &sourceReturn = sourceBody.back();
+  ArrayAttr combinerRefs = sourceRefs(&sourceCombiner);
+  auto combinerOwner = sourceCombiner.getAttr(kOperationRefAttribute);
+  auto returnOwner = sourceReturn.getAttr(kOperationRefAttribute);
+  auto outerOwner = operation->getAttr(kOperationRefAttribute);
+  if (!combinerRefs || combinerRefs.size() != 1 || !combinerOwner ||
+      !returnOwner || !outerOwner)
+    return operation->emitOpError(
+        "has incomplete outer/reducer source provenance");
+
+  llvm::SmallDenseSet<int64_t> updateWindowDims(
+      dimensions.getUpdateWindowDims().begin(),
+      dimensions.getUpdateWindowDims().end());
+  SmallVector<int64_t> updateRouteDims;
+  for (int64_t dimension = 0; dimension < updates.getRank(); ++dimension)
+    if (!updateWindowDims.contains(dimension))
+      updateRouteDims.push_back(dimension);
+  llvm::SmallDenseSet<int64_t> batchedIndexDims(
+      dimensions.getScatterIndicesBatchingDims().begin(),
+      dimensions.getScatterIndicesBatchingDims().end());
+  SmallVector<int64_t> reductionUpdateDims;
+  for (auto [position, updateDimension] : llvm::enumerate(updateRouteDims))
+    if (!batchedIndexDims.contains(position))
+      reductionUpdateDims.push_back(updateDimension);
+  if (reductionUpdateDims.empty())
+    return operation->emitOpError(
+        "requires at least one non-batched indexed-update dimension");
+
+  SmallVector<int64_t> contributionShape(operand.getShape());
+  for (int64_t dimension : reductionUpdateDims)
+    contributionShape.push_back(updates.getDimSize(dimension));
+  auto contributionType = RankedTensorType::get(
+      contributionShape, operand.getElementType(), operand.getEncoding());
+  const int64_t contributionRank = contributionType.getRank();
+  const int64_t outputRank = operand.getRank();
+  SmallVector<int64_t> reductionDimensions;
+  for (int64_t dimension = outputRank; dimension < contributionRank;
+       ++dimension)
+    reductionDimensions.push_back(dimension);
+
+  OpBuilder builder(operation);
+  NamedAttribute metadataFields[] = {
+      builder.getNamedAttr("output_shape",
+                           builder.getDenseI64ArrayAttr(operand.getShape())),
+      builder.getNamedAttr(
+          "update_window_dims",
+          builder.getDenseI64ArrayAttr(dimensions.getUpdateWindowDims())),
+      builder.getNamedAttr(
+          "inserted_window_dims",
+          builder.getDenseI64ArrayAttr(dimensions.getInsertedWindowDims())),
+      builder.getNamedAttr(
+          "input_batching_dims",
+          builder.getDenseI64ArrayAttr(dimensions.getInputBatchingDims())),
+      builder.getNamedAttr("scatter_indices_batching_dims",
+                           builder.getDenseI64ArrayAttr(
+                               dimensions.getScatterIndicesBatchingDims())),
+      builder.getNamedAttr("scatter_dims_to_operand_dims",
+                           builder.getDenseI64ArrayAttr(
+                               dimensions.getScatterDimsToOperandDims())),
+      builder.getNamedAttr(
+          "index_vector_dim",
+          builder.getI64IntegerAttr(dimensions.getIndexVectorDim())),
+      builder.getNamedAttr("indices_are_sorted",
+                           operation->getAttr("indices_are_sorted")
+                               ? operation->getAttr("indices_are_sorted")
+                               : builder.getBoolAttr(false)),
+      builder.getNamedAttr("unique_indices",
+                           operation->getAttr("unique_indices")
+                               ? operation->getAttr("unique_indices")
+                               : builder.getBoolAttr(false)),
+      builder.getNamedAttr("conflict_resolution",
+                           builder.getStringAttr("source_ordered_add"))};
+  OperationState relationState(operation->getLoc(),
+                               RelationOp::getOperationName());
+  relationState.addOperands(
+      {operation->getOperand(2), operation->getOperand(1)});
+  relationState.addTypes(contributionType);
+  relationState.addAttribute(
+      "semantics",
+      RelationSemanticsAttr::get(operation->getContext(),
+                                 RelationSemantics::IndexedContributions));
+  relationState.addAttribute(
+      "parameters",
+      builder.getArrayAttr({builder.getDictionaryAttr(metadataFields)}));
+  relationState.addAttribute("source", source);
+  relationState.addAttribute("source_group", algebraSourceGroup(builder, 0, 4));
+  relationState.addAttribute(kOperationRefAttribute, outerOwner);
+  Operation *relation = builder.create(relationState);
+
+  auto scalarTensor = RankedTensorType::get({}, operand.getElementType());
+  OperationState initializerState(operation->getLoc(),
+                                  MapOp::getOperationName());
+  initializerState.addTypes(scalarTensor);
+  initializerState.addAttribute(
+      "indexing_maps",
+      affineMapsAttr(operation->getContext(),
+                     {AffineMap::get(0, 0, operation->getContext())}));
+  initializerState.addAttribute(
+      "semantics",
+      MapSemanticsAttr::get(operation->getContext(), MapSemantics::Pointwise));
+  initializerState.addAttribute("source", source);
+  initializerState.addAttribute("source_group",
+                                algebraSourceGroup(builder, 1, 4));
+  initializerState.addAttribute(kOperationRefAttribute, outerOwner);
+  initializerState.addRegion();
+  auto initializer = cast<MapOp>(builder.create(initializerState));
+  Block *initializerBody = new Block();
+  initializer.getBody().push_back(initializerBody);
+  builder.setInsertionPointToEnd(initializerBody);
+  OperationState zeroState(operation->getLoc(),
+                           arith::ConstantOp::getOperationName());
+  zeroState.addTypes(operand.getElementType());
+  zeroState.addAttribute("value",
+                         builder.getFloatAttr(operand.getElementType(), 0.0));
+  Operation *zero = builder.create(zeroState);
+  OperationState initializerYield(operation->getLoc(),
+                                  YieldOp::getOperationName());
+  initializerYield.addOperands(zero->getResult(0));
+  builder.create(initializerYield);
+
+  builder.setInsertionPoint(operation);
+  SmallVector<AffineExpr> resultExpressions;
+  for (int64_t dimension = 0; dimension < outputRank; ++dimension)
+    resultExpressions.push_back(
+        getAffineDimExpr(dimension, operation->getContext()));
+  OperationState foldState(operation->getLoc(), FoldOp::getOperationName());
+  foldState.addOperands({relation->getResult(0), initializer.getResult(0)});
+  foldState.addAttribute("operand_segment_sizes",
+                         builder.getDenseI32ArrayAttr({1, 1}));
+  foldState.addTypes(operand);
+  foldState.addAttribute(
+      "indexing_maps",
+      affineMapsAttr(operation->getContext(),
+                     {AffineMap::getMultiDimIdentityMap(
+                          contributionRank, operation->getContext()),
+                      AffineMap::get(contributionRank, 0, resultExpressions,
+                                     operation->getContext())}));
+  foldState.addAttribute("reduction_dimensions",
+                         builder.getDenseI64ArrayAttr(reductionDimensions));
+  foldState.addAttribute(
+      "accumulator_types",
+      builder.getArrayAttr({TypeAttr::get(operand.getElementType())}));
+  foldState.addAttribute("order_free", builder.getBoolAttr(false));
+  foldState.addAttribute("source", source);
+  foldState.addAttribute("source_group", algebraSourceGroup(builder, 2, 4));
+  foldState.addAttribute(kOperationRefAttribute, outerOwner);
+  foldState.addRegion();
+  auto fold = cast<FoldOp>(builder.create(foldState));
+  Block *combiner = new Block();
+  fold.getCombiner().push_back(combiner);
+  combiner->addArgument(operand.getElementType(),
+                        sourceBody.getArgument(0).getLoc());
+  combiner->addArgument(operand.getElementType(),
+                        sourceBody.getArgument(1).getLoc());
+  builder.setInsertionPointToEnd(combiner);
+  OperationState addState(sourceCombiner.getLoc(),
+                          arith::AddFOp::getOperationName());
+  addState.addOperands(combiner->getArguments());
+  addState.addTypes(operand.getElementType());
+  addState.addAttribute(kSourceRefsAttribute, combinerRefs);
+  addState.addAttribute(kOperationRefAttribute, combinerOwner);
+  Operation *add = builder.create(addState);
+  OperationState foldYield(sourceReturn.getLoc(), YieldOp::getOperationName());
+  foldYield.addOperands(add->getResult(0));
+  foldYield.addAttribute(kOperationRefAttribute, returnOwner);
+  builder.create(foldYield);
+
+  builder.setInsertionPoint(operation);
+  SmallVector<AffineMap> pointwiseMaps(
+      3,
+      AffineMap::getMultiDimIdentityMap(outputRank, operation->getContext()));
+  OperationState finalizerState(operation->getLoc(), MapOp::getOperationName());
+  finalizerState.addOperands({operation->getOperand(0), fold.getResult(0)});
+  finalizerState.addTypes(operand);
+  finalizerState.addAttribute(
+      "indexing_maps", affineMapsAttr(operation->getContext(), pointwiseMaps));
+  finalizerState.addAttribute(
+      "semantics",
+      MapSemanticsAttr::get(operation->getContext(), MapSemantics::Pointwise));
+  finalizerState.addAttribute("source", source);
+  finalizerState.addAttribute("source_group",
+                              algebraSourceGroup(builder, 3, 4));
+  finalizerState.addAttribute(kOperationRefAttribute, outerOwner);
+  finalizerState.addRegion();
+  auto finalizer = cast<MapOp>(builder.create(finalizerState));
+  Block *finalizerBody = new Block();
+  finalizer.getBody().push_back(finalizerBody);
+  finalizerBody->addArgument(operand.getElementType(), operation->getLoc());
+  finalizerBody->addArgument(operand.getElementType(), operation->getLoc());
+  builder.setInsertionPointToEnd(finalizerBody);
+  OperationState finalAddState(operation->getLoc(),
+                               arith::AddFOp::getOperationName());
+  finalAddState.addOperands(finalizerBody->getArguments());
+  finalAddState.addTypes(operand.getElementType());
+  Operation *finalAdd = builder.create(finalAddState);
+  OperationState finalYield(operation->getLoc(), YieldOp::getOperationName());
+  finalYield.addOperands(finalAdd->getResult(0));
+  builder.create(finalYield);
+
+  operation->getResult(0).replaceAllUsesWith(finalizer.getResult(0));
+  operation->erase();
+  return success();
+}
+
+LogicalResult convertSelectionOperation(Operation *operation) {
+  if (!isSupportedStablehloSelection(operation)) {
+    return operation->emitOpError("has no lossless Selection conversion");
+  }
+  auto decomposition =
+      operation->getAttrOfType<FlatSymbolRefAttr>("decomposition");
+  func::FuncOp implementation =
+      SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(operation,
+                                                         decomposition);
+  ArrayAttr sources = sourceRefs(operation);
+  if (!sources || sources.size() != operation->getNumResults()) {
+    return operation->emitOpError(
+        "requires one source reference per Selection result");
+  }
+  auto input = cast<RankedTensorType>(operation->getOperand(0).getType());
+  auto attributes =
+      operation->getAttrOfType<DictionaryAttr>("composite_attributes");
+  OpBuilder builder(operation);
+  OperationState state(operation->getLoc(), SelectionOp::getOperationName());
+  state.addOperands(operation->getOperands());
+  state.addTypes(operation->getResultTypes());
+  state.addAttribute("dimension",
+                     builder.getI64IntegerAttr(input.getRank() - 1));
+  state.addAttribute("count", attributes.get("k"));
+  state.addAttribute("order",
+                     SelectionOrderAttr::get(operation->getContext(),
+                                             SelectionOrder::Descending));
+  state.addAttribute("comparison", SelectionComparisonAttr::get(
+                                       operation->getContext(),
+                                       SelectionComparison::TotalOrder));
+  state.addAttribute("stable", builder.getBoolAttr(true));
+  state.addAttribute("tie_break", SelectionTieBreakAttr::get(
+                                      operation->getContext(),
+                                      SelectionTieBreak::SourceIndexAscending));
+  state.addAttribute("sources", sources);
+  Operation *selection = builder.create(state);
+  for (auto [sourceResult, selectedResult] :
+       llvm::zip_equal(operation->getResults(), selection->getResults())) {
+    sourceResult.replaceAllUsesWith(selectedResult);
+  }
+  operation->erase();
+  if (SymbolTable::symbolKnownUseEmpty(implementation,
+                                       implementation->getParentOp())) {
+    implementation.erase();
+  }
   return success();
 }
 
@@ -1749,11 +2946,31 @@ LogicalResult convertReduceOperation(Operation *operation) {
   }
 
   OpBuilder builder(operation);
+  auto inputType = cast<RankedTensorType>(operation->getOperand(0).getType());
+  llvm::SmallDenseSet<int64_t> reductionDimensions;
+  for (int64_t dimension :
+       operation->getAttrOfType<DenseI64ArrayAttr>("dimensions").asArrayRef()) {
+    reductionDimensions.insert(dimension);
+  }
+  SmallVector<AffineExpr> resultIndexing;
+  for (int64_t dimension = 0; dimension < inputType.getRank(); ++dimension) {
+    if (!reductionDimensions.contains(dimension)) {
+      resultIndexing.push_back(
+          getAffineDimExpr(dimension, operation->getContext()));
+    }
+  }
+  SmallVector<AffineMap> indexingMaps{
+      AffineMap::getMultiDimIdentityMap(inputType.getRank(),
+                                        operation->getContext()),
+      AffineMap::get(inputType.getRank(), 0, resultIndexing,
+                     operation->getContext())};
   OperationState state(operation->getLoc(), FoldOp::getOperationName());
   state.addOperands(operation->getOperands());
   state.addTypes(operation->getResultTypes());
   state.addAttribute("operandSegmentSizes",
                      DenseI32ArrayAttr::get(operation->getContext(), {1, 1}));
+  state.addAttribute("indexing_maps",
+                     affineMapsAttr(operation->getContext(), indexingMaps));
   state.addAttribute("reduction_dimensions", operation->getAttr("dimensions"));
   state.addAttribute("accumulator_types",
                      ArrayAttr::get(operation->getContext(),
@@ -1769,11 +2986,10 @@ LogicalResult convertReduceOperation(Operation *operation) {
   body->addArgument(builder.getF32Type(), sourceBody.getArgument(0).getLoc());
   body->addArgument(builder.getF32Type(), sourceBody.getArgument(1).getLoc());
   builder.setInsertionPointToEnd(body);
-  StringRef scalarName =
-      sourceCombiner.getName().getStringRef() ==
-              stablehlo::AddOp::getOperationName()
-          ? arith::AddFOp::getOperationName()
-          : arith::MaximumFOp::getOperationName();
+  StringRef scalarName = sourceCombiner.getName().getStringRef() ==
+                                 stablehlo::AddOp::getOperationName()
+                             ? arith::AddFOp::getOperationName()
+                             : arith::MaximumFOp::getOperationName();
   OperationState combinerState(sourceCombiner.getLoc(), scalarName);
   combinerState.addOperands(body->getArguments());
   combinerState.addTypes(builder.getF32Type());
@@ -1790,6 +3006,249 @@ LogicalResult convertReduceOperation(Operation *operation) {
   return success();
 }
 
+LogicalResult convertScanOperation(Operation *operation) {
+  FailureOr<CountedScanDescription> described = describeCountedScan(operation);
+  if (failed(described))
+    return operation->emitOpError(
+        "is not a statically bounded counted Scan with structural slice/update bindings");
+  CountedScanDescription &description = *described;
+  Block &sourceBody = operation->getRegion(1).front();
+  auto sourceReturn = cast<stablehlo::ReturnOp>(sourceBody.getTerminator());
+  func::FuncOp step = calledFunction(description.step);
+  if (!step || !llvm::hasSingleElement(step.getBody()))
+    return operation->emitOpError("requires one closed generic step function");
+  Block &stepBody = step.getBody().front();
+  auto stepReturn = dyn_cast<func::ReturnOp>(stepBody.getTerminator());
+  if (!stepReturn || stepReturn.getNumOperands() !=
+                         description.step->getNumResults())
+    return operation->emitOpError("requires a direct step-function return");
+
+  SmallVector<Value> inputs;
+  SmallVector<Type> resultTypes;
+  for (int64_t index : description.state) {
+    inputs.push_back(operation->getOperand(index));
+    resultTypes.push_back(operation->getResult(index).getType());
+  }
+  for (int64_t index : description.invariants)
+    inputs.push_back(operation->getOperand(index));
+  for (int64_t index : description.scanned)
+    inputs.push_back(operation->getOperand(index));
+  for (int64_t index : description.emitted)
+    resultTypes.push_back(operation->getResult(index).getType());
+
+  SmallVector<Attribute> sources;
+  if (failed(walkSourcePreorder(operation, [&](Operation *nested) {
+        if (ArrayAttr refs = sourceRefs(nested))
+          llvm::append_range(sources, refs);
+        return success();
+      })))
+    return failure();
+  if (sources.empty())
+    return operation->emitOpError("has no complete source provenance");
+
+  SmallVector<Attribute> resultSources;
+  ArrayAttr whileSources = sourceRefs(operation);
+  if (!whileSources || whileSources.size() != operation->getNumResults())
+    return operation->emitOpError("has incomplete result source provenance");
+  for (int64_t index : description.state)
+    resultSources.push_back(whileSources[index]);
+  for (int64_t index : description.emitted)
+    resultSources.push_back(whileSources[index]);
+
+  SmallVector<Attribute> erasedTerminatorRecords;
+  for (Region &region : operation->getRegions()) {
+    auto sourceTerminator = dyn_cast<stablehlo::ReturnOp>(
+        region.front().getTerminator());
+    if (!sourceTerminator)
+      return operation->emitOpError(
+          "requires direct StableHLO return terminators");
+    DictionaryAttr record = zeroResultRecord(sourceTerminator);
+    if (!record)
+      return sourceTerminator.emitOpError(
+          "has an operand without a structural source anchor");
+    erasedTerminatorRecords.push_back(record);
+  }
+
+  OpBuilder builder(operation);
+  OperationState state(operation->getLoc(), ScanOp::getOperationName());
+  state.addOperands(inputs);
+  state.addTypes(resultTypes);
+  state.addAttribute("axis", builder.getI64IntegerAttr(0));
+  state.addAttribute("extent", builder.getI64IntegerAttr(description.extent));
+  state.addAttribute("direction",
+                     ScanDirectionAttr::get(operation->getContext(),
+                                            description.direction));
+  SmallVector<int64_t> stateOperands(description.state.size());
+  std::iota(stateOperands.begin(), stateOperands.end(), 0);
+  SmallVector<int64_t> invariantOperands(description.invariants.size());
+  std::iota(invariantOperands.begin(), invariantOperands.end(),
+            description.state.size());
+  SmallVector<int64_t> scannedOperands(description.scanned.size());
+  std::iota(scannedOperands.begin(), scannedOperands.end(),
+            description.state.size() + description.invariants.size());
+  SmallVector<int64_t> stateResults(description.state.size());
+  std::iota(stateResults.begin(), stateResults.end(), 0);
+  SmallVector<int64_t> emittedResults(description.emitted.size());
+  std::iota(emittedResults.begin(), emittedResults.end(),
+            description.state.size());
+  state.addAttribute("state_operands",
+                     builder.getDenseI64ArrayAttr(stateOperands));
+  state.addAttribute("state_body_arguments",
+                     builder.getDenseI64ArrayAttr(stateOperands));
+  state.addAttribute("state_body_results",
+                     builder.getDenseI64ArrayAttr(stateResults));
+  state.addAttribute("state_results",
+                     builder.getDenseI64ArrayAttr(stateResults));
+  state.addAttribute("invariant_operands",
+                     builder.getDenseI64ArrayAttr(invariantOperands));
+  state.addAttribute("invariant_body_arguments",
+                     builder.getDenseI64ArrayAttr(invariantOperands));
+  state.addAttribute("scanned_operands",
+                     builder.getDenseI64ArrayAttr(scannedOperands));
+  state.addAttribute("scanned_body_arguments",
+                     builder.getDenseI64ArrayAttr(scannedOperands));
+  state.addAttribute("scanned_dimensions", builder.getDenseI64ArrayAttr(
+                                                    description.scannedDimensions));
+  state.addAttribute("emitted_body_results",
+                     builder.getDenseI64ArrayAttr(emittedResults));
+  state.addAttribute("emitted_results",
+                     builder.getDenseI64ArrayAttr(emittedResults));
+  state.addAttribute("emitted_dimensions", builder.getDenseI64ArrayAttr(
+                                                    description.emittedDimensions));
+  state.addAttribute("sources", builder.getArrayAttr(sources));
+  state.addAttribute(kScanResultSourcesAttribute,
+                     builder.getArrayAttr(resultSources));
+  state.addAttribute(kScanErasedTerminatorRecordsAttribute,
+                     builder.getArrayAttr(erasedTerminatorRecords));
+  state.addRegion();
+  auto scan = cast<ScanOp>(builder.create(state));
+  Block *body = new Block();
+  scan.getBody().push_back(body);
+  for (auto [inputIndex, input] : llvm::enumerate(inputs)) {
+    Type type = input.getType();
+    const int64_t scannedStart =
+        description.state.size() + description.invariants.size();
+    if (static_cast<int64_t>(inputIndex) >= scannedStart) {
+      // Scanned body types are supplied by their structurally proven slice.
+      int64_t position = inputIndex - scannedStart;
+      type = description.scannedValues[position].getType();
+    }
+    body->addArgument(type, input.getLoc());
+  }
+
+  IRMapping mapping;
+  for (auto [argument, operand] :
+       llvm::zip_equal(stepBody.getArguments(), description.step->getOperands())) {
+    Value replacement;
+    if (auto bodyArgument = dyn_cast<BlockArgument>(operand);
+        bodyArgument && bodyArgument.getOwner() == &sourceBody) {
+      int64_t sourceIndex = bodyArgument.getArgNumber();
+      auto stateIt = llvm::find(description.state, sourceIndex);
+      auto invariantIt = llvm::find(description.invariants, sourceIndex);
+      if (stateIt != description.state.end())
+        replacement = body->getArgument(stateIt - description.state.begin());
+      else if (invariantIt != description.invariants.end())
+        replacement = body->getArgument(description.state.size() +
+                                        invariantIt - description.invariants.begin());
+    }
+    if (!replacement) {
+      auto scannedIt = llvm::find(description.scannedValues, operand);
+      if (scannedIt != description.scannedValues.end())
+        replacement = body->getArgument(
+            description.state.size() + description.invariants.size() +
+            scannedIt - description.scannedValues.begin());
+    }
+    if (!replacement)
+      return operation->emitOpError(
+          "step operand is not a carried state, invariant, or scanned slice");
+    mapping.map(argument, replacement);
+  }
+  builder.setInsertionPointToEnd(body);
+  for (Operation &nested : stepBody.without_terminator())
+    builder.clone(nested, mapping);
+  for (auto [result, returned] :
+       llvm::zip_equal(description.step->getResults(), stepReturn.getOperands()))
+    mapping.map(result, mapping.lookupOrDefault(returned));
+
+  SmallVector<Value> yielded;
+  for (int64_t index : description.state)
+    yielded.push_back(mapping.lookupOrDefault(sourceReturn.getOperand(index)));
+  for (Value emitted : description.emittedValues)
+    yielded.push_back(mapping.lookupOrDefault(emitted));
+  if (llvm::any_of(yielded, [](Value value) { return !value; }))
+    return operation->emitOpError("cannot map a Scan result through its step function");
+  OperationState yieldState(operation->getLoc(), YieldOp::getOperationName());
+  yieldState.addOperands(yielded);
+  builder.create(yieldState);
+
+  SmallVector<Operation *> cloned;
+  for (Operation &nested : body->without_terminator())
+    cloned.push_back(&nested);
+  for (Operation *nested : cloned) {
+    StringRef name = nested->getName().getStringRef();
+    LogicalResult converted =
+        isSupportedStablehloSelection(nested) ? convertSelectionOperation(nested)
+        : isSupportedStablehloScatter(nested) ? convertScatterOperation(nested)
+        : isSupportedStablehloRelation(nested) ? convertRelationOperation(nested)
+        : name == stablehlo::ReduceOp::getOperationName()
+            ? convertReduceOperation(nested)
+        : name == stablehlo::DotGeneralOp::getOperationName()
+            ? convertContractOperation(nested)
+            : convertMapOperation(nested);
+    if (failed(converted))
+      return operation->emitOpError("has an unsupported generic Scan body operation");
+  }
+
+  llvm::SmallDenseMap<int64_t, Value> replacementByPosition;
+  for (auto [ordinal, position] : llvm::enumerate(description.state))
+    replacementByPosition[position] = scan.getResult(ordinal);
+  for (auto [ordinal, position] : llvm::enumerate(description.emitted))
+    replacementByPosition[position] =
+        scan.getResult(description.state.size() + ordinal);
+  for (int64_t position : description.invariants)
+    replacementByPosition[position] = operation->getOperand(position);
+  for (int64_t position : description.scanned)
+    replacementByPosition[position] = operation->getOperand(position);
+  for (auto [position, result] : llvm::enumerate(operation->getResults())) {
+    if (position == static_cast<size_t>(description.induction)) {
+      if (!result.use_empty())
+        return operation->emitOpError("cannot expose the counted induction result");
+      continue;
+    }
+    auto replacement = replacementByPosition.find(position);
+    if (replacement == replacementByPosition.end())
+      return operation->emitOpError("has an unclassified loop-carried result");
+    result.replaceAllUsesWith(replacement->second);
+  }
+  operation->erase();
+
+  // Counted-loop induction and destination-buffer initializers are structural
+  // StableHLO scaffolding, not Scan inputs. Preserve their source coverage on
+  // the aggregate Scan while removing any now-dead pure producer chain.
+  bool removed = true;
+  while (removed) {
+    removed = false;
+    SmallVector<Operation *> candidates;
+    for (Operation &candidate : scan->getBlock()->without_terminator())
+      candidates.push_back(&candidate);
+    for (Operation *candidate : llvm::reverse(candidates)) {
+      if (candidate == scan.getOperation() ||
+          llvm::any_of(candidate->getResults(),
+                       [](Value value) { return !value.use_empty(); }) ||
+          !isMemoryEffectFree(candidate))
+        continue;
+      SmallVector<Attribute> aggregate(scan.getSources().begin(),
+                                       scan.getSources().end());
+      if (ArrayAttr refs = sourceRefs(candidate))
+        llvm::append_range(aggregate, refs);
+      scan->setAttr("sources", builder.getArrayAttr(aggregate));
+      candidate->erase();
+      removed = true;
+    }
+  }
+  return success();
+}
+
 struct ConvertStablehloToAlgebraPass
     : impl::ShuttleConvertStablehloToAlgebraPassBase<
           ConvertStablehloToAlgebraPass> {
@@ -1803,16 +3262,34 @@ struct ConvertStablehloToAlgebraPass
     SmallVector<RegionOp> regions;
     getOperation().walk([&](RegionOp region) { regions.push_back(region); });
     for (RegionOp region : regions) {
-      SmallVector<Operation *> sourceOperations;
+      SmallVector<Operation *> scans;
       for (Operation &operation : region.getBody().front()) {
-        if (!isa<YieldOp>(operation)) {
-          sourceOperations.push_back(&operation);
+        if (isSupportedStablehloScan(&operation))
+          scans.push_back(&operation);
+      }
+      for (Operation *scan : scans) {
+        if (failed(convertScanOperation(scan))) {
+          signalPassFailure();
+          return;
         }
       }
+      SmallVector<Operation *> sourceOperations;
+      for (Operation &operation : region.getBody().front())
+        if (!isa<YieldOp>(operation) &&
+            operation.getDialect() !=
+                region->getContext()->getLoadedDialect<ShuttleDialect>())
+          sourceOperations.push_back(&operation);
       for (Operation *operation : sourceOperations) {
         StringRef name = operation->getName().getStringRef();
         LogicalResult result =
-            isSupportedStablehloRelation(operation)
+            name == stablehlo::WhileOp::getOperationName()
+                ? operation->emitOpError(
+                      "is not a statically bounded counted Scan with structural slice/update bindings")
+            : isSupportedStablehloSelection(operation)
+                ? convertSelectionOperation(operation)
+            : isSupportedStablehloScatter(operation)
+                ? convertScatterOperation(operation)
+            : isSupportedStablehloRelation(operation)
                 ? convertRelationOperation(operation)
             : name == stablehlo::ReduceOp::getOperationName()
                 ? convertReduceOperation(operation)
@@ -1825,6 +3302,11 @@ struct ConvertStablehloToAlgebraPass
         }
       }
     }
+    for (func::FuncOp function :
+         llvm::make_early_inc_range(getOperation().getOps<func::FuncOp>()))
+      if (isScanHelperFunction(function) &&
+          SymbolTable::symbolKnownUseEmpty(function, getOperation()))
+        function.erase();
   }
 };
 
@@ -1832,6 +3314,9 @@ LogicalResult verifyRegionLocalCoverage(ModuleOp module) {
   WalkResult result = module.walk([&](RegionOp region) {
     llvm::SmallDenseSet<Attribute> declaredSources;
     llvm::SmallDenseSet<Attribute> representedSources;
+    llvm::SmallDenseMap<Attribute, int64_t> sourceGroupSizes;
+    llvm::SmallDenseMap<Attribute, llvm::SmallDenseSet<int64_t, 4>>
+        sourceGroupMembers;
     for (Attribute source : region.getSourceRefs()) {
       auto sourceRef = dyn_cast<SourceRefAttr>(source);
       if (!sourceRef || !declaredSources.insert(sourceRef).second) {
@@ -1842,6 +3327,30 @@ LogicalResult verifyRegionLocalCoverage(ModuleOp module) {
     WalkResult nestedResult = region.getBody().walk([&](Operation *operation) {
       if (isa<RegionOp>(operation)) {
         return WalkResult::skip();
+      }
+      if (operation->getParentOfType<ScanOp>() && !isa<ScanOp>(operation)) {
+        return WalkResult::advance();
+      }
+      if (auto scan = dyn_cast<ScanOp>(operation)) {
+        for (Attribute source : scan.getSources()) {
+          if (!declaredSources.contains(source) ||
+              !representedSources.insert(source).second) {
+            scan.emitOpError("has invalid ordered Scan source coverage");
+            return WalkResult::interrupt();
+          }
+        }
+        return WalkResult::skip();
+      }
+      if (auto selection = dyn_cast<SelectionOp>(operation)) {
+        for (Attribute source : selection.getSources()) {
+          if (!declaredSources.contains(source) ||
+              !representedSources.insert(source).second) {
+            selection.emitOpError(
+                "has invalid multi-result Selection source coverage");
+            return WalkResult::interrupt();
+          }
+        }
+        return WalkResult::advance();
       }
       Attribute source;
       if (auto map = dyn_cast<MapOp>(operation)) {
@@ -1873,15 +3382,55 @@ LogicalResult verifyRegionLocalCoverage(ModuleOp module) {
             "source reference is absent from the enclosing shuttle.region");
         return WalkResult::interrupt();
       }
-      if (!representedSources.insert(source).second) {
+      auto sourceGroup =
+          operation->getAttrOfType<DictionaryAttr>("source_group");
+      if (sourceGroup) {
+        auto member = sourceGroup.getAs<IntegerAttr>("member");
+        auto size = sourceGroup.getAs<IntegerAttr>("size");
+        if (sourceGroup.size() != 2 || !member || !size ||
+            member.getInt() < 0 || size.getInt() <= 1 ||
+            member.getInt() >= size.getInt()) {
+          operation->emitOpError("has invalid algebra source-group metadata");
+          return WalkResult::interrupt();
+        }
+        auto [sizeIt, insertedSize] =
+            sourceGroupSizes.try_emplace(source, size.getInt());
+        if ((!insertedSize && sizeIt->second != size.getInt()) ||
+            !sourceGroupMembers[source].insert(member.getInt()).second) {
+          operation->emitOpError(
+              "has duplicate or inconsistent algebra source-group members");
+          return WalkResult::interrupt();
+        }
+        representedSources.insert(source);
+      } else if (!representedSources.insert(source).second) {
         operation->emitOpError("duplicates region-local source coverage");
         return WalkResult::interrupt();
       }
-      return WalkResult::advance();
+      if (auto fold = dyn_cast<FoldOp>(operation)) {
+        if (ArrayAttr aggregates = sourceRefs(operation)) {
+          for (Attribute aggregate : aggregates) {
+            if (aggregate == source)
+              continue;
+            if (!declaredSources.contains(aggregate) ||
+                !representedSources.insert(aggregate).second) {
+              operation->emitOpError(
+                  "has invalid aggregate Fold source coverage");
+              return WalkResult::interrupt();
+            }
+          }
+        }
+      }
+      return WalkResult::skip();
     });
     if (nestedResult.wasInterrupted()) {
       return WalkResult::interrupt();
     }
+    for (const auto &[source, size] : sourceGroupSizes)
+      if (sourceGroupMembers.lookup(source).size() !=
+          static_cast<size_t>(size)) {
+        region.emitOpError("has an incomplete algebra source group");
+        return WalkResult::interrupt();
+      }
     for (Attribute declaredSource : declaredSources) {
       if (!representedSources.contains(declaredSource)) {
         region.emitOpError(
@@ -1969,9 +3518,14 @@ FailureOr<ArrayAttr> currentExcludedRecords(ModuleOp module,
       return failure();
     }
   }
+  if (reasons.empty())
+    return ArrayAttr::get(module.getContext(), {});
 
   SmallVector<Attribute> records;
   for (func::FuncOp function : module.getOps<func::FuncOp>()) {
+    if (isCompositeDecompositionFunction(function, module)) {
+      continue;
+    }
     LogicalResult walk =
         walkSourcePreorder(function.getBody(), [&](Operation *operation) {
           ArrayAttr refs = sourceRefs(operation);
@@ -2017,16 +3571,46 @@ FailureOr<ArrayAttr> currentExcludedRecords(ModuleOp module,
 FailureOr<ArrayAttr> currentZeroResultRecords(ModuleOp module) {
   SmallVector<Attribute> records;
   for (func::FuncOp function : module.getOps<func::FuncOp>()) {
+    if (isCompositeDecompositionFunction(function, module)) {
+      continue;
+    }
     LogicalResult walk =
         walkSourcePreorder(function.getBody(), [&](Operation *operation) {
-          if (operation->getNumResults() != 0 ||
-              !operation->hasAttr(kOperationRefAttribute)) {
+          if (auto scan = dyn_cast<ScanOp>(operation)) {
+            if (auto erased = scan.getErasedTerminatorRecordsAttr())
+              llvm::append_range(records, erased);
+          }
+          if (operation->getParentOfType<ScanOp>())
+            return success();
+          if (operation->getNumResults() != 0) {
             return success();
           }
-          DictionaryAttr record = zeroResultRecord(operation);
-          if (!record) {
-            return failure();
+          if (auto groups = operation->getAttrOfType<ArrayAttr>(
+                  kOperationRefGroupsAttribute)) {
+            for (Attribute attribute : groups) {
+              auto group = dyn_cast<DictionaryAttr>(attribute);
+              auto operationRef =
+                  group ? group.getAs<DenseI64ArrayAttr>("operation_ref")
+                        : DenseI64ArrayAttr{};
+              auto operandIndices =
+                  group ? group.getAs<DenseI64ArrayAttr>("operand_indices")
+                        : DenseI64ArrayAttr{};
+              DictionaryAttr record =
+                  operationRef && operandIndices
+                      ? zeroResultRecord(operation, operationRef,
+                                         operandIndices.asArrayRef())
+                      : DictionaryAttr{};
+              if (!record)
+                return failure();
+              records.push_back(record);
+            }
+            return success();
           }
+          if (!operation->hasAttr(kOperationRefAttribute))
+            return success();
+          DictionaryAttr record = zeroResultRecord(operation);
+          if (!record)
+            return failure();
           records.push_back(record);
           return success();
         });
@@ -2040,6 +3624,9 @@ FailureOr<ArrayAttr> currentZeroResultRecords(ModuleOp module) {
 FailureOr<ArrayAttr> currentFunctionResultRecords(ModuleOp module) {
   SmallVector<Attribute> records;
   for (func::FuncOp function : module.getOps<func::FuncOp>()) {
+    if (isCompositeDecompositionFunction(function, module)) {
+      continue;
+    }
     auto functionOrdinal =
         function->getAttrOfType<IntegerAttr>(kFunctionOrdinalAttribute);
     if (!functionOrdinal || !llvm::hasSingleElement(function.getBody())) {
@@ -2189,25 +3776,87 @@ LogicalResult verifyManifestCoverage(ModuleOp module, DictionaryAttr manifest) {
   }
 
   llvm::SmallDenseSet<Attribute> operationRefs;
+  llvm::SmallDenseMap<Attribute, int64_t> expandedOperationSizes;
+  llvm::SmallDenseMap<Attribute, llvm::SmallDenseSet<int64_t, 4>>
+      expandedOperationMembers;
   WalkResult operationRefWalk = module.walk([&](Operation *operation) {
     Attribute operationRef = operation->getAttr(kOperationRefAttribute);
+    ArrayAttr operationRefGroups =
+        operation->getAttrOfType<ArrayAttr>(kOperationRefGroupsAttribute);
     ArrayAttr refs = sourceRefs(operation);
-    if (refs && operation->getParentOfType<FoldOp>() && !operationRef) {
+    const bool aggregateProvenance =
+        isa<FoldOp>(operation) || isa<stablehlo::ReduceOp>(operation);
+    if (refs && operation->getParentOfType<FoldOp>() && !operationRef &&
+        !aggregateProvenance) {
       operation->emitOpError(
           "has nested Fold sources without an operation reference");
       return WalkResult::interrupt();
     }
     if (!operationRef) {
+      if (!operationRefGroups)
+        return WalkResult::advance();
+      if (operation->getNumResults() != 0 ||
+          !operation->hasTrait<OpTrait::IsTerminator>()) {
+        operation->emitOpError(
+            "operation reference groups require a zero-result terminator");
+        return WalkResult::interrupt();
+      }
+      for (Attribute attribute : operationRefGroups) {
+        auto group = dyn_cast<DictionaryAttr>(attribute);
+        auto groupRef = group ? group.getAs<DenseI64ArrayAttr>("operation_ref")
+                              : DenseI64ArrayAttr{};
+        auto operandIndices =
+            group ? group.getAs<DenseI64ArrayAttr>("operand_indices")
+                  : DenseI64ArrayAttr{};
+        if (!groupRef || !operandIndices || operandIndices.empty() ||
+            groupRef.size() != 3 ||
+            llvm::any_of(operandIndices.asArrayRef(),
+                         [&](int64_t index) {
+                           return index < 0 ||
+                                  index >= static_cast<int64_t>(
+                                               operation->getNumOperands());
+                         }) ||
+            !operationRefs.insert(groupRef).second) {
+          operation->emitOpError(
+              "has a malformed or duplicate operation reference group");
+          return WalkResult::interrupt();
+        }
+      }
       return WalkResult::advance();
     }
-    auto denseOperationRef = dyn_cast<DenseI64ArrayAttr>(operationRef);
-    if (!denseOperationRef || denseOperationRef.size() != 3 ||
-        !operationRefs.insert(operationRef).second) {
+
+    if (operationRefGroups) {
       operation->emitOpError(
-          "has a missing-format or duplicate operation reference");
+          "cannot carry singular and grouped operation references");
       return WalkResult::interrupt();
     }
-    if (refs && llvm::any_of(refs, [&](Attribute ref) {
+    auto denseOperationRef = dyn_cast<DenseI64ArrayAttr>(operationRef);
+    auto sourceGroup = operation->getAttrOfType<DictionaryAttr>("source_group");
+    if (!denseOperationRef || denseOperationRef.size() != 3) {
+      operation->emitOpError("has a missing-format operation reference");
+      return WalkResult::interrupt();
+    }
+    if (sourceGroup) {
+      auto member = sourceGroup.getAs<IntegerAttr>("member");
+      auto size = sourceGroup.getAs<IntegerAttr>("size");
+      auto [sizeIt, insertedSize] = expandedOperationSizes.try_emplace(
+          operationRef, size ? size.getInt() : 0);
+      if (!member || !size || sourceGroup.size() != 2 || member.getInt() < 0 ||
+          size.getInt() <= 1 || member.getInt() >= size.getInt() ||
+          (!insertedSize && sizeIt->second != size.getInt()) ||
+          !expandedOperationMembers[operationRef]
+               .insert(member.getInt())
+               .second) {
+        operation->emitOpError(
+            "has malformed or duplicate expanded operation provenance");
+        return WalkResult::interrupt();
+      }
+      operationRefs.insert(operationRef);
+    } else if (!operationRefs.insert(operationRef).second) {
+      operation->emitOpError("has a duplicate operation reference");
+      return WalkResult::interrupt();
+    }
+    if (!aggregateProvenance && refs && llvm::any_of(refs, [&](Attribute ref) {
           auto source = dyn_cast<SourceRefAttr>(ref);
           return !source || operationRefForSource(source) != denseOperationRef;
         })) {
@@ -2220,6 +3869,10 @@ LogicalResult verifyManifestCoverage(ModuleOp module, DictionaryAttr manifest) {
   if (operationRefWalk.wasInterrupted()) {
     return failure();
   }
+  for (const auto &[operationRef, size] : expandedOperationSizes)
+    if (expandedOperationMembers.lookup(operationRef).size() !=
+        static_cast<size_t>(size))
+      return module.emitError("has incomplete expanded operation provenance");
 
   const bool algebraStage = !module.getOps<func::FuncOp>().empty() && [&]() {
     bool found = false;
@@ -2246,12 +3899,32 @@ LogicalResult verifyManifestCoverage(ModuleOp module, DictionaryAttr manifest) {
   }
   llvm::SmallDenseSet<Attribute> representedSelected;
   llvm::SmallDenseSet<Attribute> representedExcluded;
+  llvm::SmallDenseMap<Attribute, int64_t> selectedGroupSizes;
+  llvm::SmallDenseMap<Attribute, llvm::SmallDenseSet<int64_t>>
+      selectedGroupMembers;
   auto recordSelected = [&](Operation *operation,
                             Attribute source) -> WalkResult {
     if (!selected->contains(source)) {
       operation->emitOpError(
           "represents a source absent from selected manifest coverage");
       return WalkResult::interrupt();
+    }
+    auto sourceGroup = operation->getAttrOfType<DictionaryAttr>("source_group");
+    if (sourceGroup) {
+      auto member = sourceGroup.getAs<IntegerAttr>("member");
+      auto size = sourceGroup.getAs<IntegerAttr>("size");
+      auto [sizeIt, insertedSize] =
+          selectedGroupSizes.try_emplace(source, size ? size.getInt() : 0);
+      if (!member || !size || sourceGroup.size() != 2 || member.getInt() < 0 ||
+          size.getInt() <= 1 || member.getInt() >= size.getInt() ||
+          (!insertedSize && sizeIt->second != size.getInt()) ||
+          !selectedGroupMembers[source].insert(member.getInt()).second) {
+        operation->emitOpError(
+            "has malformed or duplicate selected source-group coverage");
+        return WalkResult::interrupt();
+      }
+      representedSelected.insert(source);
+      return WalkResult::advance();
     }
     if (!representedSelected.insert(source).second) {
       operation->emitOpError("duplicates selected source coverage");
@@ -2265,6 +3938,25 @@ LogicalResult verifyManifestCoverage(ModuleOp module, DictionaryAttr manifest) {
         if (!selected->contains(source)) {
           region.emitOpError(
               "declares a source absent from selected manifest coverage");
+          return WalkResult::interrupt();
+        }
+      }
+      return WalkResult::advance();
+    }
+    if (operation->getParentOfType<ScanOp>() && !isa<ScanOp>(operation)) {
+      return WalkResult::advance();
+    }
+    if (auto scan = dyn_cast<ScanOp>(operation)) {
+      for (Attribute source : scan.getSources()) {
+        if (recordSelected(operation, source).wasInterrupted()) {
+          return WalkResult::interrupt();
+        }
+      }
+      return WalkResult::skip();
+    }
+    if (auto selection = dyn_cast<SelectionOp>(operation)) {
+      for (Attribute source : selection.getSources()) {
+        if (recordSelected(operation, source).wasInterrupted()) {
           return WalkResult::interrupt();
         }
       }
@@ -2299,7 +3991,20 @@ LogicalResult verifyManifestCoverage(ModuleOp module, DictionaryAttr manifest) {
           return WalkResult::interrupt();
         }
       }
-      return recordSelected(operation, fold.getSource());
+      WalkResult result = recordSelected(operation, fold.getSource());
+      if (result.wasInterrupted()) {
+        return result;
+      }
+      ArrayAttr aggregate = sourceRefs(operation);
+      if (aggregate) {
+        for (Attribute source : aggregate) {
+          if (source != fold.getSource() &&
+              recordSelected(operation, source).wasInterrupted()) {
+            return WalkResult::interrupt();
+          }
+        }
+      }
+      return WalkResult::advance();
     }
     ArrayAttr refs = sourceRefs(operation);
     if (!refs) {
@@ -2339,6 +4044,9 @@ LogicalResult verifyManifestCoverage(ModuleOp module, DictionaryAttr manifest) {
   if (walk.wasInterrupted()) {
     return failure();
   }
+  for (const auto &[source, size] : selectedGroupSizes)
+    if (selectedGroupMembers.lookup(source).size() != static_cast<size_t>(size))
+      return module.emitError("has incomplete selected source-group coverage");
   if (!sameAttributeSet(representedSelected, *selected) ||
       !sameAttributeSet(representedExcluded, *excluded)) {
     return module.emitError(
@@ -2398,9 +4106,501 @@ struct VerifySemanticErasurePass
   }
 };
 
+std::optional<std::pair<unsigned, unsigned>>
+canonicalBinaryMapArguments(MapOp map, StringRef operationName) {
+  if (map.getSemantics() != MapSemantics::Pointwise ||
+      map.getInputs().size() != 2 || map.getNumResults() != 1 ||
+      map.getBody().empty()) {
+    return std::nullopt;
+  }
+  Block &body = map.getBody().front();
+  Operation *operation = body.empty() ? nullptr : &body.front();
+  auto yield = dyn_cast<YieldOp>(body.getTerminator());
+  if (!operation || operation->getName().getStringRef() != operationName ||
+      operation->getNumOperands() != 2 || operation->getNumResults() != 1 ||
+      body.getNumArguments() != 2 || body.getOperations().size() != 2 ||
+      !yield || yield.getValues().size() != 1 ||
+      yield.getValues().front() != operation->getResult(0) ||
+      operation->getOperand(0) != body.getArgument(0) ||
+      operation->getOperand(1) != body.getArgument(1)) {
+    return std::nullopt;
+  }
+  return std::pair(body.getArgument(0).getArgNumber(),
+                   body.getArgument(1).getArgNumber());
+}
+
+std::optional<unsigned> canonicalUnaryMapArgument(MapOp map,
+                                                  StringRef operationName) {
+  if (map.getSemantics() != MapSemantics::Pointwise ||
+      map.getInputs().size() != 1 || map.getNumResults() != 1 ||
+      map.getBody().empty()) {
+    return std::nullopt;
+  }
+  Block &body = map.getBody().front();
+  Operation *operation = body.empty() ? nullptr : &body.front();
+  auto yield = dyn_cast<YieldOp>(body.getTerminator());
+  if (!operation || operation->getName().getStringRef() != operationName ||
+      operation->getNumOperands() != 1 || operation->getNumResults() != 1 ||
+      body.getNumArguments() != 1 || body.getOperations().size() != 2 ||
+      !yield || yield.getValues().size() != 1 ||
+      yield.getValues().front() != operation->getResult(0) ||
+      operation->getOperand(0) != body.getArgument(0)) {
+    return std::nullopt;
+  }
+  return body.getArgument(0).getArgNumber();
+}
+
+bool canonicalValueDependsOn(Value value, Operation *ancestor) {
+  SmallVector<Value> worklist{value};
+  llvm::SmallDenseSet<Operation *> visited;
+  while (!worklist.empty()) {
+    Operation *producer = worklist.pop_back_val().getDefiningOp();
+    if (!producer || !visited.insert(producer).second)
+      continue;
+    if (producer == ancestor)
+      return true;
+    llvm::append_range(worklist, producer->getOperands());
+  }
+  return false;
+}
+
+bool canonicalFoldWithScalarCombiner(FoldOp fold, StringRef operationName) {
+  if (fold.getInputs().size() != 1 || fold.getInitializers().size() != 1 ||
+      fold.getNumResults() != 1 || fold.getCombiner().empty() ||
+      !fold.getOrderFree() || fold.getAccumulatorTypes().size() != 1 ||
+      cast<TypeAttr>(fold.getAccumulatorTypes()[0]).getValue() !=
+          Float32Type::get(fold.getContext())) {
+    return false;
+  }
+  auto input = dyn_cast<RankedTensorType>(fold.getInputs().front().getType());
+  auto initializer =
+      dyn_cast<RankedTensorType>(fold.getInitializers().front().getType());
+  auto result = dyn_cast<RankedTensorType>(fold.getResult(0).getType());
+  if (!input || !initializer || !result || !input.hasStaticShape() ||
+      initializer.getRank() != 0 || !initializer.getElementType().isF32() ||
+      !input.getElementType().isF32() || !result.getElementType().isF32()) {
+    return false;
+  }
+  Block &body = fold.getCombiner().front();
+  Operation *operation = body.empty() ? nullptr : &body.front();
+  auto yield = dyn_cast<YieldOp>(body.getTerminator());
+  if (!operation || operation->getName().getStringRef() != operationName ||
+      operation->getNumOperands() != 2 || operation->getNumResults() != 1 ||
+      body.getNumArguments() != 2 || body.getOperations().size() != 2 ||
+      !yield || yield.getValues().size() != 1 ||
+      yield.getValues().front() != operation->getResult(0) ||
+      operation->getOperand(0) != body.getArgument(0) ||
+      operation->getOperand(1) != body.getArgument(1)) {
+    return false;
+  }
+  auto fastMath =
+      operation->getAttrOfType<arith::FastMathFlagsAttr>("fastmath");
+  return !fastMath || fastMath.getValue() == arith::FastMathFlags::none;
+}
+
+void appendCanonicalSource(SmallVectorImpl<Attribute> &sources,
+                           llvm::SmallDenseSet<Attribute> &seen,
+                           Attribute source) {
+  if (source && seen.insert(source).second)
+    sources.push_back(source);
+}
+
+void appendCanonicalOperationSources(Operation *operation,
+                                     SmallVectorImpl<Attribute> &sources,
+                                     llvm::SmallDenseSet<Attribute> &seen) {
+  if (auto map = dyn_cast<MapOp>(operation))
+    appendCanonicalSource(sources, seen, map.getSource());
+  else if (auto fold = dyn_cast<FoldOp>(operation))
+    appendCanonicalSource(sources, seen, fold.getSource());
+  if (ArrayAttr refs =
+          operation->getAttrOfType<ArrayAttr>(kSourceRefsAttribute))
+    for (Attribute ref : refs)
+      appendCanonicalSource(sources, seen, ref);
+}
+
+FoldOp canonicalFoldAncestor(Value value) {
+  llvm::SmallDenseSet<Operation *> visited;
+  while (Operation *producer = value.getDefiningOp()) {
+    if (!visited.insert(producer).second)
+      return {};
+    if (auto fold = dyn_cast<FoldOp>(producer))
+      return fold;
+    auto map = dyn_cast<MapOp>(producer);
+    if (!map || map.getInputs().size() != 1 || map.getNumResults() != 1 ||
+        map->getParentOfType<RegionOp>() !=
+            producer->getParentOfType<RegionOp>())
+      return {};
+    value = map.getInputs().front();
+  }
+  return {};
+}
+
+bool canonicalMapFeeds(MapOp map, Operation *first, Operation *second) {
+  if (map.getInputs().size() != 1)
+    return false;
+  return llvm::all_of(map.getResult(0).getUsers(), [&](Operation *user) {
+    return user == first || user == second;
+  });
+}
+
+bool canonicalMapChainCanErase(ArrayRef<MapOp> maps, Operation *first,
+                               Operation *second) {
+  llvm::SmallPtrSet<Operation *, 8> chain;
+  chain.insert(first);
+  chain.insert(second);
+  for (MapOp map : maps)
+    chain.insert(map);
+  return llvm::all_of(maps, [&](MapOp map) {
+    return llvm::all_of(map.getResult(0).getUsers(),
+                        [&](Operation *user) { return chain.contains(user); });
+  });
+}
+
+void copyCanonicalProvenance(Operation *source, Operation *replacement) {
+  if (ArrayAttr refs = sourceRefs(source))
+    replacement->setAttr(kSourceRefsAttribute, refs);
+  if (Attribute owner = source->getAttr(kOperationRefAttribute))
+    replacement->setAttr(kOperationRefAttribute, owner);
+}
+
+FailureOr<AffineMap> canonicalCoordinatesToAncestor(Value value,
+                                                    Value ancestor) {
+  auto valueType = dyn_cast<RankedTensorType>(value.getType());
+  if (!valueType)
+    return failure();
+  if (value == ancestor)
+    return AffineMap::getMultiDimIdentityMap(valueType.getRank(),
+                                             value.getContext());
+  auto map = value.getDefiningOp<MapOp>();
+  if (!map || map.getInputs().size() != 1 || map.getNumResults() != 1 ||
+      map.getIndexingMaps().size() != 2)
+    return failure();
+  auto inputMap = dyn_cast<AffineMapAttr>(map.getIndexingMaps()[0]);
+  auto resultMap = dyn_cast<AffineMapAttr>(
+      map.getIndexingMaps()[map.getIndexingMaps().size() - 1]);
+  if (!inputMap || !resultMap || !resultMap.getValue().isIdentity())
+    return failure();
+  FailureOr<AffineMap> upstream =
+      canonicalCoordinatesToAncestor(map.getInputs().front(), ancestor);
+  if (failed(upstream) ||
+      upstream->getNumDims() != inputMap.getValue().getNumResults())
+    return failure();
+  return upstream->compose(inputMap.getValue());
+}
+
+void collectCanonicalMapChain(Value value, Value ancestor,
+                              SmallVectorImpl<MapOp> &maps) {
+  if (value == ancestor)
+    return;
+  auto map = value.getDefiningOp<MapOp>();
+  if (!map)
+    return;
+  collectCanonicalMapChain(map.getInputs().front(), ancestor, maps);
+  maps.push_back(map);
+}
+
+bool rewriteNormalizedExponentialSlice(MapOp normalization) {
+  RegionOp region = normalization->getParentOfType<RegionOp>();
+  if (!region || normalization->getParentOp() != region.getBody().getParentOp())
+    return false;
+  auto division = canonicalBinaryMapArguments(
+      normalization, arith::DivFOp::getOperationName());
+  if (!division)
+    return false;
+
+  Value numerator = normalization.getInputs()[division->first];
+  Value denominator = normalization.getInputs()[division->second];
+  MapOp exponential = numerator.getDefiningOp<MapOp>();
+  if (!exponential)
+    return false;
+  auto exponentialArgument =
+      canonicalUnaryMapArgument(exponential, math::ExpOp::getOperationName());
+  if (!exponentialArgument)
+    return false;
+
+  MapOp centered =
+      exponential.getInputs()[*exponentialArgument].getDefiningOp<MapOp>();
+  if (!centered || centered.getSemantics() != MapSemantics::Pointwise ||
+      centered.getInputs().size() != 2 || centered.getNumResults() != 1 ||
+      centered.getBody().empty() || !centered.getResult(0).hasOneUse() ||
+      centered.getResult(0).getUses().begin()->getOwner() != exponential)
+    return false;
+  auto subtraction =
+      canonicalBinaryMapArguments(centered, arith::SubFOp::getOperationName());
+  if (!subtraction)
+    return false;
+
+  FoldOp maximum =
+      canonicalFoldAncestor(centered.getInputs()[subtraction->second]);
+  FoldOp additive = canonicalFoldAncestor(denominator);
+  if (!maximum || !additive || maximum == additive ||
+      !canonicalFoldWithScalarCombiner(maximum,
+                                       arith::MaximumFOp::getOperationName()) ||
+      !canonicalFoldWithScalarCombiner(additive,
+                                       arith::AddFOp::getOperationName()) ||
+      maximum.getInputs().front() != centered.getInputs()[subtraction->first] ||
+      additive.getInputs().front() != exponential.getResult(0) ||
+      maximum.getReductionDimensions() != additive.getReductionDimensions() ||
+      maximum.getResult(0).getType() != additive.getResult(0).getType() ||
+      !canonicalValueDependsOn(centered.getInputs()[subtraction->second],
+                               maximum) ||
+      !canonicalValueDependsOn(denominator, additive))
+    return false;
+
+  SmallVector<MapOp> maximumExpansion;
+  SmallVector<MapOp> additiveExpansion;
+  collectCanonicalMapChain(centered.getInputs()[subtraction->second],
+                           maximum.getResult(0), maximumExpansion);
+  collectCanonicalMapChain(denominator, additive.getResult(0),
+                           additiveExpansion);
+  FailureOr<AffineMap> maximumCoordinates = canonicalCoordinatesToAncestor(
+      centered.getInputs()[subtraction->second], maximum.getResult(0));
+  FailureOr<AffineMap> additiveCoordinates =
+      canonicalCoordinatesToAncestor(denominator, additive.getResult(0));
+  if (failed(maximumCoordinates) || failed(additiveCoordinates) ||
+      maximumExpansion.empty() || additiveExpansion.empty())
+    return false;
+
+  auto maxInputMap = dyn_cast<AffineMapAttr>(maximum.getIndexingMaps()[0]);
+  auto maxResultMap = dyn_cast<AffineMapAttr>(maximum.getIndexingMaps()[1]);
+  auto addInputMap = dyn_cast<AffineMapAttr>(additive.getIndexingMaps()[0]);
+  auto addResultMap = dyn_cast<AffineMapAttr>(additive.getIndexingMaps()[1]);
+  auto centeredScoreMap =
+      dyn_cast<AffineMapAttr>(centered.getIndexingMaps()[subtraction->first]);
+  auto centeredMaximumMap =
+      dyn_cast<AffineMapAttr>(centered.getIndexingMaps()[subtraction->second]);
+  auto denominatorMap = dyn_cast<AffineMapAttr>(
+      normalization.getIndexingMaps()[division->second]);
+  auto resultMap = dyn_cast<AffineMapAttr>(
+      normalization
+          .getIndexingMaps()[normalization.getIndexingMaps().size() - 1]);
+  if (!maxInputMap || !maxResultMap || !addInputMap || !addResultMap ||
+      !centeredScoreMap || !centeredMaximumMap || !denominatorMap || !resultMap)
+    return false;
+  if (*maximumCoordinates != maxResultMap.getValue() ||
+      *additiveCoordinates != addResultMap.getValue() ||
+      maxInputMap.getValue() != addInputMap.getValue() ||
+      maxResultMap.getValue() != addResultMap.getValue() ||
+      centeredScoreMap.getValue() != maxInputMap.getValue() ||
+      centeredMaximumMap.getValue() !=
+          AffineMap::getMultiDimIdentityMap(
+              cast<RankedTensorType>(centered.getResult(0).getType()).getRank(),
+              normalization.getContext()) ||
+      denominatorMap.getValue() !=
+          AffineMap::getMultiDimIdentityMap(
+              cast<RankedTensorType>(normalization.getResult(0).getType())
+                  .getRank(),
+              normalization.getContext()) ||
+      resultMap.getValue() != maxInputMap.getValue())
+    return false;
+
+  SmallVector<Attribute> mergedSources;
+  llvm::SmallDenseSet<Attribute> seenSources;
+  const bool preservesExponential =
+      llvm::any_of(exponential.getResult(0).getUsers(), [&](Operation *user) {
+        return user != additive && user != normalization;
+      });
+  const bool preservesCentered = preservesExponential;
+  appendCanonicalSource(mergedSources, seenSources, maximum.getSource());
+  appendCanonicalSource(mergedSources, seenSources, maximum.getSource());
+  if (!preservesCentered)
+    appendCanonicalOperationSources(centered, mergedSources, seenSources);
+  if (!preservesExponential)
+    appendCanonicalOperationSources(additive, mergedSources, seenSources);
+  // The normalization source stays on the replacement Map, so it must not be
+  // moved to the Fold provenance aliases.
+
+  auto additiveInitializer =
+      additive.getInitializers().front().getDefiningOp<MapOp>();
+  if (!additiveInitializer || !additiveInitializer.getInputs().empty() ||
+      !additiveInitializer.getResult(0).hasOneUse() ||
+      *additiveInitializer.getResult(0).getUsers().begin() != additive)
+    return false;
+  additiveInitializer->moveBefore(maximum);
+  OpBuilder builder(maximum);
+  auto scoreType =
+      cast<RankedTensorType>(maximum.getInputs().front().getType());
+  OperationState onesState(exponential.getLoc(), MapOp::getOperationName());
+  onesState.addTypes(scoreType);
+  onesState.addAttribute(
+      "indexing_maps",
+      affineMapsAttr(maximum.getContext(), {maxInputMap.getValue()}));
+  onesState.addAttribute(
+      "semantics",
+      MapSemanticsAttr::get(maximum.getContext(), MapSemantics::Pointwise));
+  onesState.addAttribute("source", preservesExponential
+                                       ? additive.getSource()
+                                       : exponential.getSource());
+  onesState.addRegion();
+  MapOp ones = cast<MapOp>(builder.create(onesState));
+  Block *onesBody = new Block();
+  ones.getBody().push_back(onesBody);
+  OpBuilder onesBuilder = OpBuilder::atBlockEnd(onesBody);
+  Value one = onesBuilder.create<arith::ConstantOp>(
+      exponential.getLoc(),
+      FloatAttr::get(Float32Type::get(maximum.getContext()), 1.0));
+  onesBuilder.create<YieldOp>(exponential.getLoc(), one);
+
+  OperationState foldState(maximum.getLoc(), FoldOp::getOperationName());
+  foldState.addOperands({maximum.getInputs().front(), ones.getResult(0),
+                         maximum.getInitializers().front(),
+                         additive.getInitializers().front()});
+  foldState.addTypes(
+      {maximum.getResult(0).getType(), additive.getResult(0).getType()});
+  foldState.addAttribute("operandSegmentSizes",
+                         DenseI32ArrayAttr::get(maximum.getContext(), {2, 2}));
+  foldState.addAttribute(
+      "indexing_maps",
+      affineMapsAttr(maximum.getContext(),
+                     {maxInputMap.getValue(), addInputMap.getValue(),
+                      maxResultMap.getValue(), addResultMap.getValue()}));
+  foldState.addAttribute("reduction_dimensions",
+                         maximum.getReductionDimensionsAttr());
+  foldState.addAttribute(
+      "accumulator_types",
+      ArrayAttr::get(maximum.getContext(),
+                     {TypeAttr::get(Float32Type::get(maximum.getContext())),
+                      TypeAttr::get(Float32Type::get(maximum.getContext()))}));
+  foldState.addAttribute("order_free", builder.getBoolAttr(true));
+  foldState.addAttribute("source", maximum.getSource());
+  if (Attribute owner = maximum->getAttr(kOperationRefAttribute))
+    foldState.addAttribute(kOperationRefAttribute, owner);
+  foldState.addRegion();
+  FoldOp mergedFold = cast<FoldOp>(builder.create(foldState));
+  if (!mergedSources.empty())
+    mergedFold->setAttr(kSourceRefsAttribute,
+                        ArrayAttr::get(maximum.getContext(), mergedSources));
+  Block *foldBody = new Block();
+  mergedFold.getCombiner().push_back(foldBody);
+  for (unsigned i = 0; i < 4; ++i)
+    foldBody->addArgument(Float32Type::get(maximum.getContext()),
+                          maximum.getLoc());
+  OpBuilder foldBuilder = OpBuilder::atBlockEnd(foldBody);
+  auto maximumCombiner = &maximum.getCombiner().front().front();
+  auto additiveCombiner = &additive.getCombiner().front().front();
+  auto nextMaximum = foldBuilder.create<arith::MaximumFOp>(
+      maximum.getLoc(), foldBody->getArgument(0), foldBody->getArgument(2));
+  copyCanonicalProvenance(maximumCombiner, nextMaximum);
+  Value lhsDelta = foldBuilder.create<arith::SubFOp>(
+      maximum.getLoc(), foldBody->getArgument(0), nextMaximum);
+  Value lhsScale = foldBuilder.create<math::ExpOp>(maximum.getLoc(), lhsDelta);
+  Value lhsMass = foldBuilder.create<arith::MulFOp>(maximum.getLoc(), lhsScale,
+                                                    foldBody->getArgument(1));
+  Value rhsDelta = foldBuilder.create<arith::SubFOp>(
+      maximum.getLoc(), foldBody->getArgument(2), nextMaximum);
+  Value rhsScale = foldBuilder.create<math::ExpOp>(maximum.getLoc(), rhsDelta);
+  Value rhsMass = foldBuilder.create<arith::MulFOp>(maximum.getLoc(), rhsScale,
+                                                    foldBody->getArgument(3));
+  auto nextMass =
+      foldBuilder.create<arith::AddFOp>(maximum.getLoc(), lhsMass, rhsMass);
+  copyCanonicalProvenance(additiveCombiner, nextMass);
+  OperationState yieldState(maximum.getLoc(), YieldOp::getOperationName());
+  yieldState.addOperands({nextMaximum, nextMass});
+  SmallVector<Attribute> operationRefGroups;
+  auto addOperationRefGroup = [&](YieldOp sourceYield, int64_t operandIndex) {
+    auto operationRef =
+        sourceYield->getAttrOfType<DenseI64ArrayAttr>(kOperationRefAttribute);
+    if (!operationRef)
+      return false;
+    NamedAttribute fields[] = {
+        NamedAttribute(builder.getStringAttr("operation_ref"), operationRef),
+        NamedAttribute(
+            builder.getStringAttr("operand_indices"),
+            DenseI64ArrayAttr::get(maximum.getContext(), {operandIndex})),
+    };
+    operationRefGroups.push_back(
+        DictionaryAttr::get(maximum.getContext(), fields));
+    return true;
+  };
+  if (!addOperationRefGroup(
+          cast<YieldOp>(maximum.getCombiner().front().getTerminator()), 0) ||
+      !addOperationRefGroup(
+          cast<YieldOp>(additive.getCombiner().front().getTerminator()), 1)) {
+    mergedFold.erase();
+    ones.erase();
+    return false;
+  }
+  yieldState.addAttribute(
+      kOperationRefGroupsAttribute,
+      ArrayAttr::get(maximum.getContext(), operationRefGroups));
+  foldBuilder.create(yieldState);
+
+  maximum.getResult(0).replaceAllUsesWith(mergedFold.getResult(0));
+  additive.getResult(0).replaceAllUsesWith(mergedFold.getResult(1));
+
+  builder.setInsertionPoint(normalization);
+  OperationState mapState(normalization.getLoc(), MapOp::getOperationName());
+  mapState.addOperands({maximum.getInputs().front(),
+                        centered.getInputs()[subtraction->second],
+                        denominator});
+  mapState.addTypes(normalization.getResultTypes());
+  mapState.addAttribute(
+      "indexing_maps",
+      affineMapsAttr(normalization.getContext(),
+                     {centeredScoreMap.getValue(),
+                      centeredMaximumMap.getValue(), denominatorMap.getValue(),
+                      resultMap.getValue()}));
+  mapState.addAttribute("semantics",
+                        MapSemanticsAttr::get(normalization.getContext(),
+                                              MapSemantics::Pointwise));
+  mapState.addAttribute("source", normalization.getSource());
+  mapState.addRegion();
+  MapOp normalized = cast<MapOp>(builder.create(mapState));
+  Block *mapBody = new Block();
+  normalized.getBody().push_back(mapBody);
+  mapBody->addArgument(Float32Type::get(normalization.getContext()),
+                       normalization.getLoc());
+  mapBody->addArgument(Float32Type::get(normalization.getContext()),
+                       normalization.getLoc());
+  mapBody->addArgument(Float32Type::get(normalization.getContext()),
+                       normalization.getLoc());
+  OpBuilder mapBuilder = OpBuilder::atBlockEnd(mapBody);
+  Value delta = mapBuilder.create<arith::SubFOp>(
+      normalization.getLoc(), mapBody->getArgument(0), mapBody->getArgument(1));
+  Value exponentialValue =
+      mapBuilder.create<math::ExpOp>(normalization.getLoc(), delta);
+  Value normalizedValue = mapBuilder.create<arith::DivFOp>(
+      normalization.getLoc(), exponentialValue, mapBody->getArgument(2));
+  mapBuilder.create<YieldOp>(normalization.getLoc(), normalizedValue);
+
+  normalization.getResult(0).replaceAllUsesWith(normalized.getResult(0));
+  normalization.erase();
+  additive.erase();
+  maximum.erase();
+  if (exponential.getResult(0).use_empty())
+    exponential.erase();
+  if (centered.getResult(0).use_empty())
+    centered.erase();
+  return true;
+}
+
 struct ShuttleCanonicalizePass
     : impl::ShuttleCanonicalizePassBase<ShuttleCanonicalizePass> {
-  void runOnOperation() override {}
+  void runOnOperation() override {
+    SmallVector<RegionOp> regions;
+    getOperation().walk([&](RegionOp region) { regions.push_back(region); });
+    for (RegionOp region : regions) {
+      if (region.getPolicy() != NumericalPolicy::Fast)
+        continue;
+      // A rewrite can expose another independent local slice in the same
+      // region.  Re-scan after every successful replacement; the canonical
+      // two-result Fold no longer satisfies the source pattern, so this
+      // terminates without requiring a graph/workload recognizer.
+      bool changed = true;
+      while (changed) {
+        changed = false;
+        for (MapOp map : llvm::make_early_inc_range(
+                 region.getBody().front().getOps<MapOp>())) {
+          if (rewriteNormalizedExponentialSlice(map)) {
+            changed = true;
+            break;
+          }
+        }
+      }
+    }
+  }
+
+private:
 };
 
 FailureOr<unsigned> mapResultPosition(AffineMap map, unsigned domainPosition) {
@@ -2430,7 +4630,9 @@ LogicalResult verifyDefaultScalarSemantics(Operation *operation) {
         "has fast-math semantics with no StableHLO representation");
   }
   for (NamedAttribute attribute : operation->getAttrs()) {
-    if (attribute.getName().strref() != "fastmath") {
+    StringRef name = attribute.getName().strref();
+    if (name != "fastmath" && name != kSourceRefsAttribute &&
+        name != kOperationRefAttribute) {
       return operation->emitOpError(
           "has scalar attributes with no StableHLO representation");
     }
@@ -2542,9 +4744,9 @@ FailureOr<OperationState> lowerMapState(MapOp map, ValueRange operands) {
         expandingSingletons += expandingSingleton;
         dimensions.push_back(position);
       }
-      const bool supportedRankTwoExpansion =
-          inputType.getRank() == 2 && resultType.getRank() == 2 &&
-          expandingSingletons == 1;
+      const bool supportedRankTwoExpansion = inputType.getRank() == 2 &&
+                                             resultType.getRank() == 2 &&
+                                             expandingSingletons == 1;
       const bool supportedRankNExpansion =
           inputType.getRank() == resultType.getRank() &&
           inputType.getRank() >= 3 && inputType.getRank() <= 8 &&
@@ -2564,52 +4766,11 @@ FailureOr<OperationState> lowerMapState(MapOp map, ValueRange operands) {
     } else if (map.getSemantics() == MapSemantics::Reshape) {
       auto inputType = dyn_cast<RankedTensorType>(operands[0].getType());
       auto resultType = dyn_cast<RankedTensorType>(map.getResult(0).getType());
-      if (!inputType || !resultType || !inputType.hasStaticShape() ||
-          !resultType.hasStaticShape()) {
-        map.emitOpError("requires static singleton reshape types");
-        return failure();
-      }
-      SmallVector<int64_t> inputNonSingleton;
-      SmallVector<int64_t> resultNonSingleton;
-      llvm::copy_if(inputType.getShape(), std::back_inserter(inputNonSingleton),
-                    [](int64_t extent) { return extent != 1; });
-      llvm::copy_if(resultType.getShape(),
-                    std::back_inserter(resultNonSingleton),
-                    [](int64_t extent) { return extent != 1; });
-      SmallVector<unsigned> resultNonSingletonPositions;
-      for (auto [position, extent] : llvm::enumerate(resultType.getShape())) {
-        if (extent != 1) {
-          resultNonSingletonPositions.push_back(position);
-        }
-      }
-      if (inputNonSingleton != resultNonSingleton || inputType == resultType ||
-          inputMap.getNumResults() != inputType.getRank()) {
-        map.emitOpError("has incompatible singleton reshape types");
-        return failure();
-      }
-      unsigned nextNonSingleton = 0;
-      for (auto [inputDimension, expression] :
-           llvm::enumerate(inputMap.getResults())) {
-        if (inputType.getDimSize(inputDimension) == 1) {
-          auto constant = dyn_cast<AffineConstantExpr>(expression);
-          if (!constant || constant.getValue() != 0) {
-            map.emitOpError(
-                "singleton reshape input dimensions must use constant zero");
-            return failure();
-          }
-          continue;
-        }
-        auto dimension = dyn_cast<AffineDimExpr>(expression);
-        if (!dimension ||
-            nextNonSingleton >= resultNonSingletonPositions.size() ||
-            dimension.getPosition() !=
-                resultNonSingletonPositions[nextNonSingleton++]) {
-          map.emitOpError("has an ambiguous singleton reshape indexing map");
-          return failure();
-        }
-      }
-      if (nextNonSingleton != resultNonSingletonPositions.size()) {
-        map.emitOpError("has an incomplete singleton reshape indexing map");
+      FailureOr<AffineMap> expected = failure();
+      if (inputType && resultType)
+        expected = contiguousReshapeInputMap(inputType, resultType);
+      if (failed(expected) || inputMap != *expected) {
+        map.emitOpError("has an invalid contiguous reshape indexing map");
         return failure();
       }
       stablehloName = stablehlo::ReshapeOp::getOperationName();
@@ -2701,6 +4862,12 @@ FailureOr<OperationState> lowerMapState(MapOp map, ValueRange operands) {
         return failure();
       }
       stablehloName = stablehlo::AddOp::getOperationName();
+    } else if (scalarName == arith::MaximumFOp::getOperationName() &&
+               operands.size() == 2) {
+      if (failed(verifyDefaultScalarSemantics(scalar))) {
+        return failure();
+      }
+      stablehloName = stablehlo::MaxOp::getOperationName();
     } else if (scalarName == arith::SubFOp::getOperationName() &&
                operands.size() == 2) {
       if (failed(verifyDefaultScalarSemantics(scalar))) {
@@ -2713,6 +4880,28 @@ FailureOr<OperationState> lowerMapState(MapOp map, ValueRange operands) {
         return failure();
       }
       stablehloName = stablehlo::DivOp::getOperationName();
+    } else if (auto compare = dyn_cast<arith::CmpFOp>(scalar);
+               compare && operands.size() == 2 &&
+               compare.getPredicate() == arith::CmpFPredicate::OEQ) {
+      auto fastMath =
+          compare->getAttrOfType<arith::FastMathFlagsAttr>("fastmath");
+      if ((fastMath && fastMath.getValue() != arith::FastMathFlags::none) ||
+          llvm::any_of(compare->getAttrs(), [](NamedAttribute attribute) {
+            StringRef name = attribute.getName().strref();
+            return name != "predicate" && name != "fastmath";
+          })) {
+        compare.emitOpError(
+            "has scalar attributes with no StableHLO representation");
+        return failure();
+      }
+      stablehloName = stablehlo::CompareOp::getOperationName();
+      attributes.append("compare_type", stablehlo::ComparisonTypeAttr::get(
+                                            map.getContext(),
+                                            stablehlo::ComparisonType::FLOAT));
+      attributes.append(
+          "comparison_direction",
+          stablehlo::ComparisonDirectionAttr::get(
+              map.getContext(), stablehlo::ComparisonDirection::EQ));
     } else if (auto convert = dyn_cast<ScalarConvertOp>(scalar);
                convert && operands.size() == 1) {
       Type inputType = convert.getInput().getType();
@@ -2733,9 +4922,9 @@ FailureOr<OperationState> lowerMapState(MapOp map, ValueRange operands) {
                constant && operands.empty()) {
       auto value = dyn_cast<FloatAttr>(constant.getValue());
       auto resultType = dyn_cast<RankedTensorType>(map.getResult(0).getType());
-      if (!value || !resultType || resultType.getRank() != 0 ||
+      if (!value || !resultType || !resultType.hasStaticShape() ||
           value.getType() != resultType.getElementType()) {
-        constant.emitOpError("has no rank-zero StableHLO constant lowering");
+        constant.emitOpError("has no static splat StableHLO constant lowering");
         return failure();
       }
       stablehloName = stablehlo::ConstantOp::getOperationName();
@@ -2752,6 +4941,132 @@ FailureOr<OperationState> lowerMapState(MapOp map, ValueRange operands) {
   state.addTypes(map.getResultTypes());
   state.addAttributes(attributes);
   return state;
+}
+
+FailureOr<Operation *> lowerPointwiseMapDag(OpBuilder &builder, MapOp map,
+                                            ValueRange operands) {
+  if (map.getSemantics() != MapSemantics::Pointwise ||
+      map.getNumResults() != 1 || map.getBody().empty() || operands.empty() ||
+      !map->getDiscardableAttrs().empty())
+    return failure();
+  auto resultType = dyn_cast<RankedTensorType>(map.getResult(0).getType());
+  Block &body = map.getBody().front();
+  auto yield = dyn_cast<YieldOp>(body.getTerminator());
+  if (!resultType || !resultType.hasStaticShape() || !yield ||
+      yield.getValues().size() != 1 || !yield->getDiscardableAttrs().empty() ||
+      map.getIndexingMaps().size() != operands.size() + 1 ||
+      !llvm::all_of(map.getIndexingMaps(), [](Attribute attribute) {
+        return isIdentityMap(cast<AffineMapAttr>(attribute).getValue());
+      }))
+    return failure();
+  for (Value operand : operands)
+    if (operand.getType() != resultType)
+      return failure();
+
+  OperationState state(map.getLoc(), stablehlo::MapOp::getOperationName());
+  state.addOperands(operands);
+  state.addTypes(map.getResultTypes());
+  SmallVector<int64_t> dimensions(resultType.getRank());
+  std::iota(dimensions.begin(), dimensions.end(), 0);
+  state.addAttribute("dimensions",
+                     DenseI64ArrayAttr::get(map.getContext(), dimensions));
+  state.addAttribute(kSourceRefsAttribute,
+                     ArrayAttr::get(map.getContext(), {map.getSource()}));
+  state.addRegion();
+  Operation *loweredMap = builder.create(state);
+  Block *loweredBody = new Block();
+  loweredMap->getRegion(0).push_back(loweredBody);
+  for (BlockArgument argument : body.getArguments())
+    loweredBody->addArgument(RankedTensorType::get({}, argument.getType()),
+                             argument.getLoc());
+
+  OpBuilder nestedBuilder = OpBuilder::atBlockEnd(loweredBody);
+  IRMapping mapping;
+  for (auto [source, target] :
+       llvm::zip_equal(body.getArguments(), loweredBody->getArguments()))
+    mapping.map(source, target);
+
+  auto stablehloName = [](Operation *operation) -> StringRef {
+    return llvm::StringSwitch<StringRef>(operation->getName().getStringRef())
+        .Case(arith::AddFOp::getOperationName(),
+              stablehlo::AddOp::getOperationName())
+        .Case(arith::SubFOp::getOperationName(),
+              stablehlo::SubtractOp::getOperationName())
+        .Case(arith::MulFOp::getOperationName(),
+              stablehlo::MulOp::getOperationName())
+        .Case(arith::DivFOp::getOperationName(),
+              stablehlo::DivOp::getOperationName())
+        .Case(arith::MaximumFOp::getOperationName(),
+              stablehlo::MaxOp::getOperationName())
+        .Case(arith::NegFOp::getOperationName(),
+              stablehlo::NegOp::getOperationName())
+        .Case(math::ExpOp::getOperationName(),
+              stablehlo::ExpOp::getOperationName())
+        .Case(math::TanhOp::getOperationName(),
+              stablehlo::TanhOp::getOperationName())
+        .Case(math::RsqrtOp::getOperationName(),
+              stablehlo::RsqrtOp::getOperationName())
+        .Case(arith::SelectOp::getOperationName(),
+              stablehlo::SelectOp::getOperationName())
+        .Case(ScalarConvertOp::getOperationName(),
+              stablehlo::ConvertOp::getOperationName())
+        .Case(arith::ConstantOp::getOperationName(),
+              stablehlo::ConstantOp::getOperationName())
+        .Default(StringRef{});
+  };
+  for (Operation &operation : body.without_terminator()) {
+    StringRef name = stablehloName(&operation);
+    const bool scalarConvert = isa<ScalarConvertOp>(operation);
+    if (name.empty() || operation.getNumResults() != 1 ||
+        (!scalarConvert && !isa<arith::ConstantOp>(operation) &&
+         failed(verifyDefaultScalarSemantics(&operation)))) {
+      operation.emitOpError("has no authoritative StableHLO Map DAG lowering");
+      loweredMap->erase();
+      return failure();
+    }
+    SmallVector<Value> mappedOperands;
+    for (Value operand : operation.getOperands()) {
+      Value mapped = mapping.lookupOrNull(operand);
+      if (!mapped) {
+        operation.emitOpError("has an unmapped scalar DAG operand");
+        loweredMap->erase();
+        return failure();
+      }
+      mappedOperands.push_back(mapped);
+    }
+    Type scalarType = operation.getResult(0).getType();
+    OperationState scalarState(operation.getLoc(), name);
+    scalarState.addOperands(mappedOperands);
+    scalarState.addTypes(RankedTensorType::get({}, scalarType));
+    if (auto refs = sourceRefs(&operation))
+      scalarState.addAttribute(kSourceRefsAttribute, refs);
+    if (Attribute owner = operation.getAttr(kOperationRefAttribute))
+      scalarState.addAttribute(kOperationRefAttribute, owner);
+    if (auto constant = dyn_cast<arith::ConstantOp>(operation)) {
+      auto value = dyn_cast<FloatAttr>(constant.getValue());
+      if (!value) {
+        constant.emitOpError("requires a floating scalar constant");
+        loweredMap->erase();
+        return failure();
+      }
+      scalarState.addAttribute(
+          "value",
+          DenseElementsAttr::get(RankedTensorType::get({}, scalarType), value));
+    }
+    Operation *loweredScalar = nestedBuilder.create(scalarState);
+    mapping.map(operation.getResult(0), loweredScalar->getResult(0));
+  }
+  Value loweredResult = mapping.lookupOrNull(yield.getValues().front());
+  if (!loweredResult) {
+    yield.emitOpError("has an unmapped scalar DAG result");
+    loweredMap->erase();
+    return failure();
+  }
+  OperationState returnState(yield.getLoc(),
+                             stablehlo::ReturnOp::getOperationName());
+  returnState.addOperands(loweredResult);
+  nestedBuilder.create(returnState);
+  return loweredMap;
 }
 
 FailureOr<stablehlo::Precision> stablehloPrecision(Attribute attribute) {
@@ -2776,8 +5091,8 @@ FailureOr<OperationState> lowerRelationState(RelationOp relation,
     return failure();
   }
   StringRef stablehloName =
-      llvm::StringSwitch<StringRef>(stringifyRelationSemantics(
-          relation.getSemantics()))
+      llvm::StringSwitch<StringRef>(
+          stringifyRelationSemantics(relation.getSemantics()))
           .Case("iota", stablehlo::IotaOp::getOperationName())
           .Case("constant", stablehlo::ConstantOp::getOperationName())
           .Case("reshape", stablehlo::ReshapeOp::getOperationName())
@@ -2787,6 +5102,10 @@ FailureOr<OperationState> lowerRelationState(RelationOp relation,
           .Case("add", stablehlo::AddOp::getOperationName())
           .Case("convert", stablehlo::ConvertOp::getOperationName())
           .Case("select", stablehlo::SelectOp::getOperationName())
+          .Case("slice", stablehlo::SliceOp::getOperationName())
+          .Case("transpose", stablehlo::TransposeOp::getOperationName())
+          .Case("multiply", stablehlo::MulOp::getOperationName())
+          .Case("gather", stablehlo::GatherOp::getOperationName())
           .Default({});
   if (stablehloName.empty()) {
     relation.emitOpError("has no authoritative StableHLO lowering");
@@ -2802,14 +5121,14 @@ FailureOr<OperationState> lowerRelationState(RelationOp relation,
     state.addAttribute(
         "value", DenseElementsAttr::get(
                      result, ArrayRef<Attribute>{relation.getParameters()[0]}));
-  } else if (relation.getSemantics() ==
-             RelationSemantics::BroadcastInDim) {
+  } else if (relation.getSemantics() == RelationSemantics::BroadcastInDim) {
     SmallVector<int64_t> dimensions;
     for (Attribute parameter : relation.getParameters()) {
       dimensions.push_back(cast<IntegerAttr>(parameter).getInt());
     }
-    state.addAttribute("broadcast_dimensions",
-                       DenseI64ArrayAttr::get(relation.getContext(), dimensions));
+    state.addAttribute(
+        "broadcast_dimensions",
+        DenseI64ArrayAttr::get(relation.getContext(), dimensions));
   } else if (relation.getSemantics() == RelationSemantics::Compare) {
     auto type = stablehlo::symbolizeComparisonType(
         cast<StringAttr>(relation.getParameters()[0]).getValue());
@@ -2821,11 +5140,121 @@ FailureOr<OperationState> lowerRelationState(RelationOp relation,
     }
     state.addAttribute("compare_type", stablehlo::ComparisonTypeAttr::get(
                                            relation.getContext(), *type));
-    state.addAttribute(
-        "comparison_direction", stablehlo::ComparisonDirectionAttr::get(
-                                    relation.getContext(), *direction));
+    state.addAttribute("comparison_direction",
+                       stablehlo::ComparisonDirectionAttr::get(
+                           relation.getContext(), *direction));
+  } else if (relation.getSemantics() == RelationSemantics::Slice) {
+    state.addAttribute("start_indices", relation.getParameters()[0]);
+    state.addAttribute("limit_indices", relation.getParameters()[1]);
+    state.addAttribute("strides", relation.getParameters()[2]);
+  } else if (relation.getSemantics() == RelationSemantics::Transpose) {
+    state.addAttribute("permutation", relation.getParameters()[0]);
+  } else if (relation.getSemantics() == RelationSemantics::Gather) {
+    auto metadata = cast<DictionaryAttr>(relation.getParameters()[0]);
+    auto dimensions = stablehlo::GatherDimensionNumbersAttr::get(
+        relation.getContext(),
+        metadata.getAs<DenseI64ArrayAttr>("offset_dims").asArrayRef(),
+        metadata.getAs<DenseI64ArrayAttr>("collapsed_slice_dims").asArrayRef(),
+        metadata.getAs<DenseI64ArrayAttr>("operand_batching_dims").asArrayRef(),
+        metadata.getAs<DenseI64ArrayAttr>("start_indices_batching_dims")
+            .asArrayRef(),
+        metadata.getAs<DenseI64ArrayAttr>("start_index_map").asArrayRef(),
+        metadata.getAs<IntegerAttr>("index_vector_dim").getInt());
+    state.addAttribute("dimension_numbers", dimensions);
+    state.addAttribute("slice_sizes", metadata.get("slice_sizes"));
+    state.addAttribute("indices_are_sorted",
+                       metadata.get("indices_are_sorted"));
   }
   return state;
+}
+
+FailureOr<SmallVector<Value>>
+lowerSelection(OpBuilder &builder, SelectionOp selection, ValueRange operands) {
+  auto input = dyn_cast<RankedTensorType>(selection.getInput().getType());
+  if (operands.size() != 1 || !input || !selection.getStable() ||
+      selection.getComparison() != SelectionComparison::TotalOrder ||
+      selection.getTieBreak() != SelectionTieBreak::SourceIndexAscending ||
+      !selection->getDiscardableAttrs().empty()) {
+    selection.emitOpError("has no authoritative StableHLO Selection lowering");
+    return failure();
+  }
+  const int64_t dimension = selection.getDimension();
+  auto fullIndexType =
+      RankedTensorType::get(input.getShape(), builder.getI32Type());
+  OperationState iotaState(selection.getLoc(),
+                           stablehlo::IotaOp::getOperationName());
+  iotaState.addTypes(fullIndexType);
+  iotaState.addAttribute("iota_dimension",
+                         builder.getI64IntegerAttr(dimension));
+  Operation *iota = builder.create(iotaState);
+
+  OperationState sortState(selection.getLoc(),
+                           stablehlo::SortOp::getOperationName());
+  sortState.addOperands({operands[0], iota->getResult(0)});
+  sortState.addTypes({input, fullIndexType});
+  sortState.addAttribute("dimension", builder.getI64IntegerAttr(dimension));
+  sortState.addAttribute("is_stable", builder.getBoolAttr(true));
+  sortState.addRegion();
+  Operation *sort = builder.create(sortState);
+  Region &comparator = sort->getRegion(0);
+  Block *comparatorBlock = new Block();
+  comparator.push_back(comparatorBlock);
+  auto scalarValueType = RankedTensorType::get({}, input.getElementType());
+  auto scalarIndexType = RankedTensorType::get({}, builder.getI32Type());
+  comparatorBlock->addArgument(scalarValueType, selection.getLoc());
+  comparatorBlock->addArgument(scalarValueType, selection.getLoc());
+  comparatorBlock->addArgument(scalarIndexType, selection.getLoc());
+  comparatorBlock->addArgument(scalarIndexType, selection.getLoc());
+  OpBuilder comparatorBuilder = OpBuilder::atBlockEnd(comparatorBlock);
+  OperationState compareState(selection.getLoc(),
+                              stablehlo::CompareOp::getOperationName());
+  compareState.addOperands(
+      {comparatorBlock->getArgument(0), comparatorBlock->getArgument(1)});
+  compareState.addTypes(
+      RankedTensorType::get({}, comparatorBuilder.getI1Type()));
+  stablehlo::ComparisonDirection direction =
+      selection.getOrder() == SelectionOrder::Descending
+          ? stablehlo::ComparisonDirection::GT
+          : stablehlo::ComparisonDirection::LT;
+  compareState.addAttribute("comparison_direction",
+                            stablehlo::ComparisonDirectionAttr::get(
+                                selection.getContext(), direction));
+  compareState.addAttribute(
+      "compare_type",
+      stablehlo::ComparisonTypeAttr::get(
+          selection.getContext(), stablehlo::ComparisonType::TOTALORDER));
+  Operation *compare = comparatorBuilder.create(compareState);
+  OperationState returnState(selection.getLoc(),
+                             stablehlo::ReturnOp::getOperationName());
+  returnState.addOperands(compare->getResult(0));
+  comparatorBuilder.create(returnState);
+
+  SmallVector<int64_t> starts(input.getRank(), 0);
+  SmallVector<int64_t> limits(input.getShape());
+  SmallVector<int64_t> strides(input.getRank(), 1);
+  limits[dimension] = selection.getCount();
+  SmallVector<Value> results;
+  for (auto [resultNumber, resultType] :
+       llvm::enumerate(selection.getResultTypes())) {
+    OperationState sliceState(selection.getLoc(),
+                              stablehlo::SliceOp::getOperationName());
+    sliceState.addOperands(sort->getResult(resultNumber));
+    sliceState.addTypes(resultType);
+    sliceState.addAttribute(
+        "start_indices",
+        DenseI64ArrayAttr::get(selection.getContext(), starts));
+    sliceState.addAttribute(
+        "limit_indices",
+        DenseI64ArrayAttr::get(selection.getContext(), limits));
+    sliceState.addAttribute(
+        "strides", DenseI64ArrayAttr::get(selection.getContext(), strides));
+    sliceState.addAttribute(
+        kSourceRefsAttribute,
+        ArrayAttr::get(selection.getContext(),
+                       {selection.getSources()[resultNumber]}));
+    results.push_back(builder.create(sliceState)->getResult(0));
+  }
+  return results;
 }
 
 FailureOr<OperationState> lowerContractState(ContractOp contract,
@@ -2924,8 +5353,14 @@ FailureOr<OperationState> lowerContractState(ContractOp contract,
                     stablehlo::DotDimensionNumbersAttr::get(
                         contract.getContext(), lhsBatching, rhsBatching,
                         lhsContracting, rhsContracting));
-  attributes.append("precision_config",
-                    ArrayAttr::get(contract.getContext(), precision));
+  auto sourcePrecisionForm =
+      contract->getAttrOfType<StringAttr>("source_precision_form");
+  if (!sourcePrecisionForm || sourcePrecisionForm.getValue() != "omitted") {
+    if (sourcePrecisionForm && sourcePrecisionForm.getValue() == "empty")
+      precision.clear();
+    attributes.append("precision_config",
+                      ArrayAttr::get(contract.getContext(), precision));
+  }
   OperationState state(contract.getLoc(),
                        stablehlo::DotGeneralOp::getOperationName());
   state.addOperands(operands);
@@ -2934,66 +5369,96 @@ FailureOr<OperationState> lowerContractState(ContractOp contract,
   return state;
 }
 
+bool hasCanonicalStablehloFoldIndexing(FoldOp fold) {
+  const size_t count = fold.getInputs().size();
+  if (count == 0 || fold.getNumResults() != count ||
+      fold.getIndexingMaps().size() != 2 * count) {
+    return false;
+  }
+  llvm::SmallDenseSet<int64_t> reductionDimensions;
+  for (int64_t dimension : fold.getReductionDimensions()) {
+    if (dimension < 0)
+      return false;
+    reductionDimensions.insert(dimension);
+  }
+  AffineMap first = cast<AffineMapAttr>(fold.getIndexingMaps()[0]).getValue();
+  for (size_t index = 0; index < count; ++index) {
+    auto input = dyn_cast<RankedTensorType>(fold.getInputs()[index].getType());
+    auto inputMap = dyn_cast<AffineMapAttr>(fold.getIndexingMaps()[index]);
+    if (!input || !inputMap ||
+        inputMap.getValue() != AffineMap::getMultiDimIdentityMap(
+                                   input.getRank(), fold.getContext()) ||
+        inputMap.getValue().getNumDims() != first.getNumDims()) {
+      return false;
+    }
+  }
+  for (size_t index = 0; index < count; ++index) {
+    auto result =
+        dyn_cast<RankedTensorType>(fold.getResults()[index].getType());
+    auto resultMap =
+        dyn_cast<AffineMapAttr>(fold.getIndexingMaps()[count + index]);
+    if (!result || !resultMap ||
+        resultMap.getValue().getNumDims() != first.getNumDims()) {
+      return false;
+    }
+    SmallVector<AffineExpr> expectedResults;
+    for (int64_t dimension = 0; dimension < first.getNumDims(); ++dimension)
+      if (!reductionDimensions.contains(dimension))
+        expectedResults.push_back(
+            getAffineDimExpr(dimension, fold.getContext()));
+    if (resultMap.getValue() != AffineMap::get(first.getNumDims(), 0,
+                                               expectedResults,
+                                               fold.getContext())) {
+      return false;
+    }
+    if (resultMap.getValue().getNumResults() != result.getRank())
+      return false;
+  }
+  return true;
+}
+
 FailureOr<Operation *> lowerFold(OpBuilder &builder, FoldOp fold,
                                  ValueRange operands) {
   if (llvm::any_of(fold->getDiscardableAttrs(), [](NamedAttribute attribute) {
-        return attribute.getName().strref() != kOperationRefAttribute;
+        StringRef name = attribute.getName().strref();
+        return name != kOperationRefAttribute && name != kSourceRefsAttribute;
       })) {
     fold.emitOpError("has an unsupported discardable Fold attribute");
     return failure();
   }
-  if (operands.size() != 2 || fold.getInputs().size() != 1 ||
-      fold.getInitializers().size() != 1 || fold.getNumResults() != 1 ||
+  const size_t count = fold.getInputs().size();
+  if (count == 0 || operands.size() != 2 * count ||
+      fold.getInitializers().size() != count || fold.getNumResults() != count ||
       fold.getCombiner().empty()) {
     fold.emitOpError("is outside the first Fold lowering contract");
     return failure();
   }
-  Block &body = fold.getCombiner().front();
-  if (body.getNumArguments() != 2 || body.getOperations().size() != 2) {
-    fold.emitOpError("requires exactly one scalar combiner and one yield");
-    return failure();
-  }
-  auto add = dyn_cast<arith::AddFOp>(body.front());
-  auto maximum = dyn_cast<arith::MaximumFOp>(body.front());
-  Operation *combiner = add ? add.getOperation()
-                            : maximum ? maximum.getOperation() : nullptr;
-  auto yield = dyn_cast<YieldOp>(body.back());
-  auto fastMath =
-      combiner
-          ? combiner->getAttrOfType<arith::FastMathFlagsAttr>("fastmath")
-          : arith::FastMathFlagsAttr{};
-  if (!combiner || !yield || combiner->getOperand(0) != body.getArgument(0) ||
-      combiner->getOperand(1) != body.getArgument(1) ||
-      yield.getValues().size() != 1 ||
-      yield.getValues()[0] != combiner->getResult(0) ||
-      !body.getArgument(0).getType().isF32() ||
-      !body.getArgument(1).getType().isF32() ||
-      !fold.getOrderFree() ||
-      (fastMath && fastMath.getValue() != arith::FastMathFlags::none) ||
-      llvm::any_of(combiner->getAttrs(),
-                   [](NamedAttribute attribute) {
-                     StringRef name = attribute.getName().strref();
-                     return name != "fastmath" &&
-                            name != kSourceRefsAttribute &&
-                            name != kOperationRefAttribute;
-                   }) ||
-      llvm::any_of(yield->getAttrs(), [](NamedAttribute attribute) {
-        return attribute.getName().strref() != kOperationRefAttribute;
-      })) {
+  if (!hasCanonicalStablehloFoldIndexing(fold)) {
     fold.emitOpError(
-        "requires a closed order-free scalar f32 add or maximum combiner");
+        "requires canonical StableHLO-compatible Fold indexing maps");
     return failure();
   }
-  ArrayAttr combinerRefs = sourceRefs(combiner);
+  Block &body = fold.getCombiner().front();
+  auto yield = dyn_cast<YieldOp>(body.getTerminator());
+  if (!yield || body.getNumArguments() != 2 * count ||
+      yield.getValues().size() != count) {
+    fold.emitOpError("requires two scalar arguments and one yield per result");
+    return failure();
+  }
+  if (!fold.getOrderFree() ||
+      llvm::any_of(body.getArguments(),
+                   [](Value value) { return !value.getType().isF32(); })) {
+    fold.emitOpError("requires an order-free scalar f32 combiner");
+    return failure();
+  }
   auto foldOwner =
       fold->getAttrOfType<DenseI64ArrayAttr>(kOperationRefAttribute);
-  auto combinerOwner =
-      combiner->getAttrOfType<DenseI64ArrayAttr>(kOperationRefAttribute);
   auto yieldOwner =
       yield->getAttrOfType<DenseI64ArrayAttr>(kOperationRefAttribute);
-  if (!combinerRefs || combinerRefs.size() != 1 || !foldOwner ||
-      !combinerOwner ||
-      !yieldOwner) {
+  auto yieldOwnerGroups =
+      yield->getAttrOfType<ArrayAttr>(kOperationRefGroupsAttribute);
+  if (!foldOwner || (!yieldOwner && !yieldOwnerGroups) ||
+      (yieldOwner && yieldOwnerGroups)) {
     fold.emitOpError("has incomplete Fold source provenance");
     return failure();
   }
@@ -3002,30 +5467,91 @@ FailureOr<Operation *> lowerFold(OpBuilder &builder, FoldOp fold,
   state.addOperands(operands);
   state.addTypes(fold.getResultTypes());
   state.addAttribute("dimensions", fold.getReductionDimensionsAttr());
-  state.addAttribute(kSourceRefsAttribute,
-                     ArrayAttr::get(fold.getContext(), {fold.getSource()}));
+  ArrayAttr foldSources = sourceRefs(fold);
+  state.addAttribute(
+      kSourceRefsAttribute,
+      foldSources ? foldSources
+                  : ArrayAttr::get(fold.getContext(), {fold.getSource()}));
   state.addAttribute(kOperationRefAttribute, foldOwner);
   state.addRegion();
   Operation *reduce = builder.create(state);
   Block *reducer = new Block();
   reduce->getRegion(0).push_back(reducer);
   auto scalarTensor = RankedTensorType::get({}, builder.getF32Type());
-  reducer->addArgument(scalarTensor, body.getArgument(0).getLoc());
-  reducer->addArgument(scalarTensor, body.getArgument(1).getLoc());
+  for (size_t index = 0; index < 2 * count; ++index)
+    reducer->addArgument(scalarTensor, body.getArgument(index).getLoc());
   OpBuilder reducerBuilder = OpBuilder::atBlockEnd(reducer);
-  StringRef stablehloCombinerName =
-      add ? stablehlo::AddOp::getOperationName()
-          : stablehlo::MaxOp::getOperationName();
-  OperationState combinerState(combiner->getLoc(), stablehloCombinerName);
-  combinerState.addOperands(reducer->getArguments());
-  combinerState.addTypes(scalarTensor);
-  combinerState.addAttribute(kSourceRefsAttribute, combinerRefs);
-  combinerState.addAttribute(kOperationRefAttribute, combinerOwner);
-  Operation *loweredCombiner = reducerBuilder.create(combinerState);
+  IRMapping mapping;
+  for (auto [source, target] :
+       llvm::zip_equal(body.getArguments(), reducer->getArguments()))
+    mapping.map(source, target);
+  auto scalarName = [](Operation *operation) -> StringRef {
+    return llvm::StringSwitch<StringRef>(operation->getName().getStringRef())
+        .Case(arith::AddFOp::getOperationName(),
+              stablehlo::AddOp::getOperationName())
+        .Case(arith::SubFOp::getOperationName(),
+              stablehlo::SubtractOp::getOperationName())
+        .Case(arith::MulFOp::getOperationName(),
+              stablehlo::MulOp::getOperationName())
+        .Case(arith::MaximumFOp::getOperationName(),
+              stablehlo::MaxOp::getOperationName())
+        .Case(math::ExpOp::getOperationName(),
+              stablehlo::ExpOp::getOperationName())
+        .Case(arith::ConstantOp::getOperationName(),
+              stablehlo::ConstantOp::getOperationName())
+        .Default(StringRef{});
+  };
+  for (Operation &operation : body.without_terminator()) {
+    StringRef name = scalarName(&operation);
+    if (name.empty() || operation.getNumResults() != 1 ||
+        failed(verifyDefaultScalarSemantics(&operation))) {
+      operation.emitOpError("has no authoritative StableHLO Fold lowering");
+      return failure();
+    }
+    OperationState combinerState(operation.getLoc(), name);
+    SmallVector<Value> mappedOperands;
+    for (Value operand : operation.getOperands()) {
+      Value mapped = mapping.lookupOrNull(operand);
+      if (!mapped) {
+        operation.emitOpError("has an unmapped Fold combiner operand");
+        return failure();
+      }
+      mappedOperands.push_back(mapped);
+    }
+    combinerState.addOperands(mappedOperands);
+    combinerState.addTypes(scalarTensor);
+    if (auto refs = sourceRefs(&operation))
+      combinerState.addAttribute(kSourceRefsAttribute, refs);
+    if (auto owner = operation.getAttr(kOperationRefAttribute))
+      combinerState.addAttribute(kOperationRefAttribute, owner);
+    if (isa<arith::ConstantOp>(operation)) {
+      auto value = operation.getAttrOfType<FloatAttr>("value");
+      if (!value) {
+        operation.emitOpError("requires a scalar floating constant");
+        return failure();
+      }
+      combinerState.addAttribute("value",
+                                 DenseElementsAttr::get(scalarTensor, value));
+    }
+    Operation *lowered = reducerBuilder.create(combinerState);
+    mapping.map(operation.getResult(0), lowered->getResult(0));
+  }
+  SmallVector<Value> loweredResults;
+  for (Value value : yield.getValues()) {
+    Value mapped = mapping.lookupOrNull(value);
+    if (!mapped) {
+      yield.emitOpError("has an unmapped Fold result");
+      return failure();
+    }
+    loweredResults.push_back(mapped);
+  }
   OperationState returnState(yield.getLoc(),
                              stablehlo::ReturnOp::getOperationName());
-  returnState.addOperands(loweredCombiner->getResult(0));
-  returnState.addAttribute(kOperationRefAttribute, yieldOwner);
+  returnState.addOperands(loweredResults);
+  if (yieldOwner)
+    returnState.addAttribute(kOperationRefAttribute, yieldOwner);
+  else
+    returnState.addAttribute(kOperationRefGroupsAttribute, yieldOwnerGroups);
   reducerBuilder.create(returnState);
   return reduce;
 }
@@ -3053,6 +5579,18 @@ LogicalResult lowerRegion(RegionOp region) {
       }
       operands.push_back(mapped);
     }
+    if (auto selection = dyn_cast<SelectionOp>(operation)) {
+      FailureOr<SmallVector<Value>> lowered =
+          lowerSelection(builder, selection, operands);
+      if (failed(lowered)) {
+        return failure();
+      }
+      for (auto [result, loweredResult] :
+           llvm::zip_equal(operation.getResults(), *lowered)) {
+        mapping.map(result, loweredResult);
+      }
+      continue;
+    }
     Attribute source;
     FailureOr<OperationState> state = failure();
     if (auto fold = dyn_cast<FoldOp>(operation)) {
@@ -3067,6 +5605,16 @@ LogicalResult lowerRegion(RegionOp region) {
       continue;
     }
     if (auto map = dyn_cast<MapOp>(operation)) {
+      if (region.getPolicy() == NumericalPolicy::Fast &&
+          map.getSemantics() == MapSemantics::Pointwise &&
+          llvm::range_size(map.getBody().front().without_terminator()) > 1) {
+        FailureOr<Operation *> lowered =
+            lowerPointwiseMapDag(builder, map, operands);
+        if (failed(lowered))
+          return failure();
+        mapping.map(map.getResult(0), (*lowered)->getResult(0));
+        continue;
+      }
       source = map.getSource();
       state = lowerMapState(map, operands);
     } else if (auto relation = dyn_cast<RelationOp>(operation)) {
@@ -3136,6 +5684,7 @@ struct StripSourceProvenancePass
       operation->removeAttr(kSelectedAttribute);
       operation->removeAttr(kFunctionOrdinalAttribute);
       operation->removeAttr(kOperationRefAttribute);
+      operation->removeAttr(kOperationRefGroupsAttribute);
       operation->removeAttr(kRegionResultSourcesAttribute);
       if (containsShuttleAttribute(operation->getLoc())) {
         operation->setLoc(UnknownLoc::get(operation->getContext()));
@@ -3175,7460 +5724,835 @@ struct VerifyNoShuttleOpsPass
   }
 };
 
-std::string attributeText(Attribute attribute) {
-  std::string text;
-  llvm::raw_string_ostream stream(text);
-  attribute.print(stream);
-  return text;
-}
+#include "MaterializationPlanning.inc"
 
-std::string normalizedModuleFingerprintImpl(ModuleOp module) {
-  std::string normalized;
-  llvm::raw_string_ostream stream(normalized);
-  for (NamedAttribute attribute : module->getAttrs()) {
-    if (attribute.getName().strref() == SymbolTable::getSymbolAttrName()) {
-      continue;
-    }
-    stream << "module_attr:" << attribute.getName() << '=';
-    attribute.getValue().print(stream);
-    stream << '\n';
-  }
-  for (func::FuncOp function : module.getOps<func::FuncOp>()) {
-    stream << "function:";
-    function.getFunctionType().print(stream);
-    stream << '\n';
-    llvm::SmallDenseMap<Value, uint64_t> values;
-    uint64_t nextValue = 0;
-    for (BlockArgument argument : function.getArguments()) {
-      values.try_emplace(argument, nextValue++);
-    }
-    std::function<void(Operation &)> printOperation =
-        [&](Operation &operation) {
-          stream << operation.getName() << '(';
-          for (Value operand : operation.getOperands()) {
-            auto position = values.find(operand);
-            if (position == values.end()) {
-              stream << "missing";
-            } else {
-              stream << position->second;
-            }
-            stream << ',';
-          }
-          stream << ")->(";
-          for (Type type : operation.getResultTypes()) {
-            type.print(stream);
-            stream << ',';
-          }
-          stream << "){";
-          for (NamedAttribute attribute : operation.getAttrs()) {
-            StringRef name = attribute.getName().strref();
-            if (name == SymbolTable::getSymbolAttrName() ||
-                name == kSourceRefsAttribute || name == kSelectedAttribute ||
-                name == kFunctionOrdinalAttribute ||
-                name == kOperationRefAttribute ||
-                name == kCoverageManifestAttribute ||
-                name == kRegionResultSourcesAttribute) {
-              continue;
-            }
-            stream << name << '=';
-            attribute.getValue().print(stream);
-            stream << ',';
-          }
-          stream << "}\n";
-          for (Value result : operation.getResults()) {
-            values.try_emplace(result, nextValue++);
-          }
-          for (auto [regionOrdinal, region] :
-               llvm::enumerate(operation.getRegions())) {
-            stream << "region:" << regionOrdinal << '\n';
-            for (auto [blockOrdinal, block] : llvm::enumerate(region)) {
-              stream << "block:" << blockOrdinal << '(';
-              for (BlockArgument argument : block.getArguments()) {
-                argument.getType().print(stream);
-                stream << ':' << nextValue << ',';
-                values.try_emplace(argument, nextValue++);
-              }
-              stream << ")\n";
-              for (Operation &nested : block) {
-                printOperation(nested);
-              }
-            }
-          }
-        };
-    for (Operation &operation : function.getBody().front()) {
-      printOperation(operation);
-    }
-  }
-  stream.flush();
-  return sha256(normalized);
-}
+#include "ScheduleLowering.inc"
 
-std::string generatedGpuBundleFingerprintImpl(ModuleOp module) {
-  SmallVector<DeviceModuleOp> devices(module.getOps<DeviceModuleOp>());
-  SmallVector<InvocationAbiOp> abis(module.getOps<InvocationAbiOp>());
-  SmallVector<ExecutableBundleOp> bundles(module.getOps<ExecutableBundleOp>());
-  if (bundles.empty() || devices.size() != bundles.size() ||
-      abis.size() != bundles.size())
-    return {};
-  std::string normalized;
-  llvm::raw_string_ostream stream(normalized);
-  llvm::SmallDenseSet<Operation *> matchedDevices;
-  llvm::SmallDenseSet<Operation *> matchedAbis;
-  stream << "bundle_count:" << bundles.size() << '\n';
-  for (auto [ordinal, bundle] : llvm::enumerate(bundles)) {
-    DeviceModuleOp device;
-    for (DeviceModuleOp candidate : devices) {
-      if (candidate.getFingerprint() != bundle.getDeviceModuleFingerprint())
-        continue;
-      if (device)
-        return {};
-      device = candidate;
-    }
-    InvocationAbiOp abi;
-    for (InvocationAbiOp candidate : abis) {
-      if (candidate.getFingerprint() != bundle.getInvocationAbiFingerprint())
-        continue;
-      if (abi)
-        return {};
-      abi = candidate;
-    }
-    if (!device || !abi ||
-        !matchedDevices.insert(device.getOperation()).second ||
-        !matchedAbis.insert(abi.getOperation()).second)
-      return {};
-    stream << "tuple:" << ordinal
-           << "\ndevice_module:" << deviceModuleFingerprint(device)
-           << "\ninvocation_abi:" << invocationAbiFingerprint(abi)
-           << "\nexecutable_bundle:" << executableBundleFingerprint(bundle)
-           << '\n';
-  }
-  stream.flush();
-  return sha256(normalized);
-}
-
-bool isMaterializationFingerprintProvenance(StringRef name) {
-  return name == kSourceRefsAttribute || name == kSelectedAttribute ||
-         name == kFunctionOrdinalAttribute || name == kOperationRefAttribute ||
-         name == kCoverageManifestAttribute ||
-         name == kRegionResultSourcesAttribute || name == "source";
-}
-
-std::string semanticTaskFingerprint(Operation *root) {
-  std::string normalized;
-  llvm::raw_string_ostream stream(normalized);
-  llvm::SmallDenseMap<Value, uint64_t> values;
-  uint64_t nextValue = 0;
-  for (Value operand : root->getOperands()) {
-    values.try_emplace(operand, nextValue++);
-  }
-  std::function<void(Operation &)> printOperation = [&](Operation &operation) {
-    stream << operation.getName() << '(';
-    for (Value operand : operation.getOperands()) {
-      auto position = values.find(operand);
-      stream << (position == values.end() ? UINT64_MAX : position->second)
-             << ',';
-    }
-    stream << ")->(";
-    for (Type type : operation.getResultTypes()) {
-      type.print(stream);
-      stream << ',';
-    }
-    stream << "){";
-    for (NamedAttribute attribute : operation.getAttrs()) {
-      if (isMaterializationFingerprintProvenance(
-              attribute.getName().strref())) {
-        continue;
-      }
-      stream << attribute.getName() << '=';
-      attribute.getValue().print(stream);
-      stream << ',';
-    }
-    stream << "}\n";
-    for (Value result : operation.getResults()) {
-      values.try_emplace(result, nextValue++);
-    }
-    for (Region &region : operation.getRegions()) {
-      for (Block &block : region) {
-        stream << "block(";
-        for (BlockArgument argument : block.getArguments()) {
-          argument.getType().print(stream);
-          stream << ':' << nextValue << ',';
-          values.try_emplace(argument, nextValue++);
-        }
-        stream << ")\n";
-        for (Operation &nested : block) {
-          printOperation(nested);
-        }
-      }
-    }
-  };
-  printOperation(*root);
-  stream.flush();
-  return sha256(normalized);
-}
-
-FailureOr<SmallVector<int64_t>> mapDomainShape(MapOp map) {
-  if (map.getNumResults() != 1) {
-    return failure();
-  }
-  auto resultType = dyn_cast<RankedTensorType>(map.getResult(0).getType());
-  if (!resultType || !resultType.hasStaticShape() ||
-      llvm::any_of(resultType.getShape(),
-                   [](int64_t extent) { return extent <= 0; })) {
-    return failure();
-  }
-  AffineMap resultMap =
-      cast<AffineMapAttr>(
-          map.getIndexingMaps()[map.getIndexingMaps().size() - 1])
-          .getValue();
-  SmallVector<int64_t> domain(resultMap.getNumDims(), ShapedType::kDynamic);
-  for (auto [resultPosition, expression] :
-       llvm::enumerate(resultMap.getResults())) {
-    auto dimension = dyn_cast<AffineDimExpr>(expression);
-    if (!dimension) {
-      return failure();
-    }
-    domain[dimension.getPosition()] = resultType.getDimSize(resultPosition);
-  }
-  if (llvm::is_contained(domain, ShapedType::kDynamic)) {
-    return failure();
-  }
-  return domain;
-}
-
-FailureOr<SmallVector<int64_t>> genericMapDomainShape(MapOp map) {
-  if (map.getNumResults() == 0 ||
-      map.getIndexingMaps().size() !=
-          map.getInputs().size() + map.getNumResults()) {
-    return failure();
-  }
-  std::optional<SmallVector<int64_t>> commonDomain;
-  ArrayRef<Attribute> resultMaps =
-      map.getIndexingMaps().getValue().drop_front(map.getInputs().size());
-  for (auto [result, mapAttribute] :
-       llvm::zip_equal(map.getResults(), resultMaps)) {
-    auto resultType = dyn_cast<RankedTensorType>(result.getType());
-    auto resultMap = dyn_cast<AffineMapAttr>(mapAttribute);
-    if (!resultType || !resultType.hasStaticShape() || !resultMap ||
-        resultMap.getValue().getNumSymbols() != 0 ||
-        resultMap.getValue().getNumResults() != resultType.getRank() ||
-        llvm::any_of(resultType.getShape(),
-                     [](int64_t extent) { return extent <= 0; })) {
-      return failure();
-    }
-    SmallVector<int64_t> domain(resultMap.getValue().getNumDims(),
-                                ShapedType::kDynamic);
-    for (auto [resultPosition, expression] :
-         llvm::enumerate(resultMap.getValue().getResults())) {
-      auto dimension = dyn_cast<AffineDimExpr>(expression);
-      if (!dimension ||
-          domain[dimension.getPosition()] != ShapedType::kDynamic) {
-        return failure();
-      }
-      domain[dimension.getPosition()] = resultType.getDimSize(resultPosition);
-    }
-    if (llvm::is_contained(domain, ShapedType::kDynamic) ||
-        (commonDomain && *commonDomain != domain)) {
-      return failure();
-    }
-    commonDomain = std::move(domain);
-  }
-  return std::move(*commonDomain);
-}
-
-FailureOr<SmallVector<int64_t>> contractDomainShape(ContractOp contract) {
-  if (contract.getInputs().size() != 2 || contract.getNumResults() != 1 ||
-      contract.getIndexingMaps().size() != 3) {
-    return failure();
-  }
-  AffineMap first =
-      cast<AffineMapAttr>(contract.getIndexingMaps()[0]).getValue();
-  SmallVector<int64_t> domain(first.getNumDims(), ShapedType::kDynamic);
-  SmallVector<Type> indexedTypes;
-  llvm::append_range(indexedTypes, contract.getInputs().getTypes());
-  llvm::append_range(indexedTypes, contract.getResults().getTypes());
-  for (auto [mapAttribute, type] :
-       llvm::zip_equal(contract.getIndexingMaps(), indexedTypes)) {
-    auto tensor = dyn_cast<RankedTensorType>(type);
-    auto map = dyn_cast<AffineMapAttr>(mapAttribute);
-    if (!tensor || !tensor.hasStaticShape() || !map ||
-        map.getValue().getNumDims() != domain.size() ||
-        map.getValue().getNumResults() != tensor.getRank()) {
-      return failure();
-    }
-    for (auto [axis, expression] :
-         llvm::enumerate(map.getValue().getResults())) {
-      auto dimension = dyn_cast<AffineDimExpr>(expression);
-      if (!dimension || tensor.getDimSize(axis) <= 0) {
-        return failure();
-      }
-      int64_t &extent = domain[dimension.getPosition()];
-      if (!ShapedType::isDynamic(extent) && extent != tensor.getDimSize(axis)) {
-        return failure();
-      }
-      extent = tensor.getDimSize(axis);
-    }
-  }
-  if (llvm::is_contained(domain, ShapedType::kDynamic)) {
-    return failure();
-  }
-  return domain;
-}
-
-bool isClosedProjectedContract(ContractOp contract) {
-  auto lhs = contract.getInputs().size() == 2
-                 ? dyn_cast<RankedTensorType>(contract.getInputs()[0].getType())
-                 : RankedTensorType{};
-  auto rhs = contract.getInputs().size() == 2
-                 ? dyn_cast<RankedTensorType>(contract.getInputs()[1].getType())
-                 : RankedTensorType{};
-  auto result =
-      contract.getNumResults() == 1
-          ? dyn_cast<RankedTensorType>(contract.getResult(0).getType())
-          : RankedTensorType{};
-  FailureOr<SmallVector<int64_t>> domain = contractDomainShape(contract);
-  constexpr int64_t kMaximumContractRank = 8;
-  if (!lhs || !rhs || !result || failed(domain) || lhs.getRank() < 2 ||
-      rhs.getRank() < 2 || result.getRank() < 2 ||
-      lhs.getRank() > kMaximumContractRank ||
-      rhs.getRank() > kMaximumContractRank ||
-      result.getRank() > kMaximumContractRank ||
-      lhs.getElementType() != rhs.getElementType() ||
-      (!lhs.getElementType().isBF16() && !lhs.getElementType().isF32()) ||
-      !result.getElementType().isF32() ||
-      domain->size() != static_cast<size_t>(result.getRank() + 1) ||
-      contract.getAlgorithm() != "dot_general" ||
-      contract.getAccumulatorTypes().size() != 1 ||
-      cast<TypeAttr>(contract.getAccumulatorTypes()[0]).getValue() !=
-          Float32Type::get(contract.getContext()) ||
-      contract.getPrecision().size() != 2 ||
-      llvm::any_of(contract.getPrecision(), [](Attribute precision) {
-        auto value = dyn_cast<StringAttr>(precision);
-        return !value || value.getValue() != "DEFAULT";
-      })) {
-    return false;
-  }
-  int64_t reduction = -1;
-  for (auto [position, iterator] :
-       llvm::enumerate(contract.getIteratorKinds())) {
-    auto value = dyn_cast<StringAttr>(iterator);
-    if (!value) {
-      return false;
-    }
-    if (value.getValue() == "reduction") {
-      if (reduction >= 0) {
-        return false;
-      }
-      reduction = position;
-    } else if (value.getValue() != "parallel") {
-      return false;
-    }
-  }
-  if (reduction != static_cast<int64_t>(domain->size()) - 1) {
-    return false;
-  }
-  AffineMap lhsMap =
-      cast<AffineMapAttr>(contract.getIndexingMaps()[0]).getValue();
-  AffineMap rhsMap =
-      cast<AffineMapAttr>(contract.getIndexingMaps()[1]).getValue();
-  AffineMap resultMap =
-      cast<AffineMapAttr>(contract.getIndexingMaps()[2]).getValue();
-  MLIRContext *context = contract.getContext();
-  SmallVector<AffineExpr> expectedResultExpressions;
-  expectedResultExpressions.reserve(result.getRank());
-  for (int64_t dimension = 0; dimension < result.getRank(); ++dimension) {
-    expectedResultExpressions.push_back(getAffineDimExpr(dimension, context));
-  }
-  if (resultMap !=
-      AffineMap::get(domain->size(), 0, expectedResultExpressions, context)) {
-    return false;
-  }
-  for (unsigned dimension = 0; dimension < domain->size(); ++dimension) {
-    const bool inLhs = succeeded(mapResultPosition(lhsMap, dimension));
-    const bool inRhs = succeeded(mapResultPosition(rhsMap, dimension));
-    const bool inResult = succeeded(mapResultPosition(resultMap, dimension));
-    if (dimension == static_cast<unsigned>(reduction)) {
-      if (!inLhs || !inRhs || inResult) {
-        return false;
-      }
-    } else if ((!inLhs && !inRhs) || !inResult) {
-      return false;
-    }
-  }
-  return true;
-}
-
-bool isClosedContractMapRegion(RegionOp region, ArrayRef<Operation *> algebra) {
-  auto isExternalType = [](Type type) {
-    auto tensor = dyn_cast<RankedTensorType>(type);
-    return tensor && tensor.hasStaticShape() && tensor.getRank() >= 2 &&
-           tensor.getRank() <= 8 && tensor.getElementType().isBF16() &&
-           llvm::all_of(tensor.getShape(),
-                        [](int64_t extent) { return extent > 0; });
-  };
-  if (!llvm::all_of(
-          region.getInputs(),
-          [&](Value input) { return isExternalType(input.getType()); }) ||
-      !llvm::all_of(region.getResults(), [&](Value result) {
-        return isExternalType(result.getType());
-      })) {
-    return false;
-  }
-  return llvm::all_of(algebra, [](Operation *operation) {
-    if (auto contract = dyn_cast<ContractOp>(operation)) {
-      return isClosedProjectedContract(contract);
-    }
-    return isa<MapOp>(operation);
-  });
-}
-
-bool isClosedRankTwoFold(FoldOp fold) {
-  auto inputType =
-      fold.getInputs().size() == 1
-          ? dyn_cast<RankedTensorType>(fold.getInputs()[0].getType())
-          : RankedTensorType{};
-  auto initType =
-      fold.getInitializers().size() == 1
-          ? dyn_cast<RankedTensorType>(fold.getInitializers()[0].getType())
-          : RankedTensorType{};
-  auto resultType =
-      fold.getNumResults() == 1
-          ? dyn_cast<RankedTensorType>(fold.getResult(0).getType())
-          : RankedTensorType{};
-  if (!inputType || !initType || !resultType || !inputType.hasStaticShape() ||
-      inputType.getRank() != 2 || inputType.getDimSize(0) <= 0 ||
-      inputType.getDimSize(1) <= 0 || !inputType.getElementType().isF32() ||
-      initType.getRank() != 0 || !initType.getElementType().isF32() ||
-      fold.getReductionDimensions().size() != 1 ||
-      fold.getReductionDimensions().front() < 0 ||
-      fold.getReductionDimensions().front() >= inputType.getRank() ||
-      !fold.getOrderFree() || fold.getAccumulatorTypes().size() != 1 ||
-      cast<TypeAttr>(fold.getAccumulatorTypes()[0]).getValue() !=
-          Float32Type::get(fold.getContext())) {
-    return false;
-  }
-  SmallVector<int64_t> expectedResultShape(inputType.getShape());
-  expectedResultShape.erase(expectedResultShape.begin() +
-                            fold.getReductionDimensions().front());
-  if (resultType.getShape() != ArrayRef<int64_t>(expectedResultShape) ||
-      !resultType.getElementType().isF32()) {
-    return false;
-  }
-  Block &body = fold.getCombiner().front();
-  if (body.getNumArguments() != 2 || body.getOperations().size() != 2) {
-    return false;
-  }
-  auto add = dyn_cast<arith::AddFOp>(body.front());
-  auto yield = dyn_cast<YieldOp>(body.back());
-  auto fastMath = add ? add->getAttrOfType<arith::FastMathFlagsAttr>("fastmath")
-                      : arith::FastMathFlagsAttr{};
-  if (!add || !yield || add.getLhs() != body.getArgument(0) ||
-      add.getRhs() != body.getArgument(1) || yield.getValues().size() != 1 ||
-      yield.getValues()[0] != add.getResult() ||
-      (fastMath && fastMath.getValue() != arith::FastMathFlags::none)) {
-    return false;
-  }
-  return true;
-}
-
-bool hasExactPositiveZeroInitializer(FoldOp fold) {
-  if (fold.getInitializers().size() != 1) {
-    return false;
-  }
-  auto initializer = fold.getInitializers()[0].getDefiningOp<MapOp>();
-  if (!initializer || !initializer.getInputs().empty() ||
-      initializer.getBody().empty()) {
-    return false;
-  }
-  Block &body = initializer.getBody().front();
-  auto constant = body.getOperations().size() == 2
-                      ? dyn_cast<arith::ConstantOp>(body.front())
-                      : arith::ConstantOp{};
-  auto value =
-      constant ? dyn_cast<FloatAttr>(constant.getValue()) : FloatAttr{};
-  return value && value.getType().isF32() && value.getValue().isZero() &&
-         !value.getValue().isNegative();
-}
-
-bool isClosedTerminalRankNFold(FoldOp fold) {
-  if (!isClosedRankTwoFold(fold)) {
-    auto inputType =
-        fold.getInputs().size() == 1
-            ? dyn_cast<RankedTensorType>(fold.getInputs()[0].getType())
-            : RankedTensorType{};
-    if (!inputType || !inputType.hasStaticShape() || inputType.getRank() < 3 ||
-        inputType.getRank() > 8 ||
-        fold.getReductionDimensions() !=
-            ArrayRef<int64_t>({inputType.getRank() - 1})) {
-      return false;
-    }
-    // Reuse the closed scalar/type/combiner checks with a shape-only rank-two
-    // view would obscure the actual operation. Spell out the rank-independent
-    // portion here instead.
-    auto initType =
-        fold.getInitializers().size() == 1
-            ? dyn_cast<RankedTensorType>(fold.getInitializers()[0].getType())
-            : RankedTensorType{};
-    auto resultType =
-        fold.getNumResults() == 1
-            ? dyn_cast<RankedTensorType>(fold.getResult(0).getType())
-            : RankedTensorType{};
-    if (!initType || !resultType || !inputType.getElementType().isF32() ||
-        initType.getRank() != 0 || !initType.getElementType().isF32() ||
-        !fold.getOrderFree() || fold.getAccumulatorTypes().size() != 1 ||
-        cast<TypeAttr>(fold.getAccumulatorTypes()[0]).getValue() !=
-            Float32Type::get(fold.getContext()) ||
-        resultType.getShape() != inputType.getShape().drop_back() ||
-        !resultType.getElementType().isF32()) {
-      return false;
-    }
-    Block &body = fold.getCombiner().front();
-    if (body.getNumArguments() != 2 || body.getOperations().size() != 2) {
-      return false;
-    }
-    auto add = dyn_cast<arith::AddFOp>(body.front());
-    auto yield = dyn_cast<YieldOp>(body.back());
-    auto fastMath =
-        add ? add->getAttrOfType<arith::FastMathFlagsAttr>("fastmath")
-            : arith::FastMathFlagsAttr{};
-    if (!add || !yield || add.getLhs() != body.getArgument(0) ||
-        add.getRhs() != body.getArgument(1) || yield.getValues().size() != 1 ||
-        yield.getValues()[0] != add.getResult() ||
-        (fastMath && fastMath.getValue() != arith::FastMathFlags::none)) {
-      return false;
-    }
-  }
-  return hasExactPositiveZeroInitializer(fold);
-}
-
-bool isFullPrefixReduction(ArrayRef<int64_t> dimensions, int64_t rank) {
-  return rank >= 3 && rank <= 8 &&
-         dimensions.size() == static_cast<size_t>(rank - 1) &&
-         llvm::all_of(llvm::enumerate(dimensions), [](auto indexedDimension) {
-           return indexedDimension.value() ==
-                  static_cast<int64_t>(indexedDimension.index());
-         });
-}
-
-bool isClosedFullPrefixRankNFold(FoldOp fold) {
-  auto input =
-      fold.getInputs().size() == 1
-          ? dyn_cast<RankedTensorType>(fold.getInputs()[0].getType())
-          : RankedTensorType{};
-  auto initializer =
-      fold.getInitializers().size() == 1
-          ? dyn_cast<RankedTensorType>(fold.getInitializers()[0].getType())
-          : RankedTensorType{};
-  auto result = fold.getNumResults() == 1
-                    ? dyn_cast<RankedTensorType>(fold.getResult(0).getType())
-                    : RankedTensorType{};
-  if (!input || !initializer || !result || !input.hasStaticShape() ||
-      !result.hasStaticShape() ||
-      !isFullPrefixReduction(fold.getReductionDimensions(), input.getRank()) ||
-      !input.getElementType().isF32() || initializer.getRank() != 0 ||
-      !initializer.getElementType().isF32() || result.getRank() != 1 ||
-      !result.getElementType().isF32() ||
-      result.getShape() != input.getShape().take_back() ||
-      !llvm::all_of(input.getShape(),
-                    [](int64_t extent) { return extent > 0; }) ||
-      !fold.getOrderFree() || fold.getAccumulatorTypes().size() != 1 ||
-      cast<TypeAttr>(fold.getAccumulatorTypes()[0]).getValue() !=
-          Float32Type::get(fold.getContext())) {
-    return false;
-  }
-  Block &body = fold.getCombiner().front();
-  if (body.getNumArguments() != 2 || body.getOperations().size() != 2) {
-    return false;
-  }
-  auto add = dyn_cast<arith::AddFOp>(body.front());
-  auto yield = dyn_cast<YieldOp>(body.back());
-  auto fastMath = add ? add->getAttrOfType<arith::FastMathFlagsAttr>("fastmath")
-                      : arith::FastMathFlagsAttr{};
-  return add && yield && add.getLhs() == body.getArgument(0) &&
-         add.getRhs() == body.getArgument(1) &&
-         yield.getValues().size() == 1 &&
-         yield.getValues()[0] == add.getResult() &&
-         (!fastMath || fastMath.getValue() == arith::FastMathFlags::none) &&
-         hasExactPositiveZeroInitializer(fold);
-}
-
-bool isClosedRankNFold(FoldOp fold) {
-  return isClosedTerminalRankNFold(fold) ||
-         isClosedFullPrefixRankNFold(fold);
-}
-
-bool isClosedAdditivePlanningFold(FoldOp fold) {
-  auto input = fold.getInputs().size() == 1
-                   ? dyn_cast<RankedTensorType>(fold.getInputs()[0].getType())
-                   : RankedTensorType{};
-  auto initializer =
-      fold.getInitializers().size() == 1
-          ? dyn_cast<RankedTensorType>(fold.getInitializers()[0].getType())
-          : RankedTensorType{};
-  auto result = fold.getNumResults() == 1
-                    ? dyn_cast<RankedTensorType>(fold.getResult(0).getType())
-                    : RankedTensorType{};
-  if (!input || !initializer || !result || !input.hasStaticShape() ||
-      !result.hasStaticShape() || !input.getElementType().isF32() ||
-      initializer.getRank() != 0 || !initializer.getElementType().isF32() ||
-      !result.getElementType().isF32() || !fold.getOrderFree() ||
-      fold.getAccumulatorTypes().size() != 1 ||
-      cast<TypeAttr>(fold.getAccumulatorTypes()[0]).getValue() !=
-          Float32Type::get(fold.getContext()) ||
-      llvm::any_of(input.getShape(),
-                   [](int64_t extent) { return extent <= 0; })) {
-    return false;
-  }
-  ArrayRef<int64_t> dimensions = fold.getReductionDimensions();
-  const bool rankTwo =
-      input.getRank() == 2 && dimensions.size() == 1 &&
-      dimensions.front() >= 0 && dimensions.front() < input.getRank();
-  const bool terminalRankN =
-      input.getRank() >= 3 && input.getRank() <= 8 &&
-      dimensions == ArrayRef<int64_t>({input.getRank() - 1});
-  if (!rankTwo && !terminalRankN &&
-      !isFullPrefixReduction(dimensions, input.getRank())) {
-    return false;
-  }
-  SmallVector<int64_t> expectedResult(input.getShape());
-  for (int64_t dimension : llvm::reverse(dimensions))
-    expectedResult.erase(expectedResult.begin() + dimension);
-  if (result.getShape() != ArrayRef<int64_t>(expectedResult))
-    return false;
-  Block &body = fold.getCombiner().front();
-  if (body.getNumArguments() != 2 || body.getOperations().size() != 2)
-    return false;
-  auto add = dyn_cast<arith::AddFOp>(body.front());
-  auto yield = dyn_cast<YieldOp>(body.back());
-  auto fastMath = add ? add->getAttrOfType<arith::FastMathFlagsAttr>("fastmath")
-                      : arith::FastMathFlagsAttr{};
-  return add && yield && add.getLhs() == body.getArgument(0) &&
-         add.getRhs() == body.getArgument(1) &&
-         yield.getValues().size() == 1 &&
-         yield.getValues()[0] == add.getResult() &&
-         (!fastMath || fastMath.getValue() == arith::FastMathFlags::none);
-}
-
-#include "OnlinePlanner.inc"
-
-bool isClosedDirectProjectedMap(MapOp map) {
-  if (map.getNumResults() != 1 ||
-      map.getIndexingMaps().size() != map.getInputs().size() + 1) {
-    return false;
-  }
-  auto result = dyn_cast<RankedTensorType>(map.getResult(0).getType());
-  ArrayRef<Attribute> maps = map.getIndexingMaps().getValue();
-  auto resultMap = dyn_cast<AffineMapAttr>(maps.back());
-  if (!result || !result.hasStaticShape() || !resultMap ||
-      !isIdentityMap(resultMap.getValue())) {
-    return false;
-  }
-  for (auto [input, attribute] :
-       llvm::zip_equal(map.getInputs(), maps.drop_back())) {
-    auto type = dyn_cast<RankedTensorType>(input.getType());
-    auto indexing = dyn_cast<AffineMapAttr>(attribute);
-    if (!type || !type.hasStaticShape() || !indexing ||
-        indexing.getValue().getNumDims() != result.getRank() ||
-        indexing.getValue().getNumSymbols() != 0 ||
-        indexing.getValue().getNumResults() != type.getRank()) {
-      return false;
-    }
-    llvm::SmallDenseSet<unsigned> dimensions;
-    for (auto [axis, expression] :
-         llvm::enumerate(indexing.getValue().getResults())) {
-      auto dimension = dyn_cast<AffineDimExpr>(expression);
-      if (!dimension || dimension.getPosition() >= result.getRank() ||
-          !dimensions.insert(dimension.getPosition()).second ||
-          type.getDimSize(axis) != result.getDimSize(dimension.getPosition())) {
-        return false;
-      }
-    }
-  }
-  return true;
-}
-
-bool isClosedFullPrefixBf16Result(MapOp map) {
-  if (map.getSemantics() != MapSemantics::Pointwise ||
-      map.getInputs().size() != 1 || map.getNumResults() != 1 ||
-      !isClosedDirectProjectedMap(map) || map.getBody().empty()) {
-    return false;
-  }
-  auto input = dyn_cast<RankedTensorType>(map.getInputs()[0].getType());
-  auto result = dyn_cast<RankedTensorType>(map.getResult(0).getType());
-  auto fold = map.getInputs()[0].getDefiningOp<FoldOp>();
-  if (!input || !result || !fold || fold->getParentOp() != map->getParentOp() ||
-      !isClosedFullPrefixRankNFold(fold) || input.getRank() != 1 ||
-      result.getRank() != 1 || input.getShape() != result.getShape() ||
-      !input.getElementType().isF32() || !result.getElementType().isBF16() ||
-      !llvm::all_of(result.getShape(),
-                    [](int64_t extent) { return extent > 0; })) {
-    return false;
-  }
-  Block &body = map.getBody().front();
-  if (body.getNumArguments() != 1 || body.getOperations().size() != 2) {
-    return false;
-  }
-  auto convert = dyn_cast<ScalarConvertOp>(body.front());
-  auto yield = dyn_cast<YieldOp>(body.back());
-  return convert && yield && convert.getInput() == body.getArgument(0) &&
-         convert.getInput().getType().isF32() &&
-         convert.getResult().getType().isBF16() &&
-         convert.getSemantics() ==
-             ScalarConvertSemantics::RoundNearestEven &&
-         yield.getValues().size() == 1 &&
-         yield.getValues()[0] == convert.getResult();
-}
-
-std::optional<unsigned> closedRankNExpandingSingletonMaps(MapOp map) {
-  if (map.getSemantics() != MapSemantics::BroadcastInDim ||
-      map.getInputs().size() != 1 || map.getNumResults() != 1 ||
-      map.getIndexingMaps().size() != 2 || map.getBody().empty()) {
-    return std::nullopt;
-  }
-  auto input = dyn_cast<RankedTensorType>(map.getInputs()[0].getType());
-  auto result = dyn_cast<RankedTensorType>(map.getResult(0).getType());
-  auto inputMap = dyn_cast<AffineMapAttr>(map.getIndexingMaps()[0]);
-  auto resultMap = dyn_cast<AffineMapAttr>(map.getIndexingMaps()[1]);
-  if (!input || !result || !input.hasStaticShape() ||
-      !result.hasStaticShape() || input.getRank() < 3 || input.getRank() > 8 ||
-      input.getRank() != result.getRank() || !input.getElementType().isF32() ||
-      !result.getElementType().isF32() || !inputMap || !resultMap ||
-      inputMap.getValue().getNumSymbols() != 0 ||
-      inputMap.getValue().getNumDims() != result.getRank() ||
-      inputMap.getValue().getNumResults() != input.getRank() ||
-      !isIdentityMap(resultMap.getValue())) {
-    return std::nullopt;
-  }
-
-  unsigned expandingSingletons = 0;
-  for (auto [axis, expression] :
-       llvm::enumerate(inputMap.getValue().getResults())) {
-    if (auto dimension = dyn_cast<AffineDimExpr>(expression)) {
-      if (dimension.getPosition() != axis ||
-          input.getDimSize(axis) != result.getDimSize(axis)) {
-        return std::nullopt;
-      }
-      continue;
-    }
-    auto floorDiv = dyn_cast<AffineBinaryOpExpr>(expression);
-    AffineExpr dividendExpression =
-        floorDiv && floorDiv.getKind() == AffineExprKind::FloorDiv
-            ? floorDiv.getLHS()
-            : AffineExpr{};
-    AffineExpr divisorExpression =
-        floorDiv && floorDiv.getKind() == AffineExprKind::FloorDiv
-            ? floorDiv.getRHS()
-            : AffineExpr{};
-    auto dividend = dyn_cast_if_present<AffineDimExpr>(dividendExpression);
-    auto divisor = dyn_cast_if_present<AffineConstantExpr>(divisorExpression);
-    if (!dividend || !divisor || dividend.getPosition() != axis ||
-        input.getDimSize(axis) != 1 || result.getDimSize(axis) <= 1 ||
-        divisor.getValue() != result.getDimSize(axis)) {
-      return std::nullopt;
-    }
-    ++expandingSingletons;
-  }
-  if (expandingSingletons == 0) {
-    return std::nullopt;
-  }
-  Block &body = map.getBody().front();
-  auto yield = dyn_cast<YieldOp>(body.getTerminator());
-  if (body.getNumArguments() != 1 || body.getOperations().size() != 1 ||
-      !yield || yield.getValues().size() != 1 ||
-      yield.getValues()[0] != body.getArgument(0)) {
-    return std::nullopt;
-  }
-  return expandingSingletons;
-}
-
-bool hasIdentityScalarBody(MapOp map) {
-  if (map.getBody().empty()) {
-    return false;
-  }
-  Block &body = map.getBody().front();
-  auto yield = dyn_cast<YieldOp>(body.getTerminator());
-  return body.getNumArguments() == 1 && body.getOperations().size() == 1 &&
-         yield && yield.getValues().size() == 1 &&
-         yield.getValues()[0] == body.getArgument(0);
-}
-
-bool isClosedProjectedParameterInsertionMap(MapOp map) {
-  if (map.getSemantics() != MapSemantics::BroadcastInDim ||
-      map.getInputs().size() != 1 || map.getNumResults() != 1 ||
-      !isClosedDirectProjectedMap(map) || !hasIdentityScalarBody(map)) {
-    return false;
-  }
-  auto input = dyn_cast<RankedTensorType>(map.getInputs()[0].getType());
-  auto result = dyn_cast<RankedTensorType>(map.getResult(0).getType());
-  auto inputMap = dyn_cast<AffineMapAttr>(map.getIndexingMaps()[0]);
-  if (!input || !result || !inputMap || !input.getElementType().isF32() ||
-      !result.getElementType().isF32() || input.getRank() < 1 ||
-      input.getRank() >= result.getRank() || result.getRank() > 8) {
-    return false;
-  }
-  llvm::SmallDenseSet<unsigned> mapped;
-  for (AffineExpr expression : inputMap.getValue().getResults()) {
-    auto dimension = dyn_cast<AffineDimExpr>(expression);
-    if (!dimension || !mapped.insert(dimension.getPosition()).second) {
-      return false;
-    }
-  }
-  for (auto [axis, extent] : llvm::enumerate(result.getShape())) {
-    if (!mapped.contains(axis) && extent != 1) {
-      return false;
-    }
-  }
-  return true;
-}
-
-std::optional<Value> projectedBf16ParameterRoot(MapOp conversion,
-                                                int64_t expansionRank) {
-  if (conversion.getSemantics() != MapSemantics::Pointwise ||
-      conversion.getInputs().size() != 1 || conversion.getNumResults() != 1 ||
-      conversion.getIndexingMaps().size() != 2 ||
-      conversion.getInputs()[0].getDefiningOp() || conversion.getBody().empty()) {
-    return std::nullopt;
-  }
-  auto input = dyn_cast<RankedTensorType>(conversion.getInputs()[0].getType());
-  auto result =
-      dyn_cast<RankedTensorType>(conversion.getResult(0).getType());
-  auto inputMap = dyn_cast<AffineMapAttr>(conversion.getIndexingMaps()[0]);
-  auto resultMap = dyn_cast<AffineMapAttr>(conversion.getIndexingMaps()[1]);
-  if (!input || !result || !input.hasStaticShape() ||
-      !result.hasStaticShape() || input.getRank() < 1 ||
-      input.getRank() >= expansionRank || input.getShape() != result.getShape() ||
-      !input.getElementType().isBF16() || !result.getElementType().isF32() ||
-      !inputMap || !resultMap || !isIdentityMap(inputMap.getValue()) ||
-      !isIdentityMap(resultMap.getValue()) ||
-      !llvm::all_of(input.getShape(),
-                    [](int64_t extent) { return extent > 0; })) {
-    return std::nullopt;
-  }
-  Block &body = conversion.getBody().front();
-  if (body.getNumArguments() != 1 || body.getOperations().size() != 2) {
-    return std::nullopt;
-  }
-  auto scalarConvert = dyn_cast<ScalarConvertOp>(body.front());
-  auto yield = dyn_cast<YieldOp>(body.back());
-  if (!scalarConvert || !yield ||
-      scalarConvert.getInput() != body.getArgument(0) ||
-      !scalarConvert.getInput().getType().isBF16() ||
-      !scalarConvert.getResult().getType().isF32() ||
-      scalarConvert.getSemantics() != ScalarConvertSemantics::Exact ||
-      yield.getValues().size() != 1 ||
-      yield.getValues()[0] != scalarConvert.getResult()) {
-    return std::nullopt;
-  }
-  return conversion.getInputs()[0];
-}
-
-std::optional<Value> projectedParameterRoot(MapOp expansion) {
-  std::optional<unsigned> expansions =
-      closedRankNExpandingSingletonMaps(expansion);
-  if (!expansions || *expansions < 2) {
-    return std::nullopt;
-  }
-  auto expansionType =
-      cast<RankedTensorType>(expansion.getResult(0).getType());
-  Region *region = expansion->getParentRegion();
-  Value producerValue = expansion.getInputs()[0];
-  llvm::SmallPtrSet<Operation *, 8> visited;
-  while (Operation *producer = producerValue.getDefiningOp()) {
-    if (producer->getParentRegion() != region ||
-        !visited.insert(producer).second) {
-      return std::nullopt;
-    }
-    auto map = dyn_cast<MapOp>(producer);
-    if (!map) {
-      return std::nullopt;
-    }
-    if (std::optional<Value> root =
-            projectedBf16ParameterRoot(map, expansionType.getRank())) {
-      auto argument = dyn_cast<BlockArgument>(*root);
-      auto parentRegion = dyn_cast<RegionOp>(expansion->getParentOp());
-      if (!argument || !parentRegion ||
-          argument.getOwner() != &parentRegion.getBody().front() ||
-          argument.getArgNumber() >= parentRegion.getInputs().size()) {
-        return std::nullopt;
-      }
-      return parentRegion.getInputs()[argument.getArgNumber()];
-    }
-    if (!isClosedProjectedParameterInsertionMap(map) ||
-        map.getInputs().size() != 1) {
-      return std::nullopt;
-    }
-    producerValue = map.getInputs()[0];
-  }
-  return std::nullopt;
-}
-
-bool isExpansionDrivenByTerminalFold(MapOp expansion) {
-  Operation *root = expansion.getInputs()[0].getDefiningOp();
-  if (!root) {
-    return false;
-  }
-  Operation *parent = expansion->getParentOp();
-  SmallVector<Operation *> worklist{root};
-  llvm::SmallPtrSet<Operation *, 8> visited;
-  FoldOp terminalFold;
-  while (!worklist.empty()) {
-    Operation *producer = worklist.pop_back_val();
-    if (producer->getParentOp() != parent) {
-      return false;
-    }
-    if (!visited.insert(producer).second) {
-      continue;
-    }
-    if (auto fold = dyn_cast<FoldOp>(producer)) {
-      if (!isClosedTerminalRankNFold(fold) ||
-          (terminalFold && terminalFold != fold)) {
-        return false;
-      }
-      terminalFold = fold;
-      continue;
-    }
-    auto map = dyn_cast<MapOp>(producer);
-    if (!map || !isClosedDirectProjectedMap(map) ||
-        closedRankNExpandingSingletonMaps(map).has_value()) {
-      return false;
-    }
-    if (map.getInputs().empty()) {
-      if (map.getBody().empty()) {
-        return false;
-      }
-      auto result = map.getNumResults() == 1
-                        ? dyn_cast<RankedTensorType>(map.getResult(0).getType())
-                        : RankedTensorType{};
-      Block &body = map.getBody().front();
-      auto constant = body.getOperations().size() == 2
-                          ? dyn_cast<arith::ConstantOp>(body.front())
-                          : arith::ConstantOp{};
-      auto yield = dyn_cast<YieldOp>(body.getTerminator());
-      auto value = constant ? dyn_cast<FloatAttr>(constant.getValue())
-                            : FloatAttr{};
-      if (!result || result.getRank() != 0 ||
-          !result.getElementType().isF32() || !value ||
-          !value.getType().isF32() || !yield ||
-          yield.getValues().size() != 1 ||
-          yield.getValues()[0] != constant.getResult()) {
-        return false;
-      }
-      continue;
-    }
-    for (Value input : map.getInputs()) {
-      Operation *inputProducer = input.getDefiningOp();
-      if (!inputProducer || inputProducer->getParentOp() != parent) {
-        return false;
-      }
-      worklist.push_back(inputProducer);
-    }
-  }
-  return static_cast<bool>(terminalFold);
-}
-
-bool isClosedRankNFoldMapRegion(RegionOp region,
-                                ArrayRef<Operation *> algebra) {
-  llvm::SmallDenseSet<Value, 4> parameterRoots;
-  for (Operation *operation : algebra) {
-    auto map = dyn_cast<MapOp>(operation);
-    if (!map) {
-      continue;
-    }
-    std::optional<unsigned> expansions =
-        closedRankNExpandingSingletonMaps(map);
-    if (!expansions || *expansions < 2) {
-      continue;
-    }
-    std::optional<Value> root = projectedParameterRoot(map);
-    if (!root) {
-      return false;
-    }
-    parameterRoots.insert(*root);
-  }
-  auto isExternalInput = [&](Value value) {
-    auto tensor = dyn_cast<RankedTensorType>(value.getType());
-    return value.getDefiningOp() == nullptr && tensor &&
-           tensor.hasStaticShape() && tensor.getRank() >= 1 &&
-           tensor.getRank() <= 8 && tensor.getElementType().isBF16() &&
-           (tensor.getRank() >= 3 || parameterRoots.contains(value)) &&
-           llvm::all_of(tensor.getShape(),
-                        [](int64_t extent) { return extent > 0; });
-  };
-  auto isExternalResult = [](Type type) {
-    auto tensor = dyn_cast<RankedTensorType>(type);
-    return tensor && tensor.hasStaticShape() && tensor.getRank() >= 1 &&
-           tensor.getRank() <= 8 && tensor.getElementType().isBF16() &&
-           llvm::all_of(tensor.getShape(),
-                        [](int64_t extent) { return extent > 0; });
-  };
-  if (!llvm::all_of(region.getInputs(), isExternalInput) ||
-      !llvm::all_of(region.getResults(), [&](Value result) {
-        return isExternalResult(result.getType());
-      })) {
-    return false;
-  }
-  auto regionYield = dyn_cast<YieldOp>(region.getBody().front().getTerminator());
-  if (!regionYield ||
-      regionYield.getValues().size() != region.getResults().size()) {
-    return false;
-  }
-  for (auto [result, yielded] :
-       llvm::zip_equal(region.getResults(), regionYield.getValues())) {
-    auto type = cast<RankedTensorType>(result.getType());
-    if (type.getRank() < 3) {
-      auto map = yielded.getDefiningOp<MapOp>();
-      if (!map || !isClosedFullPrefixBf16Result(map)) {
-        return false;
-      }
-    }
-  }
-  return llvm::all_of(algebra, [](Operation *operation) {
-    if (auto fold = dyn_cast<FoldOp>(operation)) {
-      auto input =
-          fold.getInputs().size() == 1
-              ? dyn_cast<RankedTensorType>(fold.getInputs()[0].getType())
-              : RankedTensorType{};
-      return input && input.getRank() >= 3 && input.getRank() <= 8 &&
-             isClosedRankNFold(fold);
-    }
-    auto map = dyn_cast<MapOp>(operation);
-    if (!map) {
-      return false;
-    }
-    std::optional<unsigned> expansions =
-        closedRankNExpandingSingletonMaps(map);
-    if (!expansions) {
-      return isClosedDirectProjectedMap(map);
-    }
-    return *expansions == 1
-               ? isExpansionDrivenByTerminalFold(map)
-               : projectedParameterRoot(map).has_value();
-  });
-}
-
-struct PlannedTask {
-  Operation *operation;
-  MaterializationTaskKind kind;
-  SmallVector<int64_t> domain;
-  SmallVector<int64_t> reductionDimensions;
-  bool orderFree = false;
-  SmallVector<int64_t> inputs;
-  SmallVector<int64_t> outputs;
-  SmallVector<int64_t> dependencies;
-  SmallVector<Operation *> fusedOperations;
-  SmallVector<AffineMap> composedInputMaps;
-  Operation *fusedFold = nullptr;
-  SmallVector<Operation *> foldRegionSources;
-  SmallVector<Operation *> foldRegionPhases;
-  SmallVector<Operation *> foldRegionOutputs;
-  struct BoundaryUse {
-    int64_t inputBuffer;
-    MapOp source;
-    unsigned operand;
-    AffineMap indexingMap;
-    int64_t phase;
-  };
-  SmallVector<BoundaryUse> foldRegionBoundaryUses;
-  SmallVector<Operation *> foldRegionRecomputedSources;
-  SmallVector<Operation *> contractRegionSources;
-  std::string contractRegionStrategy;
-  Operation *contractRegionFold = nullptr;
-  Operation *contractRegionContract = nullptr;
-  Operation *contractRegionBf16Boundary = nullptr;
-  SmallVector<Operation *> contractRegionEpilogueSources;
-  int64_t contractRegionNormalizedOperand = -1;
-  struct ContractRegionCost {
-    int64_t rows;
-    int64_t reduction;
-    int64_t columns;
-    int64_t outputTile;
-    int64_t outputTiles;
-    int64_t duplicatedFoldElements;
-    int64_t normalizedTemporaryBytes;
-    int64_t contractTemporaryBytes;
-    int64_t compactStatBytes;
-  } contractRegionCost{};
-  SmallVector<Operation *> contractRegionRecomputedSources;
-  std::string compositionKind;
-  SmallVector<Operation *> compositionSources;
-  SmallVector<Operation *> compositionRecomputedSources;
-  SmallVector<int64_t> onlineVectorDimensions;
-  bool onlineMma = false;
-  struct CompositionCost {
-    int64_t baselineLaunches;
-    int64_t candidateLaunches;
-    int64_t baselineTemporaryBytes;
-    int64_t candidateTemporaryBytes;
-    int64_t baselineTemporaryTrafficBytes;
-    int64_t candidateTemporaryTrafficBytes;
-    int64_t contractEvaluations;
-  } compositionCost{};
-};
-
-struct PlannedBuffer {
-  Value value;
-  std::optional<int64_t> producer;
-  SmallVector<int64_t> consumers;
-  bool liveOut = false;
-};
-
-struct DerivedPlan {
-  SmallVector<PlannedTask, 0> tasks;
-  SmallVector<PlannedBuffer, 0> buffers;
-  bool hasContract = false;
-  bool hasRankNFold = false;
-  bool hasFoldRegion = false;
-  bool hasContractRegion = false;
-  bool hasContractFoldComposition = false;
-  bool hasLogicalRelation = false;
-};
-
-SourceRefAttr algebraSource(Operation *operation) {
-  if (auto map = dyn_cast<MapOp>(operation))
-    return map.getSource();
-  if (auto relation = dyn_cast<RelationOp>(operation))
-    return relation.getSource();
-  if (auto fold = dyn_cast<FoldOp>(operation))
-    return fold.getSource();
-  return cast<ContractOp>(operation).getSource();
-}
-
-bool hasIdentityResultMap(MapOp map) {
-  if (map.getNumResults() != 1 ||
-      map.getIndexingMaps().size() != map.getInputs().size() + 1)
-    return false;
-  auto resultMap =
-      dyn_cast<AffineMapAttr>(map.getIndexingMaps().getValue().back());
-  return resultMap && resultMap.getValue().isIdentity();
-}
-
-bool isEligibleF32Map(MapOp map) {
-  if (!hasIdentityResultMap(map))
-    return false;
-  FailureOr<SmallVector<int64_t>> domain = mapDomainShape(map);
-  if (failed(domain))
-    return false;
-  return llvm::all_of(
-      llvm::concat<Type>(map.getOperandTypes(), map.getResultTypes()),
-      [](Type type) {
-        auto tensor = dyn_cast<RankedTensorType>(type);
-        return tensor && tensor.hasStaticShape() &&
-               tensor.getElementType().isF32();
-      });
-}
-
-bool isEligibleFoldMapEdge(FoldOp fold, MapOp map, unsigned operandNumber) {
-  if (!isClosedAdditivePlanningFold(fold) ||
-      !hasExactPositiveZeroInitializer(fold) ||
-      fold.getNumResults() != 1 || !fold.getResult(0).hasOneUse() ||
-      !isEligibleF32Map(map) || operandNumber >= map.getInputs().size())
-    return false;
-  auto folded = dyn_cast<RankedTensorType>(fold.getResult(0).getType());
-  auto output = dyn_cast<RankedTensorType>(map.getResult(0).getType());
-  auto edge = dyn_cast<AffineMapAttr>(map.getIndexingMaps()[operandNumber]);
-  if (!folded || !output || !edge ||
-      edge.getValue().getNumDims() != output.getRank() ||
-      edge.getValue().getNumSymbols() != 0 ||
-      edge.getValue().getNumResults() != folded.getRank())
-    return false;
-  auto elementCount = [](RankedTensorType type) -> FailureOr<int64_t> {
-    int64_t count = 1;
-    for (int64_t extent : type.getShape()) {
-      if (extent <= 0 || count > std::numeric_limits<int64_t>::max() / extent)
-        return failure();
-      count *= extent;
-    }
-    return count;
-  };
-  FailureOr<int64_t> foldedElements = elementCount(folded);
-  FailureOr<int64_t> outputElements = elementCount(output);
-  if (failed(foldedElements) || failed(outputElements) ||
-      *foldedElements != *outputElements)
-    return false;
-  llvm::SmallDenseSet<unsigned> mapped;
-  std::optional<unsigned> previousDimension;
-  for (auto [axis, expression] :
-       llvm::enumerate(edge.getValue().getResults())) {
-    auto dimension = dyn_cast<AffineDimExpr>(expression);
-    if (!dimension || dimension.getPosition() >= output.getRank() ||
-        !mapped.insert(dimension.getPosition()).second ||
-        (previousDimension &&
-         dimension.getPosition() <= *previousDimension) ||
-        folded.getDimSize(axis) !=
-            output.getDimSize(dimension.getPosition()))
-      return false;
-    previousDimension = dimension.getPosition();
-  }
-  return llvm::all_of(llvm::enumerate(output.getShape()), [&](auto item) {
-    return mapped.contains(item.index()) || item.value() == 1;
-  });
-}
-
-std::string fusedMapFingerprint(ArrayRef<Operation *> operations) {
-  std::string normalized("map-dag-v1\n");
-  for (Operation *operation : operations) {
-    normalized.append(semanticTaskFingerprint(operation));
-    normalized.push_back('\n');
-  }
-  return sha256(normalized);
-}
-
-std::string fusedFoldMapFingerprint(FoldOp fold,
-                                    ArrayRef<Operation *> maps) {
-  std::string normalized("fold-map-v1\n");
-  normalized.append(semanticTaskFingerprint(fold));
-  normalized.push_back('\n');
-  for (Operation *operation : maps) {
-    normalized.append(semanticTaskFingerprint(operation));
-    normalized.push_back('\n');
-  }
-  return sha256(normalized);
-}
-
-std::string closedRegionFingerprint(StringRef family,
-                                    ArrayRef<Operation *> operations) {
-  std::string normalized = (llvm::Twine(family) + "\n").str();
-  llvm::SmallDenseMap<Operation *, int64_t> operationOrdinals;
-  for (auto [ordinal, operation] : llvm::enumerate(operations))
-    operationOrdinals.try_emplace(operation, ordinal);
-  for (auto [ordinal, operation] : llvm::enumerate(operations)) {
-    normalized.append(semanticTaskFingerprint(operation));
-    normalized.push_back('\n');
-    for (auto [operandOrdinal, operand] :
-         llvm::enumerate(operation->getOperands())) {
-      normalized.append((llvm::Twine("edge:") + llvm::Twine(ordinal) + ":" +
-                         llvm::Twine(operandOrdinal) + ":")
-                            .str());
-      if (auto argument = dyn_cast<BlockArgument>(operand)) {
-        normalized.append(
-            (llvm::Twine("argument:") + llvm::Twine(argument.getArgNumber()))
-                .str());
-      } else if (auto result = dyn_cast<OpResult>(operand)) {
-        Operation *producer = result.getOwner();
-        auto producerOrdinal = operationOrdinals.find(producer);
-        if (producerOrdinal != operationOrdinals.end()) {
-          normalized.append((llvm::Twine("source:") +
-                             llvm::Twine(producerOrdinal->second) + ":" +
-                             llvm::Twine(result.getResultNumber()))
-                                .str());
-        } else {
-          normalized.append("external:");
-          if (Attribute source = producer->getAttr("source")) {
-            std::string sourceText;
-            llvm::raw_string_ostream sourceStream(sourceText);
-            source.print(sourceStream);
-            sourceStream.flush();
-            normalized.append(sourceText);
-          } else {
-            normalized.append(producer->getName().getStringRef());
-          }
-          normalized.append(
-              (llvm::Twine(":") + llvm::Twine(result.getResultNumber())).str());
-        }
-      } else {
-        normalized.append("unknown");
-      }
-      normalized.push_back('\n');
-    }
-  }
-  return sha256(normalized);
-}
-
-std::string foldRegionFingerprint(ArrayRef<Operation *> operations) {
-  return closedRegionFingerprint("fold-region-v2", operations);
-}
-
-std::string contractRegionFingerprint(ArrayRef<Operation *> operations) {
-  return closedRegionFingerprint("contract-region-v2", operations);
-}
-
-std::string compositionFingerprint(StringRef kind,
-                                   ArrayRef<Operation *> operations) {
-  return closedRegionFingerprint((llvm::Twine("composition-") + kind).str(),
-                                 operations);
-}
-
-bool valueDependsOnOperation(Value value, Operation *operation) {
-  llvm::SmallDenseSet<Operation *> visited;
-  SmallVector<Value> worklist{value};
-  while (!worklist.empty()) {
-    Operation *producer = worklist.pop_back_val().getDefiningOp();
-    if (!producer || !visited.insert(producer).second)
-      continue;
-    if (producer == operation)
-      return true;
-    llvm::append_range(worklist, producer->getOperands());
-  }
-  return false;
-}
-
-bool isRneF32ToBf16Map(MapOp map) {
-  if (map.getSemantics() != MapSemantics::Pointwise ||
-      map.getInputs().size() != 1 || map.getNumResults() != 1 ||
-      !isClosedDirectProjectedMap(map))
-    return false;
-  auto input = dyn_cast<RankedTensorType>(map.getInputs().front().getType());
-  auto result = dyn_cast<RankedTensorType>(map.getResult(0).getType());
-  if (!input || !result || input.getShape() != result.getShape() ||
-      !input.getElementType().isF32() || !result.getElementType().isBF16())
-    return false;
-  Block &body = map.getBody().front();
-  auto conversion = body.empty() ? ScalarConvertOp{}
-                                 : dyn_cast<ScalarConvertOp>(body.front());
-  auto yield = dyn_cast<YieldOp>(body.getTerminator());
-  return body.getNumArguments() == 1 && body.getOperations().size() == 2 &&
-         conversion && yield && conversion.getInput() == body.getArgument(0) &&
-         conversion.getSemantics() ==
-             ScalarConvertSemantics::RoundNearestEven &&
-         yield.getValues().size() == 1 &&
-         yield.getValues().front() == conversion.getResult();
-}
-
-FailureOr<int64_t> checkedShapeElements(ArrayRef<int64_t> shape) {
-  int64_t elements = 1;
-  for (int64_t extent : shape) {
-    if (extent <= 0 || elements > std::numeric_limits<int64_t>::max() / extent)
-      return failure();
-    elements *= extent;
-  }
-  return elements;
-}
-
-FailureOr<int64_t> checkedTensorBytes(RankedTensorType type) {
-  FailureOr<int64_t> elements = checkedShapeElements(type.getShape());
-  if (!type.getElementType().isBF16() && !type.getElementType().isF32())
-    return failure();
-  const int64_t elementBytes = type.getElementType().isBF16() ? 2 : 4;
-  if (failed(elements) ||
-      *elements > std::numeric_limits<int64_t>::max() / elementBytes)
-    return failure();
-  return *elements * elementBytes;
-}
-
-#include "OnlineCompositionPlanner.inc"
-
-bool isProjectedFoldStatistic(MapOp map, unsigned operand,
-                              RankedTensorType full, RankedTensorType compact) {
-  if (operand >= map.getInputs().size() ||
-      map.getInputs()[operand].getType() != compact ||
-      map.getResult(0).getType() != full ||
-      compact.getShape() != full.getShape().drop_back())
-    return false;
-  auto indexing = dyn_cast<AffineMapAttr>(map.getIndexingMaps()[operand]);
-  if (!indexing || indexing.getValue().getNumDims() != full.getRank() ||
-      indexing.getValue().getNumSymbols() != 0 ||
-      indexing.getValue().getNumResults() != compact.getRank())
-    return false;
-  for (auto [axis, expression] :
-       llvm::enumerate(indexing.getValue().getResults())) {
-    auto dimension = dyn_cast<AffineDimExpr>(expression);
-    if (!dimension || dimension.getPosition() != axis)
-      return false;
-  }
-  return true;
-}
-
-FailureOr<DerivedPlan>
-deriveGenericContractFoldCompositionPlan(RegionOp region,
-                                         const DerivedPlan &materialized) {
-  SmallVector<Operation *> algebra;
-  for (Operation &operation : region.getBody().front().without_terminator())
-    algebra.push_back(&operation);
-  if (algebra.size() < 4 || algebra.size() > 5)
-    return failure();
-
-  SmallVector<ContractOp> contracts;
-  FoldOp fold;
-  SmallVector<MapOp> maps;
-  for (Operation *operation : algebra) {
-    if (auto contract = dyn_cast<ContractOp>(operation))
-      contracts.push_back(contract);
-    else if (auto candidate = dyn_cast<FoldOp>(operation)) {
-      if (fold)
-        return failure();
-      fold = candidate;
-    } else if (auto candidate = dyn_cast<MapOp>(operation)) {
-      maps.push_back(candidate);
-    } else {
-      return failure();
-    }
-  }
-  if (contracts.size() != 2 || !fold || maps.empty() || maps.size() > 2 ||
-      !isClosedAdditivePlanningFold(fold) || fold.getInputs().size() != 1 ||
-      fold.getInitializers().size() != 1 || fold.getNumResults() != 1)
-    return failure();
-
-  ContractOp first = fold.getInputs().front().getDefiningOp<ContractOp>();
-  if (!first || !llvm::is_contained(contracts, first) ||
-      !isClosedProjectedContract(first))
-    return failure();
-  Value fullValue = first.getResult(0);
-  Value compactValue = fold.getResult(0);
-  MapOp map = maps.back();
-  MapOp projectedStatistic;
-  if (maps.size() == 2) {
-    projectedStatistic = maps.front();
-    if (projectedStatistic.getSemantics() != MapSemantics::BroadcastInDim ||
-        !isEligibleF32Map(projectedStatistic) ||
-        projectedStatistic.getInputs().size() != 1 ||
-        projectedStatistic.getInputs().front() != compactValue ||
-        projectedStatistic.getNumResults() != 1 ||
-        !projectedStatistic.getResult(0).hasOneUse() ||
-        projectedStatistic.getResult(0).getUses().begin()->getOwner() != map)
-      return failure();
-  }
-  if (map.getInputs().size() != 2 || map.getNumResults() != 1 ||
-      !isEligibleF32Map(map))
-    return failure();
-  unsigned fullOperand = 0;
-  unsigned compactOperand = 0;
-  bool sawFull = false;
-  bool sawCompact = false;
-  for (auto [operand, value] : llvm::enumerate(map.getInputs())) {
-    if (value == fullValue) {
-      fullOperand = operand;
-      sawFull = true;
-    } else if (value == compactValue ||
-               (projectedStatistic &&
-                value == projectedStatistic.getResult(0))) {
-      compactOperand = operand;
-      sawCompact = true;
-    }
-  }
-  if (!sawFull || !sawCompact || fullOperand == compactOperand ||
-      std::distance(fullValue.getUses().begin(), fullValue.getUses().end()) !=
-          2 ||
-      !compactValue.hasOneUse() || !map.getResult(0).hasOneUse())
-    return failure();
-  auto full = dyn_cast<RankedTensorType>(fullValue.getType());
-  auto compact = dyn_cast<RankedTensorType>(compactValue.getType());
-  auto mapped = dyn_cast<RankedTensorType>(map.getResult(0).getType());
-  auto fullIndexing =
-      dyn_cast<AffineMapAttr>(map.getIndexingMaps()[fullOperand]);
-  if (!full || !compact || !mapped || full.getRank() < 2 ||
-      full.getRank() > 8 || full != mapped || !full.getElementType().isF32() ||
-      !compact.getElementType().isF32() ||
-      fold.getReductionDimensions() !=
-          ArrayRef<int64_t>({full.getRank() - 1}) ||
-      compact.getShape() != full.getShape().drop_back() || !fullIndexing ||
-      !isIdentityMap(fullIndexing.getValue()) ||
-      !(projectedStatistic
-            ? isProjectedFoldStatistic(projectedStatistic, 0, full, compact)
-            : isProjectedFoldStatistic(map, compactOperand, full, compact)))
-    return failure();
-
-  ContractOp second =
-      dyn_cast<ContractOp>(map.getResult(0).getUses().begin()->getOwner());
-  if (!second || second == first || !llvm::is_contained(contracts, second) ||
-      !isClosedProjectedContract(second) || !second.getResult(0).hasOneUse())
-    return failure();
-  auto mapUse = llvm::find(second.getInputs(), map.getResult(0));
-  if (mapUse == second.getInputs().end())
-    return failure();
-  const unsigned mappedContractOperand =
-      std::distance(second.getInputs().begin(), mapUse);
-  if (mappedContractOperand > 1)
-    return failure();
-  Value projection = second.getInputs()[1 - mappedContractOperand];
-  auto projectionArgument = dyn_cast<BlockArgument>(projection);
-  auto initializerArgument =
-      dyn_cast<BlockArgument>(fold.getInitializers().front());
-  auto initializerType =
-      dyn_cast<RankedTensorType>(fold.getInitializers().front().getType());
-  auto firstLhs = dyn_cast<BlockArgument>(first.getInputs()[0]);
-  auto firstRhs = dyn_cast<BlockArgument>(first.getInputs()[1]);
-  if (!projectionArgument || !initializerArgument || !initializerType ||
-      initializerType.getRank() != 0 ||
-      !initializerType.getElementType().isF32() || !firstLhs || !firstRhs ||
-      projectionArgument.getOwner() != &region.getBody().front() ||
-      initializerArgument.getOwner() != &region.getBody().front() ||
-      firstLhs.getOwner() != &region.getBody().front() ||
-      firstRhs.getOwner() != &region.getBody().front())
-    return failure();
-  llvm::SmallDenseSet<Value> publicInputs{
-      firstLhs, firstRhs, projectionArgument, initializerArgument};
-  if (region.getInputs().size() != 4 || publicInputs.size() != 4 ||
-      !llvm::all_of(region.getBody().front().getArguments(),
-                    [&](BlockArgument argument) {
-                      return publicInputs.contains(argument);
-                    }))
-    return failure();
-  auto regionYield =
-      dyn_cast<YieldOp>(region.getBody().front().getTerminator());
-  if (!regionYield || regionYield.getValues().size() != 1 ||
-      regionYield.getValues().front() != second.getResult(0))
-    return failure();
-  if (llvm::any_of(
-          llvm::concat<Type>(first.getOperandTypes(), first.getResultTypes(),
-                             second.getOperandTypes(), second.getResultTypes()),
-          [](Type type) {
-            auto tensor = dyn_cast<RankedTensorType>(type);
-            return !tensor || !tensor.getElementType().isF32();
-          }))
-    return failure();
-
-  FailureOr<SmallVector<int64_t>> secondDomain = contractDomainShape(second);
-  FailureOr<int64_t> fullElements = checkedShapeElements(full.getShape());
-  FailureOr<int64_t> compactElements =
-      checkedShapeElements(compact.getShape());
-  FailureOr<int64_t> resultElements = checkedShapeElements(
-      cast<RankedTensorType>(second.getResult(0).getType()).getShape());
-  FailureOr<int64_t> fullBytes = checkedTensorBytes(full);
-  FailureOr<int64_t> compactBytes = checkedTensorBytes(compact);
-  if (failed(secondDomain) || failed(fullElements) ||
-      failed(compactElements) || failed(resultElements) ||
-      *fullElements > UINT32_MAX || *compactElements > UINT32_MAX ||
-      *resultElements > UINT32_MAX || failed(fullBytes) ||
-      failed(compactBytes))
-    return failure();
-  int64_t baselineTemporaryBytes = 0;
-  int64_t baselineTemporaryTrafficBytes = 0;
-  for (const PlannedBuffer &buffer : materialized.buffers) {
-    if (!buffer.producer || buffer.liveOut)
-      continue;
-    auto type = dyn_cast<RankedTensorType>(buffer.value.getType());
-    if (!type)
-      return failure();
-    FailureOr<int64_t> bytes = checkedTensorBytes(type);
-    const int64_t uses = static_cast<int64_t>(buffer.consumers.size()) + 1;
-    if (failed(bytes) ||
-        baselineTemporaryBytes > std::numeric_limits<int64_t>::max() - *bytes ||
-        uses > std::numeric_limits<int64_t>::max() / *bytes ||
-        baselineTemporaryTrafficBytes >
-            std::numeric_limits<int64_t>::max() - *bytes * uses)
-      return failure();
-    baselineTemporaryBytes += *bytes;
-    baselineTemporaryTrafficBytes += *bytes * uses;
-  }
-  if (*fullBytes > std::numeric_limits<int64_t>::max() - *compactBytes)
-    return failure();
-  const int64_t candidateTemporaryBytes = *fullBytes + *compactBytes;
-  if (candidateTemporaryBytes > std::numeric_limits<int64_t>::max() / 2)
-    return failure();
-  const int64_t candidateTemporaryTrafficBytes = 2 * candidateTemporaryBytes;
-  if (materialized.tasks.size() >
-      static_cast<size_t>(std::numeric_limits<int64_t>::max()))
-    return failure();
-  const int64_t baselineLaunches =
-      static_cast<int64_t>(materialized.tasks.size());
-  constexpr int64_t candidateLaunches = 2;
-  if (candidateLaunches > baselineLaunches ||
-      candidateTemporaryBytes > baselineTemporaryBytes ||
-      candidateTemporaryTrafficBytes > baselineTemporaryTrafficBytes ||
-      !(candidateLaunches < baselineLaunches ||
-        candidateTemporaryBytes < baselineTemporaryBytes ||
-        candidateTemporaryTrafficBytes < baselineTemporaryTrafficBytes))
-    return failure();
-
-  DerivedPlan result;
-  result.hasContract = true;
-  result.hasRankNFold = full.getRank() > 2;
-  result.hasContractFoldComposition = true;
-  llvm::SmallDenseMap<Value, int64_t> bufferForValue;
-  for (BlockArgument argument : region.getBody().front().getArguments()) {
-    bufferForValue.try_emplace(argument, result.buffers.size());
-    result.buffers.push_back({argument, std::nullopt, {}, false});
-  }
-  auto addBuffer = [&](Value value, int64_t producer, bool liveOut) {
-    int64_t ordinal = result.buffers.size();
-    bufferForValue.try_emplace(value, ordinal);
-    result.buffers.push_back({value, producer, {}, liveOut});
-    return ordinal;
-  };
-  const int64_t fullBuffer = addBuffer(fullValue, 0, false);
-  const int64_t compactBuffer = addBuffer(compactValue, 0, false);
-  const int64_t resultBuffer = addBuffer(second.getResult(0), 1, true);
-
-  PlannedTask firstTask;
-  firstTask.operation = fold;
-  firstTask.kind = MaterializationTaskKind::Fold;
-  firstTask.domain.assign(full.getShape().begin(), full.getShape().end());
-  firstTask.reductionDimensions.assign(fold.getReductionDimensions().begin(),
-                                       fold.getReductionDimensions().end());
-  firstTask.orderFree = fold.getOrderFree();
-  firstTask.inputs = {bufferForValue.lookup(firstLhs),
-                      bufferForValue.lookup(firstRhs),
-                      bufferForValue.lookup(initializerArgument)};
-  firstTask.outputs = {fullBuffer, compactBuffer};
-  firstTask.compositionKind = "contract_fold";
-  firstTask.compositionSources = {first, fold};
-
-  PlannedTask secondTask;
-  secondTask.operation = second;
-  secondTask.kind = MaterializationTaskKind::Contract;
-  secondTask.domain = std::move(*secondDomain);
-  secondTask.reductionDimensions = {
-      static_cast<int64_t>(secondTask.domain.size()) - 1};
-  secondTask.inputs = {fullBuffer, compactBuffer,
-                       bufferForValue.lookup(projectionArgument)};
-  secondTask.outputs = {resultBuffer};
-  secondTask.dependencies = {0};
-  secondTask.compositionKind = "map_contract";
-  if (projectedStatistic)
-    secondTask.compositionSources = {projectedStatistic, map, second};
-  else
-    secondTask.compositionSources = {map, second};
-  secondTask.compositionCost = {baselineLaunches,
-                                candidateLaunches,
-                                baselineTemporaryBytes,
-                                candidateTemporaryBytes,
-                                baselineTemporaryTrafficBytes,
-                                candidateTemporaryTrafficBytes,
-                                1};
-  result.tasks = {std::move(firstTask), std::move(secondTask)};
-  result.buffers[fullBuffer].consumers = {1};
-  result.buffers[compactBuffer].consumers = {1};
-  for (int64_t input : result.tasks[0].inputs)
-    result.buffers[input].consumers.push_back(0);
-  result.buffers[result.tasks[1].inputs.back()].consumers.push_back(1);
-  return result;
-}
-
-FailureOr<DerivedPlan> deriveNormContractSubplan(RegionOp region,
-                                                 ArrayRef<Operation *> algebra,
-                                                 Value yieldedValue) {
-  SmallVector<FoldOp> folds;
-  SmallVector<ContractOp> contracts;
-  SmallVector<MapOp> reciprocalMaps;
-  for (Operation *candidate : algebra) {
-    Operation &operation = *candidate;
-    if (auto map = dyn_cast<MapOp>(operation)) {
-      if (!isClosedFoldRegionMap(map))
-        return failure();
-      int64_t reciprocalCount = 0;
-      map.walk([&](math::RsqrtOp) { ++reciprocalCount; });
-      if (reciprocalCount > 1)
-        return failure();
-      if (reciprocalCount == 1)
-        reciprocalMaps.push_back(map);
-    } else if (auto fold = dyn_cast<FoldOp>(operation)) {
-      folds.push_back(fold);
-    } else if (auto contract = dyn_cast<ContractOp>(operation)) {
-      contracts.push_back(contract);
-    } else {
-      return failure();
-    }
-  }
-  if (folds.size() != 1 || contracts.size() != 1 || reciprocalMaps.size() != 1)
-    return failure();
-  FoldOp fold = folds.front();
-  ContractOp contract = contracts.front();
-  MapOp reciprocal = reciprocalMaps.front();
-  MapOp boundary = contract.getInputs().front().getDefiningOp<MapOp>();
-  MapOp epilogue = yieldedValue.getDefiningOp<MapOp>();
-  if (!isClosedAdditivePlanningFold(fold) ||
-      !hasExactPositiveZeroInitializer(fold) || fold.getNumResults() != 1 ||
-      !isClosedProjectedContract(contract) || !boundary || !epilogue ||
-      !isRneF32ToBf16Map(boundary) || !isRneF32ToBf16Map(epilogue) ||
-      epilogue.getInputs().front() != contract.getResult(0) ||
-      !valueDependsOnOperation(reciprocal.getResult(0), fold) ||
-      !valueDependsOnOperation(boundary.getResult(0), reciprocal) ||
-      !valueDependsOnOperation(boundary.getResult(0), fold))
-    return failure();
-  auto activation = dyn_cast<RankedTensorType>(boundary.getResult(0).getType());
-  auto foldInput =
-      dyn_cast<RankedTensorType>(fold.getInputs().front().getType());
-  auto foldResult = dyn_cast<RankedTensorType>(fold.getResult(0).getType());
-  auto scale = dyn_cast<RankedTensorType>(reciprocal.getResult(0).getType());
-  auto projection =
-      dyn_cast<RankedTensorType>(contract.getInputs()[1].getType());
-  auto contractResult =
-      dyn_cast<RankedTensorType>(contract.getResult(0).getType());
-  auto result = dyn_cast<RankedTensorType>(epilogue.getResult(0).getType());
-  if (!activation || !foldInput || !foldResult || !scale || !projection ||
-      !contractResult || !result || activation.getRank() < 2 ||
-      activation.getRank() > 8 ||
-      activation.getShape() != foldInput.getShape() ||
-      !activation.getElementType().isBF16() ||
-      !foldInput.getElementType().isF32() ||
-      fold.getReductionDimensions() !=
-          ArrayRef<int64_t>({foldInput.getRank() - 1}) ||
-      foldResult.getShape() != activation.getShape().drop_back() ||
-      scale.getShape().drop_back() != foldResult.getShape() ||
-      scale.getShape().back() != 1 || !scale.getElementType().isF32() ||
-      projection.getRank() != 2 ||
-      projection.getDimSize(0) !=
-          activation.getDimSize(activation.getRank() - 1) ||
-      !projection.getElementType().isBF16() ||
-      contractResult.getShape() != result.getShape() ||
-      result.getShape().drop_back() != activation.getShape().drop_back() ||
-      !contractResult.getElementType().isF32() ||
-      !result.getElementType().isBF16())
-    return failure();
-  const unsigned activationRank = activation.getRank();
-  const unsigned contractRank = activationRank + 1;
-  MLIRContext *context = region.getContext();
-  SmallVector<AffineExpr> lhsExpressions;
-  for (unsigned dimension = 0; dimension + 1 < activationRank; ++dimension)
-    lhsExpressions.push_back(getAffineDimExpr(dimension, context));
-  lhsExpressions.push_back(getAffineDimExpr(contractRank - 1, context));
-  AffineMap expectedLhs =
-      AffineMap::get(contractRank, 0, lhsExpressions, context);
-  AffineMap expectedRhs =
-      AffineMap::get(contractRank, 0,
-                     {getAffineDimExpr(contractRank - 1, context),
-                      getAffineDimExpr(contractRank - 2, context)},
-                     context);
-  SmallVector<AffineExpr> resultExpressions;
-  for (unsigned dimension = 0; dimension + 1 < contractRank; ++dimension)
-    resultExpressions.push_back(getAffineDimExpr(dimension, context));
-  AffineMap expectedResult =
-      AffineMap::get(contractRank, 0, resultExpressions, context);
-  auto epilogueInputMap =
-      dyn_cast<AffineMapAttr>(epilogue.getIndexingMaps()[0]);
-  if (cast<AffineMapAttr>(contract.getIndexingMaps()[0]).getValue() !=
-          expectedLhs ||
-      cast<AffineMapAttr>(contract.getIndexingMaps()[1]).getValue() !=
-          expectedRhs ||
-      cast<AffineMapAttr>(contract.getIndexingMaps()[2]).getValue() !=
-          expectedResult ||
-      !epilogueInputMap || !isIdentityMap(epilogueInputMap.getValue()))
-    return failure();
-
-  auto collect = [&](Value value, Operation *stop,
-                     llvm::SmallDenseSet<Operation *> &operations,
-                     auto &self) -> LogicalResult {
-    Operation *producer = value.getDefiningOp();
-    if (!producer || producer == stop)
-      return success();
-    if (producer->getParentOfType<RegionOp>() != region ||
-        !isa<MapOp, FoldOp, ContractOp>(producer))
-      return failure();
-    if (!operations.insert(producer).second)
-      return success();
-    for (Value operand : producer->getOperands())
-      if (failed(self(operand, stop, operations, self)))
-        return failure();
-    return success();
-  };
-  llvm::SmallDenseSet<Operation *> allSources;
-  if (failed(collect(yieldedValue, nullptr, allSources, collect)) ||
-      allSources.size() != algebra.size())
-    return failure();
-  llvm::SmallDenseSet<Operation *> foldSources;
-  if (failed(collect(reciprocal.getResult(0), nullptr, foldSources, collect)))
-    return failure();
-  llvm::SmallDenseSet<Operation *> contractSources;
-  if (failed(collect(yieldedValue, reciprocal, contractSources, collect)))
-    return failure();
-  llvm::SmallDenseSet<Operation *> covered(foldSources);
-  covered.insert(contractSources.begin(), contractSources.end());
-  const bool invalidOverlap =
-      llvm::any_of(foldSources, [&](Operation *operation) {
-        return contractSources.contains(operation) && !isa<MapOp>(operation);
-      });
-  if (covered.size() != algebra.size() || invalidOverlap)
-    return failure();
-
-  llvm::SmallDenseSet<Value> foldExternal;
-  llvm::SmallDenseSet<Value> boundaryExternal;
-  auto collectExternal = [&](Value root, llvm::SmallDenseSet<Value> &external) {
-    llvm::SmallDenseSet<Operation *> visited;
-    SmallVector<Value> worklist{root};
-    while (!worklist.empty()) {
-      Value value = worklist.pop_back_val();
-      Operation *producer = value.getDefiningOp();
-      if (!producer) {
-        external.insert(value);
-        continue;
-      }
-      if (!visited.insert(producer).second)
-        continue;
-      llvm::append_range(worklist, producer->getOperands());
-    }
-  };
-  collectExternal(fold.getInputs().front(), foldExternal);
-  collectExternal(boundary.getResult(0), boundaryExternal);
-  Value projectionValue = contract.getInputs()[1];
-  if (projectionValue.getDefiningOp() || foldExternal.size() != 1 ||
-      boundaryExternal.size() != 2 ||
-      boundaryExternal.contains(projectionValue))
-    return failure();
-  Value activationValue = *foldExternal.begin();
-  if (!boundaryExternal.contains(activationValue))
-    return failure();
-  Value weightValue = *llvm::find_if(
-      boundaryExternal, [&](Value value) { return value != activationValue; });
-  auto activationArgument = dyn_cast<BlockArgument>(activationValue);
-  auto weightArgument = dyn_cast<BlockArgument>(weightValue);
-  auto projectionArgument = dyn_cast<BlockArgument>(projectionValue);
-  auto activationBoundary =
-      dyn_cast<RankedTensorType>(activationValue.getType());
-  auto weightBoundary = dyn_cast<RankedTensorType>(weightValue.getType());
-  if (!activationArgument || !weightArgument || !projectionArgument ||
-      activationArgument.getOwner() != &region.getBody().front() ||
-      weightArgument.getOwner() != &region.getBody().front() ||
-      projectionArgument.getOwner() != &region.getBody().front() ||
-      activationArgument == weightArgument ||
-      activationArgument == projectionArgument ||
-      weightArgument == projectionArgument || !activationBoundary ||
-      !weightBoundary || activationBoundary != activation ||
-      weightBoundary.getRank() != 1 ||
-      weightBoundary.getDimSize(0) != activation.getShape().back() ||
-      !weightBoundary.getElementType().isBF16())
-    return failure();
-
-  FailureOr<int64_t> rows =
-      checkedShapeElements(activation.getShape().drop_back());
-  if (failed(rows))
-    return failure();
-  const int64_t reduction = activation.getShape().back();
-  const int64_t columns = result.getShape().back();
-  const NumericalPolicy policy = region.getPolicy();
-  const int64_t capacity = policy == NumericalPolicy::Fast ? 8 : 256;
-  const int64_t outputTile = std::min(columns, capacity);
-  const int64_t outputTiles = ceilDivPositive(columns, outputTile);
-  const bool inlineFold = outputTiles == 1 && reduction <= 256;
-  auto checkedProduct =
-      [](std::initializer_list<int64_t> factors) -> FailureOr<int64_t> {
-    int64_t product = 1;
-    for (int64_t factor : factors) {
-      if (factor < 0 ||
-          (factor != 0 &&
-           product > std::numeric_limits<int64_t>::max() / factor))
-        return failure();
-      product *= factor;
-    }
-    return product;
-  };
-  FailureOr<int64_t> duplicated =
-      checkedProduct({*rows, reduction, outputTiles - 1});
-  FailureOr<int64_t> normalizedBytes = checkedProduct({2, *rows, reduction});
-  FailureOr<int64_t> contractBytes = checkedProduct({4, *rows, columns});
-  FailureOr<int64_t> compactBytes = checkedProduct({4, *rows});
-  if (failed(duplicated) || failed(normalizedBytes) || failed(contractBytes) ||
-      failed(compactBytes))
-    return failure();
-
-  SmallVector<Operation *> orderedFoldSources;
-  SmallVector<Operation *> orderedContractSources;
-  for (Operation *operation : algebra) {
-    if (foldSources.contains(operation))
-      orderedFoldSources.push_back(operation);
-    if (contractSources.contains(operation))
-      orderedContractSources.push_back(operation);
-  }
-  DerivedPlan plan;
-  plan.hasContract = true;
-  plan.hasContractRegion = true;
-  llvm::SmallDenseMap<Value, int64_t> bufferForValue;
-  for (Value argument : {activationValue, weightValue, projectionValue}) {
-    bufferForValue.try_emplace(argument, plan.buffers.size());
-    plan.buffers.push_back({argument, std::nullopt, {}, false});
-  }
-  int64_t compactBuffer = -1;
-  if (!inlineFold) {
-    compactBuffer = plan.buffers.size();
-    bufferForValue.try_emplace(reciprocal.getResult(0), compactBuffer);
-    plan.buffers.push_back({reciprocal.getResult(0), int64_t{0}, {}, false});
-  }
-  int64_t outputBuffer = plan.buffers.size();
-  bufferForValue.try_emplace(yieldedValue, outputBuffer);
-  plan.buffers.push_back(
-      {yieldedValue, inlineFold ? int64_t{0} : int64_t{1}, {}, true});
-
-  auto boundaryValues = [&](ArrayRef<Operation *> sources,
-                            Operation *materializedStop) {
-    llvm::SmallDenseSet<Operation *> sourceSet(sources.begin(), sources.end());
-    SmallVector<Value> values;
-    llvm::SmallDenseSet<Value> seen;
-    for (Operation *operation : sources) {
-      for (Value operand : operation->getOperands()) {
-        if (operand.getDefiningOp() == materializedStop ||
-            !sourceSet.contains(operand.getDefiningOp())) {
-          if (seen.insert(operand).second)
-            values.push_back(operand);
-        }
-      }
-    }
-    return values;
-  };
-  auto fillContractMetadata = [&](PlannedTask &task,
-                                  ArrayRef<Operation *> sources) {
-    task.contractRegionSources.assign(sources.begin(), sources.end());
-    task.contractRegionStrategy = inlineFold ? "inline_fold" : "compact_stat";
-    task.contractRegionFold = fold;
-    task.contractRegionContract = contract;
-    task.contractRegionBf16Boundary = boundary;
-    task.contractRegionEpilogueSources.push_back(epilogue);
-    task.contractRegionNormalizedOperand = 0;
-    task.contractRegionCost = {*rows,
-                               reduction,
-                               columns,
-                               outputTile,
-                               outputTiles,
-                               *duplicated,
-                               *normalizedBytes,
-                               *contractBytes,
-                               inlineFold ? 0 : *compactBytes};
-  };
-  if (!inlineFold) {
-    PlannedTask foldTask;
-    foldTask.operation = fold;
-    foldTask.kind = MaterializationTaskKind::Fold;
-    foldTask.domain.assign(foldInput.getShape().begin(),
-                           foldInput.getShape().end());
-    foldTask.reductionDimensions.assign(fold.getReductionDimensions().begin(),
-                                        fold.getReductionDimensions().end());
-    foldTask.orderFree = fold.getOrderFree();
-    foldTask.foldRegionSources = orderedFoldSources;
-    foldTask.foldRegionPhases.push_back(fold);
-    for (Value value : boundaryValues(orderedFoldSources, nullptr)) {
-      auto found = bufferForValue.find(value);
-      if (found == bufferForValue.end())
-        return failure();
-      if (!llvm::is_contained(foldTask.inputs, found->second))
-        foldTask.inputs.push_back(found->second);
-    }
-    for (Operation *operation : orderedFoldSources) {
-      auto map = dyn_cast<MapOp>(operation);
-      if (!map)
-        continue;
-      for (auto [operandOrdinal, operand] : llvm::enumerate(map.getInputs())) {
-        if (foldSources.contains(operand.getDefiningOp()))
-          continue;
-        auto found = bufferForValue.find(operand);
-        if (found == bufferForValue.end())
-          return failure();
-        foldTask.foldRegionBoundaryUses.push_back(
-            {found->second, map, static_cast<unsigned>(operandOrdinal),
-             cast<AffineMapAttr>(map.getIndexingMaps()[operandOrdinal])
-                 .getValue(),
-             0});
-      }
-    }
-    foldTask.outputs.push_back(compactBuffer);
-    foldTask.foldRegionOutputs.push_back(reciprocal);
-    plan.tasks.push_back(std::move(foldTask));
-  }
-
-  PlannedTask contractTask;
-  contractTask.operation = contract;
-  contractTask.kind = MaterializationTaskKind::Contract;
-  FailureOr<SmallVector<int64_t>> contractDomain =
-      contractDomainShape(contract);
-  if (failed(contractDomain))
-    return failure();
-  contractTask.domain = std::move(*contractDomain);
-  contractTask.reductionDimensions.push_back(contractTask.domain.size() - 1);
-  ArrayRef<Operation *> contractTaskSources =
-      inlineFold ? ArrayRef<Operation *>(algebra)
-                 : ArrayRef<Operation *>(orderedContractSources);
-  fillContractMetadata(contractTask, contractTaskSources);
-  SmallVector<Value> actualContractBoundaries = boundaryValues(
-      contractTaskSources, inlineFold ? nullptr : reciprocal.getOperation());
-  SmallVector<Value> canonicalContractBoundaries{activationValue};
-  if (!inlineFold)
-    canonicalContractBoundaries.push_back(reciprocal.getResult(0));
-  canonicalContractBoundaries.push_back(weightValue);
-  canonicalContractBoundaries.push_back(projectionValue);
-  llvm::SmallDenseSet<Value> actualContractBoundarySet(
-      actualContractBoundaries.begin(), actualContractBoundaries.end());
-  if (actualContractBoundarySet.size() != canonicalContractBoundaries.size() ||
-      llvm::any_of(canonicalContractBoundaries, [&](Value value) {
-        return !actualContractBoundarySet.contains(value);
-      }))
-    return failure();
-  for (Value value : canonicalContractBoundaries) {
-    auto found = bufferForValue.find(value);
-    if (found == bufferForValue.end())
-      return failure();
-    if (!llvm::is_contained(contractTask.inputs, found->second))
-      contractTask.inputs.push_back(found->second);
-  }
-  contractTask.outputs.push_back(outputBuffer);
-  if (!inlineFold)
-    contractTask.dependencies.push_back(0);
-  plan.tasks.push_back(std::move(contractTask));
-
-  llvm::SmallDenseMap<Operation *, int64_t> occurrences;
-  for (PlannedTask &task : plan.tasks) {
-    for (Operation *operation : task.foldRegionSources)
-      ++occurrences[operation];
-    for (Operation *operation : task.contractRegionSources)
-      ++occurrences[operation];
-  }
-  for (PlannedTask &task : plan.tasks) {
-    for (Operation *operation : task.foldRegionSources)
-      if (occurrences.lookup(operation) > 1)
-        task.foldRegionRecomputedSources.push_back(operation);
-    for (Operation *operation : task.contractRegionSources)
-      if (occurrences.lookup(operation) > 1)
-        task.contractRegionRecomputedSources.push_back(operation);
-  }
-  for (auto [taskOrdinal, task] : llvm::enumerate(plan.tasks)) {
-    for (int64_t input : task.inputs)
-      plan.buffers[input].consumers.push_back(taskOrdinal);
-  }
-  return plan;
-}
-
-FailureOr<DerivedPlan> deriveNormContractPlan(RegionOp region) {
-  SmallVector<Operation *> algebra;
-  for (Operation &operation : region.getBody().front().without_terminator())
-    algebra.push_back(&operation);
-  auto yield = dyn_cast<YieldOp>(region.getBody().front().getTerminator());
-  if (!yield || yield.getValues().size() != 1)
-    return failure();
-  return deriveNormContractSubplan(region, algebra, yield.getValues().front());
-}
-
-FailureOr<DerivedPlan> deriveFoldRegionPlan(RegionOp region) {
-  SmallVector<Operation *> algebra;
-  SmallVector<FoldOp> folds;
-  bool hasReciprocalRoot = false;
-  for (Operation &operation : region.getBody().front().without_terminator()) {
-    if (auto map = dyn_cast<MapOp>(operation)) {
-      if (!isClosedFoldRegionMap(map))
-        return failure();
-      map.walk([&](math::RsqrtOp) { hasReciprocalRoot = true; });
-    } else if (auto fold = dyn_cast<FoldOp>(operation)) {
-      if (!isClosedAdditivePlanningFold(fold) ||
-          !hasExactPositiveZeroInitializer(fold) || fold.getNumResults() != 1)
-        return failure();
-      folds.push_back(fold);
-    } else {
-      return failure();
-    }
-    algebra.push_back(&operation);
-  }
-  if (folds.empty() || !hasReciprocalRoot)
-    return failure();
-  auto regionYield =
-      dyn_cast<YieldOp>(region.getBody().front().getTerminator());
-  if (!regionYield || regionYield.getValues().empty())
-    return failure();
-
-  FoldOp primary;
-  for (FoldOp fold : folds) {
-    if (llvm::all_of(regionYield.getValues(), [&](Value yielded) {
-          return valueDependsOnOperation(yielded, fold);
-        })) {
-      primary = fold;
-      break;
-    }
-  }
-  if (!primary ||
-      llvm::is_contained(regionYield.getValues(), primary.getResult(0)))
-    return failure();
-
-  auto collectSources = [&](Value root, llvm::SmallDenseSet<Operation *> &set,
-                            bool stopAtPrimary, auto &self) -> LogicalResult {
-    Operation *producer = root.getDefiningOp();
-    if (!producer)
-      return success();
-    if (producer == primary && stopAtPrimary)
-      return success();
-    if (!isa<MapOp, FoldOp>(producer) ||
-        producer->getParentOfType<RegionOp>() != region)
-      return failure();
-    if (!set.insert(producer).second)
-      return success();
-    for (Value operand : producer->getOperands()) {
-      if (failed(self(operand, set, stopAtPrimary, self)))
-        return failure();
-    }
-    return success();
-  };
-
-  SmallVector<llvm::SmallDenseSet<Operation *>> sourceSets;
-  sourceSets.emplace_back();
-  for (Value operand : primary->getOperands()) {
-    if (failed(
-            collectSources(operand, sourceSets.front(), false, collectSources)))
-      return failure();
-  }
-  sourceSets.front().insert(primary);
-  SmallVector<SmallVector<Value>> publicOutputs(1);
-  for (Value yielded : regionYield.getValues()) {
-    llvm::SmallDenseSet<Operation *> branch;
-    if (failed(collectSources(yielded, branch, true, collectSources)))
-      return failure();
-    if (regionYield.getValues().size() == 1) {
-      sourceSets.front().insert(branch.begin(), branch.end());
-      publicOutputs.front().push_back(yielded);
-      continue;
-    }
-    if (llvm::none_of(branch,
-                      [](Operation *operation) {
-                        return isa<FoldOp>(operation);
-                      })) {
-      llvm::SmallDenseSet<Operation *> complete = sourceSets.front();
-      complete.insert(branch.begin(), branch.end());
-      sourceSets.push_back(std::move(complete));
-      publicOutputs.push_back({yielded});
-      continue;
-    }
-    sourceSets.push_back(std::move(branch));
-    publicOutputs.push_back({yielded});
-  }
-
-  llvm::SmallDenseSet<Operation *> covered;
-  for (const auto &set : sourceSets)
-    covered.insert(set.begin(), set.end());
-  if (covered.size() != algebra.size())
-    return failure();
-
-  SmallVector<SmallVector<Operation *>> orderedSources(sourceSets.size());
-  for (auto [taskOrdinal, set] : llvm::enumerate(sourceSets)) {
-    for (Operation *operation : algebra) {
-      if (set.contains(operation))
-        orderedSources[taskOrdinal].push_back(operation);
-    }
-    SmallVector<FoldOp> phases;
-    for (Operation *operation : orderedSources[taskOrdinal]) {
-      if (auto fold = dyn_cast<FoldOp>(operation))
-        phases.push_back(fold);
-    }
-    if (phases.empty()) {
-      return failure();
-    }
-    for (auto [phaseOrdinal, fold] : llvm::enumerate(phases)) {
-      auto input = cast<RankedTensorType>(fold.getInputs().front().getType());
-      if (llvm::any_of(fold.getInputs(), [&](Value value) {
-            return !set.contains(value.getDefiningOp());
-          }))
-        return failure();
-      ArrayRef<int64_t> reduction = fold.getReductionDimensions();
-      const bool row =
-          reduction.size() == 1 && reduction.front() == input.getRank() - 1;
-      const bool column =
-          reduction.size() == static_cast<size_t>(input.getRank() - 1) &&
-          llvm::all_of(llvm::enumerate(reduction),
-                       [](auto axis) { return axis.index() == axis.value(); });
-      if (!row && !column)
-        return failure();
-      if (phaseOrdinal == 0)
-        continue;
-      int64_t cardinality = 1;
-      for (int64_t axis : reduction)
-        cardinality *= input.getDimSize(axis);
-      FoldOp previous = phases[phaseOrdinal - 1];
-      auto previousInput =
-          cast<RankedTensorType>(previous.getInputs().front().getType());
-      const bool degenerateTransition = cardinality == 1;
-      const bool sameDomainTransition =
-          input == previousInput &&
-          fold.getReductionDimensions() == previous.getReductionDimensions();
-      if ((!degenerateTransition && !sameDomainTransition) ||
-          fold.getResult(0).getType() != previous.getResult(0).getType() ||
-          !valueDependsOnOperation(fold.getInputs().front(), previous))
-        return failure();
-    }
-    for (Operation *operation : orderedSources[taskOrdinal]) {
-      auto map = dyn_cast<MapOp>(operation);
-      if (!map)
-        continue;
-      for (auto [operandOrdinal, operand] : llvm::enumerate(map.getInputs())) {
-        if (isa_and_nonnull<FoldOp>(operand.getDefiningOp()) &&
-            set.contains(operand.getDefiningOp()) &&
-            !isCanonicalFoldResultExpansion(map, operandOrdinal))
-          return failure();
-      }
-    }
-  }
-
-  DerivedPlan result;
-  result.hasRankNFold = true;
-  llvm::SmallDenseMap<Value, int64_t> bufferForValue;
-  for (BlockArgument argument : region.getBody().front().getArguments()) {
-    bufferForValue.try_emplace(argument, result.buffers.size());
-    result.buffers.push_back({argument, std::nullopt, {}, false});
-  }
-  if (sourceSets.size() > 1) {
-    bufferForValue.try_emplace(primary.getResult(0), result.buffers.size());
-    result.buffers.push_back({primary.getResult(0), int64_t{0}, {}, false});
-  }
-  for (auto [taskOrdinal, outputs] : llvm::enumerate(publicOutputs)) {
-    for (Value output : outputs) {
-      bufferForValue.try_emplace(output, result.buffers.size());
-      result.buffers.push_back(
-          {output, static_cast<int64_t>(taskOrdinal), {}, true});
-    }
-  }
-
-  llvm::SmallDenseMap<Operation *, int64_t> sourceOccurrences;
-  for (const auto &set : sourceSets) {
-    for (Operation *operation : set)
-      ++sourceOccurrences[operation];
-  }
-  if (llvm::any_of(sourceOccurrences, [](const auto &occurrence) {
-        return occurrence.second > 1 && !isa<MapOp, FoldOp>(occurrence.first);
-      }))
-    return failure();
-  for (auto [taskOrdinal, sources] : llvm::enumerate(orderedSources)) {
-    PlannedTask task;
-    task.foldRegionSources = sources;
-    llvm::SmallDenseSet<Operation *> taskSet;
-    taskSet.insert(sources.begin(), sources.end());
-    for (Operation *operation : sources) {
-      if (isa<FoldOp>(operation))
-        task.foldRegionPhases.push_back(operation);
-      if (sourceOccurrences.lookup(operation) > 1)
-        task.foldRegionRecomputedSources.push_back(operation);
-    }
-    task.operation = task.foldRegionPhases.front();
-    task.kind = MaterializationTaskKind::Fold;
-    auto firstFold = cast<FoldOp>(task.operation);
-    task.domain.assign(
-        cast<RankedTensorType>(firstFold.getInputs().front().getType())
-            .getShape()
-            .begin(),
-        cast<RankedTensorType>(firstFold.getInputs().front().getType())
-            .getShape()
-            .end());
-    task.reductionDimensions.assign(firstFold.getReductionDimensions().begin(),
-                                    firstFold.getReductionDimensions().end());
-    task.orderFree = firstFold.getOrderFree();
-
-    auto addInput = [&](int64_t ordinal) {
-      if (!llvm::is_contained(task.inputs, ordinal))
-        task.inputs.push_back(ordinal);
-    };
-    for (Operation *operation : sources) {
-      auto map = dyn_cast<MapOp>(operation);
-      if (!map)
-        continue;
-      for (auto [operandOrdinal, operand] : llvm::enumerate(map.getInputs())) {
-        if (taskSet.contains(operand.getDefiningOp()))
-          continue;
-        auto buffer = bufferForValue.find(operand);
-        if (buffer == bufferForValue.end())
-          return failure();
-        addInput(buffer->second);
-        int64_t phase = 0;
-        for (Operation *phaseOperation : task.foldRegionPhases) {
-          auto phaseSource = cast<FoldOp>(phaseOperation).getSource();
-          if (std::tuple(phaseSource.getFunctionOrdinal(),
-                         phaseSource.getBlockOrdinal(),
-                         phaseSource.getOperationOrdinal(),
-                         phaseSource.getResultOrdinal()) <
-              std::tuple(map.getSource().getFunctionOrdinal(),
-                         map.getSource().getBlockOrdinal(),
-                         map.getSource().getOperationOrdinal(),
-                         map.getSource().getResultOrdinal()))
-            ++phase;
-        }
-        phase = std::min<int64_t>(phase, task.foldRegionPhases.size() - 1);
-        task.foldRegionBoundaryUses.push_back(
-            {buffer->second, map, static_cast<unsigned>(operandOrdinal),
-             cast<AffineMapAttr>(map.getIndexingMaps()[operandOrdinal])
-                 .getValue(),
-             phase});
-      }
-    }
-    if (task.foldRegionBoundaryUses.empty())
-      return failure();
-    if (taskOrdinal == 0 && sourceSets.size() > 1) {
-      task.outputs.push_back(bufferForValue.lookup(primary.getResult(0)));
-      task.foldRegionOutputs.push_back(primary);
-    }
-    for (Value output : publicOutputs[taskOrdinal]) {
-      task.outputs.push_back(bufferForValue.lookup(output));
-      task.foldRegionOutputs.push_back(output.getDefiningOp());
-    }
-    for (int64_t input : task.inputs) {
-      if (std::optional<int64_t> producer = result.buffers[input].producer;
-          producer && !llvm::is_contained(task.dependencies, *producer))
-        task.dependencies.push_back(*producer);
-    }
-    llvm::sort(task.dependencies);
-    result.tasks.push_back(std::move(task));
-  }
-  for (auto [taskOrdinal, task] : llvm::enumerate(result.tasks)) {
-    for (int64_t input : task.inputs)
-      result.buffers[input].consumers.push_back(taskOrdinal);
-  }
-  result.hasFoldRegion = true;
-  return result;
-}
-
-FailureOr<int64_t> scheduleElementCount(ArrayRef<int64_t> shape);
-FailureOr<int64_t> staticElementCount(RankedTensorType type);
-
-FailureOr<DerivedPlan> deriveSharedStatFoldRegionPlan(RegionOp region) {
-  SmallVector<Operation *> algebra;
-  SmallVector<FoldOp> folds;
-  for (Operation &operation : region.getBody().front().without_terminator()) {
-    if (auto map = dyn_cast<MapOp>(operation)) {
-      if (!isClosedFoldRegionMap(map))
-        return failure();
-    } else if (auto fold = dyn_cast<FoldOp>(operation)) {
-      if (!isClosedAdditivePlanningFold(fold) ||
-          !hasExactPositiveZeroInitializer(fold) || fold.getNumResults() != 1)
-        return failure();
-      folds.push_back(fold);
-    } else {
-      return failure();
-    }
-    algebra.push_back(&operation);
-  }
-  if (folds.empty())
-    return failure();
-  auto regionYield =
-      dyn_cast<YieldOp>(region.getBody().front().getTerminator());
-  if (!regionYield || regionYield.getValues().size() < 3)
-    return failure();
-
-  RankedTensorType domain;
-  for (FoldOp fold : folds) {
-    auto input = cast<RankedTensorType>(fold.getInputs().front().getType());
-    if (fold.getReductionDimensions() ==
-        ArrayRef<int64_t>({input.getRank() - 1})) {
-      domain = input;
-      break;
-    }
-  }
-  if (!domain || domain.getRank() < 2)
-    return failure();
-  SmallVector<int64_t> rowShape(domain.getShape().drop_back());
-  SmallVector<int64_t> featureShape(domain.getShape().take_back());
-  SmallVector<Value> rowOutputs;
-  SmallVector<Value> featureOutputs;
-  llvm::SmallDenseMap<Value, int64_t> outputTask;
-  for (Value output : regionYield.getValues()) {
-    auto type = dyn_cast<RankedTensorType>(output.getType());
-    if (!type)
-      return failure();
-    if (type.getShape() == domain.getShape()) {
-      outputTask.try_emplace(output, 0);
-      rowOutputs.push_back(output);
-    } else if (type.getShape() == ArrayRef<int64_t>(featureShape)) {
-      outputTask.try_emplace(output, 1);
-      featureOutputs.push_back(output);
-    } else {
-      return failure();
-    }
-  }
-  if (rowOutputs.empty() || featureOutputs.size() < 2)
-    return failure();
-
-  auto collectSources = [&](Value root,
-                            const llvm::SmallDenseSet<Value> &stops,
-                            llvm::SmallDenseSet<Operation *> &set,
-                            auto &self) -> LogicalResult {
-    if (stops.contains(root))
-      return success();
-    Operation *producer = root.getDefiningOp();
-    if (!producer)
-      return success();
-    if (!isa<MapOp, FoldOp>(producer) ||
-        producer->getParentOfType<RegionOp>() != region)
-      return failure();
-    if (!set.insert(producer).second)
-      return success();
-    for (Value operand : producer->getOperands()) {
-      if (failed(self(operand, stops, set, self)))
-        return failure();
-    }
-    return success();
-  };
-  const llvm::SmallDenseSet<Value> noStops;
-  llvm::SmallDenseSet<Operation *> rowSet;
-  llvm::SmallDenseSet<Operation *> featureRawSet;
-  for (Value output : rowOutputs)
-    if (failed(collectSources(output, noStops, rowSet, collectSources)))
-      return failure();
-  for (Value output : featureOutputs)
-    if (failed(
-            collectSources(output, noStops, featureRawSet, collectSources)))
-      return failure();
-
-  SmallVector<Value> sharedStats;
-  llvm::SmallDenseSet<Value> sharedStatSet;
-  FailureOr<int64_t> rowElements = scheduleElementCount(rowShape);
-  if (failed(rowElements))
-    return failure();
-  for (Operation *operation : algebra) {
-    auto map = dyn_cast<MapOp>(operation);
-    if (!map || !rowSet.contains(operation) ||
-        !featureRawSet.contains(operation))
-      continue;
-    auto type = cast<RankedTensorType>(map.getResult(0).getType());
-    FailureOr<int64_t> elements = staticElementCount(type);
-    if (failed(elements) || *elements != *rowElements ||
-        !type.getElementType().isF32() ||
-        llvm::none_of(map.getResult(0).getUsers(), [&](Operation *user) {
-          auto resultType =
-              user->getNumResults() == 1
-                  ? dyn_cast<RankedTensorType>(user->getResult(0).getType())
-                  : RankedTensorType{};
-          if (!resultType)
-            return false;
-          FailureOr<int64_t> resultElements = staticElementCount(resultType);
-          return succeeded(resultElements) && *resultElements > *rowElements;
-        }))
-      continue;
-    sharedStats.push_back(map.getResult(0));
-    sharedStatSet.insert(map.getResult(0));
-  }
-  if (sharedStats.size() != 2)
-    return failure();
-
-  llvm::SmallDenseSet<Operation *> featureSet;
-  for (Value output : featureOutputs)
-    if (failed(collectSources(output, sharedStatSet, featureSet,
-                              collectSources)))
-      return failure();
-  llvm::SmallDenseSet<Operation *> covered(rowSet.begin(), rowSet.end());
-  covered.insert(featureSet.begin(), featureSet.end());
-  if (covered.size() != algebra.size())
-    return failure();
-
-  std::array<llvm::SmallDenseSet<Operation *> *, 2> sourceSets = {&rowSet,
-                                                                  &featureSet};
-  std::array<SmallVector<Operation *>, 2> orderedSources;
-  for (auto [taskOrdinal, set] : llvm::enumerate(sourceSets)) {
-    for (Operation *operation : algebra)
-      if (set->contains(operation))
-        orderedSources[taskOrdinal].push_back(operation);
-    SmallVector<FoldOp> phases;
-    for (Operation *operation : orderedSources[taskOrdinal])
-      if (auto fold = dyn_cast<FoldOp>(operation))
-        phases.push_back(fold);
-    if (phases.empty())
-      return failure();
-    auto firstInput =
-        cast<RankedTensorType>(phases.front().getInputs().front().getType());
-    ArrayRef<int64_t> firstReduction =
-        phases.front().getReductionDimensions();
-    for (auto [phaseOrdinal, fold] : llvm::enumerate(phases)) {
-      auto input = cast<RankedTensorType>(fold.getInputs().front().getType());
-      ArrayRef<int64_t> reduction = fold.getReductionDimensions();
-      const bool row = reduction == ArrayRef<int64_t>({input.getRank() - 1});
-      const bool column =
-          (input.getRank() == 2 && reduction == ArrayRef<int64_t>({0})) ||
-          isFullPrefixReduction(reduction, input.getRank());
-      int64_t cardinality = 1;
-      for (int64_t axis : reduction)
-        cardinality *= input.getDimSize(axis);
-      const bool degenerate = cardinality == 1;
-      if ((!row && !column) ||
-          (phaseOrdinal == 0 && input != domain) ||
-          (phaseOrdinal != 0 &&
-           ((!degenerate &&
-             (input != firstInput || reduction != firstReduction)) ||
-            fold.getResult(0).getType() !=
-                phases.front().getResult(0).getType() ||
-            (degenerate &&
-             !valueDependsOnOperation(fold.getInputs().front(),
-                                      phases[phaseOrdinal - 1]))))) {
-        return failure();
-      }
-      Value initializer = fold.getInitializers().front();
-      if (!set->contains(initializer.getDefiningOp())) {
-        return failure();
-      }
-    }
-    for (Operation *operation : orderedSources[taskOrdinal]) {
-      auto map = dyn_cast<MapOp>(operation);
-      if (!map)
-        continue;
-      for (auto [operandOrdinal, operand] : llvm::enumerate(map.getInputs())) {
-        if (isa_and_nonnull<FoldOp>(operand.getDefiningOp()) &&
-            set->contains(operand.getDefiningOp()) &&
-            !isCanonicalFoldResultExpansion(map, operandOrdinal)) {
-          return failure();
-        }
-      }
-    }
-  }
-
-  DerivedPlan result;
-  result.hasRankNFold = domain.getRank() > 2;
-  result.hasFoldRegion = true;
-  llvm::SmallDenseMap<Value, int64_t> bufferForValue;
-  for (BlockArgument argument : region.getBody().front().getArguments()) {
-    bufferForValue.try_emplace(argument, result.buffers.size());
-    result.buffers.push_back({argument, std::nullopt, {}, false});
-  }
-  for (Value stat : sharedStats) {
-    bufferForValue.try_emplace(stat, result.buffers.size());
-    result.buffers.push_back({stat, int64_t{0}, {}, false});
-  }
-  for (Value output : regionYield.getValues()) {
-    int64_t producer = outputTask.lookup(output);
-    bufferForValue.try_emplace(output, result.buffers.size());
-    result.buffers.push_back({output, producer, {}, true});
-  }
-
-  llvm::SmallDenseMap<Operation *, int64_t> sourceOccurrences;
-  for (auto *set : sourceSets)
-    for (Operation *operation : *set)
-      ++sourceOccurrences[operation];
-  for (auto [operation, occurrences] : sourceOccurrences)
-    if (occurrences > 1 && !isa<MapOp>(operation))
-      return failure();
-  for (auto [taskOrdinal, sources] : llvm::enumerate(orderedSources)) {
-    PlannedTask task;
-    task.foldRegionSources = sources;
-    llvm::SmallDenseSet<Operation *> taskSet(sources.begin(), sources.end());
-    for (Operation *operation : sources) {
-      if (isa<FoldOp>(operation))
-        task.foldRegionPhases.push_back(operation);
-      if (sourceOccurrences.lookup(operation) > 1)
-        task.foldRegionRecomputedSources.push_back(operation);
-    }
-    task.operation = task.foldRegionPhases.front();
-    task.kind = MaterializationTaskKind::Fold;
-    auto firstFold = cast<FoldOp>(task.operation);
-    task.domain.assign(domain.getShape().begin(), domain.getShape().end());
-    task.reductionDimensions.assign(firstFold.getReductionDimensions().begin(),
-                                    firstFold.getReductionDimensions().end());
-    task.orderFree = firstFold.getOrderFree();
-    auto addInput = [&](Value value) -> LogicalResult {
-      auto found = bufferForValue.find(value);
-      if (found == bufferForValue.end())
-        return failure();
-      if (!llvm::is_contained(task.inputs, found->second))
-        task.inputs.push_back(found->second);
-      return success();
-    };
-    for (Operation *operation : sources) {
-      auto map = dyn_cast<MapOp>(operation);
-      if (!map)
-        continue;
-      for (auto [operandOrdinal, operand] : llvm::enumerate(map.getInputs())) {
-        if (taskSet.contains(operand.getDefiningOp()))
-          continue;
-        if (failed(addInput(operand)))
-          return failure();
-        int64_t phase = 0;
-        for (Operation *phaseOperation : task.foldRegionPhases) {
-          if (cast<FoldOp>(phaseOperation).getSource().getOperationOrdinal() <
-              map.getSource().getOperationOrdinal())
-            ++phase;
-        }
-        phase = std::min<int64_t>(phase, task.foldRegionPhases.size() - 1);
-        task.foldRegionBoundaryUses.push_back(
-            {bufferForValue.lookup(operand), map,
-             static_cast<unsigned>(operandOrdinal),
-             cast<AffineMapAttr>(map.getIndexingMaps()[operandOrdinal])
-                 .getValue(),
-             phase});
-      }
-    }
-    llvm::sort(task.inputs);
-    for (Operation *phase : task.foldRegionPhases) {
-      Value input = cast<FoldOp>(phase).getInputs().front();
-      if (!taskSet.contains(input.getDefiningOp()) &&
-          (!bufferForValue.count(input) ||
-           !llvm::is_contained(task.inputs, bufferForValue.lookup(input))))
-        return failure();
-    }
-    if (task.foldRegionBoundaryUses.empty())
-      return failure();
-    if (taskOrdinal == 0) {
-      for (Value stat : sharedStats) {
-        task.outputs.push_back(bufferForValue.lookup(stat));
-        task.foldRegionOutputs.push_back(stat.getDefiningOp());
-      }
-      for (Value output : rowOutputs) {
-        task.outputs.push_back(bufferForValue.lookup(output));
-        task.foldRegionOutputs.push_back(output.getDefiningOp());
-      }
-    } else {
-      for (Value output : featureOutputs) {
-        task.outputs.push_back(bufferForValue.lookup(output));
-        task.foldRegionOutputs.push_back(output.getDefiningOp());
-      }
-    }
-    for (int64_t input : task.inputs) {
-      if (std::optional<int64_t> producer = result.buffers[input].producer;
-          producer && !llvm::is_contained(task.dependencies, *producer))
-        task.dependencies.push_back(*producer);
-    }
-    llvm::sort(task.dependencies);
-    result.tasks.push_back(std::move(task));
-  }
-  for (auto [taskOrdinal, task] : llvm::enumerate(result.tasks))
-    for (int64_t input : task.inputs)
-      result.buffers[input].consumers.push_back(taskOrdinal);
-  return result;
-}
-
-FailureOr<DerivedPlan> fuseEligibleMapTasks(RegionOp region,
-                                            DerivedPlan initial) {
-  SmallVector<Operation *> algebra;
-  for (Operation &operation : region.getBody().front().without_terminator())
-    algebra.push_back(&operation);
-  llvm::SmallDenseMap<Operation *, unsigned> index;
-  for (auto [ordinal, operation] : llvm::enumerate(algebra))
-    index.try_emplace(operation, ordinal);
-  SmallVector<unsigned> parent(algebra.size());
-  std::iota(parent.begin(), parent.end(), 0);
-  auto root = [&](unsigned value) {
-    while (parent[value] != value) {
-      parent[value] = parent[parent[value]];
-      value = parent[value];
-    }
-    return value;
-  };
-  auto merge = [&](unsigned left, unsigned right) {
-    left = root(left);
-    right = root(right);
-    if (left != right)
-      parent[left] = right;
-  };
-  for (auto [ordinal, operation] : llvm::enumerate(algebra)) {
-    auto producer = dyn_cast<MapOp>(operation);
-    if (!producer || !isEligibleF32Map(producer) ||
-        !producer.getResult(0).hasOneUse())
-      continue;
-    OpOperand &use = *producer.getResult(0).getUses().begin();
-    auto consumer = dyn_cast<MapOp>(use.getOwner());
-    if (!consumer || !isEligibleF32Map(consumer))
-      continue;
-    auto consumerIndex = index.find(consumer);
-    if (consumerIndex == index.end())
-      continue;
-    AffineMap edge = cast<AffineMapAttr>(
-                         consumer.getIndexingMaps()[use.getOperandNumber()])
-                         .getValue();
-    FailureOr<SmallVector<int64_t>> producerDomain = mapDomainShape(producer);
-    FailureOr<SmallVector<int64_t>> consumerDomain = mapDomainShape(consumer);
-    if (!edge.isIdentity() || failed(producerDomain) ||
-        failed(consumerDomain) || *producerDomain != *consumerDomain)
-      continue;
-    merge(ordinal, consumerIndex->second);
-  }
-  for (auto [ordinal, operation] : llvm::enumerate(algebra)) {
-    auto fold = dyn_cast<FoldOp>(operation);
-    if (!fold || fold.getNumResults() != 1 ||
-        !fold.getResult(0).hasOneUse())
-      continue;
-    OpOperand &use = *fold.getResult(0).getUses().begin();
-    auto consumer = dyn_cast<MapOp>(use.getOwner());
-    auto consumerIndex = consumer ? index.find(consumer) : index.end();
-    if (!consumer || consumerIndex == index.end() ||
-        !isEligibleFoldMapEdge(fold, consumer, use.getOperandNumber()))
-      continue;
-    const unsigned consumerRoot = root(consumerIndex->second);
-    const bool anotherFoldBoundary = llvm::any_of(
-        llvm::enumerate(algebra), [&](auto member) {
-          auto memberMap = dyn_cast<MapOp>(member.value());
-          if (!memberMap || root(member.index()) != consumerRoot)
-            return false;
-          return llvm::any_of(memberMap.getInputs(), [&](Value input) {
-            auto other = input.getDefiningOp<FoldOp>();
-            return other && other != fold;
-          });
-        });
-    if (!anotherFoldBoundary)
-      merge(ordinal, consumerIndex->second);
-  }
-
-  SmallVector<SmallVector<unsigned>> members(algebra.size());
-  for (unsigned ordinal = 0; ordinal < algebra.size(); ++ordinal)
-    members[root(ordinal)].push_back(ordinal);
-
-  llvm::SmallDenseMap<Operation *, PlannedTask *> initialTask;
-  for (PlannedTask &task : initial.tasks)
-    initialTask.try_emplace(task.operation, &task);
-  DerivedPlan fused;
-  fused.hasContract = initial.hasContract;
-  fused.hasRankNFold = initial.hasRankNFold;
-  llvm::SmallDenseMap<Value, int64_t> bufferForValue;
-  for (BlockArgument input : region.getBody().front().getArguments()) {
-    bufferForValue.try_emplace(input, fused.buffers.size());
-    fused.buffers.push_back({input, std::nullopt, {}, false});
-  }
-  for (auto [ordinal, operation] : llvm::enumerate(algebra)) {
-    unsigned groupRoot = root(ordinal);
-    ArrayRef<unsigned> group = members[groupRoot];
-    if (ordinal != group.back())
-      continue;
-    PlannedTask task;
-    Operation *foldMember = nullptr;
-    for (unsigned member : group) {
-      if (!isa<FoldOp>(algebra[member]))
-        continue;
-      if (foldMember)
-        return failure();
-      foldMember = algebra[member];
-    }
-    task.operation = foldMember ? foldMember : operation;
-    task.kind = initialTask.lookup(task.operation)->kind;
-    task.domain = initialTask.lookup(task.operation)->domain;
-    task.reductionDimensions =
-        initialTask.lookup(task.operation)->reductionDimensions;
-    task.orderFree = initialTask.lookup(task.operation)->orderFree;
-    llvm::SmallDenseSet<Operation *> groupSet;
-    for (unsigned member : group)
-      groupSet.insert(algebra[member]);
-    if (group.size() > 1) {
-      for (unsigned member : group) {
-        Operation *memberOperation = algebra[member];
-        if (isa<MapOp>(memberOperation))
-          task.fusedOperations.push_back(memberOperation);
-        else if (!foldMember || memberOperation != foldMember)
-          return failure();
-      }
-      if (foldMember) {
-        if (task.fusedOperations.empty())
-          return failure();
-        task.fusedFold = foldMember;
-      } else if (task.fusedOperations.size() != group.size()) {
-        return failure();
-      }
-    }
-    unsigned singletonMember = ordinal;
-    ArrayRef<unsigned> taskMembers =
-        task.fusedOperations.empty() ? ArrayRef<unsigned>(singletonMember)
-                                     : group;
-    llvm::SmallDenseMap<Value, AffineMap> boundaryMaps;
-    const bool fusedGroup = !task.fusedOperations.empty();
-    auto addInput = [&](Value operand) -> LogicalResult {
-      auto found = bufferForValue.find(operand);
-      if (found == bufferForValue.end())
-        return failure();
-      task.inputs.push_back(found->second);
-      PlannedBuffer &buffer = fused.buffers[found->second];
-      if (buffer.consumers.empty() ||
-          buffer.consumers.back() !=
-              static_cast<int64_t>(fused.tasks.size()))
-        buffer.consumers.push_back(fused.tasks.size());
-      if (buffer.producer &&
-          !llvm::is_contained(task.dependencies, *buffer.producer))
-        task.dependencies.push_back(*buffer.producer);
-      return success();
-    };
-    if (foldMember) {
-      for (Value operand : foldMember->getOperands()) {
-        if (failed(addInput(operand)))
-          return failure();
-      }
-    }
-    for (unsigned member : llvm::reverse(taskMembers)) {
-      Operation *memberOperation = algebra[member];
-      auto memberMap = dyn_cast<MapOp>(memberOperation);
-      for (auto [operandOrdinal, operand] :
-           llvm::enumerate(memberOperation->getOperands())) {
-        if (groupSet.contains(operand.getDefiningOp()))
-          continue;
-        if (foldMember && memberOperation == foldMember)
-          continue;
-        AffineMap composedMap;
-        if (memberMap)
-          composedMap = cast<AffineMapAttr>(
-                            memberMap.getIndexingMaps()[operandOrdinal])
-                            .getValue();
-        auto prior = boundaryMaps.find(operand);
-        if (fusedGroup && prior != boundaryMaps.end()) {
-          if (memberMap && prior->second != composedMap)
-            return failure();
-          continue;
-        }
-        if (fusedGroup && memberMap)
-          boundaryMaps.try_emplace(operand, composedMap);
-        if (failed(addInput(operand)))
-          return failure();
-        if (fusedGroup && memberMap)
-          task.composedInputMaps.push_back(composedMap);
-      }
-    }
-    llvm::sort(task.dependencies);
-    for (unsigned member : taskMembers) {
-      for (Value result : algebra[member]->getResults()) {
-        const bool internal = llvm::all_of(result.getUses(), [&](OpOperand &use) {
-          return groupSet.contains(use.getOwner());
-        });
-        if (internal && !result.use_empty())
-          continue;
-        int64_t bufferOrdinal = fused.buffers.size();
-        bufferForValue.try_emplace(result, bufferOrdinal);
-        fused.buffers.push_back(
-            {result, static_cast<int64_t>(fused.tasks.size()), {}, false});
-        task.outputs.push_back(bufferOrdinal);
-      }
-    }
-    if (task.outputs.empty())
-      return failure();
-    fused.tasks.push_back(std::move(task));
-  }
-  auto regionYield = cast<YieldOp>(region.getBody().front().getTerminator());
-  for (Value value : regionYield.getValues()) {
-    auto found = bufferForValue.find(value);
-    if (found == bufferForValue.end())
-      return failure();
-    fused.buffers[found->second].liveOut = true;
-  }
-  for (PlannedBuffer &buffer : fused.buffers) {
-    if (!buffer.liveOut && buffer.consumers.empty())
-      return failure();
-  }
-  return fused;
-}
-
-FailureOr<DerivedPlan> deriveHybridNormContractPlan(RegionOp region,
-                                                    DerivedPlan generic) {
-  SmallVector<Operation *> algebra;
-  for (Operation &operation : region.getBody().front().without_terminator())
-    algebra.push_back(&operation);
-  auto regionYield =
-      dyn_cast<YieldOp>(region.getBody().front().getTerminator());
-  if (!regionYield || regionYield.getValues().size() < 2)
-    return failure();
-
-  std::optional<DerivedPlan> specialized;
-  SmallVector<Operation *> specializedSources;
-  Value specializedOutput;
-  for (Value yielded : regionYield.getValues()) {
-    llvm::SmallDenseSet<Operation *> closure;
-    SmallVector<Value> worklist{yielded};
-    bool closed = true;
-    while (!worklist.empty() && closed) {
-      Operation *producer = worklist.pop_back_val().getDefiningOp();
-      if (!producer)
-        continue;
-      if (producer->getParentOfType<RegionOp>() != region ||
-          !isa<MapOp, FoldOp, ContractOp>(producer)) {
-        closed = false;
-        break;
-      }
-      if (closure.insert(producer).second)
-        llvm::append_range(worklist, producer->getOperands());
-    }
-    if (!closed)
-      continue;
-    SmallVector<Operation *> ordered;
-    llvm::copy_if(
-        algebra, std::back_inserter(ordered),
-        [&](Operation *operation) { return closure.contains(operation); });
-    if (ordered.size() != closure.size())
-      continue;
-    FailureOr<DerivedPlan> candidate =
-        deriveNormContractSubplan(region, ordered, yielded);
-    if (failed(candidate))
-      continue;
-    if (specialized)
-      return failure();
-    specialized = std::move(*candidate);
-    specializedSources = std::move(ordered);
-    specializedOutput = yielded;
-  }
-  if (!specialized)
-    return failure();
-
-  auto specializedContractIt =
-      llvm::find_if(specialized->tasks, [](PlannedTask &task) {
-        return !task.contractRegionSources.empty();
-      });
-  if (specializedContractIt == specialized->tasks.end())
-    return failure();
-  PlannedTask *specializedContract = &*specializedContractIt;
-  if (!specializedContract->contractRegionBf16Boundary ||
-      !specializedContract->contractRegionContract ||
-      specializedContract->contractRegionEpilogueSources.size() != 1)
-    return failure();
-  Value normalized =
-      cast<MapOp>(specializedContract->contractRegionBf16Boundary).getResult(0);
-  Value contractIntermediate =
-      cast<ContractOp>(specializedContract->contractRegionContract)
-          .getResult(0);
-  Operation *epilogue = specializedContract->contractRegionEpilogueSources[0];
-
-  auto taskSources = [](const PlannedTask &task) {
-    SmallVector<Operation *> sources;
-    if (!task.contractRegionSources.empty()) {
-      llvm::append_range(sources, task.contractRegionSources);
-    } else if (!task.foldRegionSources.empty()) {
-      llvm::append_range(sources, task.foldRegionSources);
-    } else if (task.fusedFold) {
-      sources.push_back(task.fusedFold);
-      llvm::append_range(sources, task.fusedOperations);
-    } else if (!task.fusedOperations.empty()) {
-      llvm::append_range(sources, task.fusedOperations);
-    } else {
-      sources.push_back(task.operation);
-    }
-    return sources;
-  };
-  auto singletonTask = [&](Operation *operation) -> std::optional<int64_t> {
-    std::optional<int64_t> found;
-    for (auto [ordinal, task] : llvm::enumerate(generic.tasks)) {
-      SmallVector<Operation *> sources = taskSources(task);
-      if (sources.size() != 1 || sources.front() != operation)
-        continue;
-      if (found)
-        return std::nullopt;
-      found = ordinal;
-    }
-    return found;
-  };
-  std::optional<int64_t> boundaryTask =
-      singletonTask(specializedContract->contractRegionBf16Boundary);
-  std::optional<int64_t> contractTask =
-      singletonTask(specializedContract->contractRegionContract);
-  std::optional<int64_t> epilogueTask = singletonTask(epilogue);
-  if (!boundaryTask || !contractTask || !epilogueTask ||
-      !(*boundaryTask < *contractTask && *contractTask < *epilogueTask))
-    return failure();
-
-  DerivedPlan hybrid;
-  hybrid.hasContract = generic.hasContract;
-  hybrid.hasRankNFold = generic.hasRankNFold;
-  hybrid.hasContractRegion = true;
-  hybrid.hasFoldRegion =
-      llvm::any_of(specialized->tasks, [](const PlannedTask &task) {
-        return !task.foldRegionSources.empty();
-      });
-  SmallVector<int64_t> oldBufferToNew(generic.buffers.size(), -1);
-  llvm::SmallDenseMap<Value, int64_t> combinedBufferForValue;
-  for (auto [ordinal, buffer] : llvm::enumerate(generic.buffers)) {
-    if (buffer.value == contractIntermediate)
-      continue;
-    int64_t combined = hybrid.buffers.size();
-    oldBufferToNew[ordinal] = combined;
-    combinedBufferForValue.try_emplace(buffer.value, combined);
-    hybrid.buffers.push_back({buffer.value, std::nullopt, {}, buffer.liveOut});
-  }
-  auto normalizedBuffer = combinedBufferForValue.find(normalized);
-  auto outputBuffer = combinedBufferForValue.find(specializedOutput);
-  if (normalizedBuffer == combinedBufferForValue.end() ||
-      outputBuffer == combinedBufferForValue.end() ||
-      hybrid.buffers[normalizedBuffer->second].liveOut)
-    return failure();
-
-  SmallVector<int64_t> specializedBufferToCombined(specialized->buffers.size(),
-                                                   -1);
-  for (auto [ordinal, buffer] : llvm::enumerate(specialized->buffers)) {
-    if (!buffer.producer || buffer.liveOut) {
-      auto found = combinedBufferForValue.find(buffer.value);
-      if (found == combinedBufferForValue.end())
-        return failure();
-      specializedBufferToCombined[ordinal] = found->second;
-      continue;
-    }
-    specializedBufferToCombined[ordinal] = hybrid.buffers.size();
-    hybrid.buffers.push_back({buffer.value, std::nullopt, {}, false});
-  }
-
-  auto remap = [](SmallVectorImpl<int64_t> &ordinals,
-                  ArrayRef<int64_t> mapping) -> LogicalResult {
-    for (int64_t &ordinal : ordinals) {
-      if (ordinal < 0 || ordinal >= static_cast<int64_t>(mapping.size()) ||
-          mapping[ordinal] < 0)
-        return failure();
-      ordinal = mapping[ordinal];
-    }
-    return success();
-  };
-  for (auto [ordinal, original] : llvm::enumerate(generic.tasks)) {
-    if (ordinal == *boundaryTask) {
-      for (PlannedTask task : specialized->tasks) {
-        if (failed(remap(task.inputs, specializedBufferToCombined)) ||
-            failed(remap(task.outputs, specializedBufferToCombined)))
-          return failure();
-        if (!task.contractRegionSources.empty())
-          task.outputs.insert(task.outputs.begin(), normalizedBuffer->second);
-        task.dependencies.clear();
-        hybrid.tasks.push_back(std::move(task));
-      }
-      continue;
-    }
-    if (ordinal == *contractTask || ordinal == *epilogueTask)
-      continue;
-    PlannedTask task = original;
-    if (failed(remap(task.inputs, oldBufferToNew)) ||
-        failed(remap(task.outputs, oldBufferToNew)))
-      return failure();
-    task.dependencies.clear();
-    hybrid.tasks.push_back(std::move(task));
-  }
-
-  for (PlannedBuffer &buffer : hybrid.buffers) {
-    buffer.producer.reset();
-    buffer.consumers.clear();
-  }
-  for (auto [ordinal, task] : llvm::enumerate(hybrid.tasks)) {
-    for (int64_t output : task.outputs) {
-      if (output < 0 || output >= static_cast<int64_t>(hybrid.buffers.size()) ||
-          hybrid.buffers[output].producer)
-        return failure();
-      hybrid.buffers[output].producer = ordinal;
-    }
-  }
-
-  SmallVector<bool> requiredTasks(hybrid.tasks.size(), false);
-  SmallVector<bool> requiredBuffers(hybrid.buffers.size(), false);
-  SmallVector<int64_t> worklist;
-  for (auto [ordinal, buffer] : llvm::enumerate(hybrid.buffers)) {
-    if (!buffer.liveOut)
-      continue;
-    requiredBuffers[ordinal] = true;
-    worklist.push_back(ordinal);
-  }
-  while (!worklist.empty()) {
-    int64_t bufferOrdinal = worklist.pop_back_val();
-    std::optional<int64_t> producer = hybrid.buffers[bufferOrdinal].producer;
-    if (!producer || requiredTasks[*producer])
-      continue;
-    requiredTasks[*producer] = true;
-    PlannedTask &task = hybrid.tasks[*producer];
-    for (int64_t output : task.outputs) {
-      if (output < 0 || output >= static_cast<int64_t>(hybrid.buffers.size()))
-        return failure();
-      requiredBuffers[output] = true;
-    }
-    for (int64_t input : task.inputs) {
-      if (input < 0 || input >= static_cast<int64_t>(hybrid.buffers.size()))
-        return failure();
-      if (requiredBuffers[input])
-        continue;
-      requiredBuffers[input] = true;
-      worklist.push_back(input);
-    }
-  }
-
-  SmallVector<int64_t> liveBufferMapping(hybrid.buffers.size(), -1);
-  DerivedPlan live;
-  live.hasContract = hybrid.hasContract;
-  live.hasRankNFold = false;
-  live.hasContractRegion = hybrid.hasContractRegion;
-  live.hasFoldRegion = hybrid.hasFoldRegion;
-  for (auto [ordinal, buffer] : llvm::enumerate(hybrid.buffers)) {
-    if (!requiredBuffers[ordinal])
-      continue;
-    liveBufferMapping[ordinal] = live.buffers.size();
-    live.buffers.push_back({buffer.value, std::nullopt, {}, buffer.liveOut});
-  }
-  for (auto [ordinal, task] : llvm::enumerate(hybrid.tasks)) {
-    if (!requiredTasks[ordinal])
-      continue;
-    if (failed(remap(task.inputs, liveBufferMapping)) ||
-        failed(remap(task.outputs, liveBufferMapping)))
-      return failure();
-    task.dependencies.clear();
-    if (task.kind == MaterializationTaskKind::Fold &&
-        task.foldRegionSources.empty() && task.domain.size() > 2)
-      live.hasRankNFold = true;
-    live.tasks.push_back(std::move(task));
-  }
-  hybrid = std::move(live);
-
-  llvm::SmallDenseMap<Operation *, int64_t> sourceOccurrences;
-  for (PlannedTask &task : hybrid.tasks) {
-    for (Operation *operation : taskSources(task))
-      ++sourceOccurrences[operation];
-  }
-  for (PlannedTask &task : hybrid.tasks) {
-    const bool regionTask =
-        !task.foldRegionSources.empty() || !task.contractRegionSources.empty();
-    task.foldRegionRecomputedSources.clear();
-    task.contractRegionRecomputedSources.clear();
-    SmallVector<Operation *> sources = taskSources(task);
-    for (Operation *operation : sources) {
-      if (sourceOccurrences.lookup(operation) == 1 || !regionTask)
-        continue;
-      if (!isa<MapOp, FoldOp>(operation))
-        return failure();
-      if (!task.foldRegionSources.empty())
-        task.foldRegionRecomputedSources.push_back(operation);
-      else
-        task.contractRegionRecomputedSources.push_back(operation);
-    }
-  }
-
-  for (auto [ordinal, task] : llvm::enumerate(hybrid.tasks)) {
-    for (int64_t output : task.outputs) {
-      if (output < 0 || output >= static_cast<int64_t>(hybrid.buffers.size()) ||
-          hybrid.buffers[output].producer)
-        return failure();
-      hybrid.buffers[output].producer = ordinal;
-    }
-  }
-  for (auto [ordinal, task] : llvm::enumerate(hybrid.tasks)) {
-    for (int64_t input : task.inputs) {
-      if (input < 0 || input >= static_cast<int64_t>(hybrid.buffers.size()))
-        return failure();
-      PlannedBuffer &buffer = hybrid.buffers[input];
-      if (buffer.consumers.empty() || buffer.consumers.back() != ordinal)
-        buffer.consumers.push_back(ordinal);
-      if (buffer.producer &&
-          !llvm::is_contained(task.dependencies, *buffer.producer))
-        task.dependencies.push_back(*buffer.producer);
-    }
-    llvm::sort(task.dependencies);
-  }
-  for (const PlannedBuffer &buffer : hybrid.buffers) {
-    if (!buffer.liveOut && buffer.producer && buffer.consumers.empty())
-      return failure();
-  }
-  return hybrid;
-}
-
-FailureOr<DerivedPlan> deriveGpuPlan(RegionOp region,
-                                     bool preferFusion = false) {
-  SmallVector<Operation *> algebra;
-  for (Operation &operation : region.getBody().front().without_terminator()) {
-    if (!isa<MapOp, RelationOp, FoldOp, ContractOp>(operation)) {
-      return failure();
-    }
-    algebra.push_back(&operation);
-  }
-  if (algebra.empty()) {
-    return failure();
-  }
-  if (preferFusion) {
-    FailureOr<DerivedPlan> normContract = deriveNormContractPlan(region);
-    if (succeeded(normContract))
-      return normContract;
-  }
-  const bool containsContract = llvm::any_of(
-      algebra, [](Operation *operation) { return isa<ContractOp>(operation); });
-  const bool containsRelation = llvm::any_of(
-      algebra, [](Operation *operation) { return isa<RelationOp>(operation); });
-  if (!preferFusion && containsContract &&
-      !isClosedContractMapRegion(region, algebra)) {
-    return failure();
-  }
-  const bool containsRankNFold =
-      llvm::any_of(algebra, [](Operation *operation) {
-        auto fold = dyn_cast<FoldOp>(operation);
-        auto input =
-            fold && fold.getInputs().size() == 1
-                ? dyn_cast<RankedTensorType>(fold.getInputs()[0].getType())
-                : RankedTensorType{};
-        return input && input.getRank() > 2;
-      });
-  if (!preferFusion && containsRankNFold &&
-      (containsContract || !isClosedRankNFoldMapRegion(region, algebra))) {
-    return failure();
-  }
-  SmallVector<PlannedBuffer, 0> buffers;
-  llvm::SmallDenseMap<Value, int64_t> bufferForValue;
-  for (BlockArgument input : region.getBody().front().getArguments()) {
-    auto type = dyn_cast<RankedTensorType>(input.getType());
-    if (!type || !type.hasStaticShape() ||
-        llvm::any_of(type.getShape(),
-                     [](int64_t extent) { return extent <= 0; })) {
-      return failure();
-    }
-    bufferForValue.try_emplace(input, buffers.size());
-    buffers.push_back({input, std::nullopt, {}, false});
-  }
-
-  SmallVector<PlannedTask, 0> tasks;
-  unsigned foldCount = 0;
-  unsigned contractCount = 0;
-  for (Operation *operation : algebra) {
-    PlannedTask task;
-    task.operation = operation;
-    task.kind =
-        isa<FoldOp>(operation)
-            ? MaterializationTaskKind::Fold
-            : (isa<ContractOp>(operation) ? MaterializationTaskKind::Contract
-                                          : MaterializationTaskKind::Map);
-    if (auto fold = dyn_cast<FoldOp>(operation)) {
-      const bool closedFold =
-          preferFusion ? (containsRelation
-                              ? isLosslessScalarPlanningFold(fold)
-                              : isClosedAdditivePlanningFold(fold))
-                       : (containsRankNFold ? isClosedRankNFold(fold)
-                                            : isClosedRankTwoFold(fold));
-      if (!closedFold) {
-        return failure();
-      }
-      ++foldCount;
-      task.reductionDimensions.assign(fold.getReductionDimensions().begin(),
-                                      fold.getReductionDimensions().end());
-      task.orderFree = fold.getOrderFree();
-      task.domain.assign(cast<RankedTensorType>(fold.getInputs()[0].getType())
-                             .getShape()
-                             .begin(),
-                         cast<RankedTensorType>(fold.getInputs()[0].getType())
-                             .getShape()
-                             .end());
-    } else if (auto contract = dyn_cast<ContractOp>(operation)) {
-      if (!isClosedProjectedContract(contract)) {
-        return failure();
-      }
-      ++contractCount;
-      FailureOr<SmallVector<int64_t>> domain = contractDomainShape(contract);
-      if (failed(domain)) {
-        return failure();
-      }
-      task.domain = std::move(*domain);
-      for (auto [position, iterator] :
-           llvm::enumerate(contract.getIteratorKinds())) {
-        if (cast<StringAttr>(iterator).getValue() == "reduction") {
-          task.reductionDimensions.push_back(position);
-        }
-      }
-    } else if (auto map = dyn_cast<MapOp>(operation)) {
-      FailureOr<SmallVector<int64_t>> domain = preferFusion
-                                                   ? genericMapDomainShape(map)
-                                                   : mapDomainShape(map);
-      if (failed(domain)) {
-        return failure();
-      }
-      task.domain = std::move(*domain);
-    } else {
-      auto relation = cast<RelationOp>(operation);
-      if (relation.getNumResults() != 1)
-        return failure();
-      auto result = dyn_cast<RankedTensorType>(relation.getResult(0).getType());
-      if (!result || !result.hasStaticShape() || result.getRank() > 8 ||
-          llvm::any_of(result.getShape(),
-                       [](int64_t extent) { return extent <= 0; }))
-        return failure();
-      task.domain.assign(result.getShape().begin(), result.getShape().end());
-    }
-    for (Value operand : operation->getOperands()) {
-      auto found = bufferForValue.find(operand);
-      if (found == bufferForValue.end()) {
-        return failure();
-      }
-      task.inputs.push_back(found->second);
-      if (buffers[found->second].consumers.empty() ||
-          buffers[found->second].consumers.back() !=
-              static_cast<int64_t>(tasks.size())) {
-        buffers[found->second].consumers.push_back(tasks.size());
-      }
-      if (buffers[found->second].producer &&
-          !llvm::is_contained(task.dependencies,
-                              *buffers[found->second].producer)) {
-        task.dependencies.push_back(*buffers[found->second].producer);
-      }
-    }
-    llvm::sort(task.dependencies);
-    for (Value result : operation->getResults()) {
-      auto type = dyn_cast<RankedTensorType>(result.getType());
-      if (!type || !type.hasStaticShape() ||
-          llvm::any_of(type.getShape(),
-                       [](int64_t extent) { return extent <= 0; })) {
-        return failure();
-      }
-      int64_t ordinal = buffers.size();
-      bufferForValue.try_emplace(result, ordinal);
-      buffers.push_back(
-          {result, static_cast<int64_t>(tasks.size()), {}, false});
-      task.outputs.push_back(ordinal);
-    }
-    tasks.push_back(std::move(task));
-  }
-  auto regionYield = cast<YieldOp>(region.getBody().front().getTerminator());
-  for (Value value : regionYield.getValues()) {
-    auto found = bufferForValue.find(value);
-    if (found == bufferForValue.end()) {
-      return failure();
-    }
-    buffers[found->second].liveOut = true;
-  }
-  for (PlannedBuffer &buffer : buffers) {
-    if (!buffer.liveOut && buffer.consumers.empty()) {
-      return failure();
-    }
-  }
-
-  const bool containsOnlyMaps =
-      foldCount == 0 && contractCount == 0 && !containsRelation;
-  if (containsOnlyMaps) {
-    if (algebra.size() < 2) {
-      return failure();
-    }
-    for (Operation *operation : algebra) {
-      auto map = cast<MapOp>(operation);
-      if (map.getSemantics() != MapSemantics::Pointwise ||
-          !llvm::all_of(map.getIndexingMaps().getValue(),
-                        [](Attribute indexing) {
-                          return isIdentityMap(
-                              cast<AffineMapAttr>(indexing).getValue());
-                        })) {
-        return failure();
-      }
-    }
-    bool hasTemporary = false;
-    for (const PlannedBuffer &buffer : buffers) {
-      auto type = cast<RankedTensorType>(buffer.value.getType());
-      const bool external = !buffer.producer || buffer.liveOut;
-      if (external) {
-        if (type.getRank() < 1 || type.getRank() > 8 ||
-            !type.getElementType().isBF16() ||
-            (buffer.liveOut && !buffer.consumers.empty())) {
-          return failure();
-        }
-        continue;
-      }
-      if (!type.getElementType().isF32()) {
-        return failure();
-      }
-      hasTemporary = true;
-    }
-    if (!hasTemporary) {
-      return failure();
-    }
-  }
-
-  llvm::SmallDenseSet<Operation *> connected;
-  SmallVector<Operation *> worklist{algebra.front()};
-  connected.insert(algebra.front());
-  while (!worklist.empty()) {
-    Operation *operation = worklist.pop_back_val();
-    for (Operation *candidate : algebra) {
-      bool adjacent = llvm::any_of(candidate->getOperands(),
-                                   [&](Value value) {
-                                     return value.getDefiningOp() == operation;
-                                   }) ||
-                      llvm::any_of(operation->getOperands(), [&](Value value) {
-                        return value.getDefiningOp() == candidate;
-                      });
-      if (adjacent && connected.insert(candidate).second) {
-        worklist.push_back(candidate);
-      }
-    }
-  }
-  if (connected.size() != algebra.size() && !preferFusion) {
-    return failure();
-  }
-  DerivedPlan result{std::move(tasks), std::move(buffers), contractCount != 0,
-                     containsRankNFold};
-  result.hasLogicalRelation = containsRelation;
-  if (!preferFusion)
-    return result;
-  FailureOr<DerivedPlan> online = online_planner::derive(region, result);
-  if (succeeded(online))
-    return online;
-  // Relation/index-domain values are losslessly represented by ordinary
-  // materialization tasks. Scheduling these logical tasks remains fail-closed
-  // until a Relation-aware executable lowering exists.
-  if (containsRelation)
-    return result;
-  FailureOr<DerivedPlan> composition =
-      deriveGenericContractFoldCompositionPlan(region, result);
-  if (succeeded(composition))
-    return composition;
-  FailureOr<DerivedPlan> foldRegion = deriveFoldRegionPlan(region);
-  if (succeeded(foldRegion))
-    return foldRegion;
-  FailureOr<DerivedPlan> sharedStatFoldRegion =
-      deriveSharedStatFoldRegionPlan(region);
-  if (succeeded(sharedStatFoldRegion))
-    return sharedStatFoldRegion;
-  FailureOr<DerivedPlan> fused =
-      fuseEligibleMapTasks(region, std::move(result));
-  if (failed(fused))
-    return failure();
-  FailureOr<DerivedPlan> hybrid = deriveHybridNormContractPlan(region, *fused);
-  return succeeded(hybrid) ? std::move(*hybrid) : std::move(*fused);
-}
-
-Operation *createMaterializationRecord(OpBuilder &builder, Location location,
-                                       StringRef name,
-                                       ArrayRef<NamedAttribute> attrs) {
-  OperationState state(location, name);
-  state.addAttributes(attrs);
-  return builder.create(state);
-}
-
-class PlanRowFoldMaterializationPass
-    : public impl::ShuttlePlanRowFoldMaterializationPassBase<
-          PlanRowFoldMaterializationPass> {
+class PlanSourceEventLoweringPass
+    : public impl::ShuttlePlanSourceEventLoweringPassBase<
+          PlanSourceEventLoweringPass> {
 public:
   void runOnOperation() override {
     ModuleOp module = getOperation();
-    if (!module.getOps<MaterializationPlanOp>().empty()) {
-      module.emitError("already contains a materialization plan");
-      return signalPassFailure();
-    }
-    auto manifest =
-        module->getAttrOfType<DictionaryAttr>(kCoverageManifestAttribute);
-    auto tuning = manifest ? manifest.getAs<StringAttr>("canonical_tuning")
-                           : StringAttr{};
-    auto canonicalOptions =
-        manifest ? manifest.getAs<StringAttr>("canonical_options")
-                 : StringAttr{};
-    const bool materializationTuningAbi =
-        !canonicalOptions ||
-        canonicalOptions.getValue().contains(
-            "\"pipeline_abi_version\":22,\"schema_version\":1") ||
-        canonicalOptions.getValue().contains(
-            "\"pipeline_abi_version\":23,\"schema_version\":1");
-    const bool validTuning =
-        tuning && (tuning.getValue() == kDefaultCanonicalTuning ||
-                   tuning.getValue() == kFusionCanonicalTuning ||
-                   tuning.getValue() == kMaterializationCanonicalTuning);
-    if (!validTuning || (!materializationTuningAbi &&
-                         tuning.getValue() != kDefaultCanonicalTuning)) {
-      module.emitError(
-          "requires an exact ABI21 default or ABI22/ABI23 materialization "
-          "tuning");
-      return signalPassFailure();
-    }
-    const bool preferFusion = tuning.getValue() == kFusionCanonicalTuning;
-    SmallVector<std::pair<RegionOp, DerivedPlan>> selected;
-    bool invalidRegion = false;
-    module.walk([&](RegionOp region) {
-      FailureOr<DerivedPlan> candidate = deriveGpuPlan(region, preferFusion);
-      if (failed(candidate)) {
-        invalidRegion = true;
-        return WalkResult::interrupt();
-      }
-      selected.emplace_back(region, std::move(*candidate));
-      return WalkResult::advance();
-    });
-    uint64_t aggregateTasks = 0;
-    uint64_t aggregateBuffers = 0;
-    for (const auto &[region, derived] : selected) {
-      (void)region;
-      aggregateTasks += derived.tasks.size();
-      aggregateBuffers += derived.buffers.size();
-    }
-    if (invalidRegion || selected.empty() ||
-        selected.size() > kMaximumGpuExecutableRecords ||
-        aggregateTasks > kMaximumGpuExecutableRecords ||
-        aggregateBuffers > kMaximumGpuExecutableRecords) {
-      module.emitError(
-          "requires a bounded set of independently connected static GPU "
-          "algebra regions");
-      return signalPassFailure();
-    }
-    const bool mixesContractAndRankNFold =
-        llvm::any_of(selected,
-                     [](const auto &entry) {
-                       return entry.second.hasContract &&
-                              !entry.second.hasContractFoldComposition &&
-                              !entry.second.hasLogicalRelation;
-                     }) &&
-        llvm::any_of(selected, [](const auto &entry) {
-          return entry.second.hasRankNFold &&
-                 !entry.second.hasContractFoldComposition &&
-                 !entry.second.hasLogicalRelation;
-        });
-    if (mixesContractAndRankNFold) {
-      module.emitError(
-          "requires a bounded set of independently connected static GPU "
-          "algebra regions");
-      return signalPassFailure();
-    }
-    for (auto &[selectedRegion, derived] : selected) {
-      OpBuilder builder(module.getContext());
-      builder.setInsertionPointToEnd(module.getBody());
-      OperationState planState(module.getLoc(),
-                               MaterializationPlanOp::getOperationName());
-      planState.addAttribute(
-          "schema_version",
-          builder.getI64IntegerAttr(
-              derived.hasContract || derived.hasFoldRegion ? 2 : 1));
-      planState.addAttribute("policy", selectedRegion.getPolicyAttr());
-      planState.addAttribute("fingerprint",
-                             builder.getStringAttr(std::string(64, '0')));
-      planState.addRegion();
-      auto plan = cast<MaterializationPlanOp>(builder.create(planState));
-      Block *body = new Block();
-      plan.getBody().push_back(body);
-      builder.setInsertionPointToEnd(body);
-
-      auto &tasks = derived.tasks;
-      auto &buffers = derived.buffers;
-      for (auto [ordinal, buffer] : llvm::enumerate(buffers)) {
-        int64_t end =
-            buffer.liveOut
-                ? tasks.size()
-                : (buffer.consumers.empty() ? 0 : buffer.consumers.back());
-        SmallVector<NamedAttribute> attrs{
-            builder.getNamedAttr("ordinal", builder.getI64IntegerAttr(ordinal)),
-            builder.getNamedAttr("tensor_type",
-                                 TypeAttr::get(buffer.value.getType())),
-            builder.getNamedAttr("storage",
-                                 MaterializationStorageAttr::get(
-                                     module.getContext(),
-                                     (!buffer.producer || buffer.liveOut)
-                                         ? MaterializationStorage::External
-                                         : MaterializationStorage::Temporary)),
-            builder.getNamedAttr("live_in",
-                                 builder.getBoolAttr(!buffer.producer)),
-            builder.getNamedAttr("live_out",
-                                 builder.getBoolAttr(buffer.liveOut)),
-            builder.getNamedAttr(
-                "consumers",
-                DenseI64ArrayAttr::get(module.getContext(), buffer.consumers)),
-            builder.getNamedAttr(
-                "lifetime_start",
-                builder.getI64IntegerAttr(buffer.producer.value_or(0))),
-            builder.getNamedAttr("lifetime_end",
-                                 builder.getI64IntegerAttr(end))};
-        if (buffer.producer) {
-          attrs.push_back(builder.getNamedAttr(
-              "producer", builder.getI64IntegerAttr(*buffer.producer)));
-        }
-        createMaterializationRecord(builder, module.getLoc(),
-                                    MaterializationBufferOp::getOperationName(),
-                                    attrs);
-      }
-      for (auto [ordinal, task] : llvm::enumerate(tasks)) {
-        const bool fusedFoldMap = task.fusedFold != nullptr;
-        const bool fusedMap = !fusedFoldMap && task.fusedOperations.size() > 1;
-        const bool foldRegion = !task.foldRegionSources.empty();
-        const bool contractRegion = !task.contractRegionSources.empty();
-        const bool composition = !task.compositionKind.empty();
-        SourceRefAttr source = algebraSource(task.operation);
-        SmallVector<NamedAttribute> attrs{
-            builder.getNamedAttr("ordinal", builder.getI64IntegerAttr(ordinal)),
-            builder.getNamedAttr("kind", MaterializationTaskKindAttr::get(
-                                             module.getContext(), task.kind)),
-            builder.getNamedAttr(
-                "domain_shape",
-                DenseI64ArrayAttr::get(module.getContext(), task.domain)),
-            builder.getNamedAttr(
-                "reduction_dimensions",
-                DenseI64ArrayAttr::get(module.getContext(),
-                                       task.reductionDimensions)),
-            builder.getNamedAttr(
-                "input_buffers",
-                DenseI64ArrayAttr::get(module.getContext(), task.inputs)),
-            builder.getNamedAttr(
-                "output_buffers",
-                DenseI64ArrayAttr::get(module.getContext(), task.outputs)),
-            builder.getNamedAttr(
-                "dependencies",
-                DenseI64ArrayAttr::get(module.getContext(), task.dependencies)),
-            builder.getNamedAttr(
-                "semantic_fingerprint",
-                builder.getStringAttr(
-                    composition
-                        ? compositionTaskFingerprint(
-                              task.compositionKind, task.compositionSources,
-                              task.compositionRecomputedSources)
-                    : contractRegion
-                        ? contractRegionFingerprint(task.contractRegionSources)
-                    : foldRegion ? foldRegionFingerprint(task.foldRegionSources)
-                    : fusedFoldMap
-                        ? fusedFoldMapFingerprint(cast<FoldOp>(task.fusedFold),
-                                                  task.fusedOperations)
-                    : fusedMap ? fusedMapFingerprint(task.fusedOperations)
-                               : semanticTaskFingerprint(task.operation))),
-            builder.getNamedAttr("source", source)};
-        if (composition) {
-          SmallVector<Attribute> sources;
-          for (Operation *operation : task.compositionSources)
-            sources.push_back(algebraSource(operation));
-          attrs.push_back(builder.getNamedAttr(
-              "composition_kind", builder.getStringAttr(task.compositionKind)));
-          attrs.push_back(builder.getNamedAttr("composition_sources",
-                                               builder.getArrayAttr(sources)));
-          if (!task.onlineVectorDimensions.empty())
-            attrs.push_back(builder.getNamedAttr(
-                "online_vector_dimensions",
-                builder.getDenseI64ArrayAttr(task.onlineVectorDimensions)));
-          if (task.onlineMma)
-            attrs.push_back(builder.getNamedAttr("online_mma",
-                                                builder.getBoolAttr(true)));
-          if (!task.compositionRecomputedSources.empty()) {
-            SmallVector<Attribute> recomputed;
-            for (Operation *operation : task.compositionRecomputedSources)
-              recomputed.push_back(algebraSource(operation));
-            attrs.push_back(builder.getNamedAttr(
-                "composition_recomputed_sources",
-                builder.getArrayAttr(recomputed)));
-          }
-          if (task.compositionKind == "map_contract" ||
-              task.compositionKind ==
-                  "online_normalized_exponential_weighted_contract") {
-            auto cost = task.compositionCost;
-            attrs.push_back(builder.getNamedAttr(
-                "composition_cost",
-                builder.getDictionaryAttr(
-                    {builder.getNamedAttr(
-                         "baseline_launches",
-                         builder.getI64IntegerAttr(cost.baselineLaunches)),
-                     builder.getNamedAttr(
-                         "candidate_launches",
-                         builder.getI64IntegerAttr(cost.candidateLaunches)),
-                     builder.getNamedAttr("baseline_temporary_bytes",
-                                          builder.getI64IntegerAttr(
-                                              cost.baselineTemporaryBytes)),
-                     builder.getNamedAttr("candidate_temporary_bytes",
-                                          builder.getI64IntegerAttr(
-                                              cost.candidateTemporaryBytes)),
-                     builder.getNamedAttr(
-                         "baseline_temporary_traffic_bytes",
-                         builder.getI64IntegerAttr(
-                             cost.baselineTemporaryTrafficBytes)),
-                     builder.getNamedAttr(
-                         "candidate_temporary_traffic_bytes",
-                         builder.getI64IntegerAttr(
-                             cost.candidateTemporaryTrafficBytes)),
-                     builder.getNamedAttr("contract_evaluations",
-                                          builder.getI64IntegerAttr(
-                                              cost.contractEvaluations))})));
-          }
-        } else if (contractRegion) {
-          SmallVector<Attribute> sources;
-          for (Operation *operation : task.contractRegionSources) {
-            if (auto map = dyn_cast<MapOp>(operation))
-              sources.push_back(map.getSource());
-            else if (auto fold = dyn_cast<FoldOp>(operation))
-              sources.push_back(fold.getSource());
-            else
-              sources.push_back(cast<ContractOp>(operation).getSource());
-          }
-          SmallVector<Attribute> epilogues;
-          for (Operation *operation : task.contractRegionEpilogueSources)
-            epilogues.push_back(cast<MapOp>(operation).getSource());
-          auto cost = task.contractRegionCost;
-          attrs.push_back(builder.getNamedAttr("contract_region_sources",
-                                               builder.getArrayAttr(sources)));
-          attrs.push_back(builder.getNamedAttr(
-              "contract_region_strategy",
-              builder.getStringAttr(task.contractRegionStrategy)));
-          attrs.push_back(builder.getNamedAttr(
-              "contract_region_fold_source",
-              cast<FoldOp>(task.contractRegionFold).getSource()));
-          attrs.push_back(builder.getNamedAttr(
-              "contract_region_contract_source",
-              cast<ContractOp>(task.contractRegionContract).getSource()));
-          attrs.push_back(builder.getNamedAttr(
-              "contract_region_bf16_boundary_source",
-              cast<MapOp>(task.contractRegionBf16Boundary).getSource()));
-          attrs.push_back(
-              builder.getNamedAttr("contract_region_epilogue_sources",
-                                   builder.getArrayAttr(epilogues)));
-          attrs.push_back(builder.getNamedAttr(
-              "contract_region_normalized_operand",
-              builder.getI64IntegerAttr(task.contractRegionNormalizedOperand)));
-          attrs.push_back(builder.getNamedAttr(
-              "contract_region_cost",
-              builder.getDictionaryAttr(
-                  {builder.getNamedAttr("rows",
-                                        builder.getI64IntegerAttr(cost.rows)),
-                   builder.getNamedAttr(
-                       "reduction", builder.getI64IntegerAttr(cost.reduction)),
-                   builder.getNamedAttr(
-                       "columns", builder.getI64IntegerAttr(cost.columns)),
-                   builder.getNamedAttr(
-                       "output_tile",
-                       builder.getI64IntegerAttr(cost.outputTile)),
-                   builder.getNamedAttr(
-                       "output_tiles",
-                       builder.getI64IntegerAttr(cost.outputTiles)),
-                   builder.getNamedAttr(
-                       "duplicated_fold_elements",
-                       builder.getI64IntegerAttr(cost.duplicatedFoldElements)),
-                   builder.getNamedAttr("normalized_temporary_bytes",
-                                        builder.getI64IntegerAttr(
-                                            cost.normalizedTemporaryBytes)),
-                   builder.getNamedAttr(
-                       "contract_temporary_bytes",
-                       builder.getI64IntegerAttr(cost.contractTemporaryBytes)),
-                   builder.getNamedAttr(
-                       "compact_stat_bytes",
-                       builder.getI64IntegerAttr(cost.compactStatBytes))})));
-          if (!task.contractRegionRecomputedSources.empty()) {
-            SmallVector<Attribute> recomputed;
-            for (Operation *operation : task.contractRegionRecomputedSources) {
-              if (auto map = dyn_cast<MapOp>(operation))
-                recomputed.push_back(map.getSource());
-              else
-                recomputed.push_back(cast<FoldOp>(operation).getSource());
-            }
-            attrs.push_back(
-                builder.getNamedAttr("contract_region_recomputed_sources",
-                                     builder.getArrayAttr(recomputed)));
-          }
-        } else if (foldRegion) {
-          SmallVector<Attribute> sources;
-          for (Operation *operation : task.foldRegionSources) {
-            if (auto map = dyn_cast<MapOp>(operation))
-              sources.push_back(map.getSource());
-            else
-              sources.push_back(cast<FoldOp>(operation).getSource());
-          }
-          SmallVector<Attribute> phases;
-          for (auto [phaseOrdinal, operation] :
-               llvm::enumerate(task.foldRegionPhases)) {
-            auto fold = cast<FoldOp>(operation);
-            auto domain =
-                cast<RankedTensorType>(fold.getInputs().front().getType())
-                    .getShape();
-            phases.push_back(builder.getDictionaryAttr(
-                {builder.getNamedAttr("source", fold.getSource()),
-                 builder.getNamedAttr("domain_shape",
-                                      builder.getDenseI64ArrayAttr(domain)),
-                 builder.getNamedAttr("reduction_dimensions",
-                                      builder.getDenseI64ArrayAttr(
-                                          fold.getReductionDimensions())),
-                 builder.getNamedAttr("order_free",
-                                      builder.getBoolAttr(fold.getOrderFree())),
-                 builder.getNamedAttr(
-                     "transition",
-                     builder.getStringAttr(phaseOrdinal == 0 ? "launch_boundary"
-                                                             : "cta_local"))}));
-          }
-          SmallVector<Attribute> boundaryUses;
-          for (PlannedTask::BoundaryUse &use : task.foldRegionBoundaryUses) {
-            boundaryUses.push_back(builder.getDictionaryAttr(
-                {builder.getNamedAttr("input_buffer", builder.getI64IntegerAttr(
-                                                          use.inputBuffer)),
-                 builder.getNamedAttr("source", use.source.getSource()),
-                 builder.getNamedAttr("operand",
-                                      builder.getI64IntegerAttr(use.operand)),
-                 builder.getNamedAttr("indexing_map",
-                                      AffineMapAttr::get(use.indexingMap)),
-                 builder.getNamedAttr("phase",
-                                      builder.getI64IntegerAttr(use.phase))}));
-          }
-          attrs.push_back(builder.getNamedAttr("fold_region_sources",
-                                               builder.getArrayAttr(sources)));
-          SmallVector<Attribute> outputs;
-          for (Operation *operation : task.foldRegionOutputs) {
-            if (auto map = dyn_cast<MapOp>(operation))
-              outputs.push_back(map.getSource());
-            else
-              outputs.push_back(cast<FoldOp>(operation).getSource());
-          }
-          attrs.push_back(builder.getNamedAttr("fold_region_output_sources",
-                                               builder.getArrayAttr(outputs)));
-          attrs.push_back(builder.getNamedAttr("fold_region_phases",
-                                               builder.getArrayAttr(phases)));
-          attrs.push_back(builder.getNamedAttr(
-              "fold_region_boundary_uses", builder.getArrayAttr(boundaryUses)));
-          if (!task.foldRegionRecomputedSources.empty()) {
-            SmallVector<Attribute> recomputed;
-            for (Operation *operation : task.foldRegionRecomputedSources) {
-              if (auto map = dyn_cast<MapOp>(operation))
-                recomputed.push_back(map.getSource());
-              else
-                recomputed.push_back(cast<FoldOp>(operation).getSource());
-            }
-            attrs.push_back(
-                builder.getNamedAttr("fold_region_recomputed_sources",
-                                     builder.getArrayAttr(recomputed)));
-          }
-        } else if (fusedFoldMap) {
-          SmallVector<Attribute> sources;
-          for (Operation *operation : task.fusedOperations)
-            sources.push_back(cast<MapOp>(operation).getSource());
-          SmallVector<Attribute> maps;
-          for (AffineMap map : task.composedInputMaps)
-            maps.push_back(AffineMapAttr::get(map));
-          attrs.push_back(builder.getNamedAttr(
-              "fold_epilogue_sources", builder.getArrayAttr(sources)));
-          attrs.push_back(builder.getNamedAttr(
-              "epilogue_input_maps", builder.getArrayAttr(maps)));
-        } else if (fusedMap) {
-          SmallVector<Attribute> sources;
-          for (Operation *operation : task.fusedOperations)
-            sources.push_back(cast<MapOp>(operation).getSource());
-          SmallVector<Attribute> maps;
-          for (AffineMap map : task.composedInputMaps)
-            maps.push_back(AffineMapAttr::get(map));
-          attrs.push_back(builder.getNamedAttr(
-              "fused_sources", builder.getArrayAttr(sources)));
-          attrs.push_back(builder.getNamedAttr(
-              "composed_input_maps", builder.getArrayAttr(maps)));
-        }
-        if (task.kind == MaterializationTaskKind::Fold) {
-          attrs.push_back(builder.getNamedAttr(
-              "order_free", builder.getBoolAttr(task.orderFree)));
-        }
-        createMaterializationRecord(builder, task.operation->getLoc(),
-                                    MaterializationTaskOp::getOperationName(),
-                                    attrs);
-      }
-      builder.create<MaterializationPlanYieldOp>(module.getLoc());
-      plan.setFingerprint(materializationPlanFingerprint(plan));
-      if (failed(plan.verifyRegions())) {
-        return signalPassFailure();
-      }
-    }
-  }
-};
-
-LogicalResult
-verifyMaterializationPlanAgainstSource(ModuleOp module,
-                                       MaterializationPlanOp plan,
-                                       RegionOp *boundRegion = nullptr) {
-  if (failed(plan.verifyRegions())) {
-    return failure();
-  }
-  llvm::SmallDenseMap<Attribute, Operation *> sourceOperations;
-  llvm::SmallDenseSet<Attribute> duplicateSources;
-  module.walk([&](Operation *operation) {
-    if (auto map = dyn_cast<MapOp>(operation)) {
-      if (!sourceOperations.try_emplace(map.getSource(), operation).second) {
-        duplicateSources.insert(map.getSource());
-      }
-    } else if (auto relation = dyn_cast<RelationOp>(operation)) {
-      if (!sourceOperations.try_emplace(relation.getSource(), operation)
-               .second) {
-        duplicateSources.insert(relation.getSource());
-      }
-    } else if (auto fold = dyn_cast<FoldOp>(operation)) {
-      if (!sourceOperations.try_emplace(fold.getSource(), operation).second) {
-        duplicateSources.insert(fold.getSource());
-      }
-    } else if (auto contract = dyn_cast<ContractOp>(operation)) {
-      if (!sourceOperations.try_emplace(contract.getSource(), operation)
-               .second) {
-        duplicateSources.insert(contract.getSource());
-      }
-    }
-  });
-  SmallVector<MaterializationBufferOp> buffers;
-  SmallVector<MaterializationTaskOp> tasks;
-  for (Operation &operation : plan.getBody().front()) {
-    if (auto buffer = dyn_cast<MaterializationBufferOp>(operation)) {
-      buffers.push_back(buffer);
-    } else if (auto task = dyn_cast<MaterializationTaskOp>(operation)) {
-      tasks.push_back(task);
-    }
-  }
-  llvm::SmallDenseSet<Operation *> bound;
-  llvm::SmallDenseMap<Operation *, int64_t> sourceOccurrences;
-  llvm::SmallDenseMap<Operation *, int64_t> regionOccurrences;
-  llvm::SmallDenseMap<Operation *, int64_t> recomputationDeclarations;
-  bool sawFoldRegion = false;
-  bool sawContractRegion = false;
-  for (MaterializationTaskOp task : tasks) {
-    auto fusedSources = task->getAttrOfType<ArrayAttr>("fused_sources");
-    auto composedMaps = task->getAttrOfType<ArrayAttr>("composed_input_maps");
-    auto epilogueSources =
-        task->getAttrOfType<ArrayAttr>("fold_epilogue_sources");
-    auto epilogueMaps = task->getAttrOfType<ArrayAttr>("epilogue_input_maps");
-    auto foldRegionSources =
-        task->getAttrOfType<ArrayAttr>("fold_region_sources");
-    auto foldRegionOutputSources =
-        task->getAttrOfType<ArrayAttr>("fold_region_output_sources");
-    auto contractRegionSources =
-        task->getAttrOfType<ArrayAttr>("contract_region_sources");
-    auto compositionKind = task->getAttrOfType<StringAttr>("composition_kind");
-    auto compositionSources =
-        task->getAttrOfType<ArrayAttr>("composition_sources");
-    auto compositionRecomputedSources =
-        task->getAttrOfType<ArrayAttr>("composition_recomputed_sources");
-    auto compositionCost =
-        task->getAttrOfType<DictionaryAttr>("composition_cost");
-    if (compositionKind || compositionSources || compositionCost) {
-      if (!compositionKind || !compositionSources || fusedSources ||
-          composedMaps ||
-          epilogueSources || epilogueMaps || foldRegionSources ||
-          foldRegionOutputSources || contractRegionSources)
-        return task.emitOpError(
-            "generic composition metadata must be complete and exclusive");
-      const bool contractFold = compositionKind.getValue() == "contract_fold";
-      const bool mapContract = compositionKind.getValue() == "map_contract";
-      const bool online =
-          compositionKind.getValue() ==
-          "online_normalized_exponential_weighted_contract";
-      if ((!contractFold && !mapContract && !online) ||
-          (contractFold && compositionSources.size() != 2) ||
-          (mapContract && compositionSources.size() != 2 &&
-           compositionSources.size() != 3) ||
-          (contractFold && task.getKind() != MaterializationTaskKind::Fold) ||
-          (mapContract &&
-           task.getKind() != MaterializationTaskKind::Contract) ||
-          (online && task.getKind() != MaterializationTaskKind::Fold &&
-           task.getKind() != MaterializationTaskKind::Contract) ||
-          (contractFold && compositionCost) ||
-          ((mapContract || online) && !compositionCost))
-        return task.emitOpError(
-            "generic composition kind must bind its task family and cost");
-      SmallVector<Operation *> operations;
-      for (Attribute source : compositionSources) {
-        auto found = sourceOperations.find(source);
-        if (!isa<SourceRefAttr>(source) || found == sourceOperations.end() ||
-            duplicateSources.contains(source) ||
-            !bound.insert(found->second).second)
-          return task.emitOpError(
-              "composition sources must uniquely partition algebra");
-        operations.push_back(found->second);
-        ++sourceOccurrences[found->second];
-      }
-      SmallVector<Operation *> recomputedOperations;
-      llvm::SmallDenseSet<Operation *> recomputedSet;
-      if (compositionRecomputedSources) {
-        if (!online)
-          return task.emitOpError(
-              "only online composition may declare recomputation");
-        for (Attribute source : compositionRecomputedSources) {
-          auto found = sourceOperations.find(source);
-          if (!isa<SourceRefAttr>(source) || found == sourceOperations.end() ||
-              duplicateSources.contains(source) ||
-              !bound.contains(found->second) ||
-              !recomputedSet.insert(found->second).second)
-            return task.emitOpError(
-                "online recomputation must bind unique earlier composition "
-                "sources");
-          recomputedOperations.push_back(found->second);
-        }
-      }
-      if ((contractFold &&
-           (!isa<ContractOp>(operations[0]) || !isa<FoldOp>(operations[1]) ||
-            sourceOperations.lookup(task.getSource()) != operations[1])) ||
-          (mapContract && operations.size() == 2 &&
-           (!isa<MapOp>(operations[0]) || !isa<ContractOp>(operations[1]) ||
-            sourceOperations.lookup(task.getSource()) != operations[1])) ||
-          (mapContract && operations.size() == 3 &&
-           (!isa<MapOp>(operations[0]) || !isa<MapOp>(operations[1]) ||
-            !isa<ContractOp>(operations[2]) ||
-            sourceOperations.lookup(task.getSource()) != operations[2])) ||
-          (online &&
-           !llvm::is_contained(operations,
-                               sourceOperations.lookup(task.getSource()))) ||
-          task.getSemanticFingerprint() != compositionTaskFingerprint(
-              compositionKind.getValue(), operations, recomputedOperations))
-        return task.emitOpError(
-            "composition sources must bind their source-ordered algebra");
-      if (mapContract || online) {
-        constexpr StringLiteral fields[] = {"baseline_launches",
-                                            "candidate_launches",
-                                            "baseline_temporary_bytes",
-                                            "candidate_temporary_bytes",
-                                            "baseline_temporary_traffic_bytes",
-                                            "candidate_temporary_traffic_bytes",
-                                            "contract_evaluations"};
-        if (compositionCost.size() != std::size(fields))
-          return task.emitOpError(
-              "composition cost requires the closed relative fields");
-        SmallVector<int64_t> values;
-        for (StringRef field : fields) {
-          auto value = compositionCost.getAs<IntegerAttr>(field);
-          if (!value || value.getInt() < 0)
-            return task.emitOpError(
-                "composition cost fields must be nonnegative i64");
-          values.push_back(value.getInt());
-        }
-        if (values[1] > values[0] || values[3] > values[2] ||
-            values[5] > values[4] ||
-            !(values[1] < values[0] || values[3] < values[2] ||
-              values[5] < values[4]) ||
-            (mapContract ? values[6] != 1 : values[6] <= 0))
-          return task.emitOpError(
-              "composition cost must dominate the materialized baseline");
-      }
-      continue;
-    }
-    if (contractRegionSources) {
-      sawContractRegion = true;
-      if (fusedSources || composedMaps || epilogueSources || epilogueMaps ||
-          foldRegionSources || foldRegionOutputSources ||
-          task.getKind() != MaterializationTaskKind::Contract) {
-        task.emitOpError(
-            "cannot mix Contract-region and legacy fusion metadata");
-        return failure();
-      }
-      SmallVector<Operation *> operations;
-      for (Attribute source : contractRegionSources) {
-        auto found = sourceOperations.find(source);
-        if (!isa<SourceRefAttr>(source) || found == sourceOperations.end() ||
-            duplicateSources.contains(source) ||
-            !isa<MapOp, FoldOp, ContractOp>(found->second)) {
-          task.emitOpError("Contract-region sources must bind unique algebra");
-          return failure();
-        }
-        operations.push_back(found->second);
-        bound.insert(found->second);
-        ++sourceOccurrences[found->second];
-        ++regionOccurrences[found->second];
-      }
-      if (task.getSemanticFingerprint() !=
-          contractRegionFingerprint(operations)) {
-        task.emitOpError("does not fingerprint every Contract-region source");
-        return failure();
-      }
-      auto foldSource =
-          task->getAttrOfType<SourceRefAttr>("contract_region_fold_source");
-      auto contractSource =
-          task->getAttrOfType<SourceRefAttr>("contract_region_contract_source");
-      auto boundarySource = task->getAttrOfType<SourceRefAttr>(
-          "contract_region_bf16_boundary_source");
-      auto epilogues =
-          task->getAttrOfType<ArrayAttr>("contract_region_epilogue_sources");
-      if (!foldSource ||
-          !isa_and_nonnull<FoldOp>(sourceOperations.lookup(foldSource)) ||
-          !contractSource ||
-          !isa_and_nonnull<ContractOp>(
-              sourceOperations.lookup(contractSource)) ||
-          sourceOperations.lookup(contractSource) !=
-              sourceOperations.lookup(task.getSource()) ||
-          !boundarySource ||
-          !isa_and_nonnull<MapOp>(sourceOperations.lookup(boundarySource)) ||
-          !epilogues || llvm::any_of(epilogues, [&](Attribute source) {
-            return !isa_and_nonnull<MapOp>(sourceOperations.lookup(source));
-          })) {
-        task.emitOpError("Contract-region roles must bind exact algebra kinds");
-        return failure();
-      }
-      if (auto recomputed = task->getAttrOfType<ArrayAttr>(
-              "contract_region_recomputed_sources")) {
-        for (Attribute source : recomputed) {
-          Operation *operation = sourceOperations.lookup(source);
-          if (!operation || !isa<MapOp, FoldOp>(operation) ||
-              !llvm::is_contained(operations, operation)) {
-            task.emitOpError(
-                "Contract-region recomputation must bind task-local algebra");
-            return failure();
-          }
-          ++recomputationDeclarations[operation];
-        }
-      }
-      continue;
-    }
-    if (foldRegionSources) {
-      sawFoldRegion = true;
-      if (fusedSources || composedMaps || epilogueSources || epilogueMaps ||
-          task.getKind() != MaterializationTaskKind::Fold) {
-        task.emitOpError("cannot mix Fold-region and legacy fusion metadata");
-        return failure();
-      }
-      SmallVector<Operation *> operations;
-      for (Attribute source : foldRegionSources) {
-        auto found = sourceOperations.find(source);
-        if (!isa<SourceRefAttr>(source) || found == sourceOperations.end() ||
-            duplicateSources.contains(source) ||
-            !isa<MapOp, FoldOp>(found->second)) {
-          task.emitOpError("Fold-region sources must bind unique algebra");
-          return failure();
-        }
-        operations.push_back(found->second);
-        bound.insert(found->second);
-        ++sourceOccurrences[found->second];
-        ++regionOccurrences[found->second];
-      }
-      if (task.getSemanticFingerprint() != foldRegionFingerprint(operations)) {
-        task.emitOpError("does not fingerprint every Fold-region source");
-        return failure();
-      }
-      auto outputSources =
-          task->getAttrOfType<ArrayAttr>("fold_region_output_sources");
-      if (!outputSources ||
-          outputSources.size() != task.getOutputBuffers().size()) {
-        task.emitOpError("Fold-region outputs must bind ordered sources");
-        return failure();
-      }
-      for (auto [source, bufferOrdinal] :
-           llvm::zip_equal(outputSources, task.getOutputBuffers())) {
-        Operation *operation = sourceOperations.lookup(source);
-        if (!operation || !llvm::is_contained(operations, operation) ||
-            operation->getNumResults() != 1 || bufferOrdinal < 0 ||
-            bufferOrdinal >= static_cast<int64_t>(buffers.size()) ||
-            buffers[bufferOrdinal].getTensorType() !=
-                operation->getResult(0).getType()) {
-          task.emitOpError(
-              "Fold-region output buffers must match their source results");
-          return failure();
-        }
-      }
-      if (auto recomputed = task->getAttrOfType<ArrayAttr>(
-              "fold_region_recomputed_sources")) {
-        for (Attribute source : recomputed) {
-          Operation *operation = sourceOperations.lookup(source);
-          if (!operation || !isa<MapOp, FoldOp>(operation) ||
-              !llvm::is_contained(operations, operation)) {
-            task.emitOpError(
-                "Fold-region recomputation must bind task-local algebra");
-            return failure();
-          }
-          ++recomputationDeclarations[operation];
-        }
-      }
-      continue;
-    }
-    if (foldRegionOutputSources) {
-      task.emitOpError("Fold-region outputs require Fold-region sources");
-      return failure();
-    }
-    if (sawFoldRegion && !sawContractRegion) {
-      task.emitOpError("cannot mix Fold-region and legacy tasks");
-      return failure();
-    }
-    if (fusedSources && epilogueSources) {
-      task.emitOpError("cannot mix Map fusion and Fold epilogue provenance");
-      return failure();
-    }
-    auto found = sourceOperations.find(task.getSource());
-    if (found == sourceOperations.end() ||
-        duplicateSources.contains(task.getSource())) {
-      task.emitOpError("source must uniquely bind one surviving algebra task");
-      return failure();
-    }
-    Operation *source = found->second;
-    SmallVector<Operation *> fusedOperations;
-    if (fusedSources) {
-      if (task.getKind() != MaterializationTaskKind::Map ||
-          fusedSources.size() < 2 ||
-          fusedSources.getValue().back() != task.getSource() ||
-          !composedMaps ||
-          composedMaps.size() != task.getInputBuffers().size()) {
-        task.emitOpError(
-            "fused Map provenance and composed inputs must be aligned");
-        return failure();
-      }
-      for (Attribute fusedSource : fusedSources) {
-        auto found = sourceOperations.find(fusedSource);
-        if (!isa<SourceRefAttr>(fusedSource) ||
-            found == sourceOperations.end() ||
-            duplicateSources.contains(fusedSource) ||
-            !isa<MapOp>(found->second) ||
-            !bound.insert(found->second).second) {
-          task.emitOpError(
-              "fused_sources must uniquely bind ordered surviving Maps");
-          return failure();
-        }
-        fusedOperations.push_back(found->second);
-      }
-      if (task.getSemanticFingerprint() !=
-          fusedMapFingerprint(fusedOperations)) {
-        task.emitOpError("does not fingerprint every fused Map semantic");
-        return failure();
-      }
-      for (Attribute map : composedMaps) {
-        if (!isa<AffineMapAttr>(map)) {
-          task.emitOpError("composed_input_maps must contain affine maps");
-          return failure();
-        }
-      }
-    } else if (epilogueSources) {
-      auto fold = dyn_cast<FoldOp>(source);
-      if (!fold || task.getKind() != MaterializationTaskKind::Fold ||
-          epilogueSources.empty() || !epilogueMaps ||
-          task.getInputBuffers().size() < fold->getNumOperands() ||
-          epilogueMaps.size() !=
-              task.getInputBuffers().size() - fold->getNumOperands() ||
-          !bound.insert(source).second) {
-        task.emitOpError(
-            "Fold epilogue provenance and composed inputs must be aligned");
-        return failure();
-      }
-      for (Attribute epilogueSource : epilogueSources) {
-        auto epilogue = sourceOperations.find(epilogueSource);
-        if (!isa<SourceRefAttr>(epilogueSource) ||
-            epilogue == sourceOperations.end() ||
-            duplicateSources.contains(epilogueSource) ||
-            !isa<MapOp>(epilogue->second) ||
-            !bound.insert(epilogue->second).second) {
-          task.emitOpError(
-              "fold_epilogue_sources must uniquely bind ordered Maps");
-          return failure();
-        }
-        fusedOperations.push_back(epilogue->second);
-      }
-      if (task.getSemanticFingerprint() !=
-          fusedFoldMapFingerprint(fold, fusedOperations)) {
-        task.emitOpError("does not fingerprint the Fold and every epilogue");
-        return failure();
-      }
-      for (Attribute map : epilogueMaps) {
-        if (!isa<AffineMapAttr>(map)) {
-          task.emitOpError("epilogue_input_maps must contain affine maps");
-          return failure();
-        }
-      }
-    }
-    if (!fusedSources && !epilogueSources && !bound.insert(source).second) {
-      task.emitOpError("source must uniquely bind one surviving algebra task");
-      return failure();
-    }
-    const bool kindMatches =
-        (task.getKind() == MaterializationTaskKind::Map &&
-         isa<MapOp, RelationOp>(source)) ||
-        (task.getKind() == MaterializationTaskKind::Fold &&
-         isa<FoldOp>(source)) ||
-        (task.getKind() == MaterializationTaskKind::Contract &&
-         isa<ContractOp>(source));
-    const std::string expectedFingerprint =
-        fusedSources
-            ? fusedMapFingerprint(fusedOperations)
-        : epilogueSources
-            ? fusedFoldMapFingerprint(cast<FoldOp>(source), fusedOperations)
-            : semanticTaskFingerprint(source);
-    const bool arityMatches =
-        fusedSources || epilogueSources ||
-        (task.getInputBuffers().size() == source->getNumOperands() &&
-         task.getOutputBuffers().size() == source->getNumResults());
-    if (!kindMatches ||
-        task.getSemanticFingerprint() != expectedFingerprint ||
-        !arityMatches) {
-      task.emitOpError("does not match its bound algebra semantics");
-      return failure();
-    }
-    if (!fusedSources && !epilogueSources) {
-      for (auto [bufferOrdinal, value] :
-           llvm::zip_equal(task.getInputBuffers(), source->getOperands())) {
-        if (buffers[bufferOrdinal].getTensorType() != value.getType()) {
-          task.emitOpError("input buffer type does not match bound algebra");
-          return failure();
-        }
-      }
-      for (auto [bufferOrdinal, value] :
-           llvm::zip_equal(task.getOutputBuffers(), source->getResults())) {
-        if (buffers[bufferOrdinal].getTensorType() != value.getType()) {
-          task.emitOpError("output buffer type does not match bound algebra");
-          return failure();
-        }
-      }
-    } else if (epilogueSources) {
-      auto fold = cast<FoldOp>(source);
-      for (auto [bufferOrdinal, value] : llvm::zip_equal(
-               task.getInputBuffers().take_front(fold->getNumOperands()),
-               source->getOperands())) {
-        if (bufferOrdinal < 0 || bufferOrdinal >= buffers.size() ||
-            buffers[bufferOrdinal].getTensorType() != value.getType()) {
-          task.emitOpError("Fold input buffer type does not match algebra");
-          return failure();
-        }
-      }
-      if (task.getOutputBuffers().size() != 1 ||
-          task.getOutputBuffers().front() < 0 ||
-          task.getOutputBuffers().front() >= buffers.size() ||
-          buffers[task.getOutputBuffers().front()].getTensorType() !=
-              fusedOperations.back()->getResult(0).getType()) {
-        task.emitOpError("Fold epilogue output does not match final Map");
-        return failure();
-      }
-    }
-    SmallVector<int64_t> expectedDomain;
-    if (auto map = dyn_cast<MapOp>(source)) {
-      FailureOr<SmallVector<int64_t>> domain = genericMapDomainShape(map);
-      if (failed(domain)) {
-        task.emitOpError("bound Map has no closed static domain");
-        return failure();
-      }
-      expectedDomain = std::move(*domain);
-    } else if (auto relation = dyn_cast<RelationOp>(source)) {
-      auto result = relation.getNumResults() == 1
-                        ? dyn_cast<RankedTensorType>(relation.getResult(0).getType())
-                        : RankedTensorType{};
-      if (!result || !result.hasStaticShape()) {
-        task.emitOpError("bound Relation has no closed static domain");
-        return failure();
-      }
-      expectedDomain.assign(result.getShape().begin(), result.getShape().end());
-    } else if (auto contract = dyn_cast<ContractOp>(source)) {
-      FailureOr<SmallVector<int64_t>> domain = contractDomainShape(contract);
-      if (failed(domain)) {
-        task.emitOpError("bound Contract has no closed static domain");
-        return failure();
-      }
-      expectedDomain = std::move(*domain);
-    } else {
-      auto fold = cast<FoldOp>(source);
-      expectedDomain.assign(
-          cast<RankedTensorType>(fold.getInputs()[0].getType())
-              .getShape()
-              .begin(),
-          cast<RankedTensorType>(fold.getInputs()[0].getType())
-              .getShape()
-              .end());
-    }
-    if (task.getDomainShape() != ArrayRef<int64_t>(expectedDomain)) {
-      task.emitOpError("domain does not match bound algebra indexing");
-      return failure();
-    }
-    if (fusedSources) {
-      for (Operation *operation : fusedOperations)
-        ++sourceOccurrences[operation];
-    } else {
-      ++sourceOccurrences[source];
-      for (Operation *operation : fusedOperations)
-        ++sourceOccurrences[operation];
-    }
-  }
-  if (sawFoldRegion || sawContractRegion) {
-    for (auto [operation, occurrences] : regionOccurrences) {
-      const int64_t declarations = recomputationDeclarations.lookup(operation);
-      const int64_t expectedDeclarations =
-          sourceOccurrences.lookup(operation) > 1 ? occurrences : 0;
-      if (declarations != expectedDeclarations) {
-        plan.emitOpError(
-            "Fold-region recomputation must exactly declare repeated sources");
-        return failure();
-      }
-    }
-  }
-  RegionOp owner;
-  if (!bound.empty()) {
-    owner = (*bound.begin())->getParentOfType<RegionOp>();
-  }
-  if (!owner || owner.getPolicy() != plan.getPolicy() ||
-      bound.size() != owner.getBody().front().getOperations().size() - 1) {
-    plan.emitOpError("must cover exactly one connected algebra region");
-    return failure();
-  }
-  for (Operation *operation : bound) {
-    if (operation->getParentOfType<RegionOp>() != owner) {
-      plan.emitOpError("tasks must bind one algebra region");
-      return failure();
-    }
-  }
-  auto manifest =
-      module->getAttrOfType<DictionaryAttr>(kCoverageManifestAttribute);
-  auto tuning = manifest ? manifest.getAs<StringAttr>("canonical_tuning")
-                         : StringAttr{};
-  const bool preferFusion =
-      tuning && tuning.getValue() == kFusionCanonicalTuning;
-  FailureOr<DerivedPlan> expected = deriveGpuPlan(owner, preferFusion);
-  if (failed(expected) || expected->tasks.size() != tasks.size() ||
-      expected->buffers.size() != buffers.size()) {
-    plan.emitOpError("does not equal the plan derived from bound algebra");
-    return failure();
-  }
-  for (auto [ordinal, expectedTask] : llvm::enumerate(expected->tasks)) {
-    MaterializationTaskOp actual = tasks[ordinal];
-    auto actualCompositionKind =
-        actual->getAttrOfType<StringAttr>("composition_kind");
-    auto actualCompositionSources =
-        actual->getAttrOfType<ArrayAttr>("composition_sources");
-    auto actualCompositionRecomputedSources =
-        actual->getAttrOfType<ArrayAttr>("composition_recomputed_sources");
-    auto actualCompositionCost =
-        actual->getAttrOfType<DictionaryAttr>("composition_cost");
-    auto actualFoldRegionSources =
-        actual->getAttrOfType<ArrayAttr>("fold_region_sources");
-    auto actualContractRegionSources =
-        actual->getAttrOfType<ArrayAttr>("contract_region_sources");
-    const bool expectedComposition = !expectedTask.compositionKind.empty();
-    if (expectedComposition) {
-      SmallVector<Attribute> expectedSources;
-      for (Operation *operation : expectedTask.compositionSources)
-        expectedSources.push_back(algebraSource(operation));
-      SmallVector<Attribute> expectedRecomputedSources;
-      for (Operation *operation : expectedTask.compositionRecomputedSources)
-        expectedRecomputedSources.push_back(algebraSource(operation));
-      auto costMatches = [&](StringRef field, int64_t expectedValue) {
-        auto value = actualCompositionCost
-                         ? actualCompositionCost.getAs<IntegerAttr>(field)
-                         : IntegerAttr{};
-        return value && value.getInt() == expectedValue;
-      };
-      const bool expectsCost =
-          expectedTask.compositionKind == "map_contract" ||
-          expectedTask.compositionKind ==
-              "online_normalized_exponential_weighted_contract";
-      const auto cost = expectedTask.compositionCost;
-      const bool matches =
-          actualCompositionKind && actualCompositionSources &&
-          actualCompositionKind.getValue() == expectedTask.compositionKind &&
-          actualCompositionSources.getValue() ==
-              ArrayRef<Attribute>(expectedSources) &&
-          (expectedRecomputedSources.empty()
-               ? !actualCompositionRecomputedSources
-               : actualCompositionRecomputedSources &&
-                     actualCompositionRecomputedSources.getValue() ==
-                         ArrayRef<Attribute>(expectedRecomputedSources)) &&
-          (expectsCost == static_cast<bool>(actualCompositionCost)) &&
-          (!expectsCost ||
-           (costMatches("baseline_launches", cost.baselineLaunches) &&
-            costMatches("candidate_launches", cost.candidateLaunches) &&
-            costMatches("baseline_temporary_bytes",
-                        cost.baselineTemporaryBytes) &&
-            costMatches("candidate_temporary_bytes",
-                        cost.candidateTemporaryBytes) &&
-            costMatches("baseline_temporary_traffic_bytes",
-                        cost.baselineTemporaryTrafficBytes) &&
-            costMatches("candidate_temporary_traffic_bytes",
-                        cost.candidateTemporaryTrafficBytes) &&
-            costMatches("contract_evaluations", cost.contractEvaluations))) &&
-          expectedTask.operation ==
-              sourceOperations.lookup(actual.getSource()) &&
-          actual.getDomainShape() == ArrayRef<int64_t>(expectedTask.domain) &&
-          actual.getReductionDimensions() ==
-              ArrayRef<int64_t>(expectedTask.reductionDimensions) &&
-          actual.getOrderFree().value_or(false) == expectedTask.orderFree &&
-          actual.getInputBuffers() == ArrayRef<int64_t>(expectedTask.inputs) &&
-          actual.getOutputBuffers() ==
-              ArrayRef<int64_t>(expectedTask.outputs) &&
-          actual.getDependencies() ==
-              ArrayRef<int64_t>(expectedTask.dependencies);
-      if (!matches) {
-        actual.emitOpError(
-            "generic composition must equal structural SSA derivation");
-        return failure();
-      }
-      continue;
-    }
-    if (actualCompositionKind || actualCompositionSources ||
-        actualCompositionRecomputedSources ||
-        actualCompositionCost) {
-      actual.emitOpError("unexpected generic composition metadata");
-      return failure();
-    }
-    const bool expectedContractRegion =
-        !expectedTask.contractRegionSources.empty();
-    if (expectedContractRegion) {
-      SmallVector<Attribute> expectedSources;
-      for (Operation *operation : expectedTask.contractRegionSources) {
-        if (auto map = dyn_cast<MapOp>(operation))
-          expectedSources.push_back(map.getSource());
-        else if (auto fold = dyn_cast<FoldOp>(operation))
-          expectedSources.push_back(fold.getSource());
-        else
-          expectedSources.push_back(cast<ContractOp>(operation).getSource());
-      }
-      SmallVector<Attribute> expectedEpilogues;
-      for (Operation *operation : expectedTask.contractRegionEpilogueSources)
-        expectedEpilogues.push_back(cast<MapOp>(operation).getSource());
-      SmallVector<Attribute> expectedRecomputed;
-      for (Operation *operation :
-           expectedTask.contractRegionRecomputedSources) {
-        if (auto map = dyn_cast<MapOp>(operation))
-          expectedRecomputed.push_back(map.getSource());
-        else
-          expectedRecomputed.push_back(cast<FoldOp>(operation).getSource());
-      }
-      auto actualStrategy =
-          actual->getAttrOfType<StringAttr>("contract_region_strategy");
-      auto actualEpilogues =
-          actual->getAttrOfType<ArrayAttr>("contract_region_epilogue_sources");
-      auto actualOperand = actual->getAttrOfType<IntegerAttr>(
-          "contract_region_normalized_operand");
-      auto actualCost =
-          actual->getAttrOfType<DictionaryAttr>("contract_region_cost");
-      auto actualRecomputed = actual->getAttrOfType<ArrayAttr>(
-          "contract_region_recomputed_sources");
-      auto cost = expectedTask.contractRegionCost;
-      auto costMatches = [&](StringRef field, int64_t expectedValue) {
-        auto value =
-            actualCost ? actualCost.getAs<IntegerAttr>(field) : IntegerAttr{};
-        return value && value.getInt() == expectedValue;
-      };
-      const bool matches =
-          actualContractRegionSources && actualStrategy && actualEpilogues &&
-          actualOperand && actualCost &&
-          actualContractRegionSources.getValue() ==
-              ArrayRef<Attribute>(expectedSources) &&
-          actualStrategy.getValue() == expectedTask.contractRegionStrategy &&
-          actual->getAttr("contract_region_fold_source") ==
-              cast<FoldOp>(expectedTask.contractRegionFold).getSource() &&
-          actual->getAttr("contract_region_contract_source") ==
-              cast<ContractOp>(expectedTask.contractRegionContract)
-                  .getSource() &&
-          actual->getAttr("contract_region_bf16_boundary_source") ==
-              cast<MapOp>(expectedTask.contractRegionBf16Boundary)
-                  .getSource() &&
-          actualEpilogues.getValue() ==
-              ArrayRef<Attribute>(expectedEpilogues) &&
-          actualOperand.getInt() ==
-              expectedTask.contractRegionNormalizedOperand &&
-          (expectedRecomputed.empty()
-               ? !actualRecomputed
-               : actualRecomputed &&
-                     actualRecomputed.getValue() ==
-                         ArrayRef<Attribute>(expectedRecomputed)) &&
-          costMatches("rows", cost.rows) &&
-          costMatches("reduction", cost.reduction) &&
-          costMatches("columns", cost.columns) &&
-          costMatches("output_tile", cost.outputTile) &&
-          costMatches("output_tiles", cost.outputTiles) &&
-          costMatches("duplicated_fold_elements",
-                      cost.duplicatedFoldElements) &&
-          costMatches("normalized_temporary_bytes",
-                      cost.normalizedTemporaryBytes) &&
-          costMatches("contract_temporary_bytes",
-                      cost.contractTemporaryBytes) &&
-          costMatches("compact_stat_bytes", cost.compactStatBytes) &&
-          expectedTask.operation ==
-              sourceOperations.lookup(actual.getSource()) &&
-          actual.getDomainShape() == ArrayRef<int64_t>(expectedTask.domain) &&
-          actual.getReductionDimensions() ==
-              ArrayRef<int64_t>(expectedTask.reductionDimensions) &&
-          actual.getInputBuffers() == ArrayRef<int64_t>(expectedTask.inputs) &&
-          actual.getOutputBuffers() ==
-              ArrayRef<int64_t>(expectedTask.outputs) &&
-          actual.getDependencies() ==
-              ArrayRef<int64_t>(expectedTask.dependencies);
-      if (!matches) {
-        actual.emitOpError(
-            "Contract-region plan must equal structural SSA derivation");
-        return failure();
-      }
-      continue;
-    }
-    if (actualContractRegionSources) {
-      actual.emitOpError("unexpected Contract-region metadata");
-      return failure();
-    }
-    const bool expectedFoldRegion = !expectedTask.foldRegionSources.empty();
-    if (expectedFoldRegion) {
-      SmallVector<Attribute> expectedRegionSources;
-      for (Operation *operation : expectedTask.foldRegionSources) {
-        if (auto map = dyn_cast<MapOp>(operation))
-          expectedRegionSources.push_back(map.getSource());
-        else
-          expectedRegionSources.push_back(cast<FoldOp>(operation).getSource());
-      }
-      auto actualPhases =
-          actual->getAttrOfType<ArrayAttr>("fold_region_phases");
-      auto actualOutputs =
-          actual->getAttrOfType<ArrayAttr>("fold_region_output_sources");
-      auto actualBoundaryUses =
-          actual->getAttrOfType<ArrayAttr>("fold_region_boundary_uses");
-      auto actualRecomputed =
-          actual->getAttrOfType<ArrayAttr>("fold_region_recomputed_sources");
-      SmallVector<Attribute> expectedRecomputed;
-      for (Operation *operation : expectedTask.foldRegionRecomputedSources) {
-        if (auto map = dyn_cast<MapOp>(operation))
-          expectedRecomputed.push_back(map.getSource());
-        else
-          expectedRecomputed.push_back(cast<FoldOp>(operation).getSource());
-      }
-      SmallVector<Attribute> expectedOutputs;
-      for (Operation *operation : expectedTask.foldRegionOutputs) {
-        if (auto map = dyn_cast<MapOp>(operation))
-          expectedOutputs.push_back(map.getSource());
-        else
-          expectedOutputs.push_back(cast<FoldOp>(operation).getSource());
-      }
-      bool matches =
-          actualFoldRegionSources && actualPhases && actualOutputs &&
-          actualBoundaryUses &&
-          actualFoldRegionSources.getValue() ==
-              ArrayRef<Attribute>(expectedRegionSources) &&
-          actualOutputs.getValue() == ArrayRef<Attribute>(expectedOutputs) &&
-          actualPhases.size() == expectedTask.foldRegionPhases.size() &&
-          actualBoundaryUses.size() ==
-              expectedTask.foldRegionBoundaryUses.size() &&
-          (expectedRecomputed.empty()
-               ? !actualRecomputed
-               : actualRecomputed &&
-                     actualRecomputed.getValue() ==
-                         ArrayRef<Attribute>(expectedRecomputed));
-      for (auto [phaseOrdinal, operation] :
-           llvm::enumerate(expectedTask.foldRegionPhases)) {
-        if (!matches)
-          break;
-        auto phase = dyn_cast<DictionaryAttr>(actualPhases[phaseOrdinal]);
-        auto fold = cast<FoldOp>(operation);
-        auto domain =
-            phase
-                ? dyn_cast_or_null<DenseI64ArrayAttr>(phase.get("domain_shape"))
-                : DenseI64ArrayAttr{};
-        auto reduction = phase ? dyn_cast_or_null<DenseI64ArrayAttr>(
-                                     phase.get("reduction_dimensions"))
-                               : DenseI64ArrayAttr{};
-        matches = phase && phase.get("source") == fold.getSource() && domain &&
-                  reduction &&
-                  domain.asArrayRef() ==
-                      cast<RankedTensorType>(fold.getInputs().front().getType())
-                          .getShape() &&
-                  reduction.asArrayRef() == fold.getReductionDimensions() &&
-                  cast<BoolAttr>(phase.get("order_free")).getValue() ==
-                      fold.getOrderFree() &&
-                  cast<StringAttr>(phase.get("transition")).getValue() ==
-                      (phaseOrdinal == 0 ? "launch_boundary" : "cta_local");
-      }
-      for (auto [useOrdinal, expectedUse] :
-           llvm::enumerate(expectedTask.foldRegionBoundaryUses)) {
-        if (!matches)
-          break;
-        auto use = dyn_cast<DictionaryAttr>(actualBoundaryUses[useOrdinal]);
-        matches =
-            use &&
-            cast<IntegerAttr>(use.get("input_buffer")).getInt() ==
-                expectedUse.inputBuffer &&
-            use.get("source") == expectedUse.source.getSource() &&
-            cast<IntegerAttr>(use.get("operand")).getInt() ==
-                expectedUse.operand &&
-            cast<AffineMapAttr>(use.get("indexing_map")).getValue() ==
-                expectedUse.indexingMap &&
-            cast<IntegerAttr>(use.get("phase")).getInt() == expectedUse.phase;
-      }
-      if (!matches ||
-          expectedTask.operation !=
-              sourceOperations.lookup(actual.getSource()) ||
-          actual.getReductionDimensions() !=
-              ArrayRef<int64_t>(expectedTask.reductionDimensions) ||
-          actual.getOrderFree().value_or(false) != expectedTask.orderFree ||
-          actual.getInputBuffers() != ArrayRef<int64_t>(expectedTask.inputs) ||
-          actual.getOutputBuffers() !=
-              ArrayRef<int64_t>(expectedTask.outputs) ||
-          actual.getDependencies() !=
-              ArrayRef<int64_t>(expectedTask.dependencies)) {
-        actual.emitOpError(
-            "Fold-region plan must equal structural SSA derivation");
-        return failure();
-      }
-      continue;
-    }
-    if (actualFoldRegionSources) {
-      actual.emitOpError("unexpected Fold-region metadata");
-      return failure();
-    }
-    SmallVector<Attribute> expectedSources;
-    for (Operation *operation : expectedTask.fusedOperations)
-      expectedSources.push_back(cast<MapOp>(operation).getSource());
-    SmallVector<Attribute> expectedMaps;
-    for (AffineMap map : expectedTask.composedInputMaps)
-      expectedMaps.push_back(AffineMapAttr::get(map));
-    auto actualSources = actual->getAttrOfType<ArrayAttr>("fused_sources");
-    auto actualMaps =
-        actual->getAttrOfType<ArrayAttr>("composed_input_maps");
-    auto actualEpilogueSources =
-        actual->getAttrOfType<ArrayAttr>("fold_epilogue_sources");
-    auto actualEpilogueMaps =
-        actual->getAttrOfType<ArrayAttr>("epilogue_input_maps");
-    const bool expectedFoldMap = expectedTask.fusedFold != nullptr;
-    if (expectedTask.operation != sourceOperations.lookup(actual.getSource()) ||
-        (expectedFoldMap && (actualSources || actualMaps)) ||
-        (!expectedFoldMap &&
-         (expectedSources.empty() != !actualSources)) ||
-        (!expectedFoldMap && !expectedSources.empty() &&
-         actualSources.getValue() != ArrayRef<Attribute>(expectedSources)) ||
-        (!expectedFoldMap && (expectedMaps.empty() != !actualMaps)) ||
-        (!expectedFoldMap && !expectedMaps.empty() &&
-         actualMaps.getValue() != ArrayRef<Attribute>(expectedMaps)) ||
-        (expectedFoldMap != static_cast<bool>(actualEpilogueSources)) ||
-        (expectedFoldMap &&
-         actualEpilogueSources.getValue() !=
-             ArrayRef<Attribute>(expectedSources)) ||
-        (expectedFoldMap != static_cast<bool>(actualEpilogueMaps)) ||
-        (expectedFoldMap &&
-         actualEpilogueMaps.getValue() != ArrayRef<Attribute>(expectedMaps)) ||
-        actual.getReductionDimensions() !=
-            ArrayRef<int64_t>(expectedTask.reductionDimensions) ||
-        actual.getOrderFree().value_or(false) != expectedTask.orderFree ||
-        actual.getInputBuffers() != ArrayRef<int64_t>(expectedTask.inputs) ||
-        actual.getOutputBuffers() != ArrayRef<int64_t>(expectedTask.outputs) ||
-        actual.getDependencies() !=
-            ArrayRef<int64_t>(expectedTask.dependencies)) {
-      actual.emitOpError(
-          "task order and edges must equal bound algebra SSA dependencies");
-      return failure();
-    }
-  }
-  for (auto [ordinal, expectedBuffer] : llvm::enumerate(expected->buffers)) {
-    MaterializationBufferOp actual = buffers[ordinal];
-    auto actualProducer = actual->getAttrOfType<IntegerAttr>("producer");
-    std::optional<int64_t> producer =
-        actualProducer ? std::optional<int64_t>(actualProducer.getInt())
-                       : std::nullopt;
-    if (actual.getTensorType() != expectedBuffer.value.getType() ||
-        producer != expectedBuffer.producer ||
-        actual.getConsumers() != ArrayRef<int64_t>(expectedBuffer.consumers) ||
-        actual.getLiveOut() != expectedBuffer.liveOut) {
-      actual.emitOpError(
-          "buffer ownership and uses must equal bound algebra SSA edges");
-      return failure();
-    }
-  }
-  if (boundRegion)
-    *boundRegion = owner;
-  return success();
-}
-
-class VerifyMaterializationPlanPass
-    : public impl::ShuttleVerifyMaterializationPlanPassBase<
-          VerifyMaterializationPlanPass> {
-public:
-  void runOnOperation() override {
-    ModuleOp module = getOperation();
-    SmallVector<MaterializationPlanOp> plans(
-        module.getOps<MaterializationPlanOp>());
-    SmallVector<RegionOp> regions;
-    llvm::SmallDenseSet<Operation *> owners;
-    bool invalid = plans.empty();
-    for (MaterializationPlanOp plan : plans) {
-      RegionOp owner;
-      if (failed(
-              verifyMaterializationPlanAgainstSource(module, plan, &owner)) ||
-          !owners.insert(owner.getOperation()).second) {
-        invalid = true;
-        break;
-      }
-      regions.push_back(owner);
-    }
-    size_t regionCount = 0;
-    module.walk([&](RegionOp) { ++regionCount; });
-    if (invalid || regions.size() != regionCount) {
-      module.emitError(
-          "requires one source-bound materialization plan per GPU region");
-      signalPassFailure();
-    }
-  }
-};
-
-#include "GpuScheduleGeometry.inc"
-
-void createScheduleRecord(OpBuilder &builder, Location location,
-                          StringRef operationName,
-                          ArrayRef<NamedAttribute> attributes) {
-  OperationState state(location, operationName);
-  state.addAttributes(attributes);
-  builder.create(state);
-}
-
-FailureOr<ScheduleTaskKind>
-scheduleKindForMaterializationTask(MaterializationTaskOp task) {
-  if (isOnlineStateTask(task) &&
-      task.getKind() == MaterializationTaskKind::Fold)
-    return ScheduleTaskKind::RowFold;
-  if (task.getKind() == MaterializationTaskKind::Contract) {
-    return ScheduleTaskKind::Contract;
-  }
-  if (task.getKind() == MaterializationTaskKind::Map) {
-    return task.getDomainShape().empty() ? ScheduleTaskKind::Scalar
-                                         : ScheduleTaskKind::Elementwise;
-  }
-  if (task.getKind() != MaterializationTaskKind::Fold) {
-    return failure();
-  }
-  const int64_t rank = task.getDomainShape().size();
-  ArrayRef<int64_t> dimensions = task.getReductionDimensions();
-  if (dimensions == ArrayRef<int64_t>({rank - 1})) {
-    return ScheduleTaskKind::RowFold;
-  }
-  if ((rank == 2 && dimensions == ArrayRef<int64_t>({0})) ||
-      isFullPrefixReduction(dimensions, rank)) {
-    return ScheduleTaskKind::ColumnFold;
-  }
-  return failure();
-}
-
-class PlanSimt32RowFoldSchedulePass
-    : public impl::ShuttlePlanSimt32RowFoldSchedulePassBase<
-          PlanSimt32RowFoldSchedulePass> {
-public:
-  void runOnOperation() override {
-    ModuleOp module = getOperation();
-    SmallVector<MaterializationPlanOp> materializationPlans(
-        module.getOps<MaterializationPlanOp>());
-    if (materializationPlans.empty()) {
-      module.emitError("requires source-bound materialization plans");
-      return signalPassFailure();
-    }
-    llvm::SmallDenseSet<Operation *> owners;
-    for (MaterializationPlanOp plan : materializationPlans) {
-      RegionOp owner;
-      const bool online = isCertifiedOnlineStatePlan(plan);
-      if (failed(verifyMaterializationPlanAgainstSource(module, plan,
-                                                        &owner)) ||
-          !owner ||
-          (!online &&
-           llvm::any_of(owner.getBody().front().without_terminator(),
-                        [](Operation &operation) {
-                          return isa<RelationOp>(operation);
-                        })) ||
-          !owners.insert(owner.getOperation()).second) {
-        module.emitError(
-            "requires one source-bound executable materialization plan per "
-            "GPU region");
-        return signalPassFailure();
-      }
-    }
-    size_t regionCount = 0;
-    module.walk([&](RegionOp) { ++regionCount; });
-    if (owners.size() != regionCount) {
-      module.emitError(
-          "requires one source-bound materialization plan per GPU region");
-      return signalPassFailure();
-    }
-    if (!module.getOps<SchedulePlanOp>().empty()) {
-      module.emitError("already contains a schedule plan");
-      return signalPassFailure();
-    }
-    for (MaterializationPlanOp source : materializationPlans) {
-      SmallVector<MaterializationBufferOp> sourceBuffers(
-          source.getBody().front().getOps<MaterializationBufferOp>());
-      SmallVector<MaterializationTaskOp> sourceTasks(
-          source.getBody().front().getOps<MaterializationTaskOp>());
-
-      OpBuilder builder(module.getContext());
-      builder.setInsertionPointToEnd(module.getBody());
-      OperationState planState(module.getLoc(),
-                               SchedulePlanOp::getOperationName());
-      planState.addAttribute("schema_version", builder.getI64IntegerAttr(
-                                                   source.getSchemaVersion()));
-      planState.addAttribute(
-          "target",
-          ScheduleTargetAttr::get(module.getContext(), ScheduleTarget::Simt32));
-      planState.addAttribute("policy", source.getPolicyAttr());
-      planState.addAttribute("source_plan_fingerprint",
-                             builder.getStringAttr(source.getFingerprint()));
-      planState.addAttribute("fingerprint",
-                             builder.getStringAttr(std::string(64, '0')));
-      planState.addRegion();
-      auto schedule = cast<SchedulePlanOp>(builder.create(planState));
-      Block *body = new Block();
-      schedule.getBody().push_back(body);
-      builder.setInsertionPointToEnd(body);
-
-      for (auto [ordinal, buffer] : llvm::enumerate(sourceBuffers)) {
-        auto type = cast<RankedTensorType>(buffer.getTensorType());
-        SmallVector<int64_t> order;
-        for (int64_t axis = 0; axis < type.getRank(); ++axis) {
-          order.push_back(axis);
-        }
-        createScheduleRecord(
-            builder, buffer.getLoc(), ScheduleBufferOp::getOperationName(),
-            {builder.getNamedAttr("ordinal",
-                                  builder.getI64IntegerAttr(ordinal)),
-             builder.getNamedAttr("source_buffer",
-                                  builder.getI64IntegerAttr(ordinal)),
-             builder.getNamedAttr("tensor_type", TypeAttr::get(type)),
-             builder.getNamedAttr(
-                 "indexing", ScheduleBufferIndexingAttr::get(
-                                 module.getContext(),
-                                 type.getRank() == 0
-                                     ? ScheduleBufferIndexing::Scalar
-                                     : ScheduleBufferIndexing::Lexicographic)),
-             builder.getNamedAttr(
-                 "iteration_order",
-                 DenseI64ArrayAttr::get(module.getContext(), order)),
-             builder.getNamedAttr(
-                 "lifetime_start",
-                 builder.getI64IntegerAttr(buffer.getLifetimeStart())),
-             builder.getNamedAttr(
-                 "lifetime_end",
-                 builder.getI64IntegerAttr(buffer.getLifetimeEnd()))});
-      }
-      for (auto [ordinal, task] : llvm::enumerate(sourceTasks)) {
-        FailureOr<ScheduleTaskKind> derivedKind =
-            scheduleKindForMaterializationTask(task);
-        if (failed(derivedKind)) {
-          task.emitOpError("cannot derive a closed SIMT32 task kind");
-          return signalPassFailure();
-        }
-        ScheduleTaskKind kind = *derivedKind;
-        FailureOr<ScheduledGeometry> geometry =
-            isOnlineStateTask(task)
-                ? deriveOnlineStateGeometry(task)
-            : task->hasAttr("contract_region_sources")
-                ? deriveContractRegionGeometry(task, source.getPolicy())
-                : deriveSimt32Geometry(kind, task.getDomainShape(),
-                                       source.getPolicy());
-        if (failed(geometry)) {
-          task.emitOpError("cannot derive a bounded SIMT32 schedule candidate");
-          return signalPassFailure();
-        }
-        SmallVector<NamedAttribute> attrs{
-            builder.getNamedAttr("ordinal", builder.getI64IntegerAttr(ordinal)),
-            builder.getNamedAttr("source_task",
-                                 builder.getI64IntegerAttr(ordinal)),
-            builder.getNamedAttr(
-                "kind", ScheduleTaskKindAttr::get(module.getContext(), kind)),
-            builder.getNamedAttr("domain_shape", task.getDomainShapeAttr()),
-            builder.getNamedAttr(
-                "grid_shape",
-                DenseI64ArrayAttr::get(module.getContext(), geometry->grid)),
-            builder.getNamedAttr(
-                "tile_shape",
-                DenseI64ArrayAttr::get(module.getContext(), geometry->tile)),
-            builder.getNamedAttr("serial_tiles", builder.getI64IntegerAttr(
-                                                     geometry->serialTiles)),
-            builder.getNamedAttr(
-                "workgroup_threads",
-                builder.getI64IntegerAttr(geometry->workgroupThreads)),
-            builder.getNamedAttr("subgroup_size", builder.getI64IntegerAttr(
-                                                      geometry->subgroupSize)),
-            builder.getNamedAttr("scratch_bytes", builder.getI64IntegerAttr(
-                                                      geometry->scratchBytes)),
-            builder.getNamedAttr("input_buffers", task.getInputBuffersAttr()),
-            builder.getNamedAttr("output_buffers", task.getOutputBuffersAttr()),
-            builder.getNamedAttr("dependencies", task.getDependenciesAttr()),
-            builder.getNamedAttr("semantic_fingerprint",
-                                 task.getSemanticFingerprintAttr())};
-        if (isOnlineStateTask(task))
-          attrs.push_back(builder.getNamedAttr(
-              "online_state_protocol",
-              builder.getStringAttr(kOnlineStateProtocol)));
-        if (auto vectorDimensions = task.getOnlineVectorDimensionsAttr())
-          attrs.push_back(builder.getNamedAttr("online_vector_dimensions",
-                                               vectorDimensions));
-        if (task.getOnlineMma().value_or(false))
-          attrs.push_back(builder.getNamedAttr("online_mma",
-                                              builder.getBoolAttr(true)));
-        if (geometry->reductionAxis) {
-          attrs.push_back(builder.getNamedAttr(
-              "reduction_axis",
-              builder.getI64IntegerAttr(*geometry->reductionAxis)));
-          attrs.push_back(builder.getNamedAttr(
-              "reduction_order",
-              ScheduleReductionOrderAttr::get(
-                  module.getContext(),
-                  isOnlineStateTask(task)
-                      ? ScheduleReductionOrder::LeafOrderFree
-                  : kind == ScheduleTaskKind::Contract
-                      ? (source.getPolicy() == NumericalPolicy::Fast
-                             ? ScheduleReductionOrder::LeafOrderFree
-                             : ScheduleReductionOrder::SerialAscendingFmaRnF32)
-                      : ScheduleReductionOrder::
-                            TreeAssociationFreeLeafOrderFixed)));
-        }
-        if (auto strategy =
-                task->getAttrOfType<StringAttr>("contract_region_strategy")) {
-          attrs.push_back(
-              builder.getNamedAttr("contract_region_strategy", strategy));
-          attrs.push_back(builder.getNamedAttr(
-              "contract_region_cost",
-              task->getAttrOfType<DictionaryAttr>("contract_region_cost")));
-        }
-        createScheduleRecord(builder, task.getLoc(),
-                             ScheduleTaskOp::getOperationName(), attrs);
-      }
-      builder.create<SchedulePlanYieldOp>(module.getLoc());
-      schedule.setFingerprint(schedulePlanFingerprint(schedule));
-      if (failed(schedule.verifyRegions())) {
-        return signalPassFailure();
-      }
-    }
-  }
-};
-
-LogicalResult
-verifySchedulePlanAgainstMaterialization(MaterializationPlanOp source,
-                                         SchedulePlanOp schedule) {
-  if (schedule.getSchemaVersion() != source.getSchemaVersion() ||
-      schedule.getTarget() != ScheduleTarget::Simt32 ||
-      schedule.getPolicy() != source.getPolicy() ||
-      schedule.getSourcePlanFingerprint() != source.getFingerprint()) {
-    return schedule.emitOpError(
-        "schema, target, policy, and source fingerprint must bind "
-        "materialization");
-  }
-  SmallVector<MaterializationBufferOp> sourceBuffers(
-      source.getBody().front().getOps<MaterializationBufferOp>());
-  SmallVector<MaterializationTaskOp> sourceTasks(
-      source.getBody().front().getOps<MaterializationTaskOp>());
-  SmallVector<ScheduleBufferOp> buffers(
-      schedule.getBody().front().getOps<ScheduleBufferOp>());
-  SmallVector<ScheduleTaskOp> tasks(
-      schedule.getBody().front().getOps<ScheduleTaskOp>());
-  if (buffers.size() != sourceBuffers.size() ||
-      tasks.size() != sourceTasks.size()) {
-    return schedule.emitOpError(
-        "must cover every materialization buffer and task exactly once");
-  }
-  for (auto [ordinal, actual, expected] :
-       llvm::enumerate(buffers, sourceBuffers)) {
-    if (actual.getSourceBuffer() != static_cast<int64_t>(ordinal) ||
-        actual.getTensorType() != expected.getTensorType() ||
-        actual.getLifetimeStart() != expected.getLifetimeStart() ||
-        actual.getLifetimeEnd() != expected.getLifetimeEnd()) {
-      return actual.emitOpError(
-          "schedule buffer type and lifetime must equal materialization");
-    }
-  }
-  for (auto [ordinal, actual, expected] : llvm::enumerate(tasks, sourceTasks)) {
-    FailureOr<ScheduleTaskKind> expectedKind =
-        scheduleKindForMaterializationTask(expected);
-    if (failed(expectedKind)) {
-      return expected.emitOpError("does not have a closed SIMT32 task kind");
-    }
-    auto expectedContractStrategy =
-        expected->getAttr("contract_region_strategy");
-    auto expectedContractCost = expected->getAttr("contract_region_cost");
-    StringAttr expectedOnlineProtocol =
-        isOnlineStateTask(expected)
-            ? StringAttr::get(source.getContext(), kOnlineStateProtocol)
-            : StringAttr{};
-    if (actual.getSourceTask() != static_cast<int64_t>(ordinal) ||
-        actual.getKind() != *expectedKind ||
-        actual.getDomainShape() != expected.getDomainShape() ||
-        actual.getInputBuffers() != expected.getInputBuffers() ||
-        actual.getOutputBuffers() != expected.getOutputBuffers() ||
-        actual.getDependencies() != expected.getDependencies() ||
-        actual.getSemanticFingerprint() != expected.getSemanticFingerprint() ||
-        actual->getAttr("contract_region_strategy") !=
-            expectedContractStrategy ||
-        actual->getAttr("contract_region_cost") != expectedContractCost) {
-      return actual.emitOpError(
-          "schedule dependencies must equal the materialization task");
-    }
-    if (actual.getOnlineStateProtocolAttr() != expectedOnlineProtocol)
-      return actual.emitOpError(
-          "online state protocol must equal materialization semantics");
-    if (actual.getOnlineVectorDimensionsAttr() !=
-        expected.getOnlineVectorDimensionsAttr())
-      return actual.emitOpError(
-          "online vector dimensions must equal materialization semantics");
-    if (actual.getOnlineMma().value_or(false) !=
-        expected.getOnlineMma().value_or(false))
-      return actual.emitOpError(
-          "online MMA capability must equal materialization semantics");
-    FailureOr<ScheduledGeometry> expectedGeometry =
-        isOnlineStateTask(expected)
-            ? deriveOnlineStateGeometry(expected)
-        : expected->hasAttr("contract_region_sources")
-            ? deriveContractRegionGeometry(expected, source.getPolicy())
-            : deriveSimt32Geometry(*expectedKind, expected.getDomainShape(),
-                                   source.getPolicy());
-    if (failed(expectedGeometry) ||
-        actual.getGridShape() != ArrayRef<int64_t>(expectedGeometry->grid) ||
-        actual.getTileShape() != ArrayRef<int64_t>(expectedGeometry->tile) ||
-        actual.getSerialTiles() != expectedGeometry->serialTiles ||
-        actual.getWorkgroupThreads() != expectedGeometry->workgroupThreads ||
-        actual.getScratchBytes() != expectedGeometry->scratchBytes ||
-        actual.getReductionAxis() != expectedGeometry->reductionAxis ||
-        actual.getReductionOrder() !=
-            (isOnlineStateTask(expected)
-                 ? std::optional<ScheduleReductionOrder>(
-                       ScheduleReductionOrder::LeafOrderFree)
-                 : actual.getReductionOrder()))
-      return actual.emitOpError(
-          "online schedule geometry must equal the certified derivation");
-  }
-  return success();
-}
-
-class VerifySimt32RowFoldSchedulePass
-    : public impl::ShuttleVerifySimt32RowFoldSchedulePassBase<
-          VerifySimt32RowFoldSchedulePass> {
-public:
-  void runOnOperation() override {
-    ModuleOp module = getOperation();
-    SmallVector<MaterializationPlanOp> materializationPlans(
-        module.getOps<MaterializationPlanOp>());
     SmallVector<SchedulePlanOp> schedules(module.getOps<SchedulePlanOp>());
-    if (materializationPlans.empty() ||
-        materializationPlans.size() != schedules.size()) {
-      module.emitError("requires one valid schedule per materialization plan");
+    if (schedules.empty() || !module.getOps<EventLoweringPlanOp>().empty() ||
+        !module.getOps<DeviceModuleOp>().empty() ||
+        !module.getOps<InvocationAbiOp>().empty() ||
+        !module.getOps<ExecutableBundleOp>().empty()) {
+      module.emitError(
+          "requires source schedules and no Event or executable plans");
       return signalPassFailure();
     }
-    llvm::SmallDenseSet<Operation *> matchedSchedules;
-    for (MaterializationPlanOp materialization : materializationPlans) {
-      SchedulePlanOp match;
-      for (SchedulePlanOp schedule : schedules) {
-        if (schedule.getSourcePlanFingerprint() ==
-            materialization.getFingerprint()) {
-          if (match) {
-            module.emitError("materialization plan has duplicate schedules");
-            return signalPassFailure();
-          }
-          match = schedule;
-        }
+    OpBuilder builder(module.getContext());
+    builder.setInsertionPointToEnd(module.getBody());
+    for (SchedulePlanOp schedule : schedules) {
+      if (failed(schedule.verifyRegions())) {
+        schedule.emitError("cannot lower events from an invalid schedule");
+        return signalPassFailure();
       }
-      if (!match || !matchedSchedules.insert(match.getOperation()).second ||
-          failed(verifyMaterializationPlanAgainstSource(module,
-                                                        materialization)) ||
-          failed(match.verifyRegions()) ||
-          failed(verifySchedulePlanAgainstMaterialization(materialization,
-                                                          match))) {
-        module.emitError(
-            "requires one valid schedule per materialization plan");
+      EventLoweringPlanOp eventPlan =
+          createSourceBoundImperativeEventLoweringPlan(builder, module.getLoc(),
+                                                       schedule);
+      if (failed(verifyEventLoweringPlanAgainstSchedule(schedule, eventPlan))) {
+        schedule.emitError(
+            "cannot derive exact pre-physical Event wait/notify requirements");
         return signalPassFailure();
       }
     }
   }
 };
 
-struct ExecutableSlotSpec {
-  Type tensorType;
-  int64_t requiredBytes;
-  SmallVector<int64_t> strides;
-  int64_t alignment;
-  ExecutableAccess access;
-  MaterializationStorage storage;
-};
-
-struct GpuEntrySpec {
-  int64_t ordinal;
-  int64_t codeOffset;
-  int64_t codeLength;
-  SmallVector<int64_t> inputs;
-  SmallVector<int64_t> outputs;
-  SmallVector<int64_t> dependencies;
-  ExecutablePredication predication;
-  std::optional<ScheduleReductionOrder> reductionOrder;
-  std::array<int64_t, 3> grid;
-  std::array<int64_t, 3> block;
-  int64_t dynamicSharedBytes;
-  int64_t kernelArity;
-  std::optional<std::string> onlineStateProtocol;
-  SmallVector<AffineMap> logicalCoordinateMaps;
-  std::string codeDigest;
-};
-
-struct GpuExecutableSpec {
-  SmallVector<int8_t> code;
-  std::vector<GpuEntrySpec> entries;
-  SmallVector<ExecutableSlotSpec> slots;
-  SmallVector<int64_t> reuseGroups;
-  SmallVector<std::optional<int64_t>> bindingIndices;
-};
-
-SmallVector<int64_t> publicRegionResultBindings(RegionOp region) {
-  SmallVector<int64_t> bindings(region.getNumResults(), -1);
-  int64_t nextBinding = 0;
-  if (auto function = region->getParentOfType<func::FuncOp>()) {
-    if (auto returnOp =
-            dyn_cast<func::ReturnOp>(function.getBody().front().back())) {
-      for (Value value : returnOp.getOperands()) {
-        auto result = dyn_cast<OpResult>(value);
-        if (!result || result.getOwner() != region ||
-            bindings[result.getResultNumber()] >= 0)
-          continue;
-        bindings[result.getResultNumber()] = nextBinding++;
-      }
-    }
-  }
-  for (int64_t &binding : bindings)
-    if (binding < 0)
-      binding = nextBinding++;
-  return bindings;
-}
-
-FailureOr<int64_t> staticElementCount(RankedTensorType type) {
-  int64_t elements = 1;
-  for (int64_t extent : type.getShape()) {
-    if (extent <= 0 || elements > std::numeric_limits<int64_t>::max() / extent)
-      return failure();
-    elements *= extent;
-  }
-  return elements;
-}
-
-FailureOr<SmallVector<ExecutableSlotSpec>>
-deriveExecutableSlots(MaterializationPlanOp materialization) {
-  SmallVector<ExecutableSlotSpec> slots;
-  for (MaterializationBufferOp buffer :
-       materialization.getBody().front().getOps<MaterializationBufferOp>()) {
-    auto type = dyn_cast<RankedTensorType>(buffer.getTensorType());
-    if (!type || !type.hasStaticShape() ||
-        (!type.getElementType().isBF16() && !type.getElementType().isF32()))
-      return failure();
-    const int64_t elementBytes = type.getElementType().isBF16() ? 2 : 4;
-    FailureOr<int64_t> elements = staticElementCount(type);
-    if (failed(elements) ||
-        *elements > std::numeric_limits<int64_t>::max() / elementBytes)
-      return failure();
-    SmallVector<int64_t> strides(type.getRank());
-    int64_t stride = elementBytes;
-    for (int64_t axis = type.getRank(); axis > 0; --axis) {
-      strides[axis - 1] = stride;
-      stride *= type.getDimSize(axis - 1);
-    }
-    ExecutableAccess access = ExecutableAccess::ReadWrite;
-    if (buffer.getLiveIn())
-      access = ExecutableAccess::Read;
-    else if (buffer.getLiveOut())
-      access = ExecutableAccess::Write;
-    slots.push_back(ExecutableSlotSpec{type, *elements * elementBytes,
-                                       std::move(strides), elementBytes,
-                                       access, buffer.getStorage()});
-  }
-  return slots;
-}
-
-FailureOr<SmallVector<int64_t>>
-deriveGpuReuseGroups(MaterializationPlanOp materialization,
-                     ArrayRef<ExecutableSlotSpec> slots) {
-  SmallVector<MaterializationBufferOp> buffers(
-      materialization.getBody().front().getOps<MaterializationBufferOp>());
-  if (buffers.size() != slots.size())
-    return failure();
-  struct Candidate {
-    int64_t ordinal;
-    int64_t lifetimeStart;
-    int64_t lifetimeEnd;
-    int64_t requiredBytes;
-  };
-  struct ReuseGroup {
-    int64_t ordinal;
-    SmallVector<std::pair<int64_t, int64_t>> intervals;
-  };
-  SmallVector<Candidate> candidates;
-  SmallVector<int64_t> groups(slots.size(), -1);
-  for (auto [ordinal, buffer, slot] : llvm::enumerate(buffers, slots)) {
-    if (slot.storage != MaterializationStorage::Temporary) {
-      groups[ordinal] = ordinal;
-      continue;
-    }
-    if (slot.requiredBytes <= 0 || buffer.getLifetimeStart() < 0 ||
-        buffer.getLifetimeEnd() < buffer.getLifetimeStart())
-      return failure();
-    candidates.push_back({static_cast<int64_t>(ordinal),
-                          static_cast<int64_t>(buffer.getLifetimeStart()),
-                          static_cast<int64_t>(buffer.getLifetimeEnd()),
-                          slot.requiredBytes});
-  }
-  llvm::sort(candidates, [](const Candidate &left, const Candidate &right) {
-    if (left.requiredBytes != right.requiredBytes)
-      return left.requiredBytes > right.requiredBytes;
-    if (left.lifetimeStart != right.lifetimeStart)
-      return left.lifetimeStart < right.lifetimeStart;
-    if (left.lifetimeEnd != right.lifetimeEnd)
-      return left.lifetimeEnd < right.lifetimeEnd;
-    return left.ordinal < right.ordinal;
-  });
-  SmallVector<ReuseGroup> available;
-  for (const Candidate &candidate : candidates) {
-    auto reusable = llvm::find_if(available, [&](const ReuseGroup &group) {
-      return llvm::all_of(group.intervals, [&](const auto &interval) {
-        return candidate.lifetimeEnd < interval.first ||
-               interval.second < candidate.lifetimeStart;
-      });
-    });
-    if (reusable == available.end()) {
-      available.push_back(
-          {static_cast<int64_t>(slots.size() + available.size()), {}});
-      reusable = std::prev(available.end());
-    }
-    reusable->intervals.push_back(
-        {candidate.lifetimeStart, candidate.lifetimeEnd});
-    groups[candidate.ordinal] = reusable->ordinal;
-  }
-  if (llvm::is_contained(groups, -1))
-    return failure();
-  return groups;
-}
-
-struct PtxEmitter {
-  explicit PtxEmitter(int64_t arity) : arity(arity), stream(body) {}
-
-  void header(StringRef certificate, bool usesDynamicSharedMemory = false) {
-    this->certificate = certificate.str();
-    this->usesDynamicSharedMemory = usesDynamicSharedMemory;
-  }
-
-  int64_t nextF32() { return f32++; }
-  int64_t nextU64() { return u64++; }
-  int64_t nextU32() { return u32++; }
-  int64_t nextPred() { return pred++; }
-  int64_t nextBF16() { return bf16++; }
-
-  void finish() {
-    stream.flush();
-    llvm::raw_string_ostream output(text);
-    output << ".version 8.0\n.target sm_90\n.address_size 64\n";
-    if (usesDynamicSharedMemory)
-      output << ".extern .shared .align 4 .b8 shuttle_smem[];\n";
-    output << "// shuttle structural certificate: " << certificate
-           << "\n.visible .entry shuttle_entry(";
-    for (int64_t index = 0; index < arity; ++index) {
-      if (index)
-        output << ", ";
-      output << ".param .u64 p" << index;
-    }
-    output << ")\n{\n"
-           << "  .reg .pred %p<" << std::max<int64_t>(64, pred) << ">;\n"
-           << "  .reg .b16 %h<" << std::max<int64_t>(16, bf16) << ">;\n"
-           << "  .reg .b32 %r<" << std::max<int64_t>(128, u32) << ">;\n"
-           << "  .reg .b64 %rd<" << std::max<int64_t>(128, u64) << ">;\n"
-           << "  .reg .f32 %f<" << std::max<int64_t>(128, f32) << ">;\n"
-           << body << "$done:\n  ret;\n}\n";
-    output.flush();
-  }
-
-  int64_t arity;
-  int64_t f32 = 0;
-  int64_t u64 = 8;
-  int64_t u32 = 8;
-  int64_t pred = 4;
-  int64_t bf16 = 2;
-  std::string certificate;
-  bool usesDynamicSharedMemory = false;
-  std::string body;
-  std::string text;
-  llvm::raw_string_ostream stream;
-};
-
-FailureOr<GpuTarget> parseGpuTarget(StringRef target) {
-  if (target == "sm_90")
-    return GpuTarget::Sm90;
-  if (target == "sm_100")
-    return GpuTarget::Sm100;
-  return failure();
-}
-
-ExecutableCodeFormat codeFormatForTarget(GpuTarget target) {
-  return target == GpuTarget::Sm90 ? ExecutableCodeFormat::CudaPtxSm90V1
-                                   : ExecutableCodeFormat::CudaPtxSm100V1;
-}
-
-int64_t deviceSchemaForTarget(GpuTarget target) {
-  return target == GpuTarget::Sm90 ? 3 : 4;
-}
-
-FailureOr<GpuTarget> targetForCodeFormat(ExecutableCodeFormat format) {
-  if (format == ExecutableCodeFormat::CudaPtxSm90V1)
-    return GpuTarget::Sm90;
-  if (format == ExecutableCodeFormat::CudaPtxSm100V1)
-    return GpuTarget::Sm100;
-  return failure();
-}
-
-LogicalResult retargetPtx(std::string &ptx, GpuTarget target) {
-  constexpr StringLiteral sm90Header = ".version 8.0\n.target sm_90\n";
-  if (!StringRef(ptx).starts_with(sm90Header))
-    return failure();
-  if (target == GpuTarget::Sm100)
-    ptx.replace(0, sm90Header.size(), ".version 8.7\n.target sm_100\n");
-  return success();
-}
-
-LogicalResult emitLinearThread(PtxEmitter &ptx, int64_t elements) {
-  if (elements <= 0 || elements > UINT32_MAX)
-    return failure();
-  ptx.stream << "  mov.u32 %r0, %tid.x;\n"
-                "  mov.u32 %r1, %ctaid.x;\n"
-                "  mov.u32 %r2, %ntid.x;\n"
-                "  mad.lo.u32 %r3, %r1, %r2, %r0;\n"
-                "  setp.ge.u32 %p0, %r3, "
-             << elements << ";\n  @%p0 bra $done;\n"
-             << "  cvt.u64.u32 %rd0, %r3;\n";
-  return success();
-}
-
-FailureOr<SmallVector<int64_t>> emitOutputCoordinates(PtxEmitter &ptx,
-                                                      RankedTensorType type) {
-  FailureOr<int64_t> elements = staticElementCount(type);
-  if (failed(elements) || *elements > UINT32_MAX) {
-    return failure();
-  }
-  SmallVector<int64_t> coordinates;
-  int64_t stride = 1;
-  SmallVector<int64_t> strides(type.getRank());
-  for (int64_t axis = type.getRank(); axis > 0; --axis) {
-    strides[axis - 1] = stride;
-    stride *= type.getDimSize(axis - 1);
-  }
-  for (auto [axis, extent] : llvm::enumerate(type.getShape())) {
-    int64_t reg = ptx.nextU64();
-    ptx.stream << "  div.u64 %rd" << reg << ", %rd0, " << strides[axis]
-               << ";\n  rem.u64 %rd" << reg << ", %rd" << reg << ", " << extent
-               << ";\n";
-    coordinates.push_back(reg);
-  }
-  return coordinates;
-}
-
-FailureOr<int64_t> emitAffineCoordinate(PtxEmitter &ptx, AffineExpr expression,
-                                        ArrayRef<int64_t> coordinates) {
-  if (auto dimension = dyn_cast<AffineDimExpr>(expression)) {
-    if (dimension.getPosition() >= coordinates.size())
-      return failure();
-    return coordinates[dimension.getPosition()];
-  }
-  auto binary = dyn_cast<AffineBinaryOpExpr>(expression);
-  if (!binary || binary.getKind() != AffineExprKind::FloorDiv)
-    return failure();
-  auto dimension = dyn_cast<AffineDimExpr>(binary.getLHS());
-  auto divisor = dyn_cast<AffineConstantExpr>(binary.getRHS());
-  if (!dimension || !divisor || divisor.getValue() <= 1 ||
-      dimension.getPosition() >= coordinates.size())
-    return failure();
-  int64_t reg = ptx.nextU64();
-  ptx.stream << "  div.u64 %rd" << reg << ", %rd"
-             << coordinates[dimension.getPosition()] << ", "
-             << divisor.getValue() << ";\n";
-  return reg;
-}
-
-FailureOr<int64_t> emitMapInput(PtxEmitter &ptx, int64_t parameter,
-                                RankedTensorType type, AffineMap map,
-                                ArrayRef<int64_t> coordinates) {
-  if (map.getNumResults() != type.getRank())
-    return failure();
-  int64_t linear = ptx.nextU64();
-  ptx.stream << "  mov.u64 %rd" << linear << ", 0;\n";
-  for (auto [axis, expression] : llvm::enumerate(map.getResults())) {
-    FailureOr<int64_t> coordinate =
-        emitAffineCoordinate(ptx, expression, coordinates);
-    if (failed(coordinate))
-      return failure();
-    ptx.stream << "  mad.lo.u64 %rd" << linear << ", %rd" << linear << ", "
-               << type.getDimSize(axis) << ", %rd" << *coordinate << ";\n";
-  }
-  int64_t pointer = ptx.nextU64();
-  int64_t bytes = type.getElementType().isBF16() ? 2 : 4;
-  ptx.stream << "  ld.param.u64 %rd" << pointer << ", [p" << parameter
-             << "];\n  mad.lo.u64 %rd" << pointer << ", %rd" << linear << ", "
-             << bytes << ", %rd" << pointer << ";\n";
-  int64_t value = ptx.nextF32();
-  if (type.getElementType().isBF16()) {
-    ptx.stream << "  ld.global.u16 %h0, [%rd" << pointer
-               << "];\n  cvt.f32.bf16 %f" << value << ", %h0;\n";
-  } else {
-    ptx.stream << "  ld.global.f32 %f" << value << ", [%rd" << pointer
-               << "];\n";
-  }
-  return value;
-}
-
-FailureOr<int64_t> emitScalarBody(PtxEmitter &ptx, Block &body,
-                                  ArrayRef<int64_t> arguments) {
-  if (body.getNumArguments() != arguments.size())
-    return failure();
-  DenseMap<Value, int64_t> values;
-  for (auto [argument, reg] : llvm::zip_equal(body.getArguments(), arguments))
-    values[argument] = reg;
-  for (Operation &operation : body.without_terminator()) {
-    if (operation.getNumResults() != 1 ||
-        (!isa<ScalarConvertOp>(operation) &&
-         !operation.getResult(0).getType().isF32()))
-      return failure();
-    int64_t result = ptx.nextF32();
-    if (auto constant = dyn_cast<arith::ConstantOp>(operation)) {
-      auto value = dyn_cast<FloatAttr>(constant.getValue());
-      if (!value || !value.getType().isF32())
-        return failure();
-      uint32_t bits = value.getValue().bitcastToAPInt().getZExtValue();
-      ptx.stream << "  mov.b32 %f" << result << ", 0f"
-                 << llvm::utohexstr(bits, /*LowerCase=*/false, /*Width=*/8)
-                 << ";\n";
-    } else if (auto convert = dyn_cast<ScalarConvertOp>(operation)) {
-      Type inputType = convert.getInput().getType();
-      Type resultType = convert.getResult().getType();
-      int64_t operand = values.lookup(convert.getInput());
-      if ((inputType.isF32() && resultType.isF32()) ||
-          (inputType.isBF16() && resultType.isF32())) {
-        result = operand;
-      } else if (inputType.isF32() && resultType.isBF16() &&
-                 convert.getSemantics() ==
-                     ScalarConvertSemantics::RoundNearestEven) {
-        int64_t rounded = ptx.nextBF16();
-        ptx.stream << "  cvt.rn.bf16.f32 %h" << rounded << ", %f" << operand
-                   << ";\n  cvt.f32.bf16 %f" << result << ", %h" << rounded
-                   << ";\n";
-      } else {
-        return failure();
-      }
-    } else if (auto add = dyn_cast<arith::AddFOp>(operation)) {
-      ptx.stream << "  add.rn.f32 %f" << result << ", %f"
-                 << values.lookup(add.getLhs()) << ", %f"
-                 << values.lookup(add.getRhs()) << ";\n";
-    } else if (auto subtract = dyn_cast<arith::SubFOp>(operation)) {
-      ptx.stream << "  sub.rn.f32 %f" << result << ", %f"
-                 << values.lookup(subtract.getLhs()) << ", %f"
-                 << values.lookup(subtract.getRhs()) << ";\n";
-    } else if (auto negate = dyn_cast<arith::NegFOp>(operation)) {
-      ptx.stream << "  neg.f32 %f" << result << ", %f"
-                 << values.lookup(negate.getOperand()) << ";\n";
-    } else if (auto multiply = dyn_cast<arith::MulFOp>(operation)) {
-      ptx.stream << "  mul.rn.f32 %f" << result << ", %f"
-                 << values.lookup(multiply.getLhs()) << ", %f"
-                 << values.lookup(multiply.getRhs()) << ";\n";
-    } else if (auto divide = dyn_cast<arith::DivFOp>(operation)) {
-      ptx.stream << "  div.rn.f32 %f" << result << ", %f"
-                 << values.lookup(divide.getLhs()) << ", %f"
-                 << values.lookup(divide.getRhs()) << ";\n";
-    } else if (auto maximum = dyn_cast<arith::MaximumFOp>(operation)) {
-      ptx.stream << "  max.f32 %f" << result << ", %f"
-                 << values.lookup(maximum.getLhs()) << ", %f"
-                 << values.lookup(maximum.getRhs()) << ";\n";
-    } else if (auto exponential = dyn_cast<math::ExpOp>(operation)) {
-      int64_t scaled = ptx.nextF32();
-      ptx.stream << "  mul.rn.f32 %f" << scaled << ", %f"
-                 << values.lookup(exponential.getOperand())
-                 << ", 0f3FB8AA3B;\n  ex2.approx.f32 %f" << result << ", %f"
-                 << scaled << ";\n";
-    } else if (auto hyperbolic = dyn_cast<math::TanhOp>(operation)) {
-      ptx.stream << "  tanh.approx.f32 %f" << result << ", %f"
-                 << values.lookup(hyperbolic.getOperand()) << ";\n";
-    } else if (auto rsqrt = dyn_cast<math::RsqrtOp>(operation)) {
-      int64_t root = ptx.nextF32();
-      ptx.stream << "  sqrt.rn.f32 %f" << root << ", %f"
-                 << values.lookup(rsqrt.getOperand()) << ";\n  div.rn.f32 %f"
-                 << result << ", 0f3F800000, %f" << root << ";\n";
-    } else {
-      return failure();
-    }
-    if (operation.getNumResults() != 1)
-      return failure();
-    values[operation.getResult(0)] = result;
-  }
-  auto yield = dyn_cast<YieldOp>(body.getTerminator());
-  if (!yield || yield.getValues().size() != 1 ||
-      !values.count(yield.getValues().front()))
-    return failure();
-  return values.lookup(yield.getValues().front());
-}
-
-FailureOr<std::string> emitMapPtx(MapOp map, ScheduleTaskOp task) {
-  auto output = dyn_cast<RankedTensorType>(map.getResult(0).getType());
-  if (!output || map.getNumResults() != 1)
-    return failure();
-  ArrayRef<Attribute> maps = map.getIndexingMaps().getValue();
-  if (maps.size() != map.getInputs().size() + 1 ||
-      !isIdentityMap(cast<AffineMapAttr>(maps.back()).getValue()))
-    return failure();
-  FailureOr<int64_t> elements = staticElementCount(output);
-  if (failed(elements))
-    return failure();
-  PtxEmitter ptx(map.getInputs().size() + 1);
-  ptx.header(task.getSemanticFingerprint());
-  if (failed(emitLinearThread(ptx, *elements)))
-    return failure();
-  FailureOr<SmallVector<int64_t>> coordinates =
-      emitOutputCoordinates(ptx, output);
-  if (failed(coordinates))
-    return failure();
-  SmallVector<int64_t> arguments;
-  for (auto [index, input] : llvm::enumerate(map.getInputs())) {
-    auto inputType = dyn_cast<RankedTensorType>(input.getType());
-    auto indexing = dyn_cast<AffineMapAttr>(maps[index]);
-    if (!inputType || !indexing)
-      return failure();
-    FailureOr<int64_t> value =
-        emitMapInput(ptx, index, inputType, indexing.getValue(), *coordinates);
-    if (failed(value))
-      return failure();
-    arguments.push_back(*value);
-  }
-  FailureOr<int64_t> result =
-      emitScalarBody(ptx, map.getBody().front(), arguments);
-  if (failed(result))
-    return failure();
-  int64_t outputPointer = ptx.nextU64();
-  ptx.stream << "  ld.param.u64 %rd" << outputPointer << ", [p"
-             << map.getInputs().size() << "];\n";
-  int64_t bytes = output.getElementType().isBF16() ? 2 : 4;
-  ptx.stream << "  mad.lo.u64 %rd" << outputPointer << ", %rd0, " << bytes
-             << ", %rd" << outputPointer << ";\n";
-  if (output.getElementType().isBF16()) {
-    ptx.stream << "  cvt.rn.bf16.f32 %h1, %f" << *result
-               << ";\n  st.global.u16 [%rd" << outputPointer << "], %h1;\n";
-  } else {
-    ptx.stream << "  st.global.f32 [%rd" << outputPointer << "], %f" << *result
-               << ";\n";
-  }
-  if (ptx.f32 > 128 || ptx.u64 > 128 || ptx.bf16 > 16)
-    return failure();
-  ptx.finish();
-  return ptx.text;
-}
-
-FailureOr<std::string>
-emitFusedMapPtx(SmallVectorImpl<MapOp> &maps,
-                MaterializationTaskOp materializationTask,
-                SmallVectorImpl<MaterializationBufferOp> &buffers,
-                ScheduleTaskOp scheduleTask) {
-  if (maps.size() < 2 || materializationTask.getOutputBuffers().size() != 1 ||
-      llvm::any_of(maps, [](MapOp map) { return !hasIdentityResultMap(map); }))
-    return failure();
-  int64_t outputBuffer = materializationTask.getOutputBuffers().front();
-  if (outputBuffer < 0 || outputBuffer >= buffers.size())
-    return failure();
-  auto output =
-      dyn_cast<RankedTensorType>(buffers[outputBuffer].getTensorType());
-  auto composedMaps = materializationTask->getAttrOfType<ArrayAttr>(
-      "composed_input_maps");
-  if (!output || !composedMaps ||
-      composedMaps.size() != materializationTask.getInputBuffers().size())
-    return failure();
-  FailureOr<int64_t> elements = staticElementCount(output);
-  if (failed(elements))
-    return failure();
-  PtxEmitter ptx(materializationTask.getInputBuffers().size() + 1);
-  ptx.header(scheduleTask.getSemanticFingerprint());
-  if (failed(emitLinearThread(ptx, *elements)))
-    return failure();
-  FailureOr<SmallVector<int64_t>> coordinates =
-      emitOutputCoordinates(ptx, output);
-  if (failed(coordinates))
-    return failure();
-
-  llvm::SmallDenseSet<Operation *> group;
-  for (MapOp map : maps)
-    group.insert(map.getOperation());
-  SmallVector<Value> boundaryInputs;
-  llvm::SmallDenseSet<Value> seenBoundary;
-  for (MapOp map : llvm::reverse(maps)) {
-    for (Value operand : map.getInputs()) {
-      if (!group.contains(operand.getDefiningOp()) &&
-          seenBoundary.insert(operand).second)
-        boundaryInputs.push_back(operand);
-    }
-  }
-  if (boundaryInputs.size() != materializationTask.getInputBuffers().size())
-    return failure();
-  DenseMap<Value, int64_t> values;
-  for (auto [parameter, value, bufferOrdinal, mapAttribute] : llvm::enumerate(
-           boundaryInputs, materializationTask.getInputBuffers(),
-           composedMaps.getValue())) {
-    if (bufferOrdinal < 0 || bufferOrdinal >= buffers.size())
-      return failure();
-    auto input =
-        dyn_cast<RankedTensorType>(buffers[bufferOrdinal].getTensorType());
-    auto indexing = dyn_cast<AffineMapAttr>(mapAttribute);
-    if (!input || !indexing)
-      return failure();
-    FailureOr<int64_t> loaded = emitMapInput(
-        ptx, parameter, input, indexing.getValue(), *coordinates);
-    if (failed(loaded) || input != value.getType())
-      return failure();
-    values[value] = *loaded;
-  }
-  for (MapOp map : maps) {
-    SmallVector<int64_t> arguments;
-    for (Value operand : map.getInputs()) {
-      auto found = values.find(operand);
-      if (found == values.end())
-        return failure();
-      arguments.push_back(found->second);
-    }
-    FailureOr<int64_t> result =
-        emitScalarBody(ptx, map.getBody().front(), arguments);
-    if (failed(result) || map.getNumResults() != 1)
-      return failure();
-    values[map.getResult(0)] = *result;
-  }
-  auto result = values.find(maps.back().getResult(0));
-  if (result == values.end())
-    return failure();
-  int64_t outputPointer = ptx.nextU64();
-  ptx.stream << "  ld.param.u64 %rd" << outputPointer << ", [p"
-             << materializationTask.getInputBuffers().size() << "];\n";
-  ptx.stream << "  mad.lo.u64 %rd" << outputPointer << ", %rd0, 4, %rd"
-             << outputPointer << ";\n  st.global.f32 [%rd" << outputPointer
-             << "], %f" << result->second << ";\n";
-  if (ptx.f32 > 128 || ptx.u64 > 128 || ptx.bf16 > 16)
-    return failure();
-  ptx.finish();
-  return ptx.text;
-}
-
-FailureOr<std::string> emitContractPtx(ContractOp contract,
-                                       ScheduleTaskOp task) {
-  const bool fast =
-      task.getReductionOrder() == ScheduleReductionOrder::LeafOrderFree;
-  FailureOr<SmallVector<int64_t>> contractDomain =
-      contractDomainShape(contract);
-  if (!isClosedProjectedContract(contract) || failed(contractDomain) ||
-      task.getKind() != ScheduleTaskKind::Contract ||
-      task.getDomainShape() != ArrayRef<int64_t>(*contractDomain) ||
-      task.getReductionAxis() !=
-          static_cast<int64_t>(task.getDomainShape().size()) - 1 ||
-      (!fast && task.getReductionOrder() !=
-                    ScheduleReductionOrder::SerialAscendingFmaRnF32) ||
-      task.getInputBuffers().size() != 2 ||
-      task.getOutputBuffers().size() != 1 || task.getScratchBytes() != 0) {
-    return failure();
-  }
-  FailureOr<int64_t> outputCount =
-      scheduleElementCount(task.getDomainShape().drop_back());
-  if (failed(outputCount) || *outputCount > UINT32_MAX) {
-    return failure();
-  }
-  const int64_t outputs = *outputCount;
-  const int64_t reduction = task.getDomainShape().back();
-  AffineMap lhsMap =
-      cast<AffineMapAttr>(contract.getIndexingMaps()[0]).getValue();
-  AffineMap rhsMap =
-      cast<AffineMapAttr>(contract.getIndexingMaps()[1]).getValue();
-  auto lhsType = cast<RankedTensorType>(contract.getInputs()[0].getType());
-  auto rhsType = cast<RankedTensorType>(contract.getInputs()[1].getType());
-  if (fast) {
-    const int64_t outputsPerBlock = std::min<int64_t>(outputs, 8);
-    if (task.getGridShape() !=
-            ArrayRef<int64_t>({ceilDivPositive(outputs, outputsPerBlock)}) ||
-        task.getTileShape() != ArrayRef<int64_t>({outputsPerBlock}) ||
-        task.getWorkgroupThreads() != outputsPerBlock * 32 ||
-        task.getSubgroupSize() != 32 ||
-        task.getSerialTiles() != ceilDivPositive(reduction, 32)) {
-      return failure();
-    }
-
-    PtxEmitter ptx(/*arity=*/3);
-    ptx.header(task.getSemanticFingerprint());
-    ptx.stream << "  mov.u32 %r0, %tid.x;\n"
-                  "  shr.u32 %r1, %r0, 5;\n"
-                  "  and.b32 %r2, %r0, 31;\n"
-                  "  mov.u32 %r3, %ctaid.x;\n"
-                  "  mad.lo.u32 %r4, %r3, "
-               << outputsPerBlock
-               << ", %r1;\n"
-                  "  setp.ge.u32 %p0, %r4, "
-               << outputs
-               << ";\n"
-                  "  @%p0 bra $done;\n"
-                  "  cvt.u64.u32 %rd0, %r4;\n";
-    auto result = cast<RankedTensorType>(contract.getResult(0).getType());
-    FailureOr<SmallVector<int64_t>> coordinates =
-        emitOutputCoordinates(ptx, result);
-    if (failed(coordinates) ||
-        coordinates->size() + 1 != task.getDomainShape().size()) {
-      return failure();
-    }
-    int64_t accumulator = ptx.nextF32();
-    int64_t reductionCoordinate = ptx.nextU64();
-    ptx.stream << "  mov.f32 %f" << accumulator
-               << ", 0f00000000;\n"
-                  "  cvt.u64.u32 %rd"
-               << reductionCoordinate
-               << ", %r2;\n"
-                  "$contract_fast_loop:\n"
-                  "  setp.ge.u64 %p1, %rd"
-               << reductionCoordinate << ", " << reduction
-               << ";\n"
-                  "  @%p1 bra $contract_fast_reduce;\n"
-                  "";
-    SmallVector<int64_t> domainCoordinates(*coordinates);
-    domainCoordinates.push_back(reductionCoordinate);
-    FailureOr<int64_t> lhs =
-        emitMapInput(ptx, 0, lhsType, lhsMap, domainCoordinates);
-    FailureOr<int64_t> rhs =
-        emitMapInput(ptx, 1, rhsType, rhsMap, domainCoordinates);
-    if (failed(lhs) || failed(rhs)) {
-      return failure();
-    }
-    ptx.stream << "  fma.rn.f32 %f" << accumulator << ", %f" << *lhs << ", %f"
-               << *rhs << ", %f" << accumulator << ";\n  add.u64 %rd"
-               << reductionCoordinate << ", %rd" << reductionCoordinate
-               << ", 32;\n"
-                  "  bra $contract_fast_loop;\n"
-                  "$contract_fast_reduce:\n"
-                  "  mov.b32 %r5, %f"
-               << accumulator << ";\n";
-    int64_t shuffled = ptx.nextF32();
-    for (int64_t offset : {16, 8, 4, 2, 1}) {
-      ptx.stream << "  shfl.sync.down.b32 %r6, %r5, " << offset
-                 << ", 31, 0xffffffff;\n"
-                    "  mov.b32 %f"
-                 << shuffled << ", %r6;\n  add.rn.f32 %f" << accumulator
-                 << ", %f" << accumulator << ", %f" << shuffled
-                 << ";\n  mov.b32 %r5, %f" << accumulator << ";\n";
-    }
-    int64_t outputPointer = ptx.nextU64();
-    ptx.stream << "  setp.ne.u32 %p2, %r2, 0;\n"
-                  "  @%p2 bra $done;\n"
-                  "  ld.param.u64 %rd"
-               << outputPointer << ", [p2];\n  mad.lo.u64 %rd" << outputPointer
-               << ", %rd0, 4, %rd" << outputPointer << ";\n  st.global.f32 [%rd"
-               << outputPointer << "], %f" << accumulator << ";\n";
-    if (ptx.f32 > 128 || ptx.u64 > 128 || ptx.bf16 > 16) {
-      return failure();
-    }
-    ptx.finish();
-    return ptx.text;
-  }
-
-  const int64_t expectedThreads =
-      scheduleThreads(std::min<int64_t>(outputs, 256));
-  if (task.getGridShape() != ArrayRef<int64_t>({ceilDivPositive(
-                                 outputs, std::min<int64_t>(outputs, 256))}) ||
-      task.getTileShape() !=
-          ArrayRef<int64_t>({std::min<int64_t>(outputs, 256)}) ||
-      task.getWorkgroupThreads() != expectedThreads ||
-      task.getSubgroupSize() != 32 || task.getSerialTiles() != reduction) {
-    return failure();
-  }
-
-  PtxEmitter ptx(/*arity=*/3);
-  ptx.header(task.getSemanticFingerprint());
-  if (failed(emitLinearThread(ptx, outputs))) {
-    return failure();
-  }
-  auto result = cast<RankedTensorType>(contract.getResult(0).getType());
-  FailureOr<SmallVector<int64_t>> coordinates =
-      emitOutputCoordinates(ptx, result);
-  if (failed(coordinates) ||
-      coordinates->size() + 1 != task.getDomainShape().size()) {
-    return failure();
-  }
-  int64_t accumulator = ptx.nextF32();
-  int64_t reductionCoordinate = ptx.nextU64();
-  ptx.stream << "  mov.f32 %f" << accumulator << ", 0f00000000;\n  mov.u64 %rd"
-             << reductionCoordinate
-             << ", 0;\n"
-                "$contract_loop:\n"
-                "  setp.ge.u64 %p1, %rd"
-             << reductionCoordinate << ", " << reduction
-             << ";\n  @%p1 bra $contract_done;\n"
-                "";
-  SmallVector<int64_t> domainCoordinates(*coordinates);
-  domainCoordinates.push_back(reductionCoordinate);
-  FailureOr<int64_t> lhs =
-      emitMapInput(ptx, 0, lhsType, lhsMap, domainCoordinates);
-  FailureOr<int64_t> rhs =
-      emitMapInput(ptx, 1, rhsType, rhsMap, domainCoordinates);
-  if (failed(lhs) || failed(rhs)) {
-    return failure();
-  }
-  int64_t outputPointer = ptx.nextU64();
-  ptx.stream << "  fma.rn.f32 %f" << accumulator << ", %f" << *lhs << ", %f"
-             << *rhs << ", %f" << accumulator << ";\n  add.u64 %rd"
-             << reductionCoordinate << ", %rd" << reductionCoordinate
-             << ", 1;\n"
-                "  bra $contract_loop;\n"
-                "$contract_done:\n"
-                "  ld.param.u64 %rd"
-             << outputPointer << ", [p2];\n  mad.lo.u64 %rd" << outputPointer
-             << ", %rd0, 4, %rd" << outputPointer << ";\n  st.global.f32 [%rd"
-             << outputPointer << "], %f" << accumulator << ";\n";
-  if (ptx.f32 > 128 || ptx.u64 > 128 || ptx.bf16 > 16) {
-    return failure();
-  }
-  ptx.finish();
-  return ptx.text;
-}
-
-FailureOr<std::string> emitFoldMapPtx(
-    FoldOp fold, ScheduleTaskOp task, ArrayRef<MapOp> epilogueMaps,
-    MaterializationTaskOp materializationTask,
-    SmallVectorImpl<MaterializationBufferOp> *buffers) {
-  const bool fused = !epilogueMaps.empty();
-  if ((!isClosedRankTwoFold(fold) && !isClosedRankNFold(fold)) ||
-      fold.getInputs().size() != 1 || fold.getInitializers().size() != 1 ||
-      fold.getNumResults() != 1 ||
-      task.getDomainShape() !=
-          cast<RankedTensorType>(fold.getInputs()[0].getType()).getShape())
-    return failure();
-  if (!hasExactPositiveZeroInitializer(fold))
-    return failure();
-  const bool fullPrefix = isClosedFullPrefixRankNFold(fold);
-  const int64_t reductionAxis = fold.getReductionDimensions().front();
-  FailureOr<int64_t> reductionExtent =
-      fullPrefix
-          ? scheduleElementCount(task.getDomainShape().drop_back())
-          : FailureOr<int64_t>(task.getDomainShape()[reductionAxis]);
-  if (failed(reductionExtent))
-    return failure();
-  auto resultType = cast<RankedTensorType>(fold.getResult(0).getType());
-  FailureOr<int64_t> outputElements = staticElementCount(resultType);
-  if (failed(outputElements) || *outputElements > UINT32_MAX)
-    return failure();
-  const int64_t outputExtent = *outputElements;
-  const int64_t threads = task.getWorkgroupThreads();
-  const int64_t serialTiles = task.getSerialTiles();
-  auto nextPowerOfTwo = [](int64_t value) -> FailureOr<int64_t> {
-    if (value <= 0)
-      return failure();
-    int64_t power = 1;
-    while (power < value) {
-      if (power > 128)
-        return failure();
-      power *= 2;
-    }
-    return power;
-  };
-  FailureOr<int64_t> localWidth = nextPowerOfTwo(serialTiles);
-  FailureOr<int64_t> sharedWidth =
-      nextPowerOfTwo(std::min(*reductionExtent, threads));
-  if (failed(localWidth) || failed(sharedWidth) || threads <= 0 ||
-      threads > 256 ||
-      task.getGridShape() != ArrayRef<int64_t>({outputExtent}) ||
-      task.getScratchBytes() != threads * static_cast<int64_t>(sizeof(float)) ||
-      *localWidth > 64 || *sharedWidth > threads)
-    return failure();
-  if (fused &&
-      (!materializationTask || !buffers ||
-       materializationTask.getInputBuffers().size() < fold->getNumOperands() ||
-       materializationTask.getOutputBuffers().size() != 1))
-    return failure();
-  PtxEmitter ptx(fused ? materializationTask.getInputBuffers().size() + 1 : 3);
-  ptx.header(task.getSemanticFingerprint(), /*usesDynamicSharedMemory=*/true);
-  ptx.stream << "  mov.u32 %r0, %tid.x;\n"
-                "  mov.u32 %r1, %ctaid.x;\n"
-                "  setp.ge.u32 %p0, %r1, "
-             << outputExtent
-             << ";\n  @%p0 bra $done;\n"
-                "  ld.param.u64 %rd0, [p0];\n";
-  for (int64_t index = 0; index < *localWidth; ++index)
-    ptx.stream << "  mov.f32 %f" << index << ", 0f00000000;\n";
-  for (int64_t index = 0; index < serialTiles; ++index) {
-    ptx.stream << "  mul.lo.u32 %r4, %r0, " << serialTiles
-               << ";\n  add.u32 %r4, %r4, " << index
-               << ";\n  setp.ge.u32 %p1, %r4, " << *reductionExtent
-               << ";\n  @%p1 bra $load_skip" << index << ";\n"
-               << "  cvt.u64.u32 %rd1, %r4;\n"
-               << "  cvt.u64.u32 %rd2, %r1;\n";
-    if (reductionAxis ==
-        static_cast<int64_t>(task.getDomainShape().size()) - 1) {
-      ptx.stream << "  mad.lo.u64 %rd3, %rd2, " << *reductionExtent
-                 << ", %rd1;\n";
-    } else {
-      ptx.stream << "  mad.lo.u64 %rd3, %rd1, " << outputExtent << ", %rd2;\n";
-    }
-    ptx.stream << "  mad.lo.u64 %rd3, %rd3, 4, %rd0;\n"
-               << "  ld.global.f32 %f" << index << ", [%rd3];\n$load_skip"
-               << index << ":\n";
-  }
-  int64_t width = *localWidth;
-  while (width > 1) {
-    for (int64_t index = 0; index < width / 2; ++index)
-      ptx.stream << "  add.rn.f32 %f" << index << ", %f" << index * 2 << ", %f"
-                 << index * 2 + 1 << ";\n";
-    width /= 2;
-  }
-  ptx.stream << "  cvt.u64.u32 %rd3, %r0;\n"
-                "  mul.lo.u64 %rd3, %rd3, 4;\n"
-                "  mov.u64 %rd4, shuttle_smem;\n"
-                "  cvta.to.shared.u64 %rd4, %rd4;\n"
-                "  add.u64 %rd3, %rd4, %rd3;\n"
-                "  st.shared.f32 [%rd3], %f0;\n"
-                "  bar.sync 0;\n";
-  for (int64_t step = *sharedWidth / 2; step >= 1; step /= 2) {
-    ptx.stream << "  setp.ge.u32 %p1, %r0, " << step << ";\n  @%p1 bra $skip"
-               << step << ";\n"
-               << "  mul.lo.u32 %r4, %r0, 2;\n"
-               << "  cvt.u64.u32 %rd5, %r4;\n"
-               << "  mul.lo.u64 %rd5, %rd5, 4;\n"
-               << "  add.u64 %rd5, %rd4, %rd5;\n"
-               << "  ld.shared.f32 %f32, [%rd5];\n"
-               << "  ld.shared.f32 %f33, [%rd5+4];\n"
-               << "  add.rn.f32 %f34, %f32, %f33;\n"
-               << "  cvt.u64.u32 %rd6, %r0;\n"
-               << "  mul.lo.u64 %rd6, %rd6, 4;\n"
-               << "  add.u64 %rd6, %rd4, %rd6;\n"
-               << "  st.shared.f32 [%rd6], %f34;\n$skip" << step
-               << ":\n  bar.sync 0;\n";
-  }
-  ptx.stream << "  setp.ne.u32 %p2, %r0, 0;\n"
-                "  @%p2 bra $done;\n"
-                "  ld.shared.f32 %f35, [%rd4];\n"
-                "  ld.param.u64 %rd7, [p1];\n"
-                "  ld.global.f32 %f36, [%rd7];\n"
-                "  add.rn.f32 %f37, %f35, %f36;\n";
-  if (!fused) {
-    ptx.stream << "  ld.param.u64 %rd8, [p2];\n"
-                  "  cvt.u64.u32 %rd9, %r1;\n"
-                  "  mul.lo.u64 %rd9, %rd9, 4;\n"
-                  "  add.u64 %rd8, %rd8, %rd9;\n"
-                  "  st.global.f32 [%rd8], %f37;\n";
-    ptx.finish();
-    return ptx.text;
-  }
-
-  unsigned foldConsumers = 0;
-  for (MapOp map : epilogueMaps) {
-    for (auto [operandNumber, operand] : llvm::enumerate(map.getInputs())) {
-      if (operand != fold.getResult(0))
-        continue;
-      if (!isEligibleFoldMapEdge(fold, map, operandNumber))
-        return failure();
-      ++foldConsumers;
-    }
-  }
-  if (foldConsumers != 1)
-    return failure();
-  int64_t outputBuffer = materializationTask.getOutputBuffers().front();
-  if (outputBuffer < 0 || outputBuffer >= buffers->size())
-    return failure();
-  auto output =
-      dyn_cast<RankedTensorType>((*buffers)[outputBuffer].getTensorType());
-  auto mapAttributes = materializationTask->getAttrOfType<ArrayAttr>(
-      "epilogue_input_maps");
-  if (!output || !output.getElementType().isF32() || !mapAttributes ||
-      mapAttributes.size() != materializationTask.getInputBuffers().size() -
-                                  fold->getNumOperands())
-    return failure();
-  FailureOr<int64_t> finalElements = staticElementCount(output);
-  if (failed(finalElements) || *finalElements != outputExtent)
-    return failure();
-  ptx.stream << "  cvt.u64.u32 %rd0, %r1;\n";
-  FailureOr<SmallVector<int64_t>> coordinates =
-      emitOutputCoordinates(ptx, output);
-  if (failed(coordinates))
-    return failure();
-
-  llvm::SmallDenseSet<Operation *> group;
-  group.insert(fold.getOperation());
-  for (MapOp map : epilogueMaps)
-    group.insert(map.getOperation());
-  SmallVector<Value> boundaryInputs;
-  llvm::SmallDenseSet<Value> seenBoundary;
-  for (MapOp map : llvm::reverse(epilogueMaps)) {
-    for (Value operand : map.getInputs()) {
-      if (!group.contains(operand.getDefiningOp()) &&
-          seenBoundary.insert(operand).second)
-        boundaryInputs.push_back(operand);
-    }
-  }
-  if (boundaryInputs.size() != mapAttributes.size())
-    return failure();
-  DenseMap<Value, int64_t> values;
-  values[fold.getResult(0)] = 37;
-  ptx.f32 = 38;
-  ptx.u64 = std::max<int64_t>(ptx.u64, 10);
-  ArrayRef<int64_t> mapBuffers =
-      materializationTask.getInputBuffers().drop_front(fold->getNumOperands());
-  for (auto [ordinal, value, bufferOrdinal, mapAttribute] : llvm::enumerate(
-           boundaryInputs, mapBuffers, mapAttributes.getValue())) {
-    if (bufferOrdinal < 0 || bufferOrdinal >= buffers->size())
-      return failure();
-    auto input = dyn_cast<RankedTensorType>(
-        (*buffers)[bufferOrdinal].getTensorType());
-    auto indexing = dyn_cast<AffineMapAttr>(mapAttribute);
-    if (!input || !indexing || input != value.getType())
-      return failure();
-    FailureOr<int64_t> loaded = emitMapInput(
-        ptx, fold->getNumOperands() + ordinal, input, indexing.getValue(),
-        *coordinates);
-    if (failed(loaded))
-      return failure();
-    values[value] = *loaded;
-  }
-  for (MapOp map : epilogueMaps) {
-    SmallVector<int64_t> arguments;
-    for (Value operand : map.getInputs()) {
-      auto found = values.find(operand);
-      if (found == values.end())
-        return failure();
-      arguments.push_back(found->second);
-    }
-    FailureOr<int64_t> result =
-        emitScalarBody(ptx, map.getBody().front(), arguments);
-    if (failed(result) || map.getNumResults() != 1)
-      return failure();
-    values[map.getResult(0)] = *result;
-  }
-  MapOp finalMap = epilogueMaps.back();
-  auto result = values.find(finalMap.getResult(0));
-  if (result == values.end())
-    return failure();
-  int64_t outputPointer = ptx.nextU64();
-  int64_t outputParameter = materializationTask.getInputBuffers().size();
-  ptx.stream << "  ld.param.u64 %rd" << outputPointer << ", [p"
-             << outputParameter << "];\n  mad.lo.u64 %rd" << outputPointer
-             << ", %rd0, 4, %rd" << outputPointer
-             << ";\n  st.global.f32 [%rd" << outputPointer << "], %f"
-             << result->second << ";\n";
-  if (ptx.f32 > 128 || ptx.u64 > 128 || ptx.bf16 > 16)
-    return failure();
-  ptx.finish();
-  return ptx.text;
-}
-
-struct FoldRegionPtxContext {
-  PtxEmitter &ptx;
-  MaterializationTaskOp task;
-  SmallVectorImpl<MaterializationBufferOp> &buffers;
-  llvm::SmallDenseMap<Attribute, Operation *> &sourceOperations;
-  DenseMap<Operation *, int64_t> foldValues;
-  llvm::SmallDenseSet<Operation *> sourceSet;
-  DenseMap<Value, int64_t> boundaryParameters;
-  DenseMap<Value, int64_t> materializedValues;
-};
-
-FailureOr<int64_t> foldRegionBoundaryParameter(FoldRegionPtxContext &context,
-                                               MapOp map, unsigned operand) {
-  auto explicitParameter =
-      context.boundaryParameters.find(map.getInputs()[operand]);
-  if (explicitParameter != context.boundaryParameters.end())
-    return explicitParameter->second;
-  auto uses =
-      context.task->getAttrOfType<ArrayAttr>("fold_region_boundary_uses");
-  if (!uses)
-    return failure();
-  for (Attribute attribute : uses) {
-    auto use = dyn_cast<DictionaryAttr>(attribute);
-    if (!use || use.get("source") != map.getSource() ||
-        cast<IntegerAttr>(use.get("operand")).getInt() != operand)
-      continue;
-    int64_t buffer = cast<IntegerAttr>(use.get("input_buffer")).getInt();
-    auto found = llvm::find(context.task.getInputBuffers(), buffer);
-    if (found == context.task.getInputBuffers().end())
-      return failure();
-    return std::distance(context.task.getInputBuffers().begin(), found);
-  }
-  return failure();
-}
-
-FailureOr<SmallVector<int64_t>>
-emitMappedCoordinates(PtxEmitter &ptx, AffineMap map,
-                      ArrayRef<int64_t> coordinates) {
-  if (map.getNumDims() != coordinates.size() || map.getNumSymbols() != 0)
-    return failure();
-  SmallVector<int64_t> result;
-  for (AffineExpr expression : map.getResults()) {
-    FailureOr<int64_t> coordinate =
-        emitAffineCoordinate(ptx, expression, coordinates);
-    if (failed(coordinate))
-      return failure();
-    result.push_back(*coordinate);
-  }
-  return result;
-}
-
-FailureOr<SmallVector<Operation *>> compositionSourceOperations(
-    MaterializationTaskOp task,
-    const llvm::SmallDenseMap<Attribute, Operation *> &sourceOperations) {
-  auto sources = task->getAttrOfType<ArrayAttr>("composition_sources");
-  if (!sources)
-    return failure();
-  SmallVector<Operation *> result;
-  for (Attribute source : sources) {
-    Operation *operation = sourceOperations.lookup(source);
-    if (!operation)
-      return failure();
-    result.push_back(operation);
-  }
-  return result;
-}
-
-FailureOr<std::pair<Operation *, Operation *>> compositionSourcePair(
-    MaterializationTaskOp task,
-    const llvm::SmallDenseMap<Attribute, Operation *> &sourceOperations) {
-  FailureOr<SmallVector<Operation *>> sources =
-      compositionSourceOperations(task, sourceOperations);
-  if (failed(sources) || sources->size() != 2)
-    return failure();
-  return std::pair<Operation *, Operation *>{sources->front(),
-                                             sources->back()};
-}
-
-RankedTensorType
-compositionBufferType(MaterializationTaskOp task,
-                      SmallVectorImpl<MaterializationBufferOp> &buffers,
-                      bool output, unsigned position) {
-  ArrayRef<int64_t> ordinals =
-      output ? task.getOutputBuffers() : task.getInputBuffers();
-  if (position >= ordinals.size() || ordinals[position] < 0 ||
-      ordinals[position] >= static_cast<int64_t>(buffers.size()))
-    return {};
-  return dyn_cast<RankedTensorType>(
-      buffers[ordinals[position]].getTensorType());
-}
-
-FailureOr<int64_t>
-emitSerialContractElement(PtxEmitter &ptx, ContractOp contract,
-                          int64_t lhsParameter, int64_t rhsParameter,
-                          ArrayRef<int64_t> outputCoordinates,
-                          StringRef label) {
-  FailureOr<SmallVector<int64_t>> domain = contractDomainShape(contract);
-  if (!isClosedProjectedContract(contract) || failed(domain) ||
-      outputCoordinates.size() + 1 != domain->size())
-    return failure();
-  auto lhsMap = dyn_cast<AffineMapAttr>(contract.getIndexingMaps()[0]);
-  auto rhsMap = dyn_cast<AffineMapAttr>(contract.getIndexingMaps()[1]);
-  auto lhsType = dyn_cast<RankedTensorType>(contract.getInputs()[0].getType());
-  auto rhsType = dyn_cast<RankedTensorType>(contract.getInputs()[1].getType());
-  if (!lhsMap || !rhsMap || !lhsType || !rhsType)
-    return failure();
-  int64_t accumulator = ptx.nextF32();
-  int64_t reductionCoordinate = ptx.nextU64();
-  ptx.stream << "  mov.f32 %f" << accumulator << ", 0f00000000;\n  mov.u64 %rd"
-             << reductionCoordinate << ", 0;\n$" << label
-             << "_loop:\n  setp.ge.u64 %p4, %rd" << reductionCoordinate << ", "
-             << domain->back() << ";\n  @%p4 bra $" << label << "_done;\n";
-  SmallVector<int64_t> coordinates(outputCoordinates);
-  coordinates.push_back(reductionCoordinate);
-  FailureOr<int64_t> lhs =
-      emitMapInput(ptx, lhsParameter, lhsType, lhsMap.getValue(), coordinates);
-  FailureOr<int64_t> rhs =
-      emitMapInput(ptx, rhsParameter, rhsType, rhsMap.getValue(), coordinates);
-  if (failed(lhs) || failed(rhs))
-    return failure();
-  ptx.stream << "  fma.rn.f32 %f" << accumulator << ", %f" << *lhs << ", %f"
-             << *rhs << ", %f" << accumulator << ";\n  add.u64 %rd"
-             << reductionCoordinate << ", %rd" << reductionCoordinate
-             << ", 1;\n  bra $" << label << "_loop;\n$" << label << "_done:\n";
-  return accumulator;
-}
-
-FailureOr<std::string> emitContractFoldCompositionPtx(
-    MaterializationTaskOp materializationTask,
-    SmallVectorImpl<MaterializationBufferOp> &buffers, ScheduleTaskOp task,
-    const llvm::SmallDenseMap<Attribute, Operation *> &sourceOperations) {
-  auto kind =
-      materializationTask->getAttrOfType<StringAttr>("composition_kind");
-  FailureOr<std::pair<Operation *, Operation *>> sources =
-      compositionSourcePair(materializationTask, sourceOperations);
-  if (!kind || kind.getValue() != "contract_fold" || failed(sources))
-    return failure();
-  auto contract = dyn_cast<ContractOp>(sources->first);
-  auto fold = dyn_cast<FoldOp>(sources->second);
-  if (!contract || !fold || fold.getInputs().size() != 1 ||
-      fold.getInitializers().size() != 1 || fold.getNumResults() != 1 ||
-      fold.getInputs().front() != contract.getResult(0) ||
-      materializationTask.getInputBuffers().size() != 3 ||
-      materializationTask.getOutputBuffers().size() != 2)
-    return failure();
-  auto lhs = compositionBufferType(materializationTask, buffers, false, 0);
-  auto rhs = compositionBufferType(materializationTask, buffers, false, 1);
-  auto initializer =
-      compositionBufferType(materializationTask, buffers, false, 2);
-  auto full = compositionBufferType(materializationTask, buffers, true, 0);
-  auto compact = compositionBufferType(materializationTask, buffers, true, 1);
-  if (!lhs || !rhs || !initializer || !full || !compact ||
-      lhs != contract.getInputs()[0].getType() ||
-      rhs != contract.getInputs()[1].getType() ||
-      initializer != fold.getInitializers().front().getType() ||
-      full != contract.getResult(0).getType() ||
-      compact != fold.getResult(0).getType() || full.getRank() < 2 ||
-      full.getRank() > 8 || !full.getElementType().isF32() ||
-      compact.getShape() != full.getShape().drop_back() ||
-      !compact.getElementType().isF32())
-    return failure();
-  FailureOr<ScheduledGeometry> geometry =
-      deriveSimt32Geometry(ScheduleTaskKind::RowFold, full.getShape(),
-                           NumericalPolicy::SourceOrdered);
-  FailureOr<int64_t> outputElements = staticElementCount(compact);
-  if (failed(geometry) || failed(outputElements) ||
-      task.getKind() != ScheduleTaskKind::RowFold ||
-      task.getDomainShape() != full.getShape() ||
-      task.getGridShape() != ArrayRef<int64_t>(geometry->grid) ||
-      task.getTileShape() != ArrayRef<int64_t>(geometry->tile) ||
-      task.getSerialTiles() != geometry->serialTiles ||
-      task.getWorkgroupThreads() != geometry->workgroupThreads ||
-      task.getSubgroupSize() != geometry->subgroupSize ||
-      task.getScratchBytes() != geometry->scratchBytes ||
-      task.getReductionAxis() != geometry->reductionAxis ||
-      task.getReductionOrder() !=
-          ScheduleReductionOrder::TreeAssociationFreeLeafOrderFixed)
-    return failure();
-
-  const int64_t reduction = full.getShape().back();
-  const int64_t serialTiles = task.getSerialTiles();
-  if (serialTiles <= 0)
-    return failure();
-  const int64_t activeThreads = ceilDivPositive(reduction, serialTiles);
-  if (activeThreads <= 0 || activeThreads > task.getWorkgroupThreads())
-    return failure();
-  PtxEmitter ptx(materializationTask.getInputBuffers().size() +
-                 materializationTask.getOutputBuffers().size());
-  ptx.header(task.getSemanticFingerprint(), /*usesDynamicSharedMemory=*/true);
-  int64_t local = ptx.nextF32();
-  int64_t leaf = ptx.nextU64();
-  int64_t leafEnd = ptx.nextU64();
-  int64_t row = ptx.nextU64();
-  ptx.stream << "  mov.u32 %r0, %tid.x;\n"
-                "  mov.u32 %r1, %ctaid.x;\n"
-                "  mov.u32 %r2, %ntid.x;\n"
-                "  setp.ge.u32 %p0, %r1, "
-             << *outputElements
-             << ";\n  @%p0 bra $done;\n  cvt.u64.u32 %rd" << row
-             << ", %r1;\n  cvt.u64.u32 %rd" << leaf
-             << ", %r0;\n  mul.lo.u64 %rd" << leaf << ", %rd" << leaf
-             << ", " << serialTiles << ";\n  add.u64 %rd" << leafEnd
-             << ", %rd" << leaf << ", " << serialTiles
-             << ";\n  mov.u32 %r4, 1;\n$composition_fold_load:\n"
-                "  setp.ge.u64 %p1, %rd"
-             << leaf << ", " << reduction
-             << ";\n  @%p1 bra $composition_fold_loaded;\n"
-                "  setp.ge.u64 %p2, %rd"
-             << leaf << ", %rd" << leafEnd
-             << ";\n  @%p2 bra $composition_fold_loaded;\n"
-                "  mad.lo.u64 %rd0, %rd"
-             << row << ", " << reduction << ", %rd" << leaf << ";\n";
-  FailureOr<SmallVector<int64_t>> fullCoordinates =
-      emitOutputCoordinates(ptx, full);
-  if (failed(fullCoordinates))
-    return failure();
-  FailureOr<int64_t> value = emitSerialContractElement(
-      ptx, contract, 0, 1, *fullCoordinates, "composition_inner_contract");
-  if (failed(value))
-    return failure();
-  int64_t fullPointer = ptx.nextU64();
-  int64_t combined = ptx.nextF32();
-  ptx.stream << "  ld.param.u64 %rd" << fullPointer
-             << ", [p3];\n  mad.lo.u64 %rd" << fullPointer << ", %rd0, 4, %rd"
-             << fullPointer << ";\n  st.global.f32 [%rd" << fullPointer
-             << "], %f" << *value
-             << ";\n  setp.ne.u32 %p3, %r4, 0;\n  @%p3 bra "
-                "$composition_fold_first_leaf;\n  add.rn.f32 %f"
-             << combined << ", %f" << local << ", %f" << *value
-             << ";\n  mov.f32 %f" << local << ", %f" << combined
-             << ";\n  bra $composition_fold_leaf_combined;\n"
-                "$composition_fold_first_leaf:\n  mov.f32 %f"
-             << local << ", %f" << *value
-             << ";\n  mov.u32 %r4, 0;\n$composition_fold_leaf_combined:\n"
-                "  add.u64 %rd"
-             << leaf << ", %rd" << leaf << ", 1;\n"
-                "  bra $composition_fold_load;\n"
-                "$composition_fold_loaded:\n";
-  int64_t threadOffset = ptx.nextU64();
-  int64_t sharedBase = ptx.nextU64();
-  int64_t threadPointer = ptx.nextU64();
-  ptx.stream << "  setp.ge.u32 %p1, %r0, " << activeThreads
-             << ";\n  @%p1 bra $composition_fold_skip_initial_store;\n"
-                "  cvt.u64.u32 %rd"
-             << threadOffset
-             << ", %r0;\n  mul.lo.u64 %rd" << threadOffset << ", %rd"
-             << threadOffset << ", 4;\n  mov.u64 %rd" << sharedBase
-             << ", shuttle_smem;\n  cvta.to.shared.u64 %rd" << sharedBase
-             << ", %rd" << sharedBase << ";\n  add.u64 %rd" << threadPointer
-             << ", %rd" << sharedBase << ", %rd" << threadOffset
-             << ";\n  st.shared.f32 [%rd" << threadPointer << "], %f" << local
-             << ";\n$composition_fold_skip_initial_store:\n  bar.sync 0;\n";
-  for (int64_t active = activeThreads; active > 1;
-       active = (active + 1) / 2) {
-    const int64_t pairs = active / 2;
-    int64_t pairIndex = ptx.nextU64();
-    int64_t pairPointer = ptx.nextU64();
-    int64_t left = ptx.nextF32();
-    int64_t right = ptx.nextF32();
-    int64_t sum = ptx.nextF32();
-    ptx.stream << "  setp.ge.u32 %p2, %r0, " << pairs
-               << ";\n  @%p2 bra $composition_fold_skip_pair_read_" << active
-               << ";\n  mul.lo.u32 %r6, %r0, 2;\n  cvt.u64.u32 %rd" << pairIndex
-               << ", %r6;\n  mul.lo.u64 %rd" << pairIndex << ", %rd"
-               << pairIndex << ", 4;\n  add.u64 %rd" << pairPointer << ", %rd"
-               << sharedBase << ", %rd" << pairIndex << ";\n  ld.shared.f32 %f"
-               << left << ", [%rd" << pairPointer << "];\n  ld.shared.f32 %f"
-               << right << ", [%rd" << pairPointer << "+4];\n  add.rn.f32 %f"
-               << sum << ", %f" << left << ", %f" << right
-               << ";\n$composition_fold_skip_pair_read_" << active << ":\n";
-    std::optional<int64_t> carry;
-    if (active % 2 != 0) {
-      carry = ptx.nextF32();
-      ptx.stream << "  setp.ne.u32 %p3, %r0, " << pairs
-                 << ";\n  @%p3 bra $composition_fold_skip_carry_read_" << active
-                 << ";\n  ld.shared.f32 %f" << *carry << ", [%rd" << sharedBase
-                 << "+" << (active - 1) * 4
-                 << "];\n$composition_fold_skip_carry_read_" << active << ":\n";
-    }
-    ptx.stream << "  bar.sync 0;\n  @%p2 bra "
-                  "$composition_fold_skip_pair_write_"
-               << active << ";\n  cvt.u64.u32 %rd" << threadOffset
-               << ", %r0;\n  mul.lo.u64 %rd" << threadOffset << ", %rd"
-               << threadOffset << ", 4;\n  add.u64 %rd" << threadPointer
-               << ", %rd" << sharedBase << ", %rd" << threadOffset
-               << ";\n  st.shared.f32 [%rd" << threadPointer << "], %f" << sum
-               << ";\n$composition_fold_skip_pair_write_" << active << ":\n";
-    if (carry) {
-      ptx.stream << "  @%p3 bra $composition_fold_skip_carry_write_" << active
-                 << ";\n  st.shared.f32 [%rd" << sharedBase << "+" << pairs * 4
-                 << "], %f" << *carry
-                 << ";\n$composition_fold_skip_carry_write_" << active << ":\n";
-    }
-    ptx.stream << "  bar.sync 0;\n";
-  }
-  int64_t reduced = ptx.nextF32();
-  int64_t initializerPointer = ptx.nextU64();
-  int64_t initializerValue = ptx.nextF32();
-  int64_t finalValue = ptx.nextF32();
-  int64_t compactPointer = ptx.nextU64();
-  ptx.stream << "  setp.ne.u32 %p2, %r0, 0;\n"
-                "  @%p2 bra $done;\n"
-                "  ld.shared.f32 %f"
-             << reduced << ", [%rd" << sharedBase << "];\n  ld.param.u64 %rd"
-             << initializerPointer << ", [p2];\n  ld.global.f32 %f"
-             << initializerValue << ", [%rd" << initializerPointer
-             << "];\n  add.rn.f32 %f" << finalValue << ", %f" << reduced
-             << ", %f" << initializerValue << ";\n  ld.param.u64 %rd"
-             << compactPointer
-             << ", [p4];\n  cvt.u64.u32 %rd0, %r1;\n  mad.lo.u64 %rd"
-             << compactPointer << ", %rd0, 4, %rd" << compactPointer
-             << ";\n  st.global.f32 [%rd" << compactPointer << "], %f"
-             << finalValue << ";\n";
-  if (ptx.f32 > 128 || ptx.u64 > 128 || ptx.bf16 > 16)
-    return failure();
-  ptx.finish();
-  return ptx.text;
-}
-
-struct MapContractLeaf {
-  int64_t lhs;
-  int64_t rhs;
-};
-
-FailureOr<MapContractLeaf>
-emitMapContractLeaf(PtxEmitter &ptx, MapOp map, MapOp projectedStatistic,
-                    ContractOp contract,
-                    ArrayRef<int64_t> contractCoordinates,
-                    int64_t mapContractOperand) {
-  if (mapContractOperand < 0 || mapContractOperand > 1 ||
-      contract.getInputs()[mapContractOperand] != map.getResult(0))
-    return failure();
-  auto contractMap =
-      dyn_cast<AffineMapAttr>(contract.getIndexingMaps()[mapContractOperand]);
-  if (!contractMap)
-    return failure();
-  FailureOr<SmallVector<int64_t>> mapCoordinates =
-      emitMappedCoordinates(ptx, contractMap.getValue(), contractCoordinates);
-  if (failed(mapCoordinates))
-    return failure();
-  SmallVector<int64_t> mapArguments;
-  for (auto [operand, value] : llvm::enumerate(map.getInputs())) {
-    auto indexing = dyn_cast<AffineMapAttr>(map.getIndexingMaps()[operand]);
-    auto type = dyn_cast<RankedTensorType>(value.getType());
-    if (!indexing || !type)
-      return failure();
-    FailureOr<int64_t> loaded = failure();
-    if (value.getDefiningOp<ContractOp>()) {
-      loaded = emitMapInput(ptx, 0, type, indexing.getValue(), *mapCoordinates);
-    } else if (projectedStatistic &&
-               value == projectedStatistic.getResult(0)) {
-      auto projectionIndexing =
-          dyn_cast<AffineMapAttr>(projectedStatistic.getIndexingMaps()[0]);
-      auto compact = dyn_cast<RankedTensorType>(
-          projectedStatistic.getInputs().front().getType());
-      FailureOr<SmallVector<int64_t>> projectedCoordinates =
-          emitMappedCoordinates(ptx, indexing.getValue(), *mapCoordinates);
-      if (!projectionIndexing || !compact || failed(projectedCoordinates))
-        return failure();
-      loaded = emitMapInput(ptx, 1, compact, projectionIndexing.getValue(),
-                            *projectedCoordinates);
-    } else {
-      loaded = emitMapInput(ptx, 1, type, indexing.getValue(), *mapCoordinates);
-    }
-    if (failed(loaded))
-      return failure();
-    mapArguments.push_back(*loaded);
-  }
-  FailureOr<int64_t> mapped =
-      emitScalarBody(ptx, map.getBody().front(), mapArguments);
-  const int64_t projectionOperand = 1 - mapContractOperand;
-  auto projectionMap =
-      dyn_cast<AffineMapAttr>(contract.getIndexingMaps()[projectionOperand]);
-  auto projectionType = dyn_cast<RankedTensorType>(
-      contract.getInputs()[projectionOperand].getType());
-  if (!projectionMap || !projectionType)
-    return failure();
-  FailureOr<int64_t> projection = emitMapInput(
-      ptx, 2, projectionType, projectionMap.getValue(), contractCoordinates);
-  if (failed(mapped) || failed(projection))
-    return failure();
-  return mapContractOperand == 0 ? MapContractLeaf{*mapped, *projection}
-                                 : MapContractLeaf{*projection, *mapped};
-}
-
-FailureOr<std::string> emitMapContractCompositionPtx(
-    MaterializationTaskOp materializationTask,
-    SmallVectorImpl<MaterializationBufferOp> &buffers, ScheduleTaskOp task,
-    const llvm::SmallDenseMap<Attribute, Operation *> &sourceOperations) {
-  auto kind =
-      materializationTask->getAttrOfType<StringAttr>("composition_kind");
-  FailureOr<SmallVector<Operation *>> sources =
-      compositionSourceOperations(materializationTask, sourceOperations);
-  if (!kind || kind.getValue() != "map_contract" || failed(sources) ||
-      (sources->size() != 2 && sources->size() != 3))
-    return failure();
-  MapOp projectedStatistic;
-  MapOp map;
-  if (sources->size() == 3) {
-    projectedStatistic = dyn_cast<MapOp>((*sources)[0]);
-    map = dyn_cast<MapOp>((*sources)[1]);
-  } else {
-    map = dyn_cast<MapOp>((*sources)[0]);
-  }
-  auto contract = dyn_cast<ContractOp>(sources->back());
-  if (!map || !contract || map.getInputs().size() != 2 ||
-      map.getNumResults() != 1 ||
-      materializationTask.getInputBuffers().size() != 3 ||
-      materializationTask.getOutputBuffers().size() != 1)
-    return failure();
-  auto full = compositionBufferType(materializationTask, buffers, false, 0);
-  auto compact = compositionBufferType(materializationTask, buffers, false, 1);
-  auto projection =
-      compositionBufferType(materializationTask, buffers, false, 2);
-  auto result = compositionBufferType(materializationTask, buffers, true, 0);
-  Value fullValue;
-  Value compactValue;
-  for (Value value : map.getInputs()) {
-    if (value.getDefiningOp<ContractOp>())
-      fullValue = value;
-    else if (value.getDefiningOp<FoldOp>())
-      compactValue = value;
-    else if (projectedStatistic &&
-             value == projectedStatistic.getResult(0))
-      compactValue = projectedStatistic.getInputs().front();
-  }
-  auto mapUse = llvm::find(contract.getInputs(), map.getResult(0));
-  if (!full || !compact || !projection || !result || !fullValue ||
-      !compactValue || full != fullValue.getType() ||
-      compact != compactValue.getType() ||
-      mapUse == contract.getInputs().end() ||
-      result != contract.getResult(0).getType())
-    return failure();
-  const int64_t mapContractOperand =
-      std::distance(contract.getInputs().begin(), mapUse);
-  Value projectionValue = contract.getInputs()[1 - mapContractOperand];
-  if (projection != projectionValue.getType())
-    return failure();
-  FailureOr<SmallVector<int64_t>> domain = contractDomainShape(contract);
-  if (!isClosedProjectedContract(contract) || failed(domain) ||
-      task.getKind() != ScheduleTaskKind::Contract ||
-      task.getDomainShape() != ArrayRef<int64_t>(*domain) ||
-      task.getReductionAxis() != static_cast<int64_t>(domain->size()) - 1 ||
-      task.getInputBuffers().size() != 3 ||
-      task.getOutputBuffers().size() != 1 || task.getScratchBytes() != 0)
-    return failure();
-  const bool fast =
-      task.getReductionOrder() == ScheduleReductionOrder::LeafOrderFree;
-  if (!fast && task.getReductionOrder() !=
-                   ScheduleReductionOrder::SerialAscendingFmaRnF32)
-    return failure();
-  FailureOr<int64_t> outputCount =
-      scheduleElementCount(task.getDomainShape().drop_back());
-  if (failed(outputCount) || *outputCount > UINT32_MAX)
-    return failure();
-  const int64_t outputs = *outputCount;
-  const int64_t reduction = task.getDomainShape().back();
-  if (fast) {
-    const int64_t outputsPerBlock = std::min<int64_t>(outputs, 8);
-    if (task.getGridShape() !=
-            ArrayRef<int64_t>({ceilDivPositive(outputs, outputsPerBlock)}) ||
-        task.getTileShape() != ArrayRef<int64_t>({outputsPerBlock}) ||
-        task.getWorkgroupThreads() != outputsPerBlock * 32 ||
-        task.getSubgroupSize() != 32 ||
-        task.getSerialTiles() != ceilDivPositive(reduction, 32))
-      return failure();
-    PtxEmitter ptx(/*arity=*/4);
-    ptx.header(task.getSemanticFingerprint());
-    ptx.stream << "  mov.u32 %r0, %tid.x;\n"
-                  "  shr.u32 %r1, %r0, 5;\n"
-                  "  and.b32 %r2, %r0, 31;\n"
-                  "  mov.u32 %r3, %ctaid.x;\n"
-                  "  mad.lo.u32 %r4, %r3, "
-               << outputsPerBlock << ", %r1;\n  setp.ge.u32 %p0, %r4, "
-               << outputs << ";\n  @%p0 bra $done;\n  cvt.u64.u32 %rd0, %r4;\n";
-    FailureOr<SmallVector<int64_t>> outputCoordinates =
-        emitOutputCoordinates(ptx, result);
-    if (failed(outputCoordinates) ||
-        outputCoordinates->size() + 1 != domain->size())
-      return failure();
-    int64_t accumulator = ptx.nextF32();
-    int64_t reductionCoordinate = ptx.nextU64();
-    ptx.stream << "  mov.f32 %f" << accumulator
-               << ", 0f00000000;\n  cvt.u64.u32 %rd" << reductionCoordinate
-               << ", %r2;\n$composition_contract_fast_loop:\n"
-                  "  setp.ge.u64 %p1, %rd"
-               << reductionCoordinate << ", " << reduction
-               << ";\n  @%p1 bra $composition_contract_fast_reduce;\n";
-    SmallVector<int64_t> contractCoordinates(*outputCoordinates);
-    contractCoordinates.push_back(reductionCoordinate);
-    FailureOr<MapContractLeaf> leaf = emitMapContractLeaf(
-        ptx, map, projectedStatistic, contract, contractCoordinates,
-        mapContractOperand);
-    if (failed(leaf))
-      return failure();
-    ptx.stream << "  fma.rn.f32 %f" << accumulator << ", %f" << leaf->lhs
-               << ", %f" << leaf->rhs << ", %f" << accumulator
-               << ";\n  add.u64 %rd" << reductionCoordinate << ", %rd"
-               << reductionCoordinate
-               << ", 32;\n  bra $composition_contract_fast_loop;\n"
-                  "$composition_contract_fast_reduce:\n  mov.b32 %r5, %f"
-               << accumulator << ";\n";
-    int64_t shuffled = ptx.nextF32();
-    for (int64_t offset : {16, 8, 4, 2, 1}) {
-      ptx.stream << "  shfl.sync.down.b32 %r6, %r5, " << offset
-                 << ", 31, 0xffffffff;\n  mov.b32 %f" << shuffled
-                 << ", %r6;\n  add.rn.f32 %f" << accumulator << ", %f"
-                 << accumulator << ", %f" << shuffled << ";\n  mov.b32 %r5, %f"
-                 << accumulator << ";\n";
-    }
-    int64_t outputPointer = ptx.nextU64();
-    ptx.stream << "  setp.ne.u32 %p2, %r2, 0;\n  @%p2 bra $done;\n"
-                  "  ld.param.u64 %rd"
-               << outputPointer << ", [p3];\n  mad.lo.u64 %rd" << outputPointer
-               << ", %rd0, 4, %rd" << outputPointer << ";\n  st.global.f32 [%rd"
-               << outputPointer << "], %f" << accumulator << ";\n";
-    if (ptx.f32 > 128 || ptx.u64 > 128 || ptx.bf16 > 16)
-      return failure();
-    ptx.finish();
-    return ptx.text;
-  }
-
-  const int64_t tile = std::min<int64_t>(outputs, 256);
-  if (task.getGridShape() !=
-          ArrayRef<int64_t>({ceilDivPositive(outputs, tile)}) ||
-      task.getTileShape() != ArrayRef<int64_t>({tile}) ||
-      task.getWorkgroupThreads() != scheduleThreads(tile) ||
-      task.getSubgroupSize() != 32 || task.getSerialTiles() != reduction)
-    return failure();
-  PtxEmitter ptx(/*arity=*/4);
-  ptx.header(task.getSemanticFingerprint());
-  if (failed(emitLinearThread(ptx, outputs)))
-    return failure();
-  FailureOr<SmallVector<int64_t>> outputCoordinates =
-      emitOutputCoordinates(ptx, result);
-  if (failed(outputCoordinates) ||
-      outputCoordinates->size() + 1 != domain->size())
-    return failure();
-  int64_t accumulator = ptx.nextF32();
-  int64_t reductionCoordinate = ptx.nextU64();
-  ptx.stream << "  mov.f32 %f" << accumulator << ", 0f00000000;\n  mov.u64 %rd"
-             << reductionCoordinate
-             << ", 0;\n$composition_contract_loop:\n"
-                "  setp.ge.u64 %p1, %rd"
-             << reductionCoordinate << ", " << reduction
-             << ";\n  @%p1 bra $composition_contract_done;\n";
-  SmallVector<int64_t> contractCoordinates(*outputCoordinates);
-  contractCoordinates.push_back(reductionCoordinate);
-  FailureOr<MapContractLeaf> leaf = emitMapContractLeaf(
-      ptx, map, projectedStatistic, contract, contractCoordinates,
-      mapContractOperand);
-  if (failed(leaf))
-    return failure();
-  int64_t outputPointer = ptx.nextU64();
-  ptx.stream << "  fma.rn.f32 %f" << accumulator << ", %f" << leaf->lhs
-             << ", %f" << leaf->rhs << ", %f" << accumulator
-             << ";\n  add.u64 %rd" << reductionCoordinate << ", %rd"
-             << reductionCoordinate
-             << ", 1;\n  bra $composition_contract_loop;\n"
-                "$composition_contract_done:\n  ld.param.u64 %rd"
-             << outputPointer << ", [p3];\n  mad.lo.u64 %rd" << outputPointer
-             << ", %rd0, 4, %rd" << outputPointer << ";\n  st.global.f32 [%rd"
-             << outputPointer << "], %f" << accumulator << ";\n";
-  if (ptx.f32 > 128 || ptx.u64 > 128 || ptx.bf16 > 16)
-    return failure();
-  ptx.finish();
-  return ptx.text;
-}
-
-FailureOr<int64_t> emitFoldRegionValue(FoldRegionPtxContext &context,
-                                       Value value,
-                                       ArrayRef<int64_t> coordinates) {
-  auto materialized = context.materializedValues.find(value);
-  if (materialized != context.materializedValues.end())
-    return materialized->second;
-  Operation *producer = value.getDefiningOp();
-  if (auto fold = dyn_cast_or_null<FoldOp>(producer)) {
-    auto found = context.foldValues.find(fold);
-    return found == context.foldValues.end() ? FailureOr<int64_t>(failure())
-                                             : found->second;
-  }
-  auto map = dyn_cast_or_null<MapOp>(producer);
-  if (!map || map.getNumResults() != 1 || map.getResult(0) != value)
-    return failure();
-  auto output = dyn_cast<RankedTensorType>(map.getResult(0).getType());
-  if (!output || output.getRank() != static_cast<int64_t>(coordinates.size()))
-    return failure();
-  SmallVector<int64_t> arguments;
-  for (auto [operandOrdinal, operand] : llvm::enumerate(map.getInputs())) {
-    auto indexing =
-        dyn_cast<AffineMapAttr>(map.getIndexingMaps()[operandOrdinal]);
-    if (!indexing)
-      return failure();
-    Operation *operandProducer = operand.getDefiningOp();
-    if (isa_and_nonnull<MapOp>(operandProducer) &&
-        context.sourceSet.contains(operandProducer)) {
-      FailureOr<SmallVector<int64_t>> operandCoordinates =
-          emitMappedCoordinates(context.ptx, indexing.getValue(), coordinates);
-      if (failed(operandCoordinates))
-        return failure();
-      FailureOr<int64_t> argument =
-          emitFoldRegionValue(context, operand, *operandCoordinates);
-      if (failed(argument))
-        return failure();
-      arguments.push_back(*argument);
-      continue;
-    }
-    if (isa_and_nonnull<FoldOp>(operandProducer)) {
-      auto found = context.foldValues.find(operandProducer);
-      if (found != context.foldValues.end()) {
-        if (!isCanonicalFoldResultExpansion(map, operandOrdinal))
-          return failure();
-        arguments.push_back(found->second);
-        continue;
-      }
-    }
-    FailureOr<int64_t> parameter =
-        foldRegionBoundaryParameter(context, map, operandOrdinal);
-    if (failed(parameter))
-      return failure();
-    int64_t bufferOrdinal = context.task.getInputBuffers()[*parameter];
-    if (bufferOrdinal < 0 || bufferOrdinal >= context.buffers.size())
-      return failure();
-    auto input = dyn_cast<RankedTensorType>(
-        context.buffers[bufferOrdinal].getTensorType());
-    if (!input || input != operand.getType())
-      return failure();
-    FailureOr<int64_t> argument = emitMapInput(
-        context.ptx, *parameter, input, indexing.getValue(), coordinates);
-    if (failed(argument))
-      return failure();
-    arguments.push_back(*argument);
-  }
-  return emitScalarBody(context.ptx, map.getBody().front(), arguments);
-}
-
-FailureOr<std::string> emitFoldRegionPtx(
-    MaterializationTaskOp materializationTask,
-    SmallVectorImpl<MaterializationBufferOp> &buffers, ScheduleTaskOp task,
-    llvm::SmallDenseMap<Attribute, Operation *> &sourceOperations) {
-  auto sourceAttributes =
-      materializationTask->getAttrOfType<ArrayAttr>("fold_region_sources");
-  auto phaseAttributes =
-      materializationTask->getAttrOfType<ArrayAttr>("fold_region_phases");
-  auto outputAttributes = materializationTask->getAttrOfType<ArrayAttr>(
-      "fold_region_output_sources");
-  if (!sourceAttributes || !phaseAttributes || phaseAttributes.empty() ||
-      !outputAttributes || outputAttributes.empty() ||
-      outputAttributes.size() != materializationTask.getOutputBuffers().size())
-    return failure();
-  SmallVector<Operation *> sources;
-  llvm::SmallDenseSet<Operation *> sourceSet;
-  for (Attribute source : sourceAttributes) {
-    Operation *operation = sourceOperations.lookup(source);
-    if (!operation || !sourceSet.insert(operation).second)
-      return failure();
-    sources.push_back(operation);
-  }
-  SmallVector<Operation *> outputOperations;
-  for (Attribute source : outputAttributes) {
-    Operation *operation = sourceOperations.lookup(source);
-    if (!operation || !sourceSet.contains(operation) ||
-        operation->getNumResults() != 1)
-      return failure();
-    outputOperations.push_back(operation);
-  }
-  SmallVector<FoldOp> phases;
-  for (Attribute attribute : phaseAttributes) {
-    auto dictionary = dyn_cast<DictionaryAttr>(attribute);
-    auto fold = dictionary ? dyn_cast_or_null<FoldOp>(sourceOperations.lookup(
-                                 dictionary.get("source")))
-                           : FoldOp{};
-    if (!fold)
-      return failure();
-    phases.push_back(fold);
-  }
-  FoldOp primary = phases.front();
-  auto domain = cast<RankedTensorType>(primary.getInputs().front().getType());
-  auto primaryResult = cast<RankedTensorType>(primary.getResult(0).getType());
-  FailureOr<int64_t> outputExtent = staticElementCount(primaryResult);
-  if (failed(outputExtent) || *outputExtent <= 0 ||
-      task.getGridShape() != ArrayRef<int64_t>({*outputExtent}) ||
-      task.getWorkgroupThreads() <= 0 || task.getWorkgroupThreads() > 256 ||
-      task.getSerialTiles() <= 0)
-    return failure();
-  ArrayRef<int64_t> primaryReduction = primary.getReductionDimensions();
-  const bool row = primaryReduction.size() == 1 &&
-                   primaryReduction.front() == domain.getRank() - 1;
-  const bool fullPrefix =
-      primaryReduction.size() == static_cast<size_t>(domain.getRank() - 1) &&
-      llvm::all_of(llvm::enumerate(primaryReduction), [](auto axis) {
-        return static_cast<int64_t>(axis.index()) == axis.value();
-      });
-  if (!row && !fullPrefix)
-    return failure();
-  FailureOr<int64_t> reductionExtent =
-      fullPrefix ? scheduleElementCount(domain.getShape().drop_back())
-                 : FailureOr<int64_t>(domain.getShape().back());
-  if (failed(reductionExtent))
-    return failure();
-  if (task.getScratchBytes() !=
-      task.getWorkgroupThreads() * static_cast<int64_t>(sizeof(float)))
-    return failure();
-
-  PtxEmitter ptx(materializationTask.getInputBuffers().size() +
-                 materializationTask.getOutputBuffers().size());
-  ptx.header(task.getSemanticFingerprint(), /*usesDynamicSharedMemory=*/true);
-  FoldRegionPtxContext context{ptx,
-                               materializationTask,
-                               buffers,
-                               sourceOperations,
-                               DenseMap<Operation *, int64_t>(),
-                               sourceSet,
-                               DenseMap<Value, int64_t>(),
-                               DenseMap<Value, int64_t>()};
-  auto boundaryUses = materializationTask->getAttrOfType<ArrayAttr>(
-      "fold_region_boundary_uses");
-  if (!boundaryUses)
-    return failure();
-  for (Attribute attribute : boundaryUses) {
-    auto use = dyn_cast<DictionaryAttr>(attribute);
-    auto map = use ? dyn_cast_or_null<MapOp>(
-                         sourceOperations.lookup(use.get("source")))
-                   : MapOp{};
-    auto operand = use ? dyn_cast_or_null<IntegerAttr>(use.get("operand"))
-                       : IntegerAttr{};
-    auto inputBuffer =
-        use ? dyn_cast_or_null<IntegerAttr>(use.get("input_buffer"))
-            : IntegerAttr{};
-    if (!map || !operand || !inputBuffer || operand.getInt() < 0 ||
-        operand.getInt() >= static_cast<int64_t>(map.getInputs().size()))
-      return failure();
-    auto found = llvm::find(materializationTask.getInputBuffers(),
-                            inputBuffer.getInt());
-    if (found == materializationTask.getInputBuffers().end())
-      return failure();
-    int64_t parameter =
-        std::distance(materializationTask.getInputBuffers().begin(), found);
-    Value value = map.getInputs()[operand.getInt()];
-    auto [position, inserted] =
-        context.boundaryParameters.try_emplace(value, parameter);
-    if (!inserted && position->second != parameter)
-      return failure();
-  }
-  auto emitLeaf = [&](Value value, ArrayRef<int64_t> coordinates)
-      -> FailureOr<int64_t> {
-    auto boundary = context.boundaryParameters.find(value);
-    if (boundary == context.boundaryParameters.end())
-      return emitFoldRegionValue(context, value, coordinates);
-    int64_t bufferOrdinal =
-        materializationTask.getInputBuffers()[boundary->second];
-    if (bufferOrdinal < 0 || bufferOrdinal >= buffers.size())
-      return failure();
-    auto input = dyn_cast<RankedTensorType>(
-        buffers[bufferOrdinal].getTensorType());
-    if (!input || input.getRank() != static_cast<int64_t>(coordinates.size()))
-      return failure();
-    return emitMapInput(
-        ptx, boundary->second, input,
-        AffineMap::getMultiDimIdentityMap(input.getRank(),
-                                          materializationTask.getContext()),
-        coordinates);
-  };
-  SmallVector<int64_t> phaseResultRegisters;
-  for (size_t phase = 0; phase < phases.size(); ++phase)
-    phaseResultRegisters.push_back(ptx.nextF32());
-  const int64_t phaseScratchBase = ptx.f32;
-  int64_t f32RegisterHighWater = ptx.f32;
-  int64_t accumulator = ptx.nextF32();
-  ptx.stream << "  mov.u32 %r0, %tid.x;\n"
-                "  mov.u32 %r1, %ctaid.x;\n"
-                "  setp.ge.u32 %p0, %r1, "
-             << *outputExtent
-             << ";\n  @%p0 bra $done;\n"
-                "  mul.lo.u32 %r4, %r0, "
-             << task.getSerialTiles() << ";\n  add.u32 %r7, %r4, "
-             << task.getSerialTiles() << ";\n  min.u32 %r7, %r7, "
-             << *reductionExtent << ";\n  mov.f32 %f" << accumulator
-             << ", 0f00000000;\n$fold_region_load:\n"
-                "  setp.ge.u32 %p1, %r4, %r7;\n"
-                "  @%p1 bra $fold_region_loaded;\n"
-                "  cvt.u64.u32 %rd0, %r4;\n"
-                "  cvt.u64.u32 %rd1, %r1;\n";
-  if (fullPrefix)
-    ptx.stream << "  mad.lo.u64 %rd0, %rd0, " << *outputExtent << ", %rd1;\n";
-  else
-    ptx.stream << "  mad.lo.u64 %rd0, %rd1, " << *reductionExtent
-               << ", %rd0;\n";
-  FailureOr<SmallVector<int64_t>> reductionCoordinates =
-      emitOutputCoordinates(ptx, domain);
-  if (failed(reductionCoordinates))
-    return failure();
-  FailureOr<int64_t> leaf =
-      emitLeaf(primary.getInputs().front(), *reductionCoordinates);
-  if (failed(leaf))
-    return failure();
-  int64_t combined = ptx.nextF32();
-  ptx.stream << "  add.rn.f32 %f" << combined << ", %f" << accumulator << ", %f"
-             << *leaf << ";\n  mov.f32 %f" << accumulator << ", %f" << combined
-             << ";\n  add.u32 %r4, %r4, 1;\n"
-                "  bra $fold_region_load;\n$fold_region_loaded:\n";
-
-  ptx.stream << "  cvt.u64.u32 %rd2, %r0;\n"
-                "  mul.lo.u64 %rd2, %rd2, 4;\n"
-                "  mov.u64 %rd3, shuttle_smem;\n"
-                "  cvta.to.shared.u64 %rd3, %rd3;\n"
-                "  add.u64 %rd2, %rd3, %rd2;\n"
-                "  st.shared.f32 [%rd2], %f"
-             << accumulator << ";\n  bar.sync 0;\n";
-  for (int64_t active = task.getWorkgroupThreads(); active > 1;
-       active = (active + 1) / 2) {
-    int64_t pairs = active / 2;
-    int64_t left = ptx.nextF32();
-    int64_t right = ptx.nextF32();
-    int64_t sum = ptx.nextF32();
-    ptx.stream << "  setp.ge.u32 %p2, %r0, " << pairs
-               << ";\n  @%p2 bra $fold_region_skip_pair_read" << active
-               << ";\n  mul.lo.u32 %r5, %r0, 2;\n"
-                  "  cvt.u64.u32 %rd4, %r5;\n"
-                  "  mul.lo.u64 %rd4, %rd4, 4;\n"
-                  "  add.u64 %rd4, %rd3, %rd4;\n"
-                  "  ld.shared.f32 %f"
-               << left << ", [%rd4];\n  ld.shared.f32 %f" << right
-               << ", [%rd4+4];\n  add.rn.f32 %f" << sum << ", %f" << left
-               << ", %f" << right << ";\n$fold_region_skip_pair_read" << active
-               << ":\n";
-    std::optional<int64_t> carry;
-    if (active % 2 != 0) {
-      carry = ptx.nextF32();
-      ptx.stream << "  setp.ne.u32 %p3, %r0, " << pairs
-                 << ";\n  @%p3 bra $fold_region_skip_carry_read" << active
-                 << ";\n  ld.shared.f32 %f" << *carry << ", [%rd3+"
-                 << (active - 1) * static_cast<int64_t>(sizeof(float))
-                 << "];\n$fold_region_skip_carry_read" << active << ":\n";
-    }
-    ptx.stream << "  bar.sync 0;\n"
-                  "  @%p2 bra $fold_region_skip_pair_write"
-               << active
-               << ";\n  cvt.u64.u32 %rd5, %r0;\n"
-                  "  mul.lo.u64 %rd5, %rd5, 4;\n"
-                  "  add.u64 %rd5, %rd3, %rd5;\n"
-                  "  st.shared.f32 [%rd5], %f"
-               << sum << ";\n$fold_region_skip_pair_write" << active << ":\n";
-    if (carry) {
-      ptx.stream << "  @%p3 bra $fold_region_skip_carry_write" << active
-                 << ";\n  st.shared.f32 [%rd3+"
-                 << pairs * static_cast<int64_t>(sizeof(float)) << "], %f"
-                 << *carry << ";\n$fold_region_skip_carry_write" << active
-                 << ":\n";
-    }
-    ptx.stream << "  bar.sync 0;\n";
-  }
-  int64_t primaryValue = phaseResultRegisters.front();
-  ptx.stream << "  ld.shared.f32 %f" << primaryValue << ", [%rd3];\n";
-  context.foldValues[primary] = primaryValue;
-  f32RegisterHighWater = std::max(f32RegisterHighWater, ptx.f32);
-  ptx.f32 = phaseScratchBase;
-
-  for (auto indexedFold :
-       llvm::enumerate(ArrayRef<FoldOp>(phases).drop_front())) {
-    const size_t phaseOrdinal = indexedFold.index();
-    FoldOp fold = indexedFold.value();
-    auto input = cast<RankedTensorType>(fold.getInputs().front().getType());
-    int64_t cardinality = 1;
-    for (int64_t axis : fold.getReductionDimensions())
-      cardinality *= input.getDimSize(axis);
-    if (cardinality != 1) {
-      if (input != domain ||
-          fold.getReductionDimensions() != primary.getReductionDimensions())
-        return failure();
-      const int64_t phase = phaseOrdinal + 1;
-      int64_t phaseAccumulator = ptx.nextF32();
-      ptx.stream << "  bar.sync 0;\n  mul.lo.u32 %r4, %r0, "
-                 << task.getSerialTiles() << ";\n  add.u32 %r7, %r4, "
-                 << task.getSerialTiles() << ";\n  min.u32 %r7, %r7, "
-                 << *reductionExtent << ";\n  mov.f32 %f" << phaseAccumulator
-                 << ", 0f00000000;\n$fold_region_phase_" << phase
-                 << "_load:\n"
-                    "  setp.ge.u32 %p1, %r4, %r7;\n"
-                    "  @%p1 bra $fold_region_phase_"
-                 << phase
-                 << "_loaded;\n"
-                    "  cvt.u64.u32 %rd0, %r4;\n"
-                    "  cvt.u64.u32 %rd1, %r1;\n";
-      if (fullPrefix)
-        ptx.stream << "  mad.lo.u64 %rd0, %rd0, " << *outputExtent
-                   << ", %rd1;\n";
-      else
-        ptx.stream << "  mad.lo.u64 %rd0, %rd1, " << *reductionExtent
-                   << ", %rd0;\n";
-      FailureOr<SmallVector<int64_t>> phaseCoordinates =
-          emitOutputCoordinates(ptx, input);
-      if (failed(phaseCoordinates))
-        return failure();
-      FailureOr<int64_t> phaseLeaf =
-          emitLeaf(fold.getInputs().front(), *phaseCoordinates);
-      if (failed(phaseLeaf))
-        return failure();
-      int64_t phaseCombined = ptx.nextF32();
-      ptx.stream << "  add.rn.f32 %f" << phaseCombined << ", %f"
-                 << phaseAccumulator << ", %f" << *phaseLeaf
-                 << ";\n  mov.f32 %f" << phaseAccumulator << ", %f"
-                 << phaseCombined
-                 << ";\n  add.u32 %r4, %r4, 1;\n"
-                    "  bra $fold_region_phase_"
-                 << phase << "_load;\n$fold_region_phase_" << phase
-                 << "_loaded:\n"
-                    "  cvt.u64.u32 %rd2, %r0;\n"
-                    "  mul.lo.u64 %rd2, %rd2, 4;\n"
-                    "  add.u64 %rd2, %rd3, %rd2;\n"
-                    "  st.shared.f32 [%rd2], %f"
-                 << phaseAccumulator << ";\n  bar.sync 0;\n";
-      for (int64_t active = task.getWorkgroupThreads(); active > 1;
-           active = (active + 1) / 2) {
-        int64_t pairs = active / 2;
-        int64_t left = ptx.nextF32();
-        int64_t right = ptx.nextF32();
-        int64_t sum = ptx.nextF32();
-        ptx.stream << "  setp.ge.u32 %p2, %r0, " << pairs
-                   << ";\n  @%p2 bra $fold_region_phase_" << phase
-                   << "_skip_pair_read" << active
-                   << ";\n  mul.lo.u32 %r5, %r0, 2;\n"
-                      "  cvt.u64.u32 %rd4, %r5;\n"
-                      "  mul.lo.u64 %rd4, %rd4, 4;\n"
-                      "  add.u64 %rd4, %rd3, %rd4;\n"
-                      "  ld.shared.f32 %f"
-                   << left << ", [%rd4];\n  ld.shared.f32 %f" << right
-                   << ", [%rd4+4];\n  add.rn.f32 %f" << sum << ", %f" << left
-                   << ", %f" << right << ";\n$fold_region_phase_" << phase
-                   << "_skip_pair_read" << active << ":\n";
-        std::optional<int64_t> carry;
-        if (active % 2 != 0) {
-          carry = ptx.nextF32();
-          ptx.stream << "  setp.ne.u32 %p3, %r0, " << pairs
-                     << ";\n  @%p3 bra $fold_region_phase_" << phase
-                     << "_skip_carry_read" << active << ";\n  ld.shared.f32 %f"
-                     << *carry << ", [%rd3+"
-                     << (active - 1) * static_cast<int64_t>(sizeof(float))
-                     << "];\n$fold_region_phase_" << phase << "_skip_carry_read"
-                     << active << ":\n";
-        }
-        ptx.stream << "  bar.sync 0;\n"
-                      "  @%p2 bra $fold_region_phase_"
-                   << phase << "_skip_pair_write" << active
-                   << ";\n  cvt.u64.u32 %rd5, %r0;\n"
-                      "  mul.lo.u64 %rd5, %rd5, 4;\n"
-                      "  add.u64 %rd5, %rd3, %rd5;\n"
-                      "  st.shared.f32 [%rd5], %f"
-                   << sum << ";\n$fold_region_phase_" << phase
-                   << "_skip_pair_write" << active << ":\n";
-        if (carry) {
-          ptx.stream << "  @%p3 bra $fold_region_phase_" << phase
-                     << "_skip_carry_write" << active
-                     << ";\n  st.shared.f32 [%rd3+"
-                     << pairs * static_cast<int64_t>(sizeof(float)) << "], %f"
-                     << *carry << ";\n$fold_region_phase_" << phase
-                     << "_skip_carry_write" << active << ":\n";
-        }
-        ptx.stream << "  bar.sync 0;\n";
-      }
-      int64_t phaseValue = phaseResultRegisters[phase];
-      ptx.stream << "  ld.shared.f32 %f" << phaseValue << ", [%rd3];\n";
-      context.foldValues[fold] = phaseValue;
-      f32RegisterHighWater = std::max(f32RegisterHighWater, ptx.f32);
-      ptx.f32 = phaseScratchBase;
-      continue;
-    }
-    ptx.stream << "  cvt.u64.u32 %rd0, %r1;\n";
-    FailureOr<SmallVector<int64_t>> coordinates =
-        emitOutputCoordinates(ptx, input);
-    if (failed(coordinates))
-      return failure();
-    FailureOr<int64_t> value =
-        emitLeaf(fold.getInputs().front(), *coordinates);
-    if (failed(value))
-      return failure();
-    int64_t initializer = ptx.nextF32();
-    int64_t combined = ptx.nextF32();
-    ptx.stream << "  mov.f32 %f" << initializer
-               << ", 0f00000000;\n  add.rn.f32 %f" << combined << ", %f"
-               << initializer << ", %f" << *value << ";\n  mov.f32 %f"
-               << phaseResultRegisters[phaseOrdinal + 1] << ", %f" << combined
-               << ";\n";
-    context.foldValues[fold] = phaseResultRegisters[phaseOrdinal + 1];
-    f32RegisterHighWater = std::max(f32RegisterHighWater, ptx.f32);
-    ptx.f32 = phaseScratchBase;
-  }
-
-  const int64_t epilogueF32Base = phaseScratchBase;
-  for (auto [outputOrdinal, outputOperation, outputBuffer] : llvm::enumerate(
-           outputOperations, materializationTask.getOutputBuffers())) {
-    ptx.f32 = epilogueF32Base;
-    if (outputBuffer < 0 || outputBuffer >= buffers.size())
-      return failure();
-    auto output = cast<RankedTensorType>(buffers[outputBuffer].getTensorType());
-    FailureOr<int64_t> outputElements = staticElementCount(output);
-    if (failed(outputElements) || *outputElements % *outputExtent != 0)
-      return failure();
-    int64_t elementsPerBlock = *outputElements / *outputExtent;
-    int64_t outputParameter = materializationTask.getInputBuffers().size() +
-                              static_cast<int64_t>(outputOrdinal);
-    if (auto outputFold = dyn_cast<FoldOp>(outputOperation)) {
-      auto value = context.foldValues.find(outputFold);
-      if (value == context.foldValues.end() || elementsPerBlock != 1 ||
-          !output.getElementType().isF32())
-        return failure();
-      ptx.stream << "  setp.ne.u32 %p3, %r0, 0;\n"
-                    "  @%p3 bra $fold_region_output_"
-                 << outputOrdinal
-                 << "_done;\n"
-                    "  ld.param.u64 %rd6, [p"
-                 << outputParameter
-                 << "];\n  cvt.u64.u32 %rd7, %r1;\n"
-                    "  mad.lo.u64 %rd6, %rd7, 4, %rd6;\n"
-                    "  st.global.f32 [%rd6], %f"
-                 << value->second << ";\n$fold_region_output_" << outputOrdinal
-                 << "_done:\n";
-      f32RegisterHighWater = std::max(f32RegisterHighWater, ptx.f32);
-      continue;
-    }
-    auto outputMap = dyn_cast<MapOp>(outputOperation);
-    if (!outputMap || outputMap.getResult(0).getType() != output)
-      return failure();
-    ptx.stream << "  mov.u32 %r6, %r0;\n$fold_region_output_"
-               << outputOrdinal
-               << "_epilogue:\n"
-                  "  setp.ge.u32 %p3, %r6, "
-               << elementsPerBlock
-               << ";\n  @%p3 bra $fold_region_output_" << outputOrdinal
-               << "_done;\n"
-                  "  cvt.u64.u32 %rd0, %r1;\n"
-                  "  cvt.u64.u32 %rd6, %r6;\n";
-    if (row) {
-      ptx.stream << "  mad.lo.u64 %rd0, %rd0, " << elementsPerBlock
-                 << ", %rd6;\n";
-    } else {
-      ptx.stream << "  mad.lo.u64 %rd0, %rd6, " << *outputExtent
-                 << ", %rd0;\n";
-    }
-    FailureOr<SmallVector<int64_t>> coordinates =
-        emitOutputCoordinates(ptx, output);
-    if (failed(coordinates))
-      return failure();
-    FailureOr<int64_t> value =
-        emitFoldRegionValue(context, outputMap.getResult(0), *coordinates);
-    if (failed(value))
-      return failure();
-    int64_t pointer = ptx.nextU64();
-    int64_t bytes = output.getElementType().isBF16() ? 2 : 4;
-    ptx.stream << "  ld.param.u64 %rd" << pointer << ", [p" << outputParameter
-               << "];\n  mad.lo.u64 %rd" << pointer << ", %rd0, " << bytes
-               << ", %rd" << pointer << ";\n";
-    if (output.getElementType().isBF16()) {
-      int64_t rounded = ptx.nextBF16();
-      ptx.stream << "  cvt.rn.bf16.f32 %h" << rounded << ", %f" << *value
-                 << ";\n  st.global.u16 [%rd" << pointer << "], %h" << rounded
-                 << ";\n";
-    } else {
-      ptx.stream << "  st.global.f32 [%rd" << pointer << "], %f" << *value
-                 << ";\n";
-    }
-    ptx.stream << "  add.u32 %r6, %r6, " << task.getWorkgroupThreads()
-               << ";\n  bra $fold_region_output_" << outputOrdinal
-               << "_epilogue;\n$fold_region_output_" << outputOrdinal
-               << "_done:\n";
-    f32RegisterHighWater = std::max(f32RegisterHighWater, ptx.f32);
-  }
-  ptx.f32 = f32RegisterHighWater;
-  if (ptx.f32 > 128 || ptx.u64 > 128 || ptx.bf16 > 16)
-    return failure();
-  ptx.finish();
-  return ptx.text;
-}
-
-FailureOr<std::string> emitContractRegionPtx(
-    MaterializationTaskOp materializationTask,
-    SmallVectorImpl<MaterializationBufferOp> &buffers, ScheduleTaskOp task,
-    llvm::SmallDenseMap<Attribute, Operation *> &sourceOperations) {
-  auto sourceAttributes =
-      materializationTask->getAttrOfType<ArrayAttr>("contract_region_sources");
-  auto strategy = materializationTask->getAttrOfType<StringAttr>(
-      "contract_region_strategy");
-  auto cost = materializationTask->getAttrOfType<DictionaryAttr>(
-      "contract_region_cost");
-  auto foldSource = materializationTask->getAttrOfType<SourceRefAttr>(
-      "contract_region_fold_source");
-  auto contractSource = materializationTask->getAttrOfType<SourceRefAttr>(
-      "contract_region_contract_source");
-  auto boundarySource = materializationTask->getAttrOfType<SourceRefAttr>(
-      "contract_region_bf16_boundary_source");
-  auto epilogueSources = materializationTask->getAttrOfType<ArrayAttr>(
-      "contract_region_epilogue_sources");
-  ArrayRef<int64_t> outputBuffers = materializationTask.getOutputBuffers();
-  const bool materializesNormalized = outputBuffers.size() == 2;
-  if (!sourceAttributes || !strategy || !cost || !foldSource ||
-      !contractSource || !boundarySource || !epilogueSources ||
-      epilogueSources.size() != 1 ||
-      (outputBuffers.size() != 1 && !materializesNormalized) ||
-      task.getGridShape().size() != 2)
-    return failure();
-  auto rows = cost.getAs<IntegerAttr>("rows");
-  auto reductionAttribute = cost.getAs<IntegerAttr>("reduction");
-  auto columnsAttribute = cost.getAs<IntegerAttr>("columns");
-  auto outputTileAttribute = cost.getAs<IntegerAttr>("output_tile");
-  auto outputTilesAttribute = cost.getAs<IntegerAttr>("output_tiles");
-  if (!rows || !reductionAttribute || !columnsAttribute ||
-      !outputTileAttribute || !outputTilesAttribute)
-    return failure();
-  const int64_t reduction = reductionAttribute.getInt();
-  const int64_t columns = columnsAttribute.getInt();
-  const int64_t outputTile = outputTileAttribute.getInt();
-  const int64_t outputTiles = outputTilesAttribute.getInt();
-  const bool inlineFold = strategy.getValue() == "inline_fold";
-  const bool compactStat = strategy.getValue() == "compact_stat";
-  const bool fast =
-      task.getReductionOrder() == ScheduleReductionOrder::LeafOrderFree;
-  if ((!inlineFold && !compactStat) ||
-      task.getGridShape() != ArrayRef<int64_t>({rows.getInt(), outputTiles}) ||
-      task.getTileShape() != ArrayRef<int64_t>({outputTile}) ||
-      task.getWorkgroupThreads() !=
-          (fast ? outputTile * 32 : scheduleThreads(outputTile)) ||
-      task.getSerialTiles() !=
-          (fast ? ceilDivPositive(reduction, 32) : reduction))
-    return failure();
-
-  FoldOp fold = dyn_cast_or_null<FoldOp>(sourceOperations.lookup(foldSource));
-  ContractOp contract =
-      dyn_cast_or_null<ContractOp>(sourceOperations.lookup(contractSource));
-  MapOp boundary =
-      dyn_cast_or_null<MapOp>(sourceOperations.lookup(boundarySource));
-  MapOp epilogue = dyn_cast_or_null<MapOp>(
-      sourceOperations.lookup(epilogueSources.getValue().front()));
-  if (!fold || !contract || !boundary || !epilogue ||
-      !isRneF32ToBf16Map(boundary) || !isRneF32ToBf16Map(epilogue))
-    return failure();
-  MapOp reciprocal;
-  for (const auto &[source, operation] : sourceOperations) {
-    (void)source;
-    auto map = dyn_cast<MapOp>(operation);
-    bool hasReciprocal = false;
-    if (map)
-      map.walk([&](math::RsqrtOp) { hasReciprocal = true; });
-    if (hasReciprocal && valueDependsOnOperation(map.getResult(0), fold)) {
-      if (reciprocal)
-        return failure();
-      reciprocal = map;
-    }
-  }
-  if (!reciprocal)
-    return failure();
-  SmallVector<Operation *> sources;
-  llvm::SmallDenseSet<Operation *> sourceSet;
-  for (Attribute source : sourceAttributes) {
-    Operation *operation = sourceOperations.lookup(source);
-    if (!operation || !sourceSet.insert(operation).second)
-      return failure();
-    sources.push_back(operation);
-  }
-  auto lhsType = cast<RankedTensorType>(boundary.getResult(0).getType());
-  auto rhsType = cast<RankedTensorType>(contract.getInputs()[1].getType());
-  auto resultType = cast<RankedTensorType>(contract.getResult(0).getType());
-  if (llvm::any_of(outputBuffers, [&](int64_t ordinal) {
-        return ordinal < 0 || ordinal >= static_cast<int64_t>(buffers.size());
-      }))
-    return failure();
-  if (materializesNormalized &&
-      buffers[outputBuffers.front()].getTensorType() != lhsType)
-    return failure();
-  if (buffers[outputBuffers.back()].getTensorType() !=
-      cast<RankedTensorType>(epilogue.getResult(0).getType()))
-    return failure();
-  if (lhsType.getShape().back() != reduction ||
-      rhsType.getShape() != ArrayRef<int64_t>({reduction, columns}))
-    return failure();
-
-  PtxEmitter ptx(materializationTask.getInputBuffers().size() +
-                 outputBuffers.size());
-  ptx.header(task.getSemanticFingerprint(), /*usesDynamicSharedMemory=*/true);
-  FoldRegionPtxContext context{ptx,
-                               materializationTask,
-                               buffers,
-                               sourceOperations,
-                               DenseMap<Operation *, int64_t>(),
-                               sourceSet,
-                               DenseMap<Value, int64_t>(),
-                               DenseMap<Value, int64_t>()};
-  RegionOp owner = contract->getParentOfType<RegionOp>();
-  if (!owner)
-    return failure();
-  for (BlockArgument argument : owner.getBody().front().getArguments()) {
-    int64_t buffer = argument.getArgNumber();
-    auto found = llvm::find(materializationTask.getInputBuffers(), buffer);
-    if (found != materializationTask.getInputBuffers().end())
-      context.boundaryParameters[argument] =
-          std::distance(materializationTask.getInputBuffers().begin(), found);
-  }
-  if (compactStat)
-    context.boundaryParameters[reciprocal.getResult(0)] = 1;
-
-  ptx.stream << "  mov.u32 %r0, %tid.x;\n"
-                "  mov.u32 %r1, %ctaid.x;\n"
-                "  mov.u32 %r2, %ctaid.y;\n"
-                "  mov.u64 %rd3, shuttle_smem;\n"
-                "  cvta.to.shared.u64 %rd3, %rd3;\n";
-  if (inlineFold) {
-    const int64_t paddedReduction = scheduleThreads(reduction);
-    if (task.getScratchBytes() != paddedReduction * 4)
-      return failure();
-    int64_t foldIndex = ptx.nextU64();
-    ptx.stream << "  mov.u32 %r4, %r0;\n"
-                  "$contract_region_fold_fill:\n"
-                  "  setp.ge.u32 %p0, %r4, "
-               << paddedReduction
-               << ";\n  @%p0 bra $contract_region_fold_filled;\n"
-                  "  setp.ge.u32 %p1, %r4, "
-               << reduction
-               << ";\n  @%p1 bra $contract_region_fold_zero;\n"
-                  "  cvt.u64.u32 %rd0, %r1;\n"
-                  "  cvt.u64.u32 %rd"
-               << foldIndex << ", %r4;\n  mad.lo.u64 %rd0, %rd0, " << reduction
-               << ", %rd" << foldIndex << ";\n";
-    FailureOr<SmallVector<int64_t>> leafCoordinates = emitOutputCoordinates(
-        ptx, cast<RankedTensorType>(fold.getInputs().front().getType()));
-    if (failed(leafCoordinates))
-      return failure();
-    FailureOr<int64_t> leaf = emitFoldRegionValue(
-        context, fold.getInputs().front(), *leafCoordinates);
-    if (failed(leaf))
-      return failure();
-    ptx.stream << "  mov.f32 %f0, %f" << *leaf
-               << ";\n  bra $contract_region_fold_store;\n"
-                  "$contract_region_fold_zero:\n"
-                  "  mov.f32 %f0, 0f00000000;\n"
-                  "$contract_region_fold_store:\n"
-                  "  cvt.u64.u32 %rd4, %r4;\n"
-                  "  mad.lo.u64 %rd4, %rd4, 4, %rd3;\n"
-                  "  st.shared.f32 [%rd4], %f0;\n"
-                  "  add.u32 %r4, %r4, "
-               << task.getWorkgroupThreads()
-               << ";\n  bra $contract_region_fold_fill;\n"
-                  "$contract_region_fold_filled:\n"
-                  "  bar.sync 0;\n"
-                  "  setp.ne.u32 %p0, %r0, 0;\n"
-                  "  @%p0 bra $contract_region_scale_ready;\n";
-    int64_t treeLeft = ptx.nextF32();
-    int64_t treeRight = ptx.nextF32();
-    int64_t treeSum = ptx.nextF32();
-    int64_t treeCarry = ptx.nextF32();
-    int64_t active = paddedReduction;
-    while (active > 1) {
-      const int64_t pairs = active / 2;
-      for (int64_t pair = 0; pair < pairs; ++pair) {
-        ptx.stream << "  ld.shared.f32 %f" << treeLeft << ", [%rd3+" << pair * 8
-                   << "];\n  ld.shared.f32 %f" << treeRight << ", [%rd3+"
-                   << pair * 8 + 4 << "];\n  add.rn.f32 %f" << treeSum << ", %f"
-                   << treeLeft << ", %f" << treeRight
-                   << ";\n  st.shared.f32 [%rd3+" << pair * 4 << "], %f"
-                   << treeSum << ";\n";
-      }
-      if (active % 2 != 0) {
-        ptx.stream << "  ld.shared.f32 %f" << treeCarry << ", [%rd3+"
-                   << (active - 1) * 4 << "];\n  st.shared.f32 [%rd3+"
-                   << pairs * 4 << "], %f" << treeCarry << ";\n";
-      }
-      active = (active + 1) / 2;
-    }
-    int64_t sum = ptx.nextF32();
-    ptx.stream << "  ld.shared.f32 %f" << sum << ", [%rd3];\n";
-    context.foldValues[fold] = sum;
-    ptx.stream << "  cvt.u64.u32 %rd0, %r1;\n";
-    FailureOr<SmallVector<int64_t>> scaleCoordinates = emitOutputCoordinates(
-        ptx, cast<RankedTensorType>(reciprocal.getResult(0).getType()));
-    if (failed(scaleCoordinates))
-      return failure();
-    FailureOr<int64_t> scale = emitFoldRegionValue(
-        context, reciprocal.getResult(0), *scaleCoordinates);
-    if (failed(scale))
-      return failure();
-    ptx.stream << "  st.shared.f32 [%rd3], %f" << *scale
-               << ";\n$contract_region_scale_ready:\n"
-                  "  bar.sync 0;\n";
-    int64_t sharedScale = ptx.nextF32();
-    ptx.stream << "  ld.shared.f32 %f" << sharedScale << ", [%rd3];\n";
-    context.materializedValues[reciprocal.getResult(0)] = sharedScale;
-  } else if (task.getScratchBytes() != std::min<int64_t>(reduction, 256) * 2) {
-    return failure();
-  }
-
-  int64_t column = 0;
-  int64_t lane = -1;
-  if (fast) {
-    ptx.stream << "  shr.u32 %r5, %r0, 5;\n"
-                  "  and.b32 %r6, %r0, 31;\n"
-                  "  mad.lo.u32 %r5, %r2, "
-               << outputTile
-               << ", %r5;\n"
-                  "  setp.ge.u32 %p0, %r5, "
-               << columns << ";\n  @%p0 bra $done;\n";
-    column = 5;
-    lane = 6;
-  } else {
-    ptx.stream << "  mad.lo.u32 %r5, %r2, " << outputTile
-               << ", %r0;\n  setp.ge.u32 %p0, %r5, " << columns
-               << ";\n  @%p0 bra $done;\n";
-    column = 5;
-  }
-  int64_t outputLinear = ptx.nextU64();
-  int64_t columnIndex = ptx.nextU64();
-  ptx.stream << "  cvt.u64.u32 %rd" << outputLinear
-             << ", %r1;\n  cvt.u64.u32 %rd" << columnIndex << ", %r" << column
-             << ";\n  mad.lo.u64 %rd" << outputLinear << ", %rd"
-             << outputLinear << ", " << columns << ", %rd" << columnIndex
-             << ";\n  mov.u64 %rd0, %rd" << outputLinear << ";\n";
-  FailureOr<SmallVector<int64_t>> outputCoordinates =
-      emitOutputCoordinates(ptx, resultType);
-  if (failed(outputCoordinates))
-    return failure();
-  int64_t accumulator = ptx.nextF32();
-  int64_t reductionCoordinate = ptx.nextU64();
-  ptx.stream << "  mov.f32 %f" << accumulator << ", 0f00000000;\n";
-  if (fast)
-    ptx.stream << "  cvt.u64.u32 %rd" << reductionCoordinate << ", %r" << lane
-               << ";\n$contract_region_fast_loop:\n";
-  else
-    ptx.stream << "  mov.u64 %rd" << reductionCoordinate
-               << ", 0;\n$contract_region_source_ordered_loop:\n";
-  ptx.stream << "  setp.ge.u64 %p1, %rd" << reductionCoordinate << ", "
-             << reduction << ";\n  @%p1 bra "
-             << (fast ? "$contract_region_fast_reduce"
-                      : "$contract_region_source_ordered_done")
-             << ";\n"
-                "  cvt.u64.u32 %rd0, %r1;\n"
-                "  mad.lo.u64 %rd0, %rd0, "
-             << reduction << ", %rd" << reductionCoordinate << ";\n";
-  FailureOr<SmallVector<int64_t>> activationCoordinates =
-      emitOutputCoordinates(ptx, lhsType);
-  if (failed(activationCoordinates))
-    return failure();
-  FailureOr<int64_t> lhs = emitFoldRegionValue(context, boundary.getResult(0),
-                                               *activationCoordinates);
-  SmallVector<int64_t> contractCoordinates(*outputCoordinates);
-  contractCoordinates.push_back(reductionCoordinate);
-  auto rhsMap = cast<AffineMapAttr>(contract.getIndexingMaps()[1]).getValue();
-  auto projectionParameter =
-      context.boundaryParameters.find(contract.getInputs()[1]);
-  if (failed(lhs) || projectionParameter == context.boundaryParameters.end())
-    return failure();
-  if (materializesNormalized) {
-    const int64_t normalizedParameter =
-        materializationTask.getInputBuffers().size();
-    int64_t normalizedLinear = ptx.nextU64();
-    int64_t normalizedPointer = ptx.nextU64();
-    int64_t normalizedRounded = ptx.nextBF16();
-    ptx.stream << "  setp.ne.u32 %p3, %r2, 0;\n"
-                  "  @%p3 bra $contract_region_normalized_done;\n"
-                  "  setp.ne.u32 %p3, %r5, 0;\n"
-                  "  @%p3 bra $contract_region_normalized_done;\n"
-                  "  cvt.u64.u32 %rd"
-               << normalizedLinear << ", %r1;\n  mad.lo.u64 %rd"
-               << normalizedLinear << ", %rd" << normalizedLinear << ", "
-               << reduction << ", %rd" << reductionCoordinate
-               << ";\n  ld.param.u64 %rd" << normalizedPointer << ", [p"
-               << normalizedParameter << "];\n  mad.lo.u64 %rd"
-               << normalizedPointer << ", %rd" << normalizedLinear << ", 2, %rd"
-               << normalizedPointer << ";\n  cvt.rn.bf16.f32 %h"
-               << normalizedRounded << ", %f" << *lhs
-               << ";\n  st.global.u16 [%rd" << normalizedPointer << "], %h"
-               << normalizedRounded << ";\n$contract_region_normalized_done:\n";
-  }
-  FailureOr<int64_t> rhs = emitMapInput(ptx, projectionParameter->second,
-                                        rhsType, rhsMap, contractCoordinates);
-  if (failed(rhs))
-    return failure();
-  ptx.stream << "  fma.rn.f32 %f" << accumulator << ", %f" << *lhs << ", %f"
-             << *rhs << ", %f" << accumulator << ";\n  add.u64 %rd"
-             << reductionCoordinate << ", %rd" << reductionCoordinate << ", "
-             << (fast ? 32 : 1) << ";\n  bra "
-             << (fast ? "$contract_region_fast_loop"
-                      : "$contract_region_source_ordered_loop")
-             << ";\n";
-  if (fast) {
-    ptx.stream << "$contract_region_fast_reduce:\n"
-                  "  mov.b32 %r7, %f"
-               << accumulator << ";\n";
-    int64_t shuffled = ptx.nextF32();
-    for (int64_t offset : {16, 8, 4, 2, 1}) {
-      ptx.stream << "  shfl.sync.down.b32 %r8, %r7, " << offset
-                 << ", 31, 0xffffffff;\n  mov.b32 %f" << shuffled
-                 << ", %r8;\n  add.rn.f32 %f" << accumulator << ", %f"
-                 << accumulator << ", %f" << shuffled << ";\n  mov.b32 %r7, %f"
-                 << accumulator << ";\n";
-    }
-    ptx.stream << "  setp.ne.u32 %p2, %r6, 0;\n"
-                  "  @%p2 bra $done;\n";
-  } else {
-    ptx.stream << "$contract_region_source_ordered_done:\n";
-  }
-  int64_t outputPointer = ptx.nextU64();
-  int64_t rounded = ptx.nextBF16();
-  const int64_t outputParameter = materializationTask.getInputBuffers().size() +
-                                  (materializesNormalized ? 1 : 0);
-  ptx.stream << "  ld.param.u64 %rd" << outputPointer << ", [p"
-             << outputParameter << "];\n  mad.lo.u64 %rd" << outputPointer
-             << ", %rd" << outputLinear << ", 2, %rd" << outputPointer
-             << ";\n  cvt.rn.bf16.f32 %h" << rounded << ", %f" << accumulator
-             << ";\n  st.global.u16 [%rd" << outputPointer << "], %h" << rounded
-             << ";\n";
-  if (ptx.f32 > 128 || ptx.u64 > 128 || ptx.bf16 > 16)
-    return failure();
-  ptx.finish();
-  return ptx.text;
-}
-
-FailureOr<std::string> emitFoldPtx(FoldOp fold, ScheduleTaskOp task) {
-  return emitFoldMapPtx(fold, task, {}, {}, nullptr);
-}
-
-#include "OnlineAttentionEmitter.inc"
-FailureOr<GpuExecutableSpec>
-deriveGpuExecutable(RegionOp region, MaterializationPlanOp materialization,
-                    SchedulePlanOp schedule, GpuTarget target) {
-  SmallVector<Operation *> algebra;
-  for (Operation &operation : region.getBody().front().without_terminator())
-    algebra.push_back(&operation);
-  llvm::SmallDenseMap<Attribute, Operation *> sourceOperations;
-  for (Operation *operation : algebra) {
-    if (auto map = dyn_cast<MapOp>(operation))
-      sourceOperations.try_emplace(map.getSource(), operation);
-    else if (auto fold = dyn_cast<FoldOp>(operation))
-      sourceOperations.try_emplace(fold.getSource(), operation);
-    else if (auto contract = dyn_cast<ContractOp>(operation))
-      sourceOperations.try_emplace(contract.getSource(), operation);
-    else if (auto relation = dyn_cast<RelationOp>(operation))
-      sourceOperations.try_emplace(relation.getSource(), operation);
-  }
-  SmallVector<MaterializationBufferOp> materializationBuffers(
-      materialization.getBody().front().getOps<MaterializationBufferOp>());
-  SmallVector<MaterializationTaskOp> materializationTasks(
-      materialization.getBody().front().getOps<MaterializationTaskOp>());
-  SmallVector<ScheduleTaskOp> tasks(
-      schedule.getBody().front().getOps<ScheduleTaskOp>());
-  if (algebra.empty() || materializationTasks.size() != tasks.size() ||
-      tasks.size() > kMaximumGpuExecutableRecords)
-    return failure();
-
+struct GpuBuildUnit {
+  RegionOp region;
+  MaterializationPlanOp materialization;
+  SchedulePlanOp schedule;
+  EventLoweringPlanOp eventPlan;
   GpuExecutableSpec spec;
-  FailureOr<SmallVector<ExecutableSlotSpec>> slots =
+  SmallVector<uint8_t> nativeTransport;
+  std::string physicalRequestFingerprint;
+  std::string physicalCompileRequestFingerprint;
+  std::string physicalLaunchRecipeFingerprint;
+  SmallVector<uint8_t> trustedEventCertificates;
+  struct TrustedInternalEventCertificate {
+    int64_t regionOrdinal;
+    int64_t allocationOrdinal;
+    std::string allocationId;
+    std::string compilerIrDigest;
+    std::string deviceImageDigest;
+  };
+  SmallVector<TrustedInternalEventCertificate> trustedInternalEventCertificates;
+
+  bool isFatbin() const { return !nativeTransport.empty(); }
+};
+
+struct PhysicalTaskPosition {
+  int64_t launch;
+  int64_t position;
+};
+
+struct EventRealizationSpec {
+  EventRealizationKind kind;
+  SmallVector<int64_t> coveringLaunchOrder;
+};
+
+FailureOr<SmallVector<uint8_t>> bindTrustedSourceEventLegalizations(
+    GpuFatbinExecutableBundle &bundle,
+    ArrayRef<GpuSourceEventLegalization> legalizations) {
+  SmallVector<uint8_t> trusted(bundle.eventRealizations.size(), 0);
+  auto codeIdentity = gpuFatbinCodeIdentity(bundle.images, bundle.launches);
+  if (!codeIdentity.ok())
+    return failure();
+  for (const GpuSourceEventLegalization &legalization : legalizations) {
+    if (legalization.eventOrdinal < 0 ||
+        legalization.eventOrdinal >=
+            static_cast<int64_t>(bundle.eventRealizations.size()) ||
+        trusted[legalization.eventOrdinal] || legalization.operations.empty())
+      return failure();
+    GpuEventRealization &realization =
+        bundle.eventRealizations[legalization.eventOrdinal];
+    if (realization.eventOrdinal != legalization.eventOrdinal ||
+        realization.operationCertificate)
+      return failure();
+    GpuEventOperationCertificate certificate{
+        {}, gpuExecutableBundleDigest(*codeIdentity), legalization.operations};
+    certificate.compilerIrDigest =
+        gpuEventOperationCertificateDigest(certificate);
+    realization.operationCertificate = std::move(certificate);
+    trusted[legalization.eventOrdinal] = 1;
+  }
+  return trusted;
+}
+
+SmallVector<GpuInternalEventOperation>
+internalEventOperations(const GpuInternalEventAllocation &allocation) {
+  SmallVector<GpuInternalEventOperation> operations;
+  operations.reserve(allocation.notifyRelations.size() +
+                     allocation.waitRelations.size());
+  auto coordinateOrdinal = [&](ArrayRef<int64_t> coordinate) {
+    auto found =
+        llvm::find_if(allocation.mechanismCoordinates,
+                      [&](const GpuInternalEventCoordinate &candidate) {
+                        return ArrayRef<int64_t>(candidate) == coordinate;
+                      });
+    assert(found != allocation.mechanismCoordinates.end());
+    return static_cast<int64_t>(
+        std::distance(allocation.mechanismCoordinates.begin(), found));
+  };
+  for (auto [relationOrdinal, relation] :
+       llvm::enumerate(allocation.notifyRelations)) {
+    const int64_t mechanismOrdinal =
+        coordinateOrdinal(relation.mechanismCoordinate);
+    operations.push_back(
+        {static_cast<int64_t>(operations.size()),
+         GpuInternalEventOperationKind::Notify,
+         static_cast<int64_t>(relationOrdinal), relation.taskFamily,
+         relation.taskCoordinate, relation.mechanismCoordinate,
+         allocation.legalizationKind, allocation.scope,
+         allocation.allocationOwners[mechanismOrdinal],
+         allocation.slots[mechanismOrdinal],
+         allocation.generations[mechanismOrdinal], allocation.generationCount,
+         1, allocation.initialCounts[mechanismOrdinal],
+         allocation.releaseOnNotify,
+         allocation.transactionBytesByCoordinate
+             ? std::optional<int64_t>(
+                   (*allocation.transactionBytesByCoordinate)[mechanismOrdinal])
+             : std::nullopt});
+  }
+  for (auto [relationOrdinal, relation] :
+       llvm::enumerate(allocation.waitRelations)) {
+    const int64_t mechanismOrdinal =
+        coordinateOrdinal(relation.mechanismCoordinate);
+    operations.push_back(
+        {static_cast<int64_t>(operations.size()),
+         GpuInternalEventOperationKind::Wait,
+         static_cast<int64_t>(relationOrdinal), relation.taskFamily,
+         relation.taskCoordinate, relation.mechanismCoordinate,
+         allocation.legalizationKind, allocation.scope,
+         allocation.allocationOwners[mechanismOrdinal],
+         allocation.slots[mechanismOrdinal],
+         allocation.generations[mechanismOrdinal], allocation.generationCount,
+         allocation.initialCounts[mechanismOrdinal],
+         allocation.initialCounts[mechanismOrdinal],
+         allocation.acquireBeforeConsumer, std::nullopt});
+  }
+  return operations;
+}
+
+bool equalInternalEventOperation(const GpuInternalEventOperation &left,
+                                 const GpuInternalEventOperation &right) {
+  return left.ordinal == right.ordinal && left.kind == right.kind &&
+         left.relationOrdinal == right.relationOrdinal &&
+         left.taskFamily == right.taskFamily &&
+         left.taskCoordinate == right.taskCoordinate &&
+         left.mechanismCoordinate == right.mechanismCoordinate &&
+         left.legalizationKind == right.legalizationKind &&
+         left.scope == right.scope &&
+         left.allocationOwner == right.allocationOwner &&
+         left.slot == right.slot && left.generation == right.generation &&
+         left.generationCount == right.generationCount &&
+         left.operationCount == right.operationCount &&
+         left.initialCount == right.initialCount &&
+         left.releaseAcquire == right.releaseAcquire &&
+         left.transactionBytes == right.transactionBytes;
+}
+
+void updateInternalCertificateDigest(llvm::SHA256 &digest, StringRef value) {
+  const std::string size = std::to_string(value.size());
+  digest.update(size);
+  digest.update(StringRef(":"));
+  digest.update(value);
+}
+
+void updateInternalCertificateDigest(llvm::SHA256 &digest, int64_t value) {
+  updateInternalCertificateDigest(digest, std::to_string(value));
+}
+
+std::string
+internalEventCertificateDigest(int64_t regionOrdinal, StringRef allocationId,
+                               ArrayRef<GpuInternalEventOperation> operations) {
+  llvm::SHA256 digest;
+  updateInternalCertificateDigest(digest, regionOrdinal);
+  updateInternalCertificateDigest(digest, allocationId);
+  updateInternalCertificateDigest(digest,
+                                  static_cast<int64_t>(operations.size()));
+  for (const GpuInternalEventOperation &operation : operations) {
+    updateInternalCertificateDigest(digest, operation.ordinal);
+    updateInternalCertificateDigest(digest,
+                                    static_cast<int64_t>(operation.kind));
+    updateInternalCertificateDigest(digest, operation.relationOrdinal);
+    updateInternalCertificateDigest(digest, operation.taskFamily);
+    updateInternalCertificateDigest(
+        digest, static_cast<int64_t>(operation.taskCoordinate.size()));
+    for (int64_t coordinate : operation.taskCoordinate)
+      updateInternalCertificateDigest(digest, coordinate);
+    updateInternalCertificateDigest(
+        digest, static_cast<int64_t>(operation.mechanismCoordinate.size()));
+    for (int64_t coordinate : operation.mechanismCoordinate)
+      updateInternalCertificateDigest(digest, coordinate);
+    updateInternalCertificateDigest(
+        digest, static_cast<int64_t>(operation.legalizationKind));
+    updateInternalCertificateDigest(digest,
+                                    static_cast<int64_t>(operation.scope));
+    updateInternalCertificateDigest(
+        digest, static_cast<int64_t>(operation.allocationOwner.size()));
+    for (int64_t coordinate : operation.allocationOwner)
+      updateInternalCertificateDigest(digest, coordinate);
+    updateInternalCertificateDigest(digest, operation.slot);
+    updateInternalCertificateDigest(digest, operation.generation);
+    updateInternalCertificateDigest(digest, operation.generationCount);
+    updateInternalCertificateDigest(digest, operation.operationCount);
+    updateInternalCertificateDigest(digest, operation.initialCount);
+    updateInternalCertificateDigest(digest, operation.releaseAcquire ? 1 : 0);
+    updateInternalCertificateDigest(
+        digest, operation.transactionBytes ? *operation.transactionBytes : -1);
+  }
+  return llvm::toHex(digest.final(), true);
+}
+
+FailureOr<SmallVector<GpuBuildUnit::TrustedInternalEventCertificate>>
+bindTrustedInternalEventLegalizations(
+    const GpuFatbinExecutableBundle &bundle,
+    ArrayRef<GpuInternalEventLegalization> legalizations) {
+  SmallVector<GpuBuildUnit::TrustedInternalEventCertificate> certificates;
+  if (legalizations.empty())
+    return certificates;
+  if (bundle.physicalEventProvenance.empty())
+    return failure();
+  absl::StatusOr<GpuInternalEventSchedule> schedule =
+      parseGpuInternalEventSchedule(bundle.physicalEventProvenance);
+  if (!schedule.ok())
+    return failure();
+  llvm::SmallDenseSet<std::pair<int64_t, int64_t>> covered;
+  auto codeIdentity = gpuFatbinCodeIdentity(bundle.images, bundle.launches);
+  if (!codeIdentity.ok())
+    return failure();
+  const std::string deviceImageDigest =
+      gpuExecutableBundleDigest(*codeIdentity);
+  for (const GpuInternalEventLegalization &legalization : legalizations) {
+    if (legalization.regionOrdinal < 0 ||
+        legalization.regionOrdinal >=
+            static_cast<int64_t>(schedule->regions.size()))
+      return failure();
+    const GpuInternalEventRegion &region =
+        schedule->regions[legalization.regionOrdinal];
+    auto allocation = llvm::find_if(
+        region.allocations, [&](const GpuInternalEventAllocation &candidate) {
+          return candidate.allocationId == legalization.allocationId;
+        });
+    if (allocation == region.allocations.end())
+      return failure();
+    const int64_t allocationOrdinal =
+        std::distance(region.allocations.begin(), allocation);
+    if (!covered.insert({legalization.regionOrdinal, allocationOrdinal}).second)
+      return failure();
+    SmallVector<GpuInternalEventOperation> expected =
+        internalEventOperations(*allocation);
+    if (expected.empty() || expected.size() != legalization.operations.size() ||
+        !llvm::all_of(llvm::zip(expected, legalization.operations),
+                      [](auto pair) {
+                        return equalInternalEventOperation(std::get<0>(pair),
+                                                           std::get<1>(pair));
+                      }))
+      return failure();
+    certificates.push_back(
+        {legalization.regionOrdinal, allocationOrdinal,
+         legalization.allocationId,
+         internalEventCertificateDigest(legalization.regionOrdinal,
+                                        legalization.allocationId, expected),
+         deviceImageDigest});
+  }
+  return certificates;
+}
+
+FailureOr<AffineExpr> affineExpression(const GpuAffineExpression &expression,
+                                       int64_t dimensions,
+                                       MLIRContext *context) {
+  switch (expression.kind) {
+  case GpuAffineExpressionKind::Dimension:
+    if (expression.payload < 0 || expression.payload >= dimensions)
+      return failure();
+    return getAffineDimExpr(expression.payload, context);
+  case GpuAffineExpressionKind::Constant:
+    return getAffineConstantExpr(expression.payload, context);
+  case GpuAffineExpressionKind::Add:
+  case GpuAffineExpressionKind::Multiply:
+    if (expression.operands.size() != 2)
+      return failure();
+    break;
+  case GpuAffineExpressionKind::Modulo:
+  case GpuAffineExpressionKind::FloorDivide:
+  case GpuAffineExpressionKind::CeilDivide:
+    if (expression.operands.size() != 2 ||
+        expression.operands[1].kind != GpuAffineExpressionKind::Constant ||
+        expression.operands[1].payload <= 0)
+      return failure();
+    break;
+  }
+  FailureOr<AffineExpr> left =
+      affineExpression(expression.operands[0], dimensions, context);
+  FailureOr<AffineExpr> right =
+      affineExpression(expression.operands[1], dimensions, context);
+  if (failed(left) || failed(right))
+    return failure();
+  switch (expression.kind) {
+  case GpuAffineExpressionKind::Add:
+    return *left + *right;
+  case GpuAffineExpressionKind::Multiply:
+    return *left * *right;
+  case GpuAffineExpressionKind::Modulo:
+    return *left % expression.operands[1].payload;
+  case GpuAffineExpressionKind::FloorDivide:
+    return left->floorDiv(expression.operands[1].payload);
+  case GpuAffineExpressionKind::CeilDivide:
+    return left->ceilDiv(expression.operands[1].payload);
+  case GpuAffineExpressionKind::Dimension:
+  case GpuAffineExpressionKind::Constant:
+    llvm_unreachable("leaf affine expressions returned above");
+  }
+  llvm_unreachable("unknown GPU affine expression kind");
+}
+
+FailureOr<AffineMap> affineMap(const GpuAffineMap &map, int64_t dimensions,
+                               MLIRContext *context) {
+  if (map.dimensions != dimensions || map.results.empty())
+    return failure();
+  SmallVector<AffineExpr> results;
+  results.reserve(map.results.size());
+  for (const GpuAffineExpression &result : map.results) {
+    FailureOr<AffineExpr> expression =
+        affineExpression(result, dimensions, context);
+    if (failed(expression))
+      return failure();
+    results.push_back(*expression);
+  }
+  return AffineMap::get(dimensions, 0, results, context);
+}
+
+FailureOr<IntegerSet> integerSet(const GpuIntegerSet &set, int64_t dimensions,
+                                 MLIRContext *context) {
+  if (set.dimensions != dimensions ||
+      set.constraints.size() != set.equalities.size())
+    return failure();
+  SmallVector<AffineExpr> constraints;
+  SmallVector<bool> equalities;
+  constraints.reserve(set.constraints.size());
+  equalities.reserve(set.equalities.size());
+  for (auto [constraint, equality] :
+       llvm::zip_equal(set.constraints, set.equalities)) {
+    if (equality > 1)
+      return failure();
+    FailureOr<AffineExpr> expression =
+        affineExpression(constraint, dimensions, context);
+    if (failed(expression))
+      return failure();
+    constraints.push_back(*expression);
+    equalities.push_back(equality != 0);
+  }
+  return IntegerSet::get(dimensions, 0, constraints, equalities);
+}
+
+FailureOr<presburger::IntegerPolyhedron>
+boundedRelationDomain(ArrayRef<int64_t> shape,
+                      std::optional<IntegerSet> predicate) {
+  if (shape.empty() ||
+      llvm::any_of(shape, [](int64_t extent) { return extent <= 0; }))
+    return failure();
+  presburger::IntegerPolyhedron domain(
+      presburger::PresburgerSpace::getSetSpace(shape.size()));
+  for (auto [axis, extent] : llvm::enumerate(shape)) {
+    domain.addBound(presburger::BoundType::LB, axis, 0);
+    domain.addBound(presburger::BoundType::UB, axis, extent - 1);
+  }
+  if (predicate)
+    domain = domain.intersect(FlatLinearValueConstraints(*predicate));
+  return domain;
+}
+
+FailureOr<bool>
+affineMapsEqualOverDomain(AffineMap left, AffineMap right,
+                          const presburger::IntegerPolyhedron &domain) {
+  if (left.getNumResults() != right.getNumResults())
+    return failure();
+  SmallVector<AffineExpr> constraints;
+  SmallVector<bool> equalities;
+  for (auto [leftResult, rightResult] :
+       llvm::zip_equal(left.getResults(), right.getResults())) {
+    constraints.push_back(leftResult - rightResult);
+    equalities.push_back(true);
+  }
+  IntegerSet equality =
+      IntegerSet::get(left.getNumDims(), 0, constraints, equalities);
+  presburger::IntegerPolyhedron equalDomain =
+      domain.intersect(FlatLinearValueConstraints(equality));
+  return domain.isSubsetOf(equalDomain);
+}
+
+FailureOr<bool>
+affineMapRangeInBounds(AffineMap map,
+                       const presburger::IntegerPolyhedron &domain,
+                       ArrayRef<uint64_t> shape) {
+  if (map.getNumResults() != shape.size())
+    return failure();
+  presburger::MultiAffineFunction function(
+      presburger::PresburgerSpace::getRelationSpace(),
+      presburger::IntMatrix(/*rows=*/0, /*columns=*/1));
+  if (failed(getMultiAffineFunctionFromMap(map, function)))
+    return failure();
+  presburger::IntegerRelation graph = function.getAsRelation();
+  graph.intersectDomain(domain);
+  presburger::IntegerPolyhedron image = graph.getRangeSet();
+  presburger::IntegerPolyhedron bounds(
+      presburger::PresburgerSpace::getSetSpace(shape.size()));
+  for (auto [axis, extent] : llvm::enumerate(shape)) {
+    if (extent == 0 ||
+        extent > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+      return failure();
+    bounds.addBound(presburger::BoundType::LB, axis, 0);
+    bounds.addBound(presburger::BoundType::UB, axis,
+                    static_cast<int64_t>(extent) - 1);
+  }
+  return image.isSubsetOf(bounds);
+}
+
+FailureOr<bool> lexicographicallyOrderedOverDomain(
+    AffineMap producer, AffineMap consumer,
+    const presburger::IntegerPolyhedron &domain) {
+  if (producer.getNumResults() != consumer.getNumResults())
+    return failure();
+  presburger::PresburgerSet ordered = presburger::PresburgerSet::getEmpty(
+      presburger::PresburgerSpace::getSetSpace(producer.getNumDims()));
+  for (int64_t position = 0;
+       position < static_cast<int64_t>(producer.getNumResults()); ++position) {
+    SmallVector<AffineExpr> constraints;
+    SmallVector<bool> equalities;
+    for (int64_t prefix = 0; prefix < position; ++prefix) {
+      constraints.push_back(producer.getResult(prefix) -
+                            consumer.getResult(prefix));
+      equalities.push_back(true);
+    }
+    constraints.push_back(consumer.getResult(position) -
+                          producer.getResult(position) - 1);
+    equalities.push_back(false);
+    IntegerSet earlier =
+        IntegerSet::get(producer.getNumDims(), 0, constraints, equalities);
+    ordered.unionInPlace(domain.intersect(FlatLinearValueConstraints(earlier)));
+  }
+  return presburger::PresburgerSet(domain).isSubsetOf(ordered);
+}
+
+LogicalResult
+verifyPhysicalEventCoverPieces(EventTensorOp event,
+                               const GpuEventRealization &realization,
+                               ArrayRef<GpuLaunch> launches) {
+  if (realization.coverPieces.empty())
+    return success();
+  const int64_t dimensions = event.getRelationDomainShape().size();
+  FailureOr<presburger::IntegerPolyhedron> required = boundedRelationDomain(
+      event.getRelationDomainShape(), event.getRelationPredicate());
+  if (failed(required))
+    return event.emitOpError("has an unsupported exact relation domain");
+  presburger::PresburgerSet covered = presburger::PresburgerSet::getEmpty(
+      presburger::PresburgerSpace::getSetSpace(dimensions));
+  for (const GpuEventCoverPiece &piece : realization.coverPieces) {
+    presburger::IntegerPolyhedron pieceDomain = *required;
+    if (piece.relationSubset) {
+      FailureOr<IntegerSet> subset =
+          integerSet(*piece.relationSubset, dimensions, event.getContext());
+      if (failed(subset))
+        return event.emitOpError("has an invalid physical cover predicate");
+      pieceDomain = pieceDomain.intersect(FlatLinearValueConstraints(*subset));
+    }
+    const int64_t producerLaunch = piece.producer.launchOrdinal;
+    const int64_t consumerLaunch = piece.consumer.launchOrdinal;
+    if (producerLaunch < 0 || consumerLaunch < 0 ||
+        producerLaunch >= static_cast<int64_t>(launches.size()) ||
+        consumerLaunch >= static_cast<int64_t>(launches.size()))
+      return event.emitOpError("physical cover references an unknown launch");
+    FailureOr<AffineMap> producerOwner =
+        affineMap(piece.producer.owner, dimensions, event.getContext());
+    FailureOr<AffineMap> consumerOwner =
+        affineMap(piece.consumer.owner, dimensions, event.getContext());
+    FailureOr<AffineMap> producerTime =
+        affineMap(piece.producer.localTime, dimensions, event.getContext());
+    FailureOr<AffineMap> consumerTime =
+        affineMap(piece.consumer.localTime, dimensions, event.getContext());
+    if (failed(producerOwner) || failed(consumerOwner) ||
+        failed(producerTime) || failed(consumerTime))
+      return event.emitOpError("has invalid physical owner/time maps");
+    FailureOr<bool> producerOwnerInBounds = affineMapRangeInBounds(
+        *producerOwner, pieceDomain, launches[producerLaunch].grid);
+    FailureOr<bool> consumerOwnerInBounds = affineMapRangeInBounds(
+        *consumerOwner, pieceDomain, launches[consumerLaunch].grid);
+    if (failed(producerOwnerInBounds) || !*producerOwnerInBounds ||
+        failed(consumerOwnerInBounds) || !*consumerOwnerInBounds)
+      return event.emitOpError("physical owner map escapes its launch grid");
+    if (realization.kind == GpuEventRealizationKind::StreamOrder) {
+      if (producerLaunch >= consumerLaunch)
+        return event.emitOpError(
+            "stream-order cover must cross forward in launch order");
+    } else {
+      if (producerLaunch != consumerLaunch)
+        return event.emitOpError(
+            "same-launch cover must fuse both Event endpoints");
+      FailureOr<bool> sameOwner = affineMapsEqualOverDomain(
+          *producerOwner, *consumerOwner, pieceDomain);
+      if (failed(sameOwner) || !*sameOwner)
+        return event.emitOpError(
+            "same-launch cover does not preserve sequential ownership");
+      if (realization.kind == GpuEventRealizationKind::ProgramOrder) {
+        FailureOr<bool> ordered = lexicographicallyOrderedOverDomain(
+            *producerTime, *consumerTime, pieceDomain);
+        if (failed(ordered) || !*ordered)
+          return event.emitOpError(
+              "program-order cover does not order every Event instance");
+      }
+    }
+    covered.unionInPlace(pieceDomain);
+  }
+  if (!presburger::PresburgerSet(*required).isSubsetOf(covered))
+    return event.emitOpError(
+        "physical Event cover omits part of the exact relation");
+  return success();
+}
+
+LogicalResult verifyPhysicalEventMechanism(
+    EventTensorOp event, const GpuEventRealization &realization,
+    const GpuExecutable &executable, bool trustedInProcessCertificate) {
+  const bool erased =
+      realization.kind == GpuEventRealizationKind::ProgramOrder ||
+      realization.kind == GpuEventRealizationKind::StreamOrder ||
+      realization.kind == GpuEventRealizationKind::AlgebraicRefinement;
+  if (erased) {
+    if (realization.mechanism || realization.operationCertificate)
+      return event.emitOpError("erased physical Event cannot allocate a "
+                               "synchronization mechanism or certificate");
+    return success();
+  }
+  if (!realization.mechanism)
+    return event.emitOpError(
+        "physical Event realization requires a bounded mechanism allocation");
+  if (!realization.operationCertificate)
+    return event.emitOpError(
+        "physical Event realization requires an emitted-operation "
+        "certificate");
+
+  const GpuEventMechanismAllocation &mechanism = *realization.mechanism;
+  const GpuEventOperationCertificate &certificate =
+      *realization.operationCertificate;
+  if (certificate.compilerIrDigest !=
+      gpuEventOperationCertificateDigest(certificate))
+    return event.emitOpError(
+        "physical Event operation certificate has an invalid compiler-IR "
+        "digest");
+  auto codeIdentity =
+      gpuFatbinCodeIdentity(executable.codeImages(), executable.launches());
+  if (!codeIdentity.ok() ||
+      certificate.deviceImageDigest != gpuExecutableBundleDigest(*codeIdentity))
+    return event.emitOpError(
+        "physical Event operation certificate does not bind the loaded "
+        "device image");
+  if (certificate.operations.size() != realization.coverPieces.size() * 2)
+    return event.emitOpError(
+        "physical Event operation certificate does not exactly cover every "
+        "wait and notify site");
+
+  const int64_t dimensions = event.getRelationDomainShape().size();
+  FailureOr<AffineMap> mechanismSlot =
+      affineMap(mechanism.slot, dimensions, event.getContext());
+  FailureOr<AffineMap> mechanismGeneration =
+      affineMap(mechanism.generationPhase, dimensions, event.getContext());
+  if (failed(mechanismSlot) || failed(mechanismGeneration))
+    return event.emitOpError(
+        "physical Event operation certificate has invalid mechanism maps");
+  SmallVector<uint8_t> covered(realization.coverPieces.size(), 0);
+  for (auto [ordinal, operation] : llvm::enumerate(certificate.operations)) {
+    if (operation.ordinal != static_cast<int64_t>(ordinal) ||
+        operation.coverPieceOrdinal < 0 ||
+        operation.coverPieceOrdinal >=
+            static_cast<int64_t>(realization.coverPieces.size()))
+      return event.emitOpError(
+          "physical Event operation certificate has an invalid operation "
+          "ordinal");
+    const GpuEventCoverPiece &piece =
+        realization.coverPieces[operation.coverPieceOrdinal];
+    const bool notify = operation.kind == GpuEventOperationKind::Notify;
+    const uint8_t operationBit = notify ? 1 : 2;
+    uint8_t &pieceCoverage = covered[operation.coverPieceOrdinal];
+    if (pieceCoverage & operationBit)
+      return event.emitOpError(
+          "physical Event operation certificate duplicates a wait or notify "
+          "site");
+    pieceCoverage |= operationBit;
+    const GpuEventCoverEndpoint &expectedEndpoint =
+        notify ? piece.producer : piece.consumer;
+    FailureOr<AffineMap> operationOwner = affineMap(
+        operation.executionPoint.owner, dimensions, event.getContext());
+    FailureOr<AffineMap> expectedOwner =
+        affineMap(expectedEndpoint.owner, dimensions, event.getContext());
+    FailureOr<AffineMap> operationTime = affineMap(
+        operation.executionPoint.localTime, dimensions, event.getContext());
+    FailureOr<AffineMap> expectedTime =
+        affineMap(expectedEndpoint.localTime, dimensions, event.getContext());
+    FailureOr<AffineMap> operationSlot =
+        affineMap(operation.slot, dimensions, event.getContext());
+    FailureOr<AffineMap> operationGeneration =
+        affineMap(operation.generationPhase, dimensions, event.getContext());
+    if (failed(operationOwner) || failed(expectedOwner) ||
+        failed(operationTime) || failed(expectedTime) ||
+        failed(operationSlot) || failed(operationGeneration) ||
+        operation.executionPoint.launchOrdinal !=
+            expectedEndpoint.launchOrdinal ||
+        *operationOwner != *expectedOwner || *operationTime != *expectedTime ||
+        *operationSlot != *mechanismSlot ||
+        *operationGeneration != *mechanismGeneration ||
+        operation.scope != mechanism.scope ||
+        operation.count != event.getNotifyCount() ||
+        operation.count != mechanism.arrivalCount ||
+        operation.releaseAcquire !=
+            (notify ? event.getRelease() : event.getAcquire()))
+      return event.emitOpError(
+          "physical Event operation certificate does not match its exact "
+          "source requirement and mechanism");
+  }
+  if (llvm::any_of(covered, [](uint8_t value) { return value != 3; }))
+    return event.emitOpError(
+        "physical Event operation certificate omits a wait or notify site");
+
+  if (!trustedInProcessCertificate)
+    return event.emitOpError(
+        "external device images cannot establish trusted in-process provenance "
+        "for a physical Event operation certificate");
+  return success();
+}
+
+using PhysicalTaskCoverage =
+    llvm::SmallDenseMap<int64_t, SmallVector<PhysicalTaskPosition>>;
+
+FailureOr<SmallVector<EventRealizationSpec>>
+deriveEventRealizationSpecs(SchedulePlanOp schedule,
+                            const PhysicalTaskCoverage &coverage) {
+  // These are the exact logical task-dependence events from SchedulePlan. A
+  // fused physical kernel may still use independently derived mbarriers for
+  // shared-memory pipelines after every event here has erased to phase order.
+  SmallVector<EventRealizationSpec> result;
+  for (EventTensorOp event :
+       schedule.getBody().front().getOps<EventTensorOp>()) {
+    auto producers = coverage.find(event.getProducerTask());
+    auto consumers = coverage.find(event.getConsumerTask());
+    if (producers == coverage.end() || consumers == coverage.end() ||
+        producers->second.empty() || consumers->second.empty())
+      return event.emitOpError(
+          "physical Event erasure is missing source-task coverage");
+    const bool localReduction =
+        event.getProducerPhase() == "partial" &&
+        event.getConsumerPhase() == "merge" &&
+        event.getProducerTask() == event.getConsumerTask();
+    if (localReduction) {
+      if (producers->second.size() < 2)
+        return event.emitOpError(
+            "partial-to-merge Event erasure requires two ordered physical "
+            "launches refining the same Fold task");
+      auto first =
+          llvm::min_element(producers->second, [](PhysicalTaskPosition left,
+                                                  PhysicalTaskPosition right) {
+            return std::tie(left.launch, left.position) <
+                   std::tie(right.launch, right.position);
+          });
+      auto last =
+          llvm::max_element(producers->second, [](PhysicalTaskPosition left,
+                                                  PhysicalTaskPosition right) {
+            return std::tie(left.launch, left.position) <
+                   std::tie(right.launch, right.position);
+          });
+      if (first->launch >= last->launch)
+        return event.emitOpError(
+            "partial-to-merge Event has no exact same-stream launch-order "
+            "witness");
+      result.push_back(
+          {EventRealizationKind::StreamOrderErased,
+           {first->launch, first->position, last->launch, last->position}});
+      continue;
+    }
+    EventRealizationSpec spec{EventRealizationKind::ProgramOrderErased, {}};
+    for (PhysicalTaskPosition consumer : consumers->second) {
+      std::optional<PhysicalTaskPosition> witness;
+      for (PhysicalTaskPosition producer : producers->second) {
+        if (producer.launch == consumer.launch &&
+            producer.position < consumer.position) {
+          witness = producer;
+          break;
+        }
+      }
+      if (!witness) {
+        for (PhysicalTaskPosition producer : producers->second) {
+          if (producer.launch >= consumer.launch)
+            continue;
+          if (!witness || witness->launch < producer.launch)
+            witness = producer;
+        }
+      }
+      if (!witness)
+        return event.emitOpError(
+            "physical Event Tensor edge is unresolved: no ordered producer "
+            "covers one consumer launch");
+      if (witness->launch < consumer.launch)
+        spec.kind = EventRealizationKind::StreamOrderErased;
+      llvm::append_range(
+          spec.coveringLaunchOrder,
+          ArrayRef<int64_t>({witness->launch, witness->position,
+                             consumer.launch, consumer.position}));
+    }
+    result.push_back(std::move(spec));
+  }
+  return result;
+}
+
+FailureOr<PhysicalTaskCoverage> physicalTaskCoverage(const GpuBuildUnit &unit) {
+  PhysicalTaskCoverage coverage;
+  if (!unit.isFatbin()) {
+    for (const GpuEntrySpec &entry : unit.spec.entries)
+      coverage[entry.ordinal].push_back({entry.ordinal, 0});
+    return coverage;
+  }
+  absl::StatusOr<std::shared_ptr<const GpuExecutable>> executable =
+      GpuExecutable::Load(unit.nativeTransport);
+  if (!executable.ok())
+    return failure();
+  for (const GpuLaunch &launch : (*executable)->launches())
+    for (auto [position, sourceTask] :
+         llvm::enumerate(launch.sourceTaskOrdinals))
+      coverage[sourceTask].push_back(
+          {launch.taskOrdinal, static_cast<int64_t>(position)});
+  return coverage;
+}
+
+FailureOr<SmallVector<EventRealizationSpec>>
+physicalEventRealizationSpecs(SchedulePlanOp schedule,
+                              const GpuExecutable &executable,
+                              ArrayRef<uint8_t> trustedCertificates = {}) {
+  SmallVector<EventTensorOp> events(
+      schedule.getBody().front().getOps<EventTensorOp>());
+  const size_t eventCount = events.size();
+  if (executable.eventRealizations().size() != eventCount)
+    return failure();
+  if (!trustedCertificates.empty() && trustedCertificates.size() != eventCount)
+    return failure();
+  SmallVector<EventRealizationSpec> result;
+  result.reserve(eventCount);
+  for (auto [ordinal, realization] :
+       llvm::enumerate(executable.eventRealizations())) {
+    if (realization.eventOrdinal != static_cast<int64_t>(ordinal))
+      return failure();
+    EventTensorOp event = events[ordinal];
+    if (failed(verifyPhysicalEventCoverPieces(event, realization,
+                                              executable.launches())) ||
+        failed(verifyPhysicalEventMechanism(event, realization, executable,
+                                            !trustedCertificates.empty() &&
+                                                trustedCertificates[ordinal])))
+      return failure();
+    for (size_t index = 0; index < realization.coveringLaunchOrder.size();
+         index += 4) {
+      const int64_t producerLaunch = realization.coveringLaunchOrder[index];
+      const int64_t consumerLaunch = realization.coveringLaunchOrder[index + 2];
+      if (producerLaunch < 0 || consumerLaunch < 0 ||
+          producerLaunch >=
+              static_cast<int64_t>(executable.launches().size()) ||
+          consumerLaunch >=
+              static_cast<int64_t>(executable.launches().size()) ||
+          !llvm::is_contained(
+              executable.launches()[producerLaunch].sourceTaskOrdinals,
+              event.getProducerTask()) ||
+          !llvm::is_contained(
+              executable.launches()[consumerLaunch].sourceTaskOrdinals,
+              event.getConsumerTask()))
+        return failure();
+    }
+    EventRealizationKind kind;
+    switch (realization.kind) {
+    case GpuEventRealizationKind::ProgramOrder:
+      kind = EventRealizationKind::ProgramOrderErased;
+      break;
+    case GpuEventRealizationKind::StreamOrder:
+      kind = EventRealizationKind::StreamOrderErased;
+      break;
+    case GpuEventRealizationKind::AlgebraicRefinement:
+      kind = EventRealizationKind::AlgebraicRefinementErased;
+      break;
+    case GpuEventRealizationKind::MBarrier:
+      kind = EventRealizationKind::MBarrier;
+      break;
+    case GpuEventRealizationKind::Pipeline:
+      kind = EventRealizationKind::Pipeline;
+      break;
+    case GpuEventRealizationKind::Queue:
+      return event.emitOpError(
+          "device queue Event realization is not yet supported");
+    }
+    result.push_back(
+        {kind, SmallVector<int64_t>(realization.coveringLaunchOrder.begin(),
+                                    realization.coveringLaunchOrder.end())});
+  }
+  return result;
+}
+
+FailureOr<GpuExecutableSpec>
+deriveFatbinBoundary(RegionOp region, MaterializationPlanOp materialization,
+                     SchedulePlanOp schedule,
+                     const GpuFatbinExecutableBundle &bundle,
+                     GpuTarget target) {
+  auto codeIdentity = gpuFatbinCodeIdentity(bundle.images, bundle.launches);
+  if (!codeIdentity.ok() ||
+      bundle.deviceSchemaVersion != fatbinDeviceSchemaForTarget(target) ||
+      bundle.codeFormat != fatbinCodeFormatForTarget(target) ||
+      bundle.scheduleFingerprint != schedule.getFingerprint() ||
+      bundle.planFingerprint != materialization.getFingerprint())
+    return failure();
+  FailureOr<SmallVector<ExecutableSlotSpec>> expectedSlots =
       deriveExecutableSlots(materialization);
-  if (failed(slots) || slots->empty() ||
-      slots->size() > kMaximumGpuExecutableRecords)
+  if (failed(expectedSlots)) {
+    materialization.emitError("cannot derive source materialization ABI");
     return failure();
-  spec.slots = std::move(*slots);
-  FailureOr<SmallVector<int64_t>> reuseGroups =
-      deriveGpuReuseGroups(materialization, spec.slots);
-  if (failed(reuseGroups))
-    return failure();
-  spec.reuseGroups = std::move(*reuseGroups);
+  }
   auto manifest =
       region->getParentOfType<ModuleOp>()->getAttrOfType<DictionaryAttr>(
           kCoverageManifestAttribute);
@@ -10636,199 +6560,145 @@ deriveGpuExecutable(RegionOp region, MaterializationPlanOp materialization,
       manifest ? manifest.getAs<StringAttr>("canonical_tuning") : StringAttr{};
   FailureOr<DerivedPlan> derived = deriveGpuPlan(
       region, tuning && tuning.getValue() == kFusionCanonicalTuning);
-  auto regionYield = cast<YieldOp>(region.getBody().front().getTerminator());
-  SmallVector<int64_t> resultBindings = publicRegionResultBindings(region);
-  if (failed(derived) || derived->buffers.size() != spec.slots.size())
+  if (failed(derived)) {
+    materialization.emitError(
+        "cannot rederive physical artifact source ownership");
     return failure();
-  spec.bindingIndices.resize(spec.slots.size());
-  llvm::SmallDenseSet<int64_t> seenOperandBindings;
-  llvm::SmallDenseSet<int64_t> seenResultBindings;
-  for (auto [ordinal, buffer, slot] :
-       llvm::enumerate(derived->buffers, spec.slots)) {
-    if (slot.storage != MaterializationStorage::External)
-      continue;
-    if (!buffer.producer) {
-      auto argument = dyn_cast<BlockArgument>(buffer.value);
-      if (!argument || argument.getOwner() != &region.getBody().front())
-        return failure();
-      if (!seenOperandBindings.insert(argument.getArgNumber()).second)
-        return failure();
-      spec.bindingIndices[ordinal] = argument.getArgNumber();
-      continue;
-    }
-    if (!buffer.liveOut)
-      return failure();
-    auto yielded = llvm::find(regionYield.getValues(), buffer.value);
-    if (yielded == regionYield.getValues().end())
-      return failure();
-    int64_t resultIndex =
-        std::distance(regionYield.getValues().begin(), yielded);
-    const int64_t binding = resultBindings[resultIndex];
-    if (!seenResultBindings.insert(binding).second)
-      return failure();
-    spec.bindingIndices[ordinal] = binding;
   }
-  if (seenOperandBindings.size() !=
-          region.getBody().front().getNumArguments() ||
-      seenResultBindings.size() != regionYield.getValues().size())
+  FailureOr<SmallVector<std::optional<int64_t>>> expectedBindings =
+      deriveGpuBindingIndices(region, *derived, *expectedSlots);
+  if (failed(expectedBindings))
     return failure();
-  for (auto [ordinal, materializationTask, task] :
-       llvm::enumerate(materializationTasks, tasks)) {
-    Operation *operation =
-        sourceOperations.lookup(materializationTask.getSource());
-    if (!operation)
-      return failure();
-    FailureOr<std::string> ptx = failure();
-    auto compositionKind =
-        materializationTask->getAttrOfType<StringAttr>("composition_kind");
-    if (compositionKind && compositionKind.getValue() == "contract_fold") {
-      ptx = emitContractFoldCompositionPtx(
-          materializationTask, materializationBuffers, task, sourceOperations);
-    } else if (compositionKind &&
-               compositionKind.getValue() == "map_contract") {
-      ptx = emitMapContractCompositionPtx(
-          materializationTask, materializationBuffers, task, sourceOperations);
-    } else if (compositionKind &&
-               compositionKind.getValue() == kOnlineStateProtocol) {
-      ptx = emitOnlineSufficientStatePtx(
-          region, materializationTask, materializationBuffers, task);
-    } else if (compositionKind) {
-      return failure();
-    } else if (materializationTask->getAttr("contract_region_sources")) {
-      ptx = emitContractRegionPtx(materializationTask, materializationBuffers,
-                                  task, sourceOperations);
-    } else if (materializationTask->getAttr("fold_region_sources")) {
-      ptx = emitFoldRegionPtx(materializationTask, materializationBuffers, task,
-                              sourceOperations);
-    } else if (auto epilogueSources =
-                   materializationTask->getAttrOfType<ArrayAttr>(
-                       "fold_epilogue_sources")) {
-      auto fold = dyn_cast<FoldOp>(operation);
-      SmallVector<MapOp> maps;
-      for (Attribute source : epilogueSources) {
-        auto map = dyn_cast_or_null<MapOp>(sourceOperations.lookup(source));
-        if (!map)
-          return failure();
-        maps.push_back(map);
+
+  GpuExecutableSpec spec;
+  spec.code.append(codeIdentity->begin(), codeIdentity->end());
+  for (const auto &image : bundle.images)
+    spec.rawFatbinCodeBytes += image.size();
+  SmallVector<bool> projectedSourceBuffers(expectedSlots->size(), false);
+  for (auto [ordinal, slot] : llvm::enumerate(bundle.slots)) {
+    if (slot.storage == MaterializationStorage::External) {
+      std::optional<size_t> sourceOrdinal;
+      for (auto [candidateOrdinal, candidate] :
+           llvm::enumerate(*expectedSlots)) {
+        if (candidate.storage != MaterializationStorage::External ||
+            !(*expectedBindings)[candidateOrdinal])
+          continue;
+        const ExecutableBindingKind candidateBinding =
+            candidate.access == ExecutableAccess::Read
+                ? ExecutableBindingKind::Operand
+                : ExecutableBindingKind::Result;
+        if (slot.bindingKind == candidateBinding &&
+            slot.bindingIndex == *(*expectedBindings)[candidateOrdinal]) {
+          if (sourceOrdinal) {
+            materialization.emitError(
+                "source external binding does not identify one buffer");
+            return failure();
+          }
+          sourceOrdinal = candidateOrdinal;
+        }
       }
-      if (!fold)
+      if (!sourceOrdinal || projectedSourceBuffers[*sourceOrdinal]) {
+        materialization.emitError("physical artifact slot ")
+            << ordinal << " does not project to one source external buffer";
         return failure();
-      ptx = emitFoldMapPtx(fold, task, maps, materializationTask,
-                           &materializationBuffers);
-    } else if (auto fusedSources =
-                   materializationTask->getAttrOfType<ArrayAttr>(
-                       "fused_sources")) {
-      SmallVector<MapOp> maps;
-      for (Attribute source : fusedSources) {
-        auto map = dyn_cast_or_null<MapOp>(sourceOperations.lookup(source));
-        if (!map)
-          return failure();
-        maps.push_back(map);
       }
-      ptx = emitFusedMapPtx(maps, materializationTask,
-                            materializationBuffers, task);
-    } else if (auto map = dyn_cast<MapOp>(operation)) {
-      ptx = emitMapPtx(map, task);
-    } else if (auto fold = dyn_cast<FoldOp>(operation)) {
-      ptx = emitFoldPtx(fold, task);
-    } else if (auto contract = dyn_cast<ContractOp>(operation)) {
-      ptx = emitContractPtx(contract, task);
+      const ExecutableSlotSpec &expected = (*expectedSlots)[*sourceOrdinal];
+      const bool validAlignment = slot.alignment >= expected.alignment &&
+                                  slot.alignment <= 256 &&
+                                  (slot.alignment & (slot.alignment - 1)) == 0;
+      if (slot.ordinal != static_cast<int64_t>(ordinal) ||
+          slot.tensorType != expected.tensorType ||
+          slot.requiredBytes != expected.requiredBytes ||
+          slot.byteStrides != ArrayRef<int64_t>(expected.strides) ||
+          slot.byteOffset != 0 || !validAlignment ||
+          slot.addressSpace != ExecutableAddressSpace::Device ||
+          slot.access != expected.access ||
+          slot.aliasGroup != static_cast<int64_t>(ordinal) ||
+          slot.reuseGroup != static_cast<int64_t>(ordinal)) {
+        materialization.emitError("physical artifact slot ")
+            << ordinal << " does not match projected source buffer "
+            << *sourceOrdinal;
+        return failure();
+      }
+      projectedSourceBuffers[*sourceOrdinal] = true;
+      spec.slots.push_back({expected.tensorType, expected.requiredBytes,
+                            expected.strides, slot.alignment, expected.access,
+                            expected.storage});
+      spec.bindingIndices.push_back(slot.bindingIndex);
+      spec.reuseGroups.push_back(slot.reuseGroup);
+      spec.sourceBuffers.push_back(*sourceOrdinal);
+      continue;
     }
-    if (failed(ptx)) {
-      operation->emitOpError("cannot emit bounded generic CUDA PTX");
+    auto tensor = dyn_cast<RankedTensorType>(slot.tensorType);
+    const bool validAlignment = slot.alignment > 0 && slot.alignment <= 256 &&
+                                (slot.alignment & (slot.alignment - 1)) == 0;
+    if (slot.ordinal != static_cast<int64_t>(ordinal) || !tensor ||
+        !tensor.hasStaticShape() ||
+        (!tensor.getElementType().isBF16() &&
+         !tensor.getElementType().isF32()) ||
+        slot.requiredBytes <= 0 || slot.byteOffset != 0 || !validAlignment ||
+        slot.addressSpace != ExecutableAddressSpace::Device ||
+        slot.access != ExecutableAccess::ReadWrite ||
+        slot.storage != MaterializationStorage::Temporary ||
+        slot.aliasGroup != static_cast<int64_t>(ordinal) ||
+        slot.reuseGroup < 0 ||
+        slot.bindingKind != ExecutableBindingKind::None ||
+        slot.bindingIndex != -1) {
+      materialization.emitError("physical-private slot ")
+          << ordinal << " must be bounded unbound device temporary storage";
       return failure();
     }
-    if (failed(retargetPtx(*ptx, target))) {
-      operation->emitOpError("cannot bind generic CUDA PTX to its target");
+    spec.slots.push_back({slot.tensorType, slot.requiredBytes, slot.byteStrides,
+                          slot.alignment, slot.access, slot.storage});
+    spec.bindingIndices.push_back(std::nullopt);
+    spec.reuseGroups.push_back(slot.reuseGroup);
+    spec.sourceBuffers.push_back(-1);
+  }
+  for (auto [sourceOrdinal, expected] : llvm::enumerate(*expectedSlots)) {
+    if (expected.storage == MaterializationStorage::External &&
+        !projectedSourceBuffers[sourceOrdinal]) {
+      materialization.emitError(
+          "physical artifact omits source external buffer ")
+          << sourceOrdinal;
       return failure();
     }
-    const bool contractRegion =
-        materializationTask->hasAttr("contract_region_sources");
-    const size_t expectedGridRank = contractRegion ? 2 : 1;
-    if (ptx->empty() || !StringRef(*ptx).ends_with("\n") ||
-        ptx->size() > kMaximumGpuEntryCodeBytes ||
-        task.getGridShape().size() != expectedGridRank ||
-        llvm::any_of(task.getGridShape(),
-                     [](int64_t extent) {
-                       return extent <= 0 || extent > UINT32_MAX;
-                     }) ||
-        task.getWorkgroupThreads() <= 0 || task.getWorkgroupThreads() > 1024 ||
-        task.getScratchBytes() < 0 ||
-        task.getScratchBytes() > kMaximumGpuDynamicSharedMemoryBytes) {
-      task.emitOpError("has invalid bounded GPU code or launch resources");
+    if (expected.storage != MaterializationStorage::External &&
+        expected.storage != MaterializationStorage::Temporary) {
+      materialization.emitError("only source temporaries may be elided");
       return failure();
     }
-    int64_t offset = spec.code.size();
-    spec.code.append(ptx->begin(), ptx->end());
-    SmallVector<int64_t> inputs(task.getInputBuffers());
-    SmallVector<int64_t> outputs(task.getOutputBuffers());
-    SmallVector<int64_t> grid(task.getGridShape());
-    while (grid.size() < 3)
-      grid.push_back(1);
-    std::array<int64_t, 3> launchGrid = {grid[0], grid[1], grid[2]};
-    FailureOr<SmallVector<AffineMap>> logicalMaps =
-        isOnlineStateTask(materializationTask)
-            ? onlineLogicalCoordinateMaps(task)
-            : FailureOr<SmallVector<AffineMap>>(SmallVector<AffineMap>{});
-    if (failed(logicalMaps))
-      return failure();
+  }
+  for (const GpuLaunch &launch : bundle.launches) {
+    ArrayRef<uint8_t> image = bundle.images[launch.imageIndex];
+    SmallVector<int64_t> grid(launch.grid.begin(), launch.grid.end());
+    SmallVector<int64_t> block(launch.block.begin(), launch.block.end());
     spec.entries.push_back(
-        {static_cast<int64_t>(ordinal),
-         offset,
-         static_cast<int64_t>(ptx->size()),
-         std::move(inputs),
-         std::move(outputs),
-         SmallVector<int64_t>(task.getDependencies()),
-         task.getKind() == ScheduleTaskKind::Scalar
-             ? ExecutablePredication::None
-             : ExecutablePredication::DomainBounds,
-         isOnlineStateTask(materializationTask)
-             ? task.getReductionOrder()
-             : isa<ContractOp>(operation) ? std::nullopt
-                                          : task.getReductionOrder(),
-         launchGrid,
-         {static_cast<int64_t>(task.getWorkgroupThreads()), 1, 1},
-         static_cast<int64_t>(task.getScratchBytes()),
-         static_cast<int64_t>(task.getInputBuffers().size() +
-                              task.getOutputBuffers().size()),
-         isOnlineStateTask(materializationTask)
-             ? std::optional<std::string>(kOnlineStateProtocol.str())
-             : std::nullopt,
-         std::move(*logicalMaps),
-         sha256(*ptx)});
+        {launch.taskOrdinal,
+         0,
+         static_cast<int64_t>(image.size()),
+         SmallVector<int64_t>(launch.inputSlots.begin(),
+                              launch.inputSlots.end()),
+         SmallVector<int64_t>(launch.outputSlots.begin(),
+                              launch.outputSlots.end()),
+         SmallVector<int64_t>(launch.dependencies.begin(),
+                              launch.dependencies.end()),
+         ExecutablePredication::None,
+         std::nullopt,
+         {static_cast<int64_t>(launch.grid[0]),
+          static_cast<int64_t>(launch.grid[1]),
+          static_cast<int64_t>(launch.grid[2])},
+         {static_cast<int64_t>(launch.block[0]),
+          static_cast<int64_t>(launch.block[1]),
+          static_cast<int64_t>(launch.block[2])},
+         static_cast<int64_t>(launch.dynamicSharedMemoryBytes),
+         static_cast<int64_t>(launch.arguments.size()),
+         std::nullopt,
+         {},
+         executableCodeDigest(ArrayRef<int8_t>(
+             reinterpret_cast<const int8_t *>(image.data()), image.size()))});
   }
-  if (spec.code.size() > kMaximumGpuCodeBytes)
-    return failure();
   return spec;
 }
-
-ArrayAttr accessArray(MLIRContext *context, ExecutableAccess access,
-                      size_t count) {
-  SmallVector<Attribute> values(count,
-                                ExecutableAccessAttr::get(context, access));
-  return ArrayAttr::get(context, values);
-}
-
-SchedulePlanOp
-uniqueScheduleForMaterialization(ArrayRef<SchedulePlanOp> schedules,
-                                 MaterializationPlanOp materialization) {
-  SchedulePlanOp match;
-  for (SchedulePlanOp schedule : schedules) {
-    if (schedule.getSourcePlanFingerprint() != materialization.getFingerprint())
-      continue;
-    if (match)
-      return {};
-    match = schedule;
-  }
-  return match;
-}
-
-struct GpuBuildUnit {
-  RegionOp region;
-  MaterializationPlanOp materialization;
-  SchedulePlanOp schedule;
-  GpuExecutableSpec spec;
-};
 
 bool hasBoundedGpuModuleResources(ArrayRef<GpuBuildUnit> units) {
   if (units.empty() || units.size() > kMaximumGpuExecutableRecords)
@@ -10841,7 +6711,8 @@ bool hasBoundedGpuModuleResources(ArrayRef<GpuBuildUnit> units) {
   for (const GpuBuildUnit &unit : units) {
     entries += unit.spec.entries.size();
     slots += unit.spec.slots.size();
-    codeBytes += unit.spec.code.size();
+    codeBytes +=
+        unit.isFatbin() ? unit.spec.rawFatbinCodeBytes : unit.spec.code.size();
     if (entries > kMaximumGpuExecutableRecords ||
         slots > kMaximumGpuExecutableRecords ||
         codeBytes > kMaximumGpuCodeBytes)
@@ -10890,6 +6761,12 @@ public:
   explicit BuildGpuExecutableBundlePass(GpuTarget gpuTarget) {
     target = gpuTarget == GpuTarget::Sm90 ? "sm_90" : "sm_100";
   }
+  BuildGpuExecutableBundlePass(
+      GpuTarget gpuTarget,
+      std::shared_ptr<const GpuPhysicalArtifactProvider> provider)
+      : provider(std::move(provider)) {
+    target = gpuTarget == GpuTarget::Sm90 ? "sm_90" : "sm_100";
+  }
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
@@ -10901,8 +6778,15 @@ public:
     SmallVector<MaterializationPlanOp> materializations(
         module.getOps<MaterializationPlanOp>());
     SmallVector<SchedulePlanOp> schedules(module.getOps<SchedulePlanOp>());
+    SmallVector<EventLoweringPlanOp> sourceEventPlans(
+        module.getOps<EventLoweringPlanOp>());
     if (materializations.empty() ||
         materializations.size() != schedules.size() ||
+        sourceEventPlans.size() != materializations.size() ||
+        llvm::any_of(sourceEventPlans,
+                     [](EventLoweringPlanOp eventPlan) {
+                       return eventPlan.getPhysicalLaunchRecipeFingerprint();
+                     }) ||
         !module.getOps<DeviceModuleOp>().empty() ||
         !module.getOps<InvocationAbiOp>().empty() ||
         !module.getOps<ExecutableBundleOp>().empty()) {
@@ -10928,13 +6812,127 @@ public:
         module.emitError("GPU plans do not form one-to-one source bindings");
         return signalPassFailure();
       }
+      EventLoweringPlanOp sourceEventPlan =
+          uniqueSourceEventPlanForSchedule(sourceEventPlans, schedule);
+      if (!sourceEventPlan) {
+        schedule.emitError(
+            "requires one exact source-bound Event lowering plan before "
+            "physical binding");
+        return signalPassFailure();
+      }
+      if (failed(verifyEventLoweringPlanAgainstSchedule(schedule,
+                                                        sourceEventPlan))) {
+        schedule.emitError(
+            "cannot derive exact pre-physical Event wait/notify requirements");
+        return signalPassFailure();
+      }
+      const std::string requestFingerprint =
+          gpuPhysicalArtifactRequestFingerprint(
+              region, materialization, schedule, sourceEventPlan, *gpuTarget);
+      std::optional<GpuPhysicalArtifactCompilation> physicalCompilation;
+      if (provider) {
+        FailureOr<SmallVector<ExecutableSlotSpec>> sourceSlots =
+            deriveExecutableSlots(materialization);
+        auto manifest =
+            module->getAttrOfType<DictionaryAttr>(kCoverageManifestAttribute);
+        auto tuning = manifest ? manifest.getAs<StringAttr>("canonical_tuning")
+                               : StringAttr{};
+        FailureOr<DerivedPlan> sourcePlan = deriveGpuPlan(
+            region, tuning && tuning.getValue() == kFusionCanonicalTuning);
+        FailureOr<SmallVector<std::optional<int64_t>>> sourceBindings =
+            failure();
+        FailureOr<SmallVector<std::optional<int64_t>>> sourceRegionResults =
+            failure();
+        FailureOr<SmallVector<int64_t>> sourceReuse = failure();
+        if (succeeded(sourceSlots) && succeeded(sourcePlan)) {
+          sourceBindings =
+              deriveGpuBindingIndices(region, *sourcePlan, *sourceSlots);
+          sourceRegionResults =
+              deriveGpuRegionResultIndices(region, *sourcePlan, *sourceSlots);
+        }
+        if (succeeded(sourceSlots))
+          sourceReuse = deriveGpuReuseGroups(materialization, *sourceSlots);
+        if (failed(sourceBindings) || failed(sourceRegionResults) ||
+            failed(sourceReuse)) {
+          module.emitError(
+              "cannot derive source bindings or reuse for GPU physical "
+              "artifact");
+          return signalPassFailure();
+        }
+        GpuPhysicalArtifactRequest request{region,
+                                           materialization,
+                                           schedule,
+                                           sourceEventPlan,
+                                           *gpuTarget,
+                                           requestFingerprint,
+                                           std::move(*sourceBindings),
+                                           std::move(*sourceRegionResults),
+                                           std::move(*sourceReuse)};
+        absl::StatusOr<std::optional<GpuPhysicalArtifactCompilation>> provided =
+            provider->compile(request);
+        if (!provided.ok()) {
+          module.emitError("GPU physical artifact provider failed: ")
+              << provided.status().message();
+          return signalPassFailure();
+        }
+        physicalCompilation = std::move(*provided);
+      }
+      if (!physicalCompilation &&
+          isCertifiedReverseStatePlan(materialization)) {
+        materialization.emitError(
+            "certified reverse-state Contract/Fold plan has no matching GPU "
+            "physical artifact for its structural boundary");
+        return signalPassFailure();
+      }
+      if (physicalCompilation) {
+        GpuFatbinExecutableBundle &fatbin = physicalCompilation->bundle;
+        const std::string physicalLaunchRecipeFingerprint =
+            fatbin.scheduleFingerprint;
+        const std::string physicalCompileRequestFingerprint =
+            fatbin.planFingerprint;
+        fatbin.scheduleFingerprint = schedule.getFingerprint().str();
+        fatbin.planFingerprint = materialization.getFingerprint().str();
+        FailureOr<SmallVector<uint8_t>> trustedCertificates =
+            bindTrustedSourceEventLegalizations(
+                fatbin, physicalCompilation->sourceEventLegalizations);
+        FailureOr<SmallVector<GpuBuildUnit::TrustedInternalEventCertificate>>
+            trustedInternalCertificates = bindTrustedInternalEventLegalizations(
+                fatbin, physicalCompilation->internalEventLegalizations);
+        FailureOr<GpuExecutableSpec> spec = deriveFatbinBoundary(
+            region, materialization, schedule, fatbin, *gpuTarget);
+        absl::StatusOr<SmallVector<uint8_t>> transport =
+            serializeGpuFatbinExecutableBundle(fatbin);
+        if (failed(trustedCertificates) ||
+            failed(trustedInternalCertificates) || failed(spec) ||
+            !transport.ok()) {
+          module.emitError(
+              "physical artifact does not match the source-bound GPU plan");
+          return signalPassFailure();
+        }
+        units.push_back({region, materialization, schedule, sourceEventPlan,
+                         std::move(*spec), std::move(*transport),
+                         requestFingerprint, physicalCompileRequestFingerprint,
+                         physicalLaunchRecipeFingerprint,
+                         std::move(*trustedCertificates),
+                         std::move(*trustedInternalCertificates)});
+        continue;
+      }
       FailureOr<GpuExecutableSpec> spec =
           deriveGpuExecutable(region, materialization, schedule, *gpuTarget);
       if (failed(spec)) {
         module.emitError("failed to build exact GPU executable bundle");
         return signalPassFailure();
       }
-      units.push_back({region, materialization, schedule, std::move(*spec)});
+      units.push_back({region,
+                       materialization,
+                       schedule,
+                       sourceEventPlan,
+                       std::move(*spec),
+                       {},
+                       {},
+                       {},
+                       {},
+                       {}});
     }
     size_t regionCount = 0;
     module.walk([&](RegionOp) { ++regionCount; });
@@ -10951,13 +6949,17 @@ public:
       const std::string codeDigest = executableCodeDigest(spec.code);
       OperationState deviceState(module.getLoc(),
                                  DeviceModuleOp::getOperationName());
-      deviceState.addAttribute(
-          "schema_version",
-          builder.getI64IntegerAttr(deviceSchemaForTarget(*gpuTarget)));
+      deviceState.addAttribute("schema_version",
+                               builder.getI64IntegerAttr(
+                                   unit.isFatbin()
+                                       ? fatbinDeviceSchemaForTarget(*gpuTarget)
+                                       : deviceSchemaForTarget(*gpuTarget)));
       deviceState.addAttribute(
           "code_format",
-          ExecutableCodeFormatAttr::get(module.getContext(),
-                                        codeFormatForTarget(*gpuTarget)));
+          ExecutableCodeFormatAttr::get(
+              module.getContext(), unit.isFatbin()
+                                       ? fatbinCodeFormatForTarget(*gpuTarget)
+                                       : codeFormatForTarget(*gpuTarget)));
       deviceState.addAttribute("policy", schedule.getPolicyAttr());
       deviceState.addAttribute("source_schedule_fingerprint",
                                schedule.getFingerprintAttr());
@@ -10967,73 +6969,245 @@ public:
                                builder.getStringAttr(codeDigest));
       deviceState.addAttribute("fingerprint",
                                builder.getStringAttr(std::string(64, '0')));
+      if (unit.isFatbin()) {
+        deviceState.addAttribute(
+            "native_transport",
+            DenseI8ArrayAttr::get(
+                module.getContext(),
+                ArrayRef<int8_t>(reinterpret_cast<const int8_t *>(
+                                     unit.nativeTransport.data()),
+                                 unit.nativeTransport.size())));
+        deviceState.addAttribute(
+            "physical_request_fingerprint",
+            builder.getStringAttr(unit.physicalRequestFingerprint));
+        deviceState.addAttribute(
+            "physical_compile_request_fingerprint",
+            builder.getStringAttr(unit.physicalCompileRequestFingerprint));
+        deviceState.addAttribute(
+            "physical_launch_recipe_fingerprint",
+            builder.getStringAttr(unit.physicalLaunchRecipeFingerprint));
+        {
+          absl::StatusOr<std::shared_ptr<const GpuExecutable>> executable =
+              GpuExecutable::Load(unit.nativeTransport);
+          if (!executable.ok()) {
+            schedule.emitError("cannot read structured device IR snapshots");
+            return signalPassFailure();
+          }
+          if (!(*executable)->deviceIrSnapshots().empty()) {
+            SmallVector<Attribute> digests;
+            for (const GpuDeviceIrSnapshot &snapshot :
+                 (*executable)->deviceIrSnapshots())
+              digests.push_back(
+                  builder.getStringAttr(snapshot.mlirBytecodeDigest));
+            deviceState.addAttribute("device_ir_snapshot_digests",
+                                     builder.getArrayAttr(digests));
+          }
+        }
+        if (llvm::is_contained(unit.trustedEventCertificates, uint8_t{1})) {
+          absl::StatusOr<std::shared_ptr<const GpuExecutable>> executable =
+              GpuExecutable::Load(unit.nativeTransport);
+          if (!executable.ok()) {
+            schedule.emitError(
+                "cannot read trusted source Event certificate provenance");
+            return signalPassFailure();
+          }
+          SmallVector<Attribute> certificates;
+          for (auto [eventOrdinal, trusted] :
+               llvm::enumerate(unit.trustedEventCertificates)) {
+            if (!trusted)
+              continue;
+            const auto &certificate = (*executable)
+                                          ->eventRealizations()[eventOrdinal]
+                                          .operationCertificate;
+            if (!certificate) {
+              schedule.emitError(
+                  "trusted source Event legalization has no certificate");
+              return signalPassFailure();
+            }
+            certificates.push_back(builder.getDictionaryAttr(
+                {builder.getNamedAttr("event",
+                                      builder.getI64IntegerAttr(eventOrdinal)),
+                 builder.getNamedAttr(
+                     "compiler_ir_digest",
+                     builder.getStringAttr(certificate->compilerIrDigest))}));
+          }
+          deviceState.addAttribute("trusted_source_event_certificates",
+                                   builder.getArrayAttr(certificates));
+        }
+        if (!unit.trustedInternalEventCertificates.empty()) {
+          SmallVector<Attribute> certificates;
+          for (const auto &certificate : unit.trustedInternalEventCertificates)
+            certificates.push_back(builder.getDictionaryAttr(
+                {builder.getNamedAttr("region", builder.getI64IntegerAttr(
+                                                    certificate.regionOrdinal)),
+                 builder.getNamedAttr(
+                     "allocation",
+                     builder.getI64IntegerAttr(certificate.allocationOrdinal)),
+                 builder.getNamedAttr(
+                     "allocation_id",
+                     builder.getStringAttr(certificate.allocationId)),
+                 builder.getNamedAttr(
+                     "compiler_ir_digest",
+                     builder.getStringAttr(certificate.compilerIrDigest)),
+                 builder.getNamedAttr(
+                     "device_image_digest",
+                     builder.getStringAttr(certificate.deviceImageDigest))}));
+          deviceState.addAttribute("trusted_internal_event_certificates",
+                                   builder.getArrayAttr(certificates));
+        }
+      }
       deviceState.addRegion();
       auto device = cast<DeviceModuleOp>(builder.create(deviceState));
       device.getBody().push_back(new Block());
       builder.setInsertionPointToEnd(&device.getBody().front());
-      for (const GpuEntrySpec &entry : spec.entries) {
-        SmallVector<NamedAttribute> attributes{
-            builder.getNamedAttr("ordinal",
-                                 builder.getI64IntegerAttr(entry.ordinal)),
-            builder.getNamedAttr("source_task",
-                                 builder.getI64IntegerAttr(entry.ordinal)),
-            builder.getNamedAttr("code_offset",
-                                 builder.getI64IntegerAttr(entry.codeOffset)),
-            builder.getNamedAttr("code_length",
-                                 builder.getI64IntegerAttr(entry.codeLength)),
-            builder.getNamedAttr(
-                "input_buffers",
-                DenseI64ArrayAttr::get(module.getContext(), entry.inputs)),
-            builder.getNamedAttr(
-                "output_buffers",
-                DenseI64ArrayAttr::get(module.getContext(), entry.outputs)),
-            builder.getNamedAttr("input_accesses",
-                                 accessArray(module.getContext(),
-                                             ExecutableAccess::Read,
-                                             entry.inputs.size())),
-            builder.getNamedAttr("output_accesses",
-                                 accessArray(module.getContext(),
-                                             ExecutableAccess::Write,
-                                             entry.outputs.size())),
-            builder.getNamedAttr("dependencies",
-                                 DenseI64ArrayAttr::get(module.getContext(),
-                                                        entry.dependencies)),
-            builder.getNamedAttr("predication",
-                                 ExecutablePredicationAttr::get(
-                                     module.getContext(), entry.predication)),
-            builder.getNamedAttr("code_digest",
-                                 builder.getStringAttr(entry.codeDigest)),
-            builder.getNamedAttr("grid", DenseI64ArrayAttr::get(
-                                             module.getContext(), entry.grid)),
-            builder.getNamedAttr(
-                "block",
-                DenseI64ArrayAttr::get(module.getContext(), entry.block)),
-            builder.getNamedAttr(
-                "dynamic_shared_bytes",
-                builder.getI64IntegerAttr(entry.dynamicSharedBytes)),
-            builder.getNamedAttr("kernel_arity",
-                                 builder.getI64IntegerAttr(entry.kernelArity))};
-        if (entry.reductionOrder)
-          attributes.push_back(builder.getNamedAttr(
-              "reduction_order",
-              ScheduleReductionOrderAttr::get(module.getContext(),
-                                              *entry.reductionOrder)));
-        if (entry.onlineStateProtocol) {
-          SmallVector<Attribute> logicalMaps;
-          for (AffineMap map : entry.logicalCoordinateMaps)
-            logicalMaps.push_back(AffineMapAttr::get(map));
-          attributes.push_back(builder.getNamedAttr(
-              "online_state_protocol",
-              builder.getStringAttr(*entry.onlineStateProtocol)));
-          attributes.push_back(builder.getNamedAttr(
-              "logical_coordinate_maps",
-              builder.getArrayAttr(logicalMaps)));
+      if (!unit.isFatbin())
+        for (const GpuEntrySpec &entry : spec.entries) {
+          SmallVector<NamedAttribute> attributes{
+              builder.getNamedAttr("ordinal",
+                                   builder.getI64IntegerAttr(entry.ordinal)),
+              builder.getNamedAttr("source_task",
+                                   builder.getI64IntegerAttr(entry.ordinal)),
+              builder.getNamedAttr("code_offset",
+                                   builder.getI64IntegerAttr(entry.codeOffset)),
+              builder.getNamedAttr("code_length",
+                                   builder.getI64IntegerAttr(entry.codeLength)),
+              builder.getNamedAttr(
+                  "input_buffers",
+                  DenseI64ArrayAttr::get(module.getContext(), entry.inputs)),
+              builder.getNamedAttr(
+                  "output_buffers",
+                  DenseI64ArrayAttr::get(module.getContext(), entry.outputs)),
+              builder.getNamedAttr("input_accesses",
+                                   accessArray(module.getContext(),
+                                               ExecutableAccess::Read,
+                                               entry.inputs.size())),
+              builder.getNamedAttr("output_accesses",
+                                   accessArray(module.getContext(),
+                                               ExecutableAccess::Write,
+                                               entry.outputs.size())),
+              builder.getNamedAttr("dependencies",
+                                   DenseI64ArrayAttr::get(module.getContext(),
+                                                          entry.dependencies)),
+              builder.getNamedAttr("predication",
+                                   ExecutablePredicationAttr::get(
+                                       module.getContext(), entry.predication)),
+              builder.getNamedAttr("code_digest",
+                                   builder.getStringAttr(entry.codeDigest)),
+              builder.getNamedAttr(
+                  "grid",
+                  DenseI64ArrayAttr::get(module.getContext(), entry.grid)),
+              builder.getNamedAttr(
+                  "block",
+                  DenseI64ArrayAttr::get(module.getContext(), entry.block)),
+              builder.getNamedAttr(
+                  "dynamic_shared_bytes",
+                  builder.getI64IntegerAttr(entry.dynamicSharedBytes)),
+              builder.getNamedAttr("kernel_arity", builder.getI64IntegerAttr(
+                                                       entry.kernelArity))};
+          if (entry.reductionOrder)
+            attributes.push_back(builder.getNamedAttr(
+                "reduction_order",
+                ScheduleReductionOrderAttr::get(module.getContext(),
+                                                *entry.reductionOrder)));
+          if (entry.onlineStateProtocol) {
+            SmallVector<Attribute> logicalMaps;
+            for (AffineMap map : entry.logicalCoordinateMaps)
+              logicalMaps.push_back(AffineMapAttr::get(map));
+            attributes.push_back(builder.getNamedAttr(
+                "online_state_protocol",
+                builder.getStringAttr(*entry.onlineStateProtocol)));
+            attributes.push_back(builder.getNamedAttr(
+                "logical_coordinate_maps", builder.getArrayAttr(logicalMaps)));
+          }
+          createScheduleRecord(builder, module.getLoc(),
+                               DeviceEntryOp::getOperationName(), attributes);
         }
-        createScheduleRecord(builder, module.getLoc(),
-                             DeviceEntryOp::getOperationName(), attributes);
-      }
       builder.create<DeviceModuleYieldOp>(module.getLoc());
       device.setFingerprint(deviceModuleFingerprint(device));
+
+      FailureOr<SmallVector<EventRealizationSpec>> eventRealizations =
+          failure();
+      if (unit.isFatbin()) {
+        absl::StatusOr<std::shared_ptr<const GpuExecutable>> executable =
+            GpuExecutable::Load(unit.nativeTransport);
+        if (executable.ok())
+          eventRealizations = physicalEventRealizationSpecs(
+              schedule, **executable, unit.trustedEventCertificates);
+      } else {
+        FailureOr<PhysicalTaskCoverage> coverage = physicalTaskCoverage(unit);
+        if (succeeded(coverage))
+          eventRealizations = deriveEventRealizationSpecs(schedule, *coverage);
+      }
+      if (failed(eventRealizations)) {
+        schedule.emitError(
+            "cannot lower every exact Event Tensor: the physical compiler did "
+            "not provide a source-bound full-relation erasure or physical "
+            "mechanism certificate");
+        return signalPassFailure();
+      }
+      builder.setInsertionPointToEnd(module.getBody());
+      OperationState eventPlanState(module.getLoc(),
+                                    EventLoweringPlanOp::getOperationName());
+      eventPlanState.addAttribute("schema_version",
+                                  builder.getI64IntegerAttr(1));
+      eventPlanState.addAttribute("source_schedule_fingerprint",
+                                  schedule.getFingerprintAttr());
+      eventPlanState.addAttribute(
+          "physical_launch_recipe_fingerprint",
+          unit.isFatbin()
+              ? builder.getStringAttr(unit.physicalLaunchRecipeFingerprint)
+              : device.getFingerprintAttr());
+      eventPlanState.addAttribute("fingerprint",
+                                  builder.getStringAttr(std::string(64, '0')));
+      eventPlanState.addRegion();
+      auto eventPlan =
+          cast<EventLoweringPlanOp>(builder.create(eventPlanState));
+      eventPlan.getBody().push_back(new Block());
+      builder.setInsertionPointToEnd(&eventPlan.getBody().front());
+      for (auto [eventOrdinal, realization] :
+           llvm::enumerate(*eventRealizations))
+        createScheduleRecord(
+            builder, module.getLoc(), EventRealizationOp::getOperationName(),
+            {builder.getNamedAttr("event",
+                                  builder.getI64IntegerAttr(eventOrdinal)),
+             builder.getNamedAttr(
+                 "kind", EventRealizationKindAttr::get(module.getContext(),
+                                                       realization.kind)),
+             builder.getNamedAttr(
+                 "covering_launch_order",
+                 DenseI64ArrayAttr::get(module.getContext(),
+                                        realization.coveringLaunchOrder))});
+      builder.create<EventLoweringPlanYieldOp>(module.getLoc());
+      eventPlan.setFingerprint(eventLoweringPlanFingerprint(eventPlan));
+
+      if (unit.isFatbin()) {
+        absl::StatusOr<std::shared_ptr<const GpuExecutable>> executable =
+            GpuExecutable::Load(unit.nativeTransport);
+        if (!executable.ok()) {
+          schedule.emitError("cannot read physical Event provenance");
+          return signalPassFailure();
+        }
+        StringRef canonicalSchedule = (*executable)->physicalEventProvenance();
+        if (!canonicalSchedule.empty()) {
+          StringRef canonicalScheduleDigest =
+              (*executable)->physicalEventProvenanceDigest();
+          if (!(*executable)->internalEventSchedule()) {
+            schedule.emitError(
+                "cannot read the typed refined internal Event schedule");
+            return signalPassFailure();
+          }
+          builder.setInsertionPointToEnd(module.getBody());
+          if (failed(createInternalEventPlan(
+                  builder, module.getLoc(),
+                  *(*executable)->internalEventSchedule(),
+                  unit.physicalLaunchRecipeFingerprint, canonicalSchedule,
+                  canonicalScheduleDigest))) {
+            schedule.emitError(
+                "cannot materialize the typed refined internal Event plan");
+            return signalPassFailure();
+          }
+        }
+      }
 
       builder.setInsertionPointToEnd(module.getBody());
       OperationState abiState(module.getLoc(),
@@ -11049,6 +7223,10 @@ public:
       auto abi = cast<InvocationAbiOp>(builder.create(abiState));
       abi.getBody().push_back(new Block());
       builder.setInsertionPointToEnd(&abi.getBody().front());
+      if (spec.slots.size() != spec.reuseGroups.size() ||
+          spec.slots.size() != spec.bindingIndices.size() ||
+          spec.slots.size() != spec.sourceBuffers.size())
+        return signalPassFailure();
       for (auto [ordinal, slot] : llvm::enumerate(spec.slots)) {
         ExecutableBindingKind binding = ExecutableBindingKind::None;
         std::optional<int64_t> bindingIndex;
@@ -11065,8 +7243,9 @@ public:
           return signalPassFailure();
         SmallVector<NamedAttribute> attributes{
             builder.getNamedAttr("ordinal", builder.getI64IntegerAttr(ordinal)),
-            builder.getNamedAttr("source_buffer",
-                                 builder.getI64IntegerAttr(ordinal)),
+            builder.getNamedAttr(
+                "source_buffer",
+                builder.getI64IntegerAttr(spec.sourceBuffers[ordinal])),
             builder.getNamedAttr("tensor_type", TypeAttr::get(slot.tensorType)),
             builder.getNamedAttr("required_bytes",
                                  builder.getI64IntegerAttr(slot.requiredBytes)),
@@ -11111,6 +7290,8 @@ public:
                                device.getFingerprintAttr());
       bundleState.addAttribute("invocation_abi_fingerprint",
                                abi.getFingerprintAttr());
+      bundleState.addAttribute("event_lowering_plan_fingerprint",
+                               eventPlan.getFingerprintAttr());
       bundleState.addAttribute(
           "completion",
           ExecutableCompletionAttr::get(module.getContext(),
@@ -11121,6 +7302,9 @@ public:
       bundle.setFingerprint(executableBundleFingerprint(bundle));
     }
   }
+
+private:
+  std::shared_ptr<const GpuPhysicalArtifactProvider> provider;
 };
 
 DenseIntElementsAttr rowMajorLayout(RankedTensorType type) {
@@ -11133,19 +7317,347 @@ DenseIntElementsAttr rowMajorLayout(RankedTensorType type) {
   return DenseIntElementsAttr::get(layoutType, order);
 }
 
-LogicalResult verifyGpuExecutableUnit(ModuleOp module, RegionOp region,
-                                      MaterializationPlanOp materialization,
-                                      SchedulePlanOp schedule,
-                                      DeviceModuleOp device,
-                                      InvocationAbiOp abi,
-                                      ExecutableBundleOp bundle) {
+LogicalResult verifyGpuExecutableUnit(
+    ModuleOp module, RegionOp region, MaterializationPlanOp materialization,
+    SchedulePlanOp schedule, EventLoweringPlanOp sourceEventPlan,
+    EventLoweringPlanOp eventPlan, DeviceModuleOp device, InvocationAbiOp abi,
+    ExecutableBundleOp bundle) {
   if (failed(verifyMaterializationPlanAgainstSource(module, materialization)) ||
       failed(schedule.verifyRegions()) ||
       failed(verifySchedulePlanAgainstMaterialization(materialization,
                                                       schedule)) ||
+      failed(
+          verifyEventLoweringPlanAgainstSchedule(schedule, sourceEventPlan)) ||
+      failed(verifyEventLoweringPlanAgainstSchedule(schedule, eventPlan)) ||
       failed(device.verifyRegions()) || failed(abi.verifyRegions()) ||
       failed(bundle.verify()))
     return failure();
+  SmallVector<EventTensorOp> events(
+      schedule.getBody().front().getOps<EventTensorOp>());
+  llvm::SmallDenseMap<int64_t, DeviceEntryOp> entriesBySourceTask;
+  for (DeviceEntryOp entry : device.getBody().front().getOps<DeviceEntryOp>())
+    if (!entriesBySourceTask.try_emplace(entry.getSourceTask(), entry).second)
+      return entry.emitOpError(
+          "source task must identify one stream-ordered launch");
+  const bool fatbin =
+      device.getCodeFormat() == ExecutableCodeFormat::CudaFatbinSm90V1 ||
+      device.getCodeFormat() == ExecutableCodeFormat::CudaFatbinSm100V1;
+  std::shared_ptr<const GpuExecutable> physicalExecutable;
+  PhysicalTaskCoverage physicalCoverage;
+  if (fatbin && entriesBySourceTask.empty()) {
+    DenseI8ArrayAttr transport = device.getNativeTransportAttr();
+    if (!transport)
+      return bundle.emitOpError(
+          "native artifact requires physical source-task launch provenance");
+    ArrayRef<int8_t> signedBytes = transport.asArrayRef();
+    ArrayRef<uint8_t> bytes(
+        reinterpret_cast<const uint8_t *>(signedBytes.data()),
+        signedBytes.size());
+    absl::StatusOr<std::shared_ptr<const GpuExecutable>> loaded =
+        GpuExecutable::Load(bytes);
+    if (!loaded.ok())
+      return bundle.emitOpError(
+          "native artifact requires valid physical source-task launch "
+          "provenance");
+    physicalExecutable = std::move(*loaded);
+    const int64_t sourceTaskCount =
+        llvm::range_size(schedule.getBody().front().getOps<ScheduleTaskOp>());
+    for (const GpuLaunch &launch : physicalExecutable->launches()) {
+      for (auto [sourceTaskPosition, sourceTask] :
+           llvm::enumerate(launch.sourceTaskOrdinals)) {
+        if (sourceTask < 0 || sourceTask >= sourceTaskCount)
+          return bundle.emitOpError(
+              "physical launch references an unknown source task");
+        physicalCoverage[sourceTask].push_back(
+            {launch.taskOrdinal, static_cast<int64_t>(sourceTaskPosition)});
+      }
+    }
+    for (int64_t sourceTask = 0; sourceTask < sourceTaskCount; ++sourceTask)
+      if (!physicalCoverage.count(sourceTask))
+        return bundle.emitOpError(
+            "physical launch projection does not cover every source task");
+  }
+  if (!entriesBySourceTask.empty())
+    for (auto [sourceTask, entry] : entriesBySourceTask)
+      physicalCoverage[sourceTask].push_back(
+          {static_cast<int64_t>(entry.getOrdinal()), 0});
+  if (fatbin) {
+    ArrayAttr snapshotDigests = device.getDeviceIrSnapshotDigestsAttr();
+    ArrayRef<GpuDeviceIrSnapshot> snapshots =
+        physicalExecutable->deviceIrSnapshots();
+    if ((snapshotDigests ? snapshotDigests.size() : 0) != snapshots.size())
+      return device.emitOpError(
+          "device IR snapshot digests do not equal native transport");
+    if (snapshotDigests)
+      for (auto [attribute, snapshot] : llvm::zip(snapshotDigests, snapshots)) {
+        auto digest = dyn_cast<StringAttr>(attribute);
+        if (!digest || digest.getValue() != snapshot.mlirBytecodeDigest)
+          return device.emitOpError(
+              "device IR snapshot digest does not equal native transport");
+      }
+  }
+  SmallVector<InternalEventPlanOp> internalEventPlans(
+      module.getOps<InternalEventPlanOp>());
+  if (fatbin) {
+    StringRef canonicalSchedule = physicalExecutable->physicalEventProvenance();
+    if (canonicalSchedule.empty()) {
+      if (!internalEventPlans.empty())
+        return internalEventPlans.front().emitOpError(
+            "has no matching native physical Event provenance");
+    } else {
+      if (internalEventPlans.size() != 1)
+        return bundle.emitOpError(
+            "requires one distinct typed refined internal Event plan");
+      InternalEventPlanOp provenance = internalEventPlans.front();
+      StringRef canonicalDigest =
+          physicalExecutable->physicalEventProvenanceDigest();
+      if (!physicalExecutable->internalEventSchedule())
+        return provenance.emitOpError(
+            "cannot read the native typed refined internal Event schedule");
+      StringRef scheduleFingerprint =
+          physicalExecutable->internalEventSchedule()
+              ->physicalScheduleFingerprint;
+      const std::string expectedFingerprint =
+          physicalEventProvenanceFingerprint(
+              scheduleFingerprint, *device.getPhysicalLaunchRecipeFingerprint(),
+              canonicalDigest);
+      if (failed(provenance.verify()) ||
+          provenance.getPhysicalScheduleFingerprint() != scheduleFingerprint ||
+          provenance.getPhysicalLaunchRecipeFingerprint() !=
+              device.getPhysicalLaunchRecipeFingerprint() ||
+          provenance.getCanonicalSchedule() != canonicalSchedule ||
+          provenance.getCanonicalScheduleDigest() != canonicalDigest ||
+          provenance.getFingerprint() != expectedFingerprint)
+        return provenance.emitOpError(
+            "does not equal the native refined internal Event provenance");
+      if (failed(verifyInternalEventPlanAgainstNative(
+              provenance, *physicalExecutable->internalEventSchedule(),
+              *device.getPhysicalLaunchRecipeFingerprint(), canonicalSchedule,
+              canonicalDigest)))
+        return failure();
+    }
+  } else if (!internalEventPlans.empty()) {
+    return internalEventPlans.front().emitOpError(
+        "requires a physically compiled native artifact");
+  }
+  if (fatbin) {
+    ArrayAttr records = device.getTrustedInternalEventCertificatesAttr();
+    if (records) {
+      if (!physicalExecutable->internalEventSchedule())
+        return device.emitOpError(
+            "trusted internal Event certificate requires a typed native "
+            "internal Event schedule");
+      llvm::SmallDenseSet<std::pair<int64_t, int64_t>> covered;
+      auto codeIdentity = gpuFatbinCodeIdentity(
+          physicalExecutable->codeImages(), physicalExecutable->launches());
+      if (!codeIdentity.ok())
+        return failure();
+      const std::string deviceImageDigest =
+          gpuExecutableBundleDigest(*codeIdentity);
+      for (Attribute attribute : records) {
+        auto record = dyn_cast<DictionaryAttr>(attribute);
+        if (!record || record.size() != 5)
+          return device.emitOpError(
+              "trusted internal Event certificate has invalid fields");
+        auto regionAttr = record.getAs<IntegerAttr>("region");
+        auto allocationAttr = record.getAs<IntegerAttr>("allocation");
+        auto allocationIdAttr = record.getAs<StringAttr>("allocation_id");
+        auto compilerDigestAttr =
+            record.getAs<StringAttr>("compiler_ir_digest");
+        auto deviceDigestAttr = record.getAs<StringAttr>("device_image_digest");
+        if (!regionAttr || !allocationAttr || !allocationIdAttr ||
+            !compilerDigestAttr || !deviceDigestAttr)
+          return device.emitOpError(
+              "trusted internal Event certificate has invalid field types");
+        const int64_t regionOrdinal = regionAttr.getInt();
+        const int64_t allocationOrdinal = allocationAttr.getInt();
+        const GpuInternalEventSchedule &schedule =
+            *physicalExecutable->internalEventSchedule();
+        if (regionOrdinal < 0 ||
+            regionOrdinal >= static_cast<int64_t>(schedule.regions.size()))
+          return device.emitOpError(
+              "trusted internal Event certificate references an unknown "
+              "region");
+        const GpuInternalEventRegion &region = schedule.regions[regionOrdinal];
+        if (allocationOrdinal < 0 ||
+            allocationOrdinal >=
+                static_cast<int64_t>(region.allocations.size()) ||
+            !covered.insert({regionOrdinal, allocationOrdinal}).second)
+          return device.emitOpError(
+              "trusted internal Event certificate references an unknown or "
+              "duplicate allocation");
+        const GpuInternalEventAllocation &allocation =
+            region.allocations[allocationOrdinal];
+        SmallVector<GpuInternalEventOperation> operations =
+            internalEventOperations(allocation);
+        if (allocationIdAttr.getValue() != allocation.allocationId ||
+            operations.empty() ||
+            compilerDigestAttr.getValue() !=
+                internalEventCertificateDigest(
+                    regionOrdinal, allocation.allocationId, operations) ||
+            deviceDigestAttr.getValue() != deviceImageDigest)
+          return device.emitOpError(
+              "trusted internal Event certificate does not equal the native "
+              "allocation recipe and device image");
+      }
+    }
+  } else if (device.getTrustedInternalEventCertificatesAttr()) {
+    return device.emitOpError(
+        "trusted internal Event certificates require a fatbin artifact");
+  }
+  SmallVector<uint8_t> trustedSourceCertificates;
+  if (fatbin) {
+    trustedSourceCertificates.assign(
+        physicalExecutable->eventRealizations().size(), 0);
+    if (ArrayAttr records = device->getAttrOfType<ArrayAttr>(
+            "trusted_source_event_certificates")) {
+      for (Attribute attribute : records) {
+        auto record = cast<DictionaryAttr>(attribute);
+        int64_t event = record.getAs<IntegerAttr>("event").getInt();
+        StringRef digest =
+            record.getAs<StringAttr>("compiler_ir_digest").getValue();
+        if (event < 0 ||
+            event >= static_cast<int64_t>(
+                         physicalExecutable->eventRealizations().size()))
+          return device.emitOpError(
+              "trusted source Event certificate references an unknown event");
+        const auto &certificate =
+            physicalExecutable->eventRealizations()[event].operationCertificate;
+        if (!certificate || certificate->compilerIrDigest != digest)
+          return device.emitOpError("trusted source Event certificate does not "
+                                    "equal native transport");
+        trustedSourceCertificates[event] = 1;
+      }
+    }
+  }
+  FailureOr<SmallVector<EventRealizationSpec>> expectedRealizations =
+      fatbin ? physicalEventRealizationSpecs(schedule, *physicalExecutable,
+                                             trustedSourceCertificates)
+             : deriveEventRealizationSpecs(schedule, physicalCoverage);
+  SmallVector<EventRealizationOp> actualRealizations(
+      eventPlan.getBody().front().getOps<EventRealizationOp>());
+  if (failed(expectedRealizations) ||
+      actualRealizations.size() != expectedRealizations->size())
+    return eventPlan.emitOpError(
+        "must realize every exact Event Tensor against physical launch order");
+  for (auto [ordinal, actual, expected] :
+       llvm::enumerate(actualRealizations, *expectedRealizations))
+    if (actual.getEvent() != static_cast<int64_t>(ordinal) ||
+        actual.getKind() != expected.kind ||
+        actual.getCoveringLaunchOrder() !=
+            ArrayRef<int64_t>(expected.coveringLaunchOrder))
+      return actual.emitOpError(
+          "does not equal the source-bound physical Event realization");
+  std::optional<StringRef> expectedPhysicalFingerprint =
+      fatbin ? device.getPhysicalLaunchRecipeFingerprint()
+             : std::optional<StringRef>(device.getFingerprint());
+  if (eventPlan.getSourceScheduleFingerprint() != schedule.getFingerprint() ||
+      eventPlan.getPhysicalLaunchRecipeFingerprint() !=
+          *expectedPhysicalFingerprint ||
+      bundle.getEventLoweringPlanFingerprint() != eventPlan.getFingerprint())
+    return eventPlan.emitOpError(
+        "must bind the source schedule, physical launch recipe, and executable "
+        "bundle");
+  if (fatbin) {
+    FailureOr<GpuTarget> target = targetForCodeFormat(device.getCodeFormat());
+    if (failed(target) ||
+        device.getSchemaVersion() != fatbinDeviceSchemaForTarget(*target) ||
+        device.getPolicy() != schedule.getPolicy() ||
+        device.getSourceScheduleFingerprint() != schedule.getFingerprint() ||
+        abi.getSchemaVersion() != 3 ||
+        abi.getSourcePlanFingerprint() != materialization.getFingerprint() ||
+        abi.getSourceScheduleFingerprint() != schedule.getFingerprint() ||
+        bundle.getSchemaVersion() != 2 ||
+        bundle.getSourceScheduleFingerprint() != schedule.getFingerprint() ||
+        bundle.getDeviceModuleFingerprint() != device.getFingerprint() ||
+        bundle.getInvocationAbiFingerprint() != abi.getFingerprint() ||
+        bundle.getCompletion() != ExecutableCompletion::StreamOrdered ||
+        !device.getPhysicalRequestFingerprintAttr() ||
+        device.getPhysicalRequestFingerprint() !=
+            gpuPhysicalArtifactRequestFingerprint(
+                region, materialization, schedule, sourceEventPlan, *target))
+      return failure();
+    FailureOr<SmallVector<ExecutableSlotSpec>> expectedSlots =
+        deriveExecutableSlots(materialization);
+    if (failed(expectedSlots))
+      return failure();
+    auto manifest =
+        module->getAttrOfType<DictionaryAttr>(kCoverageManifestAttribute);
+    auto tuning = manifest ? manifest.getAs<StringAttr>("canonical_tuning")
+                           : StringAttr{};
+    FailureOr<DerivedPlan> derived = deriveGpuPlan(
+        region, tuning && tuning.getValue() == kFusionCanonicalTuning);
+    if (failed(derived))
+      return failure();
+    FailureOr<SmallVector<std::optional<int64_t>>> expectedBindings =
+        deriveGpuBindingIndices(region, *derived, *expectedSlots);
+    SmallVector<InvocationSlotOp> actualSlots(
+        abi.getBody().front().getOps<InvocationSlotOp>());
+    if (failed(expectedBindings))
+      return failure();
+    SmallVector<bool> projectedSourceBuffers(expectedSlots->size(), false);
+    for (InvocationSlotOp actual : actualSlots) {
+      const int64_t sourceOrdinal = actual.getSourceBuffer();
+      if (sourceOrdinal == -1) {
+        if (actual.getStorage() != MaterializationStorage::Temporary ||
+            actual.getAccess() != ExecutableAccess::ReadWrite ||
+            actual.getAddressSpace() != ExecutableAddressSpace::Device ||
+            actual.getBinding() != ExecutableBindingKind::None ||
+            actual.getBindingIndex())
+          return failure();
+        continue;
+      }
+      if (sourceOrdinal < 0 ||
+          sourceOrdinal >= static_cast<int64_t>(expectedSlots->size()) ||
+          projectedSourceBuffers[sourceOrdinal])
+        return failure();
+      const ExecutableSlotSpec &expected = (*expectedSlots)[sourceOrdinal];
+      if (expected.storage != MaterializationStorage::External)
+        return failure();
+      ExecutableBindingKind binding = ExecutableBindingKind::None;
+      std::optional<int64_t> bindingIndex;
+      if (expected.storage == MaterializationStorage::External &&
+          expected.access == ExecutableAccess::Read) {
+        binding = ExecutableBindingKind::Operand;
+        bindingIndex = (*expectedBindings)[sourceOrdinal];
+      } else if (expected.storage == MaterializationStorage::External &&
+                 expected.access == ExecutableAccess::Write) {
+        binding = ExecutableBindingKind::Result;
+        bindingIndex = (*expectedBindings)[sourceOrdinal];
+      }
+      if (actual.getTensorType() != expected.tensorType ||
+          actual.getRequiredBytes() != expected.requiredBytes ||
+          actual.getStrides() != ArrayRef<int64_t>(expected.strides) ||
+          actual.getOffset() != 0 ||
+          actual.getAlignment() < expected.alignment ||
+          actual.getAddressSpace() != ExecutableAddressSpace::Device ||
+          actual.getAccess() != expected.access ||
+          actual.getStorage() != expected.storage ||
+          actual.getAliasGroup() != actual.getOrdinal() ||
+          actual.getReuseGroup() != actual.getOrdinal() ||
+          actual.getBinding() != binding ||
+          actual.getBindingIndex() != bindingIndex)
+        return failure();
+      projectedSourceBuffers[sourceOrdinal] = true;
+    }
+    for (auto [sourceOrdinal, expected] : llvm::enumerate(*expectedSlots)) {
+      if (expected.storage == MaterializationStorage::External &&
+          !projectedSourceBuffers[sourceOrdinal])
+        return failure();
+      if (expected.storage != MaterializationStorage::External &&
+          expected.storage != MaterializationStorage::Temporary)
+        return failure();
+    }
+    OpBuilder builder(module.getContext());
+    OwningOpRef<ModuleOp> stripped = ModuleOp::create(module.getLoc());
+    builder.setInsertionPointToEnd(stripped->getBody());
+    builder.insert(eventPlan->clone());
+    builder.insert(device->clone());
+    builder.insert(abi->clone());
+    builder.insert(bundle->clone());
+    return succeeded(serializeGpuExecutableBundle(*stripped)) ? success()
+                                                              : failure();
+  }
   FailureOr<GpuExecutableSpec> expected =
       [&]() -> FailureOr<GpuExecutableSpec> {
     FailureOr<GpuTarget> target = targetForCodeFormat(device.getCodeFormat());
@@ -11204,7 +7716,9 @@ LogicalResult verifyGpuExecutableUnit(ModuleOp module, RegionOp region,
       binding = ExecutableBindingKind::Result;
       bindingIndex = expected->bindingIndices[ordinal];
     }
-    if (actual.getTensorType() != spec.tensorType ||
+    if (actual.getOrdinal() != static_cast<int64_t>(ordinal) ||
+        actual.getSourceBuffer() != expected->sourceBuffers[ordinal] ||
+        actual.getTensorType() != spec.tensorType ||
         actual.getRequiredBytes() != spec.requiredBytes ||
         actual.getStrides() != ArrayRef<int64_t>(spec.strides) ||
         actual.getOffset() != 0 || actual.getAlignment() != spec.alignment ||
@@ -11224,11 +7738,14 @@ LogicalResult verifyGpuExecutableAgainstSource(ModuleOp module) {
   SmallVector<MaterializationPlanOp> materializations(
       module.getOps<MaterializationPlanOp>());
   SmallVector<SchedulePlanOp> schedules(module.getOps<SchedulePlanOp>());
+  SmallVector<EventLoweringPlanOp> eventPlans(
+      module.getOps<EventLoweringPlanOp>());
   SmallVector<DeviceModuleOp> devices(module.getOps<DeviceModuleOp>());
   SmallVector<InvocationAbiOp> abis(module.getOps<InvocationAbiOp>());
   SmallVector<ExecutableBundleOp> bundles(module.getOps<ExecutableBundleOp>());
   if (materializations.empty() || materializations.size() != schedules.size() ||
       materializations.size() != devices.size() ||
+      materializations.size() * 2 != eventPlans.size() ||
       materializations.size() != abis.size() ||
       materializations.size() != bundles.size())
     return failure();
@@ -11236,6 +7753,7 @@ LogicalResult verifyGpuExecutableAgainstSource(ModuleOp module) {
   llvm::SmallDenseSet<Operation *> regions;
   llvm::SmallDenseSet<Operation *> matchedSchedules;
   llvm::SmallDenseSet<Operation *> matchedDevices;
+  llvm::SmallDenseSet<Operation *> matchedEventPlans;
   llvm::SmallDenseSet<Operation *> matchedAbis;
   llvm::SmallDenseSet<Operation *> matchedBundles;
   SmallVector<GpuBuildUnit, 0> units;
@@ -11273,6 +7791,26 @@ LogicalResult verifyGpuExecutableAgainstSource(ModuleOp module) {
         !matchedAbis.insert(abi.getOperation()).second)
       return failure();
 
+    EventLoweringPlanOp sourceEventPlan;
+    EventLoweringPlanOp eventPlan;
+    for (EventLoweringPlanOp candidate : eventPlans) {
+      if (candidate.getSourceScheduleFingerprint() != schedule.getFingerprint())
+        continue;
+      if (candidate.getPhysicalLaunchRecipeFingerprint()) {
+        if (eventPlan)
+          return failure();
+        eventPlan = candidate;
+      } else {
+        if (sourceEventPlan)
+          return failure();
+        sourceEventPlan = candidate;
+      }
+    }
+    if (!sourceEventPlan || !eventPlan ||
+        !matchedEventPlans.insert(sourceEventPlan.getOperation()).second ||
+        !matchedEventPlans.insert(eventPlan.getOperation()).second)
+      return failure();
+
     ExecutableBundleOp bundle;
     for (ExecutableBundleOp candidate : bundles) {
       if (candidate.getSourceScheduleFingerprint() !=
@@ -11286,16 +7824,52 @@ LogicalResult verifyGpuExecutableAgainstSource(ModuleOp module) {
     }
     if (!bundle || !matchedBundles.insert(bundle.getOperation()).second ||
         failed(verifyGpuExecutableUnit(module, region, materialization,
-                                       schedule, device, abi, bundle)))
+                                       schedule, sourceEventPlan, eventPlan,
+                                       device, abi, bundle)))
       return failure();
-    FailureOr<GpuTarget> target = targetForCodeFormat(device.getCodeFormat());
-    if (failed(target))
-      return failure();
-    FailureOr<GpuExecutableSpec> spec =
-        deriveGpuExecutable(region, materialization, schedule, *target);
-    if (failed(spec))
-      return failure();
-    units.push_back({region, materialization, schedule, std::move(*spec)});
+    if (device.getCodeFormat() == ExecutableCodeFormat::CudaFatbinSm90V1 ||
+        device.getCodeFormat() == ExecutableCodeFormat::CudaFatbinSm100V1) {
+      DenseI8ArrayAttr transport = device.getNativeTransportAttr();
+      if (!transport)
+        return failure();
+      ArrayRef<int8_t> bytes = transport.asArrayRef();
+      auto fatbin = deserializeGpuFatbinExecutableBundle(
+          ArrayRef<uint8_t>(reinterpret_cast<const uint8_t *>(bytes.data()),
+                            bytes.size()),
+          module.getContext());
+      auto target = targetForCodeFormat(device.getCodeFormat());
+      if (!fatbin.ok() || failed(target))
+        return failure();
+      auto spec = deriveFatbinBoundary(region, materialization, schedule,
+                                       *fatbin, *target);
+      if (failed(spec))
+        return failure();
+      units.push_back(
+          {region, materialization, schedule, sourceEventPlan, std::move(*spec),
+           SmallVector<uint8_t>(
+               reinterpret_cast<const uint8_t *>(bytes.data()),
+               reinterpret_cast<const uint8_t *>(bytes.data()) + bytes.size()),
+           device.getPhysicalRequestFingerprint()->str(),
+           device.getPhysicalCompileRequestFingerprint()->str(),
+           device.getPhysicalLaunchRecipeFingerprint()->str()});
+    } else {
+      FailureOr<GpuTarget> target = targetForCodeFormat(device.getCodeFormat());
+      if (failed(target))
+        return failure();
+      FailureOr<GpuExecutableSpec> spec =
+          deriveGpuExecutable(region, materialization, schedule, *target);
+      if (failed(spec))
+        return failure();
+      units.push_back({region,
+                       materialization,
+                       schedule,
+                       sourceEventPlan,
+                       std::move(*spec),
+                       {},
+                       {},
+                       {},
+                       {}});
+    }
   }
   size_t regionCount = 0;
   module.walk([&](RegionOp) { ++regionCount; });
@@ -11319,6 +7893,7 @@ public:
 
 struct PreparedGpuCall {
   RegionOp region;
+  int64_t transportSchemaVersion;
   int64_t deviceSchemaVersion;
   SmallVector<uint8_t> bundleBytes;
   std::string digest;
@@ -11376,9 +7951,24 @@ FailureOr<PreparedGpuCall> prepareGpuCall(ModuleOp module, RegionOp region,
         slot.getTensorType() != region.getResults()[regionIndex].getType())
       return failure();
   }
+  EventLoweringPlanOp eventPlan;
+  if (bundle.getEventLoweringPlanFingerprint()) {
+    for (EventLoweringPlanOp candidate : module.getOps<EventLoweringPlanOp>()) {
+      if (candidate.getFingerprint() !=
+          *bundle.getEventLoweringPlanFingerprint())
+        continue;
+      if (eventPlan)
+        return failure();
+      eventPlan = candidate;
+    }
+    if (!eventPlan)
+      return failure();
+  }
   OpBuilder builder(module.getContext());
   OwningOpRef<ModuleOp> stripped = ModuleOp::create(module.getLoc());
   builder.setInsertionPointToEnd(stripped->getBody());
+  if (eventPlan)
+    builder.insert(eventPlan->clone());
   builder.insert(device->clone());
   builder.insert(abi->clone());
   builder.insert(bundle->clone());
@@ -11387,6 +7977,7 @@ FailureOr<PreparedGpuCall> prepareGpuCall(ModuleOp module, RegionOp region,
   if (failed(bundleBytes))
     return failure();
   PreparedGpuCall prepared{region,
+                           device.getSchemaVersion() >= 5 ? 3 : 2,
                            static_cast<int64_t>(device.getSchemaVersion()),
                            std::move(*bundleBytes),
                            {},
@@ -11411,6 +8002,65 @@ FailureOr<PreparedGpuCall> prepareGpuCall(ModuleOp module, RegionOp region,
   return prepared;
 }
 
+LogicalResult verifyInternalEventPlansCanErase(ModuleOp module) {
+  for (InternalEventPlanOp plan : module.getOps<InternalEventPlanOp>()) {
+    DeviceModuleOp device;
+    for (DeviceModuleOp candidate : module.getOps<DeviceModuleOp>()) {
+      if (!candidate.getPhysicalLaunchRecipeFingerprint() ||
+          *candidate.getPhysicalLaunchRecipeFingerprint() !=
+              plan.getPhysicalLaunchRecipeFingerprint())
+        continue;
+      if (device)
+        return plan.emitOpError(
+            "cannot erase a refined internal Event plan bound to multiple "
+            "physical artifacts");
+      device = candidate;
+    }
+    if (!device || !device.getNativeTransportAttr())
+      return plan.emitOpError(
+          "cannot erase a refined internal Event plan without its bound "
+          "native physical artifact");
+
+    llvm::SmallDenseSet<std::pair<int64_t, int64_t>> certifiedAllocations;
+    if (ArrayAttr certificates =
+            device.getTrustedInternalEventCertificatesAttr())
+      for (Attribute attribute : certificates) {
+        auto certificate = cast<DictionaryAttr>(attribute);
+        certifiedAllocations.insert(
+            {certificate.getAs<IntegerAttr>("region").getInt(),
+             certificate.getAs<IntegerAttr>("allocation").getInt()});
+      }
+    for (InternalEventAllocationOp allocation :
+         plan.getBody().front().getOps<InternalEventAllocationOp>())
+      if (!certifiedAllocations.contains(
+              {allocation.getRegion(), allocation.getOrdinal()}))
+        return allocation.emitOpError(
+            "cannot erase a physical internal Event allocation without a "
+            "trusted compiler/device legalization certificate");
+
+    for (InternalEventRealizationOp realization :
+         plan.getBody().front().getOps<InternalEventRealizationOp>()) {
+      StringRef kind = realization.getKind();
+      if (kind == "physical") {
+        if (realization.getAllocations().empty())
+          return realization.emitOpError(
+              "cannot erase a physical internal Event realization without a "
+              "certified allocation");
+        continue;
+      }
+      if (kind != "erased_program_order" && kind != "erased_stream_order" &&
+          kind != "erased_algebraic_refinement")
+        return realization.emitOpError(
+            "cannot erase an unknown internal Event realization");
+      if (!realization.getAllocations().empty())
+        return realization.emitOpError(
+            "an erased internal Event realization cannot retain a physical "
+            "allocation");
+    }
+  }
+  return success();
+}
+
 class ReplaceWithGpuExecutableBundlePass
     : public impl::ShuttleReplaceWithGpuExecutableBundlePassBase<
           ReplaceWithGpuExecutableBundlePass> {
@@ -11421,6 +8071,8 @@ public:
       module.emitError("requires source-bound closed GPU executables");
       return signalPassFailure();
     }
+    if (failed(verifyInternalEventPlansCanErase(module)))
+      return signalPassFailure();
     SmallVector<MaterializationPlanOp> materializations(
         module.getOps<MaterializationPlanOp>());
     SmallVector<SchedulePlanOp> schedules(module.getOps<SchedulePlanOp>());
@@ -11482,8 +8134,9 @@ public:
                                builder.getStringAttr(prepared.digest)),
           builder.getNamedAttr("bundle_size", builder.getI64IntegerAttr(
                                                   prepared.bundleBytes.size())),
-          builder.getNamedAttr("transport_schema_version",
-                               builder.getI64IntegerAttr(2)),
+          builder.getNamedAttr(
+              "transport_schema_version",
+              builder.getI64IntegerAttr(prepared.transportSchemaVersion)),
           builder.getNamedAttr(
               "device_schema_version",
               builder.getI64IntegerAttr(prepared.deviceSchemaVersion)),
@@ -11520,8 +8173,9 @@ public:
     }
     for (Operation &operation :
          llvm::make_early_inc_range(module.getBody()->without_terminator())) {
-      if (isa<MaterializationPlanOp, SchedulePlanOp, DeviceModuleOp,
-              InvocationAbiOp, ExecutableBundleOp>(operation))
+      if (isa<MaterializationPlanOp, SchedulePlanOp, EventLoweringPlanOp,
+              InternalEventPlanOp, DeviceModuleOp, InvocationAbiOp,
+              ExecutableBundleOp>(operation))
         operation.erase();
     }
   }
@@ -11551,8 +8205,7 @@ void emitObserverSnapshot(
     for (DeviceModuleOp device : module.getOps<DeviceModuleOp>())
       bundleLaunchCount += static_cast<uint64_t>(
           llvm::range_size(device.getBody().front().getOps<DeviceEntryOp>()));
-    for (MaterializationPlanOp plan :
-         module.getOps<MaterializationPlanOp>()) {
+    for (MaterializationPlanOp plan : module.getOps<MaterializationPlanOp>()) {
       for (MaterializationBufferOp buffer :
            plan.getBody().front().getOps<MaterializationBufferOp>()) {
         if (buffer.getStorage() == MaterializationStorage::Temporary)
@@ -11560,16 +8213,16 @@ void emitObserverSnapshot(
       }
     }
   }
-  invocation->emit(
-      phase, std::move(regionMembership), std::move(coverageManifest),
-      std::move(unsupportedFingerprint),
-      phase == ShuttlePipelinePhase::GeneratedBundle
-          ? generatedGpuBundleFingerprintImpl(module)
-      : phase == ShuttlePipelinePhase::FinalErasure
-          ? normalizedModuleFingerprintImpl(module)
-          : std::string{},
-      phase == ShuttlePipelinePhase::FinalErasure, failurePass.str(),
-      bundleLaunchCount, bundleTemporaryCount);
+  invocation->emit(phase, std::move(regionMembership),
+                   std::move(coverageManifest),
+                   std::move(unsupportedFingerprint),
+                   phase == ShuttlePipelinePhase::GeneratedBundle
+                       ? generatedGpuBundleFingerprintImpl(module)
+                   : phase == ShuttlePipelinePhase::FinalErasure
+                       ? normalizedModuleFingerprintImpl(module)
+                       : std::string{},
+                   phase == ShuttlePipelinePhase::FinalErasure,
+                   failurePass.str(), bundleLaunchCount, bundleTemporaryCount);
 }
 
 class EmitObserverPass
@@ -11653,7 +8306,9 @@ void buildShuttleGpuExecutablePipeline(
   manager.addPass(createVerifyMaterializationPlanPass());
   manager.addPass(createPlanSimt32RowFoldSchedulePass());
   manager.addPass(createVerifySimt32RowFoldSchedulePass());
-  manager.addPass(createBuildGpuExecutableBundlePass(options.gpuTarget));
+  manager.addPass(createPlanSourceEventLoweringPass());
+  manager.addPass(createBuildGpuExecutableBundlePass(
+      options.gpuTarget, gpuPhysicalArtifactProvider()));
   manager.addPass(createVerifyGpuExecutableBundlePass());
   manager.addPass(createVerifySourceCoveragePass());
   manager.addPass(std::make_unique<EmitObserverPass>(
@@ -11797,12 +8452,23 @@ std::unique_ptr<Pass> createVerifySimt32RowFoldSchedulePass() {
   return std::make_unique<VerifySimt32RowFoldSchedulePass>();
 }
 
+std::unique_ptr<Pass> createPlanSourceEventLoweringPass() {
+  return std::make_unique<PlanSourceEventLoweringPass>();
+}
+
 std::unique_ptr<Pass> createBuildGpuExecutableBundlePass() {
   return std::make_unique<BuildGpuExecutableBundlePass>();
 }
 
 std::unique_ptr<Pass> createBuildGpuExecutableBundlePass(GpuTarget target) {
   return std::make_unique<BuildGpuExecutableBundlePass>(target);
+}
+
+std::unique_ptr<Pass> createBuildGpuExecutableBundlePass(
+    GpuTarget target,
+    std::shared_ptr<const GpuPhysicalArtifactProvider> provider) {
+  return std::make_unique<BuildGpuExecutableBundlePass>(target,
+                                                        std::move(provider));
 }
 
 std::unique_ptr<Pass> createVerifyGpuExecutableBundlePass() {

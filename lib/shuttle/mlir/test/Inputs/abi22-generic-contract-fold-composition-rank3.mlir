@@ -36,6 +36,8 @@ module @different_anonymous_graph attributes {
         %sum = arith.addf %element, %accumulator : f32
         "shuttle.yield"(%sum) : (f32) -> ()
       }) {
+
+        indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d1, d2)>, affine_map<(d0, d1, d2) -> (d0, d1)>],
         accumulator_types = [f32],
         operandSegmentSizes = array<i32: 1, 1>, order_free = true,
         reduction_dimensions = array<i64: 2>,

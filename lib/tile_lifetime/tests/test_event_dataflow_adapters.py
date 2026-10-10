@@ -1,6 +1,8 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -24,6 +26,7 @@ from tile_lifetime.event_dataflow_adapters import (
     streaming_fold_task_dataflow,
 )
 from tile_lifetime.event_dataflow_examples import relation_segment_dependence
+from tile_lifetime.h100_streaming_lowering import Sm90ContractSchedule, Sm90ForwardPipelineSchedule
 from tile_lifetime.relation import build_relation_plan
 from tile_lifetime.streaming_attention import (
     StreamingTileSchedule,
@@ -63,19 +66,20 @@ def test_streaming_program_mechanically_derives_contract_fold_task_graph() -> No
     adapted = streaming_fold_task_dataflow(streaming)
 
     verify_event_dataflow_program(adapted.program)
-    assert adapted.qk_contract.name == streaming.qk.name
-    assert adapted.pv_contract.name == streaming.pv.name
-    assert adapted.finalize.name == streaming.finalize.name
+    assert adapted.qk_contract.name == streaming.region.producer.name
+    assert adapted.pv_contract.name == streaming.region.consumer.name
+    assert adapted.finalize.name == streaming.region.finalizer.name
     assert adapted.row_tile_count == 24
     assert adapted.fold_partition_count == 3
     assert adapted.pipeline_depth == streaming.schedule.pipeline_depth
     assert tuple(plan.initial_count.counts[0].value for plan in adapted.program.event_plans) == (1, 1, 1, 1, 3, 0)
     assert all("attention" not in family.name for family in adapted.program.task_families)
-    assert adapted.key_value_buffer.capacity == adapted.row_tile_count * adapted.pipeline_depth
+    assert adapted.key_value_buffer.capacity == adapted.pipeline_depth
+    assert set(adapted.key_value_buffer.allocation_owners) == {(row,) for row in range(adapted.row_tile_count)}
     assert len(adapted.key_value_buffer.reuse_dependences) == 1
 
     last_consumers = dict(adapted.key_value_buffer.last_consumers)
-    assert set(item.family for item in last_consumers.values()) == {streaming.pv.name}
+    assert set(item.family for item in last_consumers.values()) == {streaming.region.consumer.name}
     reuse = adapted.key_value_buffer.reuse_dependences[0].relation
     assert ((0, 0), (0, 2)) in {(pair.source, pair.target) for pair in reuse.pairs}
     assert ((0, 1), (0, 3)) not in {(pair.source, pair.target) for pair in reuse.pairs}
@@ -100,17 +104,24 @@ def test_fold_domain_mutation_changes_events_without_a_workload_dispatch() -> No
 
 def test_attention_program_erases_to_generic_streaming_event_descriptor() -> None:
     semantic_program = _streaming_program(key_length=9, query_tile_size=64)
-    descriptor = streaming_contract_fold_event_descriptor(semantic_program)
+    physical_program = replace(
+        semantic_program,
+        schedule=Sm90ForwardPipelineSchedule(
+            contract=Sm90ContractSchedule(tile_m=64, tile_n=128, threads=256),
+            stages=2,
+        ),
+    )
+    descriptor = streaming_contract_fold_event_descriptor(physical_program)
     schedule = derive_streaming_physical_event_schedule(descriptor)
 
     assert descriptor.fold_extent == 9
     assert descriptor.resident_tile_size == 64
-    assert descriptor.streamed_tile_size == 4
+    assert descriptor.streamed_tile_size == 128
     assert descriptor.resident_reduction_dimension == 8
     assert descriptor.streamed_reduction_dimension == 8
     assert descriptor.output_dimension == 8
     assert descriptor.element_bytes == 2
-    assert schedule.dataflow.partition_count == 3
+    assert schedule.dataflow.partition_count == 1
     assert all("attention" not in family.name for family in schedule.dataflow.program.task_families)
 
 
@@ -206,7 +217,7 @@ def test_event_realization_audit_distinguishes_erased_and_physical_edges() -> No
         verify_event_realizations(adapted.program, tuple(bad))
 
 
-def test_bounded_buffer_rejects_reusing_a_slot_in_the_same_generation() -> None:
+def test_bounded_buffer_rejects_reusing_an_owner_slot_in_the_same_generation() -> None:
     adapted = streaming_fold_task_dataflow(_streaming_program())
     stage_to_consumers = tuple(
         dependence.relation
@@ -214,17 +225,21 @@ def test_bounded_buffer_rejects_reusing_a_slot_in_the_same_generation() -> None:
         if dependence.relation.source == adapted.key_value_stage
     )
     coordinates = adapted.key_value_stage.coordinates
-    with pytest.raises(EventDataflowError, match="generations must be contiguous"):
+    with pytest.raises(EventDataflowError, match="owner/slot/generation tuple"):
         derive_bounded_buffer_plan(
             name="invalid_reuse",
             program=adapted.program,
             producer=adapted.key_value_stage,
             uses=stage_to_consumers,
             capacity=adapted.key_value_buffer.capacity,
-            slot_for={
-                coordinate: coordinate[0] * adapted.pipeline_depth + coordinate[1] % adapted.pipeline_depth
-                for coordinate in coordinates
-            },
+            allocation_owner_for=dict(
+                zip(
+                    adapted.key_value_stage.coordinates,
+                    adapted.key_value_buffer.allocation_owners,
+                    strict=True,
+                )
+            ),
+            slot_for={coordinate: coordinate[1] % adapted.pipeline_depth for coordinate in coordinates},
             generation_for={coordinate: 0 for coordinate in coordinates},
             visibility=adapted.program.dependences[0].visibility,
         )

@@ -4,6 +4,7 @@
 #include "shuttle/Runtime/GpuFfi.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -12,33 +13,86 @@
 #include <new>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "absl/types/span.h"
 #include "shuttle/Runtime/GpuExecutable.h"
+#include "tsl/profiler/lib/traceme.h"
 #include "xla/backends/gpu/ffi.h"
 #include "xla/ffi/ffi.h"
-#include "xla/service/gpu/launch_dimensions.h"
-#include "xla/service/gpu/stream_executor_util.h"
 #include "xla/stream_executor/device_address_allocator.h"
+#include "xla/stream_executor/gpu/tma_metadata.h"
 #include "xla/stream_executor/kernel.h"
+#include "xla/stream_executor/kernel_args.h"
 #include "xla/stream_executor/kernel_spec.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
-#include "tsl/profiler/lib/traceme.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
 
 namespace mlir::shuttle {
 namespace {
 
 namespace ffi = xla::ffi;
 namespace se = stream_executor;
+
+class DynamicKernelArguments final : public se::KernelArgsPackedArrayBase {
+public:
+  explicit DynamicKernelArguments(size_t capacity) {
+    values.reserve(capacity);
+    addresses.reserve(capacity);
+  }
+
+  void add(ArrayRef<uint8_t> bytes, size_t alignment) {
+    values.push_back(std::make_unique<Value>(bytes, alignment));
+    addresses.push_back(values.back()->data);
+  }
+
+  template <typename T> void add(const T &value) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    add(ArrayRef<uint8_t>(reinterpret_cast<const uint8_t *>(&value), sizeof(T)),
+        alignof(T));
+  }
+
+  void setSharedMemoryBytes(uint64_t value) { sharedMemoryBytes = value; }
+
+  size_t number_of_arguments() const final {
+    return addresses.size() + (sharedMemoryBytes > 0);
+  }
+  uint64_t number_of_shared_bytes() const final { return sharedMemoryBytes; }
+  absl::Span<const void *const> argument_addresses() const final {
+    return addresses;
+  }
+
+private:
+  struct Value {
+    Value(ArrayRef<uint8_t> bytes, size_t requestedAlignment)
+        : alignment(std::max(requestedAlignment, alignof(std::max_align_t))),
+          size(bytes.size()),
+          data(::operator new(size, std::align_val_t(alignment))) {
+      std::memcpy(data, bytes.data(), size);
+    }
+    ~Value() { ::operator delete(data, std::align_val_t(alignment)); }
+    Value(const Value &) = delete;
+    Value &operator=(const Value &) = delete;
+
+    size_t alignment;
+    size_t size;
+    void *data;
+  };
+
+  std::vector<std::unique_ptr<Value>> values;
+  std::vector<const void *> addresses;
+  uint64_t sharedMemoryBytes = 0;
+};
 
 struct LoadedExecutable {
   std::vector<std::string> ptx;
@@ -90,6 +144,10 @@ std::optional<ExternalElement> externalElement(RankedTensorType type) {
     return ExternalElement{xla::PrimitiveType::BF16, 2};
   if (type.getElementType().isF32())
     return ExternalElement{xla::PrimitiveType::F32, 4};
+  if (type.getElementType().isInteger(32))
+    return ExternalElement{xla::PrimitiveType::S32, 4};
+  if (type.getElementType().isInteger(1))
+    return ExternalElement{xla::PrimitiveType::PRED, 1};
   return std::nullopt;
 }
 
@@ -112,7 +170,8 @@ absl::Status projectBindings(ArrayRef<GpuExternalBinding> bindings,
     int64_t elements = 1;
     if (!element || binding.slotOrdinal < 0 ||
         !slots.insert(binding.slotOrdinal).second ||
-        binding.alignment != element->width)
+        binding.alignment < element->width ||
+        binding.alignment % element->width != 0)
       return invalid("GPU executable external projection type is invalid");
     for (int64_t extent : type.getShape()) {
       if (extent <= 0 ||
@@ -217,8 +276,9 @@ instantiate(int64_t transportSchemaVersion, absl::string_view bundleBytes,
             int64_t bundleSchemaVersion, absl::string_view completion) {
   tsl::profiler::TraceMe trace("ShuttleGpuFfi::Instantiate");
   try {
-    if (transportSchemaVersion != 2 ||
-        (deviceSchemaVersion != 3 && deviceSchemaVersion != 4) ||
+    if ((transportSchemaVersion != 2 && transportSchemaVersion != 3) ||
+        (deviceSchemaVersion != 3 && deviceSchemaVersion != 4 &&
+         deviceSchemaVersion != 5 && deviceSchemaVersion != 6) ||
         invocationAbiSchemaVersion != 3 || bundleSchemaVersion != 2 ||
         completion != "stream_ordered" || bundleSize < 0 ||
         static_cast<size_t>(bundleSize) != bundleBytes.size() ||
@@ -340,34 +400,24 @@ initialize(InstantiateState *state, se::Stream *stream,
         capability->cuda_compute_capability();
     const ExecutableCodeFormat format = state->executable->codeFormat();
     const bool capabilityMatches =
-        cuda != nullptr && ((format == ExecutableCodeFormat::CudaPtxSm90V1 &&
-                             cuda->major == 9 && cuda->minor == 0) ||
-                            (format == ExecutableCodeFormat::CudaPtxSm100V1 &&
-                             cuda->major == 10 && cuda->minor == 0));
+        cuda != nullptr &&
+        (((format == ExecutableCodeFormat::CudaPtxSm90V1 ||
+           format == ExecutableCodeFormat::CudaFatbinSm90V1) &&
+          cuda->major == 9 && cuda->minor == 0) ||
+         ((format == ExecutableCodeFormat::CudaPtxSm100V1 ||
+           format == ExecutableCodeFormat::CudaFatbinSm100V1) &&
+          cuda->major == 10 && cuda->minor == 0));
     if (!capabilityMatches)
       return invalid(
           "GPU executable target does not match CUDA compute capability");
     if (state->initializationCache == nullptr)
       return invalid("GPU executable Initialize cache is invalid");
-    const bool requiresSharedMemoryOptIn = llvm::any_of(
-        state->executable->launches(), [](const GpuLaunch &launch) {
-          return launch.dynamicSharedMemoryBytes > 48 * 1024;
-        });
-    const int64_t dynamicSharedMemoryLimit =
-        requiresSharedMemoryOptIn
-            ? stream->parent()
-                  ->GetDeviceDescription()
-                  .shared_memory_per_block_optin()
-            : 48 * 1024;
-    if (requiresSharedMemoryOptIn && dynamicSharedMemoryLimit <= 48 * 1024)
-      return invalid(
-          "GPU executable requires unavailable dynamic shared-memory opt-in");
     std::lock_guard lock(state->initializationCache->mutex);
-    auto cached = state->initializationCache->executables.find(stream->parent());
+    auto cached =
+        state->initializationCache->executables.find(stream->parent());
     if (cached != state->initializationCache->executables.end()) {
       tsl::profiler::TraceMe cacheHit("ShuttleGpuFfi::InitializeCacheHit");
-      return std::make_unique<InitializeState>(
-          InitializeState{cached->second});
+      return std::make_unique<InitializeState>(InitializeState{cached->second});
     }
 
     tsl::profiler::TraceMe cacheMiss("ShuttleGpuFfi::InitializeCacheMiss");
@@ -375,26 +425,58 @@ initialize(InstantiateState *state, se::Stream *stream,
     loaded->ptx.reserve(state->executable->launches().size());
     loaded->kernels.reserve(state->executable->launches().size());
     for (const GpuLaunch &launch : state->executable->launches()) {
-      if (launch.dynamicSharedMemoryBytes > 48 * 1024 &&
-          launch.dynamicSharedMemoryBytes >
-          static_cast<uint64_t>(dynamicSharedMemoryLimit))
-        return invalid(
-            "GPU executable dynamic shared memory exceeds device opt-in capacity");
-      ArrayRef<uint8_t> slice = state->executable->codeBytes().slice(
-          launch.codeOffset, launch.codeLength);
-      loaded->ptx.emplace_back(
-          reinterpret_cast<const char *>(slice.data()), slice.size());
-      se::KernelLoaderSpec spec =
-          se::KernelLoaderSpec::CreateCudaPtxInMemorySpec(
-              loaded->ptx.back(), "shuttle_entry",
-              launch.inputSlots.size() + launch.outputSlots.size());
+      uint64_t requestedDynamicBytes = launch.dynamicSharedMemoryBytes;
+      for (const GpuFunctionAttribute &attribute : launch.functionAttributes) {
+        if (attribute.kind !=
+            GpuFunctionAttributeKind::MaximumDynamicSharedMemoryBytes)
+          return invalid(
+              "GPU executable function attribute is not supported by the "
+              "StreamExecutor launch boundary");
+        requestedDynamicBytes =
+            std::max(requestedDynamicBytes, attribute.value);
+      }
+      se::KernelLoaderSpec spec = [&]() {
+        if (format == ExecutableCodeFormat::CudaFatbinSm90V1 ||
+            format == ExecutableCodeFormat::CudaFatbinSm100V1) {
+          ArrayRef<uint8_t> image =
+              state->executable->codeImage(launch.imageIndex);
+          return se::KernelLoaderSpec::CreateCudaCubinInMemorySpec(
+              absl::Span<const uint8_t>(image.data(), image.size()),
+              launch.kernelName, launch.arguments.size());
+        }
+        ArrayRef<uint8_t> slice = state->executable->codeBytes().slice(
+            launch.codeOffset, launch.codeLength);
+        loaded->ptx.emplace_back(reinterpret_cast<const char *>(slice.data()),
+                                 slice.size());
+        return se::KernelLoaderSpec::CreateCudaPtxInMemorySpec(
+            loaded->ptx.back(), launch.kernelName, launch.arguments.size());
+      }();
       absl::StatusOr<std::unique_ptr<se::Kernel>> kernel =
           stream->parent()->LoadKernel(spec);
       if (!kernel.ok())
         return kernel.status();
-      se::KernelMetadata metadata;
-      metadata.set_shared_memory_bytes(launch.dynamicSharedMemoryBytes);
-      (*kernel)->set_metadata(metadata);
+      // LoadKernel queries static shared memory from CUDA. Keep that metadata;
+      // the packed arguments request dynamic memory separately, and the CUDA
+      // kernel launcher performs the required per-function opt-in.
+      const std::optional<int64_t> staticBytes =
+          (*kernel)->metadata().shared_memory_bytes();
+      if (!staticBytes || *staticBytes < 0)
+        return invalid("GPU executable static shared memory is unavailable");
+      if (requestedDynamicBytes > 48 * 1024 ||
+          static_cast<uint64_t>(*staticBytes) >
+              48 * 1024 - requestedDynamicBytes) {
+        const int64_t sharedMemoryLimit = stream->parent()
+                                              ->GetDeviceDescription()
+                                              .shared_memory_per_block_optin();
+        if (sharedMemoryLimit <= 0 ||
+            requestedDynamicBytes > static_cast<uint64_t>(sharedMemoryLimit) ||
+            static_cast<uint64_t>(*staticBytes) >
+                static_cast<uint64_t>(sharedMemoryLimit) -
+                    requestedDynamicBytes)
+          return invalid(
+              "GPU executable static and dynamic shared memory exceed "
+              "device opt-in capacity");
+      }
       loaded->kernels.push_back(std::move(*kernel));
     }
     if (loaded->kernels.size() != state->executable->launches().size())
@@ -431,26 +513,82 @@ absl::Status execute(ffi::RemainingArgs arguments, ffi::RemainingRets results,
     }
     tsl::profiler::TraceMe launches("ShuttleGpuFfi::EnqueueKernels");
     for (const GpuLaunch &launch : state->executable->launches()) {
-      SmallVector<se::KernelArg> kernelArguments;
-      for (int64_t slot : launch.inputSlots) {
-        if (!slots.count(slot))
-          return invalid("GPU executable launch input is not bound");
-        kernelArguments.push_back(slots.lookup(slot));
+      DynamicKernelArguments kernelArguments(launch.arguments.size());
+      for (const GpuKernelArgument &argument : launch.arguments) {
+        if (argument.kind == GpuKernelArgumentKind::SlotPointer) {
+          if (!slots.count(argument.slotOrdinal))
+            return invalid("GPU executable launch pointer is not bound");
+          void *pointer = static_cast<uint8_t *>(
+                              slots.lookup(argument.slotOrdinal).opaque()) +
+                          argument.slotByteOffset;
+          kernelArguments.add(pointer);
+          continue;
+        }
+        if (argument.kind == GpuKernelArgumentKind::TensorMap) {
+          const GpuTensorMapDescriptor &tensorMap = argument.tensorMap;
+          if (!slots.count(tensorMap.slotOrdinal))
+            return invalid("GPU executable tensor-map slot is not bound");
+          se::DeviceAddressBase address = slots.lookup(tensorMap.slotOrdinal);
+          auto descriptor = se::gpu::TmaDescriptor::Create(
+              tensorMap.globalDimensions, tensorMap.globalByteStrides,
+              tensorMap.boxDimensions, tensorMap.elementStrides,
+              tensorMap.elementByteWidth,
+              static_cast<se::gpu::TmaDescriptor::TmaInterleave>(
+                  tensorMap.interleave),
+              static_cast<se::gpu::TmaDescriptor::TmaSwizzle>(
+                  tensorMap.swizzle),
+              static_cast<se::gpu::TmaDescriptor::TmaL2Promotion>(
+                  tensorMap.l2Promotion),
+              static_cast<se::gpu::TmaDescriptor::TmaFloatOobFill>(
+                  tensorMap.oobFill));
+          if (!descriptor.ok())
+            return descriptor.status();
+          void *globalAddress =
+              static_cast<uint8_t *>(address.opaque()) + tensorMap.byteOffset;
+          absl::StatusOr<se::TensorMap> value =
+              stream->parent()->CreateTensorMap(*descriptor, globalAddress);
+          if (!value.ok())
+            return value.status();
+          kernelArguments.add(
+              ArrayRef<uint8_t>(
+                  reinterpret_cast<const uint8_t *>(value->storage),
+                  sizeof(value->storage)),
+              tensorMap.alignment);
+          continue;
+        }
+        if (argument.kind == GpuKernelArgumentKind::StructuredBytes) {
+          std::vector<uint8_t> value(argument.structure.size, 0);
+          for (const GpuStructuredField &field : argument.structure.fields) {
+            if (field.kind == GpuStructuredFieldKind::ImmediateBytes) {
+              std::memcpy(value.data() + field.offset, field.bytes.data(),
+                          field.bytes.size());
+              continue;
+            }
+            if (!slots.count(field.slotOrdinal))
+              return invalid("GPU executable structured slot is not bound");
+            uintptr_t pointer = reinterpret_cast<uintptr_t>(
+                slots.lookup(field.slotOrdinal).opaque());
+            pointer += field.slotByteOffset;
+            std::memcpy(value.data() + field.offset, &pointer, sizeof(pointer));
+          }
+          kernelArguments.add(value, argument.structure.alignment);
+          continue;
+        }
+        kernelArguments.add(argument.bytes, argument.alignment);
       }
-      for (int64_t slot : launch.outputSlots) {
-        if (!slots.count(slot))
-          return invalid("GPU executable launch output is not bound");
-        kernelArguments.push_back(slots.lookup(slot));
-      }
-      xla::gpu::LaunchDimensions dimensions(
-          se::BlockDim(launch.grid[0], launch.grid[1], launch.grid[2]),
-          se::ThreadDim(launch.block[0], launch.block[1], launch.block[2]));
-      if (absl::Status status = xla::gpu::ExecuteKernelOnStream(
-              *initialized->executable->kernels[launch.taskOrdinal],
-              kernelArguments,
-              dimensions, std::nullopt, stream);
+      kernelArguments.setSharedMemoryBytes(launch.dynamicSharedMemoryBytes);
+      if (absl::Status status =
+              initialized->executable->kernels[launch.taskOrdinal]->Launch(
+                  se::ThreadDim(launch.block[0], launch.block[1],
+                                launch.block[2]),
+                  se::BlockDim(launch.grid[0], launch.grid[1], launch.grid[2]),
+                  stream, kernelArguments);
           !status.ok())
-        return status;
+        return absl::Status(
+            status.code(),
+            absl::StrCat("Shuttle GPU launch ", launch.taskOrdinal, " kernel ",
+                         launch.kernelName, " image ", launch.imageIndex, ": ",
+                         status.message()));
     }
     return absl::OkStatus();
   } catch (const std::bad_alloc &) {

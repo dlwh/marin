@@ -108,7 +108,7 @@ def _function_argument_count(path: Path, function_name: str) -> int:
     return len(function.args.args)
 
 
-def test_recompute_plan_preserves_natural_vjp_signature_and_emits_three_aot_kernels() -> None:
+def test_recompute_plan_preserves_natural_vjp_signature_and_emits_two_composition_kernels() -> None:
     program, schedule = _program_and_schedule()
 
     generated = generate_streaming_attention_backward_ffi(
@@ -126,16 +126,17 @@ def test_recompute_plan_preserves_natural_vjp_signature_and_emits_three_aot_kern
         "value_cotangent",
     )
     assert tuple(kernel.kernel_name for kernel in generated.aot_kernels) == (
-        "_streaming_grouped_query_forward",
-        "_streaming_dq_kernel",
-        "_streaming_dkdv_kernel",
+        "_normalized_exponential_reverse_query_kernel",
+        "_normalized_exponential_reverse_key_value_kernel",
     )
     for kernel in generated.aot_kernels:
         assert len(kernel.signature) == _function_argument_count(REPOSITORY / kernel.source, kernel.kernel_name)
     assert "torch" not in generated.handler_template.lower()
     assert "triton" not in generated.handler_template.lower()
     assert "ScratchAllocator" in generated.handler_template
-    assert "{forward_launcher}" in generated.handler_template
+    assert "{forward_launcher}" not in generated.handler_template
+    assert "ShuttleIotaKernel" not in generated.handler_template
+    assert "row_centered_product_sum" in generated.handler_template
 
 
 def test_training_plan_returns_recomputed_forward_output_without_output_scratch() -> None:
@@ -224,12 +225,11 @@ def test_short_d16_plan_legalizes_only_physical_aot_tiles() -> None:
         target_name="shuttle.streaming_reverse.short_d16_test_v1",
     )
 
-    forward, query_cotangent, key_value_cotangents = generated.aot_kernels
+    query_cotangent, key_value_cotangents = generated.aot_kernels
     assert (schedule.query_tile_size, schedule.key_value_tile_size) == (4, 4)
-    assert forward.signature[-8:-4] == ("16", "16", "16", "2")
     assert query_cotangent.signature[-6:-2] == ("16", "16", "16", "2")
     assert key_value_cotangents.signature[-6:-2] == ("16", "16", "16", "2")
-    assert tuple(kernel.grid for kernel in generated.aot_kernels) == ((1, 2, 1), (1, 2, 1), (1, 2, 1))
+    assert tuple(kernel.grid for kernel in generated.aot_kernels) == ((1, 2, 1), (1, 2, 1))
 
 
 def test_short_unsupported_head_dimension_fails_closed() -> None:

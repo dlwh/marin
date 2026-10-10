@@ -1,7 +1,7 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Compile StableHLO and execute its selected dense RegionPlan on H100."""
+"""Replay the quarantined named dense plan against the explicit FA3 oracle."""
 
 import argparse
 import ast
@@ -14,18 +14,12 @@ import statistics
 import subprocess
 import sys
 from collections.abc import Callable, Mapping
-from enum import StrEnum
 from pathlib import Path
 from types import ModuleType
 
 import torch
 from quack.operand_transform import transform_a_operand
 from quack.rms_final_reduce import _rms_final_reduce_out
-
-try:
-    from backends.h100.cute_streaming_emitter import compile_h100_streaming_program
-except ModuleNotFoundError:
-    compile_h100_streaming_program = None
 
 try:
     from flash_attn_interface import flash_attn_3_gpu
@@ -37,11 +31,11 @@ from tile_lifetime import (
     GemmSkeleton,
     NumericalPolicy,
     ReductionSkeleton,
-    StreamingAttentionSkeleton,
 )
 from tile_lifetime.compiler import RowScalePlacement
 from tile_lifetime.experimental_pipeline import compile_experimental_stablehlo_dense_transformer_region
 from tile_lifetime.gemm_program import GENERIC_H100_GEMM_BACKEND, compile_gemm_program
+from tile_lifetime.plan import ReferenceAttentionSkeleton
 from tile_lifetime.quack_gemm_codegen import (
     GeneratedQuackGemm,
     QuackOperand,
@@ -50,22 +44,13 @@ from tile_lifetime.quack_gemm_codegen import (
     safe_module_name,
 )
 from tile_lifetime.reference import DENSE_REGION_INPUT_NAMES, DenseDebugConfig, export_debug_dense_region
-from tile_lifetime.runtime import RuntimeBufferSpec, TensorBinding, execute_region_plan, required_input_specs
-from tile_lifetime.streaming_attention import (
-    StreamingTileSchedule,
-    apply_causal_score_mask,
-    build_attention_tensor_program,
-    derive_streaming_attention,
-    scaled_score_map,
+from tile_lifetime.runtime import (
+    RuntimeBufferSpec,
+    TensorBinding,
+    execute_reference_dense_plan,
+    reference_required_input_specs,
 )
 from tile_lifetime.tile_program import TileProgramStage
-
-
-class AttentionBackend(StrEnum):
-    """Explicit physical attention choice for the dense replay."""
-
-    GENERATED_SM90 = "generated_sm90"
-    OFFICIAL_FA3_ORACLE = "official_fa3_oracle"
 
 
 def _tensor(bindings: Mapping[str, TensorBinding], name: str) -> torch.Tensor:
@@ -94,28 +79,22 @@ def _gemm_schedule(
     return tile_shape, cluster_shape, pingpong
 
 
-class H100DenseBackend:
-    """Generated QuACK/CuTe GEMMs plus the bounded attention implementation."""
+class ReferenceDenseReplayBackend:
+    """Generated GEMMs plus the explicit official-FA3 comparison oracle."""
 
     def __init__(
         self,
         config: DenseDebugConfig,
         *,
-        attention_backend: AttentionBackend = AttentionBackend.GENERATED_SM90,
         generated_source_directory: Path | None = None,
     ) -> None:
         self.config = config
-        self.attention_backend = attention_backend
         self.buffers: dict[str, torch.Tensor] = {}
         self.generated_source_directory = generated_source_directory or Path("/tmp/shuttle-quack-generated")
         self.generated_source_directory.mkdir(parents=True, exist_ok=True)
         self.generated_modules: dict[str, ModuleType] = {}
         self.generated_sources: dict[str, str] = {}
         self.gemm_launches: dict[GemmSkeleton, Callable[[], None]] = {}
-        self.compiled_attention: dict[
-            str,
-            Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], None],
-        ] = {}
 
     def allocate(self, spec: RuntimeBufferSpec) -> TensorBinding:
         tensor = self.buffers.get(spec.name)
@@ -358,70 +337,14 @@ class H100DenseBackend:
 
     def run_attention(
         self,
-        skeleton: StreamingAttentionSkeleton,
+        skeleton: ReferenceAttentionSkeleton,
         bindings: Mapping[str, TensorBinding],
     ) -> None:
-        if self.attention_backend is AttentionBackend.GENERATED_SM90:
-            self._run_generated_attention(skeleton, bindings)
-            return
         self._run_official_fa3_oracle(skeleton, bindings)
-
-    def _run_generated_attention(
-        self,
-        skeleton: StreamingAttentionSkeleton,
-        bindings: Mapping[str, TensorBinding],
-    ) -> None:
-        query = _tensor(bindings, skeleton.query)
-        key = _tensor(bindings, skeleton.key)
-        value = _tensor(bindings, skeleton.value)
-        output = _tensor(bindings, skeleton.output)
-        lse_name = f"{skeleton.name}.generated_lse"
-        log_sum_exp = self.buffers.get(lse_name)
-        if log_sum_exp is None:
-            log_sum_exp = torch.empty(
-                query.shape[0], query.shape[2], query.shape[1], dtype=torch.float32, device=query.device
-            )
-            self.buffers[lse_name] = log_sum_exp
-        compiled = self.compiled_attention.get(skeleton.name)
-        if compiled is None:
-            if compile_h100_streaming_program is None:
-                raise RuntimeError("generated SM90 attention dependencies are unavailable")
-            score_map = scaled_score_map(skeleton.scale)
-            if skeleton.causal:
-                score_map = apply_causal_score_mask(score_map)
-            source = build_attention_tensor_program(
-                batch_size=query.shape[0],
-                query_length=query.shape[1],
-                key_length=key.shape[1],
-                query_heads=query.shape[2],
-                key_value_heads=key.shape[2],
-                key_dimension=query.shape[3],
-                value_dimension=value.shape[3],
-                score_map=score_map,
-                input_dtype=DType.BF16,
-            )
-            program = derive_streaming_attention(
-                source,
-                schedule=StreamingTileSchedule(
-                    skeleton.query_block_size,
-                    skeleton.key_value_block_size,
-                    skeleton.pipeline_stages,
-                ),
-            )
-            compiled = compile_h100_streaming_program(
-                program,
-                query=query,
-                key=key,
-                value=value,
-                output=output,
-                log_sum_exp=log_sum_exp,
-            )
-            self.compiled_attention[skeleton.name] = compiled
-        compiled(query, key, value, output, log_sum_exp)
 
     def _run_official_fa3_oracle(
         self,
-        skeleton: StreamingAttentionSkeleton,
+        skeleton: ReferenceAttentionSkeleton,
         bindings: Mapping[str, TensorBinding],
     ) -> None:
         if flash_attn_3_gpu is None:
@@ -453,7 +376,7 @@ class H100DenseBackend:
 
 
 def _input_bindings(plan, config: DenseDebugConfig) -> dict[str, TensorBinding]:
-    specifications = required_input_specs(plan)
+    specifications = reference_required_input_specs(plan)
     torch.manual_seed(0)
     query_width = config.query_heads * config.head_dimension
     key_value_width = config.key_value_heads * config.head_dimension
@@ -505,7 +428,7 @@ def _benchmark_variants(
     variants = tuple(plans.items())
     for _ in range(warmups):
         for name, plan in variants:
-            execute_region_plan(plan, inputs, backends[name])
+            execute_reference_dense_plan(plan, inputs, backends[name])
     torch.cuda.synchronize()
     samples = {name: [] for name, _ in variants}
     for repeat in range(repeats):
@@ -515,7 +438,7 @@ def _benchmark_variants(
             end = torch.cuda.Event(enable_timing=True)
             start.record()
             for _ in range(iterations):
-                execute_region_plan(plan, inputs, backends[name])
+                execute_reference_dense_plan(plan, inputs, backends[name])
             end.record()
             end.synchronize()
             samples[name].append(start.elapsed_time(end) / iterations)
@@ -538,12 +461,6 @@ def main() -> None:
     parser.add_argument("--json-output", type=Path)
     parser.add_argument("--shuttle-revision", required=False)
     parser.add_argument("--quack-revision", required=False)
-    parser.add_argument(
-        "--attention-backend",
-        type=AttentionBackend,
-        choices=tuple(AttentionBackend),
-        default=AttentionBackend.GENERATED_SM90,
-    )
     args = parser.parse_args()
     config = DenseDebugConfig(
         sequence=args.sequence,
@@ -567,11 +484,11 @@ def main() -> None:
         for placement in (RowScalePlacement.CONSUMER_PROLOGUE, RowScalePlacement.CONSUMER_EPILOGUE)
     }
     inputs = _input_bindings(plans[RowScalePlacement.CONSUMER_PROLOGUE.value], config)
-    backends = {name: H100DenseBackend(config, attention_backend=args.attention_backend) for name in plans}
+    backends = {name: ReferenceDenseReplayBackend(config) for name in plans}
     outputs = {}
     deterministic_hashes: dict[str, dict[str, str]] = {}
     for name, plan in plans.items():
-        result = execute_region_plan(plan, inputs, backends[name])
+        result = execute_reference_dense_plan(plan, inputs, backends[name])
         outputs[name] = (
             _tensor(result.bindings, "x2").clone(),
             _tensor(result.bindings, "next_qkv").clone(),
@@ -580,13 +497,13 @@ def main() -> None:
             "x2": _tensor_sha256(_tensor(result.bindings, "x2")),
             "next_qkv": _tensor_sha256(_tensor(result.bindings, "next_qkv")),
         }
-        repeated = execute_region_plan(plan, inputs, backends[name])
+        repeated = execute_reference_dense_plan(plan, inputs, backends[name])
         second_hashes = {
             "x2": _tensor_sha256(_tensor(repeated.bindings, "x2")),
             "next_qkv": _tensor_sha256(_tensor(repeated.bindings, "next_qkv")),
         }
         if first_hashes != second_hashes:
-            raise AssertionError(f"generated dense plan {name!r} is not bitwise deterministic")
+            raise AssertionError(f"reference dense replay {name!r} is not bitwise deterministic")
         deterministic_hashes[name] = first_hashes
     prologue_x2, prologue_qkv = outputs[RowScalePlacement.CONSUMER_PROLOGUE.value]
     delayed_x2, delayed_qkv = outputs[RowScalePlacement.CONSUMER_EPILOGUE.value]
@@ -628,23 +545,13 @@ def main() -> None:
             if isinstance(skeleton, GemmSkeleton)
         }
         generated_only = gemm_backends == {GENERIC_H100_GEMM_BACKEND}
-        attention_manifests = {
-            placement: {
-                name: {
-                    "program_sha256": hashlib.sha256(repr(getattr(compiled, "program", None)).encode()).hexdigest(),
-                    "schedule": repr(getattr(compiled, "schedule", None)),
-                }
-                for name, compiled in backend.compiled_attention.items()
-            }
-            for placement, backend in backends.items()
-        }
         manifest = {
             "generated_gemm_source_sha256": sorted(generated_sources),
             "gemm_backends": sorted(str(backend) for backend in gemm_backends),
             "named_gemm_callback_selected": not generated_only,
-            "attention_backend": args.attention_backend.value,
-            "official_fa3_oracle_selected": args.attention_backend is AttentionBackend.OFFICIAL_FA3_ORACLE,
-            "attention_programs": attention_manifests,
+            "attention_backend": "official_fa3_oracle",
+            "official_fa3_oracle_selected": True,
+            "canonical_shuttle_physical_request": False,
         }
         (generated_root / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
         telemetry = subprocess.check_output(
@@ -670,7 +577,7 @@ def main() -> None:
                 "accumulation_dtype": "float32",
             },
             "benchmark": {
-                "attention_backend": args.attention_backend.value,
+                "attention_backend": "official_fa3_oracle",
                 "warmups": args.warmups,
                 "repeats": args.repeats,
                 "iterations_per_sample": args.iterations,
@@ -686,7 +593,7 @@ def main() -> None:
             },
             "comparison": {
                 "historical_manual_oracle_ms": historical_oracle_ms,
-                "generated_delayed_ratio": (
+                "reference_replay_delayed_ratio": (
                     float(measurements[RowScalePlacement.CONSUMER_EPILOGUE.value]["median_ms"]) / historical_oracle_ms
                     if historical_oracle_ms is not None
                     else None
@@ -703,9 +610,6 @@ def main() -> None:
                     for path in (
                         Path(__file__),
                         Path(__file__).parents[1] / "src/tile_lifetime/quack_gemm_codegen.py",
-                        Path(__file__).parents[1] / "src/tile_lifetime/h100_streaming_lowering.py",
-                        Path(__file__).parents[1] / "backends/h100/cute_streaming_emitter.py",
-                        Path(__file__).parents[1] / "backends/h100/cute_streaming_sm90.py",
                     )
                 },
             },

@@ -45,9 +45,16 @@ from clean_routed_streaming_emitter import (  # noqa: E402
 )
 
 from shuttle.ir import DType  # noqa: E402
+from tile_lifetime.normalized_exp_contract_region import ContractDomainTraversal  # noqa: E402
 from tile_lifetime.relation import build_relation_plan  # noqa: E402
 from tile_lifetime.sm100_routed_lowering import SM100RelationOrientation  # noqa: E402
-from tile_lifetime.tensor_program import TensorAxis  # noqa: E402
+from tile_lifetime.tensor_program import (  # noqa: E402
+    ScalarExpressionKind,
+    TensorAxis,
+    scalar_binary,
+    scalar_constant,
+    scalar_input,
+)
 from tile_lifetime.tiled_fold_finalize import (  # noqa: E402
     FoldFeatureLayout,
     FoldPartialAddressing,
@@ -84,7 +91,15 @@ def _lowering(
             right_stages=2,
             right_edges_per_task=32,
         ),
-        score_map=SimpleNamespace(causal=causal, scale=score_scale, softcap=None),
+        score_map=SimpleNamespace(
+            expression=scalar_binary(
+                ScalarExpressionKind.MULTIPLY,
+                scalar_input("score"),
+                scalar_constant(float(score_scale)),
+            ),
+            score_input="score",
+            domain_traversal=(ContractDomainTraversal.LOWER_TRIANGULAR if causal else ContractDomainTraversal.FULL),
+        ),
         head_group_size=4,
         key_value_heads=2,
         query_length=8,
@@ -449,11 +464,13 @@ def test_partial_value_storage_policy_changes_generated_load_not_physical_family
         lowering,
         paged_key_value=False,
         partial_value_dtype=PartialValueDType.BF16,
+        partial_merge_schedule=PartialMergeScheduleKind.ROW_BLOCK,
     )
     fp32_plan = emitter_plan_from_lowering(
         lowering,
         paged_key_value=False,
         partial_value_dtype=PartialValueDType.FP32,
+        partial_merge_schedule=PartialMergeScheduleKind.ROW_BLOCK,
     )
     bf16_source = render_partial_merge_cuda(bf16_plan.partial_merge)
     fp32_source = render_partial_merge_cuda(fp32_plan.partial_merge)
@@ -500,6 +517,34 @@ def test_warp_rows_merge_is_a_schedule_candidate_for_the_same_physical_family() 
     assert warp_source.count("expf(") == 1
     assert "row_count + 8 - 1" in warp_source
     assert row_source != warp_source
+
+
+def test_default_fold_schedule_is_derived_from_geometry_and_resources() -> None:
+    lowering = _lowering(causal=False)
+    lowering.selected_count = 16
+
+    selected = emitter_plan_from_lowering(lowering, paged_key_value=False)
+    explicit = emitter_plan_from_lowering(
+        lowering,
+        paged_key_value=False,
+        partial_merge_schedule=PartialMergeScheduleKind.TILED_PIPELINED,
+    )
+    insufficient_threads = _lowering(causal=False)
+    insufficient_threads.selected_count = 16
+    insufficient_threads.schedule.partial_merge_threads = 128
+    fallback = emitter_plan_from_lowering(insufficient_threads, paged_key_value=False)
+    fp32 = emitter_plan_from_lowering(
+        lowering,
+        paged_key_value=False,
+        partial_value_dtype=PartialValueDType.FP32,
+    )
+
+    assert selected.partial_merge.schedule_kind is PartialMergeScheduleKind.TILED_PIPELINED
+    assert selected.partial_merge == explicit.partial_merge
+    assert selected.partial_merge.feature_tile == 128
+    assert selected.partial_merge.pipeline_buffers == 2
+    assert fallback.partial_merge.schedule_kind is PartialMergeScheduleKind.ROW_BLOCK
+    assert fp32.partial_merge.schedule_kind is PartialMergeScheduleKind.ROW_BLOCK
 
 
 def test_tiled_fold_finalizer_exposes_generic_vector_staging_and_fixed_tree_order() -> None:

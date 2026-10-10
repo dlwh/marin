@@ -12,14 +12,14 @@ import math
 import statistics
 import subprocess
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import torch
-from backends.h100.cute_streaming_emitter import compile_h100_streaming_program
 
 from shuttle.ir import DType
-from tile_lifetime.ir import ScaledDotProductAttentionOp, TensorGraph
+from tile_lifetime.backends.h100.cute_streaming_emitter import compile_h100_streaming_program
+from tile_lifetime.h100_streaming_lowering import Sm90ContractSchedule, Sm90ForwardPipelineSchedule
 from tile_lifetime.streaming_attention import (
     StreamingTileSchedule,
     apply_causal_score_mask,
@@ -27,7 +27,6 @@ from tile_lifetime.streaming_attention import (
     build_attention_tensor_program,
     derive_streaming_attention,
     scaled_score_map,
-    streaming_attention_from_semantic_operation,
 )
 
 OFFICIAL_FA3_ORACLE_REVISION = "3fa810570e17bb4354155bdb71d826eca6079208"
@@ -139,40 +138,29 @@ def main() -> None:
         device=device,
     )
 
-    semantic_graph = TensorGraph()
-    semantic_query = semantic_graph.input("query", shape=tuple(query.shape), dtype=DType.BF16)
-    semantic_key = semantic_graph.input("key", shape=tuple(key.shape), dtype=DType.BF16)
-    semantic_value = semantic_graph.input("value", shape=tuple(value.shape), dtype=DType.BF16)
-    semantic_graph.scaled_dot_product_attention(
-        semantic_query,
-        semantic_key,
-        semantic_value,
-        name="attention.output",
-        scale=scale,
-        causal=True,
-        accumulation_dtype=DType.FP32,
-        source_location="recovered StableHLO attention",
-    )
-    semantic_operation = semantic_graph.operations[0]
-    assert isinstance(semantic_operation, ScaledDotProductAttentionOp)
-    schedule = StreamingTileSchedule(query_tile_size=128, key_value_tile_size=128, pipeline_depth=2)
-    if args.softcap is None:
-        program = streaming_attention_from_semantic_operation(semantic_operation, schedule=schedule)
-    else:
-        score_map = apply_causal_score_mask(scaled_score_map(scale))
+    score_map = apply_causal_score_mask(scaled_score_map(scale))
+    if args.softcap is not None:
         score_map = apply_tanh_softcap(score_map, args.softcap)
-        source = build_attention_tensor_program(
-            batch_size=batch_size,
-            query_length=sequence_length,
-            key_length=sequence_length,
-            query_heads=query_heads,
-            key_value_heads=key_value_heads,
-            key_dimension=head_dimension,
-            value_dimension=head_dimension,
-            score_map=score_map,
-            input_dtype=DType.BF16,
-        )
-        program = derive_streaming_attention(source, schedule=schedule)
+    source = build_attention_tensor_program(
+        batch_size=batch_size,
+        query_length=sequence_length,
+        key_length=sequence_length,
+        query_heads=query_heads,
+        key_value_heads=key_value_heads,
+        key_dimension=head_dimension,
+        value_dimension=head_dimension,
+        score_map=score_map,
+        input_dtype=DType.BF16,
+    )
+    logical_schedule = StreamingTileSchedule(query_tile_size=128, key_value_tile_size=128, pipeline_depth=2)
+    program = derive_streaming_attention(source, schedule=logical_schedule)
+    program = replace(
+        program,
+        schedule=Sm90ForwardPipelineSchedule(
+            contract=Sm90ContractSchedule(tile_m=128, tile_n=128),
+            stages=2,
+        ),
+    )
     compile_start = time.perf_counter()
     compiled = compile_h100_streaming_program(
         program,
@@ -206,16 +194,12 @@ def main() -> None:
         hashes.append(_sha256_tensor(output))
 
     repository_root = Path(__file__).resolve().parents[3]
-    backend_root = repository_root / "lib/tile_lifetime/backends/h100"
+    backend_root = repository_root / "lib/tile_lifetime/src/tile_lifetime/backends/h100"
     median_ms = statistics.median(samples)
     record = {
         "name": "shuttle_generated_sm90_streaming_contract_fold",
         "semantic_source": "Contract -> scalar Map -> max/sum Fold -> Contract -> normalize Map",
-        "semantic_frontend": (
-            "recovered ScaledDotProductAttentionOp -> Contract/Map/Fold bridge"
-            if args.softcap is None
-            else "generic scalar score-map mutation -> Contract/Map/Fold"
-        ),
+        "semantic_frontend": "generic Contract/Map/Fold with scalar score-Map AST",
         "uses_official_attention_interface": False,
         "shape": {
             "batch": batch_size,
@@ -225,7 +209,7 @@ def main() -> None:
             "head_dimension": head_dimension,
         },
         "score_map": asdict(compiled.score_map),
-        "gqa_head_group_size": compiled.head_group_size,
+        "relation_group_size": compiled.relation_layout.relation_group_size,
         "schedule": asdict(compiled.schedule),
         "compile_seconds": compile_seconds,
         "warmups": args.warmups,

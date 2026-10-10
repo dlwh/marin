@@ -18,6 +18,7 @@ MOE_REGION_INPUT_NAMES = (
     "routed_up_weight",
     "routed_down_weight",
 )
+MOE_BACKWARD_INPUT_NAMES = (*MOE_REGION_INPUT_NAMES, "output_cotangent")
 
 # JAX emits top-k as a public StableHLO composite and expert indexing as gather.
 # Its private top-k decomposition contains stablehlo.sort; the importer deliberately
@@ -45,8 +46,33 @@ class MoEDebugConfig:
 
 def export_debug_moe_region(config: MoEDebugConfig = MoEDebugConfig()) -> bytes:
     """Export the ordinary shared-plus-routed JAX region as portable StableHLO."""
+    exported = jax.export.export(jax.jit(moe_region(config)))(*_moe_input_specifications(config))
+    return exported.mlir_module_serialized
+
+
+def export_debug_moe_value_and_grad(config: MoEDebugConfig = MoEDebugConfig()) -> bytes:
+    """Export a scalar objective and its JAX-owned reverse as StableHLO."""
+    return _export_debug_moe_value_and_grad(config).mlir_module_serialized
+
+
+def export_debug_moe_value_and_grad_text(config: MoEDebugConfig = MoEDebugConfig()) -> str:
+    """Render the JAX-owned reverse boundary for source-lineage audits."""
+    return _export_debug_moe_value_and_grad(config).mlir_module()
+
+
+def export_debug_moe_training_step(config: MoEDebugConfig = MoEDebugConfig()) -> bytes:
+    """Export the ordinary forward composed with its JAX-owned pullback."""
+    return _export_debug_moe_training_step(config).mlir_module_serialized
+
+
+def export_debug_moe_training_step_text(config: MoEDebugConfig = MoEDebugConfig()) -> str:
+    """Render the composed forward-and-reverse boundary for lineage audits."""
+    return _export_debug_moe_training_step(config).mlir_module()
+
+
+def _moe_input_specifications(config: MoEDebugConfig) -> tuple[jax.ShapeDtypeStruct, ...]:
     bf16 = jnp.bfloat16
-    specifications = (
+    return (
         jax.ShapeDtypeStruct((config.tokens, config.hidden), bf16),
         jax.ShapeDtypeStruct((config.hidden, config.experts), bf16),
         jax.ShapeDtypeStruct((config.intermediate, config.hidden), bf16),
@@ -56,8 +82,19 @@ def export_debug_moe_region(config: MoEDebugConfig = MoEDebugConfig()) -> bytes:
         jax.ShapeDtypeStruct((config.experts, config.intermediate, config.hidden), bf16),
         jax.ShapeDtypeStruct((config.experts, config.hidden, config.intermediate), bf16),
     )
-    exported = jax.export.export(jax.jit(moe_region(config)))(*specifications)
-    return exported.mlir_module_serialized
+
+
+def _moe_backward_specifications(config: MoEDebugConfig) -> tuple[jax.ShapeDtypeStruct, ...]:
+    output_cotangent = jax.ShapeDtypeStruct((config.tokens, config.hidden), jnp.bfloat16)
+    return (*_moe_input_specifications(config), output_cotangent)
+
+
+def _export_debug_moe_value_and_grad(config: MoEDebugConfig):
+    return jax.export.export(jax.jit(moe_value_and_grad(config)))(*_moe_backward_specifications(config))
+
+
+def _export_debug_moe_training_step(config: MoEDebugConfig):
+    return jax.export.export(jax.jit(moe_training_step(config)))(*_moe_backward_specifications(config))
 
 
 def moe_region(config: MoEDebugConfig):
@@ -95,6 +132,51 @@ def moe_region(config: MoEDebugConfig):
         return shared_output + routed_sum, expert_indices, route_weights
 
     return region
+
+
+def moe_value_and_grad(config: MoEDebugConfig):
+    """Return a scalar objective whose differentiation is owned entirely by JAX."""
+    region = moe_region(config)
+
+    def objective(*arguments):
+        *inputs, output_cotangent = arguments
+        output, expert_indices, route_weights = region(*inputs)
+        loss = jnp.vdot(output.astype(jnp.float32), output_cotangent.astype(jnp.float32))
+        return loss, (output, expert_indices, route_weights)
+
+    differentiated = jax.value_and_grad(
+        objective,
+        argnums=tuple(range(len(MOE_REGION_INPUT_NAMES))),
+        has_aux=True,
+    )
+
+    def value_and_grad(*arguments):
+        (value, auxiliary), gradients = differentiated(*arguments)
+        output, expert_indices, route_weights = auxiliary
+        return value, output, expert_indices, route_weights, *gradients
+
+    return value_and_grad
+
+
+def moe_training_step(config: MoEDebugConfig):
+    """Return the ordinary forward composed directly with its JAX-owned pullback."""
+    region = moe_region(config)
+
+    def differentiable_output(*inputs):
+        output, expert_indices, route_weights = region(*inputs)
+        return output, (expert_indices, route_weights)
+
+    def training_step(*arguments):
+        *inputs, output_cotangent = arguments
+        output_value, pullback, auxiliary = jax.vjp(
+            differentiable_output,
+            *inputs,
+            has_aux=True,
+        )
+        expert_indices, route_weights = auxiliary
+        return output_value, expert_indices, route_weights, *pullback(output_cotangent)
+
+    return training_step
 
 
 def _linear(left, right, specification: str):

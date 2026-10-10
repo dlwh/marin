@@ -90,6 +90,13 @@ def ShuttleVerifySimt32RowFoldSchedulePass
   let constructor = "createVerifySimt32RowFoldSchedulePass()";
 }
 
+def ShuttlePlanSourceEventLoweringPass
+    : Pass<"shuttle-plan-source-event-lowering", "::mlir::ModuleOp"> {
+  let summary = "Lower exact scheduled dependencies to source-bound imperative events";
+  let dependentDialects = ["::mlir::shuttle::ShuttleDialect"];
+  let constructor = "createPlanSourceEventLoweringPass()";
+}
+
 def ShuttleBuildGpuExecutableBundlePass
     : Pass<"shuttle-build-gpu-executable-bundle", "::mlir::ModuleOp"> {
   let summary = "Generate a target-bound CUDA PTX bundle from Shuttle IR";

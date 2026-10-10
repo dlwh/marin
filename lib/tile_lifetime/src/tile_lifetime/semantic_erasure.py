@@ -8,10 +8,10 @@ from dataclasses import dataclass, replace
 from tile_lifetime.plan import (
     GemmSkeleton,
     ReductionSkeleton,
-    RegionPlan,
+    ReferenceAttentionSkeleton,
+    ReferenceRegionPlan,
     SemanticErasureReport,
     SemanticLoweringStep,
-    StreamingAttentionSkeleton,
     TransformSkeleton,
 )
 from tile_lifetime.tensor_program import (
@@ -163,8 +163,8 @@ def semantic_erasure_errors(report: SemanticErasureReport) -> tuple[str, ...]:
     return tuple(dict.fromkeys(errors))
 
 
-def validate_plan_semantic_erasure(plan: RegionPlan) -> None:
-    """Validate the accepted physical path contains no named semantic dispatch."""
+def validate_reference_plan_semantic_erasure(plan: ReferenceRegionPlan) -> None:
+    """Validate the historical reference plan's claimed semantic erasure."""
     report = plan.semantic_erasure_report
     if report is None:
         raise SemanticErasureError("region plan has no semantic-erasure report")
@@ -188,7 +188,7 @@ def validate_plan_semantic_erasure(plan: RegionPlan) -> None:
             normalized_operator = skeleton.operator.lower().replace("-", "_")
             if any(token in normalized_operator for token in _FORBIDDEN_SCHEDULING_TOKENS):
                 errors.append(f"reduction operator {skeleton.operator!r} retains a workload name")
-        elif isinstance(skeleton, StreamingAttentionSkeleton):
+        elif isinstance(skeleton, ReferenceAttentionSkeleton):
             for attachment in skeleton.attachments:
                 if attachment.operation not in _GENERIC_ATTACHMENT_OPERATIONS:
                     errors.append(f"streaming attachment {attachment.operation!r} is not a generic semantic primitive")

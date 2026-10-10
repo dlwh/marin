@@ -24,8 +24,9 @@ from tile_lifetime.cuda_axis_fold_codegen import (
     generate_cuda_axis_fold,
     generate_cuda_axis_fold_ffi,
     generate_cuda_axis_fold_pipeline_ffi,
+    render_cuda_scalar_expression,
 )
-from tile_lifetime.tensor_program import ScalarExpressionKind, scalar_binary, scalar_constant, scalar_input
+from tile_lifetime.tensor_program import ScalarExpressionKind, scalar_binary, scalar_constant, scalar_input, scalar_unary
 
 
 def _scaled_column_sum_program(*, threads: int = 64) -> AxisFoldProgram:
@@ -437,3 +438,10 @@ def test_axis_fold_pipeline_rejects_coalescing_when_second_reduction_uses_first_
             target_name="shuttle.axis_fold_illegal_coalescing_v1",
             schedule=AxisFoldPipelineSchedule.COALESCE_COMPATIBLE_ROW_STAGES,
         )
+
+
+def test_public_cuda_scalar_renderer_fails_at_the_unsupported_operation() -> None:
+    expression = scalar_unary(ScalarExpressionKind.NEGATE, scalar_input("value"))
+
+    with pytest.raises(ValueError, match="unsupported axis-Fold scalar operation negate"):
+        render_cuda_scalar_expression(expression, {"value": "loaded_value"})

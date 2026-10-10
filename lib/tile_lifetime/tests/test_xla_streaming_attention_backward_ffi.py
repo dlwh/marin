@@ -271,9 +271,13 @@ def test_hlo_derived_ffi_output_layouts_erase_all_output_copies() -> None:
         (0, 2, 1, 3),
         (0, 2, 3, 1),
     )
-    dkdv = next(kernel for kernel in generated.aot_kernels if kernel.output_name == "shuttle_streaming_dkdv")
-    assert dkdv.signature[31:35] == ("2048", "64", "1024", "1")
-    assert dkdv.signature[35:39] == ("2048", "1", "1024", "16")
+    dkdv = next(
+        kernel
+        for kernel in generated.aot_kernels
+        if kernel.output_name == "shuttle_normalized_exponential_reverse_key_value"
+    )
+    assert dkdv.signature[32:36] == ("2048", "64", "1024", "1")
+    assert dkdv.signature[36:40] == ("2048", "1", "1024", "16")
 
 
 def test_physical_output_layout_mutation_changes_strides_without_semantic_dispatch() -> None:

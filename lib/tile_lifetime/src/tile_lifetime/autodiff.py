@@ -5,23 +5,36 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from shuttle.ir import DType
 from tile_lifetime.tensor_program import (
+    ContractOperandPrecision,
     ContractPrimitive,
     FoldPrimitive,
     FoldReducer,
+    IndexExpression,
+    IndexExpressionKind,
     MapPrimitive,
+    OperandIndexing,
     ProgramValue,
+    RelationPrimitive,
+    ScalarConversionSemantics,
     ScalarExpression,
     ScalarExpressionKind,
     TensorAxis,
     TensorPrimitive,
     TensorProgram,
+    index_axis,
+    index_binary,
+    index_constant,
     primitive_inputs,
+    primitive_outputs,
     scalar_binary,
     scalar_constant,
+    scalar_convert,
     scalar_expression_inputs,
     scalar_input,
     scalar_select,
@@ -57,6 +70,11 @@ def differentiate_scalar_expression(expression: ScalarExpression, input_name: st
         return scalar_constant(1.0 if expression.input_name == input_name else 0.0)
     if kind is ScalarExpressionKind.CONSTANT:
         return scalar_constant(0.0)
+    if kind is ScalarExpressionKind.CONVERT:
+        # TensorProgram conversions declare value rounding, while their tangent
+        # semantics follow JAX's linear convert rule. The cotangent is converted
+        # to the source dtype when the Map adjoint is materialized below.
+        return differentiate_scalar_expression(expression.operands[0], input_name)
     operands = expression.operands
     derivatives = tuple(differentiate_scalar_expression(operand, input_name) for operand in operands)
     if kind is ScalarExpressionKind.ADD:
@@ -103,6 +121,19 @@ def scalar_expression_vjp(
     )
 
 
+def adjoint_contract_operand_precision(
+    operation: ContractPrimitive,
+    input_index: int,
+) -> tuple[ContractOperandPrecision, ...]:
+    """Preserve retained operand requests and conservatively type the cotangent."""
+    precision_order = tuple(ContractOperandPrecision)
+    cotangent_precision = max(operation.operand_precision, key=precision_order.index)
+    return (
+        cotangent_precision,
+        *(precision for index, precision in enumerate(operation.operand_precision) if index != input_index),
+    )
+
+
 def differentiate_tensor_program(
     source: TensorProgram,
     *,
@@ -117,10 +148,11 @@ def differentiate_tensor_program(
 
     value_by_name = {value.name: value for value in source.inputs}
     for operation in source.operations:
-        value_by_name[operation.output.name] = operation.output
+        for output in primitive_outputs(operation):
+            value_by_name[output.name] = output
     requested = tuple(_required_value(value_by_name, name) for name in with_respect_to)
     counter = 0
-    backward_operations: list[ContractPrimitive | MapPrimitive | FoldPrimitive] = []
+    backward_operations: list[ContractPrimitive | MapPrimitive | FoldPrimitive | RelationPrimitive] = []
     contributions: dict[str, list[ProgramValue]] = {}
 
     def fresh_value(prefix: str, axes: tuple[TensorAxis, ...], template: ProgramValue) -> ProgramValue:
@@ -158,9 +190,20 @@ def differentiate_tensor_program(
         return accumulated
 
     for operation in reversed(source.operations):
-        output_cotangent = aggregate(operation.output)
-        if output_cotangent is None:
+        output_cotangents_for_operation = tuple(aggregate(output) for output in primitive_outputs(operation))
+        if not any(cotangent is not None for cotangent in output_cotangents_for_operation):
             continue
+        if isinstance(operation, RelationPrimitive):
+            _differentiate_relation(
+                operation,
+                output_cotangents_for_operation,
+                contributions,
+                backward_operations,
+                fresh_value,
+            )
+            continue
+        (output_cotangent,) = output_cotangents_for_operation
+        assert output_cotangent is not None
         if isinstance(operation, MapPrimitive):
             _differentiate_map(
                 operation,
@@ -194,7 +237,9 @@ def differentiate_tensor_program(
             continue
         assert isinstance(operation, ContractPrimitive)
         if operation.input_index_maps:
-            raise NotImplementedError("Contract adjoints with index maps are not implemented")
+            output_cotangent = _align_contract_output_cotangent(
+                operation, output_cotangent, backward_operations, fresh_value
+            )
         for input_index, operand in enumerate(operation.inputs):
             other_operands = tuple(value for index, value in enumerate(operation.inputs) if index != input_index)
             adjoint_inputs = (output_cotangent, *other_operands)
@@ -210,6 +255,8 @@ def differentiate_tensor_program(
                     output=input_cotangent,
                     reduction_axes=reduction_axes,
                     accumulation_dtype=operation.accumulation_dtype,
+                    order=operation.order,
+                    operand_precision=adjoint_contract_operand_precision(operation, input_index),
                 )
             )
             contributions.setdefault(operand.name, []).append(input_cotangent)
@@ -233,6 +280,40 @@ def differentiate_tensor_program(
     )
 
 
+def _align_contract_output_cotangent(
+    operation: ContractPrimitive,
+    output_cotangent: ProgramValue,
+    backward_operations: list[ContractPrimitive | MapPrimitive | FoldPrimitive | RelationPrimitive],
+    fresh_value: Callable[[str, tuple[TensorAxis, ...], ProgramValue], ProgramValue],
+) -> ProgramValue:
+    domain_to_operand: dict[TensorAxis, TensorAxis] = {}
+    for mappings in operation.input_index_maps:
+        for mapping in mappings:
+            if mapping.divisor != 1 or mapping.offset != 0 or mapping.modulus is not None:
+                raise NotImplementedError(
+                    "Contract adjoints require injective identity index maps; non-injective maps need explicit relations"
+                )
+            previous = domain_to_operand.setdefault(mapping.domain_axis, mapping.operand_axis)
+            if previous != mapping.operand_axis:
+                raise NotImplementedError("Contract output axis has incompatible operand index relations")
+    aligned_axes = tuple(domain_to_operand.get(axis, axis) for axis in operation.output.axes)
+    if len(set(aligned_axes)) != len(aligned_axes):
+        raise NotImplementedError("Contract output index relation is not injective")
+    aligned = fresh_value(f"aligned_d_{operation.output.name}", aligned_axes, output_cotangent)
+    source_indices = tuple(index_axis(aligned_axis) for aligned_axis in aligned_axes)
+    backward_operations.append(
+        RelationPrimitive(
+            name=f"align output cotangent of {operation.name}",
+            inputs=(output_cotangent,),
+            outputs=(aligned,),
+            domain_axes=aligned_axes,
+            input_indexing=(OperandIndexing(output_cotangent, aligned_axes, source_indices),),
+            result_sources=(output_cotangent,),
+        )
+    )
+    return aligned
+
+
 def extract_backward_tensor_program(
     differentiated: DifferentiatedTensorProgram,
     *,
@@ -251,8 +332,9 @@ def extract_backward_tensor_program(
     source_value_by_name = {value.name: value for value in source.inputs}
     producer_by_name: dict[str, TensorPrimitive] = {}
     for operation in source.operations:
-        source_value_by_name[operation.output.name] = operation.output
-        producer_by_name[operation.output.name] = operation
+        for output in primitive_outputs(operation):
+            source_value_by_name[output.name] = output
+            producer_by_name[output.name] = operation
 
     duplicate_saved_values = sorted(name for name in set(saved_values) if saved_values.count(name) > 1)
     if duplicate_saved_values:
@@ -282,10 +364,12 @@ def extract_backward_tensor_program(
                 require_forward_value(operand)
 
     recomputed_operations = tuple(
-        operation for operation in source.operations if operation.output.name in required_recompute_names
+        operation
+        for operation in source.operations
+        if any(output.name in required_recompute_names for output in primitive_outputs(operation))
     )
     operations = (*recomputed_operations, *backward_operations)
-    produced_names = {operation.output.name for operation in operations}
+    produced_names = {output.name for operation in operations for output in primitive_outputs(operation)}
     required_input_names = {
         value.name
         for operation in operations
@@ -316,7 +400,7 @@ def _differentiate_map(
     operation: MapPrimitive,
     output_cotangent: ProgramValue,
     contributions: dict[str, list[ProgramValue]],
-    backward_operations: list[ContractPrimitive | MapPrimitive | FoldPrimitive],
+    backward_operations: list[ContractPrimitive | MapPrimitive | FoldPrimitive | RelationPrimitive],
     fresh_value: Callable[[str, tuple[TensorAxis, ...], ProgramValue], ProgramValue],
 ) -> None:
     input_by_name = {value.name: value for value in operation.inputs}
@@ -325,11 +409,23 @@ def _differentiate_map(
         if _is_constant(derivative, 0.0):
             continue
         expression = _multiply(scalar_input(output_cotangent.name), derivative)
+        if output_cotangent.dtype is not input_value.dtype:
+            expression = scalar_convert(
+                expression,
+                result_dtype=input_value.dtype,
+                semantics=_cotangent_conversion_semantics(output_cotangent.dtype, input_value.dtype),
+            )
         referenced_names = scalar_expression_inputs(expression)
+        predicate_input_names = {
+            value.name for value in operation.inputs if value.name not in scalar_expression_inputs(operation.expression)
+        }
         pointwise_inputs = tuple(
-            value for value in (*operation.inputs, output_cotangent) if value.name in referenced_names
+            value
+            for value in (*operation.inputs, output_cotangent)
+            if value.name in referenced_names or value.name in predicate_input_names
         )
-        if set(referenced_names) != {value.name for value in pointwise_inputs}:
+        expected_input_names = set(referenced_names) | predicate_input_names
+        if expected_input_names != {value.name for value in pointwise_inputs}:
             missing = sorted(set(referenced_names) - set(input_by_name) - {output_cotangent.name})
             raise ValueError(f"Map derivative references unavailable inputs {missing}")
         pointwise = fresh_value(f"pointwise_d_{input_value.name}", operation.output.axes, input_value)
@@ -339,6 +435,8 @@ def _differentiate_map(
                 inputs=pointwise_inputs,
                 output=pointwise,
                 expression=expression,
+                predicate=operation.predicate,
+                rejected_value=0.0 if operation.predicate is not None else None,
             )
         )
         reduction_axes = tuple(axis for axis in operation.output.axes if axis not in input_value.axes)
@@ -357,6 +455,196 @@ def _differentiate_map(
         else:
             input_cotangent = pointwise
         contributions.setdefault(input_value.name, []).append(input_cotangent)
+
+
+def _differentiate_relation(
+    operation: RelationPrimitive,
+    output_cotangents: tuple[ProgramValue | None, ...],
+    contributions: dict[str, list[ProgramValue]],
+    backward_operations: list[ContractPrimitive | MapPrimitive | FoldPrimitive | RelationPrimitive],
+    fresh_value: Callable[[str, tuple[TensorAxis, ...], ProgramValue], ProgramValue],
+) -> None:
+    if len(operation.inputs) != 1 or len(operation.outputs) != 1:
+        raise NotImplementedError("Relation adjoints currently require one indexed source and one result")
+    source = operation.inputs[0]
+    result = operation.outputs[0]
+    (output_cotangent,) = output_cotangents
+    if output_cotangent is None:
+        return
+    if _append_broadcast_relation_adjoint(operation, output_cotangent, contributions, backward_operations, fresh_value):
+        return
+    if (
+        operation.predicate is not None
+        or operation.input_indexing[0].predicate is not None
+        or operation.resolved_result_sources != (source,)
+        or operation.resolved_result_expressions != (None,)
+        or math.prod(source.shape) != math.prod(result.shape)
+    ):
+        raise NotImplementedError(
+            f"non-injective Relation {operation.name!r} gradients require an explicit Fold or scatter relation"
+        )
+    inverse_indices = _inverse_relation_indices(operation)
+    if inverse_indices is None:
+        raise NotImplementedError(
+            "non-injective Relation gradient is not proven to be an axis permutation or row-major reshape"
+        )
+    input_cotangent = fresh_value(f"d_{source.name}", source.axes, source)
+    backward_operations.append(
+        RelationPrimitive(
+            name=f"adjoint of {operation.name}",
+            inputs=(output_cotangent,),
+            outputs=(input_cotangent,),
+            domain_axes=source.axes,
+            input_indexing=(OperandIndexing(output_cotangent, source.axes, inverse_indices),),
+            result_sources=(output_cotangent,),
+        )
+    )
+    contributions.setdefault(source.name, []).append(input_cotangent)
+
+
+def _append_broadcast_relation_adjoint(
+    operation: RelationPrimitive,
+    output_cotangent: ProgramValue,
+    contributions: dict[str, list[ProgramValue]],
+    backward_operations: list[ContractPrimitive | MapPrimitive | FoldPrimitive | RelationPrimitive],
+    fresh_value: Callable[[str, tuple[TensorAxis, ...], ProgramValue], ProgramValue],
+) -> bool:
+    if (
+        len(operation.inputs) != 1
+        or len(operation.outputs) != 1
+        or operation.predicate is not None
+        or operation.input_indexing[0].predicate is not None
+        or operation.resolved_result_sources != operation.inputs
+        or operation.resolved_result_expressions != (None,)
+    ):
+        return False
+    source = operation.inputs[0]
+    result = operation.outputs[0]
+    if math.prod(source.shape) == math.prod(result.shape):
+        return False
+    result_to_source: dict[TensorAxis, TensorAxis] = {}
+    for source_axis, expression in zip(source.axes, operation.input_indexing[0].indices, strict=True):
+        if expression.kind is IndexExpressionKind.AXIS and expression.axis is not None:
+            if expression.axis.extent != source_axis.extent or expression.axis in result_to_source:
+                return False
+            result_to_source[expression.axis] = source_axis
+            continue
+        if expression.kind is IndexExpressionKind.CONSTANT and expression.constant == 0 and source_axis.extent == 1:
+            continue
+        return False
+    aligned_axes = tuple(result_to_source.get(axis, axis) for axis in result.axes)
+    if len(set(aligned_axes)) != len(aligned_axes):
+        return False
+    aligned = fresh_value(f"aligned_d_{result.name}", aligned_axes, output_cotangent)
+    backward_operations.append(
+        RelationPrimitive(
+            name=f"align broadcast cotangent of {operation.name}",
+            inputs=(output_cotangent,),
+            outputs=(aligned,),
+            domain_axes=aligned_axes,
+            input_indexing=(
+                OperandIndexing(output_cotangent, aligned_axes, tuple(index_axis(axis) for axis in aligned_axes)),
+            ),
+            result_sources=(output_cotangent,),
+        )
+    )
+    reduction_axes = tuple(axis for axis in aligned_axes if axis not in source.axes)
+    if reduction_axes:
+        retained_axes = tuple(axis for axis in aligned_axes if axis not in reduction_axes)
+        reduced = fresh_value(f"reduced_d_{source.name}", retained_axes, source)
+        backward_operations.append(
+            FoldPrimitive(
+                name=f"broadcast adjoint Fold for {source.name}",
+                input=aligned,
+                output=reduced,
+                reduction_axes=reduction_axes,
+                reducer=FoldReducer.SUM,
+                accumulation_dtype=source.dtype,
+            )
+        )
+        if retained_axes == source.axes:
+            input_cotangent = reduced
+        else:
+            input_cotangent = fresh_value(f"d_{source.name}", source.axes, source)
+            backward_operations.append(
+                RelationPrimitive(
+                    name=f"restore unit axes for {source.name}",
+                    inputs=(reduced,),
+                    outputs=(input_cotangent,),
+                    domain_axes=source.axes,
+                    input_indexing=(
+                        OperandIndexing(reduced, source.axes, tuple(index_axis(axis) for axis in retained_axes)),
+                    ),
+                    result_sources=(reduced,),
+                )
+            )
+    else:
+        input_cotangent = aligned
+    contributions.setdefault(source.name, []).append(input_cotangent)
+    return True
+
+
+def _inverse_relation_indices(operation: RelationPrimitive) -> tuple[IndexExpression, ...] | None:
+    source = operation.inputs[0]
+    result = operation.outputs[0]
+    indexing = operation.input_indexing[0]
+    source_axis_for_result: dict[TensorAxis, TensorAxis] = {}
+    for source_axis, expression in zip(source.axes, indexing.indices, strict=True):
+        if expression.kind is IndexExpressionKind.AXIS and expression.axis is not None:
+            source_axis_for_result[expression.axis] = source_axis
+            continue
+        if expression.kind is IndexExpressionKind.CONSTANT and expression.constant == 0 and source_axis.extent == 1:
+            continue
+        else:
+            source_axis_for_result.clear()
+            break
+    if all(axis in source_axis_for_result or axis.extent == 1 for axis in result.axes):
+        return tuple(
+            (
+                index_axis(source_axis_for_result[result_axis])
+                if result_axis in source_axis_for_result
+                else index_constant(0)
+            )
+            for result_axis in result.axes
+        )
+
+    expected = _row_major_indices(source.axes, result.axes)
+    if indexing.indices != expected:
+        return None
+    return _row_major_indices(result.axes, source.axes)
+
+
+def _row_major_indices(
+    operand_axes: tuple[TensorAxis, ...], domain_axes: tuple[TensorAxis, ...]
+) -> tuple[IndexExpression, ...]:
+    linear = index_constant(0)
+    for dimension, axis in enumerate(domain_axes):
+        stride = math.prod(remaining.extent for remaining in domain_axes[dimension + 1 :])
+        term = index_axis(axis)
+        if stride != 1:
+            term = index_binary(IndexExpressionKind.MULTIPLY, term, index_constant(stride))
+        linear = index_binary(IndexExpressionKind.ADD, linear, term)
+    indices: list[IndexExpression] = []
+    for dimension, axis in enumerate(operand_axes):
+        stride = math.prod(remaining.extent for remaining in operand_axes[dimension + 1 :])
+        index = linear
+        if stride != 1:
+            index = index_binary(IndexExpressionKind.FLOOR_DIVIDE, index, index_constant(stride))
+        if axis.extent != 1:
+            index = index_binary(IndexExpressionKind.MODULO, index, index_constant(axis.extent))
+        else:
+            index = index_constant(0)
+        indices.append(index)
+    return tuple(indices)
+
+
+def _cotangent_conversion_semantics(source: DType, result: DType) -> ScalarConversionSemantics:
+    precision = {DType.BF16: 0, DType.FP32: 1, DType.FP64: 2}
+    if source not in precision or result not in precision:
+        raise NotImplementedError("scalar conversion adjoints currently require floating-point cotangents")
+    if precision[result] >= precision[source]:
+        return ScalarConversionSemantics.EXACT
+    return ScalarConversionSemantics.ROUND_NEAREST_EVEN
 
 
 def _required_value(values: dict[str, ProgramValue], name: str) -> ProgramValue:

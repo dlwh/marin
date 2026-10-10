@@ -15,6 +15,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from math import ceil
+from typing import Any
 
 from tile_lifetime.event_buffering import (
     BoundedBufferPlan,
@@ -26,9 +27,11 @@ from tile_lifetime.event_buffering import (
     verify_event_realizations,
 )
 from tile_lifetime.event_dataflow import (
+    Coordinate,
     EventDataflowProgram,
     EventGenerationPolicy,
     EventMemoryScope,
+    EventTensorPlan,
     MemoryVisibility,
     TaskAxis,
     TaskDependence,
@@ -36,6 +39,15 @@ from tile_lifetime.event_dataflow import (
     TaskRelation,
     derive_event_tensor_plan,
     verify_event_dataflow_program,
+)
+from tile_lifetime.internal_event_allocation import (
+    InternalEventAllocation,
+    InternalEventMechanismKind,
+    bounded_buffer_internal_event_allocation,
+    internal_event_allocation_record,
+    internal_event_realization_records,
+    phased_internal_event_allocation,
+    verify_internal_event_allocations,
 )
 
 
@@ -132,35 +144,231 @@ class StreamingPipelineDataflow:
 
 
 @dataclass(frozen=True)
+class StreamingBoundedPipelineAllocation:
+    """One same-CTA full/empty pipeline derived from exact internal events."""
+
+    name: str
+    full_event: EventTensorPlan
+    empty_event: EventTensorPlan | None
+    coordinates: tuple[Coordinate, ...]
+    capacity: int
+    allocation_owners: tuple[Coordinate, ...]
+    slots: tuple[int, ...]
+    generations: tuple[int, ...]
+    generation_count: int
+    notify_count: int
+    transaction_bytes: int
+    extra_transaction_bytes: tuple[int, ...]
+    scope: EventMemoryScope = EventMemoryScope.CTA
+    physical_barriers_per_stage: int = 2
+
+    def __post_init__(self) -> None:
+        if self.transaction_bytes <= 0:
+            raise ValueError("streaming pipeline base transaction bytes must be positive")
+        if len(self.extra_transaction_bytes) != len(self.coordinates):
+            raise ValueError("streaming pipeline extra transaction bytes must cover every producer coordinate")
+        if any(extra < 0 for extra in self.extra_transaction_bytes):
+            raise ValueError("streaming pipeline extra transaction bytes must be nonnegative")
+
+    @property
+    def transaction_bytes_by_coordinate(self) -> tuple[int, ...]:
+        """Return the exact expected transaction bytes for every full Event."""
+        return tuple(self.transaction_bytes + extra for extra in self.extra_transaction_bytes)
+
+    @property
+    def physical_barrier_slots(self) -> int:
+        """Return barrier storage reserved by the selected physical template."""
+        return self.capacity * self.physical_barriers_per_stage
+
+    @property
+    def required_barriers_per_stage(self) -> int:
+        """Return phases required by the exact full/optional-empty Events."""
+        return 1 + int(self.empty_event is not None)
+
+    @property
+    def required_barrier_slots(self) -> int:
+        """Return the minimum storage extent required by the exact Events."""
+        return self.capacity * self.required_barriers_per_stage
+
+
+@dataclass(frozen=True)
 class StreamingPhysicalEventSchedule:
     """Verified readiness configuration consumed by a physical GPU skeleton."""
 
     dataflow: StreamingPipelineDataflow
     audit: EventRealizationAudit
     workers: StreamingWorkerAssignment
-    resident_input_stages: int
-    first_streamed_input_stages: int
-    second_streamed_input_stages: int
-    barriers_per_stage: int
-    resident_input_transaction_bytes: int
-    first_streamed_input_transaction_bytes: int
-    second_streamed_input_transaction_bytes: int
+    resident_input_pipeline: StreamingBoundedPipelineAllocation
+    first_streamed_input_pipeline: StreamingBoundedPipelineAllocation
+    second_streamed_input_pipeline: StreamingBoundedPipelineAllocation
     fingerprint: str
 
     @property
-    def resident_input_barrier_slots(self) -> int:
-        """Return full/empty barrier storage for the resident input."""
-        return self.resident_input_stages * self.barriers_per_stage
+    def allocations(self) -> tuple[InternalEventAllocation, ...]:
+        """Return the exact bounded allocations consumed by the backend."""
+        return _streaming_internal_event_allocations(self)
 
     @property
-    def first_streamed_input_barrier_slots(self) -> int:
-        """Return full/empty barrier storage for the first streamed input."""
-        return self.first_streamed_input_stages * self.barriers_per_stage
+    def resident_input_stages(self) -> int:
+        """Return the resident-input allocation capacity."""
+        return self.resident_input_pipeline.capacity
 
     @property
-    def second_streamed_input_barrier_slots(self) -> int:
-        """Return full/empty barrier storage for the second streamed input."""
-        return self.second_streamed_input_stages * self.barriers_per_stage
+    def first_streamed_input_stages(self) -> int:
+        """Return the first streamed-input allocation capacity."""
+        return self.first_streamed_input_pipeline.capacity
+
+    @property
+    def second_streamed_input_stages(self) -> int:
+        """Return the second streamed-input allocation capacity."""
+        return self.second_streamed_input_pipeline.capacity
+
+    @property
+    def physical_barriers_per_stage(self) -> int:
+        """Return the common barrier count reserved per physical pipeline stage."""
+        counts = {
+            self.resident_input_pipeline.physical_barriers_per_stage,
+            self.first_streamed_input_pipeline.physical_barriers_per_stage,
+            self.second_streamed_input_pipeline.physical_barriers_per_stage,
+        }
+        if len(counts) != 1:
+            raise ValueError("streaming input pipelines disagree on barrier phases")
+        return next(iter(counts))
+
+    @property
+    def resident_input_transaction_bytes(self) -> int:
+        """Return bytes associated with one resident-input full notification."""
+        return self.resident_input_pipeline.transaction_bytes
+
+    @property
+    def first_streamed_input_transaction_bytes(self) -> int:
+        """Return bytes associated with one first streamed-input notification."""
+        return self.first_streamed_input_pipeline.transaction_bytes
+
+    @property
+    def second_streamed_input_transaction_bytes(self) -> int:
+        """Return bytes associated with one second streamed-input notification."""
+        return self.second_streamed_input_pipeline.transaction_bytes
+
+    @property
+    def resident_input_physical_barrier_slots(self) -> int:
+        """Return physical barrier storage reserved for the resident input."""
+        return self.resident_input_pipeline.physical_barrier_slots
+
+    @property
+    def first_streamed_input_physical_barrier_slots(self) -> int:
+        """Return physical barrier storage reserved for the first streamed input."""
+        return self.first_streamed_input_pipeline.physical_barrier_slots
+
+    @property
+    def second_streamed_input_physical_barrier_slots(self) -> int:
+        """Return physical barrier storage reserved for the second streamed input."""
+        return self.second_streamed_input_pipeline.physical_barrier_slots
+
+
+def streaming_physical_event_schedule_record(schedule: StreamingPhysicalEventSchedule) -> dict[str, Any]:
+    """Serialize exact internal Events and their selected bounded allocations."""
+
+    plans_by_name = {plan.name: plan for plan in schedule.dataflow.program.event_plans}
+    allocations = schedule.allocations
+    verify_internal_event_allocations(schedule.audit, allocations)
+
+    return {
+        "schema_version": 5,
+        "fingerprint": schedule.fingerprint,
+        "realizations": internal_event_realization_records(schedule.audit, plans_by_name, allocations),
+        "allocations": tuple(internal_event_allocation_record(allocation) for allocation in allocations),
+    }
+
+
+def canonical_streaming_physical_event_schedule_record(schedule: StreamingPhysicalEventSchedule) -> dict[str, Any]:
+    """Serialize exact internal tasks and Events with source names alpha-renamed by role."""
+    record = streaming_physical_event_schedule_record(schedule)
+    dataflow = schedule.dataflow
+    family_names = {
+        dataflow.resident_input_stage.name: "resident_input_stage",
+        dataflow.first_streamed_input_stage.name: "first_streamed_input_stage",
+        dataflow.second_streamed_input_stage.name: "second_streamed_input_stage",
+        dataflow.first_contract.name: "first_contract",
+        dataflow.fold_update.name: "streaming_fold_update",
+        dataflow.second_contract.name: "second_contract",
+        dataflow.finalize.name: "finalize",
+    }
+    plan_names: dict[str, str] = {}
+    event_domain_names: dict[str, str] = {}
+    for ordinal, plan in enumerate(dataflow.program.event_plans):
+        relation = plan.required_dependence.relation
+        canonical_name = f"event_{ordinal}_{family_names[relation.source.name]}_to_{family_names[relation.target.name]}"
+        plan_names[plan.name] = canonical_name
+        event_domain_names[f"{plan.name}.events"] = f"{canonical_name}.events"
+    allocation_names = {
+        f"{plan_name}.allocation": f"{canonical_name}.allocation" for plan_name, canonical_name in plan_names.items()
+    }
+    names = {**family_names, **plan_names, **event_domain_names, **allocation_names}
+
+    def alpha_rename(value: Any) -> Any:
+        if isinstance(value, dict):
+            renamed = {key: alpha_rename(item) for key, item in value.items() if key != "fingerprint"}
+            for relation_key in ("notify_relations", "wait_relations"):
+                if relation_key in renamed:
+                    renamed[relation_key] = tuple(
+                        sorted(
+                            renamed[relation_key],
+                            key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")),
+                        )
+                    )
+            return renamed
+        if isinstance(value, tuple):
+            return tuple(alpha_rename(item) for item in value)
+        if isinstance(value, list):
+            return [alpha_rename(item) for item in value]
+        if isinstance(value, str):
+            return names.get(value, value)
+        return value
+
+    canonical = alpha_rename(record)
+    canonical["fingerprint"] = hashlib.sha256(
+        json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return canonical
+
+
+def _streaming_internal_event_allocations(
+    schedule: StreamingPhysicalEventSchedule,
+) -> tuple[InternalEventAllocation, ...]:
+    pipeline_allocations = tuple(
+        bounded_buffer_internal_event_allocation(
+            allocation_id=allocation.name,
+            buffer=buffer,
+            plans=(
+                (allocation.full_event,)
+                if allocation.empty_event is None
+                else (allocation.full_event, allocation.empty_event)
+            ),
+            transaction_bytes_by_coordinate=allocation.transaction_bytes_by_coordinate,
+        )
+        for allocation, buffer in (
+            (schedule.resident_input_pipeline, schedule.dataflow.resident_input_buffer),
+            (schedule.first_streamed_input_pipeline, schedule.dataflow.first_streamed_input_buffer),
+            (schedule.second_streamed_input_pipeline, schedule.dataflow.second_streamed_input_buffer),
+        )
+    )
+    covered = {plan.name for allocation in pipeline_allocations for plan in allocation.covered_plans}
+    plans_by_name = {plan.name: plan for plan in schedule.dataflow.program.event_plans}
+    residual = tuple(
+        phased_internal_event_allocation(
+            allocation_id=f"{entry.plan_name}.allocation",
+            plans=(plans_by_name[entry.plan_name],),
+            capacity=1,
+            allocation_owners=((),) * len(plans_by_name[entry.plan_name].domain.coordinates),
+            slots=(0,) * len(plans_by_name[entry.plan_name].domain.coordinates),
+            generations=tuple(range(len(plans_by_name[entry.plan_name].domain.coordinates))),
+            mechanism_kind=InternalEventMechanismKind.CTA_MBARRIER,
+        )
+        for entry in schedule.audit.physical
+        if entry.plan_name not in covered
+    )
+    return (*pipeline_allocations, *residual)
 
 
 def verify_streaming_event_backend_parameters(
@@ -193,7 +401,7 @@ def verify_streaming_event_backend_parameters(
         "resident_input_stages": schedule.resident_input_stages,
         "first_streamed_input_stages": schedule.first_streamed_input_stages,
         "second_streamed_input_stages": schedule.second_streamed_input_stages,
-        "barriers_per_stage": schedule.barriers_per_stage,
+        "barriers_per_stage": schedule.physical_barriers_per_stage,
         "transfer_warps": schedule.workers.transfer_warps,
         "matrix_warpgroups": schedule.workers.matrix_warpgroups,
         "scheduler_arrival_threads": schedule.workers.scheduler_arrival_threads,
@@ -210,9 +418,9 @@ def derive_streaming_physical_event_schedule(
 ) -> StreamingPhysicalEventSchedule:
     """Derive synchronization for a resident-left streaming skeleton.
 
-    The task graph is a kernel-local template. Two resident-tile generations
-    expose reuse, while every streamed partition is represented so pipeline
-    generations and the final producer tail are exact.
+    The task graph is one kernel-local resident invocation. Every streamed
+    partition is represented, so slot reuse arises only when that invocation's
+    streamed loop wraps the selected bounded pipeline.
     """
     resident_tile = descriptor.resident_tile_size
     streamed_tile = descriptor.streamed_tile_size
@@ -223,7 +431,7 @@ def derive_streaming_physical_event_schedule(
         descriptor,
         partition_count=partition_count,
         pipeline_depth=pipeline_depth,
-        generation_count=2,
+        generation_count=1,
     )
     matrix_warpgroups = resident_tile // 64
     if matrix_warpgroups <= 0 or resident_tile % 64:
@@ -235,6 +443,32 @@ def derive_streaming_physical_event_schedule(
         threads_per_warpgroup=128,
     )
     audit = _realization_audit(dataflow, workers)
+    resident_input_transaction_bytes = resident_tile * descriptor.resident_reduction_dimension * descriptor.element_bytes
+    first_streamed_input_transaction_bytes = (
+        streamed_tile * descriptor.streamed_reduction_dimension * descriptor.element_bytes
+    )
+    second_streamed_input_transaction_bytes = streamed_tile * descriptor.output_dimension * descriptor.element_bytes
+    resident_input_pipeline = derive_streaming_bounded_pipeline_allocation(
+        name="resident_input_pipeline",
+        program=dataflow.program,
+        buffer=dataflow.resident_input_buffer,
+        consumer=dataflow.first_contract,
+        transaction_bytes=resident_input_transaction_bytes,
+    )
+    first_streamed_input_pipeline = derive_streaming_bounded_pipeline_allocation(
+        name="first_streamed_input_pipeline",
+        program=dataflow.program,
+        buffer=dataflow.first_streamed_input_buffer,
+        consumer=dataflow.first_contract,
+        transaction_bytes=first_streamed_input_transaction_bytes,
+    )
+    second_streamed_input_pipeline = derive_streaming_bounded_pipeline_allocation(
+        name="second_streamed_input_pipeline",
+        program=dataflow.program,
+        buffer=dataflow.second_streamed_input_buffer,
+        consumer=dataflow.second_contract,
+        transaction_bytes=second_streamed_input_transaction_bytes,
+    )
     payload = {
         "partition_count": partition_count,
         "pipeline_depth": pipeline_depth,
@@ -247,18 +481,9 @@ def derive_streaming_physical_event_schedule(
         },
         "events": tuple((entry.plan_name, entry.kind.value, entry.mechanism) for entry in audit.entries),
         "buffers": {
-            "resident_input": (
-                dataflow.resident_input_buffer.capacity,
-                dataflow.resident_input_buffer.generations,
-            ),
-            "first_streamed_input": (
-                dataflow.first_streamed_input_buffer.capacity,
-                dataflow.first_streamed_input_buffer.generations,
-            ),
-            "second_streamed_input": (
-                dataflow.second_streamed_input_buffer.capacity,
-                dataflow.second_streamed_input_buffer.generations,
-            ),
+            "resident_input": _pipeline_fingerprint_record(resident_input_pipeline),
+            "first_streamed_input": _pipeline_fingerprint_record(first_streamed_input_pipeline),
+            "second_streamed_input": _pipeline_fingerprint_record(second_streamed_input_pipeline),
         },
     }
     fingerprint = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -266,18 +491,121 @@ def derive_streaming_physical_event_schedule(
         dataflow=dataflow,
         audit=audit,
         workers=workers,
-        resident_input_stages=1,
-        first_streamed_input_stages=pipeline_depth,
-        second_streamed_input_stages=pipeline_depth,
-        barriers_per_stage=2,
-        resident_input_transaction_bytes=(
-            resident_tile * descriptor.resident_reduction_dimension * descriptor.element_bytes
-        ),
-        first_streamed_input_transaction_bytes=(
-            streamed_tile * descriptor.streamed_reduction_dimension * descriptor.element_bytes
-        ),
-        second_streamed_input_transaction_bytes=(streamed_tile * descriptor.output_dimension * descriptor.element_bytes),
+        resident_input_pipeline=resident_input_pipeline,
+        first_streamed_input_pipeline=first_streamed_input_pipeline,
+        second_streamed_input_pipeline=second_streamed_input_pipeline,
         fingerprint=fingerprint,
+    )
+
+
+def derive_streaming_bounded_pipeline_allocation(
+    *,
+    name: str,
+    program: EventDataflowProgram,
+    buffer: BoundedBufferPlan,
+    consumer: TaskFamily,
+    transaction_bytes: int,
+    extra_transaction_bytes: dict[Coordinate, int] | None = None,
+) -> StreamingBoundedPipelineAllocation:
+    """Legalize one exact full/reuse Event pair to a same-CTA pipeline."""
+    if not name:
+        raise ValueError("streaming pipeline allocation name must be non-empty")
+    if transaction_bytes <= 0:
+        raise ValueError("streaming pipeline transaction bytes must be positive")
+    if extra_transaction_bytes is None:
+        extra_transaction_bytes = {coordinate: 0 for coordinate in buffer.producer.coordinates}
+    if set(extra_transaction_bytes) != set(buffer.producer.coordinates):
+        raise ValueError("streaming pipeline extra transaction bytes must cover the producer domain")
+    if any(extra < 0 for extra in extra_transaction_bytes.values()):
+        raise ValueError("streaming pipeline extra transaction bytes must be nonnegative")
+    matching_uses = tuple(use for use in buffer.uses if use.target == consumer)
+    if len(matching_uses) != 1:
+        raise ValueError("streaming pipeline allocation requires one exact readiness relation to its first consumer")
+    if len(buffer.reuse_dependences) > 1:
+        raise ValueError("streaming pipeline allocation supports at most one exact slot-reuse dependence")
+
+    full_event = _unique_event_plan(program, matching_uses[0], "full readiness")
+    empty_event = (
+        None
+        if not buffer.reuse_dependences
+        else _unique_event_plan(program, buffer.reuse_dependences[0].relation, "empty reuse")
+    )
+    full_relation = full_event.required_dependence.relation
+    if full_relation.source != buffer.producer or full_relation.target != consumer:
+        raise ValueError("streaming pipeline full Event does not connect the buffer producer to its consumer")
+    if full_event.memory_scope is not EventMemoryScope.CTA:
+        raise ValueError("streaming pipeline Events must have CTA scope")
+    if full_event.generation_policy is not EventGenerationPolicy.PER_INVOCATION:
+        raise ValueError("streaming pipeline full Event must use per-invocation generations")
+    for event in (full_event,) if empty_event is None else (full_event, empty_event):
+        visibility = event.visibility
+        if not visibility.release_on_notify or not visibility.acquire_before_consumer:
+            raise ValueError("streaming pipeline Events require release/acquire visibility")
+
+    full_counts = {count.value for count in full_event.initial_count.counts}
+    if len(full_counts) != 1 or 0 in full_counts:
+        raise ValueError("streaming pipeline full Event must have one uniform positive notify count")
+    notify_count = next(iter(full_counts))
+    if empty_event is not None:
+        empty_relation = empty_event.required_dependence.relation
+        if empty_relation.target != buffer.producer:
+            raise ValueError("streaming pipeline empty Event does not release the next buffer producer")
+        if empty_event.memory_scope is not EventMemoryScope.CTA:
+            raise ValueError("streaming pipeline Events must have CTA scope")
+        if empty_event.generation_policy is not EventGenerationPolicy.PHASED:
+            raise ValueError("streaming pipeline empty Event must use phased generations")
+        empty_counts = {count.value for count in empty_event.initial_count.counts}
+        if not empty_counts <= {0, notify_count} or notify_count not in empty_counts:
+            raise ValueError("streaming pipeline empty Event counts do not match full readiness")
+
+    coordinates = buffer.producer.coordinates
+    if (
+        len(buffer.allocation_owners) != len(coordinates)
+        or len(buffer.slots) != len(coordinates)
+        or len(buffer.generations) != len(coordinates)
+    ):
+        raise ValueError("streaming pipeline owner/slot/generation mapping does not cover its producer domain")
+    initial_slots = {slot for slot, generation in zip(buffer.slots, buffer.generations, strict=True) if generation == 0}
+    if initial_slots != set(range(min(buffer.capacity, len(coordinates)))):
+        raise ValueError("streaming pipeline initial generation does not initialize every active slot")
+    generation_count = max(buffer.generations, default=0) + 1
+    return StreamingBoundedPipelineAllocation(
+        name=name,
+        full_event=full_event,
+        empty_event=empty_event,
+        coordinates=coordinates,
+        capacity=buffer.capacity,
+        allocation_owners=buffer.allocation_owners,
+        slots=buffer.slots,
+        generations=buffer.generations,
+        generation_count=generation_count,
+        notify_count=notify_count,
+        transaction_bytes=transaction_bytes,
+        extra_transaction_bytes=tuple(extra_transaction_bytes[coordinate] for coordinate in coordinates),
+    )
+
+
+def _unique_event_plan(program: EventDataflowProgram, relation: TaskRelation, label: str) -> EventTensorPlan:
+    matches = tuple(plan for plan in program.event_plans if plan.required_dependence.relation == relation)
+    if len(matches) != 1:
+        raise ValueError(f"streaming pipeline requires one exact {label} Event, found {len(matches)}")
+    return matches[0]
+
+
+def _pipeline_fingerprint_record(allocation: StreamingBoundedPipelineAllocation) -> tuple[object, ...]:
+    return (
+        allocation.full_event.name,
+        None if allocation.empty_event is None else allocation.empty_event.name,
+        allocation.capacity,
+        allocation.allocation_owners,
+        allocation.slots,
+        allocation.generations,
+        allocation.generation_count,
+        allocation.notify_count,
+        allocation.transaction_bytes,
+        allocation.extra_transaction_bytes,
+        allocation.scope.value,
+        allocation.physical_barriers_per_stage,
     )
 
 
@@ -376,6 +704,7 @@ def _derive_pipeline_dataflow(
         producer=resident_input_stage,
         uses=(resident_input_to_first_contract.relation,),
         capacity=1,
+        allocation_owner_for={coordinate: () for coordinate in resident_input_stage.coordinates},
         slot_for={(generation,): 0 for generation in range(generation_count)},
         generation_for={(generation,): generation for generation in range(generation_count)},
         visibility=visibility,
@@ -394,6 +723,7 @@ def _derive_pipeline_dataflow(
         producer=first_streamed_input_stage,
         uses=(first_streamed_input_to_first_contract.relation,),
         capacity=pipeline_depth,
+        allocation_owner_for={coordinate: () for coordinate in pipeline_coordinates},
         slot_for=slots,
         generation_for=generations,
         visibility=visibility,
@@ -404,6 +734,7 @@ def _derive_pipeline_dataflow(
         producer=second_streamed_input_stage,
         uses=(second_streamed_input_to_second_contract.relation,),
         capacity=pipeline_depth,
+        allocation_owner_for={coordinate: () for coordinate in pipeline_coordinates},
         slot_for=slots,
         generation_for=generations,
         visibility=visibility,

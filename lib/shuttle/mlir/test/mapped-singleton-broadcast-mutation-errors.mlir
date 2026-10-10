@@ -25,6 +25,6 @@
 // NON-SINGLETON: broadcast input map dimensions must be unique, in range, and match direct or bounded singleton extents
 // MAP-ATTR: has attributes with no StableHLO Map representation
 // YIELD-ATTR: has attributes with no stablehlo.return representation
-// BROADCAST-REPLAY: has incompatible singleton reshape types
+// BROADCAST-REPLAY: has an invalid contiguous reshape indexing map
 // CONSTANT-ZERO: constant-zero input indexing is reserved for typed static singleton reshapes
 // RESHAPE-REPLAY: has incompatible broadcast indexing maps

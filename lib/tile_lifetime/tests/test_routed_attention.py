@@ -364,7 +364,7 @@ def test_relation_candidates_are_derived_from_generic_streaming_semantics(softca
 
     compilation = compile_routed_streaming_attention_candidates(streamed, relation, config)
 
-    assert compilation.program.score_map.expression == score_map.expression
+    assert compilation.program.region.score_map.expression == score_map.expression
     assert compilation.relation is relation
     assert [candidate.orientation for candidate in compilation.candidates] == [
         RoutedAttentionOrientation.QUERY_MAJOR,

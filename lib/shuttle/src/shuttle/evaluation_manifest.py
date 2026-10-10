@@ -15,6 +15,12 @@ from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import Protocol, cast
 
+from shuttle.attention_evaluation import (
+    ATTENTION_SHAPE_ID,
+    ATTENTION_SHAPE_SPECIFICATION,
+    AttentionEvaluationError,
+    validate_attention_evaluation,
+)
 from shuttle.options import Numerics
 
 SCHEMA_VERSION = 1
@@ -47,7 +53,7 @@ EXPECTED_TARGET_DIMENSIONS = {
     ),
     3: (
         {"forward", "backward", "composed_forward_backward"},
-        {"dot_product_attention_representative_pending"},
+        {ATTENTION_SHAPE_ID},
         {"h100", "gb200_or_b200"},
     ),
     4: (
@@ -57,12 +63,12 @@ EXPECTED_TARGET_DIMENSIONS = {
     ),
     5: (
         {"forward", "backward", "composed_forward_backward"},
-        {"gated_delta_net_representative_pending"},
+        {"stateful_scan_bf16_b1_t4_h2_k16_v16_r1_scalar_exp"},
         {"h100", "gb200_or_b200"},
     ),
     6: (
         {"forward", "backward", "composed_forward_backward"},
-        {"dense_transformer_block_representative_pending"},
+        {"dense_transformer_block_bf16_b1_s2048_m4096_f14336_hq32_hkv8_d128_causal"},
         {"h100", "gb200_or_b200"},
     ),
     7: (
@@ -87,9 +93,24 @@ EXPECTED_TARGET_DIMENSIONS = {
     ),
 }
 EXPECTED_SHAPE_SPECIFICATIONS = {
+    "dense_transformer_block_bf16_b1_s2048_m4096_f14336_hq32_hkv8_d128_causal": (
+        "x:bf16[1,2048,4096], input_scale:bf16[4096], query:bf16[4096,32,128], "
+        "key:bf16[4096,8,128], value:bf16[4096,8,128], output:bf16[32,128,4096], "
+        "mlp_scale:bf16[4096], gate:bf16[4096,14336], up:bf16[4096,14336], down:bf16[14336,4096], "
+        "y:bf16[1,2048,4096], dy:bf16[1,2048,4096], loss:f32[]=mean(cast_f32(y)^2), "
+        "gradients:bf16_matching_all_primals, epsilon=1e-6, causal=true, rope=false, "
+        "optimizer=false, dot_precision=DEFAULT, layout:row_major_contiguous"
+    ),
     "rmsnorm_bf16_2048x4096": (
         "x:bf16[2048,4096], gamma:bf16[4096], dy:bf16[2048,4096], y:bf16[2048,4096], "
         "dx:bf16[2048,4096], dgamma:bf16[4096], epsilon:f32=1e-5, layout:row_major_contiguous"
+    ),
+    ATTENTION_SHAPE_ID: ATTENTION_SHAPE_SPECIFICATION,
+    "stateful_scan_bf16_b1_t4_h2_k16_v16_r1_scalar_exp": (
+        "query:bf16[1,4,2,16], key:bf16[1,4,2,1,16], value:bf16[1,4,2,1,16], "
+        "log_decay:f32[1,4,2], beta:f32[1,4,2,1], initial_state:f32[1,2,16,16], "
+        "output_cotangent:f32[1,4,2,16], final_state_cotangent:f32[1,2,16,16], "
+        "update_rank=1, decay=scalar_exp, layout:row_major_contiguous"
     ),
 }
 REQUIRED_POLICIES = frozenset(Numerics)
@@ -166,6 +187,7 @@ class EvidenceFormat(StrEnum):
     """Artifact format with a closed claim extractor."""
 
     CPU_ORDINARY_JAX_ACCEPTANCE_V1 = "cpu_ordinary_jax_acceptance_v1"
+    ATTENTION_EVALUATION_V1 = "attention_evaluation_v1"
     ARCHITECTURE_STATUS_DOCUMENT_V1 = "architecture_status_document_v1"
 
 
@@ -330,7 +352,7 @@ def validate_evaluation_manifest(document: object, *, source_root: Path) -> Eval
     for item in evidence:
         if item.architecture_conformance is not ArchitectureConformance.CONFORMING:
             raise EvaluationManifestError(f"evidence {item.id!r} is not architecturally conforming")
-        if not item.claims:
+        if not item.claims and item.format is not EvidenceFormat.ATTENTION_EVALUATION_V1:
             raise EvaluationManifestError(f"active evidence {item.id!r} must declare cell-scoped gates")
 
     excluded_evidence = tuple(
@@ -414,6 +436,7 @@ def _evidence(value: object, name: str, *, source_root: Path) -> Evidence:
     claims = _artifact_claims(
         evidence_format,
         artifact,
+        artifact_root=(source_root / Path(path)).parent,
         source_commit=source_commit,
         architecture_conformance=architecture_conformance,
         name=name,
@@ -461,6 +484,7 @@ def _artifact_claims(
     evidence_format: EvidenceFormat,
     artifact: bytes,
     *,
+    artifact_root: Path,
     source_commit: str,
     architecture_conformance: ArchitectureConformance,
     name: str,
@@ -472,6 +496,34 @@ def _artifact_claims(
         if "This checkpoint is `architecture_nonconforming`." not in text:
             raise EvaluationManifestError(f"{name} does not contain its required architecture status")
         return ()
+
+    if evidence_format is EvidenceFormat.ATTENTION_EVALUATION_V1:
+        if architecture_conformance is not ArchitectureConformance.CONFORMING:
+            raise EvaluationManifestError(f"{name} attention evidence must remain conforming")
+        try:
+            document = json.loads(artifact, object_pairs_hook=_unique_json_object)
+            record = validate_attention_evaluation(document, artifact_root=artifact_root)
+        except (AttentionEvaluationError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise EvaluationManifestError(f"{name} does not satisfy attention_evaluation_v1") from error
+        if record.source_commit != source_commit:
+            raise EvaluationManifestError(f"{name} source commit differs from its attention provenance")
+        if not record.accepted:
+            return ()
+        boundary = Boundary(record.boundary)
+        hardware = Hardware(record.hardware)
+        return tuple(
+            EvidenceClaim(
+                identity=CellIdentity(
+                    target_id=3,
+                    boundary=boundary,
+                    shape=ATTENTION_SHAPE_ID,
+                    policy=policy,
+                    hardware=hardware,
+                ),
+                gates=tuple(EvidenceGateClaim(gate, Status.ACCEPTED) for gate in Gate),
+            )
+            for policy in (Numerics.SOURCE_ORDERED, Numerics.FAST)
+        )
 
     if architecture_conformance is not ArchitectureConformance.CONFORMING:
         raise EvaluationManifestError(f"{name} CPU acceptance artifact must remain conforming")

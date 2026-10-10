@@ -8,6 +8,7 @@ from enum import StrEnum
 
 from shuttle.ir import DType
 from tile_lifetime.plan import MaterializationRecord, RewriteExplanation
+from tile_lifetime.relation import RelationPlacement, RelationProjectionSpec
 from tile_lifetime.tensor_program import ScalarExpression
 from tile_lifetime.tile_program import TileProgram
 
@@ -54,13 +55,6 @@ class TileStorage(StrEnum):
     SHARDED_PARAMETER_VIEW = "sharded_parameter_view"
     RELATION_BUFFER = "relation_buffer"
     GLOBAL_BUFFER = "global_buffer"
-
-
-class ExchangeRowMode(StrEnum):
-    """Relation projection used to form activation exchange rows."""
-
-    ASSIGNMENT = "assignment"
-    COALESCED_TOKEN_OWNER = "coalesced_token_owner"
 
 
 class GateUpPhysicalLayout(StrEnum):
@@ -117,23 +111,6 @@ class RouteRelation:
 
 
 @dataclass(frozen=True)
-class ExpertOwnership:
-    """Contiguous mapping from global experts to EP ranks and local experts."""
-
-    global_expert_count: int
-    expert_parallel_size: int
-    local_expert_count: int
-    owner_rank_expression: str
-    local_expert_expression: str
-
-    def owner(self, global_expert: int) -> tuple[int, int]:
-        """Return the contiguous owner-rank and local-expert coordinates."""
-        if not 0 <= global_expert < self.global_expert_count:
-            raise ValueError(f"global expert must be in [0, {self.global_expert_count}), got {global_expert}")
-        return divmod(global_expert, self.local_expert_count)
-
-
-@dataclass(frozen=True)
 class ExpertSegmentContract:
     """Grouping and padding contract for routed assignments."""
 
@@ -153,17 +130,6 @@ class ExpertCapacityPolicy:
     receiver_assignment_capacity: int
     padded_local_capacity: int
     overflow_policy: str
-
-
-@dataclass(frozen=True)
-class ExchangeRelationProjection:
-    """One legal mapping from route assignments to exchanged activation rows."""
-
-    mode: ExchangeRowMode
-    grouping_keys: tuple[str, ...]
-    activation_rows: str
-    metadata_rows: str
-    receiver_expansion: str
 
 
 @dataclass(frozen=True)
@@ -199,7 +165,7 @@ class PipelineDepth:
 class ExpertParallelSchedule:
     """Bounded physical choices without binding to one megakernel implementation."""
 
-    expert_parallel_size: int
+    placement_rank_count: int
     segment_padding: int
     contraction_tile: tuple[int, int, int]
     swiglu_tile: tuple[int, int]
@@ -283,11 +249,11 @@ class ExpertParallelPlan:
     """Generic EP stages, tile flow, and derived storage decisions."""
 
     route_relation: RouteRelation
-    ownership: ExpertOwnership
+    placement: RelationPlacement
     segments: ExpertSegmentContract
     capacity: ExpertCapacityPolicy
-    exchange_projections: tuple[ExchangeRelationProjection, ...]
-    selected_exchange_projection: ExchangeRelationProjection
+    exchange_projections: tuple[RelationProjectionSpec, ...]
+    selected_exchange_projection: RelationProjectionSpec
     gate_up_layout: GateUpLayoutContract
     schedule: ExpertParallelSchedule
     map_fold_semantics: MapFoldSemantics

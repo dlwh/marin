@@ -9,12 +9,9 @@ from math import ceil, isfinite
 from shuttle.ir import DType
 from tile_lifetime.expert_parallel_plan import (
     BufferLifetime,
-    ExchangeRelationProjection,
-    ExchangeRowMode,
     ExpertCapacityPolicy,
     ExpertMaterializationSchedule,
     ExpertOverlapPolicy,
-    ExpertOwnership,
     ExpertParallelPlan,
     ExpertParallelSchedule,
     ExpertParallelStage,
@@ -47,7 +44,12 @@ from tile_lifetime.plan import (
     NumericalPolicy,
     RewriteExplanation,
 )
-from tile_lifetime.relation import compile_ordered_relation_fold
+from tile_lifetime.relation import (
+    RelationPlacement,
+    RelationProjectionAxis,
+    RelationProjectionSpec,
+    compile_ordered_relation_fold,
+)
 from tile_lifetime.tensor_program import (
     ScalarExpressionKind,
     scalar_binary,
@@ -61,7 +63,7 @@ from tile_lifetime.tensor_program import (
 class ExpertParallelConfig:
     """Bounded generic schedule choices for expert-parallel execution."""
 
-    expert_parallel_size: int
+    placement: RelationPlacement
     segment_padding: int = 256
     receiver_capacity_factor: float = 1.25
     contraction_tile: tuple[int, int, int] = (256, 256, 64)
@@ -95,7 +97,24 @@ class ExpertParallelConfig:
     merge_implementation: str = "generated_source_ordered_fold"
     segmented_contraction_implementation: str = "standalone_sm100_grouped_gemm"
     segmented_contraction_candidates: tuple[str, ...] = ("standalone_sm100_grouped_gemm", "ragged_dot")
-    exchange_row_mode: ExchangeRowMode = ExchangeRowMode.COALESCED_TOKEN_OWNER
+    exchange_projection: RelationProjectionSpec = field(
+        default_factory=lambda: RelationProjectionSpec(
+            grouping_axes=(RelationProjectionAxis.SOURCE_ITEM, RelationProjectionAxis.DESTINATION_RANK),
+            payload_axis=RelationProjectionAxis.SOURCE_ITEM,
+        )
+    )
+    exchange_projection_candidates: tuple[RelationProjectionSpec, ...] = field(
+        default_factory=lambda: (
+            RelationProjectionSpec(
+                grouping_axes=(RelationProjectionAxis.LOGICAL_EDGE,),
+                payload_axis=RelationProjectionAxis.SOURCE_ITEM,
+            ),
+            RelationProjectionSpec(
+                grouping_axes=(RelationProjectionAxis.SOURCE_ITEM, RelationProjectionAxis.DESTINATION_RANK),
+                payload_axis=RelationProjectionAxis.SOURCE_ITEM,
+            ),
+        )
+    )
     gate_up_layout: GateUpPhysicalLayout = GateUpPhysicalLayout.CONCATENATED_E_2I_K
     gate_up_layout_candidates: tuple[GateUpPhysicalLayout, ...] = (
         GateUpPhysicalLayout.CONCATENATED_E_2I_K,
@@ -203,10 +222,11 @@ def _legality_reasons(
     routed_experts = region.routed.gate_weight.shape[0]
     if numerical_policy is NumericalPolicy.BITWISE_EXACT:
         reasons.append("segmented contractions and scatter reduction may reorder floating-point operations")
-    if config.expert_parallel_size <= 0:
-        reasons.append("expert-parallel size must be positive")
-    elif global_experts % config.expert_parallel_size != 0:
-        reasons.append("global expert count must be divisible by expert-parallel size")
+    if config.placement.destination_count != global_experts:
+        reasons.append(
+            f"placement must cover the global expert axis ({global_experts}), "
+            f"got {config.placement.destination_count}"
+        )
     if routed_experts != global_experts:
         reasons.append(f"routed weights must have the global expert axis ({global_experts}), got {routed_experts}")
     if config.segment_padding <= 0:
@@ -266,6 +286,8 @@ def _legality_reasons(
         reasons.append("selected overlap policy must be one of the declared candidates")
     if config.materialization_schedule not in config.materialization_schedule_candidates:
         reasons.append("selected materialization schedule must be one of the declared candidates")
+    if config.exchange_projection not in config.exchange_projection_candidates:
+        reasons.append("selected relation projection must be one of the declared candidates")
     if region.shared.accumulation_dtype is not DType.FP32 or region.routed.accumulation_dtype is not DType.FP32:
         reasons.append("expert contractions must accumulate in FP32")
     activation_and_weights = (
@@ -285,7 +307,7 @@ def _legality_reasons(
 def _build_plan(region: _Region, *, config: ExpertParallelConfig) -> ExpertParallelPlan:
     tokens, hidden = region.shared.input.shape
     global_experts, intermediate, _ = region.routed.gate_weight.shape
-    local_experts = global_experts // config.expert_parallel_size
+    local_experts = max(config.placement.item_count_by_rank)
     assignments = tokens * region.router.top_k
     receiver_capacity = max(local_experts, ceil(config.receiver_capacity_factor * assignments))
     padded_local_capacity = receiver_capacity + local_experts * (config.segment_padding - 1)
@@ -302,13 +324,6 @@ def _build_plan(region: _Region, *, config: ExpertParallelConfig) -> ExpertParal
         source_expert_indices=region.router.expert_indices.name,
         source_weights=region.router.output.name,
     )
-    ownership = ExpertOwnership(
-        global_expert_count=global_experts,
-        expert_parallel_size=config.expert_parallel_size,
-        local_expert_count=local_experts,
-        owner_rank_expression=f"global_expert // {local_experts}",
-        local_expert_expression=f"global_expert % {local_experts}",
-    )
     segments = ExpertSegmentContract(
         keys=("local_expert",),
         stable_order=("token", "slot"),
@@ -323,25 +338,8 @@ def _build_plan(region: _Region, *, config: ExpertParallelConfig) -> ExpertParal
         padded_local_capacity=padded_local_capacity,
         overflow_policy="reject selected plan and run exact fallback before expert contraction",
     )
-    exchange_projections = (
-        ExchangeRelationProjection(
-            mode=ExchangeRowMode.ASSIGNMENT,
-            grouping_keys=("token", "slot", "owner_rank", "local_expert"),
-            activation_rows="one activation row per route assignment",
-            metadata_rows="one metadata row per route assignment",
-            receiver_expansion="identity followed by local expert grouping",
-        ),
-        ExchangeRelationProjection(
-            mode=ExchangeRowMode.COALESCED_TOKEN_OWNER,
-            grouping_keys=("source_token", "owner_rank"),
-            activation_rows="one activation row per distinct (source_token, owner_rank)",
-            metadata_rows="all route slots and local experts for the coalesced activation row",
-            receiver_expansion="expand route slots then group by local expert",
-        ),
-    )
-    selected_exchange_projection = next(
-        projection for projection in exchange_projections if projection.mode is config.exchange_row_mode
-    )
+    exchange_projections = config.exchange_projection_candidates
+    selected_exchange_projection = config.exchange_projection
     gate_up_layout = GateUpLayoutContract(
         semantic_weight_layout="separate [global_expert, intermediate, hidden] gate/up",
         semantic_output_layout="separate gate and up values",
@@ -359,7 +357,7 @@ def _build_plan(region: _Region, *, config: ExpertParallelConfig) -> ExpertParal
     )
     schedule = _schedule(config)
     merge_program = compile_ordered_relation_fold(
-        partition_count=config.expert_parallel_size,
+        partition_count=config.placement.rank_count,
         accumulation_dtype=DType.FP32,
         output_dtype=region.combine.output.dtype,
     ).tile_program
@@ -380,7 +378,7 @@ def _build_plan(region: _Region, *, config: ExpertParallelConfig) -> ExpertParal
     materializations = _derive_materializations(tile_flows)
     return ExpertParallelPlan(
         route_relation=route_relation,
-        ownership=ownership,
+        placement=config.placement,
         segments=segments,
         capacity=capacity,
         exchange_projections=exchange_projections,
@@ -463,7 +461,7 @@ def _schedule(config: ExpertParallelConfig) -> ExpertParallelSchedule:
         ExpertParallelStageKind.SHARED_ADD,
     )
     return ExpertParallelSchedule(
-        expert_parallel_size=config.expert_parallel_size,
+        placement_rank_count=config.placement.rank_count,
         segment_padding=config.segment_padding,
         contraction_tile=config.contraction_tile,
         swiglu_tile=config.swiglu_tile,
@@ -546,7 +544,7 @@ def _stages(
     region: _Region,
     *,
     names: dict[str, str],
-    exchange_projection: ExchangeRelationProjection,
+    exchange_projection: RelationProjectionSpec,
     gate_up: GateUpLayoutContract,
 ) -> tuple[ExpertParallelStage, ...]:
     return (
@@ -563,8 +561,8 @@ def _stages(
             ExpertParallelStageKind.EXPERT_OWNERSHIP,
             (names["route_keys"],),
             (names["owned_routes"],),
-            "map each global expert to a contiguous (owner_rank, local_expert)",
-            ("RoutedExpertMLPOp global expert axis",),
+            "map each global expert through the declared placement to (rank, local index)",
+            ("RoutedExpertMLPOp global expert axis", "RelationPlacement"),
         ),
         _stage(
             "legalize_local_expert_weights",
@@ -585,7 +583,7 @@ def _stages(
                 names["segment_sizes"],
             ),
             "stable sort/group assignments by owner_rank for transport",
-            ("TopKRouterOp", "ExpertOwnership"),
+            ("TopKRouterOp", "RelationPlacement"),
         ),
         _stage(
             "project_exchange_rows",
@@ -597,8 +595,8 @@ def _stages(
                 names["segment_sizes"],
             ),
             (names["exchange_x_rows"], names["exchange_route_metadata"], names["exchange_owner_sizes"]),
-            f"project route relation by {exchange_projection.grouping_keys}: {exchange_projection.activation_rows}",
-            ("owner-grouped route relation", exchange_projection.mode.value),
+            "project route relation by " f"({', '.join(axis.value for axis in exchange_projection.grouping_axes)})",
+            ("placement-grouped route relation", "RelationProjectionSpec"),
         ),
         _stage(
             "forward_exchange",
@@ -613,8 +611,8 @@ def _stages(
             ExpertParallelStageKind.EXPAND_LOCAL_ASSIGNMENTS,
             (names["received_exchange_x"], names["received_exchange_metadata"]),
             (names["received_x"], names["received_routes"]),
-            exchange_projection.receiver_expansion,
-            ("forward exchange",),
+            "expand projected rows through the inverse relation and group by local placement index",
+            ("forward exchange", "RelationRowProjection"),
         ),
         _stage(
             "segment_by_local_expert",
@@ -764,10 +762,11 @@ def _tile_flows(
     tokens = region.shared.input.shape[0]
     top_k = region.router.top_k
     output_name = region.combine.output.name
-    if config.exchange_row_mode is ExchangeRowMode.COALESCED_TOKEN_OWNER:
-        exchange_row_capacity = tokens * min(top_k, config.expert_parallel_size)
-    else:
-        exchange_row_capacity = assignments
+    exchange_row_capacity = config.exchange_projection.maximum_row_extent(
+        source_items=tokens,
+        route_slots=top_k,
+        placement=config.placement,
+    )
     received_exchange_capacity = receiver_capacity
     if config.gate_up_layout is GateUpPhysicalLayout.SEPARATE_E_I_K:
         local_gate_up_shape = (local_experts, 2, intermediate, hidden)
@@ -875,7 +874,7 @@ def _tile_flows(
         ),
         _edge(
             names["segment_sizes"],
-            (config.expert_parallel_size,),
+            (config.placement.rank_count,),
             DType.INT32,
             "group_routes_by_owner",
             ("project_exchange_rows",),
@@ -889,7 +888,7 @@ def _tile_flows(
             DType.BF16,
             "project_exchange_rows",
             ("forward_exchange",),
-            f"{config.exchange_row_mode.value}_send_rows",
+            "relation_projection_send_rows",
             ReadinessGranularity.MINIBATCH,
             tile_shape=config.exchange_tile,
         ),
@@ -899,17 +898,17 @@ def _tile_flows(
             DType.INT32,
             "project_exchange_rows",
             ("forward_exchange",),
-            f"{config.exchange_row_mode.value}_route_metadata",
+            "relation_projection_route_metadata",
             ReadinessGranularity.MINIBATCH,
             storage=TileStorage.RELATION_BUFFER,
         ),
         _edge(
             names["exchange_owner_sizes"],
-            (config.expert_parallel_size,),
+            (config.placement.rank_count,),
             DType.INT32,
             "project_exchange_rows",
             ("forward_exchange",),
-            f"{config.exchange_row_mode.value}_owner_send_sizes",
+            "relation_projection_rank_send_sizes",
             ReadinessGranularity.MINIBATCH,
             storage=TileStorage.RELATION_BUFFER,
         ),
@@ -919,7 +918,7 @@ def _tile_flows(
             DType.BF16,
             "forward_exchange",
             ("expand_local_assignments",),
-            f"received_{config.exchange_row_mode.value}_rows",
+            "received_relation_projection_rows",
             ReadinessGranularity.MINIBATCH,
             tile_shape=config.exchange_tile,
         ),
@@ -1170,21 +1169,21 @@ def _explanation(region: _Region, *, config: ExpertParallelConfig) -> RewriteExp
         ),
         transformed_fragment=(
             "RouteRelation(token, slot, global_expert, weight)",
-            "ExpertOwnership(global_expert -> owner_rank, local_expert)",
-            f"GroupBy(owner_rank) then ProjectExchangeRows({config.exchange_row_mode.value})",
+            "RelationPlacement(global_expert -> rank, local index)",
+            "GroupBy(placement rank) then project relation rows using the selected coordinate axes",
             "forward Exchange -> expand -> SegmentBy(local_expert) -> PadLocalSegments",
             "segmented gate/up -> pairwise SwiGLU -> segmented down",
             "ReverseExchange -> weighted ScatterReduce -> shared add",
         ),
         semantic_properties=(
             "expert computations are independent before weighted token reduction",
-            "global expert weights partition into contiguous owner-local views",
+            "global expert weights follow the declared placement into rank-local views",
             "gate and up contractions share the same segmented route relation",
             "receiver-local padding rows use token=-1 and weight=0 and cannot affect the output",
         ),
         legality_checks=(
             "routed weights carry the full global expert axis",
-            "global expert count divides the expert-parallel size",
+            "the relation placement covers every global expert",
             "receiver capacity overflow is guarded by an exact fallback",
             "exchange and contraction candidates implement the declared layouts",
             f"segment padding is {config.segment_padding}",

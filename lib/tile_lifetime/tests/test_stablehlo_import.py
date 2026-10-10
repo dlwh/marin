@@ -20,7 +20,7 @@ from tile_lifetime.plan import (
     MaterializationDisposition,
     NumericalPolicy,
     ReductionSkeleton,
-    StreamingAttentionSkeleton,
+    ReferenceAttentionSkeleton,
 )
 from tile_lifetime.reference_pipeline import (
     compile_reference_stablehlo_attention_region,
@@ -28,7 +28,7 @@ from tile_lifetime.reference_pipeline import (
     compile_reference_stablehlo_rms_region,
 )
 from tile_lifetime.reference_semantic_recovery import recover_reference_rms_region
-from tile_lifetime.semantic_erasure import SemanticErasureError, validate_plan_semantic_erasure
+from tile_lifetime.semantic_erasure import SemanticErasureError, validate_reference_plan_semantic_erasure
 from tile_lifetime.streaming_attention import StreamingTileSchedule
 
 FIXTURE = Path(__file__).parent / "fixtures" / "stablehlo" / "rms_region_v1_14_1.mlir.bc.b64"
@@ -99,7 +99,7 @@ def test_reference_stablehlo_rms_region_selects_delayed_scale_plan() -> None:
     assert plan.rewrites[0].applied
     assert plan.semantic_erasure_report is not None
     assert plan.semantic_erasure_report.is_clean
-    validate_plan_semantic_erasure(plan)
+    validate_reference_plan_semantic_erasure(plan)
 
 
 def test_import_stablehlo_preserves_attention_axes_and_causal_comparison() -> None:
@@ -134,7 +134,7 @@ def test_reference_stablehlo_attention_selects_opaque_streaming_plan() -> None:
     assert len(recovered.source_operation_ids) == len(imported.operations)
     assert len(recovered.graph.operations) == 1
     skeleton = plan.skeletons[0]
-    assert isinstance(skeleton, StreamingAttentionSkeleton)
+    assert isinstance(skeleton, ReferenceAttentionSkeleton)
     assert skeleton.head_dimension == 64
     assert skeleton.query_heads == 6
     assert skeleton.key_value_heads == 2
@@ -162,11 +162,11 @@ def test_experimental_stablehlo_attention_lowers_to_backend_neutral_streaming_pr
     )
 
     program = compilation.program
-    assert program.qk.inputs[0].shape == (1, 5, 6, 64)
-    assert program.qk.inputs[1].shape == (1, 5, 2, 64)
-    assert program.pv.inputs[1].shape == (1, 5, 2, 64)
-    assert program.qk.index_maps_for_input(1)[0].divisor == 3
-    assert program.pv.index_maps_for_input(1)[0].divisor == 3
+    assert program.region.producer.inputs[0].shape == (1, 5, 6, 64)
+    assert program.region.producer.inputs[1].shape == (1, 5, 2, 64)
+    assert program.region.consumer.inputs[1].shape == (1, 5, 2, 64)
+    assert program.region.producer.index_maps_for_input(1)[0].divisor == 3
+    assert program.region.consumer.index_maps_for_input(1)[0].divisor == 3
     assert program.schedule == StreamingTileSchedule(64, 128, 2)
     assert not hasattr(program, "backend")
     assert compilation.provenance.source_kind is FrontendSourceKind.STABLEHLO_ARTIFACT
@@ -225,7 +225,7 @@ def test_reference_stablehlo_program_recovers_coda_and_fa3() -> None:
         GemmSkeleton,
         ReductionSkeleton,
         GemmSkeleton,
-        StreamingAttentionSkeleton,
+        ReferenceAttentionSkeleton,
     ]
     assert [rewrite.name for rewrite in plan.rewrites] == [
         "move_row_scalar_through_right_contract",

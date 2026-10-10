@@ -3,6 +3,7 @@
 
 """Ordinary JAX causal-GQA reverse program used by StableHLO recovery tests."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import jax
@@ -39,7 +40,10 @@ class StreamingAttentionBackwardDebugConfig:
 STREAMING_ATTENTION_BACKWARD_INPUT_NAMES = ("query", "key", "value", "output_cotangent")
 
 
-def causal_gqa_attention(config: StreamingAttentionBackwardDebugConfig):
+def causal_gqa_attention(
+    config: StreamingAttentionBackwardDebugConfig,
+    score_transform: Callable[[jax.Array], jax.Array] | None = None,
+):
     """Return ordinary JAX tensor algebra for exact causal GQA."""
 
     def attention(query, key, value):
@@ -58,6 +62,8 @@ def causal_gqa_attention(config: StreamingAttentionBackwardDebugConfig):
             preferred_element_type=jnp.float32,
         )
         scores *= config.scale
+        if score_transform is not None:
+            scores = score_transform(scores)
         query_position = jnp.arange(config.query_length)[:, None]
         key_position = jnp.arange(config.key_length)[None, :]
         valid = jnp.broadcast_to(key_position <= query_position, scores.shape)

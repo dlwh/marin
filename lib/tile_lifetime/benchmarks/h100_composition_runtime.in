@@ -1,0 +1,9 @@
+jax[cuda13]==0.10.1
+torch @ https://download-r2.pytorch.org/whl/cu130/torch-2.12.1%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=4bafc356fbb622e2756179406825c3a56c17b401196435a1487c5b40c657706c
+nvidia-cutlass-dsl[cu13]==4.6.1
+flash-attn-4[cu13]==4.0.0b19
+apache-tvm-ffi==0.1.10
+torch-c-dlpack-ext==0.1.5
+einops==0.8.1
+uv-build==0.9.30
+setuptools==80.9.0

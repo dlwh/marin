@@ -62,12 +62,14 @@ module {
     %result = "shuttle.region"(%arg) ({
     ^bb0(%region_arg: tensor<2x4xf32>):
       %zero = arith.constant dense<0.0> : tensor<f32>
-      // expected-error @+1 {{reduction dimensions must be non-negative and unique}}
+      // expected-error @+1 {{reduction dimensions must be unique dimensions of the indexing domain}}
       %folded = "shuttle.fold"(%region_arg, %zero) ({
       ^bb0(%left: f32, %right: f32):
         %sum = arith.addf %left, %right : f32
         "shuttle.yield"(%sum) : (f32) -> ()
       }) {
+
+        indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0)>],
         accumulator_types = [f32],
         operandSegmentSizes = array<i32: 1, 1>,
         order_free = false,
@@ -96,6 +98,8 @@ module {
         %sum = arith.addf %left, %right : f32
         "shuttle.yield"(%sum) : (f32) -> ()
       }) {
+
+        indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0)>],
         accumulator_types = [f32],
         operandSegmentSizes = array<i32: 1, 1>,
         order_free = false,
@@ -119,12 +123,18 @@ module {
     %result = "shuttle.region"(%arg) ({
     ^bb0(%region_arg: tensor<2x4xf32>):
       %zero = arith.constant dense<0.0> : tensor<f32>
-      // expected-error @+1 {{reduction dimension is outside an input rank}}
+      // expected-error @+1 {{reduction dimensions must be unique dimensions of the indexing domain}}
       %folded = "shuttle.fold"(%region_arg, %zero) ({
       ^bb0(%left: f32, %right: f32):
         %sum = arith.addf %left, %right : f32
         "shuttle.yield"(%sum) : (f32) -> ()
-      }) {accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 2>, source = #shuttle.source_ref<0, 0, 0, 0>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2x4xf32>
+      }) {
+        indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>,
+                         affine_map<(d0, d1) -> (d0, d1)>],
+        accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>,
+        order_free = true, reduction_dimensions = array<i64: 2>,
+        source = #shuttle.source_ref<0, 0, 0, 0>
+      } : (tensor<2x4xf32>, tensor<f32>) -> tensor<2x4xf32>
       "shuttle.yield"(%folded) : (tensor<2x4xf32>) -> ()
     }) {policy = #shuttle.policy<source_ordered>, source_refs = [#shuttle.source_ref<0, 0, 0, 0>]} : (tensor<2x4xf32>) -> tensor<2x4xf32>
     return %result : tensor<2x4xf32>
@@ -138,12 +148,14 @@ module {
     %result = "shuttle.region"(%arg) ({
     ^bb0(%region_arg: tensor<2x4xf32>):
       %zero = arith.constant dense<0.0> : tensor<f32>
-      // expected-error @+1 {{result shape must equal the input shape with reduced dimensions removed}}
+      // expected-error @+1 {{indexing maps bind one domain dimension to inconsistent static extents}}
       %folded = "shuttle.fold"(%region_arg, %zero) ({
       ^bb0(%left: f32, %right: f32):
         %sum = arith.addf %left, %right : f32
         "shuttle.yield"(%sum) : (f32) -> ()
       }) {
+
+        indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0)>],
         accumulator_types = [f32],
         operandSegmentSizes = array<i32: 1, 1>,
         order_free = false,

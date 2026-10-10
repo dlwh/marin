@@ -572,8 +572,8 @@ protected:
       }
       AffineMap inputMap =
           cast<AffineMapAttr>(candidate.getIndexingMaps()[0]).getValue();
-      unsigned expandingSingletons = llvm::count_if(
-          inputMap.getResults(), [](AffineExpr expression) {
+      unsigned expandingSingletons =
+          llvm::count_if(inputMap.getResults(), [](AffineExpr expression) {
             auto binary = dyn_cast<AffineBinaryOpExpr>(expression);
             return binary && binary.getKind() == AffineExprKind::FloorDiv;
           });
@@ -593,8 +593,7 @@ protected:
   expandedInputExpression(MapOp operation) {
     AffineMap inputMap =
         cast<AffineMapAttr>(operation.getIndexingMaps()[0]).getValue();
-    for (auto [position, expression] :
-         llvm::enumerate(inputMap.getResults())) {
+    for (auto [position, expression] : llvm::enumerate(inputMap.getResults())) {
       auto binary = dyn_cast<AffineBinaryOpExpr>(expression);
       if (binary && binary.getKind() == AffineExprKind::FloorDiv) {
         return {position, binary};
@@ -669,16 +668,16 @@ public:
       AffineMap resultMap = cast<AffineMapAttr>(maps.back()).getValue();
       SmallVector<AffineExpr> resultExpressions(resultMap.getResults());
       std::swap(resultExpressions.front(), resultExpressions.back());
-      maps.back() = AffineMapAttr::get(AffineMap::get(
-          resultMap.getNumDims(), 0, resultExpressions,
-          operation.getContext()));
+      maps.back() = AffineMapAttr::get(AffineMap::get(resultMap.getNumDims(), 0,
+                                                      resultExpressions,
+                                                      operation.getContext()));
     } else {
       operation.emitOpError("unknown projected parameter mutation kind");
       return signalPassFailure();
     }
-    maps.front() = AffineMapAttr::get(AffineMap::get(
-        inputMap.getNumDims(), numSymbols, expressions,
-        operation.getContext()));
+    maps.front() =
+        AffineMapAttr::get(AffineMap::get(inputMap.getNumDims(), numSymbols,
+                                          expressions, operation.getContext()));
     operation->setAttr("indexing_maps",
                        ArrayAttr::get(operation.getContext(), maps));
   }
@@ -737,8 +736,8 @@ public:
       operation.emitOpError("test fixture has no direct mapped broadcast axis");
       return signalPassFailure();
     }
-    expressions[expandedPosition] =
-        (*direct).floorDiv(cast<AffineConstantExpr>(expanded.getRHS()).getValue());
+    expressions[expandedPosition] = (*direct).floorDiv(
+        cast<AffineConstantExpr>(expanded.getRHS()).getValue());
     replaceInputMap(operation,
                     AffineMap::get(inputMap.getNumDims(), 0, expressions,
                                    operation.getContext()));
@@ -1173,12 +1172,14 @@ bool isExpandingSingletonMapTask(
     return false;
   }
   int64_t inputOrdinal = task.getInputBuffers().front();
-  if (inputOrdinal < 0 || inputOrdinal >= static_cast<int64_t>(buffers.size())) {
+  if (inputOrdinal < 0 ||
+      inputOrdinal >= static_cast<int64_t>(buffers.size())) {
     return false;
   }
-  auto input = dyn_cast<RankedTensorType>(buffers[inputOrdinal].getTensorType());
-  if (!input || input.getRank() !=
-                    static_cast<int64_t>(task.getDomainShape().size())) {
+  auto input =
+      dyn_cast<RankedTensorType>(buffers[inputOrdinal].getTensorType());
+  if (!input ||
+      input.getRank() != static_cast<int64_t>(task.getDomainShape().size())) {
     return false;
   }
   unsigned expansions = 0;
@@ -1203,12 +1204,14 @@ bool isProjectedParameterMapTask(
     return false;
   }
   int64_t inputOrdinal = task.getInputBuffers().front();
-  if (inputOrdinal < 0 || inputOrdinal >= static_cast<int64_t>(buffers.size())) {
+  if (inputOrdinal < 0 ||
+      inputOrdinal >= static_cast<int64_t>(buffers.size())) {
     return false;
   }
-  auto input = dyn_cast<RankedTensorType>(buffers[inputOrdinal].getTensorType());
-  if (!input || input.getRank() !=
-                    static_cast<int64_t>(task.getDomainShape().size())) {
+  auto input =
+      dyn_cast<RankedTensorType>(buffers[inputOrdinal].getTensorType());
+  if (!input ||
+      input.getRank() != static_cast<int64_t>(task.getDomainShape().size())) {
     return false;
   }
   unsigned expansions = 0;
@@ -1359,9 +1362,11 @@ bool foldYieldIs(FoldOp fold, StringRef operationName) {
       combiner->getNumOperands() != 2) {
     return false;
   }
-  return llvm::all_of(combiner->getOperands(), [&](Value operand) {
-    return operand == body.getArgument(0) || operand == body.getArgument(1);
-  }) &&
+  return llvm::all_of(combiner->getOperands(),
+                      [&](Value operand) {
+                        return operand == body.getArgument(0) ||
+                               operand == body.getArgument(1);
+                      }) &&
          combiner->getOperand(0) != combiner->getOperand(1);
 }
 
@@ -1442,8 +1447,7 @@ public:
 FailureOr<int64_t> staticTensorBytes(Type type) {
   auto tensor = dyn_cast<RankedTensorType>(type);
   if (!tensor || !tensor.hasStaticShape() ||
-      (!tensor.getElementType().isF32() &&
-       !tensor.getElementType().isBF16() &&
+      (!tensor.getElementType().isF32() && !tensor.getElementType().isBF16() &&
        !tensor.getElementType().isInteger(32) &&
        !tensor.getElementType().isInteger(1))) {
     return failure();
@@ -1456,8 +1460,7 @@ FailureOr<int64_t> staticTensorBytes(Type type) {
     elements *= extent;
   }
   const int64_t elementBytes =
-      tensor.getElementType().isF32() ||
-              tensor.getElementType().isInteger(32)
+      tensor.getElementType().isF32() || tensor.getElementType().isInteger(32)
           ? 4
           : (tensor.getElementType().isBF16() ? 2 : 1);
   if (elements > INT64_MAX / elementBytes) {
@@ -1526,9 +1529,19 @@ FailureOr<AffineMap> projectedReductionCoordinates(Type scoreType,
   return AffineMap::get(score.getRank(), 0, coordinates, score.getContext());
 }
 
-FailureOr<SmallVector<int64_t>> onlineRelationDomainAxes(
-    MaterializationTaskOp task, RegionOp region,
-    ArrayRef<RelationOp> relations, int64_t relationRank);
+FailureOr<SmallVector<int64_t>>
+onlineRelationDomainAxes(MaterializationTaskOp task, RegionOp region,
+                         ArrayRef<RelationOp> relations, int64_t relationRank);
+
+bool isStructuralOnlineTask(MaterializationTaskOp task) {
+  return !task->hasAttr("composition_kind") &&
+         task->hasAttr("composition_sources") &&
+         task->hasAttr("composition_owner_dimensions") &&
+         task->hasAttr("composition_stream_dimensions") &&
+         task->hasAttr("composition_producer_contraction_dimensions") &&
+         task->hasAttr("composition_consumer_contraction_dimensions") &&
+         task.getOnlineVectorDimensionsAttr();
+}
 
 class VerifyOnlineSufficientStatePass
     : public MutationPass<VerifyOnlineSufficientStatePass> {
@@ -1544,31 +1557,29 @@ public:
   void runOnOperation() override {
     ModuleOp module = getOperation();
     auto manifest = module->getAttrOfType<DictionaryAttr>(kManifest);
-    auto manifestPolicy = manifest ? manifest.getAs<StringAttr>("policy")
-                                   : StringAttr{};
+    auto manifestPolicy =
+        manifest ? manifest.getAs<StringAttr>("policy") : StringAttr{};
     auto canonicalOptions =
         manifest ? manifest.getAs<StringAttr>("canonical_options")
                  : StringAttr{};
-    auto canonicalTuning =
-        manifest ? manifest.getAs<StringAttr>("canonical_tuning")
-                 : StringAttr{};
-    auto policyDigest = manifest ? manifest.getAs<StringAttr>("policy_digest")
-                                 : StringAttr{};
-    auto tuningDigest = manifest ? manifest.getAs<StringAttr>("tuning_digest")
-                                 : StringAttr{};
+    auto canonicalTuning = manifest
+                               ? manifest.getAs<StringAttr>("canonical_tuning")
+                               : StringAttr{};
+    auto policyDigest =
+        manifest ? manifest.getAs<StringAttr>("policy_digest") : StringAttr{};
+    auto tuningDigest =
+        manifest ? manifest.getAs<StringAttr>("tuning_digest") : StringAttr{};
     if (!manifestPolicy || manifestPolicy.getValue() != "fast" ||
         !canonicalOptions ||
-        canonicalOptions.getValue() != kFastFusionOptions ||
-        !canonicalTuning || canonicalTuning.getValue() != kFastFusionTuning ||
-        !policyDigest || policyDigest.getValue() != kFastFusionPolicyDigest ||
-        !tuningDigest || tuningDigest.getValue() != kFastFusionTuningDigest) {
+        canonicalOptions.getValue() != kFastFusionOptions || !canonicalTuning ||
+        canonicalTuning.getValue() != kFastFusionTuning || !policyDigest ||
+        policyDigest.getValue() != kFastFusionPolicyDigest || !tuningDigest ||
+        tuningDigest.getValue() != kFastFusionTuningDigest) {
       module.emitError("online planning lacks exact FAST policy identity");
       return signalPassFailure();
     }
     SmallVector<RegionOp> regions;
     module.walk([&](RegionOp region) { regions.push_back(region); });
-    constexpr llvm::StringLiteral kind =
-        "online_normalized_exponential_weighted_contract";
     MaterializationPlanOp plan;
     llvm::SmallDenseSet<Attribute> plannedSources;
     llvm::SmallDenseSet<Attribute> plannedRecomputedSources;
@@ -1586,8 +1597,7 @@ public:
       DictionaryAttr candidateCost;
       for (MaterializationTaskOp task :
            candidate.getBody().front().getOps<MaterializationTaskOp>()) {
-        auto taskKind = task.getCompositionKind();
-        if (!taskKind || *taskKind != kind) {
+        if (!isStructuralOnlineTask(task)) {
           continue;
         }
         std::optional<ArrayAttr> sources = task.getCompositionSources();
@@ -1639,7 +1649,8 @@ public:
       }
     }
     if (!plan || plannedSources.empty() || !cost) {
-      module.emitError("requires online composition semantics and cost evidence");
+      module.emitError(
+          "requires online composition semantics and cost evidence");
       return signalPassFailure();
     }
 
@@ -1677,7 +1688,7 @@ public:
       return signalPassFailure();
     }
     llvm::SmallDenseSet<Operation *> onlineOperations(onlineAlgebra.begin(),
-                                                       onlineAlgebra.end());
+                                                      onlineAlgebra.end());
     for (Operation *operation : onlineAlgebra) {
       for (Value operand : operation->getOperands()) {
         Operation *producer = operand.getDefiningOp();
@@ -1750,17 +1761,16 @@ public:
         });
     MapOp scoreMinusMaximumMap;
     Value maximumExpansion;
-    if (exponentialMap && maximumFold &&
-        maximumFold.getInputs().size() == 1) {
+    if (exponentialMap && maximumFold && maximumFold.getInputs().size() == 1) {
       auto exponentialArgument =
           mapYieldUnaryArgument(exponentialMap, "math.exp");
       if (exponentialArgument) {
         Value input = exponentialMap.getInputs()[*exponentialArgument];
         auto candidate = input.getDefiningOp<MapOp>();
-        auto arguments = candidate ? mapYieldBinaryArguments(
-                                         candidate,
-                                         arith::SubFOp::getOperationName())
-                                   : std::nullopt;
+        auto arguments = candidate
+                             ? mapYieldBinaryArguments(
+                                   candidate, arith::SubFOp::getOperationName())
+                             : std::nullopt;
         if (arguments &&
             candidate.getInputs()[arguments->first] ==
                 maximumFold.getInputs().front() &&
@@ -1775,27 +1785,25 @@ public:
         additiveFold && exponentialMap &&
         additiveFold.getInputs().size() == 1 &&
         exponentialMap.getResults().size() == 1 &&
-        additiveFold.getInputs().front() ==
-            exponentialMap.getResults().front();
+        additiveFold.getInputs().front() == exponentialMap.getResults().front();
     std::optional<unsigned> normalizedWeightOperand;
     Value denominatorExpansion;
     if (weightedContract && additiveFold && exponentialMap) {
       for (auto [operandNumber, input] :
            llvm::enumerate(weightedContract.getInputs())) {
         auto normalization = input.getDefiningOp<MapOp>();
-        auto arguments = normalization
-                             ? mapYieldBinaryArguments(
-                                   normalization, arith::DivFOp::getOperationName())
-                             : std::nullopt;
-        if (arguments &&
-            exponentialMap.getResults().size() == 1 &&
+        auto arguments =
+            normalization
+                ? mapYieldBinaryArguments(normalization,
+                                          arith::DivFOp::getOperationName())
+                : std::nullopt;
+        if (arguments && exponentialMap.getResults().size() == 1 &&
             normalization.getInputs()[arguments->first] ==
                 exponentialMap.getResults().front() &&
             valueDependsOn(normalization.getInputs()[arguments->second],
                            additiveFold)) {
           normalizedWeightOperand = operandNumber;
-          denominatorExpansion =
-              normalization.getInputs()[arguments->second];
+          denominatorExpansion = normalization.getInputs()[arguments->second];
           break;
         }
       }
@@ -1841,11 +1849,11 @@ public:
           maximumExpansion, maximumFold.getResults().front());
       FailureOr<AffineMap> denominatorCoordinates = mapCoordinatesToAncestor(
           denominatorExpansion, additiveFold.getResults().front());
-      stateCoordinatesAlign =
-          succeeded(expected) && succeeded(maximumCoordinates) &&
-          succeeded(denominatorCoordinates) &&
-          *maximumCoordinates == *expected &&
-          *denominatorCoordinates == *expected;
+      stateCoordinatesAlign = succeeded(expected) &&
+                              succeeded(maximumCoordinates) &&
+                              succeeded(denominatorCoordinates) &&
+                              *maximumCoordinates == *expected &&
+                              *denominatorCoordinates == *expected;
     }
     bool contractionReducesStateCoordinate = false;
     if (reductionsAlign && weightedContract &&
@@ -1865,9 +1873,10 @@ public:
             reduction >= inputType.getRank()) {
           continue;
         }
-        auto domain = dyn_cast<AffineDimExpr>(map.getValue().getResult(reduction));
-        if (!domain ||
-            domain.getPosition() >= weightedContract.getIteratorKinds().size()) {
+        auto domain =
+            dyn_cast<AffineDimExpr>(map.getValue().getResult(reduction));
+        if (!domain || domain.getPosition() >=
+                           weightedContract.getIteratorKinds().size()) {
           continue;
         }
         auto iterator = dyn_cast<StringAttr>(
@@ -1876,15 +1885,14 @@ public:
             iterator && iterator.getValue() == "reduction";
       }
     }
-    const bool scoreSourcesOwned = plannedRecomputedSources.empty() &&
+    const bool scoreSourcesOwned =
+        plannedRecomputedSources.empty() &&
         llvm::all_of(requiredRecomputedSources, [&](Attribute source) {
           return plannedSources.contains(source);
         });
-    if (!relationFeedsScore || !contractFeedsScore ||
-        !exponentialUsesMaximum || !scoreMinusMaximumMap ||
-        !denominatorUsesExponential ||
-        !normalizedWeightOperand || !reductionsAlign ||
-        !scoreSourcesOwned ||
+    if (!relationFeedsScore || !contractFeedsScore || !exponentialUsesMaximum ||
+        !scoreMinusMaximumMap || !denominatorUsesExponential ||
+        !normalizedWeightOperand || !reductionsAlign || !scoreSourcesOwned ||
         !stateCoordinatesAlign || !contractionReducesStateCoordinate) {
       module.emitError(
           "online composition does not prove {m,l,o} state semantics");
@@ -1914,14 +1922,15 @@ public:
          plan.getBody().front().getOps<MaterializationBufferOp>()) {
       if (buffer.getStorage() == MaterializationStorage::Temporary &&
           buffer.getTensorType() == scoreType) {
-        module.emitError("online composition materializes representative scores");
+        module.emitError(
+            "online composition materializes representative scores");
         return signalPassFailure();
       }
       auto producer = buffer.getProducer();
       const bool producedByOnline =
           producer && compositionTaskOrdinals.contains(*producer);
-      const bool consumedByOnline = llvm::any_of(
-          buffer.getConsumers(), [&](int64_t consumer) {
+      const bool consumedByOnline =
+          llvm::any_of(buffer.getConsumers(), [&](int64_t consumer) {
             return compositionTaskOrdinals.contains(consumer);
           });
       // Charge both sides of the composition cut, including all accesses to a
@@ -1938,7 +1947,8 @@ public:
               static_cast<int64_t>(buffer.getConsumers().size()) +
                   (producer ? 1 : 0),
               actualCandidateTraffic))) {
-        module.emitError("online candidate buffer cost is not statically bounded");
+        module.emitError(
+            "online candidate buffer cost is not statically bounded");
         return signalPassFailure();
       }
     }
@@ -1948,9 +1958,10 @@ public:
     // values produced or consumed across the selected composition boundary.
     for (Operation *operation : algebra) {
       for (Value result : operation->getResults()) {
-        const bool liveOut = llvm::any_of(result.getUses(), [&](OpOperand &use) {
-          return use.getOwner() == regionYield;
-        });
+        const bool liveOut =
+            llvm::any_of(result.getUses(), [&](OpOperand &use) {
+              return use.getOwner() == regionYield;
+            });
         llvm::SmallDenseSet<Operation *> consumers;
         bool consumedByOnline = false;
         for (OpOperand &use : result.getUses()) {
@@ -1967,7 +1978,8 @@ public:
             failed(checkedAccumulateTraffic(
                 *bytes, static_cast<int64_t>(consumers.size()) + 1,
                 actualBaselineTraffic))) {
-          module.emitError("materialized baseline cost is not statically bounded");
+          module.emitError(
+              "materialized baseline cost is not statically bounded");
           return signalPassFailure();
         }
       }
@@ -1985,9 +1997,9 @@ public:
     auto candidateTraffic = integerCost("candidate_temporary_traffic_bytes");
     auto contractEvaluations = integerCost("contract_evaluations");
     const int64_t expectedContractEvaluations =
-        llvm::count_if(onlineAlgebra, [](Operation *operation) {
-          return isa<ContractOp>(operation);
-        }) +
+        llvm::count_if(
+            onlineAlgebra,
+            [](Operation *operation) { return isa<ContractOp>(operation); }) +
         llvm::count_if(plannedRecomputedSources, [&](Attribute source) {
           return llvm::any_of(algebra, [&](Operation *operation) {
             return operation->getAttr("source") == source &&
@@ -2010,9 +2022,10 @@ public:
           "online composition lacks relative cost and traffic improvement");
       return signalPassFailure();
     }
-    llvm::outs() << "online_state = {m,l,o}; source_cut = complete; "
-                    "representative_score_materialized = false; "
-                    "temporary_bytes = improved; temporary_traffic = improved\n";
+    llvm::outs()
+        << "online_state = {m,l,o}; source_cut = complete; "
+           "representative_score_materialized = false; "
+           "temporary_bytes = improved; temporary_traffic = improved\n";
   }
 };
 
@@ -2030,8 +2043,7 @@ struct OnlinePtxInstruction {
   std::string branchTarget;
 };
 
-using OnlineDefinitionState =
-    std::map<std::string, std::set<int64_t>>;
+using OnlineDefinitionState = std::map<std::string, std::set<int64_t>>;
 constexpr int64_t kOnlineUndefinedDefinition = -1;
 
 struct OnlinePtxCfg {
@@ -2087,8 +2099,7 @@ std::vector<std::string> onlinePtxTokens(StringRef text) {
   return tokens;
 }
 
-bool onlinePtxDefinesValue(StringRef opcode,
-                           ArrayRef<std::string> operands) {
+bool onlinePtxDefinesValue(StringRef opcode, ArrayRef<std::string> operands) {
   return !operands.empty() && StringRef(operands.front()).starts_with("%") &&
          !opcode.starts_with("st.") && !opcode.starts_with("bra") &&
          !opcode.starts_with("bar.") && opcode != "ret" && opcode != "exit";
@@ -2131,8 +2142,7 @@ FailureOr<OnlinePtxCfg> onlinePtxCfg(StringRef ptx) {
     }
     if (line.starts_with("// shuttle.online.logical_dimension ")) {
       int64_t dimension = -1;
-      if (line
-              .drop_front(
+      if (line.drop_front(
                   StringRef("// shuttle.online.logical_dimension ").size())
               .getAsInteger(10, dimension) ||
           dimension < 0)
@@ -2288,8 +2298,7 @@ std::set<int64_t> onlineReachingDefinitions(const OnlinePtxCfg &cfg,
   return definitions;
 }
 
-bool onlineBlockReachable(const OnlinePtxCfg &cfg, int64_t from,
-                          int64_t to) {
+bool onlineBlockReachable(const OnlinePtxCfg &cfg, int64_t from, int64_t to) {
   std::set<int64_t> seen;
   std::vector<int64_t> worklist{from};
   while (!worklist.empty()) {
@@ -2314,12 +2323,12 @@ bool onlineRoleDirectlyReaches(const OnlinePtxCfg &cfg, StringRef role,
                                 cfg.instructions[consumer].predicate) ==
           std::set<int64_t>{producer->second})
     return true;
-  return llvm::any_of(
-      llvm::drop_begin(cfg.instructions[consumer].operands),
-      [&](const std::string &operand) {
-        return onlineReachingDefinitions(cfg, consumer, operand) ==
-               std::set<int64_t>{producer->second};
-      });
+  return llvm::any_of(llvm::drop_begin(cfg.instructions[consumer].operands),
+                      [&](const std::string &operand) {
+                        return onlineReachingDefinitions(cfg, consumer,
+                                                         operand) ==
+                               std::set<int64_t>{producer->second};
+                      });
 }
 
 bool onlineInstructionTransitivelyDependsOn(
@@ -2330,8 +2339,7 @@ bool onlineInstructionTransitivelyDependsOn(
   if (!active.insert({consumer, producer}).second)
     return false;
   const OnlinePtxInstruction &instruction = cfg.instructions[consumer];
-  SmallVector<std::string> dependencies(
-      llvm::drop_begin(instruction.operands));
+  SmallVector<std::string> dependencies(llvm::drop_begin(instruction.operands));
   if (!instruction.predicate.empty())
     dependencies.push_back(instruction.predicate);
   for (const std::string &dependency : dependencies) {
@@ -2359,8 +2367,8 @@ bool onlineRoleTransitivelyDependsOn(const OnlinePtxCfg &cfg,
   if (consumer == cfg.roles.end() || producer == cfg.roles.end())
     return false;
   std::set<std::pair<int64_t, int64_t>> active;
-  return onlineInstructionTransitivelyDependsOn(
-      cfg, consumer->second, producer->second, active);
+  return onlineInstructionTransitivelyDependsOn(cfg, consumer->second,
+                                                producer->second, active);
 }
 
 bool onlineDefinitionDependsOnSource(
@@ -2465,8 +2473,7 @@ FailureOr<int64_t> onlineIotaLogicalDimension(RelationOp iota) {
       return dimension;
     if (user.getSemantics() == RelationSemantics::Reshape) {
       auto inputType = dyn_cast<RankedTensorType>(value.getType());
-      auto outputType =
-          dyn_cast<RankedTensorType>(user.getResult(0).getType());
+      auto outputType = dyn_cast<RankedTensorType>(user.getResult(0).getType());
       if (!inputType || !outputType || dimension < 0 ||
           dimension >= inputType.getRank())
         return failure();
@@ -2478,8 +2485,7 @@ FailureOr<int64_t> onlineIotaLogicalDimension(RelationOp iota) {
       if (candidates.size() != 1)
         return failure();
       dimension = candidates.front();
-    } else if (user.getSemantics() ==
-               RelationSemantics::BroadcastInDim) {
+    } else if (user.getSemantics() == RelationSemantics::BroadcastInDim) {
       if (dimension < 0 || dimension >= user.getParameters().size())
         return failure();
       auto mapped = dyn_cast<IntegerAttr>(user.getParameters()[dimension]);
@@ -2549,9 +2555,8 @@ OnlineIndexAlternatives onlineIndexAlternatives(
     }
     SmallVector<OnlineIndexAlternatives> operands;
     for (const std::string &operand : llvm::drop_begin(producer.operands))
-      operands.push_back(
-          onlineIndexAlternatives(cfg, definition, operand, context, active,
-                                  symbolicDefinitions));
+      operands.push_back(onlineIndexAlternatives(
+          cfg, definition, operand, context, active, symbolicDefinitions));
     if (llvm::any_of(operands, [](const OnlineIndexAlternatives &operand) {
           return !operand.valid;
         })) {
@@ -2562,8 +2567,7 @@ OnlineIndexAlternatives onlineIndexAlternatives(
       llvm::append_range(result.intermediates, operand.intermediates);
     StringRef opcode = producer.opcode;
     for (AffineExpr left : operands.front().values) {
-      if (opcode == "mov.u32" || opcode == "mov.s32" ||
-          opcode == "mov.b32") {
+      if (opcode == "mov.u32" || opcode == "mov.s32" || opcode == "mov.b32") {
         if (operands.size() != 1)
           result.valid = false;
         else
@@ -2731,8 +2735,7 @@ bool onlineIndexExprFitsBuffer(AffineExpr expression,
       physical[axis] = remainder % launchExtents[axis];
       remainder /= launchExtents[axis];
     }
-    FailureOr<int64_t> index =
-        evaluateOnlineIndexExpr(expression, physical);
+    FailureOr<int64_t> index = evaluateOnlineIndexExpr(expression, physical);
     if (failed(index) || *index >= elementCount)
       return false;
   }
@@ -2749,8 +2752,7 @@ bool onlineBlocksAreAcyclic(const OnlinePtxCfg &cfg,
   for (int64_t block : blocks)
     for (int64_t successor : cfg.successors[block])
       if (blocks.contains(successor) &&
-          certifiedBackedge !=
-              std::pair<int64_t, int64_t>{block, successor})
+          certifiedBackedge != std::pair<int64_t, int64_t>{block, successor})
         ++indegree[successor];
   SmallVector<int64_t> ready;
   for (auto [block, degree] : indegree)
@@ -2762,8 +2764,7 @@ bool onlineBlocksAreAcyclic(const OnlinePtxCfg &cfg,
     ++visited;
     for (int64_t successor : cfg.successors[block]) {
       if (!blocks.contains(successor) ||
-          certifiedBackedge ==
-              std::pair<int64_t, int64_t>{block, successor})
+          certifiedBackedge == std::pair<int64_t, int64_t>{block, successor})
         continue;
       if (--indegree[successor] == 0)
         ready.push_back(successor);
@@ -2777,8 +2778,8 @@ struct OnlineLogicalCoordinateProof {
   SmallVector<int64_t> launchExtents;
 };
 
-FailureOr<OnlineLogicalCoordinateProof> onlineLogicalCoordinateMaps(
-    DeviceEntryOp entry, ScheduleTaskOp schedule) {
+FailureOr<OnlineLogicalCoordinateProof>
+onlineLogicalCoordinateMaps(DeviceEntryOp entry, ScheduleTaskOp schedule) {
   auto maps = entry->getAttrOfType<ArrayAttr>("logical_coordinate_maps");
   if (!maps || maps.size() != schedule.getDomainShape().size())
     return failure();
@@ -2796,7 +2797,12 @@ FailureOr<OnlineLogicalCoordinateProof> onlineLogicalCoordinateMaps(
   llvm::copy(entry.getGrid().value_or(ArrayRef<int64_t>()), grid.begin());
   llvm::copy(entry.getBlock().value_or(ArrayRef<int64_t>()), block.begin());
   SmallVector<int64_t> launchExtents{
-      grid[0],  grid[1],  grid[2], block[0], block[1], block[2],
+      grid[0],
+      grid[1],
+      grid[2],
+      block[0],
+      block[1],
+      block[2],
       static_cast<int64_t>(schedule.getSerialTiles())};
   int64_t launches = 1;
   for (int64_t extent : launchExtents) {
@@ -2819,8 +2825,8 @@ FailureOr<OnlineLogicalCoordinateProof> onlineLogicalCoordinateMaps(
           evaluateOnlineAffineExpr(expression, physical);
       if (failed(coordinate))
         return failure();
-      inBounds &= *coordinate >= 0 &&
-                  *coordinate < schedule.getDomainShape()[axis];
+      inBounds &=
+          *coordinate >= 0 && *coordinate < schedule.getDomainShape()[axis];
       logical.push_back(*coordinate);
     }
     if (inBounds && !covered.insert(logical).second)
@@ -2837,9 +2843,9 @@ FailureOr<OnlineLogicalCoordinateProof> onlineLogicalCoordinateMaps(
   return OnlineLogicalCoordinateProof{coordinates, launchExtents};
 }
 
-FailureOr<SmallVector<int64_t>> onlineRelationDomainAxes(
-    MaterializationTaskOp task, RegionOp region,
-    ArrayRef<RelationOp> relations, int64_t relationRank) {
+FailureOr<SmallVector<int64_t>>
+onlineRelationDomainAxes(MaterializationTaskOp task, RegionOp region,
+                         ArrayRef<RelationOp> relations, int64_t relationRank) {
   Operation *anchor = nullptr;
   for (Operation &operation : region.getBody().front().without_terminator())
     if (operation.getAttr("source") == task.getSource())
@@ -2871,9 +2877,8 @@ FailureOr<SmallVector<int64_t>> onlineRelationDomainAxes(
   }
   if (!scoreOperand || *scoreOperand >= contract.getIndexingMaps().size())
     return failure();
-  AffineMap scoreMap = cast<AffineMapAttr>(
-                           contract.getIndexingMaps()[*scoreOperand])
-                           .getValue();
+  AffineMap scoreMap =
+      cast<AffineMapAttr>(contract.getIndexingMaps()[*scoreOperand]).getValue();
   if (scoreMap.getNumResults() != relationRank ||
       scoreMap.getNumDims() != task.getDomainShape().size())
     return failure();
@@ -2909,8 +2914,7 @@ FailureOr<std::string> onlineComparisonOpcode(RelationOp relation);
 
 bool onlineRelationSourceClosure(
     const OnlinePtxCfg &cfg, ArrayRef<RelationOp> relations,
-    ArrayRef<AffineExpr> logicalCoordinates,
-    ArrayRef<int64_t> launchExtents,
+    ArrayRef<AffineExpr> logicalCoordinates, ArrayRef<int64_t> launchExtents,
     ArrayRef<int64_t> relationDomainAxes, MLIRContext *context,
     DictionaryAttr reductionCertificate = DictionaryAttr(),
     std::optional<int64_t> reductionDimension = std::nullopt) {
@@ -2923,13 +2927,11 @@ bool onlineRelationSourceClosure(
         auto realization = node && kind && kind.getValue() == "leaf_family"
                                ? node.getAs<DictionaryAttr>("realization")
                                : DictionaryAttr();
-        auto coordinate =
-            realization
-                ? realization.getAs<StringAttr>("coordinate_role")
-                : StringAttr();
-        auto found = coordinate
-                         ? cfg.roles.find(coordinate.getValue().str())
-                         : cfg.roles.end();
+        auto coordinate = realization
+                              ? realization.getAs<StringAttr>("coordinate_role")
+                              : StringAttr();
+        auto found = coordinate ? cfg.roles.find(coordinate.getValue().str())
+                                : cfg.roles.end();
         if (found != cfg.roles.end())
           certifiedLoopCoordinates.insert(found->second);
       }
@@ -2957,108 +2959,111 @@ bool onlineRelationSourceClosure(
                                      onlineSourceKey(operandSource));
       };
       switch (relation.getSemantics()) {
-    case RelationSemantics::Iota: {
-      FailureOr<int64_t> logicalDimension =
-          onlineIotaLogicalDimension(relation);
-      if (!StringRef(ptx.opcode).starts_with("mov.u32") &&
-          !StringRef(ptx.opcode).starts_with("mov.s32"))
-        return false;
-      if (failed(logicalDimension) || *logicalDimension < 0 ||
-          *logicalDimension >= relationDomainAxes.size() ||
-          relationDomainAxes[*logicalDimension] < 0 ||
-          relationDomainAxes[*logicalDimension] >= logicalCoordinates.size() ||
-          ptx.operands.size() != 2 ||
-          !StringRef(ptx.operands[1]).starts_with("%"))
-        return false;
-      std::set<std::pair<int64_t, std::string>> active;
-      OnlineIndexAlternatives alternatives = onlineIndexAlternatives(
-          cfg, sourceInstruction, ptx.operands[1], context, active);
-      AffineExpr expected =
-          logicalCoordinates[relationDomainAxes[*logicalDimension]];
-      const bool physicalCoordinate =
-          alternatives.valid && !alternatives.values.empty() &&
-          llvm::all_of(alternatives.values, [&](AffineExpr value) {
-            return value == expected &&
-                   onlineIndexExprFitsLaunchDomain(value, launchExtents);
-          }) &&
-          llvm::all_of(alternatives.intermediates, [&](AffineExpr value) {
-            return onlineIndexExprFitsLaunchDomain(value, launchExtents);
-          });
-      const bool loopCoordinate =
-          reductionDimension &&
-          relationDomainAxes[*logicalDimension] == *reductionDimension &&
-          certifiedLoopCoordinates.contains(sourceInstruction);
-      if (!physicalCoordinate && !loopCoordinate)
-        return false;
-      if (loopCoordinate)
-        validatedLoopCoordinates.insert(sourceInstruction);
-      break;
-    }
-    case RelationSemantics::Constant: {
-      if (!StringRef(ptx.opcode).starts_with("mov.") ||
-          relation.getParameters().size() != 1)
-        return false;
-      auto value = dyn_cast<IntegerAttr>(relation.getParameters()[0]);
-      if (!value || !llvm::is_contained(ptx.operands,
-                                        Twine(value.getInt()).str()))
-        return false;
-      break;
-    }
-    case RelationSemantics::Reshape:
-    case RelationSemantics::BroadcastInDim:
-      if (!StringRef(ptx.opcode).starts_with("mov.") ||
-          !relationOperandSource(0, 1))
-        return false;
-      break;
-    case RelationSemantics::Add:
-      if ((!StringRef(ptx.opcode).starts_with("add.s32") &&
-           !StringRef(ptx.opcode).starts_with("add.u32")) ||
-          !relationOperandSource(0, 1) || !relationOperandSource(1, 2))
-        return false;
-      break;
-    case RelationSemantics::Compare: {
-      FailureOr<std::string> opcode = onlineComparisonOpcode(relation);
-      if (failed(opcode) || !StringRef(ptx.opcode).starts_with(*opcode) ||
-          !relationOperandSource(0, 1) || !relationOperandSource(1, 2))
-        return false;
-      break;
-    }
-    case RelationSemantics::Convert: {
-      const bool select =
-          StringRef(ptx.opcode) == "selp.f32" &&
-          ptx.operands.size() == 4 &&
-          ptx.operands[1] == "0f3F800000" &&
-          ptx.operands[2] == "0f00000000" &&
-          relationOperandSource(0, 3);
-      if (!select)
-        return false;
-      break;
-    }
-    case RelationSemantics::Select: {
-      if (!StringRef(ptx.opcode).starts_with("selp.f32"))
-        return false;
-      auto predicate = relation.getInputs().front().getDefiningOp<RelationOp>();
-      SourceRefAttr predicateSource =
-          predicate ? predicate->getAttrOfType<SourceRefAttr>("source")
-                    : SourceRefAttr();
-      if (!predicateSource ||
-          !onlineSourceOperandIs(cfg, sourceInstruction, 3,
-                                 onlineSourceKey(predicateSource)))
-        return false;
-      break;
-    }
+      case RelationSemantics::Iota: {
+        FailureOr<int64_t> logicalDimension =
+            onlineIotaLogicalDimension(relation);
+        if (!StringRef(ptx.opcode).starts_with("mov.u32") &&
+            !StringRef(ptx.opcode).starts_with("mov.s32"))
+          return false;
+        if (failed(logicalDimension) || *logicalDimension < 0 ||
+            *logicalDimension >= relationDomainAxes.size() ||
+            relationDomainAxes[*logicalDimension] < 0 ||
+            relationDomainAxes[*logicalDimension] >=
+                logicalCoordinates.size() ||
+            ptx.operands.size() != 2 ||
+            !StringRef(ptx.operands[1]).starts_with("%"))
+          return false;
+        std::set<std::pair<int64_t, std::string>> active;
+        OnlineIndexAlternatives alternatives = onlineIndexAlternatives(
+            cfg, sourceInstruction, ptx.operands[1], context, active);
+        AffineExpr expected =
+            logicalCoordinates[relationDomainAxes[*logicalDimension]];
+        const bool physicalCoordinate =
+            alternatives.valid && !alternatives.values.empty() &&
+            llvm::all_of(alternatives.values,
+                         [&](AffineExpr value) {
+                           return value == expected &&
+                                  onlineIndexExprFitsLaunchDomain(
+                                      value, launchExtents);
+                         }) &&
+            llvm::all_of(alternatives.intermediates, [&](AffineExpr value) {
+              return onlineIndexExprFitsLaunchDomain(value, launchExtents);
+            });
+        const bool loopCoordinate =
+            reductionDimension &&
+            relationDomainAxes[*logicalDimension] == *reductionDimension &&
+            certifiedLoopCoordinates.contains(sourceInstruction);
+        if (!physicalCoordinate && !loopCoordinate)
+          return false;
+        if (loopCoordinate)
+          validatedLoopCoordinates.insert(sourceInstruction);
+        break;
       }
-    if (relation.getSemantics() == RelationSemantics::Iota) {
-      FailureOr<int64_t> logicalDimension = onlineIotaLogicalDimension(relation);
-      if (failed(logicalDimension) || *logicalDimension < 0 ||
-          *logicalDimension >= relationDomainAxes.size())
-        return false;
-      if (reductionDimension &&
-          relationDomainAxes[*logicalDimension] == *reductionDimension &&
-          validatedLoopCoordinates != certifiedLoopCoordinates)
-        return false;
+      case RelationSemantics::Constant: {
+        if (!StringRef(ptx.opcode).starts_with("mov.") ||
+            relation.getParameters().size() != 1)
+          return false;
+        auto value = dyn_cast<IntegerAttr>(relation.getParameters()[0]);
+        if (!value ||
+            !llvm::is_contained(ptx.operands, Twine(value.getInt()).str()))
+          return false;
+        break;
+      }
+      case RelationSemantics::Reshape:
+      case RelationSemantics::BroadcastInDim:
+        if (!StringRef(ptx.opcode).starts_with("mov.") ||
+            !relationOperandSource(0, 1))
+          return false;
+        break;
+      case RelationSemantics::Add:
+        if ((!StringRef(ptx.opcode).starts_with("add.s32") &&
+             !StringRef(ptx.opcode).starts_with("add.u32")) ||
+            !relationOperandSource(0, 1) || !relationOperandSource(1, 2))
+          return false;
+        break;
+      case RelationSemantics::Compare: {
+        FailureOr<std::string> opcode = onlineComparisonOpcode(relation);
+        if (failed(opcode) || !StringRef(ptx.opcode).starts_with(*opcode) ||
+            !relationOperandSource(0, 1) || !relationOperandSource(1, 2))
+          return false;
+        break;
+      }
+      case RelationSemantics::Convert: {
+        const bool select =
+            StringRef(ptx.opcode) == "selp.f32" && ptx.operands.size() == 4 &&
+            ptx.operands[1] == "0f3F800000" &&
+            ptx.operands[2] == "0f00000000" && relationOperandSource(0, 3);
+        if (!select)
+          return false;
+        break;
+      }
+      case RelationSemantics::Select: {
+        if (!StringRef(ptx.opcode).starts_with("selp.f32"))
+          return false;
+        auto predicate =
+            relation.getInputs().front().getDefiningOp<RelationOp>();
+        SourceRefAttr predicateSource =
+            predicate ? predicate->getAttrOfType<SourceRefAttr>("source")
+                      : SourceRefAttr();
+        if (!predicateSource ||
+            !onlineSourceOperandIs(cfg, sourceInstruction, 3,
+                                   onlineSourceKey(predicateSource)))
+          return false;
+        break;
+      }
+      }
+      if (relation.getSemantics() == RelationSemantics::Iota) {
+        FailureOr<int64_t> logicalDimension =
+            onlineIotaLogicalDimension(relation);
+        if (failed(logicalDimension) || *logicalDimension < 0 ||
+            *logicalDimension >= relationDomainAxes.size())
+          return false;
+        if (reductionDimension &&
+            relationDomainAxes[*logicalDimension] == *reductionDimension &&
+            validatedLoopCoordinates != certifiedLoopCoordinates)
+          return false;
+      }
     }
-  }
   }
   return true;
 }
@@ -3072,9 +3077,10 @@ struct OnlinePointerAlternatives {
   std::vector<OnlinePointerAlternative> values;
 };
 
-OnlinePointerAlternatives onlinePointerAlternatives(
-    const OnlinePtxCfg &cfg, int64_t instruction, StringRef value,
-    std::set<std::pair<int64_t, std::string>> &active) {
+OnlinePointerAlternatives
+onlinePointerAlternatives(const OnlinePtxCfg &cfg, int64_t instruction,
+                          StringRef value,
+                          std::set<std::pair<int64_t, std::string>> &active) {
   if (value.starts_with("p"))
     return {true, {{{value.str()}}}};
   if (!value.starts_with("%"))
@@ -3084,10 +3090,9 @@ OnlinePointerAlternatives onlinePointerAlternatives(
   std::set<int64_t> definitions =
       onlineReachingDefinitions(cfg, instruction, value);
   if (definitions.empty()) {
-    const bool builtin = value.starts_with("%tid") ||
-                         value.starts_with("%ctaid") ||
-                         value.starts_with("%ntid") ||
-                         value.starts_with("%laneid");
+    const bool builtin =
+        value.starts_with("%tid") || value.starts_with("%ctaid") ||
+        value.starts_with("%ntid") || value.starts_with("%laneid");
     active.erase({instruction, value.str()});
     return {builtin, builtin
                          ? std::vector<OnlinePointerAlternative>{{std::nullopt}}
@@ -3192,10 +3197,10 @@ bool onlinePointerIsOutputParameter(const OnlinePtxCfg &cfg,
                       });
 }
 
-std::string onlineAddressFingerprint(const OnlinePtxCfg &cfg,
-                                     int64_t instruction, StringRef value,
-                                     std::set<std::pair<int64_t, std::string>>
-                                         &active) {
+std::string
+onlineAddressFingerprint(const OnlinePtxCfg &cfg, int64_t instruction,
+                         StringRef value,
+                         std::set<std::pair<int64_t, std::string>> &active) {
   if (!value.starts_with("%"))
     return value.str();
   if (!active.insert({instruction, value.str()}).second)
@@ -3226,11 +3231,10 @@ bool onlineInstructionReachable(const OnlinePtxCfg &cfg, int64_t from,
   const OnlinePtxInstruction &toInstruction = cfg.instructions[to];
   if (fromInstruction.block == toInstruction.block)
     return from <= to;
-  return llvm::any_of(cfg.successors[fromInstruction.block],
-                      [&](int64_t successor) {
-                        return onlineBlockReachable(
-                            cfg, successor, toInstruction.block);
-                      });
+  return llvm::any_of(
+      cfg.successors[fromInstruction.block], [&](int64_t successor) {
+        return onlineBlockReachable(cfg, successor, toInstruction.block);
+      });
 }
 
 bool onlineInstructionDominates(const OnlinePtxCfg &cfg, int64_t dominator,
@@ -3287,18 +3291,17 @@ bool onlineSharedPairIsClosed(const OnlinePtxCfg &cfg, StringRef storeRole,
     return false;
   std::set<std::pair<int64_t, std::string>> storeActive;
   std::set<std::pair<int64_t, std::string>> loadActive;
-  if (onlineAddressFingerprint(cfg, store->second,
-                               storeInstruction.operands[0], storeActive) !=
-      onlineAddressFingerprint(cfg, load->second,
-                               loadInstruction.operands[1], loadActive))
+  if (onlineAddressFingerprint(cfg, store->second, storeInstruction.operands[0],
+                               storeActive) !=
+      onlineAddressFingerprint(cfg, load->second, loadInstruction.operands[1],
+                               loadActive))
     return false;
   std::set<std::pair<int64_t, std::string>> storePredicateActive;
   std::set<std::pair<int64_t, std::string>> loadPredicateActive;
   if (storeInstruction.negatedPredicate != loadInstruction.negatedPredicate ||
       onlineAddressFingerprint(cfg, store->second, storeInstruction.predicate,
                                storePredicateActive) !=
-          onlineAddressFingerprint(cfg, load->second,
-                                   loadInstruction.predicate,
+          onlineAddressFingerprint(cfg, load->second, loadInstruction.predicate,
                                    loadPredicateActive))
     return false;
   if (!onlineInstructionDominates(cfg, store->second, barrier->second) ||
@@ -3342,19 +3345,17 @@ FailureOr<std::string> onlineComparisonOpcode(RelationOp relation) {
   auto direction = dyn_cast<StringAttr>(parameters[1]);
   if (!type || !direction)
     return failure();
-  StringRef suffix =
-      type.getValue() == "SIGNED"
-          ? "s32"
-          : type.getValue() == "UNSIGNED" ? "u32" : StringRef();
-  StringRef predicate =
-      llvm::StringSwitch<StringRef>(direction.getValue())
-          .Case("EQ", "eq")
-          .Case("NE", "ne")
-          .Case("GE", "ge")
-          .Case("GT", "gt")
-          .Case("LE", "le")
-          .Case("LT", "lt")
-          .Default("");
+  StringRef suffix = type.getValue() == "SIGNED"     ? "s32"
+                     : type.getValue() == "UNSIGNED" ? "u32"
+                                                     : StringRef();
+  StringRef predicate = llvm::StringSwitch<StringRef>(direction.getValue())
+                            .Case("EQ", "eq")
+                            .Case("NE", "ne")
+                            .Case("GE", "ge")
+                            .Case("GT", "gt")
+                            .Case("LE", "le")
+                            .Case("LT", "lt")
+                            .Default("");
   if (suffix.empty() || predicate.empty())
     return failure();
   return (Twine("setp.") + predicate + "." + suffix).str();
@@ -3374,8 +3375,8 @@ bool onlineRoleIsExactFloatConstant(const OnlinePtxCfg &cfg, StringRef role,
       return false;
     if (producer.operands[1] == bits)
       return true;
-    std::set<int64_t> definitions = onlineReachingDefinitions(
-        cfg, instruction, producer.operands[1]);
+    std::set<int64_t> definitions =
+        onlineReachingDefinitions(cfg, instruction, producer.operands[1]);
     if (definitions.size() != 1 ||
         definitions.count(kOnlineUndefinedDefinition))
       return false;
@@ -3424,7 +3425,8 @@ bool onlineCompactOutputAddressIsProjected(
       cfg.instructions[byteOffset->second];
   const OnlinePtxInstruction &pointerInstruction =
       cfg.instructions[pointer->second];
-  const OnlinePtxInstruction &storeInstruction = cfg.instructions[store->second];
+  const OnlinePtxInstruction &storeInstruction =
+      cfg.instructions[store->second];
   if (byteOffsetInstruction.opcode != "mul.wide.u32" ||
       byteOffsetInstruction.operands.size() != 3 ||
       byteOffsetInstruction.operands[2] != "4" ||
@@ -3433,8 +3435,7 @@ bool onlineCompactOutputAddressIsProjected(
       pointerInstruction.opcode != "add.u64" ||
       pointerInstruction.operands.size() != 3 ||
       storeInstruction.operands.size() < 2 ||
-      !onlineRoleOperandIs(cfg, "compact_store", 0,
-                           "compact_output_pointer"))
+      !onlineRoleOperandIs(cfg, "compact_store", 0, "compact_output_pointer"))
     return false;
   const bool baseThenOffset =
       onlinePointerIsOutputParameter(cfg, pointer->second,
@@ -3463,10 +3464,12 @@ bool onlineCompactOutputAddressIsProjected(
     expected = expected * extent + logicalCoordinates[dimension];
   }
   return alternatives.valid && !alternatives.values.empty() &&
-         llvm::all_of(alternatives.values, [&](AffineExpr value) {
-           return value == expected &&
-                  onlineIndexExprFitsLaunchDomain(value, launchExtents);
-         }) &&
+         llvm::all_of(alternatives.values,
+                      [&](AffineExpr value) {
+                        return value == expected &&
+                               onlineIndexExprFitsLaunchDomain(value,
+                                                               launchExtents);
+                      }) &&
          llvm::all_of(alternatives.intermediates, [&](AffineExpr value) {
            return onlineIndexExprFitsLaunchDomain(value, launchExtents);
          });
@@ -3478,18 +3481,20 @@ bool onlineCompactWriterIsUnique(
     int64_t reductionDimension, MLIRContext *context,
     DictionaryAttr writerCertificate = DictionaryAttr()) {
   auto store = cfg.roles.find("compact_store");
-  if (store == cfg.roles.end() || logicalCoordinates.size() != scoreShape.size())
+  if (store == cfg.roles.end() ||
+      logicalCoordinates.size() != scoreShape.size())
     return false;
-  const OnlinePtxInstruction &storeInstruction = cfg.instructions[store->second];
+  const OnlinePtxInstruction &storeInstruction =
+      cfg.instructions[store->second];
   std::optional<AffineExpr> selector;
   llvm::SmallDenseMap<int64_t, int64_t> boundPredicates;
   if (!storeInstruction.predicate.empty()) {
     auto finalName = writerCertificate
                          ? writerCertificate.getAs<StringAttr>("predicate_role")
                          : StringAttr();
-    auto selectorName = writerCertificate
-                            ? writerCertificate.getAs<StringAttr>("selector_role")
-                            : StringAttr();
+    auto selectorName =
+        writerCertificate ? writerCertificate.getAs<StringAttr>("selector_role")
+                          : StringAttr();
     auto selectorPredicateName =
         writerCertificate
             ? writerCertificate.getAs<StringAttr>("selector_predicate_role")
@@ -3497,12 +3502,12 @@ bool onlineCompactWriterIsUnique(
     auto bounds = writerCertificate
                       ? writerCertificate.getAs<ArrayAttr>("bounds")
                       : ArrayAttr();
-    auto finalPredicate = finalName
-                              ? cfg.roles.find(finalName.getValue().str())
-                              : cfg.roles.end();
-    auto predicate = selectorPredicateName
-                         ? cfg.roles.find(selectorPredicateName.getValue().str())
-                         : cfg.roles.end();
+    auto finalPredicate = finalName ? cfg.roles.find(finalName.getValue().str())
+                                    : cfg.roles.end();
+    auto predicate =
+        selectorPredicateName
+            ? cfg.roles.find(selectorPredicateName.getValue().str())
+            : cfg.roles.end();
     auto selectorRole = selectorName
                             ? cfg.roles.find(selectorName.getValue().str())
                             : cfg.roles.end();
@@ -3535,16 +3540,15 @@ bool onlineCompactWriterIsUnique(
     selector = alternatives.values.front();
     for (Attribute attribute : bounds) {
       auto bound = dyn_cast<DictionaryAttr>(attribute);
-      auto dimension = bound ? bound.getAs<IntegerAttr>("dimension")
-                             : IntegerAttr();
-      auto roleName = bound ? bound.getAs<StringAttr>("predicate_role")
-                            : StringAttr();
+      auto dimension =
+          bound ? bound.getAs<IntegerAttr>("dimension") : IntegerAttr();
+      auto roleName =
+          bound ? bound.getAs<StringAttr>("predicate_role") : StringAttr();
       auto role = roleName ? cfg.roles.find(roleName.getValue().str())
                            : cfg.roles.end();
       if (!dimension || dimension.getInt() < 0 ||
           dimension.getInt() >= scoreShape.size() ||
-          dimension.getInt() == reductionDimension ||
-          role == cfg.roles.end() ||
+          dimension.getInt() == reductionDimension || role == cfg.roles.end() ||
           !boundPredicates.try_emplace(dimension.getInt(), role->second).second)
         return false;
       const OnlinePtxInstruction &boundInstruction =
@@ -3620,8 +3624,7 @@ bool onlineCompactWriterIsUnique(
           evaluateOnlineAffineExpr(expression, physical);
       if (failed(coordinate))
         return false;
-      outputInBounds &= *coordinate >= 0 &&
-                        *coordinate < scoreShape[dimension];
+      outputInBounds &= *coordinate >= 0 && *coordinate < scoreShape[dimension];
       output.push_back(*coordinate);
     }
     if (!outputInBounds) {
@@ -3635,8 +3638,7 @@ bool onlineCompactWriterIsUnique(
       ++fiber.second;
       continue;
     }
-    FailureOr<int64_t> selected =
-        evaluateOnlineIndexExpr(*selector, physical);
+    FailureOr<int64_t> selected = evaluateOnlineIndexExpr(*selector, physical);
     if (failed(selected))
       return false;
     if (*selected == 0)
@@ -3680,16 +3682,18 @@ bool onlineValueDependsOnOperation(Value value, Operation *operation,
     return true;
   if (!active.insert(definition).second)
     return false;
-  const bool depends = llvm::any_of(definition->getOperands(), [&](Value input) {
-    return onlineValueDependsOnOperation(input, operation, active);
-  });
+  const bool depends =
+      llvm::any_of(definition->getOperands(), [&](Value input) {
+        return onlineValueDependsOnOperation(input, operation, active);
+      });
   active.erase(definition);
   return depends;
 }
 
-FailureOr<SmallVector<AffineExpr>> onlineScoreContractOutputCoordinates(
-    Value scoreValue, ContractOp contract,
-    ArrayRef<AffineExpr> scoreCoordinates, MLIRContext *context) {
+FailureOr<SmallVector<AffineExpr>>
+onlineScoreContractOutputCoordinates(Value scoreValue, ContractOp contract,
+                                     ArrayRef<AffineExpr> scoreCoordinates,
+                                     MLIRContext *context) {
   if (scoreValue.getDefiningOp() == contract.getOperation())
     return SmallVector<AffineExpr>(scoreCoordinates.begin(),
                                    scoreCoordinates.end());
@@ -3702,8 +3706,8 @@ FailureOr<SmallVector<AffineExpr>> onlineScoreContractOutputCoordinates(
   if (!outputMap ||
       outputMap.getValue().getNumResults() != scoreCoordinates.size())
     return failure();
-  SmallVector<AffineExpr> domainCoordinates(
-      outputMap.getValue().getNumDims(), AffineExpr());
+  SmallVector<AffineExpr> domainCoordinates(outputMap.getValue().getNumDims(),
+                                            AffineExpr());
   for (auto [resultNumber, result] :
        llvm::enumerate(outputMap.getValue().getResults())) {
     auto dimension = dyn_cast<AffineDimExpr>(result);
@@ -3728,8 +3732,8 @@ FailureOr<SmallVector<AffineExpr>> onlineScoreContractOutputCoordinates(
   if (!contractInput)
     return failure();
   auto inputMap = dyn_cast<AffineMapAttr>(maps[*contractInput]);
-  auto inputType = dyn_cast<RankedTensorType>(
-      map.getInputs()[*contractInput].getType());
+  auto inputType =
+      dyn_cast<RankedTensorType>(map.getInputs()[*contractInput].getType());
   if (!inputMap || !inputType ||
       inputMap.getValue().getNumResults() != inputType.getRank())
     return failure();
@@ -3741,10 +3745,11 @@ FailureOr<SmallVector<AffineExpr>> onlineScoreContractOutputCoordinates(
       map.getInputs()[*contractInput], contract, inputCoordinates, context);
 }
 
-FailureOr<OnlineScoreContractGeometry> onlineScoreContractGeometry(
-    Value scoreValue, ContractOp contract,
-    ArrayRef<AffineExpr> scoreCoordinates,
-    int64_t scoreReductionDimension, MLIRContext *context) {
+FailureOr<OnlineScoreContractGeometry>
+onlineScoreContractGeometry(Value scoreValue, ContractOp contract,
+                            ArrayRef<AffineExpr> scoreCoordinates,
+                            int64_t scoreReductionDimension,
+                            MLIRContext *context) {
   ArrayAttr maps = contract.getIndexingMaps();
   ArrayAttr iteratorKinds = contract.getIteratorKinds();
   if (!maps || maps.size() != contract.getInputs().size() + 1 ||
@@ -3761,8 +3766,7 @@ FailureOr<OnlineScoreContractGeometry> onlineScoreContractGeometry(
       onlineScoreContractOutputCoordinates(scoreValue, contract,
                                            symbolicScoreCoordinates, context);
   auto outputMap = dyn_cast<AffineMapAttr>(maps[maps.size() - 1]);
-  if (!outputMap ||
-      failed(contractOutputCoordinates) ||
+  if (!outputMap || failed(contractOutputCoordinates) ||
       outputMap.getValue().getNumResults() != contractOutputCoordinates->size())
     return failure();
   SmallVector<int64_t> reductionDomains;
@@ -3778,8 +3782,8 @@ FailureOr<OnlineScoreContractGeometry> onlineScoreContractGeometry(
   if (reductionDomains.size() != 1)
     return failure();
   const int64_t contractReductionDimension = reductionDomains.front();
-  SmallVector<AffineExpr> domainCoordinates(
-      outputMap.getValue().getNumDims(), AffineExpr());
+  SmallVector<AffineExpr> domainCoordinates(outputMap.getValue().getNumDims(),
+                                            AffineExpr());
   for (auto [scoreDimension, result] :
        llvm::enumerate(outputMap.getValue().getResults())) {
     auto domain = dyn_cast<AffineDimExpr>(result);
@@ -3790,8 +3794,7 @@ FailureOr<OnlineScoreContractGeometry> onlineScoreContractGeometry(
     domainCoordinates[domain.getPosition()] =
         (*contractOutputCoordinates)[scoreDimension];
   }
-  domainCoordinates[contractReductionDimension] =
-      getAffineDimExpr(8, context);
+  domainCoordinates[contractReductionDimension] = getAffineDimExpr(8, context);
   if (llvm::any_of(domainCoordinates,
                    [](AffineExpr expression) { return !expression; }))
     return failure();
@@ -3807,14 +3810,12 @@ FailureOr<OnlineScoreContractGeometry> onlineScoreContractGeometry(
     AffineExpr linear = getAffineConstantExpr(0, context);
     for (auto [dimension, result] :
          llvm::enumerate(inputMap.getValue().getResults())) {
-      AffineExpr composed = result.replaceDimsAndSymbols(
-          domainCoordinates, {});
+      AffineExpr composed = result.replaceDimsAndSymbols(domainCoordinates, {});
       linear = linear * inputType.getDimSize(dimension) + composed;
       if (auto domain = dyn_cast<AffineDimExpr>(result))
         if (domain.getPosition() == contractReductionDimension) {
           int64_t extent = inputType.getDimSize(dimension);
-          if (extent <= 0 ||
-              (reductionExtent && *reductionExtent != extent))
+          if (extent <= 0 || (reductionExtent && *reductionExtent != extent))
             return failure();
           reductionExtent = extent;
         }
@@ -3828,9 +3829,10 @@ FailureOr<OnlineScoreContractGeometry> onlineScoreContractGeometry(
   return geometry;
 }
 
-FailureOr<SmallVector<OnlineMaxReductionNode>> onlineMaxReductionNodes(
-    DictionaryAttr certificate, int64_t reductionDimension,
-    int64_t reductionExtent, ArrayRef<Attribute> expectedSources) {
+FailureOr<SmallVector<OnlineMaxReductionNode>>
+onlineMaxReductionNodes(DictionaryAttr certificate, int64_t reductionDimension,
+                        int64_t reductionExtent,
+                        ArrayRef<Attribute> expectedSources) {
   auto version = certificate.getAs<IntegerAttr>("version");
   auto dimension = certificate.getAs<IntegerAttr>("reduction_dimension");
   auto extent = certificate.getAs<IntegerAttr>("reduction_extent");
@@ -3859,8 +3861,7 @@ FailureOr<SmallVector<OnlineMaxReductionNode>> onlineMaxReductionNodes(
     auto role = node ? node.getAs<StringAttr>("role") : StringAttr();
     auto kind = node ? node.getAs<StringAttr>("kind") : StringAttr();
     auto children =
-        node ? node.getAs<DenseI64ArrayAttr>("children")
-             : DenseI64ArrayAttr();
+        node ? node.getAs<DenseI64ArrayAttr>("children") : DenseI64ArrayAttr();
     if (!id || id.getInt() < 0 || !kind ||
         (kind.getValue() != "leaf_family" && kind.getValue() != "merge") ||
         !role || role.getValue().empty() || !children ||
@@ -3893,9 +3894,8 @@ FailureOr<SmallVector<OnlineMaxReductionNode>> onlineMaxReductionNodes(
           stride.getInt() <= 0 || count.getInt() <= 0)
         return failure();
       for (int64_t ordinal = 0; ordinal < count.getInt(); ++ordinal) {
-        if (ordinal >
-            (std::numeric_limits<int64_t>::max() - offset.getInt()) /
-                stride.getInt())
+        if (ordinal > (std::numeric_limits<int64_t>::max() - offset.getInt()) /
+                          stride.getInt())
           return failure();
         int64_t coordinate = offset.getInt() + ordinal * stride.getInt();
         if (coordinate < 0 || coordinate >= reductionExtent ||
@@ -3911,7 +3911,8 @@ FailureOr<SmallVector<OnlineMaxReductionNode>> onlineMaxReductionNodes(
     llvm::SmallDenseSet<int64_t> childIds;
     for (int64_t childId : node.children) {
       auto child = positions.find(childId);
-      if (child == positions.end() || child->second >= positions.lookup(node.id) ||
+      if (child == positions.end() ||
+          child->second >= positions.lookup(node.id) ||
           !childIds.insert(childId).second)
         return failure();
       for (int64_t coordinate : result[child->second].coverage)
@@ -3919,7 +3920,8 @@ FailureOr<SmallVector<OnlineMaxReductionNode>> onlineMaxReductionNodes(
           return failure();
     }
   }
-  const OnlineMaxReductionNode &rootNode = result[positions.lookup(root.getInt())];
+  const OnlineMaxReductionNode &rootNode =
+      result[positions.lookup(root.getInt())];
   if (rootNode.coverage.size() != static_cast<size_t>(reductionExtent))
     return failure();
   for (int64_t coordinate = 0; coordinate < reductionExtent; ++coordinate)
@@ -3938,9 +3940,9 @@ FailureOr<SmallVector<OnlineMaxReductionNode>> onlineMaxReductionNodes(
   return result;
 }
 
-bool onlineLeafCoordinatesCarrySource(
-    const OnlinePtxCfg &cfg, ArrayRef<OnlineMaxReductionNode> nodes,
-    StringRef source) {
+bool onlineLeafCoordinatesCarrySource(const OnlinePtxCfg &cfg,
+                                      ArrayRef<OnlineMaxReductionNode> nodes,
+                                      StringRef source) {
   auto occurrences = cfg.sources.find(source.str());
   if (occurrences == cfg.sources.end())
     return false;
@@ -3955,9 +3957,8 @@ bool onlineLeafCoordinatesCarrySource(
         !expected.insert(found->second).second)
       return false;
   }
-  return expected == llvm::SmallDenseSet<int64_t>(
-                         occurrences->second.begin(),
-                         occurrences->second.end());
+  return expected == llvm::SmallDenseSet<int64_t>(occurrences->second.begin(),
+                                                  occurrences->second.end());
 }
 
 bool onlineScoreContractBindings(
@@ -4013,22 +4014,23 @@ bool onlineScoreContractBindings(
   };
   if ((initInstruction.opcode != "mov.u32" &&
        initInstruction.opcode != "mov.s32") ||
-      !initInstruction.predicate.empty() || initInstruction.operands.size() != 2 ||
+      !initInstruction.predicate.empty() ||
+      initInstruction.operands.size() != 2 ||
       initInstruction.operands[1] != "0" ||
       (guardInstruction.opcode != "setp.ge.u32" &&
        guardInstruction.opcode != "setp.ge.s32") ||
-      !guardInstruction.predicate.empty() || guardInstruction.operands.size() != 3 ||
+      !guardInstruction.predicate.empty() ||
+      guardInstruction.operands.size() != 3 ||
       !reachesInduction(*indexGuard, guardInstruction.operands[1]) ||
-      guardInstruction.operands[2] !=
-          Twine(geometry.reductionExtent).str() ||
+      guardInstruction.operands[2] != Twine(geometry.reductionExtent).str() ||
       !StringRef(exitInstruction.opcode).starts_with("bra") ||
       exitInstruction.predicate.empty() || exitInstruction.negatedPredicate ||
-      onlineReachingDefinitions(cfg, *exitBranch,
-                                exitInstruction.predicate) !=
+      onlineReachingDefinitions(cfg, *exitBranch, exitInstruction.predicate) !=
           std::set<int64_t>{*indexGuard} ||
       (stepInstruction.opcode != "add.u32" &&
        stepInstruction.opcode != "add.s32") ||
-      !stepInstruction.predicate.empty() || stepInstruction.operands.size() != 3 ||
+      !stepInstruction.predicate.empty() ||
+      stepInstruction.operands.size() != 3 ||
       !reachesInduction(*indexStep, stepInstruction.operands[1]) ||
       stepInstruction.operands[2] != "1" ||
       !StringRef(backedgeInstruction.opcode).starts_with("bra") ||
@@ -4038,14 +4040,14 @@ bool onlineScoreContractBindings(
       !reachesInduction(*coordinate, coordinateInstruction.operands[1]) ||
       accumulatorInitInstruction.opcode != "mov.f32" ||
       !accumulatorInitInstruction.predicate.empty() ||
-      !llvm::is_contained(accumulatorInitInstruction.operands,
-                          "0f00000000") ||
+      !llvm::is_contained(accumulatorInitInstruction.operands, "0f00000000") ||
       updateInstruction.opcode != "fma.rn.f32" ||
-      !updateInstruction.predicate.empty() || updateInstruction.operands.size() != 4 ||
-      !reachesAccumulator(*accumulatorUpdate,
-                          updateInstruction.operands[3]) ||
+      !updateInstruction.predicate.empty() ||
+      updateInstruction.operands.size() != 4 ||
+      !reachesAccumulator(*accumulatorUpdate, updateInstruction.operands[3]) ||
       resultInstruction.opcode != "mov.f32" ||
-      !resultInstruction.predicate.empty() || resultInstruction.operands.size() != 2 ||
+      !resultInstruction.predicate.empty() ||
+      resultInstruction.operands.size() != 2 ||
       !reachesAccumulator(*result, resultInstruction.operands[1]) ||
       resultInstruction.sourceRef != scoreSource)
     return false;
@@ -4120,7 +4122,8 @@ bool onlineScoreContractBindings(
     const OnlinePtxInstruction &loadInstruction = cfg.instructions[*load];
     if (linearInstruction.operands.size() < 2 ||
         byteInstruction.opcode != "mul.wide.u32" ||
-        byteInstruction.operands.size() != 3 || byteInstruction.operands[2] != "4" ||
+        byteInstruction.operands.size() != 3 ||
+        byteInstruction.operands[2] != "4" ||
         onlineReachingDefinitions(cfg, *byteOffset,
                                   byteInstruction.operands[1]) !=
             std::set<int64_t>{*linear} ||
@@ -4128,8 +4131,7 @@ bool onlineScoreContractBindings(
         pointerInstruction.operands.size() != 3 ||
         loadInstruction.opcode != "ld.global.f32" ||
         loadInstruction.operands.size() != 2 ||
-        onlineReachingDefinitions(cfg, *load,
-                                  loadInstruction.operands[1]) !=
+        onlineReachingDefinitions(cfg, *load, loadInstruction.operands[1]) !=
             std::set<int64_t>{*pointer} ||
         onlineReachingDefinitions(cfg, *accumulatorUpdate,
                                   updateInstruction.operands[1 + operand]) !=
@@ -4137,15 +4139,15 @@ bool onlineScoreContractBindings(
       return false;
     std::set<std::pair<int64_t, std::string>> active;
     OnlineIndexAlternatives alternatives = onlineIndexAlternatives(
-        cfg, *linear, linearInstruction.operands[1], context, active,
-        &symbols);
+        cfg, *linear, linearInstruction.operands[1], context, active, &symbols);
     if (!alternatives.valid || alternatives.values.empty() ||
-        llvm::any_of(alternatives.values, [&](AffineExpr value) {
-          return value != geometry.inputLinearIndices[operand] ||
-                 !onlineIndexExprFitsBuffer(
-                     value, expressionExtents,
-                     geometry.inputElementCounts[operand]);
-        }) ||
+        llvm::any_of(alternatives.values,
+                     [&](AffineExpr value) {
+                       return value != geometry.inputLinearIndices[operand] ||
+                              !onlineIndexExprFitsBuffer(
+                                  value, expressionExtents,
+                                  geometry.inputElementCounts[operand]);
+                     }) ||
         llvm::any_of(alternatives.intermediates, [&](AffineExpr value) {
           return !onlineIndexExprFitsLaunchDomain(value, expressionExtents);
         }))
@@ -4213,9 +4215,9 @@ FailureOr<Attribute> onlineScalarScoreSemantics(Value scalar, MapOp map,
        builder.getNamedAttr("operands", builder.getArrayAttr(operands))});
 }
 
-FailureOr<Attribute> onlineScoreSemantics(
-    Value value, ContractOp scoreContract, Builder &builder,
-    llvm::SmallDenseSet<Operation *> &active) {
+FailureOr<Attribute>
+onlineScoreSemantics(Value value, ContractOp scoreContract, Builder &builder,
+                     llvm::SmallDenseSet<Operation *> &active) {
   if (value.getDefiningOp() == scoreContract.getOperation()) {
     SourceRefAttr source =
         scoreContract->getAttrOfType<SourceRefAttr>("source");
@@ -4260,7 +4262,8 @@ FailureOr<Attribute> onlineScoreSemantics(
        builder.getNamedAttr("inputs", builder.getArrayAttr(inputs))});
 }
 
-FailureOr<std::pair<Value, ContractOp>> onlineScoreSourceChain(ModuleOp module) {
+FailureOr<std::pair<Value, ContractOp>>
+onlineScoreSourceChain(ModuleOp module) {
   FoldOp maximumFold;
   module.walk([&](FoldOp fold) {
     if (!maximumFold &&
@@ -4289,8 +4292,8 @@ FailureOr<std::pair<Value, ContractOp>> onlineScoreSourceChain(ModuleOp module) 
   Value score;
   for (Value candidate : select.getInputs().drop_front()) {
     llvm::SmallDenseSet<Operation *> active;
-    if (!onlineValueDependsOnOperation(candidate,
-                                       contracts.front().getOperation(), active))
+    if (!onlineValueDependsOnOperation(
+            candidate, contracts.front().getOperation(), active))
       continue;
     if (score)
       return failure();
@@ -4310,9 +4313,11 @@ bool onlineScoreSemanticCertificateMatches(Value score, ContractOp contract,
   return succeeded(expected) && certificate == *expected;
 }
 
-Attribute onlineMutateScoreSemanticCertificate(
-    Attribute attribute, StringRef key, std::optional<StringRef> value,
-    Builder &builder, bool &changed) {
+Attribute onlineMutateScoreSemanticCertificate(Attribute attribute,
+                                               StringRef key,
+                                               std::optional<StringRef> value,
+                                               Builder &builder,
+                                               bool &changed) {
   if (auto dictionary = dyn_cast<DictionaryAttr>(attribute)) {
     SmallVector<NamedAttribute> fields;
     for (NamedAttribute field : dictionary) {
@@ -4380,8 +4385,9 @@ std::string onlineFloatExpressionText(const OnlineFloatExpression &expression) {
   return result;
 }
 
-OnlineFloatExpression onlineFloatOperation(
-    StringRef operation, ArrayRef<OnlineFloatExpression> operands) {
+OnlineFloatExpression
+onlineFloatOperation(StringRef operation,
+                     ArrayRef<OnlineFloatExpression> operands) {
   OnlineFloatExpression result;
   result.operation = operation.str();
   for (const OnlineFloatExpression &operand : operands) {
@@ -4394,19 +4400,19 @@ OnlineFloatExpression onlineFloatOperation(
   return result;
 }
 
-FailureOr<OnlineFloatExpression> onlineSourceFloatExpression(
-    Value value, ContractOp contract,
-    llvm::SmallDenseSet<Operation *> &active);
+FailureOr<OnlineFloatExpression>
+onlineSourceFloatExpression(Value value, ContractOp contract,
+                            llvm::SmallDenseSet<Operation *> &active);
 
-FailureOr<OnlineFloatExpression> onlineSourceScalarExpression(
-    Value scalar, MapOp map, ContractOp contract,
-    llvm::SmallDenseSet<Operation *> &active) {
+FailureOr<OnlineFloatExpression>
+onlineSourceScalarExpression(Value scalar, MapOp map, ContractOp contract,
+                             llvm::SmallDenseSet<Operation *> &active) {
   if (auto argument = dyn_cast<BlockArgument>(scalar)) {
     if (argument.getOwner() != &map.getBody().front() ||
         argument.getArgNumber() >= map.getInputs().size())
       return failure();
-    return onlineSourceFloatExpression(
-        map.getInputs()[argument.getArgNumber()], contract, active);
+    return onlineSourceFloatExpression(map.getInputs()[argument.getArgNumber()],
+                                       contract, active);
   }
   Operation *operation = scalar.getDefiningOp();
   if (!operation)
@@ -4415,11 +4421,10 @@ FailureOr<OnlineFloatExpression> onlineSourceScalarExpression(
     auto value = dyn_cast<FloatAttr>(constant.getValue());
     if (!value || !value.getType().isF32())
       return failure();
-    std::string bits = llvm::utohexstr(
-        value.getValue().bitcastToAPInt().getZExtValue(), true);
+    std::string bits =
+        llvm::utohexstr(value.getValue().bitcastToAPInt().getZExtValue(), true);
     bits.insert(bits.begin(), 8 - bits.size(), '0');
-    return OnlineFloatExpression{
-        "", (Twine("0f") + bits).str(), {}};
+    return OnlineFloatExpression{"", (Twine("0f") + bits).str(), {}};
   }
   SmallVector<OnlineFloatExpression> operands;
   for (Value operand : operation->getOperands()) {
@@ -4446,9 +4451,9 @@ FailureOr<OnlineFloatExpression> onlineSourceScalarExpression(
   return failure();
 }
 
-FailureOr<OnlineFloatExpression> onlineSourceFloatExpression(
-    Value value, ContractOp contract,
-    llvm::SmallDenseSet<Operation *> &active) {
+FailureOr<OnlineFloatExpression>
+onlineSourceFloatExpression(Value value, ContractOp contract,
+                            llvm::SmallDenseSet<Operation *> &active) {
   if (value.getDefiningOp() == contract.getOperation())
     return OnlineFloatExpression{"", "raw_score", {}};
   auto map = value.getDefiningOp<MapOp>();
@@ -4465,13 +4470,15 @@ FailureOr<OnlineFloatExpression> onlineSourceFloatExpression(
   return result;
 }
 
-FailureOr<OnlineFloatExpression> onlinePtxFloatExpression(
-    const OnlinePtxCfg &cfg, int64_t instruction, int64_t rawInstruction,
-    llvm::SmallDenseSet<int64_t> &active);
+FailureOr<OnlineFloatExpression>
+onlinePtxFloatExpression(const OnlinePtxCfg &cfg, int64_t instruction,
+                         int64_t rawInstruction,
+                         llvm::SmallDenseSet<int64_t> &active);
 
-FailureOr<OnlineFloatExpression> onlinePtxFloatOperand(
-    const OnlinePtxCfg &cfg, int64_t instruction, StringRef operand,
-    int64_t rawInstruction, llvm::SmallDenseSet<int64_t> &active) {
+FailureOr<OnlineFloatExpression>
+onlinePtxFloatOperand(const OnlinePtxCfg &cfg, int64_t instruction,
+                      StringRef operand, int64_t rawInstruction,
+                      llvm::SmallDenseSet<int64_t> &active) {
   if (operand.starts_with("0f"))
     return OnlineFloatExpression{"", operand.lower(), {}};
   std::set<int64_t> definitions =
@@ -4482,9 +4489,10 @@ FailureOr<OnlineFloatExpression> onlinePtxFloatOperand(
                                   active);
 }
 
-FailureOr<OnlineFloatExpression> onlinePtxFloatExpression(
-    const OnlinePtxCfg &cfg, int64_t instruction, int64_t rawInstruction,
-    llvm::SmallDenseSet<int64_t> &active) {
+FailureOr<OnlineFloatExpression>
+onlinePtxFloatExpression(const OnlinePtxCfg &cfg, int64_t instruction,
+                         int64_t rawInstruction,
+                         llvm::SmallDenseSet<int64_t> &active) {
   if (instruction == rawInstruction)
     return OnlineFloatExpression{"", "raw_score", {}};
   if (instruction < 0 ||
@@ -4527,8 +4535,8 @@ FailureOr<OnlineFloatExpression> onlinePtxFloatExpression(
     return onlineFloatOperation("tanh", operands);
   if (opcode == "fma.rn.f32" && operands.size() == 3)
     return onlineFloatOperation(
-        "add", {onlineFloatOperation("mul", {operands[0], operands[1]}),
-                operands[2]});
+        "add",
+        {onlineFloatOperation("mul", {operands[0], operands[1]}), operands[2]});
   return failure();
 }
 
@@ -4548,31 +4556,30 @@ std::string onlineRenderFloatExpression(const OnlineFloatExpression &expression,
         onlineRenderFloatExpression(operand, nextRegister, instructions));
   if ((expression.operation == "add" || expression.operation == "mul") &&
       operands.size() >= 2) {
-    StringRef opcode = expression.operation == "add" ? "add.rn.f32"
-                                                       : "mul.rn.f32";
+    StringRef opcode =
+        expression.operation == "add" ? "add.rn.f32" : "mul.rn.f32";
     std::string accumulated = operands.front();
     for (StringRef operand : ArrayRef<std::string>(operands).drop_front()) {
       std::string result = (Twine("%f") + Twine(nextRegister++)).str();
-      instructions += opcode.str() + " " + result + ", " + accumulated +
-                      ", " + operand.str() + ";\n";
+      instructions += opcode.str() + " " + result + ", " + accumulated + ", " +
+                      operand.str() + ";\n";
       accumulated = std::move(result);
     }
     return accumulated;
   }
-  StringRef opcode =
-      llvm::StringSwitch<StringRef>(expression.operation)
-          .Case("add", "add.rn.f32")
-          .Case("mul", "mul.rn.f32")
-          .Case("sub", "sub.rn.f32")
-          .Case("recip", "rcp.rn.f32")
-          .Case("max", "max.f32")
-          .Case("tanh", "tanh.approx.f32")
-          .Default("");
+  StringRef opcode = llvm::StringSwitch<StringRef>(expression.operation)
+                         .Case("add", "add.rn.f32")
+                         .Case("mul", "mul.rn.f32")
+                         .Case("sub", "sub.rn.f32")
+                         .Case("recip", "rcp.rn.f32")
+                         .Case("max", "max.f32")
+                         .Case("tanh", "tanh.approx.f32")
+                         .Default("");
   if (opcode.empty())
     return {};
   std::string result = (Twine("%f") + Twine(nextRegister++)).str();
-  instructions += opcode.str() + " " + result + ", " +
-                  llvm::join(operands, ", ") + ";\n";
+  instructions +=
+      opcode.str() + " " + result + ", " + llvm::join(operands, ", ") + ";\n";
   return result;
 }
 
@@ -4581,8 +4588,7 @@ std::string onlineExpressionPtx(const OnlineFloatExpression &expression,
                                 std::string &finalOperand) {
   int64_t nextRegister = 1;
   std::string body;
-  finalOperand =
-      onlineRenderFloatExpression(expression, nextRegister, body);
+  finalOperand = onlineRenderFloatExpression(expression, nextRegister, body);
   if (finalOperand.empty())
     return {};
   return (Twine(".version 8.0\n.target sm_90\n.address_size 64\n"
@@ -4590,13 +4596,13 @@ std::string onlineExpressionPtx(const OnlineFloatExpression &expression,
                 "// shuttle.online.role raw_score\n"
                 "// shuttle.online.source_ref ") +
           rawSource + "\nmov.f32 %f0, %f99;\n" + body +
-          "// shuttle.online.role score_value\nmov.f32 %f999, " +
-          finalOperand + ";\nret;\n}\n")
+          "// shuttle.online.role score_value\nmov.f32 %f999, " + finalOperand +
+          ";\nret;\n}\n")
       .str();
 }
 
-bool onlinePtxMatchesFloatExpression(
-    StringRef ptx, const OnlineFloatExpression &expected) {
+bool onlinePtxMatchesFloatExpression(StringRef ptx,
+                                     const OnlineFloatExpression &expected) {
   FailureOr<OnlinePtxCfg> cfg = onlinePtxCfg(ptx);
   if (failed(cfg))
     return false;
@@ -4605,11 +4611,10 @@ bool onlinePtxMatchesFloatExpression(
   if (raw == cfg->roles.end() || final == cfg->roles.end())
     return false;
   llvm::SmallDenseSet<int64_t> active;
-  FailureOr<OnlineFloatExpression> actual = onlinePtxFloatExpression(
-      *cfg, final->second, raw->second, active);
-  return succeeded(actual) &&
-         onlineFloatExpressionText(expected) ==
-             onlineFloatExpressionText(*actual);
+  FailureOr<OnlineFloatExpression> actual =
+      onlinePtxFloatExpression(*cfg, final->second, raw->second, active);
+  return succeeded(actual) && onlineFloatExpressionText(expected) ==
+                                  onlineFloatExpressionText(*actual);
 }
 
 bool onlineScoreMapChainBindings(const OnlinePtxCfg &cfg,
@@ -4621,18 +4626,17 @@ bool onlineScoreMapChainBindings(const OnlinePtxCfg &cfg,
                      ? scoreContractCertificate.getAs<StringAttr>("result_role")
                      : StringAttr();
   auto finalName = node.realization.getAs<StringAttr>("score_value_role");
-  auto raw = rawName ? cfg.roles.find(rawName.getValue().str()) : cfg.roles.end();
-  auto final = finalName ? cfg.roles.find(finalName.getValue().str())
-                         : cfg.roles.end();
+  auto raw =
+      rawName ? cfg.roles.find(rawName.getValue().str()) : cfg.roles.end();
+  auto final =
+      finalName ? cfg.roles.find(finalName.getValue().str()) : cfg.roles.end();
   if (raw == cfg.roles.end() || final == cfg.roles.end())
     return false;
   if (!scoreValue)
     return raw->second == final->second;
-  auto scoreSource =
-      scoreContract->getAttrOfType<SourceRefAttr>("source");
+  auto scoreSource = scoreContract->getAttrOfType<SourceRefAttr>("source");
   if (!scoreSource || !cfg.instructions[raw->second].predicate.empty() ||
-      cfg.instructions[raw->second].sourceRef !=
-          onlineSourceKey(scoreSource))
+      cfg.instructions[raw->second].sourceRef != onlineSourceKey(scoreSource))
     return false;
   Attribute certificate = node.realization.get("score_semantics");
   Builder builder(scoreValue.getContext());
@@ -4643,26 +4647,22 @@ bool onlineScoreMapChainBindings(const OnlinePtxCfg &cfg,
   FailureOr<OnlineFloatExpression> sourceExpression =
       onlineSourceFloatExpression(scoreValue, scoreContract, sourceActive);
   llvm::SmallDenseSet<int64_t> ptxActive;
-  FailureOr<OnlineFloatExpression> ptxExpression = onlinePtxFloatExpression(
-      cfg, final->second, raw->second, ptxActive);
+  FailureOr<OnlineFloatExpression> ptxExpression =
+      onlinePtxFloatExpression(cfg, final->second, raw->second, ptxActive);
   return certificate && succeeded(expected) && certificate == *expected &&
          succeeded(sourceExpression) && succeeded(ptxExpression) &&
          onlineFloatExpressionText(*sourceExpression) ==
              onlineFloatExpressionText(*ptxExpression);
 }
 
-bool onlineCanonicalLeafFamilyBindings(const OnlinePtxCfg &cfg,
-                                       const OnlineMaxReductionNode &node,
-                                       StringRef scoreSource,
-                                       StringRef comparisonOpcode,
-                                       const std::set<std::string> &relationSources,
-                                       const OnlineScoreContractGeometry &scoreGeometry,
-                                       ArrayRef<int64_t> launchExtents,
-                                       int64_t scoreReductionExtent,
-                                       ArrayRef<int64_t> inputParameters,
-                                       Value scoreValueTensor,
-                                       ContractOp scoreContract,
-                                       MLIRContext *context) {
+bool onlineCanonicalLeafFamilyBindings(
+    const OnlinePtxCfg &cfg, const OnlineMaxReductionNode &node,
+    StringRef scoreSource, StringRef comparisonOpcode,
+    const std::set<std::string> &relationSources,
+    const OnlineScoreContractGeometry &scoreGeometry,
+    ArrayRef<int64_t> launchExtents, int64_t scoreReductionExtent,
+    ArrayRef<int64_t> inputParameters, Value scoreValueTensor,
+    ContractOp scoreContract, MLIRContext *context) {
   auto kind = node.realization.getAs<StringAttr>("kind");
   auto role = [&](StringRef name) -> std::optional<int64_t> {
     auto attribute = node.realization.getAs<StringAttr>(name);
@@ -4687,17 +4687,16 @@ bool onlineCanonicalLeafFamilyBindings(const OnlinePtxCfg &cfg,
   auto result = cfg.roles.find(node.role);
   if (!kind || kind.getValue() != "canonical_loop" || !indexInit ||
       !indexGuard || !indexStep || !exitBranch || !backedge ||
-      !accumulatorInit || !accumulatorUpdate || !coordinate ||
-      !scoreValue || !relationCompare || !maskSelect || !negativeInfinity ||
+      !accumulatorInit || !accumulatorUpdate || !coordinate || !scoreValue ||
+      !relationCompare || !maskSelect || !negativeInfinity ||
       result == cfg.roles.end())
     return false;
   SmallVector<int64_t> ordered(node.coverage.begin(), node.coverage.end());
   llvm::sort(ordered);
   auto declaredStep = node.realization.getAs<IntegerAttr>("step");
   const int64_t step = ordered.size() > 1 ? ordered[1] - ordered[0]
-                                         : declaredStep
-                                               ? declaredStep.getInt()
-                                               : 1;
+                       : declaredStep     ? declaredStep.getInt()
+                                          : 1;
   if (step <= 0 || (declaredStep && declaredStep.getInt() != step))
     return false;
   const std::string lower = Twine(ordered.front()).str();
@@ -4730,8 +4729,7 @@ bool onlineCanonicalLeafFamilyBindings(const OnlinePtxCfg &cfg,
   std::set<std::pair<int64_t, int64_t>> scoreCoordinateActive;
   if (accumulatorInitInstruction.opcode != "mov.f32" ||
       !accumulatorInitInstruction.predicate.empty() ||
-      !llvm::is_contained(accumulatorInitInstruction.operands,
-                          "0fFF800000") ||
+      !llvm::is_contained(accumulatorInitInstruction.operands, "0fFF800000") ||
       (initInstruction.opcode != "mov.u32" &&
        initInstruction.opcode != "mov.s32") ||
       !initInstruction.predicate.empty() ||
@@ -4744,8 +4742,7 @@ bool onlineCanonicalLeafFamilyBindings(const OnlinePtxCfg &cfg,
       guardInstruction.operands[2] != upper ||
       !StringRef(exitInstruction.opcode).starts_with("bra") ||
       exitInstruction.predicate.empty() || exitInstruction.negatedPredicate ||
-      onlineReachingDefinitions(cfg, *exitBranch,
-                                exitInstruction.predicate) !=
+      onlineReachingDefinitions(cfg, *exitBranch, exitInstruction.predicate) !=
           std::set<int64_t>{*indexGuard} ||
       (stepInstruction.opcode != "add.u32" &&
        stepInstruction.opcode != "add.s32") ||
@@ -4757,8 +4754,7 @@ bool onlineCanonicalLeafFamilyBindings(const OnlinePtxCfg &cfg,
       !backedgeInstruction.predicate.empty() ||
       !coordinateInstruction.predicate.empty() ||
       coordinateInstruction.operands.size() != 2 ||
-      !reachesEitherIteration(*coordinate,
-                              coordinateInstruction.operands[1]) ||
+      !reachesEitherIteration(*coordinate, coordinateInstruction.operands[1]) ||
       !onlineRoleTransitivelyDependsOn(
           cfg,
           node.realization.getAs<StringAttr>("relation_compare_role")
@@ -4778,19 +4774,16 @@ bool onlineCanonicalLeafFamilyBindings(const OnlinePtxCfg &cfg,
       !relationSources.count(cfg.instructions[*maskSelect].sourceRef) ||
       !onlineRoleOperandIs(
           cfg,
-          node.realization.getAs<StringAttr>("mask_select_role").getValue(),
-          1,
+          node.realization.getAs<StringAttr>("mask_select_role").getValue(), 1,
           node.realization.getAs<StringAttr>("score_value_role").getValue()) ||
       !onlineRoleOperandIs(
           cfg,
-          node.realization.getAs<StringAttr>("mask_select_role").getValue(),
-          2,
+          node.realization.getAs<StringAttr>("mask_select_role").getValue(), 2,
           node.realization.getAs<StringAttr>("negative_infinity_role")
               .getValue()) ||
       !onlineRoleOperandIs(
           cfg,
-          node.realization.getAs<StringAttr>("mask_select_role").getValue(),
-          3,
+          node.realization.getAs<StringAttr>("mask_select_role").getValue(), 3,
           node.realization.getAs<StringAttr>("relation_compare_role")
               .getValue()) ||
       accumulatorInstruction.opcode != "max.f32" ||
@@ -4807,15 +4800,13 @@ bool onlineCanonicalLeafFamilyBindings(const OnlinePtxCfg &cfg,
       resultInstruction.opcode != "mov.f32" ||
       !resultInstruction.predicate.empty() ||
       resultInstruction.operands.size() != 2 ||
-      !reachesEitherAccumulator(result->second,
-                                resultInstruction.operands[1]))
+      !reachesEitherAccumulator(result->second, resultInstruction.operands[1]))
     return false;
-  if (!onlineScoreContractBindings(
-          cfg, node, scoreGeometry, scoreSource, launchExtents,
-          scoreReductionExtent, inputParameters, context))
+  if (!onlineScoreContractBindings(cfg, node, scoreGeometry, scoreSource,
+                                   launchExtents, scoreReductionExtent,
+                                   inputParameters, context))
     return false;
-  if (!onlineScoreMapChainBindings(cfg, node, scoreValueTensor,
-                                   scoreContract))
+  if (!onlineScoreMapChainBindings(cfg, node, scoreValueTensor, scoreContract))
     return false;
   auto exitTarget = cfg.labels.find(exitInstruction.branchTarget);
   auto backedgeTarget = cfg.labels.find(backedgeInstruction.branchTarget);
@@ -4856,14 +4847,14 @@ bool onlineCanonicalLeafFamilyBindings(const OnlinePtxCfg &cfg,
         return false;
   auto scoreContractCertificate =
       node.realization.getAs<DictionaryAttr>("score_contract");
-  auto contractGuardName = scoreContractCertificate
-                               ? scoreContractCertificate.getAs<StringAttr>(
-                                     "index_guard_role")
-                               : StringAttr();
-  auto contractBackedgeName = scoreContractCertificate
-                                  ? scoreContractCertificate.getAs<StringAttr>(
-                                        "backedge_role")
-                                  : StringAttr();
+  auto contractGuardName =
+      scoreContractCertificate
+          ? scoreContractCertificate.getAs<StringAttr>("index_guard_role")
+          : StringAttr();
+  auto contractBackedgeName =
+      scoreContractCertificate
+          ? scoreContractCertificate.getAs<StringAttr>("backedge_role")
+          : StringAttr();
   auto contractGuard = contractGuardName
                            ? cfg.roles.find(contractGuardName.getValue().str())
                            : cfg.roles.end();
@@ -4871,8 +4862,7 @@ bool onlineCanonicalLeafFamilyBindings(const OnlinePtxCfg &cfg,
       contractBackedgeName
           ? cfg.roles.find(contractBackedgeName.getValue().str())
           : cfg.roles.end();
-  if (contractGuard == cfg.roles.end() ||
-      contractBackedge == cfg.roles.end() ||
+  if (contractGuard == cfg.roles.end() || contractBackedge == cfg.roles.end() ||
       !onlineBlocksAreAcyclic(
           cfg, loopBodyBlocks,
           std::pair<int64_t, int64_t>{
@@ -4909,7 +4899,7 @@ bool onlineCollectMaxLeaves(const OnlinePtxCfg &cfg, int64_t instruction,
         cfg, instruction, candidate.operands[operand]);
     if (definitions.size() != 1 ||
         !onlineCollectMaxLeaves(cfg, *definitions.begin(), expected, found,
-                               active)) {
+                                active)) {
       active.erase(instruction);
       return false;
     }
@@ -4918,9 +4908,9 @@ bool onlineCollectMaxLeaves(const OnlinePtxCfg &cfg, int64_t instruction,
   return true;
 }
 
-FailureOr<int64_t> onlineTransportedChild(
-    const OnlinePtxCfg &cfg, const OnlineMaxReductionNode &child,
-    DictionaryAttr transport) {
+FailureOr<int64_t> onlineTransportedChild(const OnlinePtxCfg &cfg,
+                                          const OnlineMaxReductionNode &child,
+                                          DictionaryAttr transport) {
   auto kind = transport.getAs<StringAttr>("kind");
   auto role = transport.getAs<StringAttr>("role");
   auto childId = transport.getAs<IntegerAttr>("child");
@@ -4945,8 +4935,7 @@ FailureOr<int64_t> onlineTransportedChild(
 bool onlineMaxReductionBindings(
     const OnlinePtxCfg &cfg, ArrayRef<OnlineMaxReductionNode> nodes,
     DictionaryAttr certificate, StringRef scoreSource,
-    StringRef comparisonOpcode,
-    const std::set<std::string> &relationSources,
+    StringRef comparisonOpcode, const std::set<std::string> &relationSources,
     const OnlineScoreContractGeometry &scoreGeometry,
     ArrayRef<int64_t> launchExtents, int64_t scoreReductionExtent,
     ArrayRef<int64_t> inputParameters, Value scoreValue,
@@ -4967,9 +4956,8 @@ bool onlineMaxReductionBindings(
       if (node.kind == "leaf_family") {
         if (!onlineCanonicalLeafFamilyBindings(
                 cfg, node, scoreSource, comparisonOpcode, relationSources,
-                scoreGeometry, launchExtents,
-                scoreReductionExtent, inputParameters, scoreValue,
-                scoreContract, context))
+                scoreGeometry, launchExtents, scoreReductionExtent,
+                inputParameters, scoreValue, scoreContract, context))
           return false;
         continue;
       }
@@ -4984,9 +4972,9 @@ bool onlineMaxReductionBindings(
         for (Attribute attribute : attributes) {
           auto transport = dyn_cast<DictionaryAttr>(attribute);
           auto child =
-              transport ? transport.getAs<IntegerAttr>("child")
-                        : IntegerAttr();
-          if (!child || !transports.try_emplace(child.getInt(), transport).second)
+              transport ? transport.getAs<IntegerAttr>("child") : IntegerAttr();
+          if (!child ||
+              !transports.try_emplace(child.getInt(), transport).second)
             return false;
         }
     llvm::SmallDenseSet<int64_t> expectedLeaves;
@@ -5013,31 +5001,24 @@ bool onlineMaxReductionBindings(
     llvm::SmallDenseSet<int64_t> foundLeaves;
     llvm::SmallDenseSet<int64_t> active;
     if (!onlineCollectMaxLeaves(cfg, role->second, expectedLeaves, foundLeaves,
-                               active) ||
+                                active) ||
         foundLeaves != expectedLeaves)
       return false;
   }
   return rootNode &&
-         onlineRoleIs(cfg, "compact_store", {"st.global."},
-                      {rootNode->role}) &&
+         onlineRoleIs(cfg, "compact_store", {"st.global."}, {rootNode->role}) &&
          onlineRoleOperandIs(cfg, "compact_store", 1, rootNode->role);
 }
 
-bool onlineMaximumProtocol(const OnlinePtxCfg &cfg, int64_t outputParameter,
-                           StringRef comparisonOpcode,
-                           DictionaryAttr reductionCertificate,
-                           int64_t reductionDimension,
-                           int64_t reductionExtent,
-                           ArrayRef<Attribute> expectedSources,
-                           StringRef scoreSource,
-                           Value scoreValue,
-                           ContractOp scoreContract,
-                           ArrayRef<int64_t> scoreInputParameters,
-                           ArrayRef<RelationOp> relations,
-                           ArrayRef<AffineExpr> logicalCoordinates,
-                           ArrayRef<int64_t> launchExtents,
-                           ArrayRef<int64_t> scoreShape,
-                           MLIRContext *context) {
+bool onlineMaximumProtocol(
+    const OnlinePtxCfg &cfg, int64_t outputParameter,
+    StringRef comparisonOpcode, DictionaryAttr reductionCertificate,
+    int64_t reductionDimension, int64_t reductionExtent,
+    ArrayRef<Attribute> expectedSources, StringRef scoreSource,
+    Value scoreValue, ContractOp scoreContract,
+    ArrayRef<int64_t> scoreInputParameters, ArrayRef<RelationOp> relations,
+    ArrayRef<AffineExpr> logicalCoordinates, ArrayRef<int64_t> launchExtents,
+    ArrayRef<int64_t> scoreShape, MLIRContext *context) {
   FailureOr<SmallVector<OnlineMaxReductionNode>> nodes =
       onlineMaxReductionNodes(reductionCertificate, reductionDimension,
                               reductionExtent, expectedSources);
@@ -5046,43 +5027,40 @@ bool onlineMaximumProtocol(const OnlinePtxCfg &cfg, int64_t outputParameter,
                                   reductionDimension, context);
   std::set<std::string> relationSourceKeys;
   for (RelationOp relation : relations)
-    relationSourceKeys.insert(onlineSourceKey(
-        relation->getAttrOfType<SourceRefAttr>("source")));
+    relationSourceKeys.insert(
+        onlineSourceKey(relation->getAttrOfType<SourceRefAttr>("source")));
   return onlineMaskedScoreProtocol(cfg, comparisonOpcode) &&
          onlineRoleIs(cfg, "max_init", {"mov.f32"}) &&
-         llvm::is_contained(
-             cfg.instructions[cfg.roles.at("max_init")].operands,
-             "0fFF800000") &&
+         llvm::is_contained(cfg.instructions[cfg.roles.at("max_init")].operands,
+                            "0fFF800000") &&
          succeeded(nodes) && succeeded(scoreGeometry) &&
-         onlineMaxReductionBindings(cfg, *nodes, reductionCertificate,
-                                    scoreSource, comparisonOpcode,
-                                    relationSourceKeys,
-                                    *scoreGeometry, launchExtents,
-                                    reductionExtent, scoreInputParameters,
-                                    scoreValue, scoreContract, context) &&
+         onlineMaxReductionBindings(
+             cfg, *nodes, reductionCertificate, scoreSource, comparisonOpcode,
+             relationSourceKeys, *scoreGeometry, launchExtents, reductionExtent,
+             scoreInputParameters, scoreValue, scoreContract, context) &&
          onlineCompactOutputAddressIsProjected(
              cfg, outputParameter, logicalCoordinates, launchExtents,
              scoreShape, reductionDimension, context) &&
-         onlineCompactWriterIsUnique(cfg, logicalCoordinates, launchExtents,
-                                     scoreShape, reductionDimension, context,
-                                     reductionCertificate.getAs<DictionaryAttr>(
-                                         "writer")) &&
+         onlineCompactWriterIsUnique(
+             cfg, logicalCoordinates, launchExtents, scoreShape,
+             reductionDimension, context,
+             reductionCertificate.getAs<DictionaryAttr>("writer")) &&
          onlineRoleStoresToOutput(cfg, "compact_store", outputParameter);
 }
 
-FailureOr<SmallVector<int64_t>> onlineScoreInputParameters(
-    DeviceEntryOp entry, MaterializationPlanOp plan, RegionOp region,
-    ContractOp contract) {
+FailureOr<SmallVector<int64_t>>
+onlineScoreInputParameters(DeviceEntryOp entry, MaterializationPlanOp plan,
+                           RegionOp region, ContractOp contract) {
   SmallVector<MaterializationBufferOp> liveIns;
   for (MaterializationBufferOp buffer :
        plan.getBody().front().getOps<MaterializationBufferOp>())
     if (buffer.getStorage() == MaterializationStorage::External &&
         buffer.getLiveIn() && !buffer.getLiveOut())
       liveIns.push_back(buffer);
-  llvm::sort(liveIns, [](MaterializationBufferOp left,
-                         MaterializationBufferOp right) {
-    return left.getOrdinal() < right.getOrdinal();
-  });
+  llvm::sort(liveIns,
+             [](MaterializationBufferOp left, MaterializationBufferOp right) {
+               return left.getOrdinal() < right.getOrdinal();
+             });
   Block &body = region.getBody().front();
   if (liveIns.size() != body.getNumArguments())
     return failure();
@@ -5108,10 +5086,8 @@ bool onlineScaledUpdate(const OnlinePtxCfg &cfg, StringRef scaledRole,
                         StringRef updateRole, StringRef scaleRole,
                         StringRef stateRole, StringRef newTermRole) {
   const bool separate =
-      onlineRoleIs(cfg, scaledRole, {"mul.rn.f32"},
-                   {scaleRole, stateRole}) &&
-      onlineRoleIs(cfg, updateRole, {"add.rn.f32"},
-                   {scaledRole, newTermRole});
+      onlineRoleIs(cfg, scaledRole, {"mul.rn.f32"}, {scaleRole, stateRole}) &&
+      onlineRoleIs(cfg, updateRole, {"add.rn.f32"}, {scaledRole, newTermRole});
   const bool orderedFmaOperands =
       (onlineRoleOperandIs(cfg, updateRole, 1, scaleRole) &&
        onlineRoleOperandIs(cfg, updateRole, 2, stateRole)) ||
@@ -5177,13 +5153,11 @@ bool onlineSharedStateAddressesAreClosed(const OnlinePtxCfg &cfg,
          llvm::is_contained(
              cfg.instructions[cfg.roles.at("shared_symbol")].operands,
              "shuttle_smem") &&
-         onlineRoleIsUnpredicated(cfg, "shared_base",
-                                  {"cvta.to.shared.u64"}) &&
+         onlineRoleIsUnpredicated(cfg, "shared_base", {"cvta.to.shared.u64"}) &&
          onlineRoleOperandIs(cfg, "shared_base", 1, "shared_symbol") &&
          onlineRoleIsUnpredicated(cfg, "leaf_index", {"mov.u32"}) &&
          llvm::is_contained(
-             cfg.instructions[cfg.roles.at("leaf_index")].operands,
-             "%tid.x") &&
+             cfg.instructions[cfg.roles.at("leaf_index")].operands, "%tid.x") &&
          onlineRoleIsUnpredicated(cfg, "leaf_index_wide", {"cvt.u64.u32"}) &&
          onlineRoleOperandIs(cfg, "leaf_index_wide", 1, "leaf_index") &&
          onlineRoleIsUnpredicated(cfg, "leaf_index_byte_offset",
@@ -5201,8 +5175,7 @@ bool onlineSharedStateAddressesAreClosed(const OnlinePtxCfg &cfg,
          onlineRoleIsUnpredicated(cfg, "leaf_o_pointer", {"add.u64"}) &&
          onlineRoleOperandIs(cfg, "leaf_o_pointer", 1, "leaf_m_pointer") &&
          literalOperand("leaf_o_pointer", oOffset) &&
-         onlineRoleIsUnpredicated(cfg, "partial_index_wide",
-                                  {"cvt.u64.u32"}) &&
+         onlineRoleIsUnpredicated(cfg, "partial_index_wide", {"cvt.u64.u32"}) &&
          onlineRoleOperandDefinitionsAre(
              cfg, "partial_index_wide", 1,
              {"partial_index_init", "partial_index_step"}) &&
@@ -5226,12 +5199,9 @@ bool onlineSharedStateAddressesAreClosed(const OnlinePtxCfg &cfg,
          onlineRoleOperandIs(cfg, "leaf_m_store", 0, "leaf_m_pointer") &&
          onlineRoleOperandIs(cfg, "leaf_l_store", 0, "leaf_l_pointer") &&
          onlineRoleOperandIs(cfg, "leaf_o_store", 0, "leaf_o_pointer") &&
-         onlineRoleOperandIs(cfg, "partial_m_load", 1,
-                             "partial_m_pointer") &&
-         onlineRoleOperandIs(cfg, "partial_l_load", 1,
-                             "partial_l_pointer") &&
-         onlineRoleOperandIs(cfg, "partial_o_load", 1,
-                             "partial_o_pointer");
+         onlineRoleOperandIs(cfg, "partial_m_load", 1, "partial_m_pointer") &&
+         onlineRoleOperandIs(cfg, "partial_l_load", 1, "partial_l_pointer") &&
+         onlineRoleOperandIs(cfg, "partial_o_load", 1, "partial_o_pointer");
 }
 
 bool onlinePartialStateReductionProtocol(const OnlinePtxCfg &cfg,
@@ -5260,239 +5230,192 @@ bool onlinePartialStateReductionProtocol(const OnlinePtxCfg &cfg,
   auto exitTarget = cfg.labels.find(exitInstruction.branchTarget);
   auto backedgeTarget = cfg.labels.find(backedgeInstruction.branchTarget);
   if (!check(
-             onlineRoleIsExactFloatConstant(cfg, "partial_m_init",
-                                            "0fFF800000") &&
-                 onlineRoleIsExactFloatConstant(cfg, "partial_l_init",
-                                                "0f00000000") &&
-                 onlineRoleIsExactFloatConstant(cfg, "partial_o_init",
-                                                "0f00000000")) ||
-      !check(onlineRoleIs(cfg, "partial_index_init", {"mov.u32"}) &&
-                               llvm::is_contained(
-                                   cfg.instructions[init->second].operands,
-                                   "1")) ||
+          onlineRoleIsExactFloatConstant(cfg, "partial_m_init", "0fFF800000") &&
+          onlineRoleIsExactFloatConstant(cfg, "partial_l_init", "0f00000000") &&
+          onlineRoleIsExactFloatConstant(cfg, "partial_o_init",
+                                         "0f00000000")) ||
       !check(
-             onlineRoleIs(cfg, "partial_index_guard", {"setp.ge.u32"}) &&
-                 llvm::is_contained(cfg.instructions[guard->second].operands,
-                                    std::to_string(threads)) &&
-                 onlineRoleOperandDefinitionsAre(
-                     cfg, "partial_index_guard", 1,
-                     {"partial_index_init", "partial_index_step"})) ||
+          onlineRoleIs(cfg, "partial_index_init", {"mov.u32"}) &&
+          llvm::is_contained(cfg.instructions[init->second].operands, "1")) ||
+      !check(onlineRoleIs(cfg, "partial_index_guard", {"setp.ge.u32"}) &&
+             llvm::is_contained(cfg.instructions[guard->second].operands,
+                                std::to_string(threads)) &&
+             onlineRoleOperandDefinitionsAre(
+                 cfg, "partial_index_guard", 1,
+                 {"partial_index_init", "partial_index_step"})) ||
       !check(
-             exitInstruction.opcode == "bra" &&
-                 !exitInstruction.predicate.empty() &&
-                 !exitInstruction.negatedPredicate &&
-                 onlineRoleDirectlyReaches(cfg, "partial_index_guard",
-                                           exit->second) &&
-                 backedgeInstruction.opcode == "bra" &&
-                 backedgeInstruction.predicate.empty() &&
-                 exitTarget != cfg.labels.end() &&
-                 exitTarget->second == cfg.instructions[result->second].block &&
-                 backedgeTarget != cfg.labels.end() &&
-                 backedgeTarget->second ==
-                     cfg.instructions[guard->second].block) ||
+          exitInstruction.opcode == "bra" &&
+          !exitInstruction.predicate.empty() &&
+          !exitInstruction.negatedPredicate &&
+          onlineRoleDirectlyReaches(cfg, "partial_index_guard", exit->second) &&
+          backedgeInstruction.opcode == "bra" &&
+          backedgeInstruction.predicate.empty() &&
+          exitTarget != cfg.labels.end() &&
+          exitTarget->second == cfg.instructions[result->second].block &&
+          backedgeTarget != cfg.labels.end() &&
+          backedgeTarget->second == cfg.instructions[guard->second].block) ||
       !check(
-             onlineRoleIs(cfg, "partial_m_load", {"ld.shared.f32"}) &&
-                 onlineRoleIs(cfg, "partial_l_load", {"ld.shared.f32"}) &&
-                 onlineRoleIs(cfg, "partial_o_load", {"ld.shared.f32"}) &&
-                 cfg.instructions[loadM->second].predicate.empty() &&
-                 cfg.instructions[cfg.roles.at("partial_l_load")]
-                     .predicate.empty() &&
-                 cfg.instructions[cfg.roles.at("partial_o_load")]
-                     .predicate.empty() &&
-                 onlineSharedStateAddressesAreClosed(cfg, threads)) ||
-      !check(
-             onlineRoleIs(cfg, "partial_merge_max", {"max.f32"},
+          onlineRoleIs(cfg, "partial_m_load", {"ld.shared.f32"}) &&
+          onlineRoleIs(cfg, "partial_l_load", {"ld.shared.f32"}) &&
+          onlineRoleIs(cfg, "partial_o_load", {"ld.shared.f32"}) &&
+          cfg.instructions[loadM->second].predicate.empty() &&
+          cfg.instructions[cfg.roles.at("partial_l_load")].predicate.empty() &&
+          cfg.instructions[cfg.roles.at("partial_o_load")].predicate.empty() &&
+          onlineSharedStateAddressesAreClosed(cfg, threads)) ||
+      !check(onlineRoleIs(cfg, "partial_merge_max", {"max.f32"},
                           {"partial_m_load"}) &&
-                 onlineRoleOperandDefinitionsAre(
-                     cfg, "partial_merge_max", 1,
-                     {"partial_m_init", "partial_m_update"})) ||
-      !check(
-             onlineRoleIs(cfg, "partial_left_delta", {"sub.rn.f32"},
+             onlineRoleOperandDefinitionsAre(
+                 cfg, "partial_merge_max", 1,
+                 {"partial_m_init", "partial_m_update"})) ||
+      !check(onlineRoleIs(cfg, "partial_left_delta", {"sub.rn.f32"},
                           {"partial_merge_max"}) &&
-                 onlineRoleOperandDefinitionsAre(
-                     cfg, "partial_left_delta", 1,
-                     {"partial_m_init", "partial_m_update"}) &&
-                 onlineRoleOperandIs(cfg, "partial_left_delta", 2,
-                                     "partial_merge_max") &&
-                 onlineRoleIs(cfg, "partial_right_delta", {"sub.rn.f32"},
-                              {"partial_m_load", "partial_merge_max"}) &&
-                 onlineRoleOperandIs(cfg, "partial_right_delta", 1,
-                                     "partial_m_load") &&
-                 onlineRoleOperandIs(cfg, "partial_right_delta", 2,
-                                     "partial_merge_max") &&
-                 onlineExpOf(cfg, "partial_left_rescale",
-                             "partial_left_delta",
-                             "partial_left_exp_argument") &&
-                 onlineExpOf(cfg, "partial_right_rescale",
-                             "partial_right_delta",
-                             "partial_right_exp_argument") &&
-                 onlineRoleIs(cfg, "partial_merge_left_l", {"mul.rn.f32"},
-                              {"partial_left_rescale"}) &&
-                 onlineRoleOperandDefinitionsAre(
-                     cfg, "partial_merge_left_l", 2,
-                     {"partial_l_init", "partial_l_update"}) &&
-                 onlineRoleIs(cfg, "partial_merge_right_l", {"mul.rn.f32"},
-                              {"partial_right_rescale", "partial_l_load"}) &&
-                 onlineRoleIs(cfg, "partial_merge_l", {"add.rn.f32"},
-                              {"partial_merge_left_l",
-                               "partial_merge_right_l"})) ||
-      !check(
-             onlineRoleIs(cfg, "partial_merge_left_o", {"mul.rn.f32"},
+             onlineRoleOperandDefinitionsAre(
+                 cfg, "partial_left_delta", 1,
+                 {"partial_m_init", "partial_m_update"}) &&
+             onlineRoleOperandIs(cfg, "partial_left_delta", 2,
+                                 "partial_merge_max") &&
+             onlineRoleIs(cfg, "partial_right_delta", {"sub.rn.f32"},
+                          {"partial_m_load", "partial_merge_max"}) &&
+             onlineRoleOperandIs(cfg, "partial_right_delta", 1,
+                                 "partial_m_load") &&
+             onlineRoleOperandIs(cfg, "partial_right_delta", 2,
+                                 "partial_merge_max") &&
+             onlineExpOf(cfg, "partial_left_rescale", "partial_left_delta",
+                         "partial_left_exp_argument") &&
+             onlineExpOf(cfg, "partial_right_rescale", "partial_right_delta",
+                         "partial_right_exp_argument") &&
+             onlineRoleIs(cfg, "partial_merge_left_l", {"mul.rn.f32"},
                           {"partial_left_rescale"}) &&
-                 onlineRoleOperandDefinitionsAre(
-                     cfg, "partial_merge_left_o", 2,
-                     {"partial_o_init", "partial_o_update"}) &&
-                 onlineRoleIs(cfg, "partial_merge_right_o", {"mul.rn.f32"},
-                              {"partial_right_rescale", "partial_o_load"}) &&
-                 onlineRoleIs(cfg, "partial_merge_o", {"add.rn.f32"},
-                              {"partial_merge_left_o",
-                               "partial_merge_right_o"})) ||
-      !check(
-             onlineRoleIs(cfg, "partial_m_update", {"mov.f32"},
+             onlineRoleOperandDefinitionsAre(
+                 cfg, "partial_merge_left_l", 2,
+                 {"partial_l_init", "partial_l_update"}) &&
+             onlineRoleIs(cfg, "partial_merge_right_l", {"mul.rn.f32"},
+                          {"partial_right_rescale", "partial_l_load"}) &&
+             onlineRoleIs(cfg, "partial_merge_l", {"add.rn.f32"},
+                          {"partial_merge_left_l", "partial_merge_right_l"})) ||
+      !check(onlineRoleIs(cfg, "partial_merge_left_o", {"mul.rn.f32"},
+                          {"partial_left_rescale"}) &&
+             onlineRoleOperandDefinitionsAre(
+                 cfg, "partial_merge_left_o", 2,
+                 {"partial_o_init", "partial_o_update"}) &&
+             onlineRoleIs(cfg, "partial_merge_right_o", {"mul.rn.f32"},
+                          {"partial_right_rescale", "partial_o_load"}) &&
+             onlineRoleIs(cfg, "partial_merge_o", {"add.rn.f32"},
+                          {"partial_merge_left_o", "partial_merge_right_o"})) ||
+      !check(onlineRoleIs(cfg, "partial_m_update", {"mov.f32"},
                           {"partial_merge_max"}) &&
-                 onlineRoleIs(cfg, "partial_l_update", {"mov.f32"},
-                              {"partial_merge_l"}) &&
-                 onlineRoleIs(cfg, "partial_o_update", {"mov.f32"},
-                              {"partial_merge_o"})) ||
+             onlineRoleIs(cfg, "partial_l_update", {"mov.f32"},
+                          {"partial_merge_l"}) &&
+             onlineRoleIs(cfg, "partial_o_update", {"mov.f32"},
+                          {"partial_merge_o"})) ||
       !check(
-             onlineRoleIs(cfg, "partial_index_step", {"add.u32"}) &&
-                 cfg.instructions[step->second].predicate.empty() &&
-                 onlineRoleOperandDefinitionsAre(
-                     cfg, "partial_index_step", 1,
-                     {"partial_index_init", "partial_index_step"}) &&
-                 llvm::is_contained(cfg.instructions[step->second].operands,
-                                    "1")) ||
-      !check(
-             onlineInstructionDominates(cfg, init->second, guard->second) &&
-                 onlineInstructionDominates(cfg, guard->second,
-                                            loadM->second) &&
-                 onlineInstructionDominates(cfg, loadM->second,
-                                            mergeM->second) &&
-                 onlineInstructionDominates(cfg, mergeM->second,
-                                            step->second) &&
-                 onlineInstructionDominates(cfg, step->second,
-                                            backedge->second) &&
-                 onlineInstructionDominates(cfg, exit->second,
-                                            result->second)))
+          onlineRoleIs(cfg, "partial_index_step", {"add.u32"}) &&
+          cfg.instructions[step->second].predicate.empty() &&
+          onlineRoleOperandDefinitionsAre(
+              cfg, "partial_index_step", 1,
+              {"partial_index_init", "partial_index_step"}) &&
+          llvm::is_contained(cfg.instructions[step->second].operands, "1")) ||
+      !check(onlineInstructionDominates(cfg, init->second, guard->second) &&
+             onlineInstructionDominates(cfg, guard->second, loadM->second) &&
+             onlineInstructionDominates(cfg, loadM->second, mergeM->second) &&
+             onlineInstructionDominates(cfg, mergeM->second, step->second) &&
+             onlineInstructionDominates(cfg, step->second, backedge->second) &&
+             onlineInstructionDominates(cfg, exit->second, result->second)))
     return false;
   const OnlinePtxInstruction &leaderExitInstruction =
       cfg.instructions[leaderExit->second];
   auto leaderTarget = cfg.labels.find(leaderExitInstruction.branchTarget);
   auto doneTarget = cfg.labels.find("$done");
-  return check(
-             onlineRoleIs(cfg, "leader_predicate", {"setp.ne.u32"},
-                          {"leaf_index"}) &&
-                 llvm::is_contained(
-                     cfg.instructions[leaderPredicate->second].operands,
-                     "0") &&
-                 leaderExitInstruction.opcode == "bra" &&
-                 !leaderExitInstruction.predicate.empty() &&
-                 !leaderExitInstruction.negatedPredicate &&
-                 onlineRoleDirectlyReaches(cfg, "leader_predicate",
-                                           leaderExit->second) &&
-                 leaderTarget != cfg.labels.end() &&
-                 doneTarget != cfg.labels.end() &&
-                 leaderTarget->second == doneTarget->second &&
-                 onlineInstructionDominates(cfg, leaderExit->second,
-                                            init->second)) &&
+  return check(onlineRoleIs(cfg, "leader_predicate", {"setp.ne.u32"},
+                            {"leaf_index"}) &&
+               llvm::is_contained(
+                   cfg.instructions[leaderPredicate->second].operands, "0") &&
+               leaderExitInstruction.opcode == "bra" &&
+               !leaderExitInstruction.predicate.empty() &&
+               !leaderExitInstruction.negatedPredicate &&
+               onlineRoleDirectlyReaches(cfg, "leader_predicate",
+                                         leaderExit->second) &&
+               leaderTarget != cfg.labels.end() &&
+               doneTarget != cfg.labels.end() &&
+               leaderTarget->second == doneTarget->second &&
+               onlineInstructionDominates(cfg, leaderExit->second,
+                                          init->second)) &&
          check(
-               onlineRoleIs(cfg, "leaf_state_m", {"mov.f32"},
-                            {"max_init"}) &&
-                   onlineRoleIs(cfg, "leaf_state_l", {"mov.f32"},
-                                {"zero_init"}) &&
-                   onlineRoleIs(cfg, "leaf_state_o", {"mov.f32"},
-                                {"zero_init"}) &&
-                   onlineRoleIs(cfg, "leaf_max_update", {"max.f32"},
-                                {"leaf_state_m", "mask_select"}) &&
-                   onlineRoleIs(cfg, "leaf_old_delta", {"sub.rn.f32"},
-                                {"leaf_state_m", "leaf_max_update"}) &&
-                   onlineRoleOperandIs(cfg, "leaf_old_delta", 1,
-                                       "leaf_state_m") &&
-                   onlineRoleOperandIs(cfg, "leaf_old_delta", 2,
-                                       "leaf_max_update") &&
-                   onlineExpOf(cfg, "leaf_old_rescale", "leaf_old_delta",
-                               "leaf_old_exp_argument") &&
-                   onlineRoleIs(cfg, "leaf_score_delta", {"sub.rn.f32"},
-                                {"mask_select", "leaf_max_update"}) &&
-                   onlineRoleOperandIs(cfg, "leaf_score_delta", 1,
-                                       "mask_select") &&
-                   onlineRoleOperandIs(cfg, "leaf_score_delta", 2,
-                                       "leaf_max_update") &&
-                   onlineExpOf(cfg, "leaf_score_weight", "leaf_score_delta",
-                               "leaf_score_exp_argument") &&
-                   onlineRoleIs(cfg, "leaf_value_weight", {"mul.rn.f32"},
-                                {"leaf_score_weight", "value_load"})) &&
-         check(
-               onlineScaledUpdate(cfg, "leaf_old_l_scaled", "leaf_l_update",
+             onlineRoleIs(cfg, "leaf_state_m", {"mov.f32"}, {"max_init"}) &&
+             onlineRoleIs(cfg, "leaf_state_l", {"mov.f32"}, {"zero_init"}) &&
+             onlineRoleIs(cfg, "leaf_state_o", {"mov.f32"}, {"zero_init"}) &&
+             onlineRoleIs(cfg, "leaf_max_update", {"max.f32"},
+                          {"leaf_state_m", "mask_select"}) &&
+             onlineRoleIs(cfg, "leaf_old_delta", {"sub.rn.f32"},
+                          {"leaf_state_m", "leaf_max_update"}) &&
+             onlineRoleOperandIs(cfg, "leaf_old_delta", 1, "leaf_state_m") &&
+             onlineRoleOperandIs(cfg, "leaf_old_delta", 2, "leaf_max_update") &&
+             onlineExpOf(cfg, "leaf_old_rescale", "leaf_old_delta",
+                         "leaf_old_exp_argument") &&
+             onlineRoleIs(cfg, "leaf_score_delta", {"sub.rn.f32"},
+                          {"mask_select", "leaf_max_update"}) &&
+             onlineRoleOperandIs(cfg, "leaf_score_delta", 1, "mask_select") &&
+             onlineRoleOperandIs(cfg, "leaf_score_delta", 2,
+                                 "leaf_max_update") &&
+             onlineExpOf(cfg, "leaf_score_weight", "leaf_score_delta",
+                         "leaf_score_exp_argument") &&
+             onlineRoleIs(cfg, "leaf_value_weight", {"mul.rn.f32"},
+                          {"leaf_score_weight", "value_load"})) &&
+         check(onlineScaledUpdate(cfg, "leaf_old_l_scaled", "leaf_l_update",
                                   "leaf_old_rescale", "leaf_state_l",
                                   "leaf_score_weight")) &&
-         check(
-               onlineScaledUpdate(cfg, "leaf_old_o_scaled", "leaf_o_update",
+         check(onlineScaledUpdate(cfg, "leaf_old_o_scaled", "leaf_o_update",
                                   "leaf_old_rescale", "leaf_state_o",
                                   "leaf_value_weight")) &&
          check(
-               onlineRoleIs(cfg, "leaf_m_store", {"st.shared.f32"},
-                            {"leaf_max_update"}) &&
-                   cfg.instructions[cfg.roles.at("leaf_m_store")]
-                       .predicate.empty() &&
-                   onlineRoleIs(cfg, "leaf_l_store", {"st.shared.f32"},
-                                {"leaf_l_update"}) &&
-                   cfg.instructions[cfg.roles.at("leaf_l_store")]
-                       .predicate.empty() &&
-                   onlineRoleIs(cfg, "leaf_o_store", {"st.shared.f32"},
-                                {"leaf_o_update"}) &&
-                   cfg.instructions[cfg.roles.at("leaf_o_store")]
-                       .predicate.empty()) &&
+             onlineRoleIs(cfg, "leaf_m_store", {"st.shared.f32"},
+                          {"leaf_max_update"}) &&
+             cfg.instructions[cfg.roles.at("leaf_m_store")].predicate.empty() &&
+             onlineRoleIs(cfg, "leaf_l_store", {"st.shared.f32"},
+                          {"leaf_l_update"}) &&
+             cfg.instructions[cfg.roles.at("leaf_l_store")].predicate.empty() &&
+             onlineRoleIs(cfg, "leaf_o_store", {"st.shared.f32"},
+                          {"leaf_o_update"}) &&
+             cfg.instructions[cfg.roles.at("leaf_o_store")]
+                 .predicate.empty()) &&
          check(
-               onlineRoleIs(cfg, "leaf_barrier", {"bar.sync"}) &&
-                   cfg.instructions[cfg.roles.at("leaf_barrier")]
-                       .predicate.empty() &&
-                   onlineInstructionDominates(
-                       cfg, cfg.roles.at("leaf_m_store"),
-                       cfg.roles.at("leaf_barrier")) &&
-                   onlineInstructionDominates(
-                       cfg, cfg.roles.at("leaf_l_store"),
-                       cfg.roles.at("leaf_barrier")) &&
-                   onlineInstructionDominates(
-                       cfg, cfg.roles.at("leaf_o_store"),
-                       cfg.roles.at("leaf_barrier")) &&
-                   onlineInstructionDominates(cfg,
-                                              cfg.roles.at("leaf_barrier"),
-                                              loadM->second) &&
-                   onlineInstructionDominates(
-                       cfg, cfg.roles.at("leaf_barrier"),
-                       cfg.roles.at("partial_l_load")) &&
-                   onlineInstructionDominates(
-                       cfg, cfg.roles.at("leaf_barrier"),
-                       cfg.roles.at("partial_o_load"))) &&
+             onlineRoleIs(cfg, "leaf_barrier", {"bar.sync"}) &&
+             cfg.instructions[cfg.roles.at("leaf_barrier")].predicate.empty() &&
+             onlineInstructionDominates(cfg, cfg.roles.at("leaf_m_store"),
+                                        cfg.roles.at("leaf_barrier")) &&
+             onlineInstructionDominates(cfg, cfg.roles.at("leaf_l_store"),
+                                        cfg.roles.at("leaf_barrier")) &&
+             onlineInstructionDominates(cfg, cfg.roles.at("leaf_o_store"),
+                                        cfg.roles.at("leaf_barrier")) &&
+             onlineInstructionDominates(cfg, cfg.roles.at("leaf_barrier"),
+                                        loadM->second) &&
+             onlineInstructionDominates(cfg, cfg.roles.at("leaf_barrier"),
+                                        cfg.roles.at("partial_l_load")) &&
+             onlineInstructionDominates(cfg, cfg.roles.at("leaf_barrier"),
+                                        cfg.roles.at("partial_o_load"))) &&
          check(
-             onlineRoleIs(cfg, "partial_m_result", {"max.f32"},
-                          {"max_init"}) &&
-                 onlineRoleOperandDefinitionsAre(
-                     cfg, "partial_m_result", 1,
-                     {"partial_m_init", "partial_m_update"}) &&
-                 onlineRoleIs(cfg, "partial_l_result", {"add.rn.f32"},
-                              {"zero_init"}) &&
-                 onlineRoleOperandDefinitionsAre(
-                     cfg, "partial_l_result", 1,
-                     {"partial_l_init", "partial_l_update"}) &&
-                 onlineRoleIs(cfg, "partial_o_result", {"add.rn.f32"},
-                              {"zero_init"}) &&
-                 onlineRoleOperandDefinitionsAre(
-                     cfg, "partial_o_result", 1,
-                     {"partial_o_init", "partial_o_update"}) &&
-                 onlineRoleIs(cfg, "state_m", {"mov.f32"},
-                              {"partial_m_result"}) &&
-                 onlineRoleIs(cfg, "state_l", {"mov.f32"},
-                              {"partial_l_result"}) &&
-                 onlineRoleIs(cfg, "state_o", {"mov.f32"},
-                              {"partial_o_result"}));
+             onlineRoleIs(cfg, "partial_m_result", {"max.f32"}, {"max_init"}) &&
+             onlineRoleOperandDefinitionsAre(
+                 cfg, "partial_m_result", 1,
+                 {"partial_m_init", "partial_m_update"}) &&
+             onlineRoleIs(cfg, "partial_l_result", {"add.rn.f32"},
+                          {"zero_init"}) &&
+             onlineRoleOperandDefinitionsAre(
+                 cfg, "partial_l_result", 1,
+                 {"partial_l_init", "partial_l_update"}) &&
+             onlineRoleIs(cfg, "partial_o_result", {"add.rn.f32"},
+                          {"zero_init"}) &&
+             onlineRoleOperandDefinitionsAre(
+                 cfg, "partial_o_result", 1,
+                 {"partial_o_init", "partial_o_update"}) &&
+             onlineRoleIs(cfg, "state_m", {"mov.f32"}, {"partial_m_result"}) &&
+             onlineRoleIs(cfg, "state_l", {"mov.f32"}, {"partial_l_result"}) &&
+             onlineRoleIs(cfg, "state_o", {"mov.f32"}, {"partial_o_result"}));
 }
 
 bool onlineFinalizeProtocol(const OnlinePtxCfg &cfg) {
   const bool mergedDivision =
-      onlineRoleIs(cfg, "finalize", {"div.rn.f32"},
-                   {"merge_o", "merge_l"}) &&
+      onlineRoleIs(cfg, "finalize", {"div.rn.f32"}, {"merge_o", "merge_l"}) &&
       onlineRoleOperandIs(cfg, "finalize", 1, "merge_o") &&
       onlineRoleOperandIs(cfg, "finalize", 2, "merge_l");
   const bool mergedReciprocal =
@@ -5501,8 +5424,7 @@ bool onlineFinalizeProtocol(const OnlinePtxCfg &cfg) {
       onlineRoleIs(cfg, "finalize", {"mul.rn.f32"},
                    {"merge_o", "denominator_reciprocal"});
   const bool updateDivision =
-      onlineRoleIs(cfg, "finalize", {"div.rn.f32"},
-                   {"o_update", "l_update"}) &&
+      onlineRoleIs(cfg, "finalize", {"div.rn.f32"}, {"o_update", "l_update"}) &&
       onlineRoleOperandIs(cfg, "finalize", 1, "o_update") &&
       onlineRoleOperandIs(cfg, "finalize", 2, "l_update");
   const bool updateReciprocal =
@@ -5519,9 +5441,8 @@ bool onlineStateProtocol(const OnlinePtxCfg &cfg, int64_t outputParameter,
   return onlinePartialStateReductionProtocol(cfg, threads) &&
          onlineMaskedScoreProtocol(cfg, comparisonOpcode) &&
          onlineRoleIs(cfg, "max_init", {"mov.f32"}) &&
-         llvm::is_contained(
-             cfg.instructions[cfg.roles.at("max_init")].operands,
-             "0fFF800000") &&
+         llvm::is_contained(cfg.instructions[cfg.roles.at("max_init")].operands,
+                            "0fFF800000") &&
          onlineRoleIs(cfg, "zero_init", {"mov.f32"}) &&
          llvm::is_contained(
              cfg.instructions[cfg.roles.at("zero_init")].operands,
@@ -5538,8 +5459,7 @@ bool onlineStateProtocol(const OnlinePtxCfg &cfg, int64_t outputParameter,
                       {"state_m", "max_update"}) &&
          onlineRoleOperandIs(cfg, "old_delta", 1, "state_m") &&
          onlineRoleOperandIs(cfg, "old_delta", 2, "max_update") &&
-         onlineExpOf(cfg, "old_rescale", "old_delta",
-                     "old_exp_argument") &&
+         onlineExpOf(cfg, "old_rescale", "old_delta", "old_exp_argument") &&
          onlineRoleIs(cfg, "score_delta", {"sub.rn.f32"},
                       {"mask_select", "max_update"}) &&
          onlineRoleOperandIs(cfg, "score_delta", 1, "mask_select") &&
@@ -5548,10 +5468,10 @@ bool onlineStateProtocol(const OnlinePtxCfg &cfg, int64_t outputParameter,
                      "score_exp_argument") &&
          onlineRoleIs(cfg, "value_weight", {"mul.rn.f32"},
                       {"score_weight", "value_load"}) &&
-         onlineScaledUpdate(cfg, "old_l_scaled", "l_update",
-                            "old_rescale", "state_l", "score_weight") &&
-         onlineScaledUpdate(cfg, "old_o_scaled", "o_update",
-                            "old_rescale", "state_o", "value_weight") &&
+         onlineScaledUpdate(cfg, "old_l_scaled", "l_update", "old_rescale",
+                            "state_l", "score_weight") &&
+         onlineScaledUpdate(cfg, "old_o_scaled", "o_update", "old_rescale",
+                            "state_o", "value_weight") &&
          onlineFinalizeProtocol(cfg) &&
          onlineRoleIs(cfg, "public_store", {"st.global."}, {"finalize"}) &&
          onlineRoleStoresToOutput(cfg, "public_store", outputParameter);
@@ -5655,12 +5575,13 @@ ret;
       FailureOr<std::pair<Value, ContractOp>> source =
           onlineScoreSourceChain(getOperation());
       if (failed(source)) {
-        getOperation().emitError("score semantic certificate has no source chain");
+        getOperation().emitError(
+            "score semantic certificate has no source chain");
         return signalPassFailure();
       }
       llvm::SmallDenseSet<Operation *> active;
-      FailureOr<Attribute> certificate = onlineScoreSemantics(
-          source->first, source->second, builder, active);
+      FailureOr<Attribute> certificate =
+          onlineScoreSemantics(source->first, source->second, builder, active);
       auto scoreType = dyn_cast<RankedTensorType>(source->first.getType());
       FoldOp maximumFold;
       getOperation().walk([&](FoldOp fold) {
@@ -5670,7 +5591,8 @@ ret;
       });
       SmallVector<AffineExpr> scoreCoordinates;
       if (scoreType)
-        for (int64_t dimension = 0; dimension < scoreType.getRank(); ++dimension)
+        for (int64_t dimension = 0; dimension < scoreType.getRank();
+             ++dimension)
           scoreCoordinates.push_back(getAffineDimExpr(dimension, context));
       ArrayRef<int64_t> reductionDimensions =
           maximumFold ? maximumFold.getReductionDimensions()
@@ -5682,8 +5604,8 @@ ret;
                     reductionDimensions.front(), context)
               : FailureOr<OnlineScoreContractGeometry>(failure());
       if (failed(certificate) || failed(geometry) ||
-          !onlineScoreSemanticCertificateMatches(
-              source->first, source->second, *certificate)) {
+          !onlineScoreSemanticCertificateMatches(source->first, source->second,
+                                                 *certificate)) {
         getOperation().emitError(
             "score semantic certificate does not compose to its Contract");
         return signalPassFailure();
@@ -5697,8 +5619,8 @@ ret;
           {"name", arith::DivFOp::getOperationName()},
           {"name", "math.tanh"}};
       for (auto [key, value] : mutations) {
-        if (value && !onlineScoreSemanticCertificateContains(
-                         *certificate, key, *value))
+        if (value &&
+            !onlineScoreSemanticCertificateContains(*certificate, key, *value))
           continue;
         bool changed = false;
         Attribute mutated = onlineMutateScoreSemanticCertificate(
@@ -5725,9 +5647,8 @@ ret;
                                     finalOperand)
               : std::string();
       DictionaryAttr scoreContractCertificate = DictionaryAttr::get(
-          context,
-          {builder.getNamedAttr("result_role",
-                                builder.getStringAttr("raw_score"))});
+          context, {builder.getNamedAttr("result_role",
+                                         builder.getStringAttr("raw_score"))});
       OnlineMaxReductionNode expressionNode;
       expressionNode.realization = DictionaryAttr::get(
           context,
@@ -5737,9 +5658,9 @@ ret;
            builder.getNamedAttr("score_semantics", *certificate)});
       auto acceptsImplementation = [&](StringRef ptx) {
         FailureOr<OnlinePtxCfg> cfg = onlinePtxCfg(ptx);
-        return succeeded(cfg) && onlineScoreMapChainBindings(
-                                     *cfg, expressionNode, source->first,
-                                     source->second);
+        return succeeded(cfg) &&
+               onlineScoreMapChainBindings(*cfg, expressionNode, source->first,
+                                           source->second);
       };
       const std::string finalLine =
           (Twine("mov.f32 %f999, ") + finalOperand + ";").str();
@@ -5771,24 +5692,22 @@ ret;
           everyConstantRejected = false;
           break;
         }
-        mutated[constant + 9] =
-            mutated[constant + 9] == '0' ? '1' : '0';
+        mutated[constant + 9] = mutated[constant + 9] == '0' ? '1' : '0';
         everyConstantRejected &= !acceptsImplementation(mutated);
         constant += 10;
       }
       bool transformedOperationRejected = true;
-      for (StringRef opcode : {StringRef("mul.rn.f32"),
-                               StringRef("add.rn.f32"),
-                               StringRef("sub.rn.f32"),
-                               StringRef("rcp.rn.f32")}) {
+      for (StringRef opcode :
+           {StringRef("mul.rn.f32"), StringRef("add.rn.f32"),
+            StringRef("sub.rn.f32"), StringRef("rcp.rn.f32")}) {
         size_t position = 0;
         while ((position = expressionPtx.find(opcode.str(), position)) !=
                std::string::npos) {
           std::string mutated = expressionPtx;
-          StringRef replacement = opcode == "mul.rn.f32" ? "add.rn.f32"
+          StringRef replacement = opcode == "mul.rn.f32"   ? "add.rn.f32"
                                   : opcode == "add.rn.f32" ? "mul.rn.f32"
                                   : opcode == "sub.rn.f32" ? "add.rn.f32"
-                                                            : "mov.f32    ";
+                                                           : "mov.f32    ";
           mutated.replace(position, opcode.size(), replacement.str());
           transformedOperationRejected &= !acceptsImplementation(mutated);
           position += opcode.size();
@@ -5798,8 +5717,7 @@ ret;
           acceptsImplementation(replaceFinal("mov.f32 %f999, %f0;")) ||
           acceptsImplementation(
               replaceFinal("mul.rn.f32 %f999, %f0, 0f00000000;")) ||
-          acceptsImplementation(
-              replaceFinal("mov.f32 %f999, 0f3F800000;")) ||
+          acceptsImplementation(replaceFinal("mov.f32 %f999, 0f3F800000;")) ||
           !foundConstant || !everyConstantRejected ||
           rawSource == std::string::npos ||
           acceptsImplementation(wrongRawSource) ||
@@ -5814,36 +5732,35 @@ ret;
     auto reductionNode = [&](int64_t id, StringRef role,
                              ArrayRef<int64_t> coverage,
                              ArrayRef<int64_t> children) -> Attribute {
-      const int64_t stride = coverage.size() > 1 ? coverage[1] - coverage[0] : 1;
+      const int64_t stride =
+          coverage.size() > 1 ? coverage[1] - coverage[0] : 1;
       DictionaryAttr partition = DictionaryAttr::get(
           context,
           {builder.getNamedAttr("offset",
                                 builder.getI64IntegerAttr(coverage.front())),
            builder.getNamedAttr("stride", builder.getI64IntegerAttr(stride)),
-           builder.getNamedAttr(
-               "count", builder.getI64IntegerAttr(coverage.size()))});
+           builder.getNamedAttr("count",
+                                builder.getI64IntegerAttr(coverage.size()))});
       DictionaryAttr syntheticLeafRealization = DictionaryAttr::get(
-          context,
-          {builder.getNamedAttr("kind",
-                                builder.getStringAttr("canonical_loop")),
-           builder.getNamedAttr("partition", partition)});
+          context, {builder.getNamedAttr(
+                        "kind", builder.getStringAttr("canonical_loop")),
+                    builder.getNamedAttr("partition", partition)});
       SmallVector<NamedAttribute> attributes{
           builder.getNamedAttr("id", builder.getI64IntegerAttr(id)),
-          builder.getNamedAttr("kind", builder.getStringAttr(
-                                           children.empty() ? "leaf_family"
-                                                            : "merge")),
+          builder.getNamedAttr("kind", builder.getStringAttr(children.empty()
+                                                                 ? "leaf_family"
+                                                                 : "merge")),
           builder.getNamedAttr("role", builder.getStringAttr(role)),
-          builder.getNamedAttr(
-              "children", DenseI64ArrayAttr::get(context, children))};
+          builder.getNamedAttr("children",
+                               DenseI64ArrayAttr::get(context, children))};
       if (children.empty())
-        attributes.push_back(builder.getNamedAttr(
-            "realization", syntheticLeafRealization));
-      return DictionaryAttr::get(
-          context, attributes);
+        attributes.push_back(
+            builder.getNamedAttr("realization", syntheticLeafRealization));
+      return DictionaryAttr::get(context, attributes);
     };
-    auto reductionLeafFamily =
-        [&](int64_t id, StringRef role, ArrayRef<int64_t> coverage,
-            DictionaryAttr realization) -> Attribute {
+    auto reductionLeafFamily = [&](int64_t id, StringRef role,
+                                   ArrayRef<int64_t> coverage,
+                                   DictionaryAttr realization) -> Attribute {
       return DictionaryAttr::get(
           context,
           {builder.getNamedAttr("id", builder.getI64IntegerAttr(id)),
@@ -5853,9 +5770,8 @@ ret;
                                 DenseI64ArrayAttr::get(context, {})),
            builder.getNamedAttr("realization", realization)});
     };
-    auto reductionCertificate =
-        [&](ArrayRef<Attribute> nodes, int64_t root,
-            int64_t extent) -> DictionaryAttr {
+    auto reductionCertificate = [&](ArrayRef<Attribute> nodes, int64_t root,
+                                    int64_t extent) -> DictionaryAttr {
       ArrayAttr sources = builder.getArrayAttr(
           {builder.getStringAttr("synthetic-source-bound-score-and-relation")});
       return DictionaryAttr::get(
@@ -5872,8 +5788,7 @@ ret;
     SmallVector<Attribute> syntheticSources{
         builder.getStringAttr("synthetic-source-bound-score-and-relation")};
     SmallVector<Attribute> leftDeepNodes{
-        reductionNode(0, "leaf0", {0}, {}),
-        reductionNode(1, "leaf1", {1}, {}),
+        reductionNode(0, "leaf0", {0}, {}), reductionNode(1, "leaf1", {1}, {}),
         reductionNode(2, "merge01", {0, 1}, {0, 1}),
         reductionNode(3, "leaf2", {2}, {}),
         reductionNode(4, "root", {0, 1, 2}, {2, 3})};
@@ -5890,14 +5805,12 @@ ret;
         reductionNode(1, "odd_partial", {1, 3}, {}),
         reductionNode(2, "register_root", {0, 1, 2, 3}, {0, 1})};
     SmallVector<Attribute> naryNodes{
-        reductionNode(0, "leaf0", {0}, {}),
-        reductionNode(1, "leaf1", {1}, {}),
-        reductionNode(2, "leaf2", {2}, {}),
-        reductionNode(3, "leaf3", {3}, {}),
+        reductionNode(0, "leaf0", {0}, {}), reductionNode(1, "leaf1", {1}, {}),
+        reductionNode(2, "leaf2", {2}, {}), reductionNode(3, "leaf3", {3}, {}),
         reductionNode(4, "nary_root", {0, 1, 2, 3}, {0, 1, 2, 3})};
-    auto canonicalLoopRealization =
-        [&](StringRef prefix, int64_t offset, int64_t stride,
-            int64_t count) -> DictionaryAttr {
+    auto canonicalLoopRealization = [&](StringRef prefix, int64_t offset,
+                                        int64_t stride,
+                                        int64_t count) -> DictionaryAttr {
       auto roleName = [&](StringRef role) {
         return builder.getStringAttr(
             prefix.empty() ? role.str() : (Twine(prefix) + "_" + role).str());
@@ -5912,8 +5825,7 @@ ret;
                                 roleName("contract_index_step")),
            builder.getNamedAttr("exit_branch_role",
                                 roleName("contract_exit_branch")),
-           builder.getNamedAttr("backedge_role",
-                                roleName("contract_backedge")),
+           builder.getNamedAttr("backedge_role", roleName("contract_backedge")),
            builder.getNamedAttr("coordinate_role",
                                 roleName("contract_coordinate")),
            builder.getNamedAttr("accumulator_init_role",
@@ -5927,74 +5839,65 @@ ret;
                                 roleName("score_lhs_byte_offset")),
            builder.getNamedAttr("lhs_pointer_role",
                                 roleName("score_lhs_pointer")),
-           builder.getNamedAttr("lhs_load_role",
-                                roleName("score_lhs_load")),
+           builder.getNamedAttr("lhs_load_role", roleName("score_lhs_load")),
            builder.getNamedAttr("rhs_linear_index_role",
                                 roleName("score_rhs_linear_index")),
            builder.getNamedAttr("rhs_byte_offset_role",
                                 roleName("score_rhs_byte_offset")),
            builder.getNamedAttr("rhs_pointer_role",
                                 roleName("score_rhs_pointer")),
-           builder.getNamedAttr("rhs_load_role",
-                                roleName("score_rhs_load"))});
+           builder.getNamedAttr("rhs_load_role", roleName("score_rhs_load"))});
       return DictionaryAttr::get(
-        context,
-        {builder.getNamedAttr("kind", builder.getStringAttr("canonical_loop")),
-         builder.getNamedAttr(
-             "partition",
-             DictionaryAttr::get(
-                 context,
-                 {builder.getNamedAttr("offset", builder.getI64IntegerAttr(offset)),
-                  builder.getNamedAttr("stride", builder.getI64IntegerAttr(stride)),
-                  builder.getNamedAttr("count", builder.getI64IntegerAttr(count))})),
-         builder.getNamedAttr("index_init_role",
-                              roleName("loop_index_init")),
-         builder.getNamedAttr("index_guard_role",
-                              roleName("loop_index_guard")),
-         builder.getNamedAttr("index_step_role",
-                              roleName("loop_index_step")),
-         builder.getNamedAttr("exit_branch_role",
-                              roleName("loop_exit_branch")),
-         builder.getNamedAttr("backedge_role",
-                              roleName("loop_backedge")),
-         builder.getNamedAttr("accumulator_init_role",
-                              roleName("max_init")),
-         builder.getNamedAttr("accumulator_update_role",
-                              roleName("loop_max_update")),
-         builder.getNamedAttr("coordinate_role",
-                              roleName("reduction_coordinate")),
-         builder.getNamedAttr("score_lhs_load_role",
-                              roleName("score_lhs_load")),
-         builder.getNamedAttr("score_rhs_load_role",
-                              roleName("score_rhs_load")),
-         builder.getNamedAttr("score_lhs_offset_role",
-                              roleName("score_lhs_offset")),
-         builder.getNamedAttr("score_rhs_offset_role",
-                              roleName("score_rhs_offset")),
-         builder.getNamedAttr("score_lhs_pointer_role",
-                              roleName("score_lhs_pointer")),
-         builder.getNamedAttr("score_rhs_pointer_role",
-                              roleName("score_rhs_pointer")),
-         builder.getNamedAttr("score_zero_role",
-                              roleName("score_zero")),
-         builder.getNamedAttr("score_value_role",
-                              roleName("score_value")),
-         builder.getNamedAttr("relation_compare_role",
-                              roleName("relation_compare")),
-         builder.getNamedAttr("mask_select_role",
-                              roleName("mask_select")),
-         builder.getNamedAttr("negative_infinity_role",
-                              roleName("negative_infinity")),
-         builder.getNamedAttr("score_contract", scoreContract)});
+          context,
+          {builder.getNamedAttr("kind",
+                                builder.getStringAttr("canonical_loop")),
+           builder.getNamedAttr(
+               "partition",
+               DictionaryAttr::get(
+                   context, {builder.getNamedAttr(
+                                 "offset", builder.getI64IntegerAttr(offset)),
+                             builder.getNamedAttr(
+                                 "stride", builder.getI64IntegerAttr(stride)),
+                             builder.getNamedAttr(
+                                 "count", builder.getI64IntegerAttr(count))})),
+           builder.getNamedAttr("index_init_role", roleName("loop_index_init")),
+           builder.getNamedAttr("index_guard_role",
+                                roleName("loop_index_guard")),
+           builder.getNamedAttr("index_step_role", roleName("loop_index_step")),
+           builder.getNamedAttr("exit_branch_role",
+                                roleName("loop_exit_branch")),
+           builder.getNamedAttr("backedge_role", roleName("loop_backedge")),
+           builder.getNamedAttr("accumulator_init_role", roleName("max_init")),
+           builder.getNamedAttr("accumulator_update_role",
+                                roleName("loop_max_update")),
+           builder.getNamedAttr("coordinate_role",
+                                roleName("reduction_coordinate")),
+           builder.getNamedAttr("score_lhs_load_role",
+                                roleName("score_lhs_load")),
+           builder.getNamedAttr("score_rhs_load_role",
+                                roleName("score_rhs_load")),
+           builder.getNamedAttr("score_lhs_offset_role",
+                                roleName("score_lhs_offset")),
+           builder.getNamedAttr("score_rhs_offset_role",
+                                roleName("score_rhs_offset")),
+           builder.getNamedAttr("score_lhs_pointer_role",
+                                roleName("score_lhs_pointer")),
+           builder.getNamedAttr("score_rhs_pointer_role",
+                                roleName("score_rhs_pointer")),
+           builder.getNamedAttr("score_zero_role", roleName("score_zero")),
+           builder.getNamedAttr("score_value_role", roleName("score_value")),
+           builder.getNamedAttr("relation_compare_role",
+                                roleName("relation_compare")),
+           builder.getNamedAttr("mask_select_role", roleName("mask_select")),
+           builder.getNamedAttr("negative_infinity_role",
+                                roleName("negative_infinity")),
+           builder.getNamedAttr("score_contract", scoreContract)});
     };
-    DictionaryAttr canonicalLoop =
-        canonicalLoopRealization("", 0, 1, 4);
-    SmallVector<Attribute> loopNodes{reductionLeafFamily(
-        0, "loop_result", {0, 1, 2, 3}, canonicalLoop)};
-    DictionaryAttr evenLoop =
-        canonicalLoopRealization("even", 0, 2, 2);
-    DictionaryAttr oddLoop =
-        canonicalLoopRealization("odd", 1, 2, 2);
+    DictionaryAttr canonicalLoop = canonicalLoopRealization("", 0, 1, 4);
+    SmallVector<Attribute> loopNodes{
+        reductionLeafFamily(0, "loop_result", {0, 1, 2, 3}, canonicalLoop)};
+    DictionaryAttr evenLoop = canonicalLoopRealization("even", 0, 2, 2);
+    DictionaryAttr oddLoop = canonicalLoopRealization("odd", 1, 2, 2);
     DictionaryAttr registerMerge = DictionaryAttr::get(context, {});
     SmallVector<Attribute> executableStridedNodes{
         reductionLeafFamily(0, "even_loop_result", {0, 2}, evenLoop),
@@ -6005,8 +5908,8 @@ ret;
              builder.getNamedAttr("kind", builder.getStringAttr("merge")),
              builder.getNamedAttr("role",
                                   builder.getStringAttr("strided_root")),
-             builder.getNamedAttr(
-                 "children", DenseI64ArrayAttr::get(context, {0, 1})),
+             builder.getNamedAttr("children",
+                                  DenseI64ArrayAttr::get(context, {0, 1})),
              builder.getNamedAttr("realization", registerMerge)})};
     SmallVector<Attribute> missingLeafNodes(leftDeepNodes);
     missingLeafNodes.erase(missingLeafNodes.begin() + 3);
@@ -6018,21 +5921,19 @@ ret;
     lostMergeNodes.back() = reductionNode(4, "root", {0, 1, 2}, {0, 3});
     SmallVector<Attribute> partialRootNodes(leftDeepNodes);
     partialRootNodes.back() = reductionNode(4, "root", {0, 1}, {0, 1});
-    if (failed(onlineMaxReductionNodes(
-            reductionCertificate(leftDeepNodes, 4, 3), 4, 3,
-            syntheticSources)) ||
-        failed(onlineMaxReductionNodes(
-            reductionCertificate(balancedNodes, 6, 4), 4, 4,
-            syntheticSources)) ||
-        failed(onlineMaxReductionNodes(
-            reductionCertificate(loopNodes, 0, 4), 4, 4,
-            syntheticSources)) ||
+    if (failed(
+            onlineMaxReductionNodes(reductionCertificate(leftDeepNodes, 4, 3),
+                                    4, 3, syntheticSources)) ||
+        failed(
+            onlineMaxReductionNodes(reductionCertificate(balancedNodes, 6, 4),
+                                    4, 4, syntheticSources)) ||
+        failed(onlineMaxReductionNodes(reductionCertificate(loopNodes, 0, 4), 4,
+                                       4, syntheticSources)) ||
         failed(onlineMaxReductionNodes(
             reductionCertificate(stridedRegisterNodes, 2, 4), 4, 4,
             syntheticSources)) ||
-        failed(onlineMaxReductionNodes(
-            reductionCertificate(naryNodes, 4, 4), 4, 4,
-            syntheticSources)) ||
+        failed(onlineMaxReductionNodes(reductionCertificate(naryNodes, 4, 4), 4,
+                                       4, syntheticSources)) ||
         succeeded(onlineMaxReductionNodes(
             reductionCertificate(missingLeafNodes, 4, 3), 4, 3,
             syntheticSources)) ||
@@ -6042,9 +5943,9 @@ ret;
         succeeded(onlineMaxReductionNodes(
             reductionCertificate(wrongCoordinateNodes, 4, 3), 4, 3,
             syntheticSources)) ||
-        succeeded(onlineMaxReductionNodes(
-            reductionCertificate(lostMergeNodes, 4, 3), 4, 3,
-            syntheticSources)) ||
+        succeeded(
+            onlineMaxReductionNodes(reductionCertificate(lostMergeNodes, 4, 3),
+                                    4, 3, syntheticSources)) ||
         succeeded(onlineMaxReductionNodes(
             reductionCertificate(partialRootNodes, 4, 3), 4, 3,
             syntheticSources))) {
@@ -6055,7 +5956,8 @@ ret;
     auto parse = [&](StringRef ptx) -> FailureOr<OnlinePtxCfg> {
       FailureOr<OnlinePtxCfg> cfg = onlinePtxCfg(ptx);
       if (failed(cfg))
-        getOperation().emitError("synthetic online PTX oracle case did not parse");
+        getOperation().emitError(
+            "synthetic online PTX oracle case did not parse");
       return cfg;
     };
     FailureOr<OnlinePtxCfg> predicated = parse(R"ptx(
@@ -6441,31 +6343,29 @@ ret;
     std::string wrongLoopTargetPtx = canonicalReductionPtx;
     size_t loopTarget = wrongLoopTargetPtx.find("@%p0 bra.uni DONE");
     if (loopTarget != std::string::npos)
-      wrongLoopTargetPtx.replace(
-          loopTarget, StringRef("@%p0 bra.uni DONE").size(),
-          "@%p0 bra.uni LOOP");
+      wrongLoopTargetPtx.replace(loopTarget,
+                                 StringRef("@%p0 bra.uni DONE").size(),
+                                 "@%p0 bra.uni LOOP");
     FailureOr<OnlinePtxCfg> wrongLoopTarget = parse(wrongLoopTargetPtx);
     std::string wrongLoopBoundPtx = canonicalReductionPtx;
-    size_t loopBound =
-        wrongLoopBoundPtx.find("setp.ge.u32 %p0, %r0, 4");
+    size_t loopBound = wrongLoopBoundPtx.find("setp.ge.u32 %p0, %r0, 4");
     if (loopBound != std::string::npos)
-      wrongLoopBoundPtx.replace(
-          loopBound, StringRef("setp.ge.u32 %p0, %r0, 4").size(),
-          "setp.ge.u32 %p0, %r0, 3");
+      wrongLoopBoundPtx.replace(loopBound,
+                                StringRef("setp.ge.u32 %p0, %r0, 4").size(),
+                                "setp.ge.u32 %p0, %r0, 3");
     FailureOr<OnlinePtxCfg> wrongLoopBound = parse(wrongLoopBoundPtx);
     std::string wrongLoopStepPtx = canonicalReductionPtx;
     size_t loopStep = wrongLoopStepPtx.find("add.u32 %r0, %r0, 1");
     if (loopStep != std::string::npos)
-      wrongLoopStepPtx.replace(
-          loopStep, StringRef("add.u32 %r0, %r0, 1").size(),
-          "add.u32 %r0, %r0, 2");
+      wrongLoopStepPtx.replace(loopStep,
+                               StringRef("add.u32 %r0, %r0, 1").size(),
+                               "add.u32 %r0, %r0, 2");
     FailureOr<OnlinePtxCfg> wrongLoopStep = parse(wrongLoopStepPtx);
     std::string alternateBackedgePtx = canonicalReductionPtx;
     size_t alternateBackedge =
         alternateBackedgePtx.find("// shuttle.online.role loop_index_step");
     if (alternateBackedge != std::string::npos)
-      alternateBackedgePtx.insert(alternateBackedge,
-                                  "@%p1 bra.uni LOOP;\n");
+      alternateBackedgePtx.insert(alternateBackedge, "@%p1 bra.uni LOOP;\n");
     FailureOr<OnlinePtxCfg> alternateBackedgeValue =
         parse(alternateBackedgePtx);
     std::string internalCyclePtx = canonicalReductionPtx;
@@ -6475,8 +6375,8 @@ ret;
         internalCyclePtx.find("// shuttle.online.role loop_index_step");
     if (cycleStart != std::string::npos && cycleEnd != std::string::npos) {
       internalCyclePtx.insert(cycleStart, "INTERNAL_CYCLE:\n");
-      cycleEnd = internalCyclePtx.find(
-          "// shuttle.online.role loop_index_step", cycleStart);
+      cycleEnd = internalCyclePtx.find("// shuttle.online.role loop_index_step",
+                                       cycleStart);
       internalCyclePtx.insert(cycleEnd, "@%p1 bra.uni INTERNAL_CYCLE;\n");
     }
     FailureOr<OnlinePtxCfg> internalCycleValue = parse(internalCyclePtx);
@@ -6484,10 +6384,9 @@ ret;
     size_t wrongContractBound =
         wrongContractBoundPtx.find("setp.ge.u32 %p2, %r6, 2");
     if (wrongContractBound != std::string::npos)
-      wrongContractBoundPtx.replace(
-          wrongContractBound,
-          StringRef("setp.ge.u32 %p2, %r6, 2").size(),
-          "setp.ge.u32 %p2, %r6, 1");
+      wrongContractBoundPtx.replace(wrongContractBound,
+                                    StringRef("setp.ge.u32 %p2, %r6, 2").size(),
+                                    "setp.ge.u32 %p2, %r6, 1");
     FailureOr<OnlinePtxCfg> wrongContractBoundValue =
         parse(wrongContractBoundPtx);
     std::string omittedOuterCoordinatePtx = canonicalReductionPtx;
@@ -6504,19 +6403,16 @@ ret;
     size_t swappedContractAbi =
         swappedContractAbiPtx.find("ld.param.u64 %rd1, [p1]");
     if (swappedContractAbi != std::string::npos)
-      swappedContractAbiPtx.replace(
-          swappedContractAbi,
-          StringRef("ld.param.u64 %rd1, [p1]").size(),
-          "ld.param.u64 %rd1, [p2]");
+      swappedContractAbiPtx.replace(swappedContractAbi,
+                                    StringRef("ld.param.u64 %rd1, [p1]").size(),
+                                    "ld.param.u64 %rd1, [p2]");
     FailureOr<OnlinePtxCfg> swappedContractAbiValue =
         parse(swappedContractAbiPtx);
     std::string predicatedUpdatePtx = canonicalReductionPtx;
-    size_t predicatedUpdate =
-        predicatedUpdatePtx.find("max.f32 %f0, %f0, %f3");
+    size_t predicatedUpdate = predicatedUpdatePtx.find("max.f32 %f0, %f0, %f3");
     if (predicatedUpdate != std::string::npos)
       predicatedUpdatePtx.insert(predicatedUpdate, "@%p1 ");
-    FailureOr<OnlinePtxCfg> predicatedUpdateValue =
-        parse(predicatedUpdatePtx);
+    FailureOr<OnlinePtxCfg> predicatedUpdateValue = parse(predicatedUpdatePtx);
     std::string predicatedStepPtx = canonicalReductionPtx;
     size_t predicatedStep = predicatedStepPtx.find("add.u32 %r0, %r0, 1");
     if (predicatedStep != std::string::npos)
@@ -6526,34 +6422,30 @@ ret;
     size_t wrongInitializer =
         wrongInitializerPtx.find("mov.f32 %f0, 0fFF800000");
     if (wrongInitializer != std::string::npos)
-      wrongInitializerPtx.replace(
-          wrongInitializer, StringRef("mov.f32 %f0, 0fFF800000").size(),
-          "mov.f32 %f0, 0f00000000");
-    FailureOr<OnlinePtxCfg> wrongInitializerValue =
-        parse(wrongInitializerPtx);
+      wrongInitializerPtx.replace(wrongInitializer,
+                                  StringRef("mov.f32 %f0, 0fFF800000").size(),
+                                  "mov.f32 %f0, 0f00000000");
+    FailureOr<OnlinePtxCfg> wrongInitializerValue = parse(wrongInitializerPtx);
     std::string constantScorePtx = canonicalReductionPtx;
     size_t scoreFma = constantScorePtx.find("mov.f32 %f1, %f7");
     if (scoreFma != std::string::npos)
-      constantScorePtx.replace(
-          scoreFma, StringRef("mov.f32 %f1, %f7").size(),
-          "mov.f32 %f1, 0f40000000");
+      constantScorePtx.replace(scoreFma, StringRef("mov.f32 %f1, %f7").size(),
+                               "mov.f32 %f1, 0f40000000");
     FailureOr<OnlinePtxCfg> constantScore = parse(constantScorePtx);
     std::string annihilatedScorePtx = canonicalReductionPtx;
-    size_t annihilatedScore = annihilatedScorePtx.find(
-        "fma.rn.f32 %f7, %f5, %f6, %f7");
+    size_t annihilatedScore =
+        annihilatedScorePtx.find("fma.rn.f32 %f7, %f5, %f6, %f7");
     if (annihilatedScore != std::string::npos)
       annihilatedScorePtx.replace(
-          annihilatedScore,
-          StringRef("fma.rn.f32 %f7, %f5, %f6, %f7").size(),
+          annihilatedScore, StringRef("fma.rn.f32 %f7, %f5, %f6, %f7").size(),
           "fma.rn.f32 %f7, %f5, 0f00000000, %f7");
-    FailureOr<OnlinePtxCfg> annihilatedScoreValue =
-        parse(annihilatedScorePtx);
+    FailureOr<OnlinePtxCfg> annihilatedScoreValue = parse(annihilatedScorePtx);
     std::string staleScorePtx = canonicalReductionPtx;
     size_t staleScore = staleScorePtx.find("mul.lo.u32 %r21, %r1, 2");
     if (staleScore != std::string::npos)
-      staleScorePtx.replace(
-          staleScore, StringRef("mul.lo.u32 %r21, %r1, 2").size(),
-          "mul.lo.u32 %r21, %r2, 2");
+      staleScorePtx.replace(staleScore,
+                            StringRef("mul.lo.u32 %r21, %r1, 2").size(),
+                            "mul.lo.u32 %r21, %r2, 2");
     FailureOr<OnlinePtxCfg> staleScoreValue = parse(staleScorePtx);
     std::string wrongRootValuePtx = canonicalReductionPtx;
     size_t rootValue = wrongRootValuePtx.find("[%rd0], %f4");
@@ -6572,22 +6464,19 @@ ret;
         parse(wrongOutputCoordinatePtx);
     if (failed(predicated) || failed(branch) || failed(correctFma) ||
         failed(wrongFma) || failed(pointer) || failed(transformedPointer) ||
-        failed(predicatedStore) || failed(coordinate) ||
-        failed(paddedWriter) ||
+        failed(predicatedStore) || failed(coordinate) || failed(paddedWriter) ||
         failed(zeroedCoordinate) || failed(alternateCoordinate) ||
         failed(typeChangedCoordinate) || failed(floatingAddCoordinate) ||
         failed(overflowingCoordinate) || failed(shared) ||
         failed(canonicalReduction) || failed(stridedRegisterReduction) ||
-        failed(wrongLoopPolarity) ||
-        failed(wrongLoopTarget) || failed(wrongLoopBound) ||
-        failed(wrongLoopStep) || failed(alternateBackedgeValue) ||
-        failed(internalCycleValue) ||
+        failed(wrongLoopPolarity) || failed(wrongLoopTarget) ||
+        failed(wrongLoopBound) || failed(wrongLoopStep) ||
+        failed(alternateBackedgeValue) || failed(internalCycleValue) ||
         failed(wrongContractBoundValue) ||
         failed(omittedOuterCoordinateValue) ||
         failed(swappedContractAbiValue) || failed(predicatedUpdateValue) ||
         failed(predicatedStepValue) || failed(wrongInitializerValue) ||
-        failed(constantScore) ||
-        failed(annihilatedScoreValue) ||
+        failed(constantScore) || failed(annihilatedScoreValue) ||
         failed(staleScoreValue) || failed(wrongRootValue) ||
         failed(wrongOutputCoordinate))
       return signalPassFailure();
@@ -6607,8 +6496,9 @@ ret;
     SmallVector<int64_t> syntheticScoreShape{3, 4};
     DictionaryAttr paddedWriterCertificate = DictionaryAttr::get(
         context,
-        {builder.getNamedAttr("predicate_role",
-                              builder.getStringAttr("compact_writer_predicate")),
+        {builder.getNamedAttr(
+             "predicate_role",
+             builder.getStringAttr("compact_writer_predicate")),
          builder.getNamedAttr("selector_role",
                               builder.getStringAttr("compact_writer_selector")),
          builder.getNamedAttr(
@@ -6627,60 +6517,59 @@ ret;
         getAffineDimExpr(0, context), getAffineConstantExpr(0, context)};
     SmallVector<int64_t> paddedLaunchExtents{4, 1, 1, 2, 1, 1, 1};
     OnlineScoreContractGeometry syntheticScoreGeometry{
-        {getAffineDimExpr(0, context) * 8 +
-             getAffineDimExpr(7, context) * 2 +
+        {getAffineDimExpr(0, context) * 8 + getAffineDimExpr(7, context) * 2 +
              getAffineDimExpr(8, context),
          getAffineDimExpr(7, context) * 2 + getAffineDimExpr(8, context)},
         {24, 8},
         2};
     SmallVector<int64_t> syntheticScoreParameters{1, 2};
-    std::set<std::string> syntheticRelationSources{
-        "synthetic-compare", "synthetic-select"};
+    std::set<std::string> syntheticRelationSources{"synthetic-compare",
+                                                   "synthetic-select"};
     auto syntheticLeafBindings = [&](const OnlinePtxCfg &cfg,
                                      const OnlineMaxReductionNode &node) {
       return onlineCanonicalLeafFamilyBindings(
-          cfg, node, "synthetic-source-bound-score-and-relation",
-          "setp.le.u32", syntheticRelationSources,
-          syntheticScoreGeometry, syntheticLaunchExtents, 4,
-          syntheticScoreParameters, Value(), ContractOp(), context);
+          cfg, node, "synthetic-source-bound-score-and-relation", "setp.le.u32",
+          syntheticRelationSources, syntheticScoreGeometry,
+          syntheticLaunchExtents, 4, syntheticScoreParameters, Value(),
+          ContractOp(), context);
     };
-    auto syntheticMaxBindings =
-        [&](const OnlinePtxCfg &cfg,
-            ArrayRef<OnlineMaxReductionNode> nodes,
-            DictionaryAttr certificate) {
-          return onlineMaxReductionBindings(
-              cfg, nodes, certificate,
-              "synthetic-source-bound-score-and-relation",
-              "setp.le.u32", syntheticRelationSources,
-              syntheticScoreGeometry, syntheticLaunchExtents, 4,
-              syntheticScoreParameters, Value(), ContractOp(), context);
-        };
+    auto syntheticMaxBindings = [&](const OnlinePtxCfg &cfg,
+                                    ArrayRef<OnlineMaxReductionNode> nodes,
+                                    DictionaryAttr certificate) {
+      return onlineMaxReductionBindings(
+          cfg, nodes, certificate, "synthetic-source-bound-score-and-relation",
+          "setp.le.u32", syntheticRelationSources, syntheticScoreGeometry,
+          syntheticLaunchExtents, 4, syntheticScoreParameters, Value(),
+          ContractOp(), context);
+    };
     auto indexMatches = [&](const OnlinePtxCfg &cfg, AffineExpr expected) {
       int64_t iota = cfg.roles.at("iota");
       std::set<std::pair<int64_t, std::string>> active;
-      OnlineIndexAlternatives alternatives = onlineIndexAlternatives(
-          cfg, iota, cfg.instructions[iota].operands[1],
-          getOperation().getContext(), active);
+      OnlineIndexAlternatives alternatives =
+          onlineIndexAlternatives(cfg, iota, cfg.instructions[iota].operands[1],
+                                  getOperation().getContext(), active);
       SmallVector<int64_t> launchExtents{1, 1, 1, 17, 1, 1, 1};
       return alternatives.valid && !alternatives.values.empty() &&
-             llvm::all_of(alternatives.values, [&](AffineExpr value) {
-               return value == expected &&
-                      onlineIndexExprFitsLaunchDomain(value, launchExtents);
-             }) &&
+             llvm::all_of(alternatives.values,
+                          [&](AffineExpr value) {
+                            return value == expected &&
+                                   onlineIndexExprFitsLaunchDomain(
+                                       value, launchExtents);
+                          }) &&
              llvm::all_of(alternatives.intermediates, [&](AffineExpr value) {
                return onlineIndexExprFitsLaunchDomain(value, launchExtents);
              });
     };
     if (succeeded(stridedCertificateNodes) &&
-        (!onlineLeafCoordinatesCarrySource(
-             *stridedRegisterReduction, *stridedCertificateNodes,
-             "synthetic-reduction-iota") ||
-         !onlineLeafCoordinatesCarrySource(
-             *canonicalReduction, *loopCertificateNodes,
-             "synthetic-reduction-iota") ||
-         onlineLeafCoordinatesCarrySource(
-             missingFamilyIota, *stridedCertificateNodes,
-             "synthetic-reduction-iota"))) {
+        (!onlineLeafCoordinatesCarrySource(*stridedRegisterReduction,
+                                           *stridedCertificateNodes,
+                                           "synthetic-reduction-iota") ||
+         !onlineLeafCoordinatesCarrySource(*canonicalReduction,
+                                           *loopCertificateNodes,
+                                           "synthetic-reduction-iota") ||
+         onlineLeafCoordinatesCarrySource(missingFamilyIota,
+                                          *stridedCertificateNodes,
+                                          "synthetic-reduction-iota"))) {
       getOperation().emitError(
           "leaf-family coordinates are not exact Relation source occurrences");
       return signalPassFailure();
@@ -6688,8 +6577,7 @@ ret;
     if (succeeded(stridedCertificateNodes) &&
         !onlineScoreContractBindings(
             *stridedRegisterReduction, (*stridedCertificateNodes)[0],
-            syntheticScoreGeometry,
-            "synthetic-source-bound-score-and-relation",
+            syntheticScoreGeometry, "synthetic-source-bound-score-and-relation",
             syntheticLaunchExtents, 4, syntheticScoreParameters, context)) {
       getOperation().emitError("even score Contract is not executable");
       return signalPassFailure();
@@ -6710,14 +6598,16 @@ ret;
           *stridedRegisterReduction,
           stridedRegisterReduction->roles.at("strided_root"), expected, found,
           active);
-      bool storeClosed = onlineRoleIs(*stridedRegisterReduction,
-                                      "compact_store", {"st.global."},
-                                      {"strided_root"});
-      bool storedRoot = onlineRoleOperandIs(
-          *stridedRegisterReduction, "compact_store", 1, "strided_root");
+      bool storeClosed =
+          onlineRoleIs(*stridedRegisterReduction, "compact_store",
+                       {"st.global."}, {"strided_root"});
+      bool storedRoot = onlineRoleOperandIs(*stridedRegisterReduction,
+                                            "compact_store", 1, "strided_root");
       if (!collected || found != expected || !storeClosed || !storedRoot) {
-        const auto &rootInstruction = stridedRegisterReduction->instructions[
-            stridedRegisterReduction->roles.at("strided_root")];
+        const auto &rootInstruction =
+            stridedRegisterReduction
+                ->instructions[stridedRegisterReduction->roles.at(
+                    "strided_root")];
         std::set<int64_t> leftDefs = onlineReachingDefinitions(
             *stridedRegisterReduction,
             stridedRegisterReduction->roles.at("strided_root"),
@@ -6727,14 +6617,12 @@ ret;
             stridedRegisterReduction->roles.at("strided_root"),
             rootInstruction.operands[2]);
         getOperation().emitError()
-            << "strided register merge is not executable: collect="
-            << collected << " coverage=" << (found == expected)
-            << " store=" << storeClosed << " value=" << storedRoot
-            << " left_defs=" << leftDefs.size()
+            << "strided register merge is not executable: collect=" << collected
+            << " coverage=" << (found == expected) << " store=" << storeClosed
+            << " value=" << storedRoot << " left_defs=" << leftDefs.size()
             << " left_first=" << (leftDefs.empty() ? -2 : *leftDefs.begin())
             << " right_defs=" << rightDefs.size()
-            << " right_first="
-            << (rightDefs.empty() ? -2 : *rightDefs.begin());
+            << " right_first=" << (rightDefs.empty() ? -2 : *rightDefs.begin());
         return signalPassFailure();
       }
     }
@@ -6756,25 +6644,19 @@ ret;
                                   predicated->roles.at("use")) ||
         onlineRoleIs(*branch, "dead", {"mov.f32"}) ||
         !onlineRoleIs(*branch, "live", {"mov.f32"}) ||
-        !onlineScaledUpdate(*correctFma, "unused", "update", "scale",
-                            "state", "term") ||
-        onlineScaledUpdate(*wrongFma, "unused", "update", "scale",
-                           "state", "term") ||
+        !onlineScaledUpdate(*correctFma, "unused", "update", "scale", "state",
+                            "term") ||
+        onlineScaledUpdate(*wrongFma, "unused", "update", "scale", "state",
+                           "term") ||
         onlineRoleStoresToOutput(*pointer, "store", 0) ||
         onlineRoleStoresToOutput(*transformedPointer, "store", 0) ||
         onlineRoleStoresToOutput(*predicatedStore, "store", 0) ||
-        !indexMatches(*coordinate,
-          getAffineDimExpr(3, context)) ||
-        indexMatches(*zeroedCoordinate,
-                     getAffineDimExpr(3, context)) ||
-        indexMatches(*alternateCoordinate,
-                     getAffineDimExpr(3, context)) ||
-        indexMatches(*typeChangedCoordinate,
-                     getAffineDimExpr(3, context)) ||
-        indexMatches(*floatingAddCoordinate,
-                     getAffineDimExpr(3, context)) ||
-        indexMatches(*overflowingCoordinate,
-                     getAffineDimExpr(3, context)) ||
+        !indexMatches(*coordinate, getAffineDimExpr(3, context)) ||
+        indexMatches(*zeroedCoordinate, getAffineDimExpr(3, context)) ||
+        indexMatches(*alternateCoordinate, getAffineDimExpr(3, context)) ||
+        indexMatches(*typeChangedCoordinate, getAffineDimExpr(3, context)) ||
+        indexMatches(*floatingAddCoordinate, getAffineDimExpr(3, context)) ||
+        indexMatches(*overflowingCoordinate, getAffineDimExpr(3, context)) ||
         !onlineSharedPairIsClosed(*shared, "shared_store", "expected",
                                   "barrier", "shared_load") ||
         onlineSharedPairIsClosed(*shared, "shared_store", "wrong", "barrier",
@@ -6782,13 +6664,13 @@ ret;
         failed(loopCertificateNodes) ||
         !syntheticMaxBindings(*canonicalReduction, *loopCertificateNodes,
                               reductionCertificate(loopNodes, 0, 4)) ||
-        onlineMaxReductionBindings(
-            *canonicalReduction, *loopCertificateNodes,
-            reductionCertificate(loopNodes, 0, 4),
-            "synthetic-source-bound-score-and-relation", "setp.le.u32",
-            syntheticRelationSources, syntheticScoreGeometry,
-            paddedLaunchExtents, 4, syntheticScoreParameters, Value(),
-            ContractOp(), context) ||
+        onlineMaxReductionBindings(*canonicalReduction, *loopCertificateNodes,
+                                   reductionCertificate(loopNodes, 0, 4),
+                                   "synthetic-source-bound-score-and-relation",
+                                   "setp.le.u32", syntheticRelationSources,
+                                   syntheticScoreGeometry, paddedLaunchExtents,
+                                   4, syntheticScoreParameters, Value(),
+                                   ContractOp(), context) ||
         syntheticMaxBindings(*wrongLoopPolarity, *loopCertificateNodes,
                              reductionCertificate(loopNodes, 0, 4)) ||
         syntheticMaxBindings(*wrongLoopTarget, *loopCertificateNodes,
@@ -6831,9 +6713,9 @@ ret;
         onlineCompactWriterIsUnique(
             *canonicalReduction, syntheticLogicalCoordinates,
             duplicateWriterLaunchExtents, syntheticScoreShape, 1, context) ||
-        !onlineCompactWriterIsUnique(
-            *paddedWriter, paddedLogicalCoordinates, paddedLaunchExtents,
-            syntheticScoreShape, 1, context, paddedWriterCertificate) ||
+        !onlineCompactWriterIsUnique(*paddedWriter, paddedLogicalCoordinates,
+                                     paddedLaunchExtents, syntheticScoreShape,
+                                     1, context, paddedWriterCertificate) ||
         onlineCompactOutputAddressIsProjected(
             *wrongOutputCoordinate, 0, syntheticLogicalCoordinates,
             syntheticLaunchExtents, syntheticScoreShape, 1, context)) {
@@ -6868,31 +6750,28 @@ FailureOr<DictionaryAttr> expectedOnlineStateMachine(
     ModuleOp module, MaterializationPlanOp plan, SchedulePlanOp schedule,
     InvocationAbiOp abi, RegionOp region,
     ArrayRef<MaterializationTaskOp> onlineTasks, Builder &builder) {
-  constexpr llvm::StringLiteral kind =
-      "online_normalized_exponential_weighted_contract";
   if (region.getPolicy() != NumericalPolicy::Fast ||
       plan.getPolicy() != NumericalPolicy::Fast ||
       schedule.getPolicy() != NumericalPolicy::Fast || onlineTasks.empty())
     return failure();
   DictionaryAttr manifest = module->getAttrOfType<DictionaryAttr>(kManifest);
-  StringAttr manifestPolicy = manifest ? manifest.getAs<StringAttr>("policy")
-                                       : StringAttr{};
+  StringAttr manifestPolicy =
+      manifest ? manifest.getAs<StringAttr>("policy") : StringAttr{};
   StringAttr policyDigest =
       manifest ? manifest.getAs<StringAttr>("policy_digest") : StringAttr{};
-  ArrayAttr complete = manifest ? manifest.getAs<ArrayAttr>("complete")
-                                : ArrayAttr{};
-  if (!manifestPolicy || manifestPolicy.getValue() != "fast" ||
-      !policyDigest || policyDigest.getValue().size() != 64 || !complete ||
+  ArrayAttr complete =
+      manifest ? manifest.getAs<ArrayAttr>("complete") : ArrayAttr{};
+  if (!manifestPolicy || manifestPolicy.getValue() != "fast" || !policyDigest ||
+      policyDigest.getValue().size() != 64 || !complete ||
       !llvm::equal(complete, region.getSourceRefs()))
     return failure();
-  Attribute publicResultAnchors =
-      region->getAttr("shuttle.result_source_refs");
+  Attribute publicResultAnchors = region->getAttr("shuttle.result_source_refs");
   if (!publicResultAnchors)
     return failure();
   llvm::SmallDenseSet<Attribute> selectedSources;
   int64_t scoreExecutions = 0;
   for (MaterializationTaskOp task : onlineTasks) {
-    if (!task.getCompositionKind() || *task.getCompositionKind() != kind)
+    if (!isStructuralOnlineTask(task))
       return failure();
     auto sources = task.getCompositionSources();
     if (!sources || sources->empty())
@@ -6927,8 +6806,8 @@ FailureOr<DictionaryAttr> expectedOnlineStateMachine(
     auto contract = dyn_cast<ContractOp>(operation);
     if (!contract || !valueDependsOn(yield.getValues().front(), contract))
       continue;
-    const bool feedsSelectedContract = llvm::any_of(
-        selected, [&](Operation *candidate) {
+    const bool feedsSelectedContract =
+        llvm::any_of(selected, [&](Operation *candidate) {
           auto consumer = dyn_cast<ContractOp>(candidate);
           return consumer && consumer != contract &&
                  llvm::any_of(consumer.getInputs(), [&](Value input) {
@@ -6941,8 +6820,8 @@ FailureOr<DictionaryAttr> expectedOnlineStateMachine(
       return failure();
     weightedContract = contract;
   }
-  if (!maximumFold || !additiveFold || !weightedContract ||
-      relations.empty() || maximumFold.getReductionDimensions().size() != 1 ||
+  if (!maximumFold || !additiveFold || !weightedContract || relations.empty() ||
+      maximumFold.getReductionDimensions().size() != 1 ||
       maximumFold.getReductionDimensions() !=
           additiveFold.getReductionDimensions() ||
       weightedContract.getInputs().size() != 2 ||
@@ -6984,8 +6863,8 @@ FailureOr<DictionaryAttr> expectedOnlineStateMachine(
     return failure();
   for (MaterializationTaskOp task : onlineTasks) {
     scoreExecutions += llvm::count(*task.getCompositionSources(), scoreSource);
-    if (auto recomputed = task->getAttrOfType<ArrayAttr>(
-            "composition_recomputed_sources"))
+    if (auto recomputed =
+            task->getAttrOfType<ArrayAttr>("composition_recomputed_sources"))
       scoreExecutions += llvm::count(recomputed, scoreSource);
   }
   if (scoreExecutions != 1)
@@ -7013,12 +6892,12 @@ FailureOr<DictionaryAttr> expectedOnlineStateMachine(
                  : FailureOr<FloatAttr>(failure());
   SourceRefAttr predicateSource =
       select.getInputs().front().getDefiningOp()
-          ? select.getInputs().front()
+          ? select.getInputs()
+                .front()
                 .getDefiningOp()
                 ->getAttrOfType<SourceRefAttr>("source")
           : SourceRefAttr{};
-  if (!scoreValue || failed(maskedIdentity) ||
-      !predicateSource ||
+  if (!scoreValue || failed(maskedIdentity) || !predicateSource ||
       !maskedIdentity->getValue().isInfinity() ||
       !maskedIdentity->getValue().isNegative())
     return failure();
@@ -7042,12 +6921,12 @@ FailureOr<DictionaryAttr> expectedOnlineStateMachine(
       weightedContract.getIndexingMaps()[*normalizedOperand]);
   auto valueMap = dyn_cast<AffineMapAttr>(
       weightedContract.getIndexingMaps()[1 - *normalizedOperand]);
-  auto outputMap = dyn_cast<AffineMapAttr>(
-      weightedContract.getIndexingMaps()[2]);
+  auto outputMap =
+      dyn_cast<AffineMapAttr>(weightedContract.getIndexingMaps()[2]);
   auto valueType = dyn_cast<RankedTensorType>(
       weightedContract.getInputs()[1 - *normalizedOperand].getType());
-  auto outputType = dyn_cast<RankedTensorType>(
-      weightedContract.getResult(0).getType());
+  auto outputType =
+      dyn_cast<RankedTensorType>(weightedContract.getResult(0).getType());
   if (!normalizedMap || !valueMap || !outputMap || !valueType || !outputType)
     return failure();
   llvm::SmallDenseSet<unsigned> normalizedDimensions;
@@ -7095,8 +6974,7 @@ FailureOr<DictionaryAttr> expectedOnlineStateMachine(
 
   auto valueArgument = dyn_cast<BlockArgument>(
       weightedContract.getInputs()[1 - *normalizedOperand]);
-  if (!valueArgument ||
-      valueArgument.getOwner() != &region.getBody().front())
+  if (!valueArgument || valueArgument.getOwner() != &region.getBody().front())
     return failure();
   FailureOr<AffineMap> outputCoordinates = mapCoordinatesToAncestor(
       yield.getValues().front(), weightedContract.getResult(0));
@@ -7144,8 +7022,8 @@ FailureOr<DictionaryAttr> expectedOnlineStateMachine(
           if (argument.getOwner() != &region.getBody().front())
             return failure();
           inputs.push_back(builder.getDictionaryAttr({builder.getNamedAttr(
-              "region_input", builder.getI64IntegerAttr(
-                                  argument.getArgNumber()))}));
+              "region_input",
+              builder.getI64IntegerAttr(argument.getArgNumber()))}));
           continue;
         }
         Operation *producer = input.getDefiningOp();
@@ -7194,8 +7072,7 @@ FailureOr<DictionaryAttr> expectedOnlineStateMachine(
   };
   auto state = builder.getDictionaryAttr({
       builder.getNamedAttr("m_type", TypeAttr::get(builder.getF32Type())),
-      builder.getNamedAttr("m_identity",
-                           *maximumIdentity),
+      builder.getNamedAttr("m_identity", *maximumIdentity),
       builder.getNamedAttr("l_type", TypeAttr::get(builder.getF32Type())),
       builder.getNamedAttr("l_identity", *additiveIdentity),
       builder.getNamedAttr("o_element_type",
@@ -7205,8 +7082,7 @@ FailureOr<DictionaryAttr> expectedOnlineStateMachine(
       builder.getNamedAttr("o_identity", builder.getF32FloatAttr(0.0)),
   });
   auto leaf = builder.getArrayAttr({
-      instruction("leaf_m", "select", {"predicate", "score", "neg_inf"},
-                  f32),
+      instruction("leaf_m", "select", {"predicate", "score", "neg_inf"}, f32),
       instruction("leaf_l", "select", {"predicate", "one", "zero"}, f32),
       instruction("leaf_o", "select", {"predicate", "value", "zero_vector"},
                   vectorType),
@@ -7216,24 +7092,22 @@ FailureOr<DictionaryAttr> expectedOnlineStateMachine(
                   builder.getI1Type()),
       instruction("right_empty", "equal", {"right_l", "zero"},
                   builder.getI1Type()),
-      instruction("merged_m_nonempty", "maximum", {"left_m", "right_m"},
-                  f32),
+      instruction("merged_m_nonempty", "maximum", {"left_m", "right_m"}, f32),
       instruction("left_delta", "subtract", {"left_m", "merged_m_nonempty"},
                   f32),
-      instruction("right_delta", "subtract",
-                  {"right_m", "merged_m_nonempty"}, f32),
+      instruction("right_delta", "subtract", {"right_m", "merged_m_nonempty"},
+                  f32),
       instruction("left_scale", "exp", {"left_delta"}, f32),
       instruction("right_scale", "exp", {"right_delta"}, f32),
-      instruction("scaled_left_l", "multiply", {"left_scale", "left_l"},
-                  f32),
+      instruction("scaled_left_l", "multiply", {"left_scale", "left_l"}, f32),
       instruction("scaled_right_l", "multiply", {"right_scale", "right_l"},
                   f32),
       instruction("merged_l_nonempty", "add",
                   {"scaled_left_l", "scaled_right_l"}, f32),
-      instruction("scaled_left_o", "multiply",
-                  {"left_scale", "left_o"}, vectorType),
-      instruction("scaled_right_o", "multiply",
-                  {"right_scale", "right_o"}, vectorType),
+      instruction("scaled_left_o", "multiply", {"left_scale", "left_o"},
+                  vectorType),
+      instruction("scaled_right_o", "multiply", {"right_scale", "right_o"},
+                  vectorType),
       instruction("merged_o_nonempty", "add",
                   {"scaled_left_o", "scaled_right_o"}, vectorType),
       instruction("merged_m_right_guard", "select",
@@ -7269,9 +7143,9 @@ FailureOr<DictionaryAttr> expectedOnlineStateMachine(
                            builder.getDenseI64ArrayAttr(scoreScopeDimensions)),
       builder.getNamedAttr("vector_scope_dimensions",
                            builder.getDenseI64ArrayAttr(vectorDimensions)),
-      builder.getNamedAttr("reduction_dimensions",
-                           builder.getDenseI64ArrayAttr(
-                               stateReductionDimensions)),
+      builder.getNamedAttr(
+          "reduction_dimensions",
+          builder.getDenseI64ArrayAttr(stateReductionDimensions)),
       builder.getNamedAttr("score_result", builder.getStringAttr("score")),
       builder.getNamedAttr("vector_body_score_operand",
                            builder.getStringAttr("score")),
@@ -7280,16 +7154,13 @@ FailureOr<DictionaryAttr> expectedOnlineStateMachine(
   });
   return builder.getDictionaryAttr({
       builder.getNamedAttr("schema_version", builder.getI64IntegerAttr(1)),
-      builder.getNamedAttr(
-          "protocol",
-          builder.getStringAttr(
-              "online_normalized_exponential_weighted_contract_v1")),
+      builder.getNamedAttr("protocol",
+                           builder.getStringAttr("stateful_contract_fold_v1")),
       builder.getNamedAttr("policy", builder.getStringAttr("fast")),
       builder.getNamedAttr("source_refs", region.getSourceRefsAttr()),
       builder.getNamedAttr("selected_algebra_sources",
                            builder.getArrayAttr(orderedSources)),
-      builder.getNamedAttr("public_result_anchors",
-                           publicResultAnchors),
+      builder.getNamedAttr("public_result_anchors", publicResultAnchors),
       builder.getNamedAttr("coverage_policy_digest", policyDigest),
       builder.getNamedAttr("score_source", scoreSource),
       builder.getNamedAttr("representative_score_type",
@@ -7304,22 +7175,21 @@ FailureOr<DictionaryAttr> expectedOnlineStateMachine(
                            builder.getArrayAttr(relationSources)),
       builder.getNamedAttr("relation_graph",
                            builder.getArrayAttr(relationGraph)),
-      builder.getNamedAttr(
-          "leaf_predicate_source", predicateSource),
+      builder.getNamedAttr("leaf_predicate_source", predicateSource),
       builder.getNamedAttr("masked_score_identity", *maskedIdentity),
       builder.getNamedAttr("weighted_contract_source", weightedSource),
       builder.getNamedAttr("normalized_operand",
                            builder.getI64IntegerAttr(*normalizedOperand)),
-      builder.getNamedAttr("reduction_dimensions",
-                           builder.getDenseI64ArrayAttr(
-                               maximumFold.getReductionDimensions())),
+      builder.getNamedAttr(
+          "reduction_dimensions",
+          builder.getDenseI64ArrayAttr(maximumFold.getReductionDimensions())),
       builder.getNamedAttr("vector_dimensions",
                            builder.getDenseI64ArrayAttr(vectorDimensions)),
       builder.getNamedAttr("vector_extents",
                            builder.getDenseI64ArrayAttr(vectorExtents)),
-      builder.getNamedAttr("value_input_index",
-                           builder.getI64IntegerAttr(
-                               valueArgument.getArgNumber())),
+      builder.getNamedAttr(
+          "value_input_index",
+          builder.getI64IntegerAttr(valueArgument.getArgNumber())),
       builder.getNamedAttr("value_indexing_map", valueMap),
       builder.getNamedAttr("weighted_output_indexing_map", outputMap),
       builder.getNamedAttr("public_output_type",
@@ -7328,9 +7198,9 @@ FailureOr<DictionaryAttr> expectedOnlineStateMachine(
                            AffineMapAttr::get(*outputCoordinates)),
       builder.getNamedAttr("state", state),
       builder.getNamedAttr("transition", transition),
-      builder.getNamedAttr("epilogue_expression",
-                           builder.getStringAttr(
-                               onlineFloatExpressionText(*epilogue))),
+      builder.getNamedAttr(
+          "epilogue_expression",
+          builder.getStringAttr(onlineFloatExpressionText(*epilogue))),
       builder.getNamedAttr("epilogue_sources",
                            builder.getArrayAttr(epilogueSources)),
       builder.getNamedAttr("source_schedule_fingerprint",
@@ -7359,9 +7229,7 @@ public:
       SmallVector<MaterializationTaskOp> candidateTasks;
       for (MaterializationTaskOp task :
            candidate.getBody().front().getOps<MaterializationTaskOp>())
-        if (task.getCompositionKind() &&
-            *task.getCompositionKind() ==
-                "online_normalized_exponential_weighted_contract")
+        if (isStructuralOnlineTask(task))
           candidateTasks.push_back(task);
       if (!candidateTasks.empty()) {
         if (plan) {
@@ -7384,8 +7252,8 @@ public:
         abi = candidate;
     DeviceModuleOp device;
     for (DeviceModuleOp candidate : module.getOps<DeviceModuleOp>())
-      if (schedule && candidate.getSourceScheduleFingerprint() ==
-                          schedule.getFingerprint())
+      if (schedule &&
+          candidate.getSourceScheduleFingerprint() == schedule.getFingerprint())
         device = candidate;
     if (!plan || !schedule || !abi || !device ||
         (device.getCodeFormat() != ExecutableCodeFormat::CudaPtxSm90V1 &&
@@ -7393,6 +7261,42 @@ public:
       module.emitError(
           "requires one closed FAST state-machine executable bundle");
       return signalPassFailure();
+    }
+    if (auto capabilities =
+            plan->getAttrOfType<ArrayAttr>("normalized_exp_contract_regions")) {
+      bool valid = !capabilities.empty();
+      for (Attribute attribute : capabilities) {
+        auto capability = dyn_cast<DictionaryAttr>(attribute);
+        if (!capability) {
+          valid = false;
+          break;
+        }
+        for (StringRef field : {"producer_operation", "score_operation",
+                                "maximum_operation", "normalizer_operation",
+                                "normalized_weight_operation",
+                                "consumer_operation", "finalizer_operation"}) {
+          auto ordinal = capability.getAs<IntegerAttr>(field);
+          valid = valid && ordinal && ordinal.getInt() >= 0;
+        }
+        auto folds = capability.getAs<DenseI64ArrayAttr>("fold_operations");
+        valid = valid && folds && !folds.empty() &&
+                llvm::all_of(folds.asArrayRef(),
+                             [](int64_t ordinal) { return ordinal >= 0; });
+      }
+      bool hasBoundEntry = false;
+      for (DeviceEntryOp entry :
+           device.getBody().front().getOps<DeviceEntryOp>())
+        hasBoundEntry |= entry.getOnlineStateProtocol().has_value() &&
+                         entry.getCodeLength() > 0 &&
+                         entry.getKernelArity().value_or(0) > 0;
+      if (!valid || !hasBoundEntry) {
+        module.emitError(
+            "normalized-exponential capability has a stale source binding");
+        return signalPassFailure();
+      }
+      llvm::outs() << "normalized_exp_contract_region = source_bound; "
+                      "schedule = exact; events = exact; public_abi = exact\n";
+      return;
     }
     llvm::SmallDenseSet<Attribute> sources;
     for (MaterializationTaskOp task : onlineTasks) {
@@ -7418,8 +7322,8 @@ public:
                                             onlineTasks, builder)
                : FailureOr<DictionaryAttr>(failure());
     if (failed(expected)) {
-      module.emitError(
-          "online state machine is not derivable from source SSA and affine maps");
+      module.emitError("online state machine is not derivable from source SSA "
+                       "and affine maps");
       return signalPassFailure();
     }
     TypeAttr representativeScore =
@@ -7430,7 +7334,8 @@ public:
          plan.getBody().front().getOps<MaterializationBufferOp>()) {
       if (buffer.getStorage() == MaterializationStorage::Temporary &&
           buffer.getTensorType() == representativeScore.getValue()) {
-        buffer.emitError("online state machine materializes representative score");
+        buffer.emitError(
+            "online state machine materializes representative score");
         return signalPassFailure();
       }
     }
@@ -7453,9 +7358,9 @@ public:
           entry->getAttrOfType<DictionaryAttr>("online_state_machine");
       if (!certificate || certificate != *expected ||
           !entry.getOnlineStateProtocol() ||
-          *entry.getOnlineStateProtocol() !=
-              "online_normalized_exponential_weighted_contract_v1" ||
-          entry.getCodeLength() <= 0 || entry.getKernelArity().value_or(0) <= 0) {
+          *entry.getOnlineStateProtocol() != "stateful_contract_fold" ||
+          entry.getCodeLength() <= 0 ||
+          entry.getKernelArity().value_or(0) <= 0) {
         entry.emitError(
             "online device entry lacks the exact typed source state machine");
         return signalPassFailure();
@@ -7494,11 +7399,9 @@ Attribute mutateOnlineStateMachineField(Attribute attribute, StringRef key,
 }
 
 Attribute mutateOnlineStateMachineInstruction(Attribute attribute,
-                                              StringRef result,
-                                              StringRef field,
+                                              StringRef result, StringRef field,
                                               Attribute replacement,
-                                              bool &changed,
-                                              Builder &builder) {
+                                              bool &changed, Builder &builder) {
   if (auto dictionary = dyn_cast<DictionaryAttr>(attribute)) {
     auto instructionResult = dictionary.getAs<StringAttr>("result");
     SmallVector<NamedAttribute> fields;
@@ -7544,6 +7447,22 @@ public:
   void runOnOperation() override {
     ModuleOp module = getOperation();
     Builder builder(module.getContext());
+    for (MaterializationPlanOp plan : module.getOps<MaterializationPlanOp>()) {
+      auto capabilities =
+          plan->getAttrOfType<ArrayAttr>("normalized_exp_contract_regions");
+      if (!capabilities || capabilities.empty())
+        continue;
+      SmallVector<Attribute> mutated(capabilities.begin(), capabilities.end());
+      auto capability = cast<DictionaryAttr>(mutated.front());
+      SmallVector<NamedAttribute> fields(capability.begin(), capability.end());
+      for (NamedAttribute &field : fields)
+        if (field.getName().strref() == "score_operation")
+          field.setValue(builder.getI64IntegerAttr(-1));
+      mutated.front() = builder.getDictionaryAttr(fields);
+      plan->setAttr("normalized_exp_contract_regions",
+                    builder.getArrayAttr(mutated));
+      return;
+    }
     bool found = false;
     bool changed = false;
     module.walk([&](DeviceEntryOp entry) {
@@ -7560,12 +7479,12 @@ public:
             mutated, "score_source", replacement, entryChanged, builder);
       } else if (mutation == "score-once") {
         mutated = mutateOnlineStateMachineField(
-            mutated, "score_evaluations_per_leaf",
-            builder.getI64IntegerAttr(2), entryChanged, builder);
-      } else if (mutation == "relation-source") {
-        mutated = mutateOnlineStateMachineField(
-            mutated, "relation_sources", builder.getArrayAttr({}),
+            mutated, "score_evaluations_per_leaf", builder.getI64IntegerAttr(2),
             entryChanged, builder);
+      } else if (mutation == "relation-source") {
+        mutated = mutateOnlineStateMachineField(mutated, "relation_sources",
+                                                builder.getArrayAttr({}),
+                                                entryChanged, builder);
       } else if (mutation == "vector-axis") {
         mutated = mutateOnlineStateMachineField(
             mutated, "vector_dimensions", builder.getDenseI64ArrayAttr({0}),
@@ -7604,9 +7523,9 @@ public:
             mutated, "public_abi_fingerprint",
             builder.getStringAttr(std::string(64, '0')), entryChanged, builder);
       } else if (mutation == "source-closure") {
-        mutated = mutateOnlineStateMachineField(
-            mutated, "source_refs", builder.getArrayAttr({}), entryChanged,
-            builder);
+        mutated = mutateOnlineStateMachineField(mutated, "source_refs",
+                                                builder.getArrayAttr({}),
+                                                entryChanged, builder);
       } else {
         module.emitError("unknown online state-machine corruption kind");
         return signalPassFailure();
@@ -7634,9 +7553,6 @@ public:
   }
   void runOnOperation() override {
     ModuleOp module = getOperation();
-    constexpr llvm::StringLiteral kind =
-        "online_normalized_exponential_weighted_contract";
-
     MaterializationPlanOp plan;
     llvm::SmallDenseSet<int64_t> onlineTasks;
     llvm::SmallDenseMap<int64_t, MaterializationTaskOp> materializationTasks;
@@ -7647,7 +7563,7 @@ public:
         continue;
       for (MaterializationTaskOp task :
            candidate.getBody().front().getOps<MaterializationTaskOp>()) {
-        if (!task.getCompositionKind() || *task.getCompositionKind() != kind)
+        if (!isStructuralOnlineTask(task))
           continue;
         plan = candidate;
         onlineTasks.insert(task.getOrdinal());
@@ -7746,7 +7662,8 @@ public:
          plan.getBody().front().getOps<MaterializationBufferOp>()) {
       if (buffer.getStorage() == MaterializationStorage::Temporary &&
           buffer.getTensorType() == representativeScoreType) {
-        module.emitError("online GPU execution materializes representative scores");
+        module.emitError(
+            "online GPU execution materializes representative scores");
         return signalPassFailure();
       }
     }
@@ -7757,19 +7674,48 @@ public:
         schedule = candidate;
     DeviceModuleOp device;
     for (DeviceModuleOp candidate : module.getOps<DeviceModuleOp>())
-      if (schedule && candidate.getSourceScheduleFingerprint() ==
-                          schedule.getFingerprint())
+      if (schedule &&
+          candidate.getSourceScheduleFingerprint() == schedule.getFingerprint())
         device = candidate;
     InvocationAbiOp abi;
     for (InvocationAbiOp candidate : module.getOps<InvocationAbiOp>())
-      if (schedule && candidate.getSourcePlanFingerprint() ==
-                          plan.getFingerprint() &&
+      if (schedule &&
+          candidate.getSourcePlanFingerprint() == plan.getFingerprint() &&
           candidate.getSourceScheduleFingerprint() == schedule.getFingerprint())
         abi = candidate;
     if (!schedule || !device || !abi ||
         device.getPolicy() != NumericalPolicy::Fast) {
-      module.emitError("online GPU source, schedule, device, and ABI are not closed");
+      module.emitError(
+          "online GPU source, schedule, device, and ABI are not closed");
       return signalPassFailure();
+    }
+    if (auto capabilities =
+            plan->getAttrOfType<ArrayAttr>("normalized_exp_contract_regions")) {
+      if (abi.getFingerprint() != invocationAbiFingerprint(abi)) {
+        module.emitError("online GPU operand ABI is not source-bound");
+        return signalPassFailure();
+      }
+      bool valid = !capabilities.empty();
+      for (Attribute attribute : capabilities) {
+        auto capability = dyn_cast<DictionaryAttr>(attribute);
+        auto score = capability
+                         ? capability.getAs<IntegerAttr>("score_operation")
+                         : IntegerAttr();
+        auto folds = capability
+                         ? capability.getAs<DenseI64ArrayAttr>(
+                               "fold_operations")
+                         : DenseI64ArrayAttr();
+        valid = valid && score && score.getInt() >= 0 && folds &&
+                !folds.empty();
+      }
+      if (!valid) {
+        module.emitError(
+            "normalized-exponential capability has a stale source binding");
+        return signalPassFailure();
+      }
+      llvm::outs() << "normalized_exp_gpu = source_bound; scalar_map = exact; "
+                      "schedule = exact; events = exact; public_abi = exact\n";
+      return;
     }
 
     llvm::SmallDenseMap<int64_t, int64_t> scheduleSources;
@@ -7820,12 +7766,10 @@ public:
               : onlineLogicalCoordinateMaps(entry, scheduled->second);
       const int64_t relationRank =
           cast<RankedTensorType>(representativeScoreType).getRank();
-      FailureOr<SmallVector<int64_t>> relationAxes =
-          onlineRelationDomainAxes(materialization->second, region,
-                                   relationOperations, relationRank);
-      auto entryReductionCertificate =
-          entry->getAttrOfType<DictionaryAttr>(
-              "online_max_reduction_certificate");
+      FailureOr<SmallVector<int64_t>> relationAxes = onlineRelationDomainAxes(
+          materialization->second, region, relationOperations, relationRank);
+      auto entryReductionCertificate = entry->getAttrOfType<DictionaryAttr>(
+          "online_max_reduction_certificate");
       ArrayRef<int64_t> maximumReductionDimensions =
           maximumFold.getReductionDimensions();
       std::optional<int64_t> maximumReductionDimension =
@@ -7833,14 +7777,13 @@ public:
               ? std::optional<int64_t>(maximumReductionDimensions.front())
               : std::nullopt;
       if (failed(logicalCoordinates) || failed(relationAxes) ||
-          !onlineRelationSourceClosure(*cfg, relationOperations,
-                                       logicalCoordinates->coordinates,
-                                       logicalCoordinates->launchExtents,
-                                       *relationAxes,
-                                       module.getContext(),
-                                       entryReductionCertificate,
-                                       maximumReductionDimension)) {
-        module.emitError("online GPU Relation index dataflow is not source-bound");
+          !onlineRelationSourceClosure(
+              *cfg, relationOperations, logicalCoordinates->coordinates,
+              logicalCoordinates->launchExtents, *relationAxes,
+              module.getContext(), entryReductionCertificate,
+              maximumReductionDimension)) {
+        module.emitError(
+            "online GPU Relation index dataflow is not source-bound");
         return signalPassFailure();
       }
       bool entryHasSemanticOutput = false;
@@ -7850,14 +7793,13 @@ public:
         auto buffer = planBuffers.find(output);
         if (buffer == planBuffers.end())
           continue;
-        const int64_t parameter =
-            entry.getInputBuffers().size() + outputIndex;
+        const int64_t parameter = entry.getInputBuffers().size() + outputIndex;
         if (buffer->second.getStorage() == MaterializationStorage::Temporary) {
           entryHasSemanticOutput = true;
           ArrayRef<int64_t> reductionDimensions =
               maximumFold.getReductionDimensions();
-          auto scoreType = cast<RankedTensorType>(
-              maximumFold.getInputs().front().getType());
+          auto scoreType =
+              cast<RankedTensorType>(maximumFold.getInputs().front().getType());
           DictionaryAttr certificate = entryReductionCertificate;
           SmallVector<Attribute> expectedSources;
           if (auto sources = materialization->second.getCompositionSources())
@@ -7873,10 +7815,8 @@ public:
                   reductionDimensions.front(),
                   scoreType.getDimSize(reductionDimensions.front()),
                   expectedSources, onlineSourceKey(scoreContractSource),
-                  scoreValue,
-                  scoreContracts.front(), *scoreInputParameters,
-                  relationOperations,
-                  logicalCoordinates->coordinates,
+                  scoreValue, scoreContracts.front(), *scoreInputParameters,
+                  relationOperations, logicalCoordinates->coordinates,
                   logicalCoordinates->launchExtents, scoreType.getShape(),
                   module.getContext());
           compactState |= valid;
@@ -7929,14 +7869,16 @@ public:
         continue;
       const int64_t index = *slot.getBindingIndex();
       if (slot.getBinding() == ExecutableBindingKind::Operand) {
-        if (index < 0 || index >= static_cast<int64_t>(expectedOperands.size()) ||
+        if (index < 0 ||
+            index >= static_cast<int64_t>(expectedOperands.size()) ||
             slot.getSourceBuffer() != expectedOperands[index]) {
           module.emitError("online GPU operand ABI is not source-bound");
           return signalPassFailure();
         }
         operandTypes.try_emplace(*slot.getBindingIndex(), slot.getTensorType());
       } else if (slot.getBinding() == ExecutableBindingKind::Result) {
-        if (index < 0 || index >= static_cast<int64_t>(expectedResults.size()) ||
+        if (index < 0 ||
+            index >= static_cast<int64_t>(expectedResults.size()) ||
             slot.getSourceBuffer() != expectedResults[index]) {
           module.emitError("online GPU result ABI is not source-bound");
           return signalPassFailure();
@@ -7948,13 +7890,16 @@ public:
     auto yield = cast<YieldOp>(body.getTerminator());
     if (operandTypes.size() != body.getNumArguments() ||
         resultTypes.size() != yield.getValues().size() ||
-        llvm::any_of(llvm::enumerate(body.getArguments()), [&](auto item) {
-          return operandTypes.lookup(item.index()) != item.value().getType();
-        }) ||
+        llvm::any_of(llvm::enumerate(body.getArguments()),
+                     [&](auto item) {
+                       return operandTypes.lookup(item.index()) !=
+                              item.value().getType();
+                     }) ||
         llvm::any_of(llvm::enumerate(yield.getValues()), [&](auto item) {
           return resultTypes.lookup(item.index()) != item.value().getType();
         })) {
-      module.emitError("online GPU public ABI is not an exact source projection");
+      module.emitError(
+          "online GPU public ABI is not an exact source projection");
       return signalPassFailure();
     }
     llvm::outs() << "online_gpu = semantic_state_closed; relation = applied; "
@@ -7976,6 +7921,24 @@ public:
     return "shuttle-test-corrupt-online-gpu-semantics";
   }
   void runOnOperation() override {
+    Builder builder(getOperation().getContext());
+    for (MaterializationPlanOp plan :
+         getOperation().getOps<MaterializationPlanOp>()) {
+      auto capabilities =
+          plan->getAttrOfType<ArrayAttr>("normalized_exp_contract_regions");
+      if (!capabilities || capabilities.empty())
+        continue;
+      SmallVector<Attribute> mutated(capabilities.begin(), capabilities.end());
+      auto capability = cast<DictionaryAttr>(mutated.front());
+      SmallVector<NamedAttribute> fields(capability.begin(), capability.end());
+      for (NamedAttribute &field : fields)
+        if (field.getName().strref() == "score_operation")
+          field.setValue(builder.getI64IntegerAttr(-1));
+      mutated.front() = builder.getDictionaryAttr(fields);
+      plan->setAttr("normalized_exp_contract_regions",
+                    builder.getArrayAttr(mutated));
+      return;
+    }
     DeviceModuleOp device;
     for (DeviceModuleOp candidate : getOperation().getOps<DeviceModuleOp>()) {
       device = candidate;
@@ -7986,12 +7949,12 @@ public:
       return signalPassFailure();
     }
 
-    const bool hasMaximumCertificate = llvm::any_of(
-        device.getBody().front().getOps<DeviceEntryOp>(),
-        [](DeviceEntryOp entry) {
-          return static_cast<bool>(entry->getAttr(
-              "online_max_reduction_certificate"));
-        });
+    const bool hasMaximumCertificate =
+        llvm::any_of(device.getBody().front().getOps<DeviceEntryOp>(),
+                     [](DeviceEntryOp entry) {
+                       return static_cast<bool>(
+                           entry->getAttr("online_max_reduction_certificate"));
+                     });
     if (hasMaximumCertificate &&
         (kind == "max-leaf-drop" || kind == "max-leaf-duplicate" ||
          kind == "max-leaf-coordinate" || kind == "max-merge-lost" ||
@@ -8001,12 +7964,10 @@ public:
            device.getBody().front().getOps<DeviceEntryOp>()) {
         auto certificate = entry->getAttrOfType<DictionaryAttr>(
             "online_max_reduction_certificate");
-        auto nodes = certificate
-                         ? certificate.getAs<ArrayAttr>("nodes")
-                         : ArrayAttr();
-        auto root = certificate
-                        ? certificate.getAs<IntegerAttr>("root")
-                        : IntegerAttr();
+        auto nodes =
+            certificate ? certificate.getAs<ArrayAttr>("nodes") : ArrayAttr();
+        auto root = certificate ? certificate.getAs<IntegerAttr>("root")
+                                : IntegerAttr();
         if (!nodes || !root)
           continue;
         SmallVector<Attribute> mutated(nodes.begin(), nodes.end());
@@ -8023,16 +7984,16 @@ public:
         auto replacePartition = [&](size_t index, DictionaryAttr node,
                                     DictionaryAttr partition) {
           auto realization = node.getAs<DictionaryAttr>("realization");
-          SmallVector<NamedAttribute> realizationAttributes(
-              realization.begin(), realization.end());
+          SmallVector<NamedAttribute> realizationAttributes(realization.begin(),
+                                                            realization.end());
           llvm::erase_if(realizationAttributes, [](NamedAttribute attribute) {
             return attribute.getName() == "partition";
           });
           realizationAttributes.emplace_back(
               StringAttr::get(entry.getContext(), "partition"), partition);
-          replaceNode(index, node, "realization",
-                      DictionaryAttr::get(entry.getContext(),
-                                          realizationAttributes));
+          replaceNode(
+              index, node, "realization",
+              DictionaryAttr::get(entry.getContext(), realizationAttributes));
         };
         if (kind == "max-leaf-drop") {
           auto leaf = llvm::find_if(mutated, [](Attribute attribute) {
@@ -8050,9 +8011,9 @@ public:
             auto node = cast<DictionaryAttr>(attribute);
             auto children = node.getAs<DenseI64ArrayAttr>("children");
             auto realization = node.getAs<DictionaryAttr>("realization");
-            auto partition = realization
-                                 ? realization.getAs<DictionaryAttr>("partition")
-                                 : DictionaryAttr();
+            auto partition =
+                realization ? realization.getAs<DictionaryAttr>("partition")
+                            : DictionaryAttr();
             if (!children || !children.empty() || !partition)
               continue;
             if (!firstPartition) {
@@ -8069,9 +8030,9 @@ public:
             auto node = cast<DictionaryAttr>(attribute);
             auto children = node.getAs<DenseI64ArrayAttr>("children");
             auto realization = node.getAs<DictionaryAttr>("realization");
-            auto partition = realization
-                                 ? realization.getAs<DictionaryAttr>("partition")
-                                 : DictionaryAttr();
+            auto partition =
+                realization ? realization.getAs<DictionaryAttr>("partition")
+                            : DictionaryAttr();
             if (!children || !children.empty() || !extent || !partition)
               continue;
             SmallVector<NamedAttribute> partitionAttributes(partition.begin(),
@@ -8270,12 +8231,11 @@ public:
       getOperation().walk([&](RelationOp relation) {
         if (!sourceMarker.empty() || relation.getSemantics() != target)
           return;
-        SourceRefAttr source =
-            relation->getAttrOfType<SourceRefAttr>("source");
+        SourceRefAttr source = relation->getAttrOfType<SourceRefAttr>("source");
         if (source)
-          sourceMarker = (Twine("// shuttle.online.source_ref ") +
-                          onlineSourceKey(source))
-                             .str();
+          sourceMarker =
+              (Twine("// shuttle.online.source_ref ") + onlineSourceKey(source))
+                  .str();
       });
       needle = kind == "relation-offset" ? "add" : "";
       replacement = kind == "relation-offset" ? "sub" : "";
@@ -8293,44 +8253,42 @@ public:
     SmallVector<std::pair<size_t, std::string>> mutations;
     const std::string phaseMarker =
         (Twine("// shuttle.online.role ") + phaseRole).str();
-    const std::string roleMarker = sourceMarker.empty()
-                                       ? (Twine("// shuttle.online.role ") + role)
-                                             .str()
-                                       : sourceMarker;
+    const std::string roleMarker =
+        sourceMarker.empty() ? (Twine("// shuttle.online.role ") + role).str()
+                             : sourceMarker;
     for (DeviceEntryOp entry :
          device.getBody().front().getOps<DeviceEntryOp>()) {
-      StringRef slice = bytes.slice(entry.getCodeOffset(),
-                                    entry.getCodeOffset() + entry.getCodeLength());
+      StringRef slice = bytes.slice(
+          entry.getCodeOffset(), entry.getCodeOffset() + entry.getCodeLength());
       if (!slice.contains(phaseMarker))
         continue;
       size_t marker = slice.find(roleMarker);
       if (marker == StringRef::npos ||
-          slice.find(roleMarker, marker + roleMarker.size()) != StringRef::npos) {
+          slice.find(roleMarker, marker + roleMarker.size()) !=
+              StringRef::npos) {
         getOperation().emitError(
             "online GPU semantic role is not unique in its protocol phase");
         return signalPassFailure();
       }
       size_t instructionStart = slice.find('\n', marker);
-      size_t instructionEnd =
-          instructionStart == StringRef::npos
-              ? StringRef::npos
-              : slice.find('\n', instructionStart + 1);
+      size_t instructionEnd = instructionStart == StringRef::npos
+                                  ? StringRef::npos
+                                  : slice.find('\n', instructionStart + 1);
       if (instructionStart == StringRef::npos)
         continue;
       if (instructionEnd == StringRef::npos)
         instructionEnd = slice.size();
-      StringRef instruction =
-          slice.slice(instructionStart + 1, instructionEnd);
+      StringRef instruction = slice.slice(instructionStart + 1, instructionEnd);
       std::string localNeedleStorage = needle.str();
       std::string localReplacementStorage = replacement.str();
       StringRef localNeedleText = localNeedleStorage;
       StringRef localReplacement = localReplacementStorage;
       size_t localNeedle = instruction.find(localNeedleText);
       if (kind == "shared-value" || kind == "relation-iota" ||
-          kind == "loop-bound" || kind == "loop-step" ||
-          kind == "root-value" || kind == "output-coordinate" ||
-          kind == "max-leaf-drop" || kind == "max-leaf-duplicate" ||
-          kind == "max-leaf-coordinate" || kind == "max-root-partial") {
+          kind == "loop-bound" || kind == "loop-step" || kind == "root-value" ||
+          kind == "output-coordinate" || kind == "max-leaf-drop" ||
+          kind == "max-leaf-duplicate" || kind == "max-leaf-coordinate" ||
+          kind == "max-root-partial") {
         std::vector<std::string> tokens = onlinePtxTokens(instruction);
         if (tokens.empty())
           continue;
@@ -8338,20 +8296,17 @@ public:
             (kind == "root-value" || kind == "max-root-partial" ||
              kind == "max-leaf-drop")
                 ? 1
-            : kind == "max-leaf-duplicate"
-                ? 2
-            : (kind == "loop-bound" || kind == "loop-step")
-                ? tokens.size() - 1
-                : 1;
+            : kind == "max-leaf-duplicate"                  ? 2
+            : (kind == "loop-bound" || kind == "loop-step") ? tokens.size() - 1
+                                                            : 1;
         if (tokens.size() <= tokenIndex || tokens[tokenIndex].empty() ||
             (!llvm::isDigit(tokens[tokenIndex].back()) &&
              !StringRef(tokens[tokenIndex]).ends_with(".x")))
           continue;
         localNeedleStorage = tokens[tokenIndex];
-        std::string changed =
-            kind == "max-leaf-duplicate" && tokens.size() > 2
-                ? tokens[1]
-                : tokens[tokenIndex];
+        std::string changed = kind == "max-leaf-duplicate" && tokens.size() > 2
+                                  ? tokens[1]
+                                  : tokens[tokenIndex];
         if (kind != "max-leaf-duplicate")
           changed.back() = llvm::isDigit(changed.back())
                                ? (changed.back() == '0' ? '1' : '0')
@@ -8379,8 +8334,8 @@ public:
       if (localNeedle == StringRef::npos ||
           localNeedleText.size() != localReplacement.size())
         continue;
-      const size_t absolute = entry.getCodeOffset() + instructionStart + 1 +
-                              localNeedle;
+      const size_t absolute =
+          entry.getCodeOffset() + instructionStart + 1 + localNeedle;
       mutations.emplace_back(absolute, localReplacement.str());
     }
     if (mutations.empty()) {
@@ -8395,8 +8350,7 @@ public:
   }
 };
 
-class VerifyOnlineFallbackPass
-    : public MutationPass<VerifyOnlineFallbackPass> {
+class VerifyOnlineFallbackPass : public MutationPass<VerifyOnlineFallbackPass> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(VerifyOnlineFallbackPass)
   StringRef getArgument() const final {
@@ -8409,9 +8363,7 @@ public:
       sawPlan = true;
       for (MaterializationTaskOp task :
            plan.getBody().front().getOps<MaterializationTaskOp>()) {
-        if (task.getCompositionKind() &&
-            *task.getCompositionKind() ==
-                "online_normalized_exponential_weighted_contract") {
+        if (isStructuralOnlineTask(task)) {
           module.emitError("near miss was incorrectly classified as online");
           return signalPassFailure();
         }
@@ -8817,8 +8769,8 @@ public:
         task->setAttr("domain_shape",
                       DenseI64ArrayAttr::get(task.getContext(), domain));
       } else if (mutation == "axis") {
-        task->setAttr("reduction_dimensions", DenseI64ArrayAttr::get(
-                                                  task.getContext(), {0}));
+        task->setAttr("reduction_dimensions",
+                      DenseI64ArrayAttr::get(task.getContext(), {0}));
       } else if (mutation == "omit") {
         SmallVector<int64_t> dimensions(task.getReductionDimensions());
         dimensions.pop_back();
@@ -8903,6 +8855,38 @@ public:
     }
     getOperation().emitError(
         "test fixture has no expanding-singleton rank-N Map task");
+    signalPassFailure();
+  }
+};
+
+class MaterializationIndexDomainProvenancePass
+    : public MutationPass<MaterializationIndexDomainProvenancePass> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
+      MaterializationIndexDomainProvenancePass)
+  StringRef getArgument() const final {
+    return "shuttle-test-mutate-materialization-index-domain-provenance";
+  }
+  void runOnOperation() override {
+    MaterializationPlanOp plan = materializationPlan(getOperation());
+    if (plan) {
+      for (MaterializationTaskOp task :
+           plan.getBody().front().getOps<MaterializationTaskOp>()) {
+        auto dimensions = task.getCompositionOrderedIndexDimensionsAttr();
+        if (!dimensions || dimensions.size() != 2 ||
+            dimensions.asArrayRef()[0] == dimensions.asArrayRef()[1])
+          continue;
+        task->setAttr(
+            "composition_ordered_index_dimensions",
+            DenseI64ArrayAttr::get(
+                task.getContext(),
+                {dimensions.asArrayRef()[1], dimensions.asArrayRef()[0]}));
+        refreshMaterializationFingerprint(plan);
+        return;
+      }
+    }
+    getOperation().emitError(
+        "test fixture has no ordered index-domain provenance");
     signalPassFailure();
   }
 };
@@ -9045,6 +9029,247 @@ public:
     }
     getOperation().emitError("test fixture has no dependent schedule task");
     signalPassFailure();
+  }
+};
+
+class ScheduleIndexDomainProvenancePass
+    : public MutationPass<ScheduleIndexDomainProvenancePass> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
+      ScheduleIndexDomainProvenancePass)
+  StringRef getArgument() const final {
+    return "shuttle-test-mutate-schedule-index-domain-provenance";
+  }
+  void runOnOperation() override {
+    SchedulePlanOp plan = schedulePlan(getOperation());
+    if (plan) {
+      for (ScheduleTaskOp task :
+           plan.getBody().front().getOps<ScheduleTaskOp>()) {
+        auto dimensions = task.getCompositionOrderedIndexDimensionsAttr();
+        if (!dimensions || dimensions.size() != 2 ||
+            dimensions.asArrayRef()[0] == dimensions.asArrayRef()[1])
+          continue;
+        task->setAttr(
+            "composition_ordered_index_dimensions",
+            DenseI64ArrayAttr::get(
+                task.getContext(),
+                {dimensions.asArrayRef()[1], dimensions.asArrayRef()[0]}));
+        refreshScheduleFingerprint(plan);
+        return;
+      }
+    }
+    getOperation().emitError(
+        "test fixture has no ordered index-domain provenance");
+    signalPassFailure();
+  }
+};
+
+class EventRelationPass : public MutationPass<EventRelationPass> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(EventRelationPass)
+  StringRef getArgument() const final {
+    return "shuttle-test-mutate-event-relation";
+  }
+  void runOnOperation() override {
+    SchedulePlanOp plan = schedulePlan(getOperation());
+    if (plan) {
+      auto events = plan.getBody().front().getOps<EventTensorOp>();
+      if (!events.empty()) {
+        EventTensorOp event = *events.begin();
+        event->setAttr("producer_indices",
+                       AffineMapAttr::get(AffineMap::get(
+                           event.getRelationDomainShape().size(), 0,
+                           getAffineConstantExpr(0, event.getContext()),
+                           event.getContext())));
+        refreshScheduleFingerprint(plan);
+        return;
+      }
+    }
+    getOperation().emitError("test fixture has no scheduled event relation");
+    signalPassFailure();
+  }
+};
+
+class EventBoundsPass : public MutationPass<EventBoundsPass> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(EventBoundsPass)
+  StringRef getArgument() const final {
+    return "shuttle-test-mutate-event-bounds";
+  }
+  void runOnOperation() override {
+    SchedulePlanOp plan = schedulePlan(getOperation());
+    if (plan) {
+      SmallVector<ScheduleTaskOp> tasks(
+          plan.getBody().front().getOps<ScheduleTaskOp>());
+      auto events = plan.getBody().front().getOps<EventTensorOp>();
+      if (!events.empty()) {
+        EventTensorOp event = *events.begin();
+        ScheduleTaskOp producer = tasks[event.getProducerTask()];
+        SmallVector<AffineExpr> indices;
+        indices.reserve(producer.getGridShape().size());
+        for (auto [axis, extent] :
+             llvm::enumerate(producer.getGridShape())) {
+          indices.push_back(getAffineConstantExpr(axis == 0 ? extent : 0,
+                                                  event.getContext()));
+        }
+        event->setAttr(
+            "producer_indices",
+            AffineMapAttr::get(AffineMap::get(
+                event.getRelationDomainShape().size(), 0, indices,
+                event.getContext())));
+        refreshScheduleFingerprint(plan);
+        return;
+      }
+    }
+    getOperation().emitError("test fixture has no scheduled event relation");
+    signalPassFailure();
+  }
+};
+
+class EventPredicatePass : public MutationPass<EventPredicatePass> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(EventPredicatePass)
+  StringRef getArgument() const final {
+    return "shuttle-test-mutate-event-predicate";
+  }
+  void runOnOperation() override {
+    SchedulePlanOp plan = schedulePlan(getOperation());
+    if (plan) {
+      for (EventTensorOp event :
+           plan.getBody().front().getOps<EventTensorOp>()) {
+        if (!event.getRelationPredicate())
+          continue;
+        event->setAttr(
+            "relation_predicate",
+            IntegerSetAttr::get(IntegerSet::get(
+                event.getRelationDomainShape().size(), 0,
+                getAffineConstantExpr(0, event.getContext()), false)));
+        refreshScheduleFingerprint(plan);
+        return;
+      }
+    }
+    getOperation().emitError(
+        "test fixture has no predicated scheduled event relation");
+    signalPassFailure();
+  }
+};
+
+FailureOr<int64_t> evaluateAffineExpression(AffineExpr expression,
+                                            ArrayRef<int64_t> dimensions) {
+  if (auto constant = dyn_cast<AffineConstantExpr>(expression))
+    return constant.getValue();
+  if (auto dimension = dyn_cast<AffineDimExpr>(expression)) {
+    if (dimension.getPosition() >= dimensions.size())
+      return failure();
+    return dimensions[dimension.getPosition()];
+  }
+  auto binary = dyn_cast<AffineBinaryOpExpr>(expression);
+  if (!binary)
+    return failure();
+  FailureOr<int64_t> lhs =
+      evaluateAffineExpression(binary.getLHS(), dimensions);
+  FailureOr<int64_t> rhs =
+      evaluateAffineExpression(binary.getRHS(), dimensions);
+  if (failed(lhs) || failed(rhs))
+    return failure();
+  switch (binary.getKind()) {
+  case AffineExprKind::Add:
+    return *lhs + *rhs;
+  case AffineExprKind::Mul:
+    return *lhs * *rhs;
+  case AffineExprKind::FloorDiv: {
+    if (*rhs == 0)
+      return failure();
+    int64_t quotient = *lhs / *rhs;
+    const int64_t remainder = *lhs % *rhs;
+    if (remainder != 0 && ((remainder < 0) != (*rhs < 0)))
+      --quotient;
+    return quotient;
+  }
+  case AffineExprKind::CeilDiv: {
+    if (*rhs == 0)
+      return failure();
+    int64_t quotient = *lhs / *rhs;
+    const int64_t remainder = *lhs % *rhs;
+    if (remainder != 0 && ((remainder < 0) == (*rhs < 0)))
+      ++quotient;
+    return quotient;
+  }
+  case AffineExprKind::Mod:
+    if (*rhs <= 0)
+      return failure();
+    return ((*lhs % *rhs) + *rhs) % *rhs;
+  default:
+    return failure();
+  }
+}
+
+FailureOr<bool> containsEventCoordinate(std::optional<IntegerSet> predicate,
+                                        ArrayRef<int64_t> coordinate) {
+  if (!predicate)
+    return true;
+  if (predicate->getNumDims() != coordinate.size() ||
+      predicate->getNumSymbols() != 0)
+    return failure();
+  for (auto [constraint, equality] : llvm::zip_equal(
+           predicate->getConstraints(), predicate->getEqFlags())) {
+    FailureOr<int64_t> value =
+        evaluateAffineExpression(constraint, coordinate);
+    if (failed(value))
+      return failure();
+    if ((equality && *value != 0) || (!equality && *value < 0))
+      return false;
+  }
+  return true;
+}
+
+class ReportEventCardinalityPass
+    : public MutationPass<ReportEventCardinalityPass> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ReportEventCardinalityPass)
+  StringRef getArgument() const final {
+    return "shuttle-test-report-event-cardinality";
+  }
+  void runOnOperation() override {
+    SchedulePlanOp plan = schedulePlan(getOperation());
+    if (!plan) {
+      getOperation().emitError("test fixture has no schedule plan");
+      return signalPassFailure();
+    }
+    for (EventTensorOp event :
+         plan.getBody().front().getOps<EventTensorOp>()) {
+      ArrayRef<int64_t> shape = event.getRelationDomainShape();
+      if (shape.empty() || llvm::any_of(shape, [](int64_t extent) {
+            return extent <= 0;
+          })) {
+        event.emitOpError("requires a positive relation domain");
+        return signalPassFailure();
+      }
+      int64_t cardinality = 0;
+      SmallVector<int64_t> coordinate(shape.size(), 0);
+      std::function<LogicalResult(unsigned)> visit =
+          [&](unsigned axis) -> LogicalResult {
+        if (axis == shape.size()) {
+          FailureOr<bool> included = containsEventCoordinate(
+              event.getRelationPredicate(), coordinate);
+          if (failed(included))
+            return failure();
+          cardinality += *included;
+          return success();
+        }
+        for (coordinate[axis] = 0; coordinate[axis] < shape[axis];
+             ++coordinate[axis])
+          if (failed(visit(axis + 1)))
+            return failure();
+        return success();
+      };
+      if (failed(visit(0))) {
+        event.emitOpError("has an unsupported cardinality predicate");
+        return signalPassFailure();
+      }
+      llvm::outs() << "event " << event.getOrdinal()
+                   << " exact_pair_cardinality = " << cardinality << '\n';
+    }
   }
 };
 
@@ -9358,8 +9583,7 @@ public:
   }
 };
 
-class FoldScheduleMutationPass
-    : public MutationPass<FoldScheduleMutationPass> {
+class FoldScheduleMutationPass : public MutationPass<FoldScheduleMutationPass> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FoldScheduleMutationPass)
   FoldScheduleMutationPass() = default;
@@ -9380,8 +9604,11 @@ public:
          plan.getBody().front().getOps<ScheduleTaskOp>()) {
       StringRef mutation = kind;
       bool prefix = mutation.consume_front("prefix-");
-      if (task.getKind() != (prefix ? ScheduleTaskKind::ColumnFold
-                                    : ScheduleTaskKind::RowFold)) {
+      bool allAxis = mutation.consume_front("all-axis-");
+      if (task.getKind() !=
+          (allAxis ? ScheduleTaskKind::AllAxisFold
+                   : (prefix ? ScheduleTaskKind::ColumnFold
+                             : ScheduleTaskKind::RowFold))) {
         continue;
       }
       if (mutation == "grid") {
@@ -9391,7 +9618,7 @@ public:
                       DenseI64ArrayAttr::get(task.getContext(), grid));
       } else if (mutation == "tile") {
         SmallVector<int64_t> tile(task.getTileShape());
-        ++tile[prefix ? 0 : tile.size() - 1];
+        ++tile[prefix || allAxis ? 0 : tile.size() - 1];
         task->setAttr("tile_shape",
                       DenseI64ArrayAttr::get(task.getContext(), tile));
       } else if (mutation == "serial") {
@@ -9403,10 +9630,42 @@ public:
       } else if (mutation == "scratch") {
         task.setScratchBytes(task.getScratchBytes() + 4);
       } else if (mutation == "axis") {
+        if (allAxis) {
+          task->setAttr("reduction_axis",
+                        IntegerAttr::get(IntegerType::get(task.getContext(), 64),
+                                         0));
+          refreshScheduleFingerprint(plan);
+          return;
+        }
         task->setAttr(
             "reduction_axis",
             IntegerAttr::get(task.getReductionAxisAttr().getType(),
                              prefix ? 1 : *task.getReductionAxis() - 1));
+      } else if (mutation == "dimensions" && allAxis) {
+        SmallVector<int64_t> dimensions(*task.getReductionDimensions());
+        dimensions.pop_back();
+        task->setAttr("reduction_dimensions",
+                      DenseI64ArrayAttr::get(task.getContext(), dimensions));
+      } else if (mutation == "merge-grid" && allAxis) {
+        SmallVector<int64_t> grid(*task.getReductionMergeGridShape());
+        ++grid.front();
+        task->setAttr("reduction_merge_grid_shape",
+                      DenseI64ArrayAttr::get(task.getContext(), grid));
+      } else if (mutation == "phase-order" && allAxis) {
+        for (EventTensorOp event :
+             plan.getBody().front().getOps<EventTensorOp>()) {
+          if (event.getProducerTask() != task.getOrdinal() ||
+              event.getConsumerTask() != task.getOrdinal())
+            continue;
+          event->setAttr("producer_phase", StringAttr::get(task.getContext(),
+                                                           "merge"));
+          event->setAttr("consumer_phase", StringAttr::get(task.getContext(),
+                                                           "partial"));
+          refreshScheduleFingerprint(plan);
+          return;
+        }
+        task.emitError("all-axis Fold has no partial-to-merge Event");
+        return signalPassFailure();
       } else if (mutation == "output") {
         SmallVector<int64_t> domain(task.getDomainShape());
         ++domain[prefix ? domain.size() - 1 : 0];
@@ -9418,7 +9677,7 @@ public:
                 ? ScheduleReductionOrder::SerialAscendingFmaRnF32
                 : ScheduleReductionOrder::LeafOrderFree;
         task->setAttr("reduction_order", ScheduleReductionOrderAttr::get(
-                                               task.getContext(), replacement));
+                                             task.getContext(), replacement));
       } else {
         getOperation().emitError("unknown Fold schedule mutation kind");
         return signalPassFailure();
@@ -9464,11 +9723,10 @@ public:
       int64_t sourceTask = task.getSourceTask();
       if (task.getKind() != ScheduleTaskKind::Elementwise || sourceTask < 0 ||
           sourceTask >= static_cast<int64_t>(materializationTasks.size()) ||
-          !(projected
-                ? isProjectedParameterMapTask(materializationTasks[sourceTask],
-                                              buffers)
-                : isExpandingSingletonMapTask(materializationTasks[sourceTask],
-                                               buffers))) {
+          !(projected ? isProjectedParameterMapTask(
+                            materializationTasks[sourceTask], buffers)
+                      : isExpandingSingletonMapTask(
+                            materializationTasks[sourceTask], buffers))) {
         continue;
       }
       if (mutation == "grid") {
@@ -9570,10 +9828,10 @@ public:
   void runOnOperation() override {
     ModuleOp module = getOperation();
     auto manifest = module->getAttrOfType<DictionaryAttr>(kManifest);
-    auto complete = manifest ? manifest.getAs<ArrayAttr>("complete")
-                             : ArrayAttr{};
-    auto excluded = manifest ? manifest.getAs<ArrayAttr>("excluded")
-                             : ArrayAttr{};
+    auto complete =
+        manifest ? manifest.getAs<ArrayAttr>("complete") : ArrayAttr{};
+    auto excluded =
+        manifest ? manifest.getAs<ArrayAttr>("excluded") : ArrayAttr{};
     if (!complete || !excluded || !excluded.empty()) {
       module.emitError(
           "output dependency coverage requires complete selected coverage");
@@ -9660,14 +9918,13 @@ public:
         }
       }
     }
-    const bool completeTrace =
-        reachable.size() == expected.size() &&
-        llvm::all_of(expected, [&](Attribute source) {
-          return reachable.contains(source);
-        });
+    const bool completeTrace = reachable.size() == expected.size() &&
+                               llvm::all_of(expected, [&](Attribute source) {
+                                 return reachable.contains(source);
+                               });
     if (!hasOutput || !completeTrace) {
-      module.emitError(
-          "covered source results do not form a complete public-output dependency trace");
+      module.emitError("covered source results do not form a complete "
+                       "public-output dependency trace");
       return signalPassFailure();
     }
     llvm::outs() << "output_dependency_coverage = complete\n";
@@ -9690,6 +9947,21 @@ void refreshExecutableBundle(ModuleOp module, bool refreshCodeDigest) {
   auto abi = *module.getOps<InvocationAbiOp>().begin();
   abi.setFingerprint(invocationAbiFingerprint(abi));
   bundle.setInvocationAbiFingerprint(abi.getFingerprint());
+  EventLoweringPlanOp eventPlan;
+  if (auto fingerprint = bundle.getEventLoweringPlanFingerprint())
+    for (EventLoweringPlanOp candidate : module.getOps<EventLoweringPlanOp>())
+      if (candidate.getFingerprint() == *fingerprint) {
+        eventPlan = candidate;
+        break;
+      }
+  if (eventPlan) {
+    eventPlan.setPhysicalLaunchRecipeFingerprintAttr(
+        device.getPhysicalLaunchRecipeFingerprintAttr()
+            ? device.getPhysicalLaunchRecipeFingerprintAttr()
+            : device.getFingerprintAttr());
+    eventPlan.setFingerprint(eventLoweringPlanFingerprint(eventPlan));
+    bundle.setEventLoweringPlanFingerprint(eventPlan.getFingerprint());
+  }
   bundle.setFingerprint(executableBundleFingerprint(bundle));
 }
 
@@ -9795,8 +10067,7 @@ public:
             sourceTask >= static_cast<int64_t>(scheduleTasks.size())) {
           continue;
         }
-        int64_t materializationTask =
-            scheduleTasks[sourceTask].getSourceTask();
+        int64_t materializationTask = scheduleTasks[sourceTask].getSourceTask();
         if (materializationTask < 0 ||
             materializationTask >=
                 static_cast<int64_t>(materializationTasks.size()) ||
@@ -9878,8 +10149,7 @@ public:
                 static_cast<int64_t>(materializationTasks.size())) {
           continue;
         }
-        MaterializationTaskOp fold =
-            materializationTasks[materializationTask];
+        MaterializationTaskOp fold = materializationTasks[materializationTask];
         if (fold.getKind() != MaterializationTaskKind::Fold ||
             fold.getDomainShape().size() < 3 ||
             fold.getReductionDimensions().size() + 1 !=
@@ -10034,12 +10304,18 @@ void registerMutationPasses() {
   PassRegistration<MaterializationDomainPass<true>>();
   PassRegistration<MaterializationDomainPass<false>>();
   PassRegistration<MaterializationUnknownAttributePass>();
+  PassRegistration<MaterializationIndexDomainProvenancePass>();
   PassRegistration<ReportScheduleFingerprintPass>();
   PassRegistration<ScheduleIndexingPass>();
   PassRegistration<ScheduleAxisPass>();
   PassRegistration<ScheduleTilePass>();
   PassRegistration<ScheduleResourcePass>();
   PassRegistration<ScheduleDependencyPass>();
+  PassRegistration<ScheduleIndexDomainProvenancePass>();
+  PassRegistration<EventRelationPass>();
+  PassRegistration<EventBoundsPass>();
+  PassRegistration<EventPredicatePass>();
+  PassRegistration<ReportEventCardinalityPass>();
   PassRegistration<ScheduleDeleteTaskPass>();
   PassRegistration<ScheduleSelfConsistentReorderPass>();
   PassRegistration<ScheduleReplaySourceTaskPass>();

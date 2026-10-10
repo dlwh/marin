@@ -11,13 +11,32 @@ result; it does not receive a workload or architecture name.
 
 from dataclasses import dataclass
 from enum import StrEnum
+from itertools import product
 
 import numpy as np
 
 from tile_lifetime.h100_streaming_lowering import LoweredScoreMap, lower_score_map
+from tile_lifetime.normalized_exp_contract_region import NormalizedExpContractProgram
+from tile_lifetime.physical_task_contract import (
+    ExecutablePhysicalRequest,
+    PhaseEdgeConstraint,
+    PhysicalNumericalPolicy,
+    PhysicalOrderKind,
+    PhysicalSchedule,
+    PhysicalScheduleFamily,
+    PhysicalTarget,
+    PhysicalTaskConstraint,
+    PhysicalTaskOrder,
+    RelationAccessClass,
+    TaskCapability,
+    TaskOperationKind,
+    TaskResourceEstimate,
+    TiledTask,
+    physical_schedule_is_eligible,
+)
 from tile_lifetime.relation import RelationPlan
-from tile_lifetime.streaming_attention import AttentionScoreAxis, StreamingAttentionProgram
-from tile_lifetime.tensor_program import ScalarExpressionKind
+from tile_lifetime.streaming_attention import AttentionScoreAxis, StreamingTileSchedule
+from tile_lifetime.tensor_program import ScalarExpressionKind, serialize_scalar_expression
 
 
 class SM100RelationOrientation(StrEnum):
@@ -71,12 +90,316 @@ class SM100RoutedSchedule:
             "max_sum_weighted_value",
             "log_normalizer_normalized_value",
         }:
-            raise ValueError("unsupported attention partial-state representation")
+            raise ValueError("unsupported normalized-Fold partial-state representation")
+
+
+@dataclass(frozen=True)
+class SM100RoutedTaskLowering:
+    """One generic relation/Contract/Fold/Contract schedule attachment."""
+
+    schedule: SM100RoutedSchedule
+    physical_schedule: PhysicalSchedule
+    source_request_fingerprint: str
+    left_extent: int
+    group_extent: int
+    left_lane_extent: int
+    selected_extent: int
+    score_feature_extent: int
+    value_feature_extent: int
+    fold_extent: int
+
+    @property
+    def task_ids(self) -> tuple[int, ...]:
+        """Generic tasks covered by this fused physical schedule."""
+        return self.physical_schedule.task_ids
+
+
+def sm100_routed_schedule_family() -> PhysicalScheduleFamily:
+    """Return the generic eligibility contract of the routed SM100 template."""
+    identity_affine = (RelationAccessClass.IDENTITY, RelationAccessClass.AFFINE)
+    element_types = ("bf16", "bool", "fp32", "int32")
+    layouts = ("row_major",)
+    resources = TaskResourceEstimate(255, 232_448, 32)
+    return PhysicalScheduleFamily(
+        name="sm100_bounded_relation_contract_fold_contract_128",
+        target=PhysicalTarget.SM100,
+        tasks=(
+            PhysicalTaskConstraint(
+                principal_kind=TaskOperationKind.RELATION,
+                required_capabilities=(TaskCapability.INDEX_RELATION,),
+                supported_capabilities=(TaskCapability.INDEX_RELATION,),
+                required_edges=(
+                    PhaseEdgeConstraint(
+                        TaskCapability.INDEX_RELATION,
+                        TaskCapability.INDEX_RELATION,
+                        RelationAccessClass.IDENTITY,
+                    ),
+                ),
+                owner_rank=3,
+                streamed_rank=0,
+                reduction_rank=0,
+                contraction_rank=0,
+                supported_relation_classes=(RelationAccessClass.BOUNDED_DYNAMIC,),
+                supported_element_types=element_types,
+                supported_layout_classes=layouts,
+                maximum_resources=resources,
+            ),
+            PhysicalTaskConstraint(
+                principal_kind=TaskOperationKind.CONTRACT,
+                required_capabilities=(TaskCapability.MATRIX_CONTRACT, TaskCapability.SCALAR_MAP),
+                supported_capabilities=(
+                    TaskCapability.MATRIX_CONTRACT,
+                    TaskCapability.INDEX_RELATION,
+                    TaskCapability.SCALAR_MAP,
+                ),
+                required_edges=(
+                    PhaseEdgeConstraint(
+                        TaskCapability.MATRIX_CONTRACT,
+                        TaskCapability.INDEX_RELATION,
+                        RelationAccessClass.IDENTITY,
+                    ),
+                    PhaseEdgeConstraint(
+                        TaskCapability.INDEX_RELATION,
+                        TaskCapability.SCALAR_MAP,
+                        RelationAccessClass.IDENTITY,
+                    ),
+                ),
+                owner_rank=3,
+                streamed_rank=1,
+                reduction_rank=0,
+                contraction_rank=1,
+                supported_relation_classes=identity_affine,
+                supported_element_types=element_types,
+                supported_layout_classes=layouts,
+                maximum_resources=resources,
+            ),
+            PhysicalTaskConstraint(
+                principal_kind=TaskOperationKind.FOLD,
+                required_capabilities=(TaskCapability.ASSOCIATIVE_FOLD, TaskCapability.SCALAR_MAP),
+                supported_capabilities=(TaskCapability.ASSOCIATIVE_FOLD, TaskCapability.SCALAR_MAP),
+                required_edges=(
+                    PhaseEdgeConstraint(
+                        TaskCapability.ASSOCIATIVE_FOLD,
+                        TaskCapability.SCALAR_MAP,
+                        RelationAccessClass.IDENTITY,
+                    ),
+                    PhaseEdgeConstraint(
+                        TaskCapability.SCALAR_MAP,
+                        TaskCapability.ASSOCIATIVE_FOLD,
+                        RelationAccessClass.IDENTITY,
+                    ),
+                ),
+                owner_rank=3,
+                streamed_rank=1,
+                reduction_rank=1,
+                contraction_rank=0,
+                supported_relation_classes=identity_affine,
+                supported_element_types=element_types,
+                supported_layout_classes=layouts,
+                maximum_resources=resources,
+            ),
+            PhysicalTaskConstraint(
+                principal_kind=TaskOperationKind.CONTRACT,
+                required_capabilities=(TaskCapability.MATRIX_CONTRACT,),
+                supported_capabilities=(TaskCapability.MATRIX_CONTRACT,),
+                required_edges=(),
+                owner_rank=4,
+                streamed_rank=1,
+                reduction_rank=0,
+                contraction_rank=1,
+                supported_relation_classes=identity_affine,
+                supported_element_types=element_types,
+                supported_layout_classes=layouts,
+                maximum_resources=resources,
+            ),
+            PhysicalTaskConstraint(
+                principal_kind=TaskOperationKind.MAP,
+                required_capabilities=(TaskCapability.SCALAR_MAP,),
+                supported_capabilities=(TaskCapability.SCALAR_MAP, TaskCapability.INDEX_RELATION),
+                required_edges=(
+                    PhaseEdgeConstraint(
+                        TaskCapability.SCALAR_MAP,
+                        TaskCapability.SCALAR_MAP,
+                        RelationAccessClass.IDENTITY,
+                    ),
+                ),
+                owner_rank=3,
+                streamed_rank=0,
+                reduction_rank=0,
+                contraction_rank=0,
+                supported_relation_classes=identity_affine,
+                supported_element_types=element_types,
+                supported_layout_classes=layouts,
+                maximum_resources=resources,
+            ),
+        ),
+    )
+
+
+def select_sm100_routed_lowerings(
+    request: ExecutablePhysicalRequest,
+) -> tuple[SM100RoutedTaskLowering, ...]:
+    """Discover generic bounded-relation normalized-Fold regions on SM100."""
+    if request.target is not PhysicalTarget.SM100 or request.numerical_policy is not PhysicalNumericalPolicy.FAST:
+        return ()
+    family = sm100_routed_schedule_family()
+    candidates = []
+    for task_ids in _eligible_task_id_products(request, family):
+        relation, score, fold, weighted, finalizer = (request.task_plan.tasks[task_id] for task_id in task_ids)
+        if not _required_routed_dependences(request, relation, score, fold, weighted, finalizer):
+            continue
+        if not _routed_axes_are_compatible(relation, score, fold, weighted, finalizer):
+            continue
+        score_feature_extent = score.structure.contraction_axes[0].extent
+        value_feature_extent = weighted.structure.owner_axes[3].extent
+        fold_extent = fold.structure.reduction_axes[0].extent
+        if score_feature_extent != 128 or value_feature_extent != 128 or fold_extent != 128:
+            continue
+        left_extent = relation.structure.owner_axes[0].extent
+        group_extent = relation.structure.owner_axes[1].extent
+        selected_extent = relation.structure.owner_axes[2].extent
+        left_lane_extent = score.structure.owner_axes[2].extent
+        if selected_extent not in (4, 8, 16, 32):
+            continue
+        orders = _internal_dependence_orders(request, task_ids)
+        for schedule in default_sm100_routed_schedules():
+            physical = PhysicalSchedule(
+                family=family,
+                task_ids=task_ids,
+                parameters={
+                    "orientation": schedule.orientation.value,
+                    "packed_left_rows": schedule.packed_left_rows,
+                    "right_block_size": schedule.right_block_size,
+                    "query_stages": schedule.query_stages,
+                    "score_stages": schedule.score_stages,
+                    "output_stages": schedule.output_stages,
+                    "right_stages": schedule.right_stages,
+                    "right_edges_per_task": schedule.right_edges_per_task,
+                    "relation_metadata_stages": schedule.relation_metadata_stages,
+                    "threads": schedule.threads,
+                    "split_probability_rows": schedule.split_probability_rows,
+                    "partial_merge_tile_rows": schedule.partial_merge_tile_rows,
+                    "partial_merge_threads": schedule.partial_merge_threads,
+                    "partial_state_representation": schedule.partial_state_representation,
+                },
+                enforced_orders=orders,
+            )
+            candidates.append(
+                SM100RoutedTaskLowering(
+                    schedule=schedule,
+                    physical_schedule=physical,
+                    source_request_fingerprint=request.fingerprint,
+                    left_extent=left_extent,
+                    group_extent=group_extent,
+                    left_lane_extent=left_lane_extent,
+                    selected_extent=selected_extent,
+                    score_feature_extent=score_feature_extent,
+                    value_feature_extent=value_feature_extent,
+                    fold_extent=fold_extent,
+                )
+            )
+    return tuple(candidates)
+
+
+def _eligible_task_id_products(
+    request: ExecutablePhysicalRequest,
+    family: PhysicalScheduleFamily,
+) -> tuple[tuple[int, ...], ...]:
+    eligible_by_constraint = []
+    for constraint in family.tasks:
+        singleton = PhysicalScheduleFamily(family.name, family.target, (constraint,))
+        eligible_by_constraint.append(
+            tuple(
+                task.id
+                for task in request.task_plan.tasks
+                if physical_schedule_is_eligible(
+                    PhysicalSchedule(singleton, (task.id,), {"eligibility_probe": True}),
+                    request.task_plan,
+                )
+            )
+        )
+    return tuple(task_ids for task_ids in product(*eligible_by_constraint) if len(set(task_ids)) == len(task_ids))
+
+
+def _has_dependence(request: ExecutablePhysicalRequest, source: TiledTask, target: TiledTask) -> bool:
+    return any(
+        dependence.relation.source == source.family and dependence.relation.target == target.family
+        for dependence in request.task_plan.dependences
+    )
+
+
+def _required_routed_dependences(
+    request: ExecutablePhysicalRequest,
+    relation: TiledTask,
+    score: TiledTask,
+    fold: TiledTask,
+    weighted: TiledTask,
+    finalizer: TiledTask,
+) -> bool:
+    return all(
+        _has_dependence(request, source, target)
+        for source, target in (
+            (relation, score),
+            (score, fold),
+            (relation, weighted),
+            (score, weighted),
+            (fold, weighted),
+            (weighted, finalizer),
+        )
+    )
+
+
+def _internal_dependence_orders(
+    request: ExecutablePhysicalRequest,
+    task_ids: tuple[int, ...],
+) -> tuple[PhysicalTaskOrder, ...]:
+    task_pairs = tuple((request.task_plan.tasks[task_id], task_id) for task_id in task_ids)
+    orders = []
+    for dependence in request.task_plan.dependences:
+        source_ids = tuple(task_id for task, task_id in task_pairs if dependence.relation.source == task.family)
+        target_ids = tuple(task_id for task, task_id in task_pairs if dependence.relation.target == task.family)
+        if len(source_ids) != 1 or len(target_ids) != 1:
+            continue
+        orders.append(
+            PhysicalTaskOrder(
+                PhysicalOrderKind.PROGRAM_ORDER,
+                source_ids[0],
+                target_ids[0],
+                dependence.relation,
+                {"kind": "fused_phase_order"},
+            )
+        )
+    return tuple(orders)
+
+
+def _routed_axes_are_compatible(
+    relation: TiledTask,
+    score: TiledTask,
+    fold: TiledTask,
+    weighted: TiledTask,
+    finalizer: TiledTask,
+) -> bool:
+    relation_owner = tuple(axis.axis_id for axis in relation.structure.owner_axes)
+    score_owner = tuple(axis.axis_id for axis in score.structure.owner_axes)
+    score_stream = score.structure.streamed_axes[0].axis_id
+    fold_owner = tuple(axis.axis_id for axis in fold.structure.owner_axes)
+    weighted_owner = tuple(axis.axis_id for axis in weighted.structure.owner_axes)
+    finalizer_owner = tuple(axis.axis_id for axis in finalizer.structure.owner_axes)
+    return (
+        relation_owner[:2] == score_owner[:2]
+        and relation_owner[2] == score_stream
+        and tuple(axis.axis_id for axis in fold.structure.streamed_axes) == (score_stream,)
+        and fold_owner == score_owner
+        and tuple(axis.axis_id for axis in weighted.structure.streamed_axes) == (score_stream,)
+        and weighted_owner[:3] == score_owner
+        and finalizer_owner == score_owner
+        and weighted.structure.contraction_axes[0].axis_id == fold.structure.reduction_axes[0].axis_id
+    )
 
 
 @dataclass(frozen=True)
 class SM100RoutedStreamingLowering:
-    """Backend-neutral contract for a generated SM100 relation program."""
+    """Legacy emitter geometry adapter; not the canonical request path."""
 
     score_map: LoweredScoreMap
     schedule: SM100RoutedSchedule
@@ -128,7 +451,7 @@ class SM100RoutedStreamingLowering:
 
     @property
     def query_tokens_per_task(self) -> int:
-        """Number of query tokens packed with their GQA heads in one task."""
+        """Number of left-domain items packed with their relation lanes."""
         return self.schedule.packed_left_rows // self.head_group_size
 
     def dump(self) -> str:
@@ -158,10 +481,8 @@ class SM100RoutedStreamingLowering:
                     f"score={self.schedule.score_stages} output={self.schedule.output_stages} "
                     f"right={self.schedule.right_stages} metadata={self.schedule.relation_metadata_stages}"
                 ),
-                (
-                    f"  score: scale={self.score_map.scale} causal={str(self.score_map.causal).lower()} "
-                    f"softcap={self.score_map.softcap}"
-                ),
+                f"  score AST: {serialize_scalar_expression(self.score_map.expression)}",
+                f"  score domain: {self.score_map.domain_traversal.value}",
                 f"  partial state: {self.schedule.partial_state_representation}",
                 "  external semantics: none",
             )
@@ -192,13 +513,14 @@ def default_sm100_routed_schedules() -> tuple[SM100RoutedSchedule, ...]:
 
 
 def lower_sm100_routed_streaming_program(
-    program: StreamingAttentionProgram,
+    program: NormalizedExpContractProgram[StreamingTileSchedule],
     relation: RelationPlan,
     schedule: SM100RoutedSchedule,
 ) -> SM100RoutedStreamingLowering:
-    """Prove one generic routed program legal for the initial SM100 skeleton."""
-    query, key = program.qk.inputs
-    value = program.pv.inputs[1]
+    """Build the quarantined legacy emitter adapter from a semantic program."""
+    region = program.region
+    query, key = region.producer.inputs
+    value = region.consumer.inputs[1]
     query_length = _axis_extent(query, AttentionScoreAxis.QUERY.value)
     key_length = _axis_extent(key, AttentionScoreAxis.KEY.value)
     query_heads = _axis_extent(query, AttentionScoreAxis.HEAD.value)
@@ -240,8 +562,6 @@ def lower_sm100_routed_streaming_program(
         raise ValueError("the initial bounded SM100 templates support selected counts 4/8/16/32")
 
     score_map = lower_score_map(program)
-    if score_map.softcap is not None:
-        raise ValueError("the first SM100 candidate does not yet legalize a score softcap")
     return SM100RoutedStreamingLowering(
         score_map=score_map,
         schedule=schedule,
@@ -263,9 +583,9 @@ def _axis_extent(value, label: str) -> int:
     return matches[0]
 
 
-def _head_group_size(program: StreamingAttentionProgram) -> int:
-    key_maps = program.qk.index_maps_for_input(1)
-    value_maps = program.pv.index_maps_for_input(1)
+def _head_group_size(program: NormalizedExpContractProgram[StreamingTileSchedule]) -> int:
+    key_maps = program.region.producer.index_maps_for_input(1)
+    value_maps = program.region.consumer.index_maps_for_input(1)
     if len(key_maps) != 1 or value_maps != key_maps:
         raise ValueError("SM100 GQA requires one shared query-head to KV-head index map")
     mapping = key_maps[0]
@@ -274,8 +594,9 @@ def _head_group_size(program: StreamingAttentionProgram) -> int:
     return mapping.divisor
 
 
-def _output_scale(program: StreamingAttentionProgram) -> float:
-    expression = program.finalize.expression
+def _output_scale(program: NormalizedExpContractProgram[StreamingTileSchedule]) -> float:
+    region = program.region
+    expression = region.finalizer.expression
     output_scale = 1.0
     if expression.kind is ScalarExpressionKind.MULTIPLY:
         left, right = expression.operands
@@ -287,7 +608,7 @@ def _output_scale(program: StreamingAttentionProgram) -> float:
     if expression.kind is not ScalarExpressionKind.DIVIDE:
         raise ValueError("the SM100 finalizer must divide the weighted state by its normalized-exp sum")
     numerator, denominator = expression.operands
-    expected = (program.state.weighted_value_accumulator.name, program.state.row_sum_exp.name)
+    expected = (region.consumer.output.name, region.fold_state.row_sum_exp.name)
     if (numerator.input_name, denominator.input_name) != expected:
         raise ValueError("the SM100 finalizer does not consume the recovered normalized-exp state")
     if not np.isfinite(output_scale):

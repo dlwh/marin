@@ -29,12 +29,13 @@ module attributes {shuttle.coverage_manifest = {}} {
       -> tensor<2xf32> {
     %0 = "shuttle.region"(%arg0, %init) ({
     ^bb0(%input: tensor<2x4xf32>, %initial: tensor<f32>):
-      // expected-error @+1 {{requires a closed order-free scalar f32 add or maximum combiner}}
+      // expected-error @+1 {{requires an order-free scalar f32 combiner}}
       %1 = "shuttle.fold"(%input, %initial) ({
       ^bb0(%element: f32, %accumulator: f32):
         %sum = arith.addf %element, %accumulator : f32
         "shuttle.yield"(%sum) {shuttle.operation_ref = array<i64: 0, 1, 1>} : (f32) -> ()
-      }) {accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = false, reduction_dimensions = array<i64: 1>, shuttle.operation_ref = array<i64: 0, 0, 0>, source = #shuttle.source_ref<0, 0, 0, 0>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
+      }) {
+indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0)>],accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = false, reduction_dimensions = array<i64: 1>, shuttle.operation_ref = array<i64: 0, 0, 0>, source = #shuttle.source_ref<0, 0, 0, 0>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
       "shuttle.yield"(%1) : (tensor<2xf32>) -> ()
     }) {policy = #shuttle.policy<source_ordered>, source_refs = [#shuttle.source_ref<0, 0, 0, 0>]} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
     return %0 : tensor<2xf32>
@@ -68,12 +69,14 @@ module attributes {shuttle.coverage_manifest = {}} {
       -> tensor<2xf32> {
     %0 = "shuttle.region"(%arg0, %init) ({
     ^bb0(%input: tensor<2x4xf32>, %initial: tensor<f32>):
-      // expected-error @+1 {{requires a closed order-free scalar f32 add or maximum combiner}}
       %1 = "shuttle.fold"(%input, %initial) ({
       ^bb0(%element: f32, %accumulator: f32):
+        // expected-error @+2 {{has fast-math semantics with no StableHLO representation}}
+        // expected-error @+1 {{has no authoritative StableHLO Fold lowering}}
         %maximum = arith.maximumf %element, %accumulator fastmath<nnan> : f32
-        "shuttle.yield"(%maximum) : (f32) -> ()
-      }) {accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 0>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
+        "shuttle.yield"(%maximum) {shuttle.operation_ref = array<i64: 0, 1, 1>} : (f32) -> ()
+      }) {
+indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0)>],accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, shuttle.operation_ref = array<i64: 0, 0, 0>, source = #shuttle.source_ref<0, 0, 0, 0>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
       "shuttle.yield"(%1) : (tensor<2xf32>) -> ()
     }) {policy = #shuttle.policy<source_ordered>, source_refs = [#shuttle.source_ref<0, 0, 0, 0>]} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
     return %0 : tensor<2xf32>

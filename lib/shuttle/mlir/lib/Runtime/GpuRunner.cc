@@ -4,6 +4,7 @@
 #include "shuttle/Runtime/GpuRunner.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <limits>
@@ -29,8 +30,8 @@
 #include "xla/stream_executor/event_based_timer.h"
 #include "xla/stream_executor/stream.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 
 namespace mlir::shuttle {
@@ -50,6 +51,10 @@ std::optional<xla::PrimitiveType> externalPrimitive(RankedTensorType type) {
     return xla::PrimitiveType::BF16;
   if (type.getElementType().isF32())
     return xla::PrimitiveType::F32;
+  if (type.getElementType().isInteger(32))
+    return xla::PrimitiveType::S32;
+  if (type.getElementType().isInteger(1))
+    return xla::PrimitiveType::PRED;
   return std::nullopt;
 }
 
@@ -83,8 +88,7 @@ projectExternalBindings(const GpuExecutable &executable) {
         return false;
     return true;
   };
-  if (!orderBindings(projection.operands) ||
-      !orderBindings(projection.results))
+  if (!orderBindings(projection.operands) || !orderBindings(projection.results))
     return invalid("GPU runner external bindings are not contiguous");
   if (projection.operands.empty() || projection.results.empty())
     return invalid("GPU runner requires operands and results");
@@ -93,15 +97,18 @@ projectExternalBindings(const GpuExecutable &executable) {
 
 void addTransportAttributes(ffi::CallFrameBuilder &builder,
                             llvm::ArrayRef<uint8_t> transport,
-                            int64_t deviceSchemaVersion) {
+                            int64_t deviceSchemaVersion,
+                            ExecutableCodeFormat codeFormat) {
   ffi::CallFrameBuilder::AttributesBuilder attributes;
-  attributes.Insert(
-      "bundle_bytes",
-      std::string(reinterpret_cast<const char *>(transport.data()),
-                  transport.size()));
+  attributes.Insert("bundle_bytes", std::string(reinterpret_cast<const char *>(
+                                                    transport.data()),
+                                                transport.size()));
   attributes.Insert("bundle_sha256", gpuExecutableBundleDigest(transport));
   attributes.Insert("bundle_size", static_cast<int64_t>(transport.size()));
-  attributes.Insert("transport_schema_version", int64_t{2});
+  const bool fatbin = codeFormat == ExecutableCodeFormat::CudaFatbinSm90V1 ||
+                      codeFormat == ExecutableCodeFormat::CudaFatbinSm100V1;
+  attributes.Insert("transport_schema_version",
+                    fatbin ? int64_t{3} : int64_t{2});
   attributes.Insert("device_schema_version", deviceSchemaVersion);
   attributes.Insert("invocation_abi_schema_version", int64_t{3});
   attributes.Insert("bundle_schema_version", int64_t{2});
@@ -125,10 +132,12 @@ absl::Status addBuffer(ffi::CallFrameBuilder &builder,
   return absl::OkStatus();
 }
 
-absl::Status validateBufferAddresses(
-    const ExternalProjection &projection,
-    llvm::ArrayRef<GpuRunnerBuffer> operands,
-    llvm::ArrayRef<GpuRunnerBuffer> results) {
+absl::Status validateBuffers(const ExternalProjection &projection,
+                             llvm::ArrayRef<GpuRunnerBuffer> operands,
+                             llvm::ArrayRef<GpuRunnerBuffer> results) {
+  if (operands.size() != projection.operands.size() ||
+      results.size() != projection.results.size())
+    return invalid("GPU runner external buffer count is invalid");
   struct Span {
     uintptr_t begin;
     uintptr_t end;
@@ -136,6 +145,8 @@ absl::Status validateBufferAddresses(
   llvm::SmallVector<Span> spans;
   auto add = [&](const GpuExternalBinding &binding,
                  const GpuRunnerBuffer &buffer) -> absl::Status {
+    if (buffer.sizeBytes <= 0 || buffer.sizeBytes != binding.requiredBytes)
+      return invalid("GPU runner buffer does not match the executable ABI");
     uintptr_t begin = reinterpret_cast<uintptr_t>(buffer.data);
     if (buffer.data == nullptr || binding.alignment <= 0 ||
         begin % static_cast<uint64_t>(binding.alignment) != 0)
@@ -159,15 +170,13 @@ absl::Status validateBufferAddresses(
   return absl::OkStatus();
 }
 
-absl::StatusOr<ffi::CallFrame> buildCallFrame(
-    llvm::ArrayRef<uint8_t> transport, const ExternalProjection &projection,
-    llvm::ArrayRef<GpuRunnerBuffer> operands,
-    llvm::ArrayRef<GpuRunnerBuffer> results, int64_t deviceSchemaVersion) {
-  if (operands.size() != projection.operands.size() ||
-      results.size() != projection.results.size())
-    return invalid("GPU runner external buffer count is invalid");
-  if (absl::Status status =
-          validateBufferAddresses(projection, operands, results);
+absl::StatusOr<ffi::CallFrame>
+buildCallFrame(llvm::ArrayRef<uint8_t> transport,
+               const ExternalProjection &projection,
+               llvm::ArrayRef<GpuRunnerBuffer> operands,
+               llvm::ArrayRef<GpuRunnerBuffer> results,
+               int64_t deviceSchemaVersion, ExecutableCodeFormat codeFormat) {
+  if (absl::Status status = validateBuffers(projection, operands, results);
       !status.ok())
     return status;
   ffi::CallFrameBuilder builder(operands.size(), results.size());
@@ -179,28 +188,39 @@ absl::StatusOr<ffi::CallFrame> buildCallFrame(
     if (absl::Status status = addBuffer(builder, binding, buffer, true);
         !status.ok())
       return status;
-  addTransportAttributes(builder, transport, deviceSchemaVersion);
+  addTransportAttributes(builder, transport, deviceSchemaVersion, codeFormat);
   return builder.Build();
 }
 
-std::pair<llvm::SmallVector<GpuRunnerBuffer>,
-          llvm::SmallVector<GpuRunnerBuffer>>
+absl::StatusOr<std::pair<llvm::SmallVector<GpuRunnerBuffer>,
+                         llvm::SmallVector<GpuRunnerBuffer>>>
 placeholderBuffers(const ExternalProjection &projection) {
   llvm::SmallVector<GpuRunnerBuffer> operands;
   llvm::SmallVector<GpuRunnerBuffer> results;
-  auto append = [](llvm::ArrayRef<GpuExternalBinding> bindings,
-                   llvm::SmallVectorImpl<GpuRunnerBuffer> &buffers) {
+  // These addresses are never dereferenced; they only seed typed call frames.
+  uintptr_t nextAddress = 1;
+  auto append =
+      [&](llvm::ArrayRef<GpuExternalBinding> bindings,
+          llvm::SmallVectorImpl<GpuRunnerBuffer> &buffers) -> absl::Status {
     for (const GpuExternalBinding &binding : bindings) {
-      uintptr_t address = UINT64_C(0x100000000) +
-                          static_cast<uintptr_t>(binding.slotOrdinal) *
-                              UINT64_C(0x10000000);
+      const uintptr_t mask = static_cast<uintptr_t>(binding.alignment) - 1;
+      if (nextAddress > std::numeric_limits<uintptr_t>::max() - mask)
+        return invalid("GPU runner placeholder alignment overflows");
+      const uintptr_t address = (nextAddress + mask) & ~mask;
+      if (static_cast<uint64_t>(binding.requiredBytes) >
+          std::numeric_limits<uintptr_t>::max() - address)
+        return invalid("GPU runner placeholder span overflows");
       buffers.push_back(
           {reinterpret_cast<void *>(address), binding.requiredBytes});
+      nextAddress = address + static_cast<uint64_t>(binding.requiredBytes);
     }
+    return absl::OkStatus();
   };
-  append(projection.operands, operands);
-  append(projection.results, results);
-  return {std::move(operands), std::move(results)};
+  if (absl::Status status = append(projection.operands, operands); !status.ok())
+    return status;
+  if (absl::Status status = append(projection.results, results); !status.ok())
+    return status;
+  return std::make_pair(std::move(operands), std::move(results));
 }
 
 GpuRunnerResources runnerResources(const GpuExecutable &executable,
@@ -215,12 +235,9 @@ GpuRunnerResources runnerResources(const GpuExecutable &executable,
   uint64_t aggregateTemporaryBytes = 0;
   for (const auto &entry : temporaryBytes)
     aggregateTemporaryBytes += entry.second;
-  return {executable.codeBytes().size(),
-          executable.launches().size(),
-          executable.slots().size(),
-          projection.operands.size(),
-          projection.results.size(),
-          temporaryBytes.size(),
+  return {executable.totalCodeBytes(), executable.launches().size(),
+          executable.slots().size(),   projection.operands.size(),
+          projection.results.size(),   temporaryBytes.size(),
           aggregateTemporaryBytes};
 }
 
@@ -228,7 +245,9 @@ GpuRunnerResources runnerResources(const GpuExecutable &executable,
 
 class GpuRunner::Impl {
 public:
-  std::vector<uint8_t> transport;
+  std::optional<ffi::CallFrame> frame;
+  std::vector<se::DeviceAddressBase> operandAddresses;
+  std::vector<se::DeviceAddressBase> resultAddresses;
   std::shared_ptr<const GpuExecutable> executable;
   ExternalProjection projection;
   GpuRunnerResources resources;
@@ -243,12 +262,29 @@ public:
   std::mutex executeMutex;
   bool pending = false;
 
+  absl::Status updateBuffers(llvm::ArrayRef<GpuRunnerBuffer> operands,
+                             llvm::ArrayRef<GpuRunnerBuffer> results) {
+    if (pending)
+      return absl::FailedPreconditionError(
+          "GPU runner completion is pending; call AwaitCompletion");
+    if (absl::Status status = validateBuffers(projection, operands, results);
+        !status.ok())
+      return status;
+    for (size_t index = 0; index < operands.size(); ++index)
+      operandAddresses[index] = se::DeviceAddressBase(
+          operands[index].data, operands[index].sizeBytes);
+    for (size_t index = 0; index < results.size(); ++index)
+      resultAddresses[index] =
+          se::DeviceAddressBase(results[index].data, results[index].sizeBytes);
+    return frame->UpdateWithBuffers(operandAddresses, resultAddresses);
+  }
+
   ffi::InvokeContext context() {
     ffi::InvokeContext result;
     result.device_ordinal = deviceOrdinal;
     result.backend_context = ffi::InvokeContext::GpuContext{
-        stream, allocator, nullptr, nullptr, nullptr, nullptr, nullptr,
-        &capability};
+        stream,  allocator, nullptr, nullptr,
+        nullptr, nullptr,   nullptr, &capability};
     result.state_context = {&instantiateState, &prepareState, &initializeState};
     return result;
   }
@@ -272,10 +308,11 @@ GpuRunner::~GpuRunner() {
     std::terminate();
 }
 
-absl::StatusOr<std::unique_ptr<GpuRunner>> GpuRunner::Create(
-    llvm::ArrayRef<uint8_t> transport, se::DeviceAddressAllocator *allocator,
-    int32_t deviceOrdinal, se::Stream *stream,
-    const se::GpuComputeCapability *capability) {
+absl::StatusOr<std::unique_ptr<GpuRunner>>
+GpuRunner::Create(llvm::ArrayRef<uint8_t> transport,
+                  se::DeviceAddressAllocator *allocator, int32_t deviceOrdinal,
+                  se::Stream *stream,
+                  const se::GpuComputeCapability *capability) {
   if (transport.empty() || allocator == nullptr || deviceOrdinal < 0 ||
       stream == nullptr || capability == nullptr)
     return invalid("GPU runner creation context is invalid");
@@ -289,61 +326,63 @@ absl::StatusOr<std::unique_ptr<GpuRunner>> GpuRunner::Create(
     return projection.status();
 
   auto implementation = std::make_unique<Impl>();
-  implementation->transport.assign(transport.begin(), transport.end());
   implementation->executable = std::move(*executable);
   implementation->projection = std::move(*projection);
-  implementation->resources = runnerResources(*implementation->executable,
-                                               implementation->projection);
+  implementation->operandAddresses.resize(
+      implementation->projection.operands.size());
+  implementation->resultAddresses.resize(
+      implementation->projection.results.size());
+  implementation->resources =
+      runnerResources(*implementation->executable, implementation->projection);
   implementation->allocator = allocator;
   implementation->deviceOrdinal = deviceOrdinal;
   implementation->stream = stream;
   implementation->capability = *capability;
   implementation->handlers = gpuExecutableBundleFfiHandlerBundle();
 
-  auto [placeholderOperands, placeholderResults] =
-      placeholderBuffers(implementation->projection);
-  absl::StatusOr<ffi::CallFrame> frame =
-      buildCallFrame(implementation->transport, implementation->projection,
-                     placeholderOperands, placeholderResults,
-                     implementation->executable->deviceSchemaVersion());
+  auto placeholders = placeholderBuffers(implementation->projection);
+  if (!placeholders.ok())
+    return placeholders.status();
+  auto &[placeholderOperands, placeholderResults] = *placeholders;
+  absl::StatusOr<ffi::CallFrame> frame = buildCallFrame(
+      transport, implementation->projection, placeholderOperands,
+      placeholderResults, implementation->executable->deviceSchemaVersion(),
+      implementation->executable->codeFormat());
   if (!frame.ok())
     return frame.status();
+  // The frame owns immutable attributes and shapes for the runner lifetime.
+  // Execution only rebinds addresses, under executeMutex and after completion.
+  implementation->frame.emplace(std::move(*frame));
   ffi::InvokeContext context = implementation->context();
   if (absl::Status status = ffi::Invoke(
-          ffi::GetXlaFfiApi(), implementation->handlers.instantiate, *frame,
-          context, XLA_FFI_ExecutionStage_INSTANTIATE);
+          ffi::GetXlaFfiApi(), implementation->handlers.instantiate,
+          *implementation->frame, context, XLA_FFI_ExecutionStage_INSTANTIATE);
       !status.ok())
     return status;
   if (absl::Status status = ffi::Invoke(
-          ffi::GetXlaFfiApi(), implementation->handlers.prepare, *frame,
-          context, XLA_FFI_ExecutionStage_PREPARE);
+          ffi::GetXlaFfiApi(), implementation->handlers.prepare,
+          *implementation->frame, context, XLA_FFI_ExecutionStage_PREPARE);
       !status.ok())
     return status;
   if (absl::Status status = ffi::Invoke(
-          ffi::GetXlaFfiApi(), implementation->handlers.initialize, *frame,
-          context, XLA_FFI_ExecutionStage_INITIALIZE);
+          ffi::GetXlaFfiApi(), implementation->handlers.initialize,
+          *implementation->frame, context, XLA_FFI_ExecutionStage_INITIALIZE);
       !status.ok())
     return status;
-  return std::unique_ptr<GpuRunner>(
-      new GpuRunner(std::move(implementation)));
+  return std::unique_ptr<GpuRunner>(new GpuRunner(std::move(implementation)));
 }
 
 absl::Status GpuRunner::Execute(llvm::ArrayRef<GpuRunnerBuffer> operands,
                                 llvm::ArrayRef<GpuRunnerBuffer> results) {
   std::lock_guard lock(implementation->executeMutex);
-  if (implementation->pending)
-    return absl::FailedPreconditionError(
-        "GPU runner completion is pending; call AwaitCompletion");
-  absl::StatusOr<ffi::CallFrame> frame = buildCallFrame(
-      implementation->transport, implementation->projection, operands, results,
-      implementation->executable->deviceSchemaVersion());
-  if (!frame.ok())
-    return frame.status();
+  if (absl::Status status = implementation->updateBuffers(operands, results);
+      !status.ok())
+    return status;
   ffi::InvokeContext context = implementation->context();
   implementation->pending = true;
-  absl::Status execute =
-      ffi::Invoke(ffi::GetXlaFfiApi(), implementation->handlers.execute,
-                  *frame, context, XLA_FFI_ExecutionStage_EXECUTE);
+  absl::Status execute = ffi::Invoke(
+      ffi::GetXlaFfiApi(), implementation->handlers.execute,
+      *implementation->frame, context, XLA_FFI_ExecutionStage_EXECUTE);
   absl::Status completion = implementation->synchronize();
   return completion.ok() ? execute : completion;
 }
@@ -352,14 +391,9 @@ absl::StatusOr<int64_t>
 GpuRunner::ExecuteTimed(llvm::ArrayRef<GpuRunnerBuffer> operands,
                         llvm::ArrayRef<GpuRunnerBuffer> results) {
   std::lock_guard lock(implementation->executeMutex);
-  if (implementation->pending)
-    return absl::FailedPreconditionError(
-        "GPU runner completion is pending; call AwaitCompletion");
-  absl::StatusOr<ffi::CallFrame> frame = buildCallFrame(
-      implementation->transport, implementation->projection, operands, results,
-      implementation->executable->deviceSchemaVersion());
-  if (!frame.ok())
-    return frame.status();
+  if (absl::Status status = implementation->updateBuffers(operands, results);
+      !status.ok())
+    return status;
   absl::StatusOr<std::unique_ptr<se::EventBasedTimer>> timer =
       implementation->stream->CreateEventBasedTimer(
           /*use_delay_kernel=*/false);
@@ -367,9 +401,9 @@ GpuRunner::ExecuteTimed(llvm::ArrayRef<GpuRunnerBuffer> operands,
     return timer.status();
   ffi::InvokeContext context = implementation->context();
   implementation->pending = true;
-  absl::Status execute =
-      ffi::Invoke(ffi::GetXlaFfiApi(), implementation->handlers.execute,
-                  *frame, context, XLA_FFI_ExecutionStage_EXECUTE);
+  absl::Status execute = ffi::Invoke(
+      ffi::GetXlaFfiApi(), implementation->handlers.execute,
+      *implementation->frame, context, XLA_FFI_ExecutionStage_EXECUTE);
   absl::StatusOr<absl::Duration> duration = (*timer)->GetElapsedDuration();
   absl::Status completion = implementation->synchronize();
   if (!completion.ok())
@@ -382,6 +416,36 @@ GpuRunner::ExecuteTimed(llvm::ArrayRef<GpuRunnerBuffer> operands,
   if (nanoseconds <= 0)
     return absl::InternalError("GPU event timer returned no elapsed time");
   return nanoseconds;
+}
+
+absl::StatusOr<GpuRunnerHostProfile>
+GpuRunner::ExecuteProfiled(llvm::ArrayRef<GpuRunnerBuffer> operands,
+                           llvm::ArrayRef<GpuRunnerBuffer> results) {
+  std::lock_guard lock(implementation->executeMutex);
+  auto start = std::chrono::steady_clock::now();
+  if (absl::Status status = implementation->updateBuffers(operands, results);
+      !status.ok())
+    return status;
+  auto frameEnd = std::chrono::steady_clock::now();
+  ffi::InvokeContext context = implementation->context();
+  implementation->pending = true;
+  absl::Status execute = ffi::Invoke(
+      ffi::GetXlaFfiApi(), implementation->handlers.execute,
+      *implementation->frame, context, XLA_FFI_ExecutionStage_EXECUTE);
+  auto enqueueEnd = std::chrono::steady_clock::now();
+  absl::Status completion = implementation->synchronize();
+  auto completionEnd = std::chrono::steady_clock::now();
+  if (!completion.ok())
+    return completion;
+  if (!execute.ok())
+    return execute;
+  auto nanoseconds = [](auto duration) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(duration)
+        .count();
+  };
+  return GpuRunnerHostProfile{nanoseconds(frameEnd - start),
+                              nanoseconds(enqueueEnd - frameEnd),
+                              nanoseconds(completionEnd - enqueueEnd)};
 }
 
 absl::Status GpuRunner::AwaitCompletion() {

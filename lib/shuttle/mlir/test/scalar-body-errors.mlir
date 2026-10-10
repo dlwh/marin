@@ -65,6 +65,8 @@ module {
         %sum = arith.addf %left, %right : f32
         "shuttle.yield"(%sum) : (f32) -> ()
       }) {
+
+        indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0)>],
         accumulator_types = [f32],
         operandSegmentSizes = array<i32: 1, 1>,
         order_free = false,

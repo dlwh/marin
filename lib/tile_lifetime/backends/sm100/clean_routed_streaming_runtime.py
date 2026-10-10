@@ -139,7 +139,7 @@ class SM100RoutedStreamingCallable:
         lowering: SM100RoutedStreamingLowering,
         *,
         partial_value_dtype: PartialValueDType = PartialValueDType.BF16,
-        partial_merge_schedule: PartialMergeScheduleKind = PartialMergeScheduleKind.ROW_BLOCK,
+        partial_merge_schedule: PartialMergeScheduleKind | None = None,
         build_directory: Path | None = None,
     ) -> None:
         self._msa_root = msa_root.resolve()
@@ -250,6 +250,7 @@ class SM100RoutedStreamingCallable:
     def __call__(self, q2k_indices: Any, q: Any, k: Any, v: Any) -> SM100RoutedStreamingResult:
         """Execute the generated path without an opaque attention or combine call."""
         physical_module, _, merge_module = self._ensure_modules()
+        emitter_plan = self._ensure_sources().emitter_plan
         self._validate_operands(q, k, v)
         relation = self.marshal_relation(q2k_indices, total_key_tokens=int(k.shape[0]))
         torch = sys.modules["torch"]
@@ -300,12 +301,11 @@ class SM100RoutedStreamingCallable:
             None,
             relation.cu_seqlens_q,
             relation.cu_seqlens_k,
-            self._lowering.score_map.scale,
+            emitter_plan.normalized_exp_fold.score_scale,
             1.0,
             self._lowering.right_block_count,
             self._lowering.key_value_heads,
             self._lowering.query_length,
-            relation.work_capacity,
         )
         output = merge_module.merge(
             log_normalizer_partials,
@@ -336,6 +336,7 @@ class SM100RoutedStreamingCallable:
         cutlass = importlib.import_module("cutlass")
         cute = importlib.import_module("cutlass.cute")
         tensor_helpers = importlib.import_module("src.common.cute_dsl_utils")
+        emitter_plan = self._ensure_sources().emitter_plan
 
         key = (
             tuple(q.shape),
@@ -346,15 +347,15 @@ class SM100RoutedStreamingCallable:
             v.dtype,
             value_partials_flat.dtype,
             relation.work_capacity,
-            self._lowering.score_map.causal,
+            emitter_plan.domain_restriction.causal,
         )
         cached = self._compiled_physical.get(key)
         if cached is not None:
             return cached
-        constructor = dict(self._ensure_sources().emitter_plan.physical_constructor)
+        constructor = dict(emitter_plan.physical_constructor)
         constructor["qk_dtype"] = cutlass.BFloat16
         constructor["pv_dtype"] = cutlass.BFloat16
-        kernel_class = getattr(physical_module, self._ensure_sources().emitter_plan.physical_class)
+        kernel_class = getattr(physical_module, emitter_plan.physical_class)
         kernel = kernel_class(**constructor)
         compiled = cute.compile(
             kernel,
@@ -374,7 +375,7 @@ class SM100RoutedStreamingCallable:
             None,
             tensor_helpers.to_cute_tensor(relation.cu_seqlens_q),
             tensor_helpers.to_cute_tensor(relation.cu_seqlens_k),
-            cutlass.Float32(self._lowering.score_map.scale),
+            cutlass.Float32(emitter_plan.normalized_exp_fold.score_scale),
             cutlass.Float32(1.0),
             cutlass.Int32(self._lowering.right_block_count),
             cutlass.Int32(self._lowering.key_value_heads),
@@ -430,7 +431,7 @@ def compile_routed_streaming_callable(
     lowering: SM100RoutedStreamingLowering,
     *,
     partial_value_dtype: PartialValueDType = PartialValueDType.BF16,
-    partial_merge_schedule: PartialMergeScheduleKind = PartialMergeScheduleKind.ROW_BLOCK,
+    partial_merge_schedule: PartialMergeScheduleKind | None = None,
     build_directory: Path | None = None,
 ) -> SM100RoutedStreamingCallable:
     """Construct the lazy callable for one recovered generic lowering."""

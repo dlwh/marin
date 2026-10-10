@@ -3,11 +3,11 @@
 
 """Generic SM100 projected Contract, block Fold, and Selection runtime.
 
-The retained physical primitives are MiniMax MSA's pinned score-only SM100
-QK/block-maximum mainloop and its standalone top-k indexer. The accepted path
-directly instantiates the physical template from compiler parameters. The
-private MiniMax variant-manager adapter lives under ``benchmarks/backends`` and
-is never imported by this accepted runtime.
+The retained physical primitive is MiniMax MSA's pinned score-only SM100
+QK/block-maximum mainloop. A generated generic Selection kernel implements the
+declared total order and source-index tie break over those materialized block
+scores. The private MiniMax variant-manager adapter lives under
+``benchmarks/backends`` and is never imported by this accepted runtime.
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ from fused_projected_selection_emitter import (
     compile_direct_projected_selection,
 )
 
+from tile_lifetime.routed_attention import SelectionOutputOrder, SelectionTieBreak
 from tile_lifetime.sm100_selection_lowering import (
     SM100ProjectedSelectionLowering,
     SM100SelectionStrategy,
@@ -45,10 +46,6 @@ PINNED_SOURCE_SHA256 = {
     "python/fmha_sm100/csrc/include/sm100_fmha_fwd_epilogue_tma_warpspecialized.hpp": (
         "7dd3cb52dae1e34f6e239cc25909f6bd44e5d4a0fef887ca6efe19c6a3c67dc9"
     ),
-    "python/fmha_sm100/csrc/include/sparse_topk_select.cuh": (
-        "6c23b2b908fb8e54614866b0393a5d2b84fbe43a26773b25bfad38fa7a33ddf3"
-    ),
-    "python/fmha_sm100/csrc/sparse_topk_select.cu": "b1a703fcc5a91880f7793a9a867710f2adad1469cca5e3b0211de7c325f24398",
 }
 
 _FORBIDDEN_OR_OPAQUE_CALLS = frozenset(
@@ -62,8 +59,6 @@ _FORBIDDEN_OR_OPAQUE_CALLS = frozenset(
 _REQUIRED_LOW_LEVEL_CALLS = frozenset(
     {
         "_fmha_sm100_plan",
-        "get_sparse_topk_module",
-        "sparse_topk_select",
     }
 )
 
@@ -110,9 +105,8 @@ class PreparedFusedProjectedSelection:
     torch: Any
     physical_plan: dict[str, Any]
     score_runner: Any
-    selection_module: Any
+    selection_runner: Any
     maximum_score: Any
-    selection_workspace: Any
     output_indices: Any
     key_value_indices: Any
     group_index: Any
@@ -191,22 +185,11 @@ class PreparedFusedProjectedSelection:
         # This generic indexed Map is one value per (group, query), not an
         # attention operation. It executes after the fused block-maximum Fold.
         self.maximum_score[self.group_index, self.local_block, self.query_index] = math.inf
-        self.selection_module.sparse_topk_select(
+        self.selection_runner(
             self.maximum_score,
+            self.valid_block_count,
             self.output_indices,
-            self.selection_workspace,
             program.selected_count,
-            lowering.right_block_count,
-            0,
-            0,
-            current_stream,
-        )
-        # Keep the rectangular top-k result but make underfilled causal rows
-        # explicit. This is a generic DomainRestriction-to-Selection
-        # legalization: indices outside the row's legal right-domain prefix
-        # become the declared invalid sentinel rather than duplicate edges.
-        self.output_indices.masked_fill_(
-            self.output_indices >= self.valid_block_count,
             program.selection_semantics.invalid_index,
         )
         return self.output_indices
@@ -231,6 +214,13 @@ def adapter_plan_from_lowering(
         raise ValueError("the score-only mainloop requires left-position >= right-position")
     if not program.force_local_block:
         raise ValueError("the physical Selection requires an explicit forced local right block")
+    if (
+        program.selection_semantics.tie_break is not SelectionTieBreak.RIGHT_INDEX_ASCENDING
+        or program.selection_semantics.output_order is not SelectionOutputOrder.RIGHT_INDEX_ASCENDING
+    ):
+        raise ValueError(
+            "the pinned physical Selection emits right-index-ascending slots with right-index-ascending tie breaking"
+        )
 
     query_position = np.arange(program.source_count, dtype=np.int64) + program.left_position_offset
     local_block = (query_position - program.right_position_offset) // program.right_block_size
@@ -267,12 +257,13 @@ def prepare_fused_projected_selection(
     adapter_plan = adapter_plan_from_lowering(lowering)
     if adapter_plan.query_tile_size != 256 or adapter_plan.key_value_tile_size != 128:
         raise ValueError("the direct generated instance currently supports query tile 256 and key tile 128")
-    score_runner, generated_sources = compile_direct_projected_selection(msa_root)
+    score_runner, selection_runner, generated_sources = compile_direct_projected_selection(msa_root)
     return _prepare_projected_selection(
         lowering,
         msa_root=msa_root,
         device=device,
         score_runner=score_runner,
+        selection_runner=selection_runner,
         physical_source_classification="direct_generated_contract_maximum_fold",
         generated_sources=generated_sources,
     )
@@ -284,6 +275,7 @@ def _prepare_projected_selection(
     msa_root: Path,
     device: Any,
     score_runner: Any,
+    selection_runner: Any,
     physical_source_classification: str,
     generated_sources: DirectProjectedSelectionSources | None,
 ) -> PreparedFusedProjectedSelection:
@@ -295,7 +287,6 @@ def _prepare_projected_selection(
         sys.path.insert(0, python_root)
     torch = importlib.import_module("torch")
     plan_api = importlib.import_module("fmha_sm100.api")
-    jit = importlib.import_module("fmha_sm100.jit")
     planner_device = torch.device(device)
     if planner_device.index is None:
         planner_device = torch.cuda.current_device()
@@ -320,14 +311,12 @@ def _prepare_projected_selection(
     if physical_plan["max_k_tiles"] != adapter_plan.maximum_key_tiles:
         raise ValueError("the private planner and generic lowering disagree on the padded right-block domain")
 
-    selection_module = jit.get_sparse_topk_module()
     maximum_score = torch.full(
         (program.group_count, adapter_plan.maximum_key_tiles, program.source_count),
         -math.inf,
         dtype=torch.float32,
         device=device,
     )
-    selection_workspace = torch.empty(maximum_score.numel(), dtype=torch.int32, device=device)
     output_indices = torch.empty(
         (program.source_count, program.group_count, program.selected_count),
         dtype=torch.int32,
@@ -347,9 +336,8 @@ def _prepare_projected_selection(
         torch=torch,
         physical_plan=physical_plan,
         score_runner=score_runner,
-        selection_module=selection_module,
+        selection_runner=selection_runner,
         maximum_score=maximum_score,
-        selection_workspace=selection_workspace,
         output_indices=output_indices,
         key_value_indices=key_value_indices,
         group_index=group_index,

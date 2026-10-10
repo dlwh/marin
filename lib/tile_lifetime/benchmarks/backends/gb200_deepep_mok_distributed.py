@@ -52,6 +52,7 @@ from tile_lifetime import (  # noqa: E402
     ExpertParallelPlan,
     ExpertParallelStageKind,
     NumericalPolicy,
+    uniform_relation_placement,
 )
 from tile_lifetime.cuda_map_fold_codegen import shuttle_map_fold_program  # noqa: E402
 from tile_lifetime.moe_reference import MOE_REGION_INPUT_NAMES  # noqa: E402
@@ -231,7 +232,7 @@ def _compile_natural_stablehlo_plan(args: argparse.Namespace) -> tuple[ExpertPar
         input_names=MOE_REGION_INPUT_NAMES,
         gemm_accumulation_dtype=DType.FP32,
         config=ExpertParallelConfig(
-            expert_parallel_size=4,
+            placement=uniform_relation_placement(destination_count=args.global_experts, rank_count=4),
             exchange_workers=args.deepep_sms,
         ),
         numerical_policy=NumericalPolicy.ALLOW_ROUNDING_REORDER,

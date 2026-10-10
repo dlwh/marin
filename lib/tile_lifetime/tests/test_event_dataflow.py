@@ -3,6 +3,7 @@
 
 from collections.abc import MutableMapping
 from dataclasses import replace
+from itertools import pairwise
 
 import numpy as np
 import pytest
@@ -438,6 +439,101 @@ def test_program_verifier_rejects_dependency_cycle_before_interpretation() -> No
         verify_event_dataflow_program(program)
 
 
+@pytest.mark.parametrize("coarsen", [False, True])
+def test_event_coverage_rejects_missing_notification_with_consistent_counts(coarsen: bool) -> None:
+    dependence = split_fold_dependence(row_count=2, partition_count=2)
+    plan = derive_event_tensor_plan(dependence, name="ready")
+    if coarsen:
+        plan = coarsen_event_tensor_plan(
+            plan,
+            domain=EventDomain("shared", (TaskAxis("all_rows", 1),)),
+            project=lambda _: (0,),
+            name="coarse",
+        )
+    removed = plan.notify_relation.pairs[0]
+    plan = replace(
+        plan,
+        notify_relation=replace(plan.notify_relation, pairs=plan.notify_relation.pairs[1:]),
+        initial_count=replace(
+            plan.initial_count,
+            counts=tuple(
+                replace(count, value=count.value - (count.coordinate == removed.target))
+                for count in plan.initial_count.counts
+            ),
+        ),
+    )
+    with pytest.raises(EventDataflowError, match="omits required edges"):
+        verify_event_tensor_plan(plan)
+
+
+@pytest.mark.parametrize("coarsen", [False, True])
+def test_program_verifier_accounts_for_cycles_added_by_event_coarsening(coarsen: bool) -> None:
+    first = TaskFamily("first", (TaskAxis("i", 2),))
+    second = TaskFamily("second", (TaskAxis("i", 2),))
+    visibility = MemoryVisibility(EventMemoryScope.DEVICE)
+    forward = TaskDependence(TaskRelation.from_pairs(first, second, (((0,), (0,)), ((1,), (1,)))), visibility)
+    backward = TaskDependence(TaskRelation.from_pairs(second, first, (((0,), (1,)),)), visibility)
+    forward_plan = derive_event_tensor_plan(forward, name="forward")
+    if coarsen:
+        forward_plan = coarsen_event_tensor_plan(
+            forward_plan,
+            domain=EventDomain("shared", (TaskAxis("all_tasks", 1),)),
+            project=lambda _: (0,),
+            name="coarse_forward",
+        )
+    program = EventDataflowProgram(
+        (first, second),
+        (forward, backward),
+        (forward_plan, derive_event_tensor_plan(backward, name="backward")),
+    )
+    if coarsen:
+        # The added first[1] -> second[0] edge closes a cycle with the backward edge.
+        with pytest.raises(EventDataflowError, match="impossible cycle"):
+            verify_event_dataflow_program(program)
+        return
+
+    result = execute_event_dataflow(
+        program,
+        actions={"first": lambda *_: None, "second": lambda *_: None},
+        state={},
+        scheduling_mode=EventSchedulingMode.DYNAMIC,
+    )
+    assert [(task.family, task.coordinate) for task in result.executed_tasks] == [
+        ("first", (0,)),
+        ("second", (0,)),
+        ("first", (1,)),
+        ("second", (1,)),
+    ]
+
+
+def test_program_events_with_shared_domains_keep_independent_readiness() -> None:
+    families = tuple(TaskFamily(name, (TaskAxis("i", 1),)) for name in ("first", "second", "third"))
+    visibility = MemoryVisibility(EventMemoryScope.DEVICE)
+    dependences = tuple(
+        TaskDependence(TaskRelation.from_pairs(source, target, (((0,), (0,)),)), visibility)
+        for source, target in pairwise(families)
+    )
+    shared = EventDomain("shared", (TaskAxis("i", 1),))
+    plans = []
+    for index, dependence in enumerate(dependences):
+        plan = derive_event_tensor_plan(dependence, name=f"ready_{index}")
+        plans.append(
+            replace(
+                plan,
+                domain=shared,
+                notify_relation=replace(plan.notify_relation, target=shared),
+                trigger_relation=replace(plan.trigger_relation, source=shared),
+            )
+        )
+    result = execute_event_dataflow(
+        EventDataflowProgram(families, dependences, tuple(plans)),
+        actions={family.name: lambda *_: None for family in families},
+        state={},
+        scheduling_mode=EventSchedulingMode.DYNAMIC,
+    )
+    assert [task.family for task in result.executed_tasks] == ["first", "second", "third"]
+
+
 def test_program_verifier_rejects_ambiguous_event_identity_and_unknown_families() -> None:
     first = TaskFamily("first", (TaskAxis("i", 1),))
     second = TaskFamily("second", (TaskAxis("i", 1),))
@@ -504,3 +600,28 @@ def test_same_event_plan_lowers_to_static_waits_or_dynamic_queue_triggers() -> N
     }
     assert sum(operation.kind is ImperativeEventOpKind.NOTIFY for operation in static) == 6
     assert sum(operation.kind is ImperativeEventOpKind.NOTIFY for operation in dynamic) == 6
+
+
+def test_imperative_operations_retain_bounded_event_slots_and_generations() -> None:
+    dependence = split_fold_dependence(row_count=2, partition_count=3)
+    plan = derive_event_tensor_plan(
+        dependence,
+        name="phased_lowering",
+        generation_policy=EventGenerationPolicy.PHASED,
+    )
+    binding = phased_event_storage_binding(
+        plan,
+        slot=lambda _: 0,
+        generation=lambda coordinate: coordinate[0],
+    )
+
+    operations = lower_event_tensor_plan(
+        plan,
+        scheduling_mode=EventSchedulingMode.STATIC,
+        storage_binding=binding,
+    )
+
+    assert {(operation.event, operation.storage_slot, operation.generation) for operation in operations} == {
+        ((0,), 0, 0),
+        ((1,), 0, 1),
+    }

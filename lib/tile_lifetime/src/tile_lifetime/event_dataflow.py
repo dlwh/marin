@@ -11,6 +11,7 @@ from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from itertools import pairwise, product
+from typing import Any
 
 Coordinate = tuple[int, ...]
 
@@ -262,6 +263,61 @@ class EventTensorPlan:
         return TaskRelation.from_pairs(required.source, required.target, tuple(pairs))
 
 
+def event_tensor_plan_record(plan: EventTensorPlan) -> dict[str, Any]:
+    """Return a canonical, lossless record of one exact EventTensor plan."""
+
+    def domain_record(domain: CoordinateDomain) -> dict[str, Any]:
+        if isinstance(domain, TaskFamily):
+            kind = "task_family"
+        elif isinstance(domain, EventDomain):
+            kind = "event_domain"
+        else:
+            kind = "coordinate_domain"
+        record: dict[str, Any] = {
+            "kind": kind,
+            "name": domain.name,
+            "axes": tuple({"name": axis.name, "extent": axis.extent} for axis in domain.axes),
+        }
+        if isinstance(domain, TaskFamily):
+            record["placement"] = domain.placement
+        return record
+
+    def relation_record(relation: TaskRelation) -> dict[str, Any]:
+        return {
+            "source_domain": domain_record(relation.source),
+            "target_domain": domain_record(relation.target),
+            "pairs": tuple({"source": pair.source, "target": pair.target} for pair in relation.pairs),
+        }
+
+    def visibility_record(visibility: MemoryVisibility) -> dict[str, Any]:
+        return {
+            "scope": visibility.scope.value,
+            "release_on_notify": visibility.release_on_notify,
+            "acquire_before_consumer": visibility.acquire_before_consumer,
+        }
+
+    return {
+        "name": plan.name,
+        "required_dependence": {
+            "relation": relation_record(plan.required_dependence.relation),
+            "visibility": visibility_record(plan.required_dependence.visibility),
+        },
+        "event_domain": domain_record(plan.domain),
+        "notify_relation": relation_record(plan.notify_relation),
+        "trigger_relation": relation_record(plan.trigger_relation),
+        "initial_count": {
+            "counts": tuple(
+                {"coordinate": count.coordinate, "value": count.value} for count in sorted(plan.initial_count.counts)
+            ),
+            "provenance": plan.initial_count.provenance,
+        },
+        "memory_scope": plan.memory_scope.value,
+        "generation_policy": plan.generation_policy.value,
+        "visibility": visibility_record(plan.visibility),
+        "scheduling_mode": None if plan.scheduling_mode is None else plan.scheduling_mode.value,
+    }
+
+
 @dataclass(frozen=True)
 class EventTensorRuntimeInputs:
     """Flat runtime tables used to initialize and traverse one event plan.
@@ -438,14 +494,27 @@ class ImperativeEventOperation:
     count: int | None
     memory_scope: EventMemoryScope
     visibility: MemoryVisibility
+    storage_slot: int
+    generation: int
 
 
 def lower_event_tensor_plan(
     plan: EventTensorPlan,
     *,
     scheduling_mode: EventSchedulingMode,
+    storage_binding: EventStorageBinding | None = None,
 ) -> tuple[ImperativeEventOperation, ...]:
-    """Expose the minimal imperative correspondence without choosing GPU primitives."""
+    """Expose storage-bound imperative operations without choosing GPU primitives."""
+    runtime = event_tensor_runtime_inputs(plan, storage_binding=storage_binding)
+    storage_by_event = {
+        coordinate: (slot, generation)
+        for coordinate, slot, generation in zip(
+            plan.domain.coordinates,
+            runtime.event_storage_slots,
+            runtime.event_generations,
+            strict=True,
+        )
+    }
     operations: list[ImperativeEventOperation] = [
         ImperativeEventOperation(
             ImperativeEventOpKind.INITIALIZE,
@@ -454,6 +523,8 @@ def lower_event_tensor_plan(
             count,
             plan.memory_scope,
             plan.visibility,
+            storage_by_event[coordinate][0],
+            storage_by_event[coordinate][1],
         )
         for coordinate, count in plan.initial_count.as_mapping().items()
     ]
@@ -466,6 +537,8 @@ def lower_event_tensor_plan(
                 None,
                 plan.memory_scope,
                 plan.visibility,
+                storage_by_event[pair.source][0],
+                storage_by_event[pair.source][1],
             )
             for pair in plan.trigger_relation.pairs
         )
@@ -477,6 +550,8 @@ def lower_event_tensor_plan(
             None,
             plan.memory_scope,
             plan.visibility,
+            storage_by_event[pair.target][0],
+            storage_by_event[pair.target][1],
         )
         for pair in plan.notify_relation.pairs
     )
@@ -489,6 +564,8 @@ def lower_event_tensor_plan(
                 None,
                 plan.memory_scope,
                 plan.visibility,
+                storage_by_event[pair.source][0],
+                storage_by_event[pair.source][1],
             )
             for pair in plan.trigger_relation.pairs
         )
@@ -617,9 +694,17 @@ def verify_event_tensor_plan(plan: EventTensorPlan) -> None:
         reasons.append("trigger relation target does not match the required consumer family")
         relation_domains_match = False
     if relation_domains_match:
-        required = set(required_relation.pairs)
-        scheduled = set(plan.scheduled_dependence.pairs)
-        missing = required - scheduled
+        events_by_producer: dict[Coordinate, set[Coordinate]] = defaultdict(set)
+        events_by_consumer: dict[Coordinate, set[Coordinate]] = defaultdict(set)
+        for pair in plan.notify_relation.pairs:
+            events_by_producer[pair.source].add(pair.target)
+        for pair in plan.trigger_relation.pairs:
+            events_by_consumer[pair.target].add(pair.source)
+        missing = [
+            pair
+            for pair in required_relation.pairs
+            if events_by_producer[pair.source].isdisjoint(events_by_consumer[pair.target])
+        ]
         if missing:
             reasons.append(f"scheduled dependence omits required edges {sorted(missing)}")
 
@@ -732,35 +817,46 @@ def verify_event_dataflow_program(program: EventDataflowProgram) -> None:
         except EventDataflowError as error:
             reasons.extend(f"{plan.name}: {reason}" for reason in error.reasons)
 
-    instances = {
-        TaskInstance(family.name, coordinate) for family in program.task_families for coordinate in family.coordinates
+    if reasons:
+        raise EventDataflowError(reasons)
+
+    # Keep Events as graph vertices: expanding producer x consumer edges adds
+    # no information for cycle detection and can make coarsened Events quadratic.
+    task_ids = {
+        instance: index
+        for index, instance in enumerate(
+            (family.name, coordinate) for family in program.task_families for coordinate in family.coordinates
+        )
     }
-    outgoing: dict[TaskInstance, set[TaskInstance]] = defaultdict(set)
-    indegree = {instance: 0 for instance in instances}
+    outgoing: list[list[int]] = [[] for _ in task_ids]
+    indegree = [0] * len(task_ids)
     for plan in program.event_plans:
+        event_ids = {coordinate: len(outgoing) + index for index, coordinate in enumerate(plan.domain.coordinates)}
+        outgoing.extend([] for _ in event_ids)
+        indegree.extend(0 for _ in event_ids)
         source_name = plan.notify_relation.source.name
         target_name = plan.trigger_relation.target.name
-        for pair in plan.scheduled_dependence.pairs:
-            source = TaskInstance(source_name, pair.source)
-            target = TaskInstance(target_name, pair.target)
-            if source not in instances or target not in instances:
-                continue
-            if target not in outgoing[source]:
-                outgoing[source].add(target)
-                indegree[target] += 1
-    frontier = deque(sorted(instance for instance, degree in indegree.items() if degree == 0))
+        for pair in plan.notify_relation.pairs:
+            source = task_ids[(source_name, pair.source)]
+            target = event_ids[pair.target]
+            outgoing[source].append(target)
+            indegree[target] += 1
+        for pair in plan.trigger_relation.pairs:
+            source = event_ids[pair.source]
+            target = task_ids[(target_name, pair.target)]
+            outgoing[source].append(target)
+            indegree[target] += 1
+    frontier = deque(index for index, degree in enumerate(indegree) if degree == 0)
     visited = 0
     while frontier:
         source = frontier.popleft()
         visited += 1
-        for target in sorted(outgoing[source]):
+        for target in outgoing[source]:
             indegree[target] -= 1
             if indegree[target] == 0:
                 frontier.append(target)
-    if visited != len(instances):
-        reasons.append("scheduled task dependencies contain an impossible cycle")
-    if reasons:
-        raise EventDataflowError(reasons)
+    if visited != len(indegree):
+        raise EventDataflowError(("scheduled task dependencies contain an impossible cycle",))
 
 
 def execute_event_dataflow(

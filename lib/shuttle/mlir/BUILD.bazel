@@ -85,6 +85,7 @@ cc_library(
         ":shuttle_dialect_inc_gen",
         ":shuttle_ops_inc_gen",
         "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:Analysis",
         "@llvm-project//mlir:BytecodeOpInterface",
         "@llvm-project//mlir:IR",
         "@llvm-project//mlir:SideEffectInterfaces",
@@ -104,17 +105,23 @@ cc_library(
         "lib/Transforms/OnlineCompositionPlanner.inc",
         "lib/Transforms/OnlinePlanner.inc",
         "lib/Transforms/Passes.cc",
+        "lib/Transforms/MaterializationPlanning.inc",
+        "lib/Transforms/ScheduleLowering.inc",
+        "lib/Transforms/PhysicalArtifact.cc",
         "lib/Transforms/StructuralSelection.inc",
     ],
     hdrs = [
         "include/shuttle/Transforms/Observer.h",
         "include/shuttle/Transforms/Passes.h",
+        "include/shuttle/Transforms/PhysicalArtifact.h",
     ],
     strip_include_prefix = "include",
     deps = [
         ":ShuttleDialect",
         ":ShuttleGpuExecutable",
         ":shuttle_passes_inc_gen",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
         "@llvm-project//llvm:Support",
         "@llvm-project//mlir:AffineDialect",
         "@llvm-project//mlir:ArithDialect",
@@ -129,7 +136,10 @@ cc_library(
 
 cc_library(
     name = "ShuttleGpuExecutable",
-    srcs = ["lib/Runtime/GpuExecutable.cc"],
+    srcs = [
+        "lib/Runtime/GpuExecutable.cc",
+        "lib/Runtime/InternalEventSchedule.cc",
+    ],
     hdrs = ["include/shuttle/Runtime/GpuExecutable.h"],
     strip_include_prefix = "include",
     deps = [
@@ -157,8 +167,8 @@ cc_library(
         "@llvm-project//mlir:IR",
         "@xla//xla/backends/gpu:ffi",
         "@xla//xla/ffi",
-        "@xla//xla/service/gpu:stream_executor_util",
         "@xla//xla/stream_executor:device_address_allocator",
+        "@xla//xla/stream_executor/gpu:tma_metadata",
         "@xla//xla/stream_executor:kernel",
         "@xla//xla/stream_executor:kernel_spec",
         "@xla//xla/stream_executor:stream",
@@ -179,6 +189,7 @@ cc_library(
         "@llvm-project//llvm:Support",
         "@llvm-project//mlir:IR",
         "@xla//xla/ffi",
+        "@xla//xla/ffi:ffi_api",
         "@xla//xla/ffi:invoke",
         "@xla//xla/stream_executor:device_address_allocator",
         "@xla//xla/stream_executor:device_description",
@@ -229,6 +240,19 @@ cc_library(
         ":ShuttleXlaRegistration",
         "@com_google_absl//absl/status",
         "@xla//xla/pjrt:stablehlo_module_transform",
+    ],
+)
+
+cc_library(
+    name = "ShuttlePythonPhysicalArtifactBridge",
+    srcs = ["lib/Transforms/PythonPhysicalArtifactBridge.cc"],
+    hdrs = ["include/shuttle/Transforms/PythonPhysicalArtifactBridge.h"],
+    strip_include_prefix = "include",
+    deps = [
+        ":ShuttlePasses",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@nanobind",
     ],
 )
 
@@ -346,8 +370,14 @@ cc_test(
     data = [
         "test/Inputs/abi22-generic-contract-fold-composition-rank2.mlir",
         "test/Inputs/abi22-generic-contract-fold-composition-rank3.mlir",
+        "test/Inputs/abi22-generic-map-contract-map-component.mlir",
         "test/Inputs/jax-0.10.1-bf16-causal-gqa-online-axis4.mlir",
         "test/Inputs/jax-0.10.1-bf16-causal-gqa-online-benchmark-s2048-d128.mlir",
+        "test/Inputs/jax-0.10.1-bf16-causal-gqa-value-and-grad-s128-d128.mlir",
+        "test/Inputs/jax-0.10.1-bf16-causal-gqa-scalar-value-and-grad-s128-d128.mlir",
+        "test/Inputs/jax-0.10.1-bf16-causal-gqa-value-and-grad-s19-d128.mlir",
+        "test/Inputs/jax-0.10.1-bf16-selection.mlir",
+        "test/Inputs/jax-0.10.1-f32-causal-gqa-online-axis4.mlir",
         "test/Inputs/jax-0.10.1-f32-causal-gqa-online-output-epilogue.mlir",
         "test/Inputs/jax-0.10.1-bf16-batched_contract-2x5x3x7x11-backward.mlir",
         "test/Inputs/jax-0.10.1-bf16-batched_contract-2x5x3x7x11-composed.mlir",
@@ -412,6 +442,62 @@ cc_test(
         "@xla//xla/stream_executor:platform_manager",
         "@xla//xla/stream_executor:stream_executor_address_allocator",
         "@bazel_tools//tools/cpp/runfiles",
+    ] + if_cuda_is_configured([
+        "@xla//xla/stream_executor/cuda:cuda_platform",
+    ]),
+)
+
+cc_test(
+    name = "gpu_fatbin_executable_test",
+    srcs = ["test/gpu-fatbin-executable-test.cc"],
+    deps = [
+        ":ShuttleDialect",
+        ":ShuttleGpuExecutable",
+        "@com_google_googletest//:gtest_main",
+        "@llvm-project//mlir:IR",
+    ],
+)
+
+cc_test(
+    name = "gpu_fatbin_h100_test",
+    srcs = ["test/gpu-fatbin-h100-test.cc"],
+    # CUDA builds prefer shared libraries, but MLIR and Shuttle are compiled
+    # with hidden visibility. Link this standalone runner test statically so
+    # its implementation symbols remain available to the test binary.
+    linkstatic = True,
+    tags = [
+        "h100",
+        "manual",
+        "requires-gpu-nvidia",
+    ],
+    deps = [
+        ":ShuttleDialect",
+        ":ShuttleGpuExecutable",
+        ":ShuttleGpuRunner",
+        "@com_google_googletest//:gtest_main",
+        "@llvm-project//mlir:IR",
+        "@xla//xla/stream_executor:platform_manager",
+        "@xla//xla/stream_executor:stream_executor_address_allocator",
+    ] + if_cuda_is_configured([
+        "@xla//xla/stream_executor/cuda:cuda_platform",
+    ]),
+)
+
+cc_test(
+    name = "gpu_fatbin_attention_h100_test",
+    srcs = ["test/gpu-fatbin-attention-h100-test.cc"],
+    linkstatic = True,
+    tags = [
+        "h100",
+        "manual",
+        "requires-gpu-nvidia",
+    ],
+    deps = [
+        ":ShuttleGpuRunner",
+        "@com_google_googletest//:gtest_main",
+        "@llvm-project//llvm:Support",
+        "@xla//xla/stream_executor:platform_manager",
+        "@xla//xla/stream_executor:stream_executor_address_allocator",
     ] + if_cuda_is_configured([
         "@xla//xla/stream_executor/cuda:cuda_platform",
     ]),
@@ -749,6 +835,10 @@ cc_test(
         "test/Inputs/abi22-generic-contract-fold-composition-rank2.mlir",
         "test/Inputs/abi22-generic-contract-fold-projected-composition-rank2.mlir",
         "test/Inputs/abi22-generic-contract-fold-composition-rank3.mlir",
+        "test/Inputs/abi22-generic-fold-dependent-input-producer.mlir",
+        "test/Inputs/abi22-generic-fold-dependent-neutral-maps.mlir",
+        "test/Inputs/abi22-generic-fold-dependent-unrelated-fold.mlir",
+        "test/Inputs/abi22-generic-map-contract-map-component.mlir",
         "test/Inputs/jax-0.10.1-bf16-matmul-vjp-17x33x19-composed.mlir",
         "test/Inputs/jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-backward.mlir",
         "test/Inputs/jax-0.10.1-bf16-layer_norm_44d152ecc3e9ff18-composed.mlir",
@@ -756,6 +846,8 @@ cc_test(
         "test/Inputs/jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-backward.mlir",
         "test/Inputs/jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-composed.mlir",
         "test/Inputs/jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-forward.mlir",
+        "test/Inputs/jax-0.10.1-bf16-causal-gqa-value-and-grad-s128-d128.mlir",
+        "test/Inputs/jax-0.10.1-bf16-causal-gqa-scalar-value-and-grad-s128-d128.mlir",
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-backward.mlir",
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-composed.mlir",
         "test/Inputs/jax-0.10.1-bf16-projected_parameter_broadcast-2x7x19-forward.mlir",
@@ -906,5 +998,15 @@ lit_test_suite(
         ":shuttle-test-opt",
         "@llvm-project//llvm:FileCheck",
         "@llvm-project//llvm:not",
+    ],
+)
+
+cc_binary(
+    name = "shuttle-gpu-inspect",
+    srcs = ["tools/shuttle-gpu-inspect.cc"],
+    deps = [
+        ":ShuttleGpuExecutable",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:IR",
     ],
 )

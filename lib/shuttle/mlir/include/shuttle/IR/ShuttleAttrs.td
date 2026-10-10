@@ -65,7 +65,13 @@ def Shuttle_RelationSemantics
                    I32EnumAttrCase<"Add", 4, "add">,
                    I32EnumAttrCase<"Compare", 5, "compare">,
                    I32EnumAttrCase<"Convert", 6, "convert">,
-                   I32EnumAttrCase<"Select", 7, "select">]> {
+                   I32EnumAttrCase<"Select", 7, "select">,
+                   I32EnumAttrCase<"Slice", 8, "slice">,
+                   I32EnumAttrCase<"Transpose", 9, "transpose">,
+                   I32EnumAttrCase<"Multiply", 10, "multiply">,
+                   I32EnumAttrCase<"Gather", 11, "gather">,
+                   I32EnumAttrCase<"IndexedContributions", 12,
+                                   "indexed_contributions">]> {
   let genSpecializedAttr = 0;
   let cppNamespace = "::mlir::shuttle";
 }
@@ -76,11 +82,67 @@ def Shuttle_RelationSemanticsAttr
   let assemblyFormat = "`<` $value `>`";
 }
 
+def Shuttle_SelectionOrder
+    : I32EnumAttr<"SelectionOrder", "Selection value ordering",
+                  [I32EnumAttrCase<"Descending", 0, "descending">,
+                   I32EnumAttrCase<"Ascending", 1, "ascending">]> {
+  let genSpecializedAttr = 0;
+  let cppNamespace = "::mlir::shuttle";
+}
+
+def Shuttle_SelectionOrderAttr
+    : EnumAttr<Shuttle_Dialect, Shuttle_SelectionOrder, "selection_order"> {
+  let assemblyFormat = "`<` $value `>`";
+}
+
+def Shuttle_SelectionComparison
+    : I32EnumAttr<"SelectionComparison", "Selection value comparison semantics",
+                  [I32EnumAttrCase<"TotalOrder", 0, "total_order">]> {
+  let genSpecializedAttr = 0;
+  let cppNamespace = "::mlir::shuttle";
+}
+
+def Shuttle_SelectionComparisonAttr
+    : EnumAttr<Shuttle_Dialect, Shuttle_SelectionComparison,
+               "selection_comparison"> {
+  let assemblyFormat = "`<` $value `>`";
+}
+
+def Shuttle_SelectionTieBreak
+    : I32EnumAttr<"SelectionTieBreak", "Selection tie-breaking semantics",
+                  [I32EnumAttrCase<"SourceIndexAscending", 0,
+                                   "source_index_ascending">]> {
+  let genSpecializedAttr = 0;
+  let cppNamespace = "::mlir::shuttle";
+}
+
+def Shuttle_SelectionTieBreakAttr
+    : EnumAttr<Shuttle_Dialect, Shuttle_SelectionTieBreak,
+               "selection_tie_break"> {
+  let assemblyFormat = "`<` $value `>`";
+}
+
+def Shuttle_ScanDirection
+    : I32EnumAttr<"ScanDirection", "Ordered Scan traversal direction",
+                  [I32EnumAttrCase<"Forward", 0, "forward">,
+                   I32EnumAttrCase<"Reverse", 1, "reverse">]> {
+  let genSpecializedAttr = 0;
+  let cppNamespace = "::mlir::shuttle";
+}
+
+def Shuttle_ScanDirectionAttr
+    : EnumAttr<Shuttle_Dialect, Shuttle_ScanDirection, "scan_direction"> {
+  let assemblyFormat = "`<` $value `>`";
+}
+
 def Shuttle_MaterializationTaskKind
     : I32EnumAttr<"MaterializationTaskKind", "Materialization task family kind",
                   [I32EnumAttrCase<"Map", 0, "map">,
                    I32EnumAttrCase<"Fold", 1, "fold">,
-                   I32EnumAttrCase<"Contract", 2, "contract">]> {
+                   I32EnumAttrCase<"Contract", 2, "contract">,
+                   I32EnumAttrCase<"Relation", 3, "relation">,
+                   I32EnumAttrCase<"Selection", 4, "selection">,
+                   I32EnumAttrCase<"Scan", 5, "scan">]> {
   let genSpecializedAttr = 0;
   let cppNamespace = "::mlir::shuttle";
 }
@@ -137,7 +199,9 @@ def Shuttle_ScheduleReductionOrder
                       "tree_association_free_leaf_order_fixed">,
                    I32EnumAttrCase<"LeafOrderFree", 1, "leaf_order_free">,
                    I32EnumAttrCase<"SerialAscendingFmaRnF32", 2,
-                                   "serial_ascending_fma_rn_f32">]> {
+                                   "serial_ascending_fma_rn_f32">,
+                   I32EnumAttrCase<"StableTotalOrderLeafOrderFixed", 3,
+                                   "stable_total_order_leaf_order_fixed">]> {
   let genSpecializedAttr = 0;
   let cppNamespace = "::mlir::shuttle";
 }
@@ -154,7 +218,9 @@ def Shuttle_ScheduleTaskKind
                    I32EnumAttrCase<"Elementwise", 1, "elementwise">,
                    I32EnumAttrCase<"RowFold", 2, "row_fold">,
                    I32EnumAttrCase<"ColumnFold", 3, "column_fold">,
-                   I32EnumAttrCase<"Contract", 4, "contract">]> {
+                   I32EnumAttrCase<"Contract", 4, "contract">,
+                   I32EnumAttrCase<"AllAxisFold", 5, "all_axis_fold">,
+                   I32EnumAttrCase<"OrderedState", 6, "ordered_state">]> {
   let genSpecializedAttr = 0;
   let cppNamespace = "::mlir::shuttle";
 }
@@ -162,6 +228,44 @@ def Shuttle_ScheduleTaskKind
 def Shuttle_ScheduleTaskKindAttr
     : EnumAttr<Shuttle_Dialect, Shuttle_ScheduleTaskKind,
                "schedule_task_kind"> {
+  let assemblyFormat = "`<` $value `>`";
+}
+
+def Shuttle_EventScope
+    : I32EnumAttr<"EventScope", "Visibility scope of an exact task event",
+                  [I32EnumAttrCase<"Thread", 0, "thread">,
+                   I32EnumAttrCase<"Workgroup", 1, "workgroup">,
+                   I32EnumAttrCase<"Device", 2, "device">,
+                   I32EnumAttrCase<"System", 3, "system">]> {
+  let genSpecializedAttr = 0;
+  let cppNamespace = "::mlir::shuttle";
+}
+
+def Shuttle_EventScopeAttr
+    : EnumAttr<Shuttle_Dialect, Shuttle_EventScope, "event_scope"> {
+  let assemblyFormat = "`<` $value `>`";
+}
+
+def Shuttle_EventRealizationKind
+    : I32EnumAttr<"EventRealizationKind", "Physical realization of an event",
+                  [I32EnumAttrCase<"ProgramOrderErased", 0,
+                                   "program_order_erased">,
+                   I32EnumAttrCase<"StreamOrderErased", 1,
+                                   "stream_order_erased">,
+                   I32EnumAttrCase<"AlgebraicRefinementErased", 2,
+                                   "algebraic_refinement_erased">,
+                   I32EnumAttrCase<"MBarrier", 3, "mbarrier">,
+                   I32EnumAttrCase<"Pipeline", 4, "pipeline">,
+                   I32EnumAttrCase<"Queue", 5, "queue">,
+                   I32EnumAttrCase<"ImperativeWaitNotify", 6,
+                                   "imperative_wait_notify">]> {
+  let genSpecializedAttr = 0;
+  let cppNamespace = "::mlir::shuttle";
+}
+
+def Shuttle_EventRealizationKindAttr
+    : EnumAttr<Shuttle_Dialect, Shuttle_EventRealizationKind,
+               "event_realization_kind"> {
   let assemblyFormat = "`<` $value `>`";
 }
 
@@ -174,7 +278,11 @@ def Shuttle_ExecutableCodeFormat
                    I32EnumAttrCase<"CudaPtxSm90V1", 2,
                                    "cuda_ptx_sm90_v1">,
                    I32EnumAttrCase<"CudaPtxSm100V1", 3,
-                                   "cuda_ptx_sm100_v1">]> {
+                                   "cuda_ptx_sm100_v1">,
+                   I32EnumAttrCase<"CudaFatbinSm90V1", 4,
+                                   "cuda_fatbin_sm90_v1">,
+                   I32EnumAttrCase<"CudaFatbinSm100V1", 5,
+                                   "cuda_fatbin_sm100_v1">]> {
   let genSpecializedAttr = 0;
   let cppNamespace = "::mlir::shuttle";
 }

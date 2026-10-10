@@ -37,7 +37,6 @@ from track1_map_h100_build import (
     source_checkouts_identity,
 )
 from track1_rmsnorm_contract_h100_topology import (
-    COMPOSED_BUNDLE_SHAPES,
     COMPOSED_TOPOLOGY_STATUS,
     PRIMAL_BUNDLE_SHAPES,
     PRIMAL_TOPOLOGY_STATUS,
@@ -70,12 +69,249 @@ LOG_TAIL_MAX_LINES = 80
 WHEEL_PREFIXES = ("jaxlib-", "jax_cuda13_plugin-", "jax_cuda13_pjrt-")
 JAX_PYTHON_VERSION = "0.10.1"
 JAX_SOURCE_HELPER_RELATIVE = Path("lib/shuttle/mlir/jax_patch/track1_map_h100_jax_source.py")
-BASE_RUNTIME_SITE_PACKAGES = Path("/opt/h100-evidence-runtime/lib/python3.12/site-packages")
+TILE_LIFETIME_SOURCE_HELPER_RELATIVE = Path("lib/shuttle/mlir/jax_patch/track1_tile_lifetime_source.py")
+SM90_RUNTIME_REQUIREMENTS_RELATIVE = Path("lib/shuttle/mlir/jax_patch/track1_sm90_runtime_requirements.txt")
+SM90_RUNTIME_REQUIREMENTS_SHA256 = "a6ddb8906e37714ae1eb9ff20c6297028e4b81736492910d9c6fc3988d9f355f"
+TILE_LIFETIME_REPOSITORY_RELATIVE = Path("lib/tile_lifetime")
+UV = Path("/bin/uv")
 WORKER_MODES = ("disabled", "source_ordered", "fast")
 GENERIC_COMPOSITION_CELL_PREFIX = composition_policy.CELL_REPORT_PREFIX
 MAX_GENERIC_COMPOSITION_CELL_BYTES = composition_policy.MAX_CELL_REPORT_BYTES
 SOURCE_MANIFEST_RELATIVE = Path("scripts/shuttle/track1_map_h100_source_manifest.json")
-SOURCE_ROOTS = (Path("lib/shuttle/mlir"), Path("lib/shuttle/src/shuttle"))
+SOURCE_ROOTS = (
+    Path("lib/shuttle/mlir"),
+    Path("lib/shuttle/src/shuttle"),
+)
+SOURCE_FILES = (
+    *(
+        Path("lib/tile_lifetime/src") / path
+        for path in (
+            "tile_lifetime/__init__.py",
+            "tile_lifetime/attention.py",
+            "tile_lifetime/autodiff.py",
+            "tile_lifetime/backends/__init__.py",
+            "tile_lifetime/backends/h100/__init__.py",
+            "tile_lifetime/backends/h100/bf16_tree_fold.py",
+            "tile_lifetime/backends/h100/bounded_transport.py",
+            "tile_lifetime/backends/h100/cuda_kv_reuse_emitter.py",
+            "tile_lifetime/backends/h100/cute_contract_component.py",
+            "tile_lifetime/backends/h100/cute_domain_restriction.py",
+            "tile_lifetime/backends/h100/cute_generic_tensor_program.py",
+            "tile_lifetime/backends/h100/cute_launch_abi.py",
+            "tile_lifetime/backends/h100/cute_launch_capture.py",
+            "tile_lifetime/backends/h100/cute_map_load_contract.py",
+            "tile_lifetime/backends/h100/cute_normalized_exp.py",
+            "tile_lifetime/backends/h100/cute_normalized_exp_backward_sm90.py",
+            "tile_lifetime/backends/h100/cute_normalized_exp_component.py",
+            "tile_lifetime/backends/h100/cute_normalized_exp_training_component.py",
+            "tile_lifetime/backends/h100/cute_post_normalization_pullback.py",
+            "tile_lifetime/backends/h100/cute_routed_streaming_emitter.py",
+            "tile_lifetime/backends/h100/cute_scalar_ast.py",
+            "tile_lifetime/backends/h100/cute_streaming_backward_emitter.py",
+            "tile_lifetime/backends/h100/cute_streaming_base.py",
+            "tile_lifetime/backends/h100/cute_streaming_emitter.py",
+            "tile_lifetime/backends/h100/cute_streaming_sm90.py",
+            "tile_lifetime/backends/h100/cute_two_pass_normalized_exp.py",
+            "tile_lifetime/backends/h100/executable_normalized_exp_contract_compiler.py",
+            "tile_lifetime/backends/h100/fp32_row_fold.py",
+            "tile_lifetime/backends/h100/generic_codegen_admission.py",
+            "tile_lifetime/backends/h100/generic_relation_simt.py",
+            "tile_lifetime/backends/h100/physical_normalized_exp_contract_compiler.py",
+            "tile_lifetime/backends/h100/provider.py",
+            "tile_lifetime/backends/h100/triton_ordered_state.py",
+            "tile_lifetime/backends/sm100/__init__.py",
+            "tile_lifetime/backends/sm100/canonical_aot_artifact.py",
+            "tile_lifetime/backends/sm100/canonical_jax_ffi.py",
+            "tile_lifetime/backends/sm100/canonical_simt_emitter.py",
+            "tile_lifetime/backends/sm100/refined_schedule.py",
+            "tile_lifetime/benchmark_boundary.py",
+            "tile_lifetime/bfloat16_metrics.py",
+            "tile_lifetime/canonical_kernel_composition.py",
+            "tile_lifetime/cast_scalar_program.py",
+            "tile_lifetime/collective_transport.py",
+            "tile_lifetime/command_buffer_capture.py",
+            "tile_lifetime/compiler.py",
+            "tile_lifetime/contract_map_backend.py",
+            "tile_lifetime/contract_map_backend_resources.py",
+            "tile_lifetime/contract_map_chain.py",
+            "tile_lifetime/cuda_axis_fold_codegen.py",
+            "tile_lifetime/cuda_contract_map_backend_codegen.py",
+            "tile_lifetime/cuda_contract_map_chain_codegen.py",
+            "tile_lifetime/cuda_dynamic_event_dataflow_codegen.py",
+            "tile_lifetime/cuda_event_dataflow_codegen.py",
+            "tile_lifetime/cuda_event_workload_codegen.py",
+            "tile_lifetime/cuda_expert_parallel_training_codegen.py",
+            "tile_lifetime/cuda_map_fold_codegen.py",
+            "tile_lifetime/cuda_normalized_exp_contract_forward_codegen.py",
+            "tile_lifetime/cuda_normalized_exp_contract_reverse_codegen.py",
+            "tile_lifetime/cuda_partitioned_gemm_codegen.py",
+            "tile_lifetime/cuda_prepared_contract_codegen.py",
+            "tile_lifetime/cuda_toolchain.py",
+            "tile_lifetime/cute_device_ir.py",
+            "tile_lifetime/cute_fast_divmod.py",
+            "tile_lifetime/cute_pair_map_codegen.py",
+            "tile_lifetime/cute_pipeline_artifact.py",
+            "tile_lifetime/cute_sm90_launch_abi.py",
+            "tile_lifetime/cute_sm90_tensor_abi.py",
+            "tile_lifetime/delta_rule_reference.py",
+            "tile_lifetime/dense_algebra.py",
+            "tile_lifetime/dense_flow.py",
+            "tile_lifetime/dense_flow_planner.py",
+            "tile_lifetime/dense_region.py",
+            "tile_lifetime/distributed_expert_backward_ffi.py",
+            "tile_lifetime/distributed_expert_jax_module.py",
+            "tile_lifetime/event_buffering.py",
+            "tile_lifetime/event_dataflow.py",
+            "tile_lifetime/event_dataflow_adapters.py",
+            "tile_lifetime/event_dataflow_examples.py",
+            "tile_lifetime/executable_normalized_exp_contract.py",
+            "tile_lifetime/experimental_msa_recovery.py",
+            "tile_lifetime/experimental_pipeline.py",
+            "tile_lifetime/experimental_routed_attention_recovery.py",
+            "tile_lifetime/experimental_semantic_recovery.py",
+            "tile_lifetime/experimental_stablehlo_scan_recovery.py",
+            "tile_lifetime/experimental_stablehlo_streaming_attention_backward.py",
+            "tile_lifetime/expert_executable_pipeline.py",
+            "tile_lifetime/expert_parallel.py",
+            "tile_lifetime/expert_parallel_plan.py",
+            "tile_lifetime/expert_parallel_training.py",
+            "tile_lifetime/expert_parallel_training_runtime.py",
+            "tile_lifetime/ffi_command_buffer.py",
+            "tile_lifetime/fold_map_contract_training_provider.py",
+            "tile_lifetime/fold_placement.py",
+            "tile_lifetime/gated_delta_scan.py",
+            "tile_lifetime/gemm_program.py",
+            "tile_lifetime/grouped_contract_event_schedule.py",
+            "tile_lifetime/h100_contract_map_benchmark.py",
+            "tile_lifetime/h100_normalized_exp_backward_lowering.py",
+            "tile_lifetime/h100_scalar_ast.py",
+            "tile_lifetime/h100_streaming_lowering.py",
+            "tile_lifetime/index_domain_canonicalization.py",
+            "tile_lifetime/internal_event_allocation.py",
+            "tile_lifetime/ir.py",
+            "tile_lifetime/jax_axis_fold_ffi.py",
+            "tile_lifetime/jax_collective_transport.py",
+            "tile_lifetime/jax_contract_map_backend_ffi.py",
+            "tile_lifetime/jax_contract_map_chain_ffi.py",
+            "tile_lifetime/jax_cute_pipeline_ffi.py",
+            "tile_lifetime/jax_event_dataflow_ffi.py",
+            "tile_lifetime/jax_fold_map_contract_training.py",
+            "tile_lifetime/jax_hlo_rewrite_runtime.py",
+            "tile_lifetime/jax_normalized_exp_contract_forward_ffi.py",
+            "tile_lifetime/jax_normalized_exp_contract_pullback.py",
+            "tile_lifetime/jax_normalized_exp_contract_reverse_ffi.py",
+            "tile_lifetime/jax_normalized_exp_contract_training.py",
+            "tile_lifetime/jax_partitioned_gemm_ffi.py",
+            "tile_lifetime/jax_relation_edge_reverse_ffi.py",
+            "tile_lifetime/jax_routed_reverse_ffi.py",
+            "tile_lifetime/jax_sm90_function.py",
+            "tile_lifetime/jax_streaming_attention_backward_ffi.py",
+            "tile_lifetime/jax_streaming_attention_forward_ffi.py",
+            "tile_lifetime/jax_tensor_program.py",
+            "tile_lifetime/kimi_delta_scan.py",
+            "tile_lifetime/layout_relation_canonicalization.py",
+            "tile_lifetime/layout_transport.py",
+            "tile_lifetime/linear_pair_map.py",
+            "tile_lifetime/moe.py",
+            "tile_lifetime/moe_reference.py",
+            "tile_lifetime/moe_training_reference.py",
+            "tile_lifetime/msa_frontend.py",
+            "tile_lifetime/msa_reference_pipeline.py",
+            "tile_lifetime/native_task_plan_adapter.py",
+            "tile_lifetime/normalized_exp_contract_region.py",
+            "tile_lifetime/normalized_exp_contract_training.py",
+            "tile_lifetime/normalized_exp_regional_pullback.py",
+            "tile_lifetime/nvtx_range.py",
+            "tile_lifetime/ordered_accumulation_event_schedule.py",
+            "tile_lifetime/partitioned_gemm_program.py",
+            "tile_lifetime/partitioned_gemm_reference.py",
+            "tile_lifetime/physical_artifact_compiler.py",
+            "tile_lifetime/physical_event_cover.py",
+            "tile_lifetime/physical_normalized_exp_contract.py",
+            "tile_lifetime/physical_schedule_semantics.py",
+            "tile_lifetime/physical_task_contract.py",
+            "tile_lifetime/pipeline_conformance.py",
+            "tile_lifetime/plan.py",
+            "tile_lifetime/qkv_rope.py",
+            "tile_lifetime/quack_gemm_codegen.py",
+            "tile_lifetime/quack_partitioned_gemm_adapter.py",
+            "tile_lifetime/quack_partitioned_mainloop.py",
+            "tile_lifetime/reference.py",
+            "tile_lifetime/reference_moe_recovery.py",
+            "tile_lifetime/reference_pipeline.py",
+            "tile_lifetime/reference_semantic_recovery.py",
+            "tile_lifetime/relation.py",
+            "tile_lifetime/relation_transport.py",
+            "tile_lifetime/right_resource_event_schedule.py",
+            "tile_lifetime/right_resource_jax_tables.py",
+            "tile_lifetime/routed_attention.py",
+            "tile_lifetime/routed_attention_frontend.py",
+            "tile_lifetime/routed_attention_plan.py",
+            "tile_lifetime/row_normalization_jax.py",
+            "tile_lifetime/row_normalization_reference_pipeline.py",
+            "tile_lifetime/row_normalization_training.py",
+            "tile_lifetime/runtime.py",
+            "tile_lifetime/segmented_grouped_contract_event_schedule.py",
+            "tile_lifetime/semantic_erasure.py",
+            "tile_lifetime/shared_reverse_fusion.py",
+            "tile_lifetime/sm100_canonical_kernel_composition.py",
+            "tile_lifetime/sm100_grouped_contract_event_codegen.py",
+            "tile_lifetime/sm100_projected_routed_lowering.py",
+            "tile_lifetime/sm100_routed_lowering.py",
+            "tile_lifetime/sm100_selection_lowering.py",
+            "tile_lifetime/sm90_backward_accumulation.py",
+            "tile_lifetime/sm90_contract_binding.py",
+            "tile_lifetime/sm90_fold_map_contract.py",
+            "tile_lifetime/stateful_scan.py",
+            "tile_lifetime/stateful_scan_planner.py",
+            "tile_lifetime/stateful_scan_recovery.py",
+            "tile_lifetime/stateful_scan_reference.py",
+            "tile_lifetime/stateful_scan_task_pipeline.py",
+            "tile_lifetime/streaming_attention.py",
+            "tile_lifetime/streaming_attention_backward.py",
+            "tile_lifetime/streaming_attention_backward_reference.py",
+            "tile_lifetime/streaming_attention_executable.py",
+            "tile_lifetime/streaming_event_schedule.py",
+            "tile_lifetime/streaming_pullback_event_schedule.py",
+            "tile_lifetime/swiglu.py",
+            "tile_lifetime/task_plan_refinement.py",
+            "tile_lifetime/tensor_program.py",
+            "tile_lifetime/tensor_program_rewrites.py",
+            "tile_lifetime/terminal_gradient_layout.py",
+            "tile_lifetime/tile_program.py",
+            "tile_lifetime/tiled_fold_finalize.py",
+            "tile_lifetime/xla_axis_fold_ffi.py",
+            "tile_lifetime/xla_axis_fold_pipeline_ffi.py",
+            "tile_lifetime/xla_contract_relation_fold_ffi.py",
+            "tile_lifetime/xla_demand_sliced_contract.py",
+            "tile_lifetime/xla_fold_consumer_preparation.py",
+            "tile_lifetime/xla_hlo_recovery.py",
+            "tile_lifetime/xla_low_rank_gated_product.py",
+            "tile_lifetime/xla_low_rank_gated_product_ffi.py",
+            "tile_lifetime/xla_normalized_exp_contract_forward.py",
+            "tile_lifetime/xla_normalized_exp_contract_reverse.py",
+            "tile_lifetime/xla_partitioned_contract_fold.py",
+            "tile_lifetime/xla_partitioned_contract_map.py",
+            "tile_lifetime/xla_rank_two_contract_ffi.py",
+            "tile_lifetime/xla_relation_edge_reverse_ffi.py",
+            "tile_lifetime/xla_relation_program_recovery.py",
+            "tile_lifetime/xla_routed_forward_ffi.py",
+            "tile_lifetime/xla_routed_input_adjoint_ffi.py",
+            "tile_lifetime/xla_routed_shared_map_training_ffi.py",
+            "tile_lifetime/xla_routed_training_ffi.py",
+            "tile_lifetime/xla_routed_weight_gradient_ffi.py",
+            "tile_lifetime/xla_scalar_map_import.py",
+            "tile_lifetime/xla_segmented_input_adjoint_ffi.py",
+            "tile_lifetime/xla_shared_contract_multimap.py",
+            "tile_lifetime/xla_shared_contract_multimap_ffi.py",
+            "tile_lifetime/xla_source_indexed_fold_ffi.py",
+            "tile_lifetime/xla_streaming_attention_backward_ffi.py",
+            "tile_lifetime/xla_streaming_attention_training_regions.py",
+            "tile_lifetime/xla_weighted_relation_reverse_ffi.py",
+        )
+    ),
+    Path("lib/tile_lifetime/pyproject.toml"),
+)
 IGNORED_SOURCE_PARTS = frozenset({"__pycache__", ".pytest_cache"})
 REDACTED_VALUE = "[REDACTED]"
 KEY_LIKE_LOG_VALUE = re.compile(r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{32,}={0,2}(?![A-Za-z0-9+/_=-])")
@@ -171,6 +407,7 @@ class PrototypePaths:
     rmsnorm_contract_primal_checkpoint: Path
     generic_composition: Path
     generic_composition_diagnostics: Path
+    attention_canaries: Path
     logs: Path
     image_identity: Path
     hydration_identity: Path
@@ -194,6 +431,7 @@ class PrototypePaths:
             rmsnorm_contract_primal_checkpoint=workspace / "rmsnorm-contract-primal.json",
             generic_composition=workspace / "generic-composition.json",
             generic_composition_diagnostics=workspace / "generic-composition.ndjson",
+            attention_canaries=workspace / "attention-canaries.json",
             logs=workspace / "logs",
             image_identity=workspace / "base-image.identity",
             hydration_identity=workspace / "hydration-identities.json",
@@ -234,6 +472,14 @@ def _expected_authorization(source_manifest_sha256: str) -> dict[str, object]:
         "schema": AUTHORIZATION_SCHEMA,
         "schema_version": 1,
         "subjects": {
+            "attention": {
+                "boundaries": ["forward", "value_and_grad"],
+                "dimension": 128,
+                "gpu_target": "sm_90",
+                "index_relations": ["floor_division_head_group", "offset_causal_domain"],
+                "numerics": "fast",
+                "score_maps": ["scaled_identity", "scaled_tanh_softcap"],
+            },
             "map": {
                 "boundaries": ["mixed_value_gradient"],
                 "modes": ["disabled", "source_ordered", "fast"],
@@ -260,8 +506,7 @@ def _expected_authorization(source_manifest_sha256: str) -> dict[str, object]:
             },
             "rmsnorm_contract": {
                 "boundaries": ["primal", "composed"],
-                "composed_bundle_shapes": authorization_bundle_shapes(COMPOSED_BUNDLE_SHAPES),
-                "composed_topology": "reviewed_hybrid_exact_nonperformance_contract",
+                "composed_topology": "telemetry_non_normative",
                 "coordinate_order": "all_primal_before_any_composed",
                 "disabled_jax_reference": True,
                 "disabled_jax_role": "diagnostic_only_never_threshold_gated",
@@ -332,12 +577,15 @@ def _expected_authorization(source_manifest_sha256: str) -> dict[str, object]:
             },
             "python_package": {
                 "dependency_resolution": False,
-                "dependency_site_packages": str(BASE_RUNTIME_SITE_PACKAGES),
-                "dependency_source": "immutable_base_image_runtime",
+                "dependency_requirements": {
+                    "path": SM90_RUNTIME_REQUIREMENTS_RELATIVE.as_posix(),
+                    "sha256": SM90_RUNTIME_REQUIREMENTS_SHA256,
+                },
+                "dependency_source": "authorization_bound_hashed_requirements",
                 "distribution": "jax",
                 "expected_base_version": JAX_PYTHON_VERSION,
-                "install_method": "site-packages-pth",
-                "network": False,
+                "install_method": "uv_require_hashes_then_offline_custom_jax",
+                "network": "hydration_only",
                 "runtime_isolation": "venv_without_system_site_packages",
                 "source": "pinned_hydrated_checkout",
             },
@@ -388,6 +636,60 @@ def _build_commands(paths: PrototypePaths, runner_repository: Path) -> tuple[lis
     return hydrate, offline
 
 
+def _sm90_runtime_hydration_command(paths: PrototypePaths, runner_repository: Path) -> list[str]:
+    return [
+        str(UV),
+        "pip",
+        "install",
+        "--python",
+        str(paths.runtime / "bin/python"),
+        "--require-hashes",
+        "--requirements",
+        str(runner_repository / SM90_RUNTIME_REQUIREMENTS_RELATIVE),
+    ]
+
+
+def _installed_distribution_versions(runtime_python: Path) -> tuple[dict[str, str], ...]:
+    script = """
+import importlib.metadata
+import json
+
+distributions = sorted(
+    ({"name": distribution.metadata["Name"], "version": distribution.version}
+     for distribution in importlib.metadata.distributions()),
+    key=lambda item: (item["name"].lower().replace("_", "-"), item["version"]),
+)
+print(json.dumps(distributions, sort_keys=True, separators=(",", ":")))
+"""
+    result = subprocess.run(
+        [str(runtime_python), "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        document = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("runtime distribution inventory is not JSON") from error
+    if type(document) is not list:
+        raise RuntimeError("runtime distribution inventory must be one list")
+    versions = []
+    normalized_names = set()
+    for item in document:
+        if type(item) is not dict or set(item) != {"name", "version"}:
+            raise RuntimeError("runtime distribution inventory entry is invalid")
+        name = item["name"]
+        version = item["version"]
+        if type(name) is not str or not name or type(version) is not str or not version:
+            raise RuntimeError("runtime distribution inventory name or version is invalid")
+        normalized = re.sub(r"[-_.]+", "-", name).lower()
+        if normalized in normalized_names:
+            raise RuntimeError(f"runtime distribution inventory repeats {normalized}")
+        normalized_names.add(normalized)
+        versions.append({"name": name, "version": version})
+    return tuple(versions)
+
+
 def _worker_command(paths: PrototypePaths, runner_repository: Path, role: str) -> list[str]:
     command = [
         str(paths.runtime / "bin/python"),
@@ -435,16 +737,36 @@ def _generic_composition_worker_command(paths: PrototypePaths, runner_repository
     ]
 
 
+def _attention_canary_command(paths: PrototypePaths, runner_repository: Path) -> list[str]:
+    return [
+        str(paths.runtime / "bin/python"),
+        str(runner_repository / "lib/shuttle/mlir/jax_patch/fast_attention_h100_benchmark.py"),
+        "--canary-only",
+        "--output",
+        str(paths.attention_canaries),
+    ]
+
+
 def _jax_source_command(paths: PrototypePaths, runner_repository: Path, action: str) -> list[str]:
-    command = [
+    return [
         str(paths.runtime / "bin/python"),
         str(runner_repository / JAX_SOURCE_HELPER_RELATIVE),
         action,
         str(paths.jax),
     ]
-    if action == "install":
-        command.extend(("--dependency-site-packages", str(BASE_RUNTIME_SITE_PACKAGES)))
-    return command
+
+
+def _tile_lifetime_source_command(
+    paths: PrototypePaths,
+    runner_repository: Path,
+    action: str,
+) -> list[str]:
+    return [
+        str(paths.runtime / "bin/python"),
+        str(runner_repository / TILE_LIFETIME_SOURCE_HELPER_RELATIVE),
+        action,
+        str(runner_repository / TILE_LIFETIME_REPOSITORY_RELATIVE),
+    ]
 
 
 def prototype_plan(
@@ -467,6 +789,14 @@ def prototype_plan(
     hydrate, offline = _build_commands(paths, runner_repository)
     install_patterns = [str(paths.wheels / f"{prefix}*.whl") for prefix in WHEEL_PREFIXES]
     phases = [
+        {
+            "name": "create_runtime",
+            "argv": [str(python), "-m", "venv", str(paths.runtime)],
+        },
+        {
+            "name": "hydrate_sm90_runtime",
+            "argv": _sm90_runtime_hydration_command(paths, runner_repository),
+        },
         {
             "name": "fetch_jax",
             "argv": ["git", "fetch", "--depth=1", JAX_URL, JAX_COMMIT],
@@ -507,10 +837,6 @@ def prototype_plan(
         {"name": "hydrate_bazel_repositories", "argv": hydrate, "cwd": str(paths.jax)},
         {"name": "offline_wheel_build", "argv": offline, "cwd": str(paths.jax)},
         {
-            "name": "create_runtime",
-            "argv": [str(python), "-m", "venv", str(paths.runtime)],
-        },
-        {
             "name": "install_wheels",
             "argv": [
                 str(paths.runtime / "bin/python"),
@@ -518,6 +844,7 @@ def prototype_plan(
                 "pip",
                 "install",
                 "--disable-pip-version-check",
+                "--force-reinstall",
                 "--no-deps",
                 "--no-index",
                 *install_patterns,
@@ -530,6 +857,18 @@ def prototype_plan(
         {
             "name": "verify_jax_runtime",
             "argv": _jax_source_command(paths, runner_repository, "verify"),
+        },
+        {
+            "name": "install_tile_lifetime_source",
+            "argv": _tile_lifetime_source_command(paths, runner_repository, "install"),
+        },
+        {
+            "name": "verify_tile_lifetime_runtime",
+            "argv": _tile_lifetime_source_command(paths, runner_repository, "verify"),
+        },
+        {
+            "name": "attention_canaries",
+            "argv": _attention_canary_command(paths, runner_repository),
         },
         {
             "name": "populate",
@@ -603,10 +942,23 @@ def source_bundle_document(bundle_root: Path) -> dict[str, object]:
                     "size": metadata.st_size,
                 }
             )
+    for relative in SOURCE_FILES:
+        path = bundle_root / relative
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError(f"source bundle file is missing or not regular: {relative}")
+        entries.append(
+            {
+                "path": relative.as_posix(),
+                "sha256": _sha256_file(path),
+                "size": path.stat().st_size,
+            }
+        )
+    entries.sort(key=lambda entry: entry["path"])
     return {
         "entries": entries,
+        "files": [path.as_posix() for path in SOURCE_FILES],
         "roots": [root.as_posix() for root in SOURCE_ROOTS],
-        "schema_version": 1,
+        "schema_version": 2,
     }
 
 
@@ -987,18 +1339,16 @@ def validate_rmsnorm_contract_result(document: object) -> dict[str, object]:
         _sha(observer["final_module_sha256"], "RMSNorm Contract final module")
         _sha(observer["generated_bundle_sha256"], "RMSNorm Contract generated bundle")
         topology = (observer["launch_count"], observer["temporary_count"])
-        if type(topology[0]) is not int or type(topology[1]) is not int:
-            raise ValueError("RMSNorm Contract bundle topology must use integers")
+        if type(topology[0]) is not int or topology[0] <= 0 or type(topology[1]) is not int or topology[1] < 0:
+            raise ValueError("RMSNorm Contract bundle topology must use nonnegative integer telemetry")
         if boundary == "primal":
             resources = PRIMAL_BUNDLE_SHAPES[shape]
             expected_topology = (resources["launches"], resources["temporaries"])
             if topology != expected_topology or observer["topology_status"] != PRIMAL_TOPOLOGY_STATUS:
                 raise ValueError("RMSNorm Contract primal bundle topology differs")
         else:
-            resources = COMPOSED_BUNDLE_SHAPES[shape]
-            expected_topology = (resources["launches"], resources["temporaries"])
-            if topology != expected_topology or observer["topology_status"] != COMPOSED_TOPOLOGY_STATUS:
-                raise ValueError("RMSNorm Contract composed bundle topology differs")
+            if observer["topology_status"] != COMPOSED_TOPOLOGY_STATUS:
+                raise ValueError("RMSNorm Contract composed topology telemetry status differs")
     if len(invocation_ids) != 8:
         raise ValueError("RMSNorm Contract observer invocation coverage differs")
     return document
@@ -1628,6 +1978,8 @@ def _hydration_identity(
     inspected: BuildInputs,
     source_identity: SourceCheckoutsIdentity,
     source_manifest_sha256: str,
+    installed_distributions: tuple[dict[str, str], ...],
+    runtime_requirements_sha256: str,
 ) -> dict[str, object]:
     return {
         "base_image": BASE_IMAGE,
@@ -1642,6 +1994,13 @@ def _hydration_identity(
             "integration_tree": INTEGRATION_TREE,
             "patched_checkouts": asdict(source_identity),
         },
+        "runtime": {
+            "installed_distributions": list(installed_distributions),
+            "requirements": {
+                "path": SM90_RUNTIME_REQUIREMENTS_RELATIVE.as_posix(),
+                "sha256": runtime_requirements_sha256,
+            },
+        },
         "tools": {
             "bazel": {
                 "identity": _identity([str(paths.bazel), "--version"]),
@@ -1654,6 +2013,10 @@ def _hydration_identity(
             "ptxas": {
                 "identity": _identity([str(cuda_root / "bin/ptxas"), "--version"]),
                 "sha256": _sha256_file(cuda_root / "bin/ptxas"),
+            },
+            "uv": {
+                "identity": _identity([str(UV), "--version"]),
+                "sha256": _sha256_file(UV),
             },
         },
     }
@@ -1713,12 +2076,18 @@ def execute_prototype(
     )
     source_manifest = require_source_bundle(runner_repository, authorization)
     source_manifest_sha256 = _sha256_bytes(canonical_json(source_manifest))
+    runtime_requirements = runner_repository / SM90_RUNTIME_REQUIREMENTS_RELATIVE
+    runtime_requirements_sha256 = _sha256_file(runtime_requirements)
+    if runtime_requirements_sha256 != SM90_RUNTIME_REQUIREMENTS_SHA256:
+        raise RuntimeError("SM90 runtime requirements differ from authorization")
     if platform.system().lower() != "linux":
         raise RuntimeError("Track 1 external prototype requires Linux")
     if not python.is_file() or not os.access(python, os.X_OK):
         raise RuntimeError("prototype Python 3.12 must resolve to one executable file")
     if not _identity([str(python), "--version"]).startswith("Python 3.12."):
         raise RuntimeError("prototype requires Python 3.12")
+    if UV.is_symlink() or not UV.is_file() or not os.access(UV, os.X_OK):
+        raise RuntimeError(f"prototype uv must be one executable regular file: {UV}")
     for tool in (cuda_root / "bin/nvcc", cuda_root / "bin/ptxas"):
         if tool.is_symlink() or not tool.is_file() or not os.access(tool, os.X_OK):
             raise RuntimeError(f"prototype CUDA tool must be one executable regular file: {tool}")
@@ -1726,6 +2095,19 @@ def execute_prototype(
     workspace.mkdir(mode=0o700)
     paths.logs.mkdir()
     paths.bazel.parent.mkdir()
+    _run(
+        [str(python), "-m", "venv", str(paths.runtime)],
+        cwd=None,
+        log=paths.logs / "runtime.log",
+        phase="create_runtime",
+    )
+    _run(
+        _sm90_runtime_hydration_command(paths, runner_repository),
+        cwd=runner_repository,
+        log=paths.logs / "sm90-runtime-hydration.log",
+        phase="hydrate_sm90_runtime",
+    )
+    installed_distributions = _installed_distribution_versions(paths.runtime / "bin/python")
     _initialize_repository(paths.jax, JAX_URL, JAX_COMMIT, paths.logs / "jax-init.log")
     _initialize_repository(paths.xla, XLA_URL, XLA_COMMIT, paths.logs / "xla-init.log")
     _require_source(paths.jax, JAX_COMMIT, tree=JAX_TREE)
@@ -1770,7 +2152,15 @@ def execute_prototype(
     require_offline_build_inputs(inspected, expected_tool_sha256=tools)
     apply_source_patches(inspected)
     patched_sources = source_checkouts_identity(jax_repository=paths.jax, xla_repository=paths.xla)
-    hydration_identity = _hydration_identity(paths, cuda_root, inspected, patched_sources, source_manifest_sha256)
+    hydration_identity = _hydration_identity(
+        paths,
+        cuda_root,
+        inspected,
+        patched_sources,
+        source_manifest_sha256,
+        installed_distributions,
+        runtime_requirements_sha256,
+    )
     paths.hydration_identity.write_bytes(canonical_json(hydration_identity))
     hydrate, offline = _build_commands(paths, runner_repository)
     _run(
@@ -1784,7 +2174,18 @@ def execute_prototype(
         jax_repository=paths.jax,
         xla_repository=paths.xla,
     )
-    if _hydration_identity(paths, cuda_root, inspected, patched_sources, source_manifest_sha256) != hydration_identity:
+    if (
+        _hydration_identity(
+            paths,
+            cuda_root,
+            inspected,
+            patched_sources,
+            source_manifest_sha256,
+            _installed_distribution_versions(paths.runtime / "bin/python"),
+            _sha256_file(runtime_requirements),
+        )
+        != hydration_identity
+    ):
         raise RuntimeError("hydrated tool identities changed before the offline build")
     require_source_checkouts_unchanged(
         patched_sources,
@@ -1800,18 +2201,13 @@ def execute_prototype(
     wheels = wheel_set(paths.wheels)
 
     _run(
-        [str(python), "-m", "venv", str(paths.runtime)],
-        cwd=None,
-        log=paths.logs / "runtime.log",
-        phase="create_runtime",
-    )
-    _run(
         [
             str(paths.runtime / "bin/python"),
             "-m",
             "pip",
             "install",
             "--disable-pip-version-check",
+            "--force-reinstall",
             "--no-deps",
             "--no-index",
             *map(str, wheels),
@@ -1838,6 +2234,27 @@ def execute_prototype(
         cwd=runner_repository,
         log=paths.logs / "jax-runtime-verify.log",
         phase="verify_jax_runtime",
+        environment=environment,
+    )
+    _run(
+        _tile_lifetime_source_command(paths, runner_repository, "install"),
+        cwd=runner_repository,
+        log=paths.logs / "tile-lifetime-source-install.log",
+        phase="install_tile_lifetime_source",
+        environment=environment,
+    )
+    _run(
+        _tile_lifetime_source_command(paths, runner_repository, "verify"),
+        cwd=runner_repository,
+        log=paths.logs / "tile-lifetime-runtime-verify.log",
+        phase="verify_tile_lifetime_runtime",
+        environment=environment,
+    )
+    _run(
+        _attention_canary_command(paths, runner_repository),
+        cwd=runner_repository,
+        log=paths.logs / "attention-canaries.log",
+        phase="attention_canaries",
         environment=environment,
     )
     _run(
@@ -1893,6 +2310,7 @@ def execute_prototype(
     generic_composition = validate_generic_composition_result(
         _load_canonical_document(paths.generic_composition, "generic composition result")
     )
+    attention_canaries = _load_canonical_document(paths.attention_canaries, "attention canary result")
     if paths.generic_composition_diagnostics.is_symlink() or not paths.generic_composition_diagnostics.is_file():
         raise RuntimeError("generic composition diagnostics must be one regular file")
     generic_composition_diagnostics = validate_generic_composition_diagnostics(
@@ -1919,4 +2337,5 @@ def execute_prototype(
         "rmsnorm_contract": rmsnorm_contract,
         "generic_composition": generic_composition,
         "generic_composition_diagnostics": list(generic_composition_diagnostics),
+        "attention_canaries": attention_canaries,
     }

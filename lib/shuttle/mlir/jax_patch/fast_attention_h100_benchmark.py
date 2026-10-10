@@ -25,9 +25,10 @@ import jax.numpy as jnp
 import numpy as np
 from jaxlib import _jax
 
-from shuttle import ExecutionMode, Materialization, Numerics, Tuning, compiler_options
+from shuttle import ExecutionMode, GpuTarget, Materialization, Numerics, Tuning, compiler_options
 
 
+@functools.cache
 def _load_grug_boundary() -> tuple[Callable[..., jax.Array], Callable[..., Any]]:
     attention_path = next(
         candidate for entry in sys.path if (candidate := Path(entry) / "levanter/grug/attention").is_dir()
@@ -57,9 +58,6 @@ def _load_grug_boundary() -> tuple[Callable[..., jax.Array], Callable[..., Any]]
     from levanter.grug.attention._fa4_cute_config import flash4_cute_kernel_config  # noqa: PLC0415
 
     return fa4_cute_attention_forward, flash4_cute_kernel_config
-
-
-fa4_cute_attention_forward, flash4_cute_kernel_config = _load_grug_boundary()
 
 
 WARMUP_ITERATIONS = 10
@@ -140,6 +138,7 @@ def attention(q: jax.Array, k: jax.Array, v: jax.Array) -> jax.Array:
 
 
 def grug_attention(q: jax.Array, k: jax.Array, v: jax.Array) -> jax.Array:
+    fa4_cute_attention_forward, flash4_cute_kernel_config = _load_grug_boundary()
     batch, key_value_heads, group, sequence, dimension = q.shape
     q_bshd = q.transpose(0, 3, 1, 2, 4).reshape(batch, sequence, key_value_heads * group, dimension)
     k_bshd = k.transpose(0, 2, 1, 3)
@@ -175,6 +174,7 @@ def offset_softcap_attention(q: jax.Array, k: jax.Array, v: jax.Array) -> jax.Ar
 def _shuttle_options() -> dict[str, bool | str]:
     return compiler_options(
         execution_mode=ExecutionMode.GPU_EXECUTABLE_BUNDLE,
+        gpu_target=GpuTarget.SM90,
         numerics=Numerics.FAST,
         tuning=Tuning(
             tile_sizes=(),
@@ -184,6 +184,94 @@ def _shuttle_options() -> dict[str, bool | str]:
             maximum_candidates=1,
         ),
     )
+
+
+def attention_value_and_grad(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    output_cotangent: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    output, pullback = jax.vjp(attention, q, k, v)
+    query_cotangent, key_cotangent, value_cotangent = pullback(output_cotangent)
+    return output, query_cotangent, key_cotangent, value_cotangent
+
+
+def _value_and_grad_canary(device: jax.Device) -> dict[str, Any]:
+    shape = Shape(batch=1, sequence=19, query_heads=6, key_value_heads=3, dimension=128)
+    operands = _inputs(shape, device)
+    generator = np.random.default_rng(20260829)
+    output_cotangent = jax.device_put(
+        generator.normal(size=operands[0].shape).astype(jnp.bfloat16),
+        device,
+    )
+    arguments = (*operands, output_cotangent)
+    ordinary = jax.jit(attention_value_and_grad).lower(*arguments).compile()
+    observer = getattr(_jax, "_shuttle_test_observer", None)
+    if observer is None:
+        raise RuntimeError("jaxlib lacks the Shuttle observer bridge")
+    with observer.subscribe() as capture:
+        shuttle = (
+            jax.jit(
+                attention_value_and_grad,
+                compiler_options=_shuttle_options(),
+            )
+            .lower(*arguments)
+            .compile()
+        )
+        snapshot = tuple(capture.snapshot())
+    expected = ordinary(*arguments)
+    actual = shuttle(*arguments)
+    jax.block_until_ready(actual)
+    names = ("output", "query_cotangent", "key_cotangent", "value_cotangent")
+    limits = {
+        "output": (0.015625, 0.001),
+        "query_cotangent": (0.5, 0.01),
+        "key_cotangent": (0.5, 0.01),
+        "value_cotangent": (0.5, 0.01),
+    }
+    metrics = {}
+    failures = []
+    for name, reference, observed in zip(names, expected, actual, strict=True):
+        reference_f32 = np.asarray(reference, dtype=np.float32)
+        observed_f32 = np.asarray(observed, dtype=np.float32)
+        absolute = np.abs(observed_f32 - reference_f32)
+        maximum = float(np.max(absolute, initial=0.0))
+        mean = float(np.mean(absolute))
+        finite = bool(np.all(np.isfinite(observed_f32)))
+        maximum_limit, mean_limit = limits[name]
+        if not finite or maximum > maximum_limit or mean > mean_limit:
+            failures.append(f"{name}: finite={finite}, maximum={maximum}, mean={mean}")
+        metrics[name] = {
+            "finite": finite,
+            "maximum_absolute_error_vs_xla": maximum,
+            "mean_absolute_error_vs_xla": mean,
+        }
+    if failures:
+        raise RuntimeError("attention value-and-grad canary failed: " + "; ".join(failures))
+    bundle_events = [event for event in snapshot if event[1] == "generated_bundle"]
+    if len(bundle_events) != 1:
+        raise RuntimeError("attention value-and-grad did not emit one generated bundle")
+    return {
+        "metrics": metrics,
+        "generated_bundle_sha256": bundle_events[0][8],
+        "shape": shape.__dict__,
+    }
+
+
+def _identity_tail_canary(device: jax.Device) -> dict[str, float | bool]:
+    operands = _inputs(Shape(batch=1, sequence=19, query_heads=6, key_value_heads=3, dimension=128), device)
+    ordinary = jax.jit(attention).lower(*operands).compile()
+    shuttle = jax.jit(attention, compiler_options=_shuttle_options()).lower(*operands).compile()
+    reference = np.asarray(ordinary(*operands).block_until_ready(), dtype=np.float32)
+    actual = np.asarray(shuttle(*operands).block_until_ready(), dtype=np.float32)
+    absolute = np.abs(actual - reference)
+    maximum = float(np.max(absolute, initial=0.0))
+    mean = float(np.mean(absolute))
+    finite = bool(np.all(np.isfinite(actual)))
+    if not finite or maximum > 0.015625 or mean > 0.001:
+        raise RuntimeError(f"identity tail canary failed: finite={finite}, maximum={maximum}, mean={mean}")
+    return {"finite": finite, "maximum_absolute_error_vs_xla": maximum, "mean_absolute_error_vs_xla": mean}
 
 
 def _inputs(shape: Shape, device: jax.Device) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -308,9 +396,27 @@ def run(shape: Shape) -> dict[str, Any]:
         "maximum_absolute_error_vs_xla": errors,
         "shuttle_generated_bundle_sha256": bundle_events[0][8],
         "softcap_axis1_canary": _softcap_canary(devices[0]),
+        "value_and_grad_canary": _value_and_grad_canary(devices[0]),
         "threshold_applied": True,
         "jax_version": jax.__version__,
         "grug_cutlass_object": cutlass_identity,
+    }
+
+
+def run_canaries() -> dict[str, Any]:
+    if jax.default_backend() != "gpu":
+        raise RuntimeError("attention canaries require the JAX GPU backend")
+    devices = jax.devices("gpu")
+    if len(devices) != 1 or "H100" not in devices[0].device_kind.upper():
+        raise RuntimeError("attention canaries require exactly one visible H100")
+    return {
+        "schema": "ordinary_jax_fast_attention_h100_canaries",
+        "schema_version": 1,
+        "device": devices[0].device_kind,
+        "jax_version": jax.__version__,
+        "identity_tail": _identity_tail_canary(devices[0]),
+        "softcap_axis1": _softcap_canary(devices[0]),
+        "value_and_grad": _value_and_grad_canary(devices[0]),
     }
 
 
@@ -318,9 +424,15 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--sequence", type=int, default=2048)
     parser.add_argument("--dimension", type=int, default=128)
+    parser.add_argument("--canary-only", action="store_true")
+    parser.add_argument("--output", type=Path)
     arguments = parser.parse_args()
-    report = run(Shape(1, arguments.sequence, 32, 8, arguments.dimension))
-    print(json.dumps(report, sort_keys=True, separators=(",", ":")))
+    report = run_canaries() if arguments.canary_only else run(Shape(1, arguments.sequence, 32, 8, arguments.dimension))
+    serialized = json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n"
+    if arguments.output is None:
+        print(serialized, end="")
+    else:
+        arguments.output.write_text(serialized)
 
 
 if __name__ == "__main__":

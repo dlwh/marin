@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "manifest_id": "shuttle_evaluation_v1",
-  "baseline_commit": "92b5dd7da84492d3766a51b8cb915a08b2a9e56a",
+  "baseline_commit": "fccc9e10f71b9eb6405bf84c4c9ed09efc89f6de",
   "acceptance_thresholds": {
     "oracle_latency_ratio": 1.2,
     "stretch_oracle_latency_ratio": 1.1
@@ -23,9 +23,9 @@
       "specification": "Representative shape and exact public layouts remain to be declared before timing."
     },
     {
-      "id": "dot_product_attention_representative_pending",
-      "declaration_status": "blocked",
-      "specification": "Representative shape and exact public layouts remain to be declared before timing."
+      "id": "dot_product_attention_bf16_b1_s2048_hq32_hkv8_dqk128_dv128_causal",
+      "declaration_status": "accepted",
+      "specification": "q:bf16[1,8,4,2048,128], k:bf16[1,8,2048,128], v:bf16[1,8,2048,128], do:bf16[1,8,4,2048,128], o:bf16[1,8,4,2048,128], dq:bf16[1,8,4,2048,128], dk:bf16[1,8,2048,128], dv:bf16[1,8,2048,128], scale:f32=1/sqrt(128), causal=true, layout:row_major_grouped_gqa"
     },
     {
       "id": "msa_representative_pending",
@@ -33,14 +33,14 @@
       "specification": "Representative shape and exact public layouts remain to be declared before timing."
     },
     {
-      "id": "gated_delta_net_representative_pending",
-      "declaration_status": "blocked",
-      "specification": "Representative shape and exact public layouts remain to be declared before timing."
+      "id": "stateful_scan_bf16_b1_t4_h2_k16_v16_r1_scalar_exp",
+      "declaration_status": "accepted",
+      "specification": "query:bf16[1,4,2,16], key:bf16[1,4,2,1,16], value:bf16[1,4,2,1,16], log_decay:f32[1,4,2], beta:f32[1,4,2,1], initial_state:f32[1,2,16,16], output_cotangent:f32[1,4,2,16], final_state_cotangent:f32[1,2,16,16], update_rank=1, decay=scalar_exp, layout:row_major_contiguous"
     },
     {
-      "id": "dense_transformer_block_representative_pending",
-      "declaration_status": "blocked",
-      "specification": "Representative shape and exact public layouts remain to be declared before timing."
+      "id": "dense_transformer_block_bf16_b1_s2048_m4096_f14336_hq32_hkv8_d128_causal",
+      "declaration_status": "accepted",
+      "specification": "x:bf16[1,2048,4096], input_scale:bf16[4096], query:bf16[4096,32,128], key:bf16[4096,8,128], value:bf16[4096,8,128], output:bf16[32,128,4096], mlp_scale:bf16[4096], gate:bf16[4096,14336], up:bf16[4096,14336], down:bf16[14336,4096], y:bf16[1,2048,4096], dy:bf16[1,2048,4096], loss:f32[]=mean(cast_f32(y)^2), gradients:bf16_matching_all_primals, epsilon=1e-6, causal=true, rope=false, optimizer=false, dot_precision=DEFAULT, layout:row_major_contiguous"
     },
     {
       "id": "local_moe_mlp_representative_pending",
@@ -79,8 +79,8 @@
       "id": "direct_h100_contract_map_backend",
       "path": ".agents/projects/tile_lifetime_compiler/h100_contract_map_backend_evidence.md",
       "source_commit": "92b5dd7da84492d3766a51b8cb915a08b2a9e56a",
-      "record_commit": "92b5dd7da84492d3766a51b8cb915a08b2a9e56a",
-      "sha256": "31d071ccaaccee4f84e0ffe7ed000a846fe76e209cb1efe7513ec5d99240d69d",
+      "record_commit": "0eea7949ad2e7376fefa9ad80deeb67f570cf71a",
+      "sha256": "b3d4fddf122e7d7597d145977244e17b08590340425869911f17590cd1804cb2",
       "architecture_conformance": "nonconforming",
       "format": "architecture_status_document_v1",
       "exclusion_reason": "architecture_nonconforming"
@@ -173,7 +173,7 @@
         "composed_forward_backward"
       ],
       "required_shapes": [
-        "dot_product_attention_representative_pending"
+        "dot_product_attention_bf16_b1_s2048_hq32_hkv8_dqk128_dv128_causal"
       ],
       "required_policies": [
         "source_ordered",
@@ -185,7 +185,6 @@
       ],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
         "oracle_not_pinned"
       ]
     },
@@ -225,7 +224,7 @@
         "composed_forward_backward"
       ],
       "required_shapes": [
-        "gated_delta_net_representative_pending"
+        "stateful_scan_bf16_b1_t4_h2_k16_v16_r1_scalar_exp"
       ],
       "required_policies": [
         "source_ordered",
@@ -237,8 +236,8 @@
       ],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
-        "oracle_not_pinned"
+        "oracle_not_pinned",
+        "performance_evidence_missing"
       ]
     },
     {
@@ -251,7 +250,7 @@
         "composed_forward_backward"
       ],
       "required_shapes": [
-        "dense_transformer_block_representative_pending"
+        "dense_transformer_block_bf16_b1_s2048_m4096_f14336_hq32_hkv8_d128_causal"
       ],
       "required_policies": [
         "source_ordered",
@@ -263,7 +262,6 @@
       ],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
         "oracle_not_pinned"
       ]
     },
@@ -966,7 +964,7 @@
     {
       "target_id": 3,
       "boundary": "forward",
-      "shape": "dot_product_attention_representative_pending",
+      "shape": "dot_product_attention_bf16_b1_s2048_hq32_hkv8_dqk128_dv128_causal",
       "policy": "source_ordered",
       "hardware": "h100",
       "status": "blocked",
@@ -976,14 +974,13 @@
       "evidence_ids": [],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
         "oracle_not_pinned"
       ]
     },
     {
       "target_id": 3,
       "boundary": "forward",
-      "shape": "dot_product_attention_representative_pending",
+      "shape": "dot_product_attention_bf16_b1_s2048_hq32_hkv8_dqk128_dv128_causal",
       "policy": "source_ordered",
       "hardware": "gb200_or_b200",
       "status": "blocked",
@@ -993,14 +990,13 @@
       "evidence_ids": [],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
         "oracle_not_pinned"
       ]
     },
     {
       "target_id": 3,
       "boundary": "forward",
-      "shape": "dot_product_attention_representative_pending",
+      "shape": "dot_product_attention_bf16_b1_s2048_hq32_hkv8_dqk128_dv128_causal",
       "policy": "fast",
       "hardware": "h100",
       "status": "blocked",
@@ -1010,14 +1006,13 @@
       "evidence_ids": [],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
         "oracle_not_pinned"
       ]
     },
     {
       "target_id": 3,
       "boundary": "forward",
-      "shape": "dot_product_attention_representative_pending",
+      "shape": "dot_product_attention_bf16_b1_s2048_hq32_hkv8_dqk128_dv128_causal",
       "policy": "fast",
       "hardware": "gb200_or_b200",
       "status": "blocked",
@@ -1027,14 +1022,13 @@
       "evidence_ids": [],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
         "oracle_not_pinned"
       ]
     },
     {
       "target_id": 3,
       "boundary": "backward",
-      "shape": "dot_product_attention_representative_pending",
+      "shape": "dot_product_attention_bf16_b1_s2048_hq32_hkv8_dqk128_dv128_causal",
       "policy": "source_ordered",
       "hardware": "h100",
       "status": "blocked",
@@ -1044,14 +1038,13 @@
       "evidence_ids": [],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
         "oracle_not_pinned"
       ]
     },
     {
       "target_id": 3,
       "boundary": "backward",
-      "shape": "dot_product_attention_representative_pending",
+      "shape": "dot_product_attention_bf16_b1_s2048_hq32_hkv8_dqk128_dv128_causal",
       "policy": "source_ordered",
       "hardware": "gb200_or_b200",
       "status": "blocked",
@@ -1061,14 +1054,13 @@
       "evidence_ids": [],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
         "oracle_not_pinned"
       ]
     },
     {
       "target_id": 3,
       "boundary": "backward",
-      "shape": "dot_product_attention_representative_pending",
+      "shape": "dot_product_attention_bf16_b1_s2048_hq32_hkv8_dqk128_dv128_causal",
       "policy": "fast",
       "hardware": "h100",
       "status": "blocked",
@@ -1078,14 +1070,13 @@
       "evidence_ids": [],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
         "oracle_not_pinned"
       ]
     },
     {
       "target_id": 3,
       "boundary": "backward",
-      "shape": "dot_product_attention_representative_pending",
+      "shape": "dot_product_attention_bf16_b1_s2048_hq32_hkv8_dqk128_dv128_causal",
       "policy": "fast",
       "hardware": "gb200_or_b200",
       "status": "blocked",
@@ -1095,14 +1086,13 @@
       "evidence_ids": [],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
         "oracle_not_pinned"
       ]
     },
     {
       "target_id": 3,
       "boundary": "composed_forward_backward",
-      "shape": "dot_product_attention_representative_pending",
+      "shape": "dot_product_attention_bf16_b1_s2048_hq32_hkv8_dqk128_dv128_causal",
       "policy": "source_ordered",
       "hardware": "h100",
       "status": "blocked",
@@ -1112,14 +1102,13 @@
       "evidence_ids": [],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
         "oracle_not_pinned"
       ]
     },
     {
       "target_id": 3,
       "boundary": "composed_forward_backward",
-      "shape": "dot_product_attention_representative_pending",
+      "shape": "dot_product_attention_bf16_b1_s2048_hq32_hkv8_dqk128_dv128_causal",
       "policy": "source_ordered",
       "hardware": "gb200_or_b200",
       "status": "blocked",
@@ -1129,14 +1118,13 @@
       "evidence_ids": [],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
         "oracle_not_pinned"
       ]
     },
     {
       "target_id": 3,
       "boundary": "composed_forward_backward",
-      "shape": "dot_product_attention_representative_pending",
+      "shape": "dot_product_attention_bf16_b1_s2048_hq32_hkv8_dqk128_dv128_causal",
       "policy": "fast",
       "hardware": "h100",
       "status": "blocked",
@@ -1146,14 +1134,13 @@
       "evidence_ids": [],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
         "oracle_not_pinned"
       ]
     },
     {
       "target_id": 3,
       "boundary": "composed_forward_backward",
-      "shape": "dot_product_attention_representative_pending",
+      "shape": "dot_product_attention_bf16_b1_s2048_hq32_hkv8_dqk128_dv128_causal",
       "policy": "fast",
       "hardware": "gb200_or_b200",
       "status": "blocked",
@@ -1163,7 +1150,6 @@
       "evidence_ids": [],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
         "oracle_not_pinned"
       ]
     },
@@ -1374,7 +1360,7 @@
     {
       "target_id": 5,
       "boundary": "forward",
-      "shape": "gated_delta_net_representative_pending",
+      "shape": "stateful_scan_bf16_b1_t4_h2_k16_v16_r1_scalar_exp",
       "policy": "source_ordered",
       "hardware": "h100",
       "status": "blocked",
@@ -1383,15 +1369,13 @@
       "performance_status": "not_started",
       "evidence_ids": [],
       "blockers": [
-        "architecture_path_unavailable",
-        "representative_shape_not_declared",
-        "oracle_not_pinned"
+        "performance_evidence_missing"
       ]
     },
     {
       "target_id": 5,
       "boundary": "forward",
-      "shape": "gated_delta_net_representative_pending",
+      "shape": "stateful_scan_bf16_b1_t4_h2_k16_v16_r1_scalar_exp",
       "policy": "source_ordered",
       "hardware": "gb200_or_b200",
       "status": "blocked",
@@ -1401,14 +1385,14 @@
       "evidence_ids": [],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
-        "oracle_not_pinned"
+        "oracle_not_pinned",
+        "performance_evidence_missing"
       ]
     },
     {
       "target_id": 5,
       "boundary": "forward",
-      "shape": "gated_delta_net_representative_pending",
+      "shape": "stateful_scan_bf16_b1_t4_h2_k16_v16_r1_scalar_exp",
       "policy": "fast",
       "hardware": "h100",
       "status": "blocked",
@@ -1418,14 +1402,13 @@
       "evidence_ids": [],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
-        "oracle_not_pinned"
+        "performance_evidence_missing"
       ]
     },
     {
       "target_id": 5,
       "boundary": "forward",
-      "shape": "gated_delta_net_representative_pending",
+      "shape": "stateful_scan_bf16_b1_t4_h2_k16_v16_r1_scalar_exp",
       "policy": "fast",
       "hardware": "gb200_or_b200",
       "status": "blocked",
@@ -1435,14 +1418,14 @@
       "evidence_ids": [],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
-        "oracle_not_pinned"
+        "oracle_not_pinned",
+        "performance_evidence_missing"
       ]
     },
     {
       "target_id": 5,
       "boundary": "backward",
-      "shape": "gated_delta_net_representative_pending",
+      "shape": "stateful_scan_bf16_b1_t4_h2_k16_v16_r1_scalar_exp",
       "policy": "source_ordered",
       "hardware": "h100",
       "status": "blocked",
@@ -1451,83 +1434,14 @@
       "performance_status": "not_started",
       "evidence_ids": [],
       "blockers": [
-        "architecture_path_unavailable",
-        "representative_shape_not_declared",
-        "oracle_not_pinned"
+        "oracle_not_pinned",
+        "performance_evidence_missing"
       ]
     },
     {
       "target_id": 5,
       "boundary": "backward",
-      "shape": "gated_delta_net_representative_pending",
-      "policy": "source_ordered",
-      "hardware": "gb200_or_b200",
-      "status": "blocked",
-      "architecture_status": "not_started",
-      "numerical_status": "not_started",
-      "performance_status": "not_started",
-      "evidence_ids": [],
-      "blockers": [
-        "architecture_path_unavailable",
-        "representative_shape_not_declared",
-        "oracle_not_pinned"
-      ]
-    },
-    {
-      "target_id": 5,
-      "boundary": "backward",
-      "shape": "gated_delta_net_representative_pending",
-      "policy": "fast",
-      "hardware": "h100",
-      "status": "blocked",
-      "architecture_status": "not_started",
-      "numerical_status": "not_started",
-      "performance_status": "not_started",
-      "evidence_ids": [],
-      "blockers": [
-        "architecture_path_unavailable",
-        "representative_shape_not_declared",
-        "oracle_not_pinned"
-      ]
-    },
-    {
-      "target_id": 5,
-      "boundary": "backward",
-      "shape": "gated_delta_net_representative_pending",
-      "policy": "fast",
-      "hardware": "gb200_or_b200",
-      "status": "blocked",
-      "architecture_status": "not_started",
-      "numerical_status": "not_started",
-      "performance_status": "not_started",
-      "evidence_ids": [],
-      "blockers": [
-        "architecture_path_unavailable",
-        "representative_shape_not_declared",
-        "oracle_not_pinned"
-      ]
-    },
-    {
-      "target_id": 5,
-      "boundary": "composed_forward_backward",
-      "shape": "gated_delta_net_representative_pending",
-      "policy": "source_ordered",
-      "hardware": "h100",
-      "status": "blocked",
-      "architecture_status": "not_started",
-      "numerical_status": "not_started",
-      "performance_status": "not_started",
-      "evidence_ids": [],
-      "blockers": [
-        "architecture_path_unavailable",
-        "representative_shape_not_declared",
-        "oracle_not_pinned"
-      ]
-    },
-    {
-      "target_id": 5,
-      "boundary": "composed_forward_backward",
-      "shape": "gated_delta_net_representative_pending",
+      "shape": "stateful_scan_bf16_b1_t4_h2_k16_v16_r1_scalar_exp",
       "policy": "source_ordered",
       "hardware": "gb200_or_b200",
       "status": "blocked",
@@ -1537,14 +1451,14 @@
       "evidence_ids": [],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
-        "oracle_not_pinned"
+        "oracle_not_pinned",
+        "performance_evidence_missing"
       ]
     },
     {
       "target_id": 5,
-      "boundary": "composed_forward_backward",
-      "shape": "gated_delta_net_representative_pending",
+      "boundary": "backward",
+      "shape": "stateful_scan_bf16_b1_t4_h2_k16_v16_r1_scalar_exp",
       "policy": "fast",
       "hardware": "h100",
       "status": "blocked",
@@ -1554,14 +1468,14 @@
       "evidence_ids": [],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
-        "oracle_not_pinned"
+        "oracle_not_pinned",
+        "performance_evidence_missing"
       ]
     },
     {
       "target_id": 5,
-      "boundary": "composed_forward_backward",
-      "shape": "gated_delta_net_representative_pending",
+      "boundary": "backward",
+      "shape": "stateful_scan_bf16_b1_t4_h2_k16_v16_r1_scalar_exp",
       "policy": "fast",
       "hardware": "gb200_or_b200",
       "status": "blocked",
@@ -1571,14 +1485,81 @@
       "evidence_ids": [],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
-        "oracle_not_pinned"
+        "oracle_not_pinned",
+        "performance_evidence_missing"
+      ]
+    },
+    {
+      "target_id": 5,
+      "boundary": "composed_forward_backward",
+      "shape": "stateful_scan_bf16_b1_t4_h2_k16_v16_r1_scalar_exp",
+      "policy": "source_ordered",
+      "hardware": "h100",
+      "status": "blocked",
+      "architecture_status": "not_started",
+      "numerical_status": "not_started",
+      "performance_status": "not_started",
+      "evidence_ids": [],
+      "blockers": [
+        "oracle_not_pinned",
+        "performance_evidence_missing"
+      ]
+    },
+    {
+      "target_id": 5,
+      "boundary": "composed_forward_backward",
+      "shape": "stateful_scan_bf16_b1_t4_h2_k16_v16_r1_scalar_exp",
+      "policy": "source_ordered",
+      "hardware": "gb200_or_b200",
+      "status": "blocked",
+      "architecture_status": "not_started",
+      "numerical_status": "not_started",
+      "performance_status": "not_started",
+      "evidence_ids": [],
+      "blockers": [
+        "architecture_path_unavailable",
+        "oracle_not_pinned",
+        "performance_evidence_missing"
+      ]
+    },
+    {
+      "target_id": 5,
+      "boundary": "composed_forward_backward",
+      "shape": "stateful_scan_bf16_b1_t4_h2_k16_v16_r1_scalar_exp",
+      "policy": "fast",
+      "hardware": "h100",
+      "status": "blocked",
+      "architecture_status": "not_started",
+      "numerical_status": "not_started",
+      "performance_status": "not_started",
+      "evidence_ids": [],
+      "blockers": [
+        "architecture_path_unavailable",
+        "oracle_not_pinned",
+        "performance_evidence_missing"
+      ]
+    },
+    {
+      "target_id": 5,
+      "boundary": "composed_forward_backward",
+      "shape": "stateful_scan_bf16_b1_t4_h2_k16_v16_r1_scalar_exp",
+      "policy": "fast",
+      "hardware": "gb200_or_b200",
+      "status": "blocked",
+      "architecture_status": "not_started",
+      "numerical_status": "not_started",
+      "performance_status": "not_started",
+      "evidence_ids": [],
+      "blockers": [
+        "architecture_path_unavailable",
+        "oracle_not_pinned",
+        "performance_evidence_missing"
       ]
     },
     {
       "target_id": 6,
       "boundary": "forward",
-      "shape": "dense_transformer_block_representative_pending",
+      "shape": "dense_transformer_block_bf16_b1_s2048_m4096_f14336_hq32_hkv8_d128_causal",
       "policy": "source_ordered",
       "hardware": "h100",
       "status": "blocked",
@@ -1588,14 +1569,13 @@
       "evidence_ids": [],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
         "oracle_not_pinned"
       ]
     },
     {
       "target_id": 6,
       "boundary": "forward",
-      "shape": "dense_transformer_block_representative_pending",
+      "shape": "dense_transformer_block_bf16_b1_s2048_m4096_f14336_hq32_hkv8_d128_causal",
       "policy": "source_ordered",
       "hardware": "gb200_or_b200",
       "status": "blocked",
@@ -1605,14 +1585,13 @@
       "evidence_ids": [],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
         "oracle_not_pinned"
       ]
     },
     {
       "target_id": 6,
       "boundary": "forward",
-      "shape": "dense_transformer_block_representative_pending",
+      "shape": "dense_transformer_block_bf16_b1_s2048_m4096_f14336_hq32_hkv8_d128_causal",
       "policy": "fast",
       "hardware": "h100",
       "status": "blocked",
@@ -1622,14 +1601,13 @@
       "evidence_ids": [],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
         "oracle_not_pinned"
       ]
     },
     {
       "target_id": 6,
       "boundary": "forward",
-      "shape": "dense_transformer_block_representative_pending",
+      "shape": "dense_transformer_block_bf16_b1_s2048_m4096_f14336_hq32_hkv8_d128_causal",
       "policy": "fast",
       "hardware": "gb200_or_b200",
       "status": "blocked",
@@ -1639,14 +1617,13 @@
       "evidence_ids": [],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
         "oracle_not_pinned"
       ]
     },
     {
       "target_id": 6,
       "boundary": "backward",
-      "shape": "dense_transformer_block_representative_pending",
+      "shape": "dense_transformer_block_bf16_b1_s2048_m4096_f14336_hq32_hkv8_d128_causal",
       "policy": "source_ordered",
       "hardware": "h100",
       "status": "blocked",
@@ -1656,14 +1633,13 @@
       "evidence_ids": [],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
         "oracle_not_pinned"
       ]
     },
     {
       "target_id": 6,
       "boundary": "backward",
-      "shape": "dense_transformer_block_representative_pending",
+      "shape": "dense_transformer_block_bf16_b1_s2048_m4096_f14336_hq32_hkv8_d128_causal",
       "policy": "source_ordered",
       "hardware": "gb200_or_b200",
       "status": "blocked",
@@ -1673,14 +1649,13 @@
       "evidence_ids": [],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
         "oracle_not_pinned"
       ]
     },
     {
       "target_id": 6,
       "boundary": "backward",
-      "shape": "dense_transformer_block_representative_pending",
+      "shape": "dense_transformer_block_bf16_b1_s2048_m4096_f14336_hq32_hkv8_d128_causal",
       "policy": "fast",
       "hardware": "h100",
       "status": "blocked",
@@ -1690,14 +1665,13 @@
       "evidence_ids": [],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
         "oracle_not_pinned"
       ]
     },
     {
       "target_id": 6,
       "boundary": "backward",
-      "shape": "dense_transformer_block_representative_pending",
+      "shape": "dense_transformer_block_bf16_b1_s2048_m4096_f14336_hq32_hkv8_d128_causal",
       "policy": "fast",
       "hardware": "gb200_or_b200",
       "status": "blocked",
@@ -1707,14 +1681,13 @@
       "evidence_ids": [],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
         "oracle_not_pinned"
       ]
     },
     {
       "target_id": 6,
       "boundary": "composed_forward_backward",
-      "shape": "dense_transformer_block_representative_pending",
+      "shape": "dense_transformer_block_bf16_b1_s2048_m4096_f14336_hq32_hkv8_d128_causal",
       "policy": "source_ordered",
       "hardware": "h100",
       "status": "blocked",
@@ -1724,14 +1697,13 @@
       "evidence_ids": [],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
         "oracle_not_pinned"
       ]
     },
     {
       "target_id": 6,
       "boundary": "composed_forward_backward",
-      "shape": "dense_transformer_block_representative_pending",
+      "shape": "dense_transformer_block_bf16_b1_s2048_m4096_f14336_hq32_hkv8_d128_causal",
       "policy": "source_ordered",
       "hardware": "gb200_or_b200",
       "status": "blocked",
@@ -1741,14 +1713,13 @@
       "evidence_ids": [],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
         "oracle_not_pinned"
       ]
     },
     {
       "target_id": 6,
       "boundary": "composed_forward_backward",
-      "shape": "dense_transformer_block_representative_pending",
+      "shape": "dense_transformer_block_bf16_b1_s2048_m4096_f14336_hq32_hkv8_d128_causal",
       "policy": "fast",
       "hardware": "h100",
       "status": "blocked",
@@ -1758,14 +1729,13 @@
       "evidence_ids": [],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
         "oracle_not_pinned"
       ]
     },
     {
       "target_id": 6,
       "boundary": "composed_forward_backward",
-      "shape": "dense_transformer_block_representative_pending",
+      "shape": "dense_transformer_block_bf16_b1_s2048_m4096_f14336_hq32_hkv8_d128_causal",
       "policy": "fast",
       "hardware": "gb200_or_b200",
       "status": "blocked",
@@ -1775,7 +1745,6 @@
       "evidence_ids": [],
       "blockers": [
         "architecture_path_unavailable",
-        "representative_shape_not_declared",
         "oracle_not_pinned"
       ]
     },

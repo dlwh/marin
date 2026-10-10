@@ -9,21 +9,21 @@ from tile_lifetime import (
     MaterializationDisposition,
     NumericalPolicy,
     ReductionSkeleton,
-    StreamingAttentionSkeleton,
     TransformSkeleton,
-    compile_erased_dense_transformer_region,
     compile_gemm_program,
     erase_dense_transformer_semantics,
     pairwise_product_expression,
     pairwise_silu_product_expression,
-    validate_plan_semantic_erasure,
 )
 from tile_lifetime.compiler import RowScalePlacement
 from tile_lifetime.dense_flow import FlowMap, FlowMapIteration
-from tile_lifetime.dense_region import compile_dense_transformer_region
+from tile_lifetime.dense_flow_planner import compile_reference_erased_dense_transformer_region
+from tile_lifetime.dense_region import compile_reference_dense_transformer_region
 from tile_lifetime.gemm_program import GENERIC_H100_GEMM_BACKEND
 from tile_lifetime.ir import TensorGraph
+from tile_lifetime.plan import ReferenceAttentionSkeleton
 from tile_lifetime.quack_gemm_codegen import generate_quack_gemm
+from tile_lifetime.semantic_erasure import validate_reference_plan_semantic_erasure
 from tile_lifetime.tensor_program import deserialize_scalar_expression
 
 BATCH = 1
@@ -127,14 +127,14 @@ def _dense_llama_region() -> TensorGraph:
 
 
 def test_dense_transformer_region_composes_expected_skeletons() -> None:
-    plan = compile_dense_transformer_region(
+    plan = compile_reference_dense_transformer_region(
         _dense_llama_region(),
         numerical_policy=NumericalPolicy.ALLOW_ROUNDING_REORDER,
     )
 
     assert [type(skeleton) for skeleton in plan.skeletons] == [
         GemmSkeleton,
-        StreamingAttentionSkeleton,
+        ReferenceAttentionSkeleton,
         GemmSkeleton,
         ReductionSkeleton,
         GemmSkeleton,
@@ -156,11 +156,11 @@ def test_dense_transformer_region_composes_expected_skeletons() -> None:
     assert plan.semantic_erasure_report is not None
     assert plan.semantic_erasure_report.is_clean
     assert len(plan.semantic_erasure_report.scheduling_keys) == 36
-    validate_plan_semantic_erasure(plan)
+    validate_reference_plan_semantic_erasure(plan)
 
 
 def test_dense_transformer_region_attaches_all_memory_bound_operations() -> None:
-    plan = compile_dense_transformer_region(
+    plan = compile_reference_dense_transformer_region(
         _dense_llama_region(),
         numerical_policy=NumericalPolicy.ALLOW_ROUNDING_REORDER,
     )
@@ -200,7 +200,7 @@ def test_dense_transformer_region_attaches_all_memory_bound_operations() -> None
 
 
 def test_dense_transformer_region_can_delay_rms_scale_in_consumer_epilogues() -> None:
-    plan = compile_dense_transformer_region(
+    plan = compile_reference_dense_transformer_region(
         _dense_llama_region(),
         numerical_policy=NumericalPolicy.ALLOW_ROUNDING_REORDER,
         rms_scale_placement=RowScalePlacement.CONSUMER_EPILOGUE,
@@ -247,7 +247,7 @@ def test_full_dense_pairwise_semantic_mutation_uses_the_same_generator() -> None
         tuple(mutated_map if operation is pairwise else operation for operation in erased.operations)
     )
 
-    plan = compile_erased_dense_transformer_region(
+    plan = compile_reference_erased_dense_transformer_region(
         mutated,
         row_scale_placement=RowScalePlacement.CONSUMER_PROLOGUE,
     )
@@ -260,21 +260,21 @@ def test_full_dense_pairwise_semantic_mutation_uses_the_same_generator() -> None
     source = generate_quack_gemm(compile_gemm_program(skeleton)).source
     assert "left_0 * right_0" in source
     assert "swiglu" not in source
-    validate_plan_semantic_erasure(plan)
+    validate_reference_plan_semantic_erasure(plan)
 
 
 def test_full_dense_recovery_uses_dataflow_instead_of_operation_slots() -> None:
     erased = erase_dense_transformer_semantics(_dense_llama_region())
     reordered = erased.with_operations(tuple(reversed(erased.operations)))
 
-    plan = compile_erased_dense_transformer_region(
+    plan = compile_reference_erased_dense_transformer_region(
         reordered,
         row_scale_placement=RowScalePlacement.CONSUMER_PROLOGUE,
     )
 
     assert [type(skeleton) for skeleton in plan.skeletons] == [
         GemmSkeleton,
-        StreamingAttentionSkeleton,
+        ReferenceAttentionSkeleton,
         GemmSkeleton,
         ReductionSkeleton,
         GemmSkeleton,
@@ -282,11 +282,11 @@ def test_full_dense_recovery_uses_dataflow_instead_of_operation_slots() -> None:
         ReductionSkeleton,
         GemmSkeleton,
     ]
-    validate_plan_semantic_erasure(plan)
+    validate_reference_plan_semantic_erasure(plan)
 
 
 def test_dense_transformer_region_materialization_boundaries_are_explicit() -> None:
-    plan = compile_dense_transformer_region(
+    plan = compile_reference_dense_transformer_region(
         _dense_llama_region(),
         numerical_policy=NumericalPolicy.ALLOW_ROUNDING_REORDER,
     )

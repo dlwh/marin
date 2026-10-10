@@ -9,7 +9,7 @@ module {
         contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT]
         : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
     %1 = stablehlo.tanh %0 : tensor<2x4xf32>
-    %2 = stablehlo.maximum %0, %1 : tensor<2x4xf32>
+    %2 = stablehlo.minimum %0, %1 : tensor<2x4xf32>
     return %2 : tensor<2x4xf32>
   }
 }

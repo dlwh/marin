@@ -1,8 +1,7 @@
 # Centered affine Contract preparation
 
-This checkpoint closes the generated-code boundary for the source-ordered
-centered affine preparation at the level of a generic physical specification.
-It does not claim a tensor-core implementation or a latency result.
+This checkpoint closes the generated-code and executable tensor-core boundary
+for generic source-ordered Map preparation feeding an SM90 Contract.
 
 The frontend and region planner erase centered affine normalization into two
 row Folds followed by this consumer preparation:
@@ -37,29 +36,16 @@ physical family.
 
 ## QuACK boundary
 
-The generated QuACK A-transform source now represents both delivery domains:
+The generated QuACK A-transform source represents compact values in both
+delivery domains and both physical dtypes:
 
-- `colvec_ktile_fp32` for an M-row value repeated across one K tile;
-- `kvec_mtile_fp32` for a K-feature value repeated across one M tile.
+- `mvec_bf16` and `mvec_fp32` for one value per Contract M coordinate;
+- `kvec_bf16` and `kvec_fp32` for one value per Contract K coordinate.
 
 The pinned patch applies cleanly to QuACK revision
-`84ef91df9bec87c7e4938517234fafb07ef844dd`. It generalizes the strip staging
-dtype and adds the K-feature kind. The K-feature host view at that revision is
-physically repeated per M tile; eliminating that small repetition is a later
-backend optimization rather than a semantic requirement.
-
-That revision still has exactly one auxiliary A-side TMA slot. Its
-`TransformAOperand` contains only `(A, sf)`, the host adapter requires exactly
-one auxiliary view, and `TransformAValue` rejects more than one auxiliary
-implementation. Centered affine preparation needs four independent values:
-row center, row scale, feature scale, and feature bias. Generated source is
-therefore syntactically complete but reports
-`executable_with_single_auxiliary_transform_backend = False`; the measured
-H100 runtime continues to fail closed instead of silently materializing or
-dropping an operand.
-
-A reusable high-throughput implementation needs a multi-auxiliary A-transform
-extension that owns:
+`84ef91df9bec87c7e4938517234fafb07ef844dd`. It replaces the single scale-factor
+slot with an ordered tuple of independently typed auxiliary tensors. The
+extension owns:
 
 1. a tuple of auxiliary TMA tensors and per-stage shared-memory layouts;
 2. descriptor, barrier-byte, and pipeline accounting for every tuple member;
@@ -67,9 +53,15 @@ extension that owns:
 4. matching runtime and trace-time host views;
 5. a cache key containing the operand delivery kinds and dtypes.
 
-This is not specific to centered normalization. The same extension supports
-any generated Contract preparation composed from multiple row- and
-feature-broadcast values.
+The compact host views alias the original `(M,)` and `(K,)` tensors; they do not
+repeat a vector per tile or materialize the mapped activation. One shared
+arrival barrier covers all auxiliary copies, with its expected byte count
+derived from the complete tuple. Each staged register value retains its source
+dtype until the generated scalar AST applies an explicit conversion.
+
+This is not specific to centered normalization. The adapter receives only the
+scalar AST, explicit Contract axes, leaf dtypes, and leaf delivery axes. The
+SM90 schedule fingerprint is independent of the AST.
 
 ## Delayed algebraic candidate
 
@@ -92,16 +84,23 @@ The bounded CUDA source is generated entirely from `GemmProgram` tile
 operations and generic operand-delivery attributes. It calls no external
 semantic kernel and contains no normalization, Transformer, or workload name.
 
-The prospective tensor-core path derives from the pinned QuACK A-transform
-and GEMM mainloop. It retains generic WGMMA, TMA, strip-layout, and pipeline
-machinery. No named normalization callback or model control flow is retained.
-The existing QuACK patch and the new delivery kind are insufficient by
-themselves because the multi-auxiliary transport described above is still
-missing.
+The tensor-core path derives from the pinned QuACK A-transform and GEMM
+mainloop. It retains generic WGMMA, TMA, strip-layout, and pipeline machinery.
+No named normalization callback or model control flow is retained.
 
-CPU tests compare the generated preparation boundary and the complete bounded
-Contract exactly with natural JAX BF16 semantics at the fixed test shape; both
-maximum and mean absolute differences are zero. Static audits verify one
-generated kernel, explicit FP32 preparation, BF16 round-to-nearest-even before
-the mainloop, ordered FP32 accumulation, no atomics, and no opaque semantic
-dependency. GPU correctness and performance remain unmeasured.
+CPU tests compare the generated preparation boundary and complete bounded
+Contract exactly with natural JAX BF16 semantics. Static audits verify explicit
+FP32 Fold-state delivery, source-ordered BF16 conversions, and typed auxiliary
+bindings.
+
+The H100 executable check evaluates
+`bf16(bf16(activation * rsqrt(fold_state / K + epsilon)) * feature_scale)`
+without mapped-activation or auxiliary-strip materialization. Against the full
+FP32 Fold-state reference, maximum and mean absolute errors are zero at both
+tested shapes. The generated median is 0.021208 ms for `256x512x512` and
+0.140734 ms for `2048x4096x4096`, respectively 0.263x and 0.713x the eager
+Map-then-Contract time. The generated kernel is 1.93x and 1.58x bare GEMM;
+those ratios expose the actual transform cost rather than hiding it behind a
+semantic special case. Raw samples, generated sources, requests, hashes, and
+environment versions are preserved in
+`benchmarks/artifacts/h100_typed_multi_aux_map_load_contract_20260903/`.

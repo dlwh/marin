@@ -14,10 +14,18 @@
 // RUN: shuttle-test-opt %S/Inputs/jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-backward.mlir --shuttle-gpu-executable-bundle-pipeline | FileCheck %s --check-prefix=BACKWARD-SMALL
 // RUN: shuttle-test-opt %S/Inputs/jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-composed.mlir --shuttle-gpu-executable-bundle-pipeline | FileCheck %s --check-prefix=COMPOSED-SMALL
 // RUN: shuttle-test-opt %S/Inputs/jax-0.10.1-bf16-layer_norm_81928ab3539c0f03-composed.mlir --shuttle-gpu-executable-bundle-fast-pipeline | FileCheck %s --check-prefix=COMPOSED-SMALL
+// RUN: shuttle-test-opt %S/Inputs/abi22-generic-two-fold-map-contract.mlir --shuttle-plan-row-fold-materialization --shuttle-verify-materialization-plan --shuttle-plan-simt32-row-fold-schedule --shuttle-verify-simt32-row-fold-schedule --shuttle-plan-source-event-lowering --shuttle-build-gpu-executable-bundle --shuttle-verify-gpu-executable-bundle --mlir-print-op-generic | FileCheck %s --check-prefix=TWO-FOLD
 
 // These fixtures constrain a generic connected Map/Fold graph.  The compiler
 // must not select behavior from function names, fixture digests, task counts,
 // or a LayerNorm semantic label.
+
+// TWO-FOLD: "shuttle.materialization_task"() <{{.*}}fold_region_output_sources = [#shuttle.source_ref<0, 0, 1, 0>, #shuttle.source_ref<0, 0, 4, 0>]
+// TWO-FOLD-SAME: fold_region_phases = [{{.*}}source = #shuttle.source_ref<0, 0, 1, 0>{{.*}}source = #shuttle.source_ref<0, 0, 4, 0>
+// TWO-FOLD: composition_kind = "map_contract"
+// TWO-FOLD-SAME: composition_recomputed_sources = [#shuttle.source_ref<0, 0, 2, 0>]
+// TWO-FOLD-COUNT-1: "shuttle.event_tensor"()
+// TWO-FOLD-COUNT-2: "shuttle.device_entry"()
 
 // FORWARD-MAPS-COUNT-29: "shuttle.map"(
 // FORWARD-MAPS-NOT: "shuttle.map"(

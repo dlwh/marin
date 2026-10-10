@@ -37,7 +37,8 @@ module attributes {
       ^bb0(%element: f32, %accumulator: f32):
         %sum = arith.addf %element, %accumulator : f32
         "shuttle.yield"(%sum) : (f32) -> ()
-      }) {accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 4>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
+      }) {
+indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0)>],accumulator_types = [f32], operandSegmentSizes = array<i32: 1, 1>, order_free = true, reduction_dimensions = array<i64: 1>, source = #shuttle.source_ref<0, 0, 0, 4>} : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
       "shuttle.yield"(%folded) : (tensor<2xf32>) -> ()
     }) {policy = #shuttle.policy<source_ordered>, source_refs = [#shuttle.source_ref<0, 0, 0, 0>, #shuttle.source_ref<0, 0, 0, 1>, #shuttle.source_ref<0, 0, 0, 2>, #shuttle.source_ref<0, 0, 0, 3>, #shuttle.source_ref<0, 0, 0, 4>]} : (tensor<1x4xf32>, tensor<2x4xf32>) -> tensor<2xf32>
     return %result : tensor<2xf32>

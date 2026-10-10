@@ -31,7 +31,7 @@ from tile_lifetime.plan import (
     PersistentTaskRole,
     PersistentWorkerRole,
     ReadinessEvent,
-    RegionPlan,
+    ReferenceRegionPlan,
     RewriteExplanation,
 )
 
@@ -81,7 +81,7 @@ def compile_mok_oracle_region(
     *,
     config: MoKOracleConfig,
     numerical_policy: NumericalPolicy,
-) -> RegionPlan:
+) -> ReferenceRegionPlan:
     """Build an oracle-backed plan that must not be counted as synthesis."""
     region = _recover_region(graph)
     reasons = _legality_reasons(region, config=config, numerical_policy=numerical_policy)
@@ -198,7 +198,7 @@ def _legality_reasons(
     return tuple(reasons)
 
 
-def _build_plan(region: _MoERegion, *, config: MoKOracleConfig) -> RegionPlan:
+def _build_plan(region: _MoERegion, *, config: MoKOracleConfig) -> ReferenceRegionPlan:
     tokens, hidden = region.shared.input.shape
     top_k = region.router.top_k
     local_experts, intermediate, _ = region.routed.gate_weight.shape
@@ -343,7 +343,7 @@ def _build_plan(region: _MoERegion, *, config: MoKOracleConfig) -> RegionPlan:
             "and conversion relative to the semantic graph"
         ),
     )
-    return RegionPlan(skeletons=(skeleton,), materializations=materializations, rewrites=(explanation,))
+    return ReferenceRegionPlan(skeletons=(skeleton,), materializations=materializations, rewrites=(explanation,))
 
 
 def _readiness_events(prefix: str) -> tuple[ReadinessEvent, ...]:

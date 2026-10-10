@@ -22,10 +22,10 @@ PATCH_NAMES = (
     "0004-register-shuttle-at-module-init.patch",
 )
 JAX_PATCH_SHA256 = (
-    "1e8b1400ee05bf8c8037277046113e1f1b1fae5ef56077899b7e853855e3424e",
+    "b8b5e0f40e0ace21436f9e50af09df59fa9ab37ac385acea0dd69af79ddb1d8c",
     "c4d5bc4aaa4b72ee7e2ecb44d28719be99da8defcf01ebd107308df41cb71942",
     "a98f04ac7afc6e5d8df63f2679cf89bc7cd0b29509a393da86f352cb6ba2ec9f",
-    "d00baeccc0f01af06288b60f4008dc83287afd9fd026b0fa4c316285247cc801",
+    "3e21c3e405331b53ef477b56f96588d78e8fa6867564289e12ce6756e81075b5",
 )
 XLA_PATCH_NAMES = (
     "0001-add-stablehlo-module-transform-hook.patch",

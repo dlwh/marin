@@ -19,6 +19,8 @@ from iris.cluster.bundle import MAX_BUNDLE_SIZE_BYTES
 from iris.cluster.client.bundle import create_workspace_zip
 
 payload = importlib.import_module("lib.tile_lifetime.benchmarks.h100_contract_map_source_payload")
+ROOT = Path(__file__).parents[3]
+SHUTTLE_SOURCE = ROOT / "lib/shuttle/src"
 
 
 def _git(repository: Path, *arguments: str) -> str:
@@ -323,7 +325,7 @@ def test_source_capsule_launcher_uses_selected_runtime_without_path_fallback(tmp
     environment = dict(os.environ)
     environment["JAX_PLATFORMS"] = "cpu"
     environment["PATH"] = str(poison)
-    environment.pop("PYTHONPATH", None)
+    environment["PYTHONPATH"] = str(SHUTTLE_SOURCE)
 
     subprocess.run(
         (
@@ -667,7 +669,7 @@ def test_source_capsule_run_export_keeps_process_alive_until_exact_ack(tmp_path)
     export = tmp_path / "export"
     environment = dict(os.environ)
     environment["JAX_PLATFORMS"] = "cpu"
-    environment.pop("PYTHONPATH", None)
+    environment["PYTHONPATH"] = str(SHUTTLE_SOURCE)
     process = subprocess.Popen(
         (
             sys.executable,
@@ -781,7 +783,7 @@ def test_source_capsule_launcher_identity_rejects_tampering(tmp_path):
 
 
 def test_real_repository_capsule_iris_bundle_is_complete_and_under_limit(tmp_path):
-    repository = Path(__file__).resolve().parents[3]
+    repository = ROOT
     source = tmp_path / "source-repository"
     subprocess.run(
         ("git", "clone", "--quiet", "--no-local", "--depth=1", repository.as_uri(), str(source)),
@@ -832,10 +834,10 @@ config = runner.RunnerConfig(
     require_jax_version="0.10.1",
 )
 runner.audit_imported_local_modules(config)
-"""
+    """
     environment = dict(os.environ)
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
-    environment["PYTHONPATH"] = payload.capsule_python_path(source_root, environment.get("PYTHONPATH"))
+    environment["PYTHONPATH"] = payload.capsule_python_path(source_root, str(SHUTTLE_SOURCE))
     subprocess.run(
         (
             sys.executable,

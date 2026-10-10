@@ -1,6 +1,7 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
+import ast
 from dataclasses import replace
 from enum import StrEnum
 from pathlib import Path
@@ -15,6 +16,8 @@ from tile_lifetime import (
     ContractPrimitive,
     FoldPrimitive,
     MapPrimitive,
+    NormalizedExpContractProgram,
+    ProgramValue,
     ScalarExpressionKind,
     StreamingAttentionStage,
     StreamingTileSchedule,
@@ -29,8 +32,17 @@ from tile_lifetime import (
     execute_tensor_program,
     scaled_score_map,
 )
-from tile_lifetime.h100_streaming_lowering import lower_h100_streaming_program
-from tile_lifetime.tensor_program import scalar_binary, scalar_constant
+from tile_lifetime.h100_streaming_lowering import (
+    Sm90ContractSchedule,
+    Sm90ForwardPipelineSchedule,
+    Sm90ProducerOperandOrientation,
+    lower_h100_streaming_program,
+    prove_sm90_packed_row_state_writes,
+    prove_sm90_producer_consumer_handoff,
+    select_sm90_contract_schedule,
+    sm90_relation_packed_layout,
+)
+from tile_lifetime.tensor_program import TensorAxis, scalar_binary, scalar_constant, scalar_input
 
 
 class ScoreMutation(StrEnum):
@@ -39,6 +51,132 @@ class ScoreMutation(StrEnum):
     CAUSAL = "causal"
     BIAS_AND_MASK = "bias_and_mask"
     TANH_SOFTCAP = "tanh_softcap"
+
+
+def test_sm90_swapped_producer_consumer_handoff_is_bijective_and_explicit() -> None:
+    relation_layout = sm90_relation_packed_layout(
+        batch_shape=(1,),
+        shared_relation_extent=1,
+        relation_group_shape=(1,),
+        owner_extent=128,
+        streamed_extent=128,
+        producer_feature_extent=128,
+        consumer_feature_extent=128,
+    )
+    contract = Sm90ContractSchedule(128, 128, relation_layout=relation_layout)
+    proof = prove_sm90_producer_consumer_handoff(
+        contract,
+        Sm90ProducerOperandOrientation.STREAMED_OWNER,
+    )
+
+    assert proof.logical_element_count == 128 * 128
+    assert proof.emitted_element_count == proof.logical_element_count
+    assert proof.unique_element_count == proof.logical_element_count
+    assert proof.shared_memory_bytes == 128 * 128 * 2
+    assert proof.requires_register_to_shared_transpose
+    assert proof.producer_fold_rows_per_thread == 32
+    assert proof.consumer_fold_rows_per_thread == 2
+    assert proof.required_schedule_local_handoffs == 3
+    assert proof.producer_fragment_axes == ("streamed", "owner")
+    assert proof.fold_fragment_axes == ("owner", "streamed")
+    assert proof.barrier_generations == ("empty_before_reuse", "full_after_store")
+    assert proof.barrier_participants == 256
+    assert proof.estimated_shared_storage_bytes == 197_632
+
+    with pytest.raises(ValueError, match="register-to-shared transpose"):
+        Sm90ForwardPipelineSchedule(
+            contract,
+            stages=2,
+            producer_operand_orientation=Sm90ProducerOperandOrientation.STREAMED_OWNER,
+        )
+    schedule = Sm90ForwardPipelineSchedule(
+        contract,
+        stages=2,
+        consumer_register_source=False,
+        producer_operand_orientation=Sm90ProducerOperandOrientation.STREAMED_OWNER,
+    )
+    assert schedule.producer_operand_orientation is Sm90ProducerOperandOrientation.STREAMED_OWNER
+
+
+def test_sm90_relation_layout_preserves_public_axes_and_selects_fa4_flattening() -> None:
+    layout = sm90_relation_packed_layout(
+        batch_shape=(2, 3),
+        shared_relation_extent=5,
+        relation_group_shape=(2, 4),
+        owner_extent=7,
+        streamed_extent=11,
+        producer_feature_extent=13,
+        consumer_feature_extent=17,
+    )
+
+    assert layout.public_owner_shape == (2, 3, 5, 2, 4, 7, 13)
+    assert layout.public_streamed_producer_shape == (2, 3, 5, 11, 13)
+    assert layout.public_streamed_consumer_shape == (2, 3, 5, 11, 17)
+    assert layout.owner_physical_shape(13) == (6, 7, 40, 13)
+    assert layout.streamed_physical_shape(13) == (6, 11, 5, 13)
+    assert layout.owner_coordinate_shape(13) == (7, 13, 40, 6)
+    assert layout.streamed_coordinate_shape(13) == (11, 13, 5, 6)
+    assert layout.streamed_coordinate_shape(17) == (11, 17, 5, 6)
+    assert layout.owner_coordinate_shape(17) == (7, 17, 40, 6)
+    assert layout.shared_relation_map.indices() == tuple(index // 8 for index in range(40))
+    assert layout.group_relation_maps[0].indices() == tuple((index // 4) % 2 for index in range(40))
+    assert layout.group_relation_maps[1].indices() == tuple(index % 4 for index in range(40))
+
+    proof = prove_sm90_packed_row_state_writes(layout, owner_tile=64)
+    assert proof.logical_row_count == 6 * 40 * 7
+    assert proof.emitted_write_count == proof.logical_row_count
+    assert proof.unique_write_count == proof.logical_row_count
+
+    batch_flat, shared, group_0, group_1, owner, feature = 5, 3, 1, 2, 6, 12
+    flattened_relation = shared * 8 + group_0 * 4 + group_1
+    physical_offset = sum(
+        index * stride
+        for index, stride in zip(
+            (batch_flat, owner, flattened_relation, feature),
+            layout.owner_physical_strides(13),
+            strict=True,
+        )
+    )
+    public_offset = ((((batch_flat * 5 + shared) * 2 + group_0) * 4 + group_1) * 7 + owner) * 13 + feature
+    assert physical_offset == public_offset
+
+
+def test_sm90_contract_schedule_is_selected_from_contraction_dimensions() -> None:
+    schedule = select_sm90_contract_schedule(
+        owner_extent=2048,
+        streamed_extent=2048,
+        producer_feature_extent=128,
+        consumer_feature_extent=128,
+    )
+
+    assert schedule.family == "sm90_contract_fold_v1"
+    assert (schedule.tile_m, schedule.tile_n, schedule.threads) == (128, 128, 384)
+
+    short_domain_schedule = select_sm90_contract_schedule(
+        owner_extent=19,
+        streamed_extent=23,
+        producer_feature_extent=128,
+        consumer_feature_extent=128,
+    )
+    assert (short_domain_schedule.tile_m, short_domain_schedule.tile_n, short_domain_schedule.threads) == (
+        64,
+        128,
+        256,
+    )
+
+    with pytest.raises(ValueError, match="one producer warpgroup"):
+        Sm90ForwardPipelineSchedule(
+            contract=Sm90ContractSchedule(tile_m=64, tile_n=128, threads=384),
+            stages=2,
+        )
+
+    with pytest.raises(ValueError, match="consumer features 64 or 128"):
+        select_sm90_contract_schedule(
+            owner_extent=2048,
+            streamed_extent=2048,
+            producer_feature_extent=128,
+            consumer_feature_extent=80,
+        )
 
 
 def _program_and_inputs(
@@ -108,12 +246,53 @@ def test_attention_source_is_only_contract_map_fold_and_derives_bounded_state() 
         ContractPrimitive,
         MapPrimitive,
     ]
-    assert generated.state.row_max.shape == (2, 4, 7)
-    assert generated.state.row_sum_exp.shape == (2, 4, 7)
-    assert generated.state.weighted_value_accumulator.shape == (2, 7, 4, 3)
+    assert isinstance(generated, NormalizedExpContractProgram)
+    assert generated.region.fold_state.row_max.shape == (2, 4, 7)
+    assert generated.region.fold_state.row_sum_exp.shape == (2, 4, 7)
+    assert generated.region.consumer.output.shape == (2, 7, 4, 3)
     assert generated.materialized_values == source.outputs
     assert generated.schedule.stages == tuple(StreamingAttentionStage)
     assert not hasattr(generated, "backend")
+
+
+def test_region_extraction_follows_dataflow_with_unrelated_interleaved_operations() -> None:
+    source, _ = _program_and_inputs(ScoreMutation.CAUSAL)
+    side_axis = source.inputs[0].axes[0]
+    side_input = ProgramValue("side.input", (side_axis,), DType.FP32)
+    side_output = ProgramValue("side.output", (side_axis,), DType.FP32)
+    side_map = MapPrimitive(
+        "unrelated side Map",
+        (side_input,),
+        side_output,
+        scalar_binary(
+            ScalarExpressionKind.ADD,
+            scalar_input(side_input.name),
+            scalar_constant(1.0),
+        ),
+    )
+    mixed = TensorProgram(
+        inputs=(*source.inputs, side_input),
+        operations=(source.operations[0], side_map, *source.operations[1:]),
+        outputs=(side_output, *source.outputs),
+    )
+
+    generated = derive_streaming_attention(
+        mixed,
+        schedule=StreamingTileSchedule(query_tile_size=3, key_value_tile_size=4, pipeline_depth=2),
+    )
+
+    assert generated.region.producer == source.operations[0]
+    assert generated.region.finalizer == source.operations[-1]
+    assert side_map not in (
+        generated.region.producer,
+        generated.region.score_map,
+        generated.region.fold_state.maximum,
+        generated.region.fold_state.center,
+        generated.region.fold_state.exponential,
+        generated.region.fold_state.normalizer,
+        generated.region.consumer,
+        generated.region.finalizer,
+    )
 
 
 @pytest.mark.parametrize("mutation", tuple(ScoreMutation))
@@ -164,7 +343,7 @@ def test_changed_score_map_changes_results_without_changing_streaming_structure(
     softcap_output = execute_streaming_attention(softcap, softcap_inputs)
 
     assert plain.schedule == softcap.schedule
-    assert plain.state == softcap.state
+    assert plain.region.fold_state == softcap.region.fold_state
     assert not np.allclose(plain_output, softcap_output, rtol=1e-4, atol=1e-4)
 
 
@@ -192,24 +371,28 @@ def test_finalization_mutation_reuses_the_derived_fold_schedule() -> None:
     )
     output_scale = 0.375
     scaled_finalize = replace(
-        generated.finalize,
+        generated.region.finalizer,
         expression=scalar_binary(
             ScalarExpressionKind.MULTIPLY,
-            generated.finalize.expression,
+            generated.region.finalizer.expression,
             scalar_constant(output_scale),
         ),
     )
     scaled_source = replace(source, operations=(*source.operations[:-1], scaled_finalize))
-    scaled_generated = replace(generated, source=scaled_source, finalize=scaled_finalize)
+    scaled_generated = replace(
+        generated,
+        source=scaled_source,
+        region=replace(generated.region, finalizer=scaled_finalize),
+    )
 
     materialized = execute_tensor_program(scaled_source, inputs)["attention.output"]
     streamed = execute_streaming_attention(scaled_generated, inputs)
     baseline = execute_streaming_attention(generated, inputs)
 
-    assert scaled_generated.qk == generated.qk
-    assert scaled_generated.score_map == generated.score_map
-    assert scaled_generated.pv == generated.pv
-    assert scaled_generated.state == generated.state
+    assert scaled_generated.region.producer == generated.region.producer
+    assert scaled_generated.region.score_map == generated.region.score_map
+    assert scaled_generated.region.consumer == generated.region.consumer
+    assert scaled_generated.region.fold_state == generated.region.fold_state
     assert scaled_generated.schedule == generated.schedule
     assert float(np.max(np.abs(streamed - materialized))) < 2e-6
     assert float(np.max(np.abs(streamed - baseline * output_scale))) < 2e-6
@@ -230,11 +413,11 @@ def test_grouped_head_index_map_is_explicit_and_matches_expanded_reference(
         schedule=StreamingTileSchedule(query_tile_size=3, key_value_tile_size=4, pipeline_depth=2),
     )
 
-    key_mapping = generated.qk.index_maps_for_input(1)
-    value_mapping = generated.pv.index_maps_for_input(1)
+    key_mapping = generated.region.producer.index_maps_for_input(1)
+    value_mapping = generated.region.consumer.index_maps_for_input(1)
     expected_mapping = AxisIndexMap(
-        domain_axis=generated.qk.output.axes[1],
-        operand_axis=generated.qk.inputs[1].axes[2],
+        domain_axis=generated.region.producer.output.axes[1],
+        operand_axis=generated.region.producer.inputs[1].axes[2],
         divisor=query_heads // key_value_heads,
     )
     assert key_mapping == (expected_mapping,)
@@ -259,6 +442,21 @@ def test_grouped_head_index_map_is_explicit_and_matches_expanded_reference(
     assert float(np.max(np.abs(streamed - reference))) < 2e-6
 
 
+def test_head_sharing_variants_are_only_axis_index_relations() -> None:
+    query_head = TensorAxis("query_head", 8)
+    relations = (
+        AxisIndexMap(query_head, TensorAxis("identity_head", 8)),
+        AxisIndexMap(query_head, TensorAxis("grouped_head", 2), divisor=4),
+        AxisIndexMap(query_head, TensorAxis("constant_head", 1), divisor=8),
+    )
+
+    assert tuple(relation.indices() for relation in relations) == (
+        (0, 1, 2, 3, 4, 5, 6, 7),
+        (0, 0, 0, 0, 1, 1, 1, 1),
+        (0, 0, 0, 0, 0, 0, 0, 0),
+    )
+
+
 def _h100_program(score_map):
     source = build_attention_tensor_program(
         batch_size=1,
@@ -271,9 +469,16 @@ def _h100_program(score_map):
         score_map=score_map,
         input_dtype=DType.BF16,
     )
-    return derive_streaming_attention(
+    logical = derive_streaming_attention(
         source,
         schedule=StreamingTileSchedule(query_tile_size=128, key_value_tile_size=128, pipeline_depth=2),
+    )
+    return replace(
+        logical,
+        schedule=Sm90ForwardPipelineSchedule(
+            contract=Sm90ContractSchedule(tile_m=128, tile_n=128),
+            stages=2,
+        ),
     )
 
 
@@ -282,10 +487,15 @@ def test_h100_lowering_recovers_causal_scale_schedule_and_gqa_without_cuda() -> 
 
     lowering = lower_h100_streaming_program(program)
 
-    assert lowering.score_map.scale == 0.125
-    assert lowering.score_map.causal
-    assert lowering.score_map.softcap is None
-    assert lowering.head_group_size == 4
+    assert lowering.score_map.domain_traversal.value == "lower_triangular"
+    assert lowering.score_map.expression == scalar_binary(
+        ScalarExpressionKind.MULTIPLY,
+        scalar_input(program.region.producer.output.name),
+        scalar_constant(0.125),
+    )
+    assert lowering.relation_layout.batch_shape == (1,)
+    assert lowering.relation_layout.relation_group_shape == (4,)
+    assert lowering.relation_layout.relation_group_size == 4
     assert (
         lowering.schedule.tile_m,
         lowering.schedule.tile_n,
@@ -293,47 +503,47 @@ def test_h100_lowering_recovers_causal_scale_schedule_and_gqa_without_cuda() -> 
     ) == (128, 128, 2)
 
 
-def test_h100_lowering_accepts_softcap_mutation_without_named_attention_dispatch() -> None:
+def test_h100_lowering_preserves_softcap_ast_without_named_attention_dispatch() -> None:
     score_map = apply_tanh_softcap(apply_causal_score_mask(scaled_score_map(0.0625)), cap=16.0)
     lowering = lower_h100_streaming_program(_h100_program(score_map))
 
-    assert lowering.score_map.scale == 0.0625
-    assert lowering.score_map.causal
-    assert lowering.score_map.softcap == 16.0
+    assert lowering.score_map.domain_traversal.value == "lower_triangular"
+    assert lowering.score_map.expression.kind is ScalarExpressionKind.MULTIPLY
+    assert any(operand.kind is ScalarExpressionKind.TANH for operand in lowering.score_map.expression.operands)
 
 
-def test_h100_lowering_changes_only_finalization_scale_for_output_map_mutation() -> None:
+def test_h100_lowering_preserves_finalizer_ast_without_changing_schedule() -> None:
     program = _h100_program(apply_causal_score_mask(scaled_score_map(0.125)))
     output_scale = 0.375
     scaled_finalize = replace(
-        program.finalize,
+        program.region.finalizer,
         expression=scalar_binary(
             ScalarExpressionKind.MULTIPLY,
-            program.finalize.expression,
+            program.region.finalizer.expression,
             scalar_constant(output_scale),
         ),
     )
-    scaled_program = replace(program, finalize=scaled_finalize)
+    scaled_program = replace(program, region=replace(program.region, finalizer=scaled_finalize))
 
     baseline = lower_h100_streaming_program(program)
     scaled = lower_h100_streaming_program(scaled_program)
 
-    assert baseline.output_scale == 1.0
-    assert scaled.output_scale == output_scale
+    assert baseline.finalizer_expression == program.region.finalizer.expression
+    assert scaled.finalizer_expression == scaled_finalize.expression
     assert scaled.score_map == baseline.score_map
     assert scaled.schedule == baseline.schedule
-    assert scaled.head_group_size == baseline.head_group_size
+    assert scaled.relation_layout == baseline.relation_layout
 
 
 def test_h100_lowering_reports_tensor_mask_as_missing_auxiliary_emitter() -> None:
     program = _h100_program(apply_arbitrary_score_mask(scaled_score_map(0.125)))
 
-    with pytest.raises(ValueError, match="auxiliary-tensor emitter"):
+    with pytest.raises(ValueError, match="lower-triangular comparison"):
         lower_h100_streaming_program(program)
 
 
 def test_sm90_streaming_skeleton_owns_fold_map_and_domain_semantics() -> None:
-    backend = Path(__file__).parents[1] / "backends" / "h100"
+    backend = Path(__file__).parents[1] / "src" / "tile_lifetime" / "backends" / "h100"
     physical_sources = tuple(
         (backend / filename).read_text() for filename in ("cute_streaming_base.py", "cute_streaming_sm90.py")
     )
@@ -353,8 +563,58 @@ def test_sm90_streaming_skeleton_owns_fold_map_and_domain_semantics() -> None:
         assert "finalize(output_scale=self.output_scale" in source
 
 
+def test_sm90_normalized_exp_kernel_abi_keeps_score_scaling_in_scalar_ast() -> None:
+    backend = Path(__file__).parents[1] / "src" / "tile_lifetime" / "backends" / "h100"
+
+    normalized_exp = ast.parse((backend / "cute_normalized_exp.py").read_text())
+    fold_state = next(
+        node for node in normalized_exp.body if isinstance(node, ast.ClassDef) and node.name == "NormalizedExpFoldState"
+    )
+    fold_fields = {node.target.id for node in fold_state.body if isinstance(node, ast.AnnAssign)}
+    score_map_helper = next(
+        node
+        for node in normalized_exp.body
+        if isinstance(node, ast.FunctionDef) and node.name == "apply_score_map_inner"
+    )
+    score_map_vjp_helper = next(
+        node
+        for node in normalized_exp.body
+        if isinstance(node, ast.FunctionDef) and node.name == "apply_score_map_vjp_inner"
+    )
+    assert "score_scale" not in fold_fields
+    assert "score_scale" not in {argument.arg for argument in score_map_helper.args.args}
+    assert "score_scale" not in {argument.arg for argument in score_map_vjp_helper.args.args}
+
+    for filename, class_name in (
+        ("cute_streaming_sm90.py", "ShuttleNormalizedExponentialContractSm90"),
+        ("cute_normalized_exp_backward_sm90.py", "ShuttleNormalizedExponentialBackwardSm90"),
+    ):
+        module = ast.parse((backend / filename).read_text())
+        kernel_class = next(node for node in module.body if isinstance(node, ast.ClassDef) and node.name == class_name)
+        call = next(node for node in kernel_class.body if isinstance(node, ast.FunctionDef) and node.name == "__call__")
+        assert "softmax_scale" not in {argument.arg for argument in call.args.args}
+
+    emitter = ast.parse((backend / "cute_streaming_backward_emitter.py").read_text())
+    forward_launch = next(
+        node for node in emitter.body if isinstance(node, ast.FunctionDef) and node.name == "_forward_launch"
+    )
+    scalar_arguments = {
+        call.args[0].value
+        for call in ast.walk(forward_launch)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "_scalar_argument"
+        and call.args
+        and isinstance(call.args[0], ast.Constant)
+        and isinstance(call.args[0].value, str)
+    }
+    assert scalar_arguments == {"scale_log2"}
+
+
 def test_normalized_exp_finalize_binds_register_state_before_child_region() -> None:
-    source = (Path(__file__).parents[1] / "backends" / "h100" / "cute_normalized_exp.py").read_text()
+    source = (
+        Path(__file__).parents[1] / "src" / "tile_lifetime" / "backends" / "h100" / "cute_normalized_exp.py"
+    ).read_text()
 
     assert "row_sum = self.row_sum" in source
     assert "row_max = self.row_max" in source

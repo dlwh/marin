@@ -442,7 +442,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "phased_pipeline": {
             "audit": {
                 "semantic_adapter": (
-                    "StreamingAttentionProgram structural adapter (not physically linked in this replay)"
+                    "NormalizedExpContractProgram structural adapter (not physically linked in this replay)"
                 ),
                 "physical_plan_source": "generic pipelined_contract_fold_program",
                 "physical_payload": "scalar_reference_pipeline",

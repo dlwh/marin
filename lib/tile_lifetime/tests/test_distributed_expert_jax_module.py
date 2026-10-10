@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 from shuttle.ir import DType
-from tile_lifetime import ExpertParallelConfig, NumericalPolicy
+from tile_lifetime import ExpertParallelConfig, NumericalPolicy, uniform_relation_placement
 from tile_lifetime.distributed_expert_jax_module import (
     DistributedExpertJaxModuleConfig,
     audit_handler_module_stablehlo,
@@ -66,7 +66,7 @@ def _training_plan():
             "routed_down_weight",
         ),
         gemm_accumulation_dtype=DType.FP32,
-        config=ExpertParallelConfig(expert_parallel_size=4),
+        config=ExpertParallelConfig(placement=uniform_relation_placement(destination_count=384, rank_count=4)),
         numerical_policy=NumericalPolicy.ALLOW_ROUNDING_REORDER,
     )
     return derive_expert_parallel_training_plan(forward)
@@ -96,6 +96,7 @@ def _module_plan(
         route_slots=2,
         destination_rank_by_item=np.arange(8, dtype=np.int32) // 2,
         destination_local_item_by_item=np.arange(8, dtype=np.int32) % 2,
+        source_placement=uniform_relation_placement(destination_count=8, rank_count=4),
         destination_capacity=5,
     )
     templates = _templates()
@@ -233,6 +234,7 @@ def test_fixed_relation_mutation_changes_index_plane_not_handler_programs() -> N
         route_slots=2,
         destination_rank_by_item=np.arange(8, dtype=np.int32) // 2,
         destination_local_item_by_item=np.arange(8, dtype=np.int32) % 2,
+        source_placement=uniform_relation_placement(destination_count=8, rank_count=4),
         destination_capacity=5,
     )
     templates = _templates()

@@ -19,9 +19,10 @@ JAXLIB_VERSION = "0.10.1"
 PINNED_XLA_REVISION = "9b635916ecc6df6efee62d8e4b0c7ef87ef84d69"
 
 
-def causal_gqa(q, k, v):
-    """Normalized causal GQA with a rank-five score domain."""
+def causal_gqa_with_score_program(q, k, v, score_program: Callable):
+    """Normalized causal GQA with a caller-supplied scalar score program."""
     scores = jnp.einsum("bhgqd,bhkd->bhgqk", q, k) * jnp.float32(0.125)
+    scores = score_program(scores)
     query = jnp.arange(17, dtype=jnp.int32).reshape(1, 1, 1, 17, 1)
     key = jnp.arange(17, dtype=jnp.int32).reshape(1, 1, 1, 1, 17)
     predicate = jnp.broadcast_to(key <= query, scores.shape)
@@ -31,6 +32,31 @@ def causal_gqa(q, k, v):
     denominator = jnp.sum(numerator, axis=4, keepdims=True)
     weights = numerator / denominator
     return jnp.einsum("bhgqk,bhkv->bhgqv", weights, v)
+
+
+def causal_gqa(q, k, v):
+    """Normalized causal GQA with a rank-five score domain."""
+    return causal_gqa_with_score_program(q, k, v, lambda scores: scores)
+
+
+def causal_gqa_softcap_score(q, k, v):
+    """The same contractions and Fold with a composed tanh score Map."""
+    return causal_gqa_with_score_program(
+        q,
+        k,
+        v,
+        lambda scores: jnp.float32(12.0) * jnp.tanh(scores / jnp.float32(12.0)),
+    )
+
+
+def causal_gqa_affine_score(q, k, v):
+    """The same contractions and Fold with a non-softcap affine score Map."""
+    return causal_gqa_with_score_program(
+        q,
+        k,
+        v,
+        lambda scores: scores * jnp.float32(0.75) + jnp.float32(0.125),
+    )
 
 
 def causal_gqa_with_output_epilogue(q, k, v):
@@ -63,6 +89,55 @@ def causal_gqa_bf16_benchmark(q, k, v):
 def causal_gqa_bf16_axis4(q, k, v):
     """Tiny BF16 public fixture preserving the accepted axis-4 semantics."""
     return causal_gqa(q.astype(jnp.float32), k.astype(jnp.float32), v.astype(jnp.float32)).astype(jnp.bfloat16)
+
+
+def causal_gqa_bf16_value_and_grad(q, k, v, output_cotangent):
+    """Ordinary-JAX value and VJP of the BF16 normalized contraction."""
+    output, pullback = jax.vjp(causal_gqa_bf16_benchmark, q, k, v)
+    return output, *pullback(output_cotangent)
+
+
+def causal_gqa_bf16_scalar_value_and_grad(q, k, v, output_cotangent):
+    """Ordinary-JAX scalar objective and gradients of the BF16 contraction."""
+
+    def objective(q, k, v, output_cotangent):
+        output = causal_gqa_bf16_benchmark(q, k, v)
+        return jnp.sum(output.astype(jnp.float32) * output_cotangent.astype(jnp.float32))
+
+    value, gradients = jax.value_and_grad(objective, argnums=(0, 1, 2))(q, k, v, output_cotangent)
+    return value, *gradients
+
+
+def attention(q, k, v):
+    """The exact math and conversion placement used by the H100 canary."""
+    scores = jnp.einsum("bhgqd,bhkd->bhgqk", q.astype(jnp.float32), k.astype(jnp.float32))
+    scores *= jnp.float32(q.shape[-1] ** -0.5)
+    sequence = q.shape[-2]
+    query_index = jnp.arange(sequence, dtype=jnp.int32)[:, None]
+    key_index = jnp.arange(sequence, dtype=jnp.int32)[None, :]
+    predicate = jnp.broadcast_to(key_index <= query_index, scores.shape)
+    scores = jax.lax.select(predicate, scores, jnp.full(scores.shape, -jnp.inf))
+    maximum = jnp.max(scores, axis=-1, keepdims=True)
+    exponentials = jnp.exp(scores - maximum)
+    normalized = exponentials / jnp.sum(exponentials, axis=-1, keepdims=True)
+    return jnp.einsum("bhgqk,bhkv->bhgqv", normalized, v.astype(jnp.float32)).astype(jnp.bfloat16)
+
+
+def attention_value_and_grad(q, k, v, output_cotangent):
+    """The exact value-and-VJP callable compiled by the H100 canary."""
+    output, pullback = jax.vjp(attention, q, k, v)
+    return output, *pullback(output_cotangent)
+
+
+def causal_gqa_bf16_finalized_value_and_grad(q, k, v, output_cotangent):
+    """Ordinary-JAX value and VJP with a nonlinear post-normalization Map."""
+
+    def finalized(q, k, v):
+        normalized = causal_gqa_benchmark(q.astype(jnp.float32), k.astype(jnp.float32), v.astype(jnp.float32))
+        return (jnp.tanh(normalized) + jnp.float32(0.25) * normalized).astype(jnp.bfloat16)
+
+    output, pullback = jax.vjp(finalized, q, k, v)
+    return output, *pullback(output_cotangent)
 
 
 def causal_gqa_long_key(q, k, v):
@@ -195,6 +270,18 @@ BENCHMARK_2048_SHAPES = (
     (1, 8, 2048, 128),
     (1, 8, 2048, 128),
 )
+VALUE_AND_GRAD_128_SHAPES = (
+    (1, 8, 4, 128, 128),
+    (1, 8, 128, 128),
+    (1, 8, 128, 128),
+    (1, 8, 4, 128, 128),
+)
+VALUE_AND_GRAD_19_SHAPES = (
+    (1, 3, 2, 19, 128),
+    (1, 3, 19, 128),
+    (1, 3, 19, 128),
+    (1, 3, 2, 19, 128),
+)
 LONG_KEY_SHAPES = ((1, 2, 2, 17, 8), (1, 2, 257, 8), (1, 2, 257, 7))
 RANK9_SHAPES = (
     (1, 1, 1, 1, 2, 2, 17, 8),
@@ -209,6 +296,18 @@ FIXTURES = (
         causal_gqa,
         AXIS4_SHAPES,
         "causal GQA [batch, kv_head, group, query, key], reduction axis 4",
+    ),
+    Fixture(
+        "jax-0.10.1-f32-causal-gqa-softcap-score-axis4.mlir",
+        causal_gqa_softcap_score,
+        AXIS4_SHAPES,
+        "causal GQA with a composed 12 * tanh(score / 12) scalar score Map",
+    ),
+    Fixture(
+        "jax-0.10.1-f32-causal-gqa-affine-score-axis4.mlir",
+        causal_gqa_affine_score,
+        AXIS4_SHAPES,
+        "causal GQA with a composed 0.75 * score + 0.125 scalar score Map",
     ),
     Fixture(
         "jax-0.10.1-f32-offset-softcap-gqa-online-axis1.mlir",
@@ -254,6 +353,34 @@ FIXTURES = (
         causal_gqa_bf16_axis4,
         AXIS4_SHAPES,
         "BF16 causal GQA axis-4 fixture with FP32 sufficient state",
+        argument_dtype="bfloat16",
+    ),
+    Fixture(
+        "jax-0.10.1-bf16-causal-gqa-value-and-grad-s128-d128.mlir",
+        causal_gqa_bf16_value_and_grad,
+        VALUE_AND_GRAD_128_SHAPES,
+        "ordinary-JAX BF16 causal GQA value and VJP, B1 Hq32 Hkv8 S128 D=Dv128",
+        argument_dtype="bfloat16",
+    ),
+    Fixture(
+        "jax-0.10.1-bf16-causal-gqa-scalar-value-and-grad-s128-d128.mlir",
+        causal_gqa_bf16_scalar_value_and_grad,
+        VALUE_AND_GRAD_128_SHAPES,
+        "ordinary-JAX scalar inner-product objective and gradients, B1 Hq32 Hkv8 S128 D=Dv128",
+        argument_dtype="bfloat16",
+    ),
+    Fixture(
+        "jax-0.10.1-bf16-causal-gqa-value-and-grad-s19-d128.mlir",
+        attention_value_and_grad,
+        VALUE_AND_GRAD_19_SHAPES,
+        "exact H100 canary BF16 normalized contraction value and VJP, B1 Hq6 Hkv3 S19 D=Dv128",
+        argument_dtype="bfloat16",
+    ),
+    Fixture(
+        "jax-0.10.1-bf16-causal-gqa-finalized-value-and-grad-s128-d128.mlir",
+        causal_gqa_bf16_finalized_value_and_grad,
+        VALUE_AND_GRAD_128_SHAPES,
+        "ordinary-JAX BF16 causal GQA value and VJP with tanh(U) + 0.25 * U finalizer",
         argument_dtype="bfloat16",
     ),
     Fixture(

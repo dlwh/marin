@@ -6,7 +6,6 @@ import pytest
 
 from shuttle.ir import DType
 from tile_lifetime import (
-    ExchangeRowMode,
     ExpertMaterializationSchedule,
     ExpertOverlapPolicy,
     ExpertParallelConfig,
@@ -14,14 +13,27 @@ from tile_lifetime import (
     GateUpPhysicalLayout,
     NumericalPolicy,
     ReadinessGranularity,
+    RelationProjectionAxis,
+    RelationProjectionSpec,
     TileStorage,
     TransportSelection,
     TransportSemantics,
     build_expert_parallel_relation_plan,
+    uniform_relation_placement,
 )
 from tile_lifetime.expert_parallel import ExpertParallelLegalityError, compile_expert_parallel_region
 from tile_lifetime.ir import TensorGraph
 from tile_lifetime.tile_program import TilePrimitive
+
+_PLACEMENT = uniform_relation_placement(destination_count=384, rank_count=4)
+_ASSIGNMENT_PROJECTION = RelationProjectionSpec(
+    grouping_axes=(RelationProjectionAxis.LOGICAL_EDGE,),
+    payload_axis=RelationProjectionAxis.SOURCE_ITEM,
+)
+
+
+def _config(**kwargs) -> ExpertParallelConfig:
+    return ExpertParallelConfig(placement=_PLACEMENT, **kwargs)
 
 
 def _global_moe_region(
@@ -65,16 +77,16 @@ def _global_moe_region(
 def test_generic_ep_lowering_exposes_atomic_global_to_local_dataflow() -> None:
     plan = compile_expert_parallel_region(
         _global_moe_region(),
-        config=ExpertParallelConfig(expert_parallel_size=4),
+        config=_config(),
         numerical_policy=NumericalPolicy.ALLOW_ROUNDING_REORDER,
     )
 
-    assert plan.ownership.global_expert_count == 384
-    assert plan.ownership.local_expert_count == 96
-    assert plan.ownership.owner(0) == (0, 0)
-    assert plan.ownership.owner(95) == (0, 95)
-    assert plan.ownership.owner(96) == (1, 0)
-    assert plan.ownership.owner(383) == (3, 95)
+    assert plan.placement.destination_count == 384
+    assert plan.placement.rank_count == 4
+    assert plan.placement.coordinate(0) == (0, 0)
+    assert plan.placement.coordinate(95) == (0, 95)
+    assert plan.placement.coordinate(96) == (1, 0)
+    assert plan.placement.coordinate(383) == (3, 95)
     assert plan.route_relation.slots_per_token == 6
     assert plan.segments.keys == ("local_expert",)
     assert plan.segments.padding_quantum == 256
@@ -150,24 +162,27 @@ def test_generic_ep_lowering_exposes_atomic_global_to_local_dataflow() -> None:
 def test_generic_ep_lowering_exposes_exchange_and_gate_up_layout_alternatives() -> None:
     plan = compile_expert_parallel_region(
         _global_moe_region(),
-        config=ExpertParallelConfig(expert_parallel_size=4),
+        config=_config(),
         numerical_policy=NumericalPolicy.ALLOW_ROUNDING_REORDER,
     )
 
-    assert {projection.mode for projection in plan.exchange_projections} == {
-        ExchangeRowMode.ASSIGNMENT,
-        ExchangeRowMode.COALESCED_TOKEN_OWNER,
+    assert set(projection.grouping_axes for projection in plan.exchange_projections) == {
+        (RelationProjectionAxis.LOGICAL_EDGE,),
+        (RelationProjectionAxis.SOURCE_ITEM, RelationProjectionAxis.DESTINATION_RANK),
     }
-    assert plan.selected_exchange_projection.mode is ExchangeRowMode.COALESCED_TOKEN_OWNER
+    assert plan.selected_exchange_projection.grouping_axes == (
+        RelationProjectionAxis.SOURCE_ITEM,
+        RelationProjectionAxis.DESTINATION_RANK,
+    )
     projection = plan.stage(ExpertParallelStageKind.PROJECT_EXCHANGE_ROWS)
-    assert "source_token" in projection.operation
+    assert "source_item" in projection.operation
     assert plan.gate_up_layout.selected is GateUpPhysicalLayout.CONCATENATED_E_2I_K
     assert "[local_expert, 2*intermediate, hidden]" in plan.gate_up_layout.legalization
 
     flows = {flow.value: flow for flow in plan.tile_flows}
     sent_x = flows["moe_output.exchange_x_rows"]
     assert sent_x.shape == (2048 * 4, 7168)
-    assert sent_x.logical_layout == "coalesced_token_owner_send_rows"
+    assert sent_x.logical_layout == "relation_projection_send_rows"
     assert sent_x.tile_shape == (128, 512)
     assert sent_x.readiness is ReadinessGranularity.MINIBATCH
     packed_weight = flows["moe_output.local_gate_up_weight"]
@@ -176,8 +191,7 @@ def test_generic_ep_lowering_exposes_exchange_and_gate_up_layout_alternatives() 
 
     separate_plan = compile_expert_parallel_region(
         _global_moe_region(),
-        config=ExpertParallelConfig(
-            expert_parallel_size=4,
+        config=_config(
             gate_up_layout=GateUpPhysicalLayout.SEPARATE_E_I_K,
         ),
         numerical_policy=NumericalPolicy.ALLOW_ROUNDING_REORDER,
@@ -190,7 +204,7 @@ def test_generic_ep_lowering_exposes_exchange_and_gate_up_layout_alternatives() 
 def test_generic_ep_buffer_lifetimes_are_derived_from_tile_flow_edges() -> None:
     plan = compile_expert_parallel_region(
         _global_moe_region(),
-        config=ExpertParallelConfig(expert_parallel_size=4),
+        config=_config(),
         numerical_policy=NumericalPolicy.ALLOW_ROUNDING_REORDER,
     )
 
@@ -213,15 +227,15 @@ def test_generic_ep_buffer_lifetimes_are_derived_from_tile_flow_edges() -> None:
 def test_generic_ep_assignment_row_exchange_is_a_distinct_legal_plan() -> None:
     plan = compile_expert_parallel_region(
         _global_moe_region(),
-        config=ExpertParallelConfig(expert_parallel_size=4, exchange_row_mode=ExchangeRowMode.ASSIGNMENT),
+        config=_config(exchange_projection=_ASSIGNMENT_PROJECTION),
         numerical_policy=NumericalPolicy.ALLOW_ROUNDING_REORDER,
     )
 
     sent_x = next(flow for flow in plan.tile_flows if flow.value == "moe_output.exchange_x_rows")
     assignments = 2048 * 6
     assert sent_x.shape == (assignments, 7168)
-    assert sent_x.logical_layout == "assignment_send_rows"
-    assert plan.selected_exchange_projection.mode is ExchangeRowMode.ASSIGNMENT
+    assert sent_x.logical_layout == "relation_projection_send_rows"
+    assert plan.selected_exchange_projection == _ASSIGNMENT_PROJECTION
     assert max(flow.shape[0] for flow in plan.tile_flows if len(flow.shape) >= 2) == 39_840
 
 
@@ -229,8 +243,7 @@ def test_generic_ep_lowering_rejects_local_weight_semantics_and_invalid_schedule
     with pytest.raises(ExpertParallelLegalityError) as exc_info:
         compile_expert_parallel_region(
             _global_moe_region(routed_weight_experts=96),
-            config=ExpertParallelConfig(
-                expert_parallel_size=4,
+            config=_config(
                 segment_padding=0,
                 exchange_workers=0,
                 exchange_worker_candidates=(12, 56),
@@ -262,7 +275,7 @@ def test_generic_ep_lowering_rejects_local_weight_semantics_and_invalid_schedule
 def test_generic_ep_capacity_drives_seeded_global_route_relation() -> None:
     plan = compile_expert_parallel_region(
         _global_moe_region(),
-        config=ExpertParallelConfig(expert_parallel_size=4),
+        config=_config(),
         numerical_policy=NumericalPolicy.ALLOW_ROUNDING_REORDER,
     )
     rng = np.random.default_rng(20260806)

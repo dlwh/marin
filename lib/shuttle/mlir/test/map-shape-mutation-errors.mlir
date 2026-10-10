@@ -8,7 +8,7 @@
 // RUN: not shuttle-test-opt --shuttle-annotate-source --shuttle-form-structural-regions --shuttle-convert-stablehlo-to-algebra --shuttle-verify-source-coverage --shuttle-test-set-structural-map-semantic --verify-each=false --shuttle-lower-algebra-to-stablehlo %S/Inputs/f32-map-shape-ops.mlir 2>&1 | FileCheck %s --check-prefix=SEMANTICS
 
 // DUPLICATE: broadcast input map dimensions must be unique, in range, and match direct or bounded singleton extents
-// RESHAPE: has an ambiguous singleton reshape indexing map
+// RESHAPE: has an invalid contiguous reshape indexing map
 // MAP-ATTR: has attributes with no StableHLO Map representation
 // YIELD-ATTR: has attributes with no stablehlo.return representation
 // SEMANTICS: structural Map semantics require an empty scalar body

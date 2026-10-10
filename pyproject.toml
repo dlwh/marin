@@ -60,6 +60,8 @@ constraint-dependencies = [
     # the pre-release component here only flips uv's per-package opt-in.
     "tfp-nightly>=0.1.dev0",
     "opentelemetry-semantic-conventions>=0.1b0",
+    "nvidia-cutlass-dsl-libs-base>=4.6.0.dev0",
+    "nvidia-cutlass-dsl-libs-cu13>=4.6.0.dev0",
 ]
 override-dependencies = [
     "omegaconf>=2.4.0.dev4",
