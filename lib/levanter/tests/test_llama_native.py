@@ -97,7 +97,9 @@ def test_native_hf_export_transformers_local_logits(tmp_path, tiny_hf_tokenizer_
     np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-5)
 
 
-@pytest.mark.parametrize("mask_kind", ["causal", "dense", "bidirectional", "offset", "none"])
+@pytest.mark.parametrize(
+    "mask_kind", ["causal", "dense", "dense_float", "explicit_int", "bidirectional", "offset", "none"]
+)
 @pytest.mark.parametrize("unbatched", [False, True])
 def test_native_lm_boundary_preserves_short_positions_masks_loss_and_gradients(mask_kind, unbatched):
     config = NativeLlamaLmConfig(
@@ -121,8 +123,12 @@ def test_native_lm_boundary_preserves_short_positions_masks_loss_and_gradients(m
         positions = positions.rearrange((Pos, Batch))
         segments = segments.rearrange((Pos, Batch))
     mask = NamedAttentionMask.causal().with_segment_ids(segments).with_sliding_window(3)
-    if mask_kind == "dense":
+    if mask_kind in ("dense", "dense_float", "explicit_int"):
         mask = mask.materialize(Pos, Pos.alias("key_position"))
+        if mask_kind == "dense_float":
+            mask = mask.astype(jnp.float32)
+        elif mask_kind == "explicit_int":
+            mask = NamedAttentionMask.explicit(mask.astype(jnp.int32))
     elif mask_kind == "bidirectional":
         mask = NamedAttentionMask.bidirectional_sliding_window(2).with_segment_ids(segments)
     elif mask_kind == "offset":

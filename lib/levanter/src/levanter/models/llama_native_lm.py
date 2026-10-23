@@ -319,7 +319,8 @@ class NativeLlamaLmHeadModel(ModuleWithStateDictSerialization, LmHeadModel[Nativ
                 "Dense, offset and bidirectional attention masks require llama_native reference attention"
             )
         assert dense is not None
-        return dense.broadcast_to((*batch_axes, Pos, KeyPos)).array
+        # Named masks use truth values; raw attention also accepts additive biases.
+        return dense.astype(jnp.bool_).broadcast_to((*batch_axes, Pos, KeyPos)).array
 
     def activations(
         self,
