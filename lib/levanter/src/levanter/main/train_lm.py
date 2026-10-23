@@ -14,6 +14,7 @@ import jax.numpy as jnp
 import jax.random as jrandom
 from haliax import Axis
 from haliax.partitioning import named_jit, round_axis_for_partitioning
+from jax.sharding import PartitionSpec as P
 
 import levanter
 import levanter.analysis
@@ -31,11 +32,14 @@ from levanter.checkpoint import latest_checkpoint_path, load_checkpoint
 from levanter.compat.hf_checkpoints import HFCompatConfig, build_generation_config
 from levanter.data.mixture import MixtureDataset
 from levanter.data.text.datasets import LmDataConfig
+from levanter.data.text.examples import GrugLmExample, named_lm_example_from_grug
 from levanter.eval_harness import LmEvalHarnessConfig
 from levanter.models.llama import LlamaConfig
+from levanter.models.llama_native import NativeLlamaSharding
+from levanter.models.llama_native_lm import NativeLlamaLmConfig
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel, split_activations
 from levanter.optim.config import AdamConfig, OptimizerConfig
-from levanter.trainer import Trainer, TrainerConfig
+from levanter.trainer import ExplicitTrainingLayout, Trainer, TrainerConfig
 from levanter.trainer_state import trainables_only
 from levanter.training_control import TrainingDashboard
 from levanter.utils.jax_utils import parameter_count
@@ -108,6 +112,36 @@ def _restore_lm_model_from_partial_checkpoint(
     return eqx.combine(checkpointed_trainables, source_model)
 
 
+def _native_llama_sharding(config: TrainerConfig) -> NativeLlamaSharding:
+    compute = config.compute_axis_mapping
+    parameters = config.parameter_axis_mapping
+    batch = compute.get(config.batch_axis_name, compute.get("batch"))
+    batch_axes = () if batch is None else (batch,) if isinstance(batch, str) else tuple(batch)
+    fsdp_axis = parameters.get("embed")
+    model_axis = compute.get("mlp")
+    if fsdp_axis is not None and not isinstance(fsdp_axis, str):
+        raise ValueError("llama_native requires one FSDP axis in mesh.param_mapping.embed")
+    if model_axis is not None and not isinstance(model_axis, str):
+        raise ValueError("llama_native requires one tensor-parallel axis in mesh.compute_mapping.mlp")
+    if model_axis is not None and (model_axis in batch_axes or model_axis == fsdp_axis):
+        raise ValueError("llama_native tensor-parallel placement must be distinct from batch/FSDP axes")
+    if compute.get("position") is not None:
+        raise ValueError("llama_native does not support sequence parallelism")
+    if compute.get("embed") is not None:
+        raise ValueError("llama_native gathers the FSDP embed dimension for computation")
+    for mapping in (compute, parameters):
+        for dimension in ("mlp", "heads", "kv_head", "vocab"):
+            if dimension in mapping and mapping[dimension] != model_axis:
+                raise ValueError(f"llama_native requires {dimension} to use the tensor-parallel axis {model_axis}")
+    return NativeLlamaSharding(batch_axes=batch_axes, fsdp_axis=fsdp_axis, model_axis=model_axis)
+
+
+def _build_lm_model(config: TrainLmConfig, Vocab: Axis, key, trainer: Trainer) -> LmHeadModel:
+    if isinstance(config.model, NativeLlamaLmConfig):
+        return config.model.build(Vocab, key=key, sharding=_native_llama_sharding(trainer.config))
+    return config.model.build(Vocab, key=key)
+
+
 def _load_lm_model_from_configured_source(
     *,
     config: TrainLmConfig,
@@ -134,12 +168,14 @@ def _load_lm_model_from_configured_source(
         # only in how main() uses the loaded weights.
         source = config.initialize_from_checkpoint_path or config.initialize_model_from_checkpoint_path
         checkpoint_path = latest_checkpoint_path(source)
-        model = eqx.filter_eval_shape(config.model.build, Vocab, key=model_key)
-        model = load_checkpoint(model, checkpoint_path, subpath="model", axis_mapping=parameter_axis_mapping)
+        model = eqx.filter_eval_shape(_build_lm_model, config, Vocab, model_key, trainer)
+        model = load_checkpoint(
+            model, checkpoint_path, subpath="model", axis_mapping=parameter_axis_mapping, mesh=trainer.device_mesh
+        )
         model = hax.shard(model, parameter_axis_mapping)
         model = named_jit(trainer.mp.cast_to_param, parameter_axis_mapping)(model)
     else:
-        model = config.model.build(Vocab, key=model_key)
+        model = _build_lm_model(config, Vocab, model_key, trainer)
 
     if not isinstance(config.adapter, NoAdaptorConfig):
         model = config.adapter.apply(model, key=adapter_key, axis_mapping=parameter_axis_mapping)
@@ -148,6 +184,21 @@ def _load_lm_model_from_configured_source(
 
 
 def main(config: TrainLmConfig):
+    native = isinstance(config.model, NativeLlamaLmConfig)
+    explicit_layout = None
+    if native:
+        if config.initialize_from_hf or config.use_hf_model_config or config.pad_tokenizer_to_match_model:
+            raise ValueError(
+                "llama_native training supports native checkpoints; HF initialization is not supported yet"
+            )
+        if not isinstance(config.adapter, NoAdaptorConfig):
+            raise ValueError("llama_native training does not support adapters yet")
+        if config.hf_save_path is not None or config.hf_upload is not None:
+            raise ValueError("llama_native training does not support HF export yet")
+        if config.trainer.quantization is not None:
+            raise ValueError("llama_native training does not support Haliax quantization")
+        config = dataclasses.replace(config, trainer=dataclasses.replace(config.trainer, use_explicit_mesh_axes=True))
+        _native_llama_sharding(config.trainer)
     tokenizer = config.data.the_tokenizer
 
     # The three weight-init sources are mutually exclusive: HF conversion, native full-state restore, and
@@ -190,7 +241,7 @@ def main(config: TrainLmConfig):
             # TODO: log diff of old and new config
             # NB: gross mutability
             config.model = converter.config_from_hf_config(converter.default_hf_config)
-    elif isinstance(config.model, HFCompatConfig):
+    elif isinstance(config.model, HFCompatConfig) and not native:
         converter = config.model.hf_checkpoint_converter()
         converter = converter.replaced(tokenizer=tokenizer)
         if config.pad_tokenizer_to_match_model:
@@ -199,9 +250,28 @@ def main(config: TrainLmConfig):
         converter = None
 
     levanter.trainer.initialize(config)
+    if native:
+        sharding = _native_llama_sharding(config.trainer)
+        mesh = config.trainer.device_mesh
+        for axis in (*sharding.batch_axes, sharding.fsdp_axis, sharding.model_axis):
+            if axis is not None and axis not in mesh.shape:
+                raise ValueError(f"llama_native placement axis {axis} is missing from the mesh")
+        if sharding.fsdp_axis is not None and config.model.hidden_dim % mesh.shape[sharding.fsdp_axis]:
+            raise ValueError("llama_native hidden_dim must be divisible by the FSDP mesh size")
+        if sharding.model_axis is not None:
+            model_size = mesh.shape[sharding.model_axis]
+            if config.model.num_kv_heads % model_size:
+                raise ValueError("llama_native num_kv_heads must be divisible by the tensor-parallel mesh size")
+            if config.model.intermediate_dim % model_size:
+                raise ValueError("llama_native intermediate_dim must be divisible by the tensor-parallel mesh size")
+        explicit_layout = ExplicitTrainingLayout(mesh, P(sharding.batch, None))
     optimizer = config.optimizer.build(config.trainer.num_train_steps)
 
-    def loss_function(model: LmHeadModel, example: LmExample, *, key=None):
+    def loss_function(model: LmHeadModel, example: LmExample | GrugLmExample, *, key=None):
+        if isinstance(example, GrugLmExample):
+            example = named_lm_example_from_grug(
+                example, model.Pos.resize(example.tokens.shape[-1]), batch_axis=config.trainer.batch_axis_name
+            )
         return model.compute_next_token_loss(example, key=key, logsumexp_weight=config.z_loss_weight)
 
     # Using the trainer as a context manager does 3 things:
@@ -209,7 +279,7 @@ def main(config: TrainLmConfig):
     # 2. Sets the axis mapping (for fsdp)
     # 3. Sets the global metrics tracker
     with (
-        Trainer(config.trainer, optimizer, loss_function) as trainer,
+        Trainer(config.trainer, optimizer, loss_function, explicit_layout=explicit_layout) as trainer,
         TrainingDashboard(config, trainer.request_checkpoint, config.trainer.id or "unknown"),
     ):
         # randomness in jax is tightly controlled by "keys" which are the states of the random number generators
@@ -225,6 +295,14 @@ def main(config: TrainLmConfig):
         # This allows Zero-3-style parameter sharding, where we shard the parameters and optimizer state across the mesh
         compute_axis_mapping = trainer.compute_axis_mapping
         parameter_axis_mapping = trainer.parameter_axis_mapping
+        if native:
+            # Named evaluation also rolls token IDs outside the model's loss
+            # boundary. Keep its loader/JIT batch placement canonical on unit axes.
+            compute_axis_mapping = dict(compute_axis_mapping)
+            batch_axes = _native_llama_sharding(config.trainer).batch_axes
+            compute_axis_mapping[config.trainer.EvalBatch.name] = tuple(
+                axis for axis in batch_axes if trainer.device_mesh.shape[axis] > 1
+            )
 
         # some axes we need
         EvalBatch = config.trainer.EvalBatch
@@ -248,12 +326,16 @@ def main(config: TrainLmConfig):
         # For most things, we just insist you specify the config right, but tokenizers often have strange numbers of
         # tokens: gpt-2 has 50257, for example. So we round up.
         vocab_size = len(tokenizer)
-        Vocab = round_axis_for_partitioning(Axis("vocab", vocab_size), parameter_axis_mapping)
+        vocab_mapping = parameter_axis_mapping
+        if native:
+            vocab_mapping = {**parameter_axis_mapping, "vocab": _native_llama_sharding(config.trainer).model_axis}
+        Vocab = round_axis_for_partitioning(Axis("vocab", vocab_size), vocab_mapping)
         if vocab_size != Vocab.size:
             logger.info(f"Rounding vocab size from {vocab_size} to {Vocab.size} for partitioning")
 
         # Get the training dataset
-        train_dataset = config.data.train_set(
+        make_train_dataset = config.data.train_mixture if native else config.data.train_set
+        train_dataset = make_train_dataset(
             Pos,
             config.trainer.batch_schedule,
             key=data_key,
@@ -285,10 +367,12 @@ def main(config: TrainLmConfig):
                 is_trainable=config.adapter.trainable_filter(initial_model),
             )
         elif isinstance(config.adapter, NoAdaptorConfig):
-            state = trainer.initial_state(training_key, model_init=lambda: config.model.build(Vocab, key=model_key))
+            state = trainer.initial_state(
+                training_key, model_init=lambda: _build_lm_model(config, Vocab, model_key, trainer)
+            )
         else:
             initial_model = config.adapter.apply(
-                config.model.build(Vocab, key=model_key),
+                _build_lm_model(config, Vocab, model_key, trainer),
                 key=adapter_key,
                 axis_mapping=parameter_axis_mapping,
             )

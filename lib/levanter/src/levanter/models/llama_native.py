@@ -197,7 +197,7 @@ class NativeLlamaAttention(eqx.Module):
     def __call__(
         self,
         x: Float[Array, "B S D"],
-        mask: AttentionMask,
+        mask: AttentionMask | Array,
         pos_ids: Int[Array, "B S"],
     ) -> Float[Array, "B S D"]:
         batch, sequence = x.shape[:2]
@@ -300,7 +300,7 @@ class NativeLlamaBlock(eqx.Module):
 
     @jax.named_call
     def __call__(
-        self, x: Float[Array, "B S D"], mask: AttentionMask, pos_ids: Int[Array, "B S"]
+        self, x: Float[Array, "B S D"], mask: AttentionMask | Array, pos_ids: Int[Array, "B S"]
     ) -> Float[Array, "B S D"]:
         attn = self.self_attn(self.input_layernorm(x), mask, pos_ids)
         x = x + (self.post_attn_layernorm(attn) if self.post_attn_layernorm is not None else attn)
@@ -369,7 +369,7 @@ class NativeLlamaModel(eqx.Module):
     def activations(
         self,
         tokens: Int[Array, "B S"],
-        mask: AttentionMask | None = None,
+        mask: AttentionMask | Array | None = None,
         *,
         pos_ids: Int[Array, "B S"] | None = None,
         key: PRNGKeyArray | None = None,
@@ -397,7 +397,7 @@ class NativeLlamaModel(eqx.Module):
     def logits(
         self,
         tokens: Int[Array, "B S"],
-        mask: AttentionMask | None = None,
+        mask: AttentionMask | Array | None = None,
         *,
         pos_ids: Int[Array, "B S"] | None = None,
         key: PRNGKeyArray | None = None,
@@ -409,7 +409,7 @@ class NativeLlamaModel(eqx.Module):
     def __call__(
         self,
         tokens: Int[Array, "B S"],
-        mask: AttentionMask | None = None,
+        mask: AttentionMask | Array | None = None,
         *,
         pos_ids: Int[Array, "B S"] | None = None,
         key: PRNGKeyArray | None = None,
@@ -421,7 +421,7 @@ class NativeLlamaModel(eqx.Module):
         tokens: Int[Array, "B S"],
         loss_weight: Float[Array, "B S"],
         *,
-        mask: AttentionMask | None = None,
+        mask: AttentionMask | Array | None = None,
         pos_ids: Int[Array, "B S"] | None = None,
         key: PRNGKeyArray | None = None,
         reduction: Literal["mean", "sum", "none"] = "mean",
