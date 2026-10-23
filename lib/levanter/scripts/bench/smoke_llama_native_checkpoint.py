@@ -367,6 +367,7 @@ def main(config: NativeCheckpointSmokeConfig):
         "all_processes_match": all_match,
     }
     _write_json(result_path, report)
+    logger.info("Native checkpoint smoke result: %s", json.dumps(report, sort_keys=True, allow_nan=False))
     if not all_match:
         raise ValueError(
             "Resumed training differs from uninterrupted training; inspect the per-process shard manifests"
