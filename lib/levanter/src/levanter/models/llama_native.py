@@ -9,6 +9,7 @@ The state-dict boundary uses canonical output-first Hugging Face parameter shape
 """
 
 import dataclasses
+import math
 from dataclasses import dataclass
 from typing import Literal, Mapping
 
@@ -104,7 +105,6 @@ class NativeLlamaConfig:
     head_dim: int | None = None
     max_seq_len: int = 2048
     layer_norm_epsilon: float = 1e-5
-    initializer_range: float = 0.02
     tie_word_embeddings: bool = False
     use_bias: bool = False
     use_layer_norm_weight: bool = True
@@ -169,7 +169,7 @@ class NativeLlamaAttention(eqx.Module):
                 out_features,
                 key=key,
                 use_bias=config.use_bias,
-                initializer_std=config.initializer_range,
+                initializer_std=1 / math.sqrt(config.hidden_dim),
                 storage_spec=sharding.column_storage,
                 compute_spec=sharding.column_compute,
             )
@@ -183,7 +183,7 @@ class NativeLlamaAttention(eqx.Module):
                 config.hidden_dim,
                 key=o_key,
                 use_bias=config.use_bias,
-                initializer_std=config.initializer_range,
+                initializer_std=1 / math.sqrt(config.num_heads * head_dim),
                 storage_spec=sharding.row_storage,
                 compute_spec=sharding.row_compute,
             ),
@@ -249,7 +249,7 @@ class NativeLlamaMlp(eqx.Module):
                 config.intermediate_dim,
                 key=key,
                 use_bias=config.use_bias,
-                initializer_std=config.initializer_range,
+                initializer_std=1 / math.sqrt(config.hidden_dim),
                 storage_spec=sharding.column_storage,
                 compute_spec=sharding.column_compute,
             )
@@ -262,7 +262,7 @@ class NativeLlamaMlp(eqx.Module):
                 config.hidden_dim,
                 key=down_key,
                 use_bias=config.use_bias,
-                initializer_std=config.initializer_range,
+                initializer_std=1 / math.sqrt(config.intermediate_dim),
                 storage_spec=sharding.row_storage,
                 compute_spec=sharding.row_compute,
             ),
@@ -328,26 +328,29 @@ class NativeLlamaModel(eqx.Module):
     ) -> "NativeLlamaModel":
         if get_abstract_mesh().empty:
             raise ValueError("NativeLlamaModel requires an explicit mesh context via jax.set_mesh")
-        layer_key, embed_key, head_key = jax.random.split(key, 3)
-        embeddings = config.initializer_range * jax.random.truncated_normal(
+        # Embeddings and an untied head share their key, preserving the existing initialization.
+        layer_key, embed_key = jax.random.split(key, 2)
+        embeddings = (1 / config.hidden_dim) * jax.random.truncated_normal(
             embed_key,
             -INITIALIZER_TRUNCATION_BOUND,
             INITIALIZER_TRUNCATION_BOUND,
             (config.vocab_size, config.hidden_dim),
             out_sharding=sharding.column_storage,
         )
+        # The one-layer initializer consumes its parent key without splitting.
+        layer_keys = layer_key[None] if config.num_layers == 1 else jax.random.split(layer_key, config.num_layers)
         layers = ArrayStacked.init(
             config.num_layers, NativeLlamaBlock, gradient_checkpointing=config.gradient_checkpointing
-        )(config, sharding, key=jax.random.split(layer_key, config.num_layers))
+        )(config, sharding, key=layer_keys)
         head = (
             None
             if config.tie_word_embeddings
             else Linear.init(
                 config.hidden_dim,
                 config.vocab_size,
-                key=head_key,
+                key=embed_key,
                 use_bias=False,
-                initializer_std=config.initializer_range,
+                initializer_std=1 / math.sqrt(config.hidden_dim),
                 storage_spec=sharding.column_storage,
                 compute_spec=sharding.column_compute,
             )
