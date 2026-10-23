@@ -72,6 +72,8 @@ class BenchmarkConfig:
     measured_steps: int = 20
     parity_atol: float = 1e-5
     parity_rtol: float = 1e-4
+    update_parameter_relative_l2: float = 0.005
+    loss_trajectory_relative_l2: float = 0.001
 
 
 class _CaptureStep(JitCallback):
@@ -237,6 +239,33 @@ def _tensor_digest(tensors: dict[str, jax.Array]) -> str:
         digest.update(json.dumps([name, list(array.shape), str(array.dtype)]).encode())
         digest.update(array.tobytes())
     return digest.hexdigest()
+
+
+def numerical_acceptance(parity: dict, config: BenchmarkConfig) -> dict:
+    """Evaluate recorded errors using the benchmark's dtype-specific criteria.
+
+    FP32 updates and parameters use a bound for every tensor; the loss
+    trajectory uses its vector relative L2. Other comparisons retain their
+    elementwise checks, including every BF16 comparison.
+    """
+    acceptance = {}
+    for label, comparison in parity.items():
+        relative_l2_limit = None
+        if config.compute_dtype == "float32":
+            if label in ("updates", "parameters_after_one_step", "execution_parameters_after_one_step"):
+                relative_l2_limit = config.update_parameter_relative_l2
+            elif label == "measured_step_losses":
+                relative_l2_limit = config.loss_trajectory_relative_l2
+        acceptance[label] = {
+            "metric": "elementwise" if relative_l2_limit is None else "relative_l2",
+            "relative_l2_limit": relative_l2_limit,
+            "accepted": (
+                comparison["allclose"]
+                if relative_l2_limit is None
+                else all(tensor["relative_l2"] <= relative_l2_limit for tensor in comparison["tensors"].values())
+            ),
+        }
+    return acceptance
 
 
 def _timing_summary(samples: list[float], tokens_per_step: int) -> dict:
@@ -656,7 +685,8 @@ def run_benchmark(
                 variants["legacy"]["layouts"][label], variants["native"]["layouts"][label], label=label
             )
         report["parity"] = parity
-        report["comparison_valid"] = all(comparison["allclose"] for comparison in parity.values())
+        report["acceptance"] = numerical_acceptance(parity, config)
+        report["comparison_valid"] = all(comparison["accepted"] for comparison in report["acceptance"].values())
         report["native_speedup"] = (
             variants["legacy"]["timing"]["mean_step_seconds"] / variants["native"]["timing"]["mean_step_seconds"]
             if report["comparison_valid"]

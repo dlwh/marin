@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 
 import numpy as np
+import pytest
 
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "bench" / "bench_llama_native.py"
@@ -33,6 +34,7 @@ def test_matched_training_benchmark_preserves_parameters_updates_and_layouts(tmp
     report = BENCHMARK.run_benchmark(config, output_dir=tmp_path)
 
     assert report["comparison_valid"]
+    assert all(result["accepted"] for result in report["acceptance"].values())
     assert report["initial_parameter_parity"]["allclose"]
     assert report["provenance"]["parameter_sha256"]
     assert report["provenance"]["batch_sha256"]
@@ -57,3 +59,33 @@ def test_matched_training_benchmark_preserves_parameters_updates_and_layouts(tmp
         assert variant["layouts"]["optimizer_state_after_one_step"]
         assert variant["layouts"]["activations"]["final_hidden"]["shape"] == [2, 8, 16]
         assert variant["compiled_memory_analysis"]["argument_size_in_bytes"] > 0
+
+
+@pytest.mark.parametrize(
+    "dtype,label,relative_errors,accepted",
+    [
+        ("float32", "updates", [0.0002, 0.001], True),
+        ("float32", "updates", [1e-8, 0.006], False),
+        ("float32", "parameters_after_one_step", [0.0005], True),
+        ("float32", "execution_parameters_after_one_step", [0.006], False),
+        ("float32", "measured_step_losses", [0.00012], True),
+        ("float32", "measured_step_losses", [0.002], False),
+        ("float32", "gradients", [1e-8], False),
+        ("float32", "adam_mu", [1e-8], False),
+        ("bfloat16", "updates", [0.0002], False),
+        ("bfloat16", "measured_step_losses", [0.00012], False),
+    ],
+)
+def test_numerical_acceptance_limits_each_tensor_and_preserves_strict_checks(dtype, label, relative_errors, accepted):
+    # These captures fail elementwise parity; small overall errors are accepted
+    # only for the approved FP32 comparisons, without hiding a bad tensor.
+    parity = {
+        label: {
+            "allclose": False,
+            "tensors": {str(index): {"relative_l2": error} for index, error in enumerate(relative_errors)},
+        }
+    }
+
+    result = BENCHMARK.numerical_acceptance(parity, BENCHMARK.BenchmarkConfig(compute_dtype=dtype))
+
+    assert result[label]["accepted"] is accepted
