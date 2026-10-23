@@ -439,6 +439,17 @@ def _run_variant(
     first_execution_seconds = time.perf_counter() - start
     state = result.new_state
     del result
+    execution_data = {
+        "execution_parameters_after_one_step": _canonical_parameters(state.model),
+        "execution_adam_mu": _canonical_parameters(state.opt_state[0].mu),
+        "execution_adam_nu": _canonical_parameters(state.opt_state[0].nu),
+        "execution_adam_count": {"count": state.opt_state[0].count},
+    }
+    for label, tensors in execution_data.items():
+        # The state is donated again below; keep independent host snapshots.
+        diagnostics[label] = jax.tree.map(np.array, tensors)
+        diagnostic_manifests[label] = _array_manifest(tensors)
+    del execution_data
     for _ in range(config.warmup_steps):
         result = step_fn(state, (batch,), {})
         jax.block_until_ready(result)
@@ -635,6 +646,10 @@ def run_benchmark(
             "adam_mu",
             "adam_nu",
             "adam_count",
+            "execution_parameters_after_one_step",
+            "execution_adam_mu",
+            "execution_adam_nu",
+            "execution_adam_count",
             "activations",
         ):
             _assert_matching_manifests(
