@@ -29,7 +29,7 @@ from levanter.callbacks._iris_status import iris_status_reporter
 from levanter.callbacks.labeled_eval import LabeledLmEvalConfig, add_labeled_lm_eval_callbacks
 from levanter.adaptor import AdaptorConfig, AdaptorExportConfig, NoAdaptorConfig
 from levanter.callbacks.tensorstore_callbacks import install_tensorstore_metrics_hook_if_enabled
-from levanter.checkpoint import latest_checkpoint_path, load_checkpoint
+from levanter.checkpoint import discover_checkpoint_candidates, latest_checkpoint_path, load_checkpoint
 from levanter.compat.hf_checkpoints import HFCompatConfig, ModelWithHfSerializationMixin, build_generation_config
 from levanter.data.mixture import MixtureDataset
 from levanter.data.text.datasets import LmDataConfig
@@ -152,6 +152,7 @@ def _load_lm_model_from_configured_source(
     adapter_key,
     parameter_axis_mapping,
     trainer: Trainer,
+    source_checkpoint_path: str | None = None,
 ) -> LmHeadModel:
     if config.initialize_from_hf:
         assert converter is not None
@@ -179,7 +180,7 @@ def _load_lm_model_from_configured_source(
         # Both load the checkpoint's `model` subtree into an abstract template. They differ
         # only in how main() uses the loaded weights.
         source = config.initialize_from_checkpoint_path or config.initialize_model_from_checkpoint_path
-        checkpoint_path = latest_checkpoint_path(source)
+        checkpoint_path = source_checkpoint_path or latest_checkpoint_path(source)
         model = eqx.filter_eval_shape(_build_lm_model, config, Vocab, model_key, trainer)
         model = load_checkpoint(
             model, checkpoint_path, subpath="model", axis_mapping=parameter_axis_mapping, mesh=trainer.device_mesh
@@ -308,9 +309,19 @@ def main(config: TrainLmConfig):
     ):
         checkpoint = trainer.checkpoint_to_load
         resuming = checkpoint is not None
+        source_checkpoint_path = None
         if isinstance(config.model, NativeLlamaLmConfig):
             if checkpoint is not None:
                 source_vocab_size = config.model.checkpoint_vocab_size(checkpoint.metadata)
+            else:
+                source = config.initialize_from_checkpoint_path or config.initialize_model_from_checkpoint_path
+                if source is not None:
+                    candidates = discover_checkpoint_candidates(source)
+                    if not candidates:
+                        raise FileNotFoundError(f"No complete checkpoint found in {source}")
+                    source_checkpoint = candidates[-1]
+                    source_checkpoint_path = source_checkpoint.path
+                    source_vocab_size = config.model.checkpoint_vocab_size(source_checkpoint.metadata)
             if source_vocab_size is None and config.initialize_from_hf:
                 if config.trainer.initialize_from is not None:
                     raise ValueError("Cannot specify both initialize_from_hf and initialize_from")
@@ -407,6 +418,7 @@ def main(config: TrainLmConfig):
             adapter_key=adapter_key,
             parameter_axis_mapping=parameter_axis_mapping,
             trainer=trainer,
+            source_checkpoint_path=source_checkpoint_path,
         )
         weight_source = config.initialize_from_hf or config.initialize_model_from_checkpoint_path is not None
         if weight_source and not resuming:
@@ -434,7 +446,7 @@ def main(config: TrainLmConfig):
             )
 
         if not resuming and config.initialize_from_checkpoint_path is not None:
-            checkpoint_path = latest_checkpoint_path(config.initialize_from_checkpoint_path)
+            checkpoint_path = source_checkpoint_path or latest_checkpoint_path(config.initialize_from_checkpoint_path)
             state = load_checkpoint(state, checkpoint_path)
             # reset to step 0, we're just initializing weights here
             state = dataclasses.replace(state, step=jnp.array(0))

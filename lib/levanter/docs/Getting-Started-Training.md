@@ -109,6 +109,15 @@ selection has not been validated. An HF initialization creates fresh optimizer,
 step and RNG state; ordinary Trainer resume restores those states from its
 checkpoint instead.
 
+Native checkpoint initialization uses the same vocabulary and semantic metadata.
+`initialize_model_from_checkpoint_path` copies only trained model weights and
+starts fresh optimizer, step and RNG state. `initialize_from_checkpoint_path`
+loads full training state, then resets the step and data position while retaining
+optimizer and RNG state. Resuming this run from its checkpoints takes precedence
+over these initialization sources. Combining weights-only initialization with
+`trainer.initialize_from` remains invalid. Older sources without model metadata
+require an explicit matching model configuration and vocabulary.
+
 Set `hf_save_path` to a local directory and `hf_save_steps` to export updated
 weights through the existing training hooks. Exports contain canonical
 safetensors, the actual model vocabulary, explicit head dimension, default/linear
