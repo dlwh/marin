@@ -414,11 +414,15 @@ def _tpu_splash_attention(
         head_shards=head_shards,
         q_seq_shards=q_seq_shards,
     )
+    kernel_sharding = NamedSharding(mesh, jax.sharding.PartitionSpec(q_pspec[1], q_pspec[2]))
+    kernel_specs = splash_kernel.manual_sharding_spec(kernel_sharding)
+    kernel_shardings = jax.tree.map(lambda spec: NamedSharding(mesh, spec), kernel_specs)
+    splash_kernel = jax.reshard(splash_kernel, kernel_shardings)
 
     @functools.partial(
         shard_map,
         mesh=mesh,
-        in_specs=(q_pspec, k_pspec, v_pspec, segment_id_lowering.segment_ids_axes, None),
+        in_specs=(q_pspec, k_pspec, v_pspec, segment_id_lowering.segment_ids_axes, kernel_specs),
         out_specs=q_pspec,
         check_vma=False,
     )
