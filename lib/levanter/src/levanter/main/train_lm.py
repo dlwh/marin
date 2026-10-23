@@ -15,6 +15,7 @@ import jax.random as jrandom
 from haliax import Axis
 from haliax.partitioning import named_jit, round_axis_for_partitioning
 from jax.sharding import PartitionSpec as P
+from rigging.filesystem.storage_path import StoragePath
 
 import levanter
 import levanter.analysis
@@ -204,8 +205,12 @@ def main(config: TrainLmConfig):
             )
         if not isinstance(config.adapter, NoAdaptorConfig):
             raise ValueError("llama_native training does not support adapters yet")
-        if config.hf_save_path is not None or config.hf_upload is not None:
-            raise ValueError("llama_native training does not support HF export yet")
+        if config.hf_upload:
+            raise ValueError("llama_native training supports local HF export only; Hub upload is unsupported")
+        if config.hf_save_path is not None:
+            if StoragePath(config.hf_save_path).is_remote:
+                raise ValueError("llama_native hf_save_path must be a local directory")
+            config.model.validate_hf_export()
         if config.trainer.quantization is not None:
             raise ValueError("llama_native training does not support Haliax quantization")
         config = dataclasses.replace(config, trainer=dataclasses.replace(config.trainer, use_explicit_mesh_axes=True))
@@ -488,9 +493,12 @@ def main(config: TrainLmConfig):
                 callbacks.mixture_weight_logging_hook(trainer.config.batch_schedule, train_dataset), every=1
             )
 
+        export_converter = converter
+        if isinstance(config.model, NativeLlamaLmConfig) and config.hf_save_path is not None:
+            export_converter = config.model.hf_export_converter(tokenizer)
         config.adapter.install_export_hooks(
             trainer=trainer,
-            converter=converter,
+            converter=export_converter,
             tokenizer=tokenizer,
             export=AdaptorExportConfig(
                 hf_save_path=config.hf_save_path,

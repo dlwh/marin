@@ -35,6 +35,7 @@ from levanter.data.text.examples import GrugLmExample
 from levanter.distributed import DistributedConfig
 from levanter.models.llama_native import NativeLlamaSharding
 from levanter.layers.rotary import DefaultRotaryEmbeddingsConfig
+from levanter.tokenizers import load_tokenizer
 from levanter.models.llama import LlamaLMHeadModel
 from levanter.models.llama_native_lm import NativeLlamaLmConfig
 from levanter.optim.config import AdamConfig, ConstantLrSchedule
@@ -330,6 +331,16 @@ class LocalLlamaCheckpoint:
     weights: dict[str, np.ndarray]
 
 
+def _write_llama_checkpoint(source, config, hf_config):
+    source.mkdir()
+    with use_test_mesh():
+        model = LlamaLMHeadModel.init(Axis("vocab", 32), config, key=jrandom.PRNGKey(13))
+        weights = to_torch_compatible_state_dict(model)
+    hf_config.save_pretrained(source)
+    safetensors.numpy.save_file(weights, source / "model.safetensors", metadata={"format": "pt"})
+    return LocalLlamaCheckpoint(source, config, weights)
+
+
 @pytest.fixture(params=[False, True], ids=["untied", "tied"])
 def native_hf_source(tmp_path, request):
     config = train_lm.LlamaConfig(
@@ -341,14 +352,7 @@ def native_hf_source(tmp_path, request):
         max_seq_len=16,
         tie_word_embeddings=request.param,
     )
-    source = tmp_path / "hf-source"
-    source.mkdir()
-    with use_test_mesh():
-        model = LlamaLMHeadModel.init(Axis("vocab", 32), config, key=jrandom.PRNGKey(13))
-        weights = to_torch_compatible_state_dict(model)
-    config.to_hf_config(32).save_pretrained(source)
-    safetensors.numpy.save_file(weights, source / "model.safetensors", metadata={"format": "pt"})
-    return LocalLlamaCheckpoint(source, config, weights)
+    return _write_llama_checkpoint(tmp_path / "hf-source", config, config.to_hf_config(32))
 
 
 @pytest.mark.tpu
@@ -480,6 +484,106 @@ def test_native_hf_rejects_default_rope_with_ignored_scaling_factor(native_hf_so
     )
     with pytest.raises(ValueError, match="scaled RoPE must declare linear"):
         train_lm.main(config)
+
+
+@pytest.mark.tpu
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize(
+    "tied,pretrained,save_dtype", [(False, True, None), (True, True, "bfloat16"), (False, False, None)]
+)
+def test_native_train_lm_exports_portable_local_weights(
+    tmp_path, tiny_hf_tokenizer_path, tied, pretrained, save_dtype
+):
+    model_config = NativeLlamaLmConfig(
+        hidden_dim=16,
+        intermediate_dim=24,
+        num_layers=1,
+        num_heads=4,
+        num_kv_heads=2,
+        head_dim=8,
+        max_seq_len=16,
+        tie_word_embeddings=tied,
+        rope=DefaultRotaryEmbeddingsConfig(factor=8.0),
+        reference_checkpoint=str(tmp_path / "unused-default-reference"),
+    )
+    named_config = train_lm.LlamaConfig(
+        **{field.name: getattr(model_config, field.name) for field in dataclasses.fields(train_lm.LlamaConfig)}
+    )
+    source = _write_llama_checkpoint(tmp_path / "source", named_config, model_config.to_hf_config(32))
+    examples = ListAsyncDataset([GrugLmExample.causal((jnp.arange(8) + i) % 31) for i in range(16)])
+    model_size = 2 if len(jax.devices()) >= 4 else 1
+    data_size = len(jax.devices()) // model_size
+    config = train_lm.TrainLmConfig(
+        model=model_config,
+        initialize_from_hf=str(source.path) if pretrained else False,
+        hf_save_path=str(tmp_path / "export"),
+        hf_save_steps=1,
+        hf_save_dtype=save_dtype,
+        train_seq_len=8,
+        data=LmDataConfig(
+            tokenizer=tiny_hf_tokenizer_path,
+            shuffle=False,
+            components={"direct": DirectDatasetComponent(datasets={"train": examples, "validation": examples})},
+        ),
+        optimizer=AdamConfig(learning_rate=1e-3, warmup=0, lr_schedule=ConstantLrSchedule()),
+        trainer=train_lm.TrainerConfig(
+            id="native-export",
+            num_train_steps=2,
+            train_batch_size=2 * data_size,
+            per_device_parallelism=1,
+            per_device_eval_parallelism=1,
+            mp=jmp.get_policy("f32"),
+            max_eval_batches=1,
+            steps_per_eval=1,
+            mesh=MeshConfig(axes={"data": data_size, "model": model_size}),
+            tracker=JsonFileTrackerConfig(output_path=str(tmp_path / "tracker")),
+            checkpointer=CheckpointerConfig(base_path=str(tmp_path / "checkpoints"), keep=[{"every": 1}]),
+            require_accelerator=False,
+            distributed=DistributedConfig(initialize_jax_distributed=False),
+            log_xla_hlo=False,
+            log_jaxprs=False,
+        ),
+    )
+    train_lm.main(config)
+    assert math.isfinite(_assert_training_recorded(str(tmp_path / "tracker"))["eval/loss"])
+    exported = tmp_path / "export/native-export/step-1"
+    fields = json.loads((exported / "config.json").read_text())
+    expected_vocab = 32 if pretrained or model_size == 2 else 31
+    assert fields["vocab_size"] == expected_vocab
+    assert fields["architectures"] == ["LlamaForCausalLM"]
+    assert fields["head_dim"] == 8
+    assert fields["rope_parameters"]["rope_type"] == "linear"
+    assert fields["rope_scaling"]["factor"] == 8.0
+    tokenizer = config.data.the_tokenizer
+    exported_tokenizer = load_tokenizer(str(exported))
+    assert exported_tokenizer.get_vocab() == tokenizer.get_vocab()
+    assert exported_tokenizer.encode("token3 token4") == tokenizer.encode("token3 token4")
+    converter = model_config.hf_checkpoint_converter(str(exported), tokenizer=tokenizer)
+    reloaded_config = NativeLlamaLmConfig.from_hf_config(converter.default_hf_config)
+    mesh = dataclasses.replace(config.trainer, use_explicit_mesh_axes=True).device_mesh
+    sharding = NativeLlamaSharding(batch_axes=("replica_dcn", "replica", "data"), fsdp_axis="data", model_axis="model")
+    with jax.set_mesh(mesh):
+        reloaded = converter.load_pretrained(
+            reloaded_config.model_type,
+            config=reloaded_config,
+            model_init=lambda vocab: reloaded_config.build(vocab, key=jrandom.PRNGKey(0), sharding=sharding),
+        )
+        saved = load_checkpoint(
+            reloaded,
+            latest_checkpoint_path(tmp_path / "checkpoints/native-export"),
+            subpath="model",
+            mesh=mesh,
+        )
+    saved_weights = saved.to_state_dict()
+    for name, actual in reloaded.to_state_dict().items():
+        expected = saved_weights[name]
+        if save_dtype is not None:
+            expected = expected.astype(jnp.dtype(save_dtype)).astype(expected.dtype)
+        np.testing.assert_array_equal(actual, expected)
+    if pretrained:
+        assert any(not np.array_equal(value, source.weights[name]) for name, value in saved_weights.items())
+    assert reloaded.native.token_embeddings.sharding.spec == sharding.column_storage
+    assert reloaded.native.layers.stacked.mlp.down_proj.weight.sharding.spec == P(None, "data", "model")
 
 
 def _frozen_lm_config(tmpdir, data_config, *, out, seed, init_from=None, ckpt_base=None):

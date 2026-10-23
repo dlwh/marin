@@ -8,9 +8,25 @@ from pathlib import Path
 
 import pytest
 from tokenizers import Tokenizer as HfBaseTokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import Whitespace
+from transformers import PreTrainedTokenizerFast
 
 from levanter.testing.tokenizer import stage_gpt2_tokenizer
 from levanter.tokenizers import HfMarinTokenizer, load_tokenizer
+
+
+@pytest.fixture
+def tiny_hf_tokenizer_path(tmp_path):
+    """A real local tokenizer with one fewer row than the tiny Llama vocabulary."""
+    backend = HfBaseTokenizer(
+        WordLevel({"[UNK]": 0, "<s>": 1, "</s>": 2, **{f"token{i}": i for i in range(3, 31)}}, unk_token="[UNK]")
+    )
+    backend.pre_tokenizer = Whitespace()
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]", bos_token="<s>", eos_token="</s>")
+    destination = tmp_path / "tokenizer"
+    tokenizer.save_pretrained(destination)
+    return str(destination)
 
 
 @pytest.fixture(scope="session")

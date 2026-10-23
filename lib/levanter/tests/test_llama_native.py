@@ -20,6 +20,81 @@ from levanter.models.llama import LlamaConfig, LlamaLMHeadModel
 from levanter.models.llama_native import NativeLlamaConfig, NativeLlamaModel, NativeLlamaSharding
 from levanter.models.llama_native_lm import NativeLlamaLmConfig
 from levanter.models.lm_model import LmExample
+from levanter.testing.helpers import skip_if_no_torch
+from levanter.tokenizers import load_tokenizer
+
+
+@pytest.mark.tpu
+@pytest.mark.parametrize("save_dtype", [None, jnp.bfloat16], ids=["master", "bf16"])
+def test_native_hf_export_sharded_dtype_and_layout_roundtrip(tmp_path, tiny_hf_tokenizer_path, save_dtype):
+    config = NativeLlamaLmConfig(
+        hidden_dim=16, intermediate_dim=24, num_layers=1, num_heads=4, num_kv_heads=2, head_dim=8, max_seq_len=8
+    )
+    model_size = 2 if len(jax.devices()) >= 4 else 1
+    mesh = Mesh(
+        np.asarray(jax.devices()).reshape(-1, model_size),
+        ("data", "model"),
+        axis_types=(AxisType.Explicit,) * 2,
+    )
+    sharding = NativeLlamaSharding(batch_axes=("data",), fsdp_axis="data", model_axis="model")
+    converter = config.hf_export_converter(load_tokenizer(tiny_hf_tokenizer_path))
+    output = tmp_path / "export"
+    with jax.set_mesh(mesh):
+        model = config.build(hax.Axis("vocab", 32), key=jax.random.PRNGKey(0), sharding=sharding)
+        converter.save_pretrained(model, str(output), max_shard_size=512, dtype=save_dtype)
+        assert len(list(output.glob("*.safetensors"))) > 1
+        assert (output / "model.safetensors.index.json").exists()
+        converter = converter.replaced(reference_checkpoint=str(output))
+        restored_config = NativeLlamaLmConfig.from_hf_config(converter.default_hf_config)
+        restored = converter.load_pretrained(
+            restored_config.model_type,
+            config=restored_config,
+            model_init=lambda vocab: restored_config.build(vocab, key=jax.random.PRNGKey(1), sharding=sharding),
+        )
+        for name, value in model.to_state_dict().items():
+            expected = value if save_dtype is None else value.astype(save_dtype).astype(value.dtype)
+            np.testing.assert_array_equal(restored.to_state_dict()[name], expected)
+        assert restored.Vocab.size == 32
+        assert restored.config.actual_head_size == 8
+        assert restored.native.token_embeddings.sharding.spec == sharding.column_storage
+        assert restored.native.layers.stacked.mlp.down_proj.weight.sharding.spec == P(None, "data", "model")
+
+
+@skip_if_no_torch
+@pytest.mark.parametrize("factor", [1.0, 8.0], ids=["default", "linear"])
+@pytest.mark.parametrize("tied", [False, True], ids=["untied", "tied"])
+def test_native_hf_export_transformers_local_logits(tmp_path, tiny_hf_tokenizer_path, factor, tied):
+    import torch  # noqa: PLC0415  # optional dependency
+    from transformers import AutoModelForCausalLM  # noqa: PLC0415  # optional Torch model
+
+    config = NativeLlamaLmConfig(
+        hidden_dim=16,
+        intermediate_dim=24,
+        num_layers=1,
+        num_heads=4,
+        num_kv_heads=2,
+        head_dim=8,
+        max_seq_len=8,
+        tie_word_embeddings=tied,
+        rope=DefaultRotaryEmbeddingsConfig(factor=factor),
+    )
+    mesh = Mesh(np.asarray(jax.devices()[:1]), ("data",), axis_types=(AxisType.Explicit,))
+    ids = np.arange(16, dtype=np.int32).reshape(2, 8)
+    converter = config.hf_export_converter(load_tokenizer(tiny_hf_tokenizer_path))
+    output = tmp_path / "export"
+    with jax.set_mesh(mesh):
+        model = config.build(hax.Axis("vocab", 32), key=jax.random.PRNGKey(3))
+        converter.save_pretrained(model, str(output))
+        tokens = hax.named(jnp.asarray(ids), (hax.Axis("batch", 2), hax.Axis("position", 8)))
+        expected = np.asarray(
+            model(tokens, NamedAttentionMask.causal()).rearrange(("batch", "position", "vocab")).array
+        )
+    reference = AutoModelForCausalLM.from_pretrained(
+        output, local_files_only=True, dtype=torch.float32, attn_implementation="eager"
+    ).eval()
+    with torch.no_grad():
+        actual = reference(input_ids=torch.from_numpy(ids).long()).logits.numpy()
+    np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.parametrize("mask_kind", ["causal", "dense", "bidirectional", "offset", "none"])
