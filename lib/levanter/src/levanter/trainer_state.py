@@ -106,7 +106,12 @@ class TrainerState(eqx.Module, Generic[M]):
 
         averaging: ModelAveraging[M] | None = None
         if model_averaging is not None:
-            averaging = model_averaging.create(trainable_model)
+            # State donation requires separate buffers for parameters and their
+            # averages, even before the first update changes either value.
+            averaging_model = jax.tree.map(
+                lambda leaf: jnp.copy(leaf) if eqx.is_array(leaf) else leaf, trainable_model
+            )
+            averaging = model_averaging.create(averaging_model)
 
         opt_state = init_optimizer_for_trainables(optimizer, trainable_model)
 
