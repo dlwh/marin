@@ -11,7 +11,7 @@ from jaxtyping import Array, Float
 
 
 class RmsNorm(eqx.Module):
-    """Normalize the last dimension, preserving Levanter's compute precision."""
+    """Normalize in FP32 and apply affine parameters in the input dtype."""
 
     weight: Float[Array, "Dim"] | None
     bias: Float[Array, "Dim"] | None
@@ -33,8 +33,9 @@ class RmsNorm(eqx.Module):
         return RmsNorm(weight, bias, eps, compute_spec)
 
     def __call__(self, x: Float[Array, "... Dim"]) -> Float[Array, "... Dim"]:
-        variance = jnp.mean(jnp.square(x), axis=-1, keepdims=True)
-        output = (x * jax.lax.rsqrt(variance + self.eps)).astype(x.dtype)
+        normalized = x.astype(jnp.float32)
+        variance = jnp.mean(jnp.square(normalized), axis=-1, keepdims=True)
+        output = (normalized * jax.lax.rsqrt(variance + self.eps)).astype(x.dtype)
         if self.weight is not None:
             output = output * reshard(self.weight, self.compute_spec).astype(x.dtype)
         if self.bias is not None:

@@ -234,11 +234,16 @@ def _reference_attention_math(
 ) -> Float[Array, "B Q Hq D"]:
     head_dim = q.shape[-1]
     num_q_heads = q.shape[2]
-    k = align_kv_heads(k, num_q_heads=num_q_heads)
-    v = align_kv_heads(v, num_q_heads=num_q_heads)
+    num_kv_heads = k.shape[2]
+    if num_q_heads % num_kv_heads:
+        raise ValueError(f"num_heads ({num_q_heads}) must be divisible by num_kv_heads ({num_kv_heads})")
+    groups = num_q_heads // num_kv_heads
+    q = q.reshape(q.shape[0], q.shape[1], num_kv_heads, groups, head_dim)
 
+    # Keep the query-group dimension in the contractions. Repeating K/V first
+    # rounds each group's BF16 cotangent before their sum in backward.
     scale = 1.0 / math.sqrt(head_dim)
-    scores = jnp.einsum("bqhd,bkhd->bhqk", q * scale, k)
+    scores = jnp.einsum("bqhgd,bkhd->bhgqk", q * scale, k)
 
     explicit = None
     if mask is None:
@@ -262,7 +267,7 @@ def _reference_attention_math(
                 f"got mask={explicit.shape}, expected [batch,{scores.shape[-2]},{scores.shape[-1]}]"
             )
 
-        explicit = explicit[:, None, :, :]  # -> [B, 1, Q, K], broadcast across heads.
+        explicit = explicit[:, None, None, :, :]  # Broadcast across KV heads and query groups.
         if explicit.dtype == jnp.bool_:
             scores = jnp.where(explicit, scores, jnp.array(-1e9, dtype=scores.dtype))
         else:
@@ -270,8 +275,8 @@ def _reference_attention_math(
     if logits_dtype is not None:
         scores = scores.astype(logits_dtype)
     weights = jax.nn.softmax(scores, axis=-1).astype(v.dtype)
-    ctx = jnp.einsum("bhqk,bkhd->bqhd", weights, v)
-    return ctx.astype(v.dtype)
+    ctx = jnp.einsum("bhgqk,bkhd->bqhgd", weights, v)
+    return ctx.reshape(ctx.shape[0], ctx.shape[1], num_q_heads, head_dim).astype(v.dtype)
 
 
 def reference_attention(

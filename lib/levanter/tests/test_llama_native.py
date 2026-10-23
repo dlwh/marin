@@ -20,15 +20,16 @@ from levanter.models.llama_native import NativeLlamaConfig, NativeLlamaModel, Na
 
 
 @pytest.mark.parametrize(
-    "options",
+    ("options", "compute_dtype"),
     [
-        {},
-        {"num_kv_heads": 1, "tie_word_embeddings": True, "use_bias": True},
-        {"use_qk_norm": True, "hybrid_norm": True, "input_embedding_norm": True},
-        {"head_dim": 6, "use_layer_norm_weight": False, "rope_factor": 2.0},
+        ({}, jnp.float32),
+        ({"num_kv_heads": 1, "tie_word_embeddings": True, "use_bias": True}, jnp.float32),
+        ({"use_qk_norm": True, "hybrid_norm": True, "input_embedding_norm": True}, jnp.float32),
+        ({"head_dim": 6, "use_layer_norm_weight": False, "rope_factor": 2.0}, jnp.float32),
+        pytest.param({}, jnp.bfloat16, id="bfloat16-compute-float32-parameters"),
     ],
 )
-def test_native_llama_matches_named_logits_loss_and_gradients(options):
+def test_native_llama_matches_named_logits_loss_and_gradients(options, compute_dtype):
     mesh = Mesh(np.asarray(jax.devices()[:1]), ("data",), axis_types=(AxisType.Explicit,))
     config = dataclasses.replace(
         NativeLlamaConfig(
@@ -83,13 +84,22 @@ def test_native_llama_matches_named_logits_loss_and_gradients(options):
         source = {key: value + 0.1 if key.endswith(".bias") else value for key, value in source.items()}
         legacy = legacy.from_state_dict(source)
         native = NativeLlamaModel.init(config, key=jax.random.key(1)).from_state_dict(source)
-        expected_logits = (
-            legacy(named_tokens, named_mask, pos_ids=named_positions).rearrange((Batch, Pos, legacy.Vocab)).array
-        )
-        actual_logits = jax.jit(lambda model: model(tokens, native_mask, pos_ids=positions))(native)
+
+        def to_compute(model):
+            return jax.tree.map(
+                lambda value: value.astype(compute_dtype) if eqx.is_inexact_array(value) else value, model
+            )
+
+        expected_logits = eqx.filter_jit(
+            lambda model: to_compute(model)(named_tokens, named_mask, pos_ids=named_positions)
+            .rearrange((Batch, Pos, legacy.Vocab))
+            .array
+        )(legacy)
+        actual_logits = eqx.filter_jit(lambda model: to_compute(model)(tokens, native_mask, pos_ids=positions))(native)
         np.testing.assert_allclose(actual_logits, expected_logits, atol=1e-5, rtol=1e-5)
 
         def legacy_loss(model):
+            model = to_compute(model)
             hidden = (
                 model.activations(named_tokens, named_mask, pos_ids=named_positions)
                 .rearrange((Batch, Pos, model.Embed))
@@ -101,11 +111,11 @@ def test_native_llama_matches_named_logits_loss_and_gradients(options):
             )
 
         def native_loss(model):
-            return model.next_token_loss(
+            return to_compute(model).next_token_loss(
                 tokens, weights, mask=native_mask, pos_ids=positions, loss_implementation="xla"
             )
 
-        expected_loss, expected_grads = eqx.filter_value_and_grad(legacy_loss)(legacy)
+        expected_loss, expected_grads = eqx.filter_jit(eqx.filter_value_and_grad(legacy_loss))(legacy)
         actual_loss, actual_grads = eqx.filter_jit(eqx.filter_value_and_grad(native_loss))(native)
         np.testing.assert_allclose(actual_loss, expected_loss, atol=1e-5, rtol=1e-5)
         expected_state = expected_grads.to_state_dict()
