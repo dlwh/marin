@@ -281,7 +281,7 @@ def main(config: NativeCheckpointSmokeConfig):
     result_path = output / f"result-process-{rank}.json"
     if result_path.exists():
         raise FileExistsError(f"Refusing to overwrite a previous smoke result: {result_path}")
-    _write_json(output / f"configuration-process-{rank}.json", draccus.encode(config))
+    (output / f"configuration-process-{rank}.yaml").write_text(draccus.dump(config))
 
     data = _data_config(config)
     full = _train_config(config, data, "full", 2)
