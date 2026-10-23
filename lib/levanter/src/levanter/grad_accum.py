@@ -14,6 +14,7 @@ from haliax.partitioning import ResourceAxis
 from haliax.util import is_named_array
 from jax.lax import with_sharding_constraint
 from jax.sharding import PartitionSpec
+from jaxtyping import PyTree
 
 from levanter.metrics import Metric, ReductionType
 from levanter.metrics import fold as fold_metric
@@ -22,7 +23,7 @@ from levanter.utils.jax_utils import zeros_like_tree
 
 Args = ParamSpec("Args")
 R = TypeVar("R")
-type ArrayGradientResult = tuple[tuple[jax.Array, dict[str, Metric]], Any]
+type ArrayGradientResult = tuple[tuple[jax.Array, dict[str, Metric]], PyTree[jax.Array]]
 
 
 def microbatched_arrays(
