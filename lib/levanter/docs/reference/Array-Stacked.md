@@ -147,6 +147,84 @@ logical-axis mapping.
 
 ::: levanter.layers.scan_checkpoint.ScanCheckpointPolicy
 
+
+## Native Llama
+
+[levanter.models.llama_native.NativeLlamaModel][] uses `ArrayStacked`, ordinary
+JAX arrays and explicit mesh axes. It remains separate from the existing
+`levanter.models.llama` implementation while numerical parity, placement and
+training performance are compared on the same parameters.
+
+This example requires four devices. For a CPU smoke, start Python with
+`JAX_NUM_CPU_DEVICES=4`.
+
+```python
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jax.sharding import AxisType, Mesh
+
+from levanter.models.llama_native import NativeLlamaConfig, NativeLlamaSharding
+
+mesh = Mesh(
+    np.asarray(jax.devices()[:4]).reshape(2, 2),
+    ("data", "model"),
+    axis_types=(AxisType.Explicit, AxisType.Explicit),
+)
+layout = NativeLlamaSharding(
+    batch_axes=("data",), fsdp_axis="data", model_axis="model"
+)
+config = NativeLlamaConfig(
+    vocab_size=128, hidden_dim=64, intermediate_dim=128,
+    num_layers=2, num_heads=4, num_kv_heads=2, max_seq_len=16,
+    attention_implementation="reference", gradient_checkpointing=True,
+)
+
+with jax.set_mesh(mesh):
+    model = config.build(key=jax.random.key(0), sharding=layout)
+    tokens = jnp.zeros((4, 16), dtype=jnp.int32)
+    weights = jnp.ones((4, 16), dtype=jnp.float32)
+    loss = eqx.filter_jit(
+        lambda m: m.next_token_loss(tokens, weights, loss_implementation="xla")
+    )(model)
+```
+
+The layout separates stored parameters from their forward computation.
+Here `P` denotes `jax.sharding.PartitionSpec`, and projection weights use
+`[output_features, input_features]` order. Column-projection weights have storage `P("model", "data")` and compute
+`P("model", None)`: forward gathers the FSDP input dimension while keeping
+output channels partitioned across `model`. Row projections use
+`P("data", "model")` in storage and `P(None, "model")` for computation.
+Residual activations partition the batch across `data`; attention heads, MLP
+intermediates and output vocabulary partition across `model`. The layer axis
+is replicated. Initialization and forward calls require a `jax.set_mesh`
+context.
+
+`next_token_loss` uses the tokens as inputs and shifts them to form targets.
+A weight at position `t` controls the loss for predicting token `t + 1`;
+the final position always has zero weight.
+
+The current model covers dense SwiGLU Llama with grouped-query attention,
+default or linear-scaled RoPE, structured causal/segment masks and explicit
+position IDs. Select raw-array attention kernels with
+`attention_implementation`; `reference` is the default, and accelerated
+implementations retain their backend and shape requirements. `xla_flash` is
+rejected because its current implementation uses named-array operations.
+Paged decoding and MoE are outside this model's scope.
+
+Use `model = model.from_state_dict(state)` outside the compiled training step
+to import an existing Llama state dict. It returns a model with the imported
+parameters in the template model's dtype and storage layout. The input uses
+canonical HF keys and raw arrays; articulated projection dimensions from the
+existing model's `to_state_dict()` are also accepted. `model.to_state_dict()`
+exports output-first projection arrays under the same keys. Calling it on the
+model tree returned by differentiation exports parameter gradients.
+
+::: levanter.models.llama_native.NativeLlamaModel
+    options:
+      members: false
+
 ## API
 
 ::: levanter.layers.stacked.ArrayStacked

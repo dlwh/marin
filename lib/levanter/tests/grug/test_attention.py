@@ -1,12 +1,15 @@
 # Copyright The Levanter Authors
 # SPDX-License-Identifier: Apache-2.0
 
+import haliax as hax
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.sharding import AbstractMesh, AxisType, NamedSharding, use_abstract_mesh
 from jax.sharding import PartitionSpec as P
+
+from levanter.layers.attention import AttentionMask as NamedAttentionMask, simple_attention_with_dropout
 
 from levanter.grug.attention import (
     xla_flash_attention,
@@ -231,3 +234,52 @@ def test_xla_flash_attention_broadcasts_shared_segment_ids_across_the_batch():
     shared = jnp.where(jnp.arange(q.shape[1]) < 40, 0, 1)[None, :]  # one row of segment ids for a batch of 2
     mask = AttentionMask.causal(sliding_window=20).with_segment_ids(shared)
     _assert_matches_reference(q, k, v, mask, block_size=16)
+
+
+def test_reference_attention_bfloat16_grouped_query_gradients_match_named():
+    q, k, v = _make_qkv()
+    cotangent = jax.random.normal(jax.random.key(17), q.shape)
+    Batch = hax.Axis("batch", q.shape[0])
+    Query = hax.Axis("position", q.shape[1])
+    Key = hax.Axis("key_position", k.shape[1])
+    KvHeads = hax.Axis("kv_head", k.shape[2])
+    Groups = hax.Axis("q_heads_per_group", q.shape[2] // k.shape[2])
+    HeadDim = hax.Axis("head_size", q.shape[-1])
+
+    def named_loss(q, k, v):
+        q, k, v = (array.astype(jnp.bfloat16) for array in (q, k, v))
+        query = hax.named(
+            q.reshape(q.shape[0], q.shape[1], KvHeads.size, Groups.size, HeadDim.size),
+            (Batch, Query, KvHeads, Groups, HeadDim),
+        ).rearrange((Batch, KvHeads, Groups, Query, HeadDim))
+        key = hax.named(k, (Batch, Key, KvHeads, HeadDim)).rearrange((Batch, KvHeads, Key, HeadDim))
+        value = hax.named(v, (Batch, Key, KvHeads, HeadDim)).rearrange((Batch, KvHeads, Key, HeadDim))
+        output = (
+            simple_attention_with_dropout(
+                Query,
+                Key,
+                HeadDim,
+                query,
+                key,
+                value,
+                mask=NamedAttentionMask.causal(),
+                inference=True,
+                attention_dtype=jnp.bfloat16,
+            )
+            .rearrange((Batch, Query, KvHeads, Groups, HeadDim))
+            .array.reshape(q.shape)
+        )
+        return jnp.sum(output.astype(jnp.float32) * cotangent)
+
+    def native_loss(q, k, v):
+        q, k, v = (array.astype(jnp.bfloat16) for array in (q, k, v))
+        output = reference_attention(q, k, v, AttentionMask.causal(), logits_dtype=None)
+        return jnp.sum(output.astype(jnp.float32) * cotangent)
+
+    expected, expected_gradients = jax.jit(jax.value_and_grad(named_loss, argnums=(0, 1, 2)))(q, k, v)
+    actual, actual_gradients = jax.jit(jax.value_and_grad(native_loss, argnums=(0, 1, 2)))(q, k, v)
+    np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-5)
+    for name, actual_grad, expected_grad in zip(
+        ("query", "key", "value"), actual_gradients, expected_gradients, strict=True
+    ):
+        np.testing.assert_allclose(actual_grad, expected_grad, atol=1e-5, rtol=1e-5, err_msg=name)
