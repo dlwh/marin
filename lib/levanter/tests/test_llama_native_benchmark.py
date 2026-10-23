@@ -29,6 +29,7 @@ def test_matched_training_benchmark_preserves_parameters_updates_and_layouts(tmp
         seq_len=8,
         warmup_steps=1,
         measured_steps=3,
+        profile_steps=2,
     )
 
     report = BENCHMARK.run_benchmark(config, output_dir=tmp_path)
@@ -45,6 +46,10 @@ def test_matched_training_benchmark_preserves_parameters_updates_and_layouts(tmp
     np.testing.assert_allclose(legacy_losses, native_losses, atol=config.parity_atol, rtol=config.parity_rtol)
     assert legacy_losses[-1] < legacy_losses[0]
     for variant in report["variants"].values():
+        assert variant["final_step"] == 5
+        assert variant["profile"]["steps"] == 2
+        traces = list(Path(variant["profile"]["path"]).rglob("*.xplane.pb"))
+        assert traces and all(path.stat().st_size > 0 for path in traces)
         assert len(variant["timing"]["step_seconds"]) == config.measured_steps
         assert len(variant["measured_step_losses"]) == config.measured_steps
         assert variant["final_loss"] == variant["measured_step_losses"][-1]

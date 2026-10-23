@@ -35,7 +35,7 @@ from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
 import haliax as hax
 from haliax._src.state_dict import flatten_modules_for_export, to_state_dict
 
-from levanter.callbacks import JitCallback
+from levanter.callbacks import JitCallback, ProfileOptionsConfig, profile_ctx
 from levanter.data.text.examples import GrugLmExample
 from levanter.kernels.pallas.fused_cross_entropy_loss import fused_cross_entropy_loss_and_logsumexp_penalty
 from levanter.layers.attention import AttentionBackend, AttentionMask
@@ -70,6 +70,7 @@ class BenchmarkConfig:
     seed: int = 42
     warmup_steps: int = 5
     measured_steps: int = 20
+    profile_steps: int = 0
     parity_atol: float = 1e-5
     parity_rtol: float = 1e-4
     update_parameter_relative_l2: float = 0.005
@@ -380,7 +381,7 @@ def _run_variant(
         id=f"llama-native-bench-{kind}",
         mp=mp,
         train_batch_size=config.batch_size,
-        num_train_steps=1 + config.warmup_steps + config.measured_steps,
+        num_train_steps=1 + config.warmup_steps + config.measured_steps + config.profile_steps,
         mesh=MeshConfig(
             axes={"data": config.data_size, "model": config.model_size},
             compute_mapping=_compute_mapping(),
@@ -497,6 +498,19 @@ def _run_variant(
     # every measured step has finished.
     measured_step_losses = [float(loss) for loss in measured_losses]
     diagnostics["measured_step_losses"] = {"losses": np.asarray(measured_step_losses, dtype=np.float32)}
+    final_step = int(state.step)
+    profile_path = None
+    if config.profile_steps:
+        assert output_dir is not None
+        profile_path = output_dir / kind / "profile"
+        options = ProfileOptionsConfig(host_tracer_level=1, python_tracer_level=0, enable_hlo_proto=True)
+        jax.block_until_ready(state)
+        with profile_ctx(str(profile_path), profiler_options=options.build_jax_profile_options()):
+            for index in range(config.profile_steps):
+                with jax.profiler.StepTraceAnnotation("train", step_num=final_step + index):
+                    result = step_fn(state, (batch,), {})
+                    jax.block_until_ready(result)
+                    state = result.new_state
     result_report = {
         "kind": kind,
         "state_init_seconds": state_init_seconds,
@@ -507,7 +521,8 @@ def _run_variant(
         "timing": _timing_summary(samples, config.batch_size * config.seq_len),
         "measured_step_losses": measured_step_losses,
         "final_loss": measured_step_losses[-1],
-        "final_step": int(state.step),
+        "final_step": final_step,
+        "profile": {"path": str(profile_path), "steps": config.profile_steps} if profile_path is not None else None,
         "layouts": {
             "parameters": model_manifest,
             "parameters_raw": raw_model_manifest,
@@ -573,6 +588,10 @@ def run_benchmark(
 ) -> dict:
     if dump_hlo and output_dir is None:
         raise ValueError("HLO capture requires an output directory")
+    if config.profile_steps < 0:
+        raise ValueError("Profile steps must be nonnegative")
+    if config.profile_steps and output_dir is None:
+        raise ValueError("Profiling requires an output directory")
     if output_dir is not None:
         output_dir.mkdir(parents=True, exist_ok=True)
     if jax.process_count() != 1:
