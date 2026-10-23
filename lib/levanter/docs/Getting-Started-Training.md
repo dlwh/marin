@@ -118,6 +118,44 @@ over these initialization sources. Combining weights-only initialization with
 `trainer.initialize_from` remains invalid. Older sources without model metadata
 require an explicit matching model configuration and vocabulary.
 
+`scripts/bench/smoke_llama_native_checkpoint.py` uses the normal training entrypoint to compare
+two uninterrupted updates with one update followed by checkpoint restore and a
+second update. Every rank hashes all local state shards, including optimizer,
+step and RNG state, and requires exact equality. Only three final checkpoints
+are written; keep their shared directory outside the report directory so that
+large training states are not included in diagnostic archives.
+
+For a local CPU check, save this as `smoke.yaml`. Local directories use plain
+filesystem paths. The checkpoint prefix must be fresh; `model` supplies native
+fields without a `type` tag.
+
+```yaml
+checkpoint_root: /tmp/native-checkpoint-smoke
+output_dir: /tmp/native-checkpoint-report
+expected_process_count: 1
+expected_global_device_count: 4
+expected_local_device_count: 4
+expected_backend: cpu
+vocab_size: 32
+batch_size: 8
+seq_len: 4
+mesh:
+  axes: {data: 2, model: 2}
+model:
+  hidden_dim: 16
+  intermediate_dim: 24
+  num_layers: 1
+  num_heads: 4
+  num_kv_heads: 2
+  max_seq_len: 4
+  attn_backend: vanilla
+```
+
+```bash
+JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=4 \
+  uv run --package marin-levanter python lib/levanter/scripts/bench/smoke_llama_native_checkpoint.py --config_path smoke.yaml
+```
+
 Set `hf_save_path` to a local directory and `hf_save_steps` to export updated
 weights through the existing training hooks. Exports contain canonical
 safetensors, the actual model vocabulary, explicit head dimension, default/linear
