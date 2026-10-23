@@ -15,6 +15,7 @@ from levanter.grug.attention import AttentionMask
 from levanter.grug.loss import fused_linear_softmax_cross_entropy_loss
 from levanter.layers.attention import AttentionBackend, AttentionMask as NamedAttentionMask
 from levanter.layers.rotary import DefaultRotaryEmbeddingsConfig
+from levanter.layers.rotary_native import RotaryConfig, apply_rotary
 from levanter.models.llama import LlamaConfig, LlamaLMHeadModel
 from levanter.models.llama_native import NativeLlamaConfig, NativeLlamaModel, NativeLlamaSharding
 
@@ -212,3 +213,48 @@ def test_native_llama_initialization_matches_named_parameters_and_forward(
         )(legacy)
         actual = eqx.filter_jit(lambda model: model(tokens))(native)
         np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.tpu
+@pytest.mark.parametrize("factor", [1.0, 8.0], ids=["default", "linear-scaled"])
+@pytest.mark.parametrize("compute_dtype", [jnp.float32, jnp.bfloat16], ids=["float32", "bfloat16"])
+def test_native_rotary_long_positions_match_named_values_and_input_gradients(factor, compute_dtype):
+    # Match the sequence length/head width that exposed TPU device-power error.
+    shape = (8, 512, 16, 64)
+    axes = tuple(hax.Axis(name, size) for name, size in zip(("batch", "position", "heads", "head_size"), shape))
+    rng = np.random.default_rng(173)
+    host_x = rng.standard_normal(shape).astype(np.float32)
+    host_cotangent = rng.standard_normal(shape).astype(np.float32)
+    host_positions = np.broadcast_to(np.arange(shape[1], dtype=np.int32), shape[:2]).copy()
+    legacy = DefaultRotaryEmbeddingsConfig(theta=10000.0, factor=factor).build(axes[-1])
+    native_config = RotaryConfig(theta=10000.0, factor=factor)
+    mesh = Mesh(np.asarray(jax.devices()[:1]), ("data",), axis_types=(AxisType.Explicit,))
+
+    def expected_forward(master, positions):
+        return (
+            legacy(hax.named(master.astype(compute_dtype), axes), hax.named(positions, axes[:2])).rearrange(axes).array
+        )
+
+    def actual_forward(master, positions):
+        return apply_rotary(master.astype(compute_dtype), positions, native_config)
+
+    def objective(forward, master, positions, cotangent):
+        return jnp.sum(forward(master, positions).astype(jnp.float32) * cotangent)
+
+    with jax.set_mesh(mesh):
+        x = jnp.asarray(host_x)
+        cotangent = jnp.asarray(host_cotangent)
+        positions = jnp.asarray(host_positions)
+        # Positions remain runtime arguments so the test exercises the compiled
+        # frequency construction rather than constant-folding a fixed output.
+        expected = jax.jit(expected_forward)(x, positions)
+        actual = jax.jit(actual_forward)(x, positions)
+        expected_grad = jax.jit(jax.grad(lambda master, pos, ct: objective(expected_forward, master, pos, ct)))(
+            x, positions, cotangent
+        )
+        actual_grad = jax.jit(jax.grad(lambda master, pos, ct: objective(actual_forward, master, pos, ct)))(
+            x, positions, cotangent
+        )
+
+    np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(actual_grad, expected_grad, atol=1e-5, rtol=1e-5)
