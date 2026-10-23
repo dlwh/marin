@@ -171,3 +171,44 @@ def test_native_llama_explicit_fsdp_tensor_parallel_forward_and_gradient_layout(
             np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-5)
         for parameter, gradient in zip(jax.tree.leaves(model), jax.tree.leaves(grads), strict=True):
             assert parameter.sharding == gradient.sharding
+
+
+@pytest.mark.parametrize("num_layers", [1, 2])
+@pytest.mark.parametrize("tie_word_embeddings,head_dim,use_bias", [(False, None, False), (True, 6, True)])
+def test_native_llama_initialization_matches_named_parameters_and_forward(
+    num_layers, tie_word_embeddings, head_dim, use_bias
+):
+    parameters = dict(
+        hidden_dim=16,
+        intermediate_dim=24,
+        num_layers=num_layers,
+        num_heads=4,
+        num_kv_heads=2,
+        head_dim=head_dim,
+        max_seq_len=8,
+        tie_word_embeddings=tie_word_embeddings,
+        use_bias=use_bias,
+    )
+    config = NativeLlamaConfig(vocab_size=32, **parameters)
+    legacy_config = LlamaConfig(**parameters, attn_backend=AttentionBackend.VANILLA)
+    mesh = Mesh(np.asarray(jax.devices()[:1]), ("data",), axis_types=(AxisType.Explicit,))
+    Batch, Pos = hax.Axis("batch", 2), hax.Axis("position", 8)
+    tokens = (jnp.arange(16).reshape(2, 8) * 3) % config.vocab_size
+
+    with jax.set_mesh(mesh):
+        key = jax.random.key(7)
+        legacy = LlamaLMHeadModel.init(hax.Axis("vocab", config.vocab_size), legacy_config, key=key)
+        native = config.build(key=key)
+        expected_state = legacy.to_state_dict()
+        actual_state = native.to_state_dict()
+        assert set(actual_state) == set(expected_state)
+        for name, value in actual_state.items():
+            np.testing.assert_array_equal(value, expected_state[name].reshape(value.shape), err_msg=name)
+
+        expected = eqx.filter_jit(
+            lambda model: model(hax.named(tokens, (Batch, Pos)), NamedAttentionMask.causal())
+            .rearrange((Batch, Pos, model.Vocab))
+            .array
+        )(legacy)
+        actual = eqx.filter_jit(lambda model: model(tokens))(native)
+        np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-5)
