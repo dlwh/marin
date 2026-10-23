@@ -37,7 +37,7 @@ from levanter.data.text.examples import GrugLmExample, named_lm_example_from_gru
 from levanter.eval_harness import LmEvalHarnessConfig
 from levanter.models.llama import LlamaConfig
 from levanter.models.llama_native import NativeLlamaSharding
-from levanter.models.llama_native_lm import NativeLlamaLmConfig
+from levanter.models.llama_native_lm import NativeLlamaLmConfig, NativeLlamaLmHeadModel
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel, split_activations
 from levanter.optim.config import AdamConfig, OptimizerConfig
 from levanter.trainer import ExplicitTrainingLayout, Trainer, TrainerConfig
@@ -238,28 +238,17 @@ def main(config: TrainLmConfig):
 
     # this is some unpleasant code to allow us to initialize from a hf checkpoint. If this is your first read through,
     # I recommend skipping it for now
-    if config.initialize_from_hf:
+    if config.initialize_from_hf and not native:
         if config.trainer.initialize_from is not None:
             raise ValueError("Cannot specify both initialize_from_hf and initialize_from")
 
         assert isinstance(config.model, HFCompatConfig)
-        if isinstance(config.model, NativeLlamaLmConfig):
-            converter = config.model.hf_checkpoint_converter(
-                config.initialize_from_hf if isinstance(config.initialize_from_hf, str) else None,
-                tokenizer=tokenizer,
-            )
-            hf_config = converter.default_hf_config
-            config.model.validate_hf_config(hf_config)
-            source_vocab_size = hf_config.vocab_size
-            if len(tokenizer) > source_vocab_size:
-                raise ValueError("llama_native tokenizer vocabulary exceeds the HF checkpoint vocabulary")
+        converter = config.model.hf_checkpoint_converter()
+        converter.warn_if_tokenizer_mismatch(tokenizer)
+        if isinstance(config.initialize_from_hf, str):
+            converter = converter.replaced(reference_checkpoint=config.initialize_from_hf, tokenizer=tokenizer)
         else:
-            converter = config.model.hf_checkpoint_converter()
-            converter.warn_if_tokenizer_mismatch(tokenizer)
-            if isinstance(config.initialize_from_hf, str):
-                converter = converter.replaced(reference_checkpoint=config.initialize_from_hf, tokenizer=tokenizer)
-            else:
-                converter = converter.replaced(tokenizer=tokenizer)
+            converter = converter.replaced(tokenizer=tokenizer)
 
         if config.pad_tokenizer_to_match_model:
             converter = converter.with_tokenizer_padded_to_match_model()
@@ -287,8 +276,6 @@ def main(config: TrainLmConfig):
             raise ValueError("llama_native hidden_dim must be divisible by the FSDP mesh size")
         if sharding.model_axis is not None:
             model_size = mesh.shape[sharding.model_axis]
-            if source_vocab_size is not None and source_vocab_size % model_size:
-                raise ValueError("llama_native HF vocabulary must be divisible by the tensor-parallel mesh size")
             if config.model.num_kv_heads % model_size:
                 raise ValueError("llama_native num_kv_heads must be divisible by the tensor-parallel mesh size")
             if config.model.intermediate_dim % model_size:
@@ -308,9 +295,41 @@ def main(config: TrainLmConfig):
     # 2. Sets the axis mapping (for fsdp)
     # 3. Sets the global metrics tracker
     with (
-        Trainer(config.trainer, optimizer, loss_function, explicit_layout=explicit_layout) as trainer,
+        Trainer(
+            config.trainer,
+            optimizer,
+            loss_function,
+            explicit_layout=explicit_layout,
+            checkpoint_metadata=(
+                (lambda model: cast(NativeLlamaLmHeadModel, model).checkpoint_metadata()) if native else None
+            ),
+        ) as trainer,
         TrainingDashboard(config, trainer.request_checkpoint, config.trainer.id or "unknown"),
     ):
+        checkpoint = trainer.checkpoint_to_load
+        resuming = checkpoint is not None
+        if isinstance(config.model, NativeLlamaLmConfig):
+            if checkpoint is not None:
+                source_vocab_size = config.model.checkpoint_vocab_size(checkpoint.metadata)
+            if source_vocab_size is None and config.initialize_from_hf:
+                if config.trainer.initialize_from is not None:
+                    raise ValueError("Cannot specify both initialize_from_hf and initialize_from")
+                converter = config.model.hf_checkpoint_converter(
+                    config.initialize_from_hf if isinstance(config.initialize_from_hf, str) else None,
+                    tokenizer=tokenizer,
+                )
+                hf_config = converter.default_hf_config
+                config.model.validate_hf_config(hf_config)
+                source_vocab_size = hf_config.vocab_size
+            if source_vocab_size is not None:
+                if len(tokenizer) > source_vocab_size:
+                    raise ValueError("llama_native tokenizer vocabulary exceeds the checkpoint vocabulary")
+                model_axis = _native_llama_sharding(config.trainer).model_axis
+                if model_axis is not None and source_vocab_size % trainer.device_mesh.shape[model_axis]:
+                    raise ValueError(
+                        "llama_native checkpoint vocabulary must be divisible by the tensor-parallel mesh size"
+                    )
+
         # randomness in jax is tightly controlled by "keys" which are the states of the random number generators
         # this makes deterministic training pretty easy
         seed = config.trainer.seed
@@ -389,7 +408,6 @@ def main(config: TrainLmConfig):
             parameter_axis_mapping=parameter_axis_mapping,
             trainer=trainer,
         )
-        _, resuming = trainer.checkpoint_load_plan()
         weight_source = config.initialize_from_hf or config.initialize_model_from_checkpoint_path is not None
         if weight_source and not resuming:
             logger.info("Initializing trainer state directly from pretrained weights")

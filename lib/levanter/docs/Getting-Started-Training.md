@@ -93,11 +93,21 @@ The checkpoint determines the complete model vocabulary, including any padded
 embedding/output rows beyond the tokenizer's length. Those rows are preserved
 and participate in the output softmax. The source vocabulary must be at least as
 large as the tokenizer and divisible by the tensor-parallel mesh size; the loader
-does not resize it. Keep `initialize_from_hf` and the source `config.json`
-available when resuming so the same model vocabulary is reconstructed. A full
-Trainer resume reads weights from its Trainer checkpoint and does not reload the
-HF safetensors. An HF initialization creates fresh optimizer, step and RNG state;
-ordinary Trainer resume restores those states from its checkpoint instead.
+does not resize it. New native Trainer checkpoints record the complete vocabulary
+and semantic architecture with the checkpoint completion marker. Resume uses the
+selected checkpoint's metadata and full training state without accessing the
+original HF directory, even if `initialize_from_hf` still names that directory.
+The configured tokenizer, training inputs and matching model configuration are
+still required.
+The configured attention geometry, normalization and RoPE must match; context
+length, attention backend and rematerialization policy may change. Older
+checkpoints without this metadata still require the original explicit config and
+HF `config.json` when the source supplied padded vocabulary. Checkpoint selection
+is pinned before model construction so a newer save cannot change the restore
+mid-startup. This resume path has single-host CPU coverage; multi-host startup
+selection has not been validated. An HF initialization creates fresh optimizer,
+step and RNG state; ordinary Trainer resume restores those states from its
+checkpoint instead.
 
 Set `hf_save_path` to a local directory and `hf_save_steps` to export updated
 weights through the existing training hooks. Exports contain canonical

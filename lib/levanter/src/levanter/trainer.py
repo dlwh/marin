@@ -70,6 +70,8 @@ from levanter.callbacks.watch import WatchConfig
 from levanter.checkpoint import (
     Checkpointer,
     CheckpointerConfig,
+    CheckpointCandidate,
+    discover_checkpoint_candidates,
     CheckpointRetention,
     is_checkpoint_path,
     load_checkpoint_or_initialize,
@@ -308,6 +310,7 @@ class Trainer:
         *,
         add_default_hooks: bool = True,
         explicit_layout: ExplicitTrainingLayout | None = None,
+        checkpoint_metadata: Callable[[Any], Mapping[str, Any]] | None = None,
     ):
         """
         Args:
@@ -318,11 +321,13 @@ class Trainer:
                 logged to the tracker with appropriate prefixes (e.g., "train/accuracy", "eval/perplexity").
                 The function should be jit-able and should not have any side effects.
             explicit_layout: Raw-array mesh and batch placement; models own storage and computation shardings.
+            checkpoint_metadata: Application metadata derived from the model being saved.
         """
         self.hooks = TrainerHooks()
         self.config = config
         self.optimizer = optimizer
         self.explicit_layout = explicit_layout
+        self._checkpoint_metadata = checkpoint_metadata
         if explicit_layout is not None and config.quantization is not None:
             raise ValueError("Explicit raw-array training does not support Haliax linear quantization")
         self._raw_loss_function = loss_fn
@@ -513,7 +518,8 @@ class Trainer:
         assert model_init is not None
 
         # first try to load a full trainer state checkpoint
-        checkpoint_search_paths, load_checkpoint = self.checkpoint_load_plan()
+        checkpoint = self.checkpoint_to_load
+        load_checkpoint = checkpoint is not None
 
         def init_state_and_model(model_init, training_key):
             model = model_init()
@@ -539,11 +545,10 @@ class Trainer:
 
         if self.explicit_layout is not None:
             loaded_state = eqx.filter(trainer_state_shape, lambda _: False)
-            if load_checkpoint:
-                checkpoint_path = levanter.checkpoint.latest_checkpoint_path(*checkpoint_search_paths)
+            if checkpoint is not None:
                 loaded_state = levanter.checkpoint.load_checkpoint(
                     eqx.filter(trainer_state_shape, saveable_train_state),
-                    checkpoint_path,
+                    checkpoint.path,
                     mesh=self.device_mesh,
                     allow_partial=self.config.allow_partial_checkpoint,
                 )
@@ -558,7 +563,8 @@ class Trainer:
 
         state = load_checkpoint_or_initialize(
             init_state_and_model,
-            checkpoint_search_paths,
+            [checkpoint.path] if checkpoint is not None else self.checkpoint_search_paths,
+            discover_latest=False,
             axis_mapping=self.parameter_axis_mapping,
             mesh=self.device_mesh,
             is_checkpointed=saveable_train_state,
@@ -568,8 +574,9 @@ class Trainer:
 
         return state
 
-    def checkpoint_load_plan(self) -> tuple[list[str], bool]:
-        """Resolve whether to restore a trainer checkpoint and where to find it."""
+    @cached_property
+    def checkpoint_to_load(self) -> CheckpointCandidate | None:
+        """Pin a complete checkpoint, or a fresh start, for template construction and restore."""
         checkpoint_search_paths = self.checkpoint_search_paths
         load_checkpoint = self.config.load_checkpoint
         if load_checkpoint is True and not any(StoragePath(path).exists() for path in checkpoint_search_paths):
@@ -586,7 +593,12 @@ class Trainer:
             if not is_checkpoint_path(checkpoint_path):
                 raise ValueError(f"initialize_from must be a checkpoint path, got {checkpoint_path}")
 
-        return checkpoint_search_paths, load_checkpoint
+        if not load_checkpoint:
+            return None
+        candidates = discover_checkpoint_candidates(*checkpoint_search_paths)
+        if not candidates:
+            raise FileNotFoundError(f"No complete checkpoint found in {checkpoint_search_paths}")
+        return candidates[-1]
 
     @property
     def checkpoint_search_paths(self) -> list[str]:
@@ -720,7 +732,10 @@ class Trainer:
                 ProgressEvent.CHECKPOINT_STARTED,
                 ProgressEvent.CHECKPOINT_FINISHED,
             ):
-                checkpointer.on_step(tree=info.state.saveable_state, step=info.step, force=force)
+                metadata = (
+                    self._checkpoint_metadata(info.state.model) if self._checkpoint_metadata is not None else None
+                )
+                checkpointer.on_step(tree=info.state.saveable_state, step=info.step, force=force, metadata=metadata)
 
         self.add_hook(checkpoint_hook, every=1)  # checkpointer manages its own frequency
 
