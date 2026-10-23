@@ -7,6 +7,7 @@ import json
 import math
 import os
 import tempfile
+from pathlib import Path
 
 import equinox as eqx
 import draccus
@@ -33,6 +34,7 @@ from levanter.data.text.datasets import DirectDatasetComponent, LmDataConfig
 from levanter.data.text.examples import GrugLmExample
 from levanter.distributed import DistributedConfig
 from levanter.models.llama_native import NativeLlamaSharding
+from levanter.layers.rotary import DefaultRotaryEmbeddingsConfig
 from levanter.models.llama import LlamaLMHeadModel
 from levanter.models.llama_native_lm import NativeLlamaLmConfig
 from levanter.optim.config import AdamConfig, ConstantLrSchedule
@@ -321,6 +323,13 @@ def test_native_train_lm_validates_and_resumes_identical_checkpoint_state(tmp_pa
         np.testing.assert_array_equal(actual_leaf, expected_leaf)
 
 
+@dataclasses.dataclass(frozen=True)
+class LocalLlamaCheckpoint:
+    path: Path
+    config: train_lm.LlamaConfig
+    weights: dict[str, np.ndarray]
+
+
 @pytest.fixture(params=[False, True], ids=["untied", "tied"])
 def native_hf_source(tmp_path, request):
     config = train_lm.LlamaConfig(
@@ -339,13 +348,15 @@ def native_hf_source(tmp_path, request):
         weights = to_torch_compatible_state_dict(model)
     config.to_hf_config(32).save_pretrained(source)
     safetensors.numpy.save_file(weights, source / "model.safetensors", metadata={"format": "pt"})
-    return source, config, weights
+    return LocalLlamaCheckpoint(source, config, weights)
 
 
 @pytest.mark.tpu
 @pytest.mark.timeout(180)
 def test_native_train_lm_hf_preserves_source_vocab_weights_and_resume(tmp_path, native_hf_source):
-    source, source_config, weights = native_hf_source
+    source = native_hf_source.path
+    source_config = native_hf_source.config
+    weights = native_hf_source.weights
     model_config = NativeLlamaLmConfig.from_hf_config(source_config.to_hf_config(32))
     # Context length is a runtime limit, not a different weight architecture.
     model_config = dataclasses.replace(
@@ -435,7 +446,8 @@ def test_native_train_lm_hf_preserves_source_vocab_weights_and_resume(tmp_path, 
 
 
 def test_native_hf_rejects_equal_shape_different_attention_architecture(native_hf_source):
-    source, source_config, _ = native_hf_source
+    source = native_hf_source.path
+    source_config = native_hf_source.config
     # Both architectures have q/o size 16x16 and k/v size 8x16, but the
     # alternate interpretation splits them into different heads and RoPE pairs.
     wrong = dataclasses.replace(
@@ -447,6 +459,26 @@ def test_native_hf_rejects_equal_shape_different_attention_architecture(native_h
         data=LmDataConfig(tokenizer="passthrough", vocab_size=31),
     )
     with pytest.raises(ValueError, match="num_attention_heads mismatch"):
+        train_lm.main(config)
+
+
+def test_native_hf_rejects_default_rope_with_ignored_scaling_factor(native_hf_source):
+    source = native_hf_source.path
+    config_path = source / "config.json"
+    hf_config = json.loads(config_path.read_text())
+    # HF default RoPE ignores factor, while Levanter's linear RoPE applies it.
+    hf_config["rope_parameters"] = {"rope_type": "default", "rope_theta": 10000.0, "factor": 8.0}
+    config_path.write_text(json.dumps(hf_config))
+    model = dataclasses.replace(
+        NativeLlamaLmConfig.from_hf_config(native_hf_source.config.to_hf_config(32)),
+        rope=DefaultRotaryEmbeddingsConfig(factor=8.0),
+    )
+    config = train_lm.TrainLmConfig(
+        model=model,
+        initialize_from_hf=str(source),
+        data=LmDataConfig(tokenizer="passthrough", vocab_size=31),
+    )
+    with pytest.raises(ValueError, match="scaled RoPE must declare linear"):
         train_lm.main(config)
 
 

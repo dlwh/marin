@@ -123,6 +123,9 @@ class NativeLlamaLmConfig(LlamaConfig):
             scaling is not None and scaling.get("partial_rotary_factor", 1.0) != 1.0
         ):
             raise ValueError("llama_native HF initialization requires full-head RoPE")
+        rope_type = (scaling.get("rope_type") or scaling.get("type") or "default") if scaling else "default"
+        if rope_type == "default" and scaling is not None and scaling.get("factor", 1.0) != 1.0:
+            raise ValueError("llama_native HF default RoPE ignores factor; scaled RoPE must declare linear")
         rope = RotaryEmbeddingsConfig.from_hf_config(theta, scaling)
         if not isinstance(rope, DefaultRotaryEmbeddingsConfig) or rope != self.rope:
             raise ValueError("llama_native HF RoPE parameters must match the configured default/linear RoPE")
