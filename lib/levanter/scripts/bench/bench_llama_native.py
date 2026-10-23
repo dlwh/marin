@@ -7,6 +7,8 @@ Both variants execute the existing Trainer's full AdamW step. Parameters are
 initialized once by legacy Llama and imported through their HF tensor names;
 no model or tokenizer download is performed. Run ``--mode compare`` to enforce
 numerical and placement parity before publishing a speed ratio.
+Use ``--attention-backend splash`` for matched TPU Splash kernels; the default
+uses vanilla/reference attention.
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ from haliax._src.state_dict import flatten_modules_for_export, to_state_dict
 from levanter.callbacks import JitCallback, ProfileOptionsConfig, profile_ctx
 from levanter.data.text.examples import GrugLmExample
 from levanter.kernels.pallas.fused_cross_entropy_loss import fused_cross_entropy_loss_and_logsumexp_penalty
+from levanter.kernels.pallas.splash_attention import DEFAULT_SPLASH_BLOCK_SIZE
 from levanter.layers.attention import AttentionBackend, AttentionMask
 from levanter.models.llama import LlamaConfig
 from levanter.models.llama_native import NativeLlamaConfig, NativeLlamaModel, NativeLlamaSharding
@@ -49,6 +52,7 @@ from levanter.utils.mesh import MeshConfig
 
 
 RMS_NORM_EPSILON = 1e-5
+ATTENTION_BACKENDS = (AttentionBackend.VANILLA, AttentionBackend.SPLASH)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -64,6 +68,7 @@ class BenchmarkConfig:
     data_size: int = 1
     model_size: int = 1
     compute_dtype: str = "float32"
+    attention_backend: AttentionBackend = AttentionBackend.VANILLA
     gradient_checkpointing: bool = True
     learning_rate: float = 1e-3
     weight_decay: float = 0.01
@@ -100,7 +105,7 @@ def _legacy_config(config: BenchmarkConfig) -> LlamaConfig:
         initializer_range=0.02,
         tie_word_embeddings=False,
         use_bias=False,
-        attn_backend=AttentionBackend.VANILLA,
+        attn_backend=config.attention_backend,
         upcast_attn=False,
         scan_layers=True,
         gradient_checkpointing=config.gradient_checkpointing,
@@ -121,7 +126,7 @@ def _native_config(config: BenchmarkConfig) -> NativeLlamaConfig:
         use_bias=False,
         upcast_attn=False,
         rope_theta=10000.0,
-        attention_implementation="reference",
+        attention_implementation="tpu_splash" if config.attention_backend == AttentionBackend.SPLASH else "reference",
         gradient_checkpointing=config.gradient_checkpointing,
     )
 
@@ -562,11 +567,18 @@ def _provenance(config: BenchmarkConfig, mesh: Mesh, source_commit: str | None, 
         "jax_default_matmul_precision": str(jax.config.jax_default_matmul_precision),
         "xla_flags": os.environ.get("XLA_FLAGS", ""),
         "libtpu_init_args": os.environ.get("LIBTPU_INIT_ARGS", ""),
-        "attention_backend": "vanilla",
+        "attention_backend": config.attention_backend.value,
         "attention_entrypoints": {
-            "legacy": "AttentionBackend.VANILLA",
-            "native": "reference_attention(logits_dtype=None)",
+            "legacy": f"AttentionBackend.{config.attention_backend.name}",
+            "native": (
+                "attention(implementation=tpu_splash)"
+                if config.attention_backend == AttentionBackend.SPLASH
+                else "reference_attention(logits_dtype=None)"
+            ),
         },
+        "attention_splash_max_block_size": (
+            DEFAULT_SPLASH_BLOCK_SIZE if config.attention_backend == AttentionBackend.SPLASH else None
+        ),
         "numpy": np.__version__,
         "loss_backend": "shared_raw_fused_cross_entropy_loss_and_logsumexp_penalty:xla",
         "loss_head_placement": "replicated in common loss adapter before the raw CE kernel",
@@ -603,6 +615,10 @@ def run_benchmark(
         raise ValueError("At least one warmup and measured step are required")
     if config.compute_dtype not in ("float32", "bfloat16"):
         raise ValueError("Use float32 or bfloat16 compute; parameters and AdamW moments remain float32")
+    if config.attention_backend not in ATTENTION_BACKENDS:
+        raise ValueError("Use vanilla or splash attention for the matched benchmark")
+    if config.attention_backend == AttentionBackend.SPLASH and jax.default_backend() != "tpu":
+        raise ValueError("Splash benchmark attention requires a TPU backend")
     device_count = config.data_size * config.model_size
     if device_count > jax.local_device_count():
         raise ValueError(f"Requested {device_count} devices but only {jax.local_device_count()} are local")
@@ -741,6 +757,10 @@ def main():
         if isinstance(default, bool):
             parser.add_argument(
                 f"--{field.name.replace('_', '-')}", action=argparse.BooleanOptionalAction, default=default
+            )
+        elif isinstance(default, AttentionBackend):
+            parser.add_argument(
+                f"--{field.name.replace('_', '-')}", type=AttentionBackend, choices=ATTENTION_BACKENDS, default=default
             )
         else:
             parser.add_argument(f"--{field.name.replace('_', '-')}", type=type(default), default=default)
