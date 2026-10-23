@@ -3,6 +3,7 @@
 
 import dataclasses
 
+import draccus
 import equinox as eqx
 import haliax as hax
 import jax
@@ -100,14 +101,18 @@ def test_native_hf_export_transformers_local_logits(tmp_path, tiny_hf_tokenizer_
 @pytest.mark.parametrize("mask_kind", ["causal", "dense", "bidirectional", "offset", "none"])
 @pytest.mark.parametrize("unbatched", [False, True])
 def test_native_lm_boundary_preserves_short_positions_masks_loss_and_gradients(mask_kind, unbatched):
-    config = NativeLlamaLmConfig(
-        hidden_dim=16,
-        intermediate_dim=24,
-        num_layers=2,
-        num_heads=4,
-        num_kv_heads=2,
-        max_seq_len=16,
-        attn_backend=AttentionBackend.VANILLA,
+    config = draccus.decode(
+        NativeLlamaLmConfig,
+        {
+            "hidden_dim": 16,
+            "intermediate_dim": 24,
+            "num_layers": 4,
+            "num_heads": 4,
+            "num_kv_heads": 2,
+            "max_seq_len": 16,
+            "attn_backend": "vanilla",
+            "gradient_checkpointing": {"save_carries": False, "save_inputs": True, "nested": 2},
+        },
     )
     mesh = Mesh(np.asarray(jax.devices()[:1]), ("data",), axis_types=(AxisType.Explicit,))
     Batch, Pos, Vocab = hax.Axis("batch", 2), hax.Axis("position", 8), hax.Axis("vocab", 32)

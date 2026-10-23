@@ -26,6 +26,7 @@ from levanter.data.text.examples import grug_attention_mask_from_named
 from levanter.grug.attention import AttentionMask as RawAttentionMask
 from levanter.layers.attention import AttentionBackend, AttentionMask
 from levanter.layers.rotary import DefaultRotaryEmbeddingsConfig, RotaryEmbeddingsConfig
+from levanter.layers.scan_checkpoint import ScanCheckpointPolicy as NativeScanCheckpointPolicy
 from levanter.models.llama import LlamaConfig
 from levanter.models.llama_native import NativeLlamaConfig, NativeLlamaModel, NativeLlamaSharding
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel
@@ -228,6 +229,10 @@ class NativeLlamaLmConfig(LlamaConfig):
             for field in dataclasses.fields(NativeLlamaConfig)
             if field.name not in {"vocab_size", "rope_theta", "rope_factor", "attention_implementation"}
         }
+        if isinstance(self.gradient_checkpointing, hax.ScanCheckpointPolicy):
+            fields["gradient_checkpointing"] = NativeScanCheckpointPolicy(
+                **dataclasses.asdict(self.gradient_checkpointing)
+            )
         return NativeLlamaConfig(
             vocab_size=vocab_size,
             rope_theta=self.rope.theta,

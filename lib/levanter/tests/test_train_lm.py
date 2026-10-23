@@ -231,10 +231,11 @@ def test_native_train_lm_validates_and_resumes_identical_checkpoint_state(tmp_pa
                 "type": "llama_native",
                 "hidden_dim": 16,
                 "intermediate_dim": 24,
-                "num_layers": 2,
+                "num_layers": 4,
                 "num_heads": 4,
                 "num_kv_heads": 2,
                 "max_seq_len": 16,
+                "gradient_checkpointing": {"save_carries": False, "save_inputs": True, "nested": 2},
             }
         },
     )
