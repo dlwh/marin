@@ -72,7 +72,41 @@ class NativeLlamaLmConfig(LlamaConfig):
     @classmethod
     def from_hf_config(cls, hf_config: HfConfig) -> "NativeLlamaLmConfig":
         named_config = LlamaConfig.from_hf_config(hf_config)
-        return cls(**{field.name: getattr(named_config, field.name) for field in dataclasses.fields(named_config)})
+        fields = {field.name: getattr(named_config, field.name) for field in dataclasses.fields(named_config)}
+        fields["head_dim"] = hf_config.head_dim
+        return cls(**fields)
+
+    def validate_hf_export(self) -> None:
+        """Require the standard HF Llama normalization and bias conventions."""
+        if (
+            self.hybrid_norm
+            or self.input_embedding_norm
+            or self.use_qk_norm
+            or not self.use_layer_norm_weight
+            or self.use_bias
+        ):
+            raise ValueError("llama_native HF export requires standard weighted RMSNorm and bias-free projections")
+
+    def to_hf_config(self, vocab_size: int, config_overrides: Optional[dict] = None) -> HfLlamaConfig:
+        self.validate_hf_export()
+        assert isinstance(self.rope, DefaultRotaryEmbeddingsConfig)
+        # Reuse the architecture translation without its untyped legacy linear
+        # scaling dictionary, then emit matching Transformers 4/5 RoPE metadata.
+        unscaled = dataclasses.replace(self, rope=DefaultRotaryEmbeddingsConfig(theta=self.rope.theta))
+        fields = LlamaConfig.to_hf_config(unscaled, vocab_size).to_dict()
+        scaling = None if self.rope.factor == 1 else {"rope_type": "linear", "factor": self.rope.factor}
+        fields.update(
+            architectures=["LlamaForCausalLM"],
+            head_dim=self.actual_head_size,
+            rope_scaling=scaling,
+            rope_parameters={"rope_theta": self.rope.theta, **(scaling or {"rope_type": "default"})},
+        )
+        fields.update(config_overrides or {})
+        return HfLlamaConfig.from_dict(fields)
+
+    def hf_export_converter(self, tokenizer: MarinTokenizer) -> HFCheckpointConverter:
+        """Build a local-export converter without resolving reference weights or metadata."""
+        return HFCheckpointConverter(type(self), HfConfigClass=HfLlamaConfig, tokenizer=tokenizer)
 
     def hf_checkpoint_converter(
         self, ref_checkpoint: str | None = None, *, tokenizer: MarinTokenizer | None = None

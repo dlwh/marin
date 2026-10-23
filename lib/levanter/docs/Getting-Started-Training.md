@@ -99,9 +99,19 @@ Trainer resume reads weights from its Trainer checkpoint and does not reload the
 HF safetensors. An HF initialization creates fresh optimizer, step and RNG state;
 ordinary Trainer resume restores those states from its checkpoint instead.
 
-HF export, LoRA and Haliax quantization remain unsupported by this training
-entrypoint and are rejected before initialization. Existing `model.type: llama`
-configurations retain their behavior.
+Set `hf_save_path` to a local directory and `hf_save_steps` to export updated
+weights through the existing training hooks. Exports contain canonical
+safetensors, the actual model vocabulary, explicit head dimension, default/linear
+RoPE metadata, and the tokenizer. Both tied and untied output heads are supported.
+The default export preserves parameter precision; `hf_save_dtype: bfloat16`
+explicitly rounds floating-point weights for the saved artifact. Exported weights
+can initialize a new native run or a standard HF Llama consumer; they do not
+contain optimizer or RNG state.
+
+Local export requires standard weighted RMSNorm and bias-free projections. Hub
+upload, remote export destinations, LoRA and Haliax quantization remain
+unsupported by this training entrypoint and are rejected before initialization.
+Existing `model.type: llama` configurations retain their behavior.
 
 ## Set Custom Training Configuration
 In machine learning experiments, it is common to adjust model hyperparameters. In this section, we will provide examples of different use cases
