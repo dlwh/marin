@@ -51,9 +51,9 @@ trainer:
     axes: {data: 2, model: 2}
 ```
 
-The tokenizer determines vocabulary size, rounded to the tensor-parallel mesh
-size. Native training enables explicit mesh axes automatically. The existing
-batch mapping places examples; `mesh.param_mapping.embed` selects the FSDP axis
+For random initialization, the tokenizer determines vocabulary size, rounded to
+the tensor-parallel mesh size. Native training enables explicit mesh axes
+automatically. The existing batch mapping places examples; `mesh.param_mapping.embed` selects the FSDP axis
 and `mesh.compute_mapping.mlp` selects the tensor-parallel axis. The native model
 uses that same tensor-parallel axis for query/KV heads, MLP channels and vocabulary
 rows, and gathers the FSDP dimension for computation. KV heads and MLP channels
@@ -76,8 +76,30 @@ windows; Splash rejects those mask forms explicitly.
 Resume a native run with the ordinary Trainer checkpoint settings. Native
 checkpoints include parameters, optimizer state, training step and RNG state.
 The named Llama and native Llama have different checkpoint trees; loading a named
-Trainer checkpoint directly into a native run is unsupported. HF initialization,
-HF export, LoRA and Haliax quantization are also unsupported by this training
+Trainer checkpoint directly into a native run is unsupported.
+
+To initialize from a local Hugging Face Llama checkpoint, set
+`initialize_from_hf: /path/to/llama-checkpoint`. The directory must contain its
+`config.json` and safetensors weights (a single file or a sharded index). Configure
+the matching native architecture explicitly. Layer count, hidden/MLP sizes,
+query/KV heads, head dimension, tied embeddings, activation, RMSNorm epsilon and
+RoPE type, base/theta and linear scaling factor must match; the maximum context
+length may differ. This path supports standard weighted RMSNorm, bias-free
+projections and no attention
+dropout. Automatic HF model-config replacement and tokenizer padding remain
+unsupported.
+
+The checkpoint determines the complete model vocabulary, including any padded
+embedding/output rows beyond the tokenizer's length. Those rows are preserved
+and participate in the output softmax. The source vocabulary must be at least as
+large as the tokenizer and divisible by the tensor-parallel mesh size; the loader
+does not resize it. Keep `initialize_from_hf` and the source `config.json`
+available when resuming so the same model vocabulary is reconstructed. A full
+Trainer resume reads weights from its Trainer checkpoint and does not reload the
+HF safetensors. An HF initialization creates fresh optimizer, step and RNG state;
+ordinary Trainer resume restores those states from its checkpoint instead.
+
+HF export, LoRA and Haliax quantization remain unsupported by this training
 entrypoint and are rejected before initialization. Existing `model.type: llama`
 configurations retain their behavior.
 

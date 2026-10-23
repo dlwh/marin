@@ -6,7 +6,7 @@ import functools
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, cast
 
 import equinox as eqx
 import haliax as hax
@@ -29,7 +29,7 @@ from levanter.callbacks.labeled_eval import LabeledLmEvalConfig, add_labeled_lm_
 from levanter.adaptor import AdaptorConfig, AdaptorExportConfig, NoAdaptorConfig
 from levanter.callbacks.tensorstore_callbacks import install_tensorstore_metrics_hook_if_enabled
 from levanter.checkpoint import latest_checkpoint_path, load_checkpoint
-from levanter.compat.hf_checkpoints import HFCompatConfig, build_generation_config
+from levanter.compat.hf_checkpoints import HFCompatConfig, ModelWithHfSerializationMixin, build_generation_config
 from levanter.data.mixture import MixtureDataset
 from levanter.data.text.datasets import LmDataConfig
 from levanter.data.text.examples import GrugLmExample, named_lm_example_from_grug
@@ -154,11 +154,22 @@ def _load_lm_model_from_configured_source(
 ) -> LmHeadModel:
     if config.initialize_from_hf:
         assert converter is not None
+        model_init = None
+        load_dtype = trainer.mp.compute_dtype
+        if isinstance(config.model, NativeLlamaLmConfig):
+
+            def initialize_native_model(vocab: Axis) -> ModelWithHfSerializationMixin:
+                return cast(ModelWithHfSerializationMixin, _build_lm_model(config, vocab, model_key, trainer))
+
+            model_init = initialize_native_model
+            # Compute precision must not round pretrained master weights before initialization.
+            load_dtype = trainer.mp.param_dtype
         model = converter.load_pretrained(
             config.model.model_type,
             config=config.model if not config.use_hf_model_config else None,
             axis_mapping=parameter_axis_mapping,
-            dtype=trainer.mp.compute_dtype,
+            dtype=load_dtype,
+            model_init=model_init,
         )
         model = named_jit(trainer.mp.cast_to_param, parameter_axis_mapping)(model)
     elif (
@@ -187,9 +198,9 @@ def main(config: TrainLmConfig):
     native = isinstance(config.model, NativeLlamaLmConfig)
     explicit_layout = None
     if native:
-        if config.initialize_from_hf or config.use_hf_model_config or config.pad_tokenizer_to_match_model:
+        if config.use_hf_model_config or config.pad_tokenizer_to_match_model:
             raise ValueError(
-                "llama_native training supports native checkpoints; HF initialization is not supported yet"
+                "llama_native HF initialization requires an explicit model config and unchanged tokenizer"
             )
         if not isinstance(config.adapter, NoAdaptorConfig):
             raise ValueError("llama_native training does not support adapters yet")
@@ -200,6 +211,7 @@ def main(config: TrainLmConfig):
         config = dataclasses.replace(config, trainer=dataclasses.replace(config.trainer, use_explicit_mesh_axes=True))
         _native_llama_sharding(config.trainer)
     tokenizer = config.data.the_tokenizer
+    source_vocab_size = None
 
     # The three weight-init sources are mutually exclusive: HF conversion, native full-state restore, and
     # native weights-only init.
@@ -226,13 +238,23 @@ def main(config: TrainLmConfig):
             raise ValueError("Cannot specify both initialize_from_hf and initialize_from")
 
         assert isinstance(config.model, HFCompatConfig)
-        converter = config.model.hf_checkpoint_converter()
-        converter.warn_if_tokenizer_mismatch(tokenizer)
-
-        if isinstance(config.initialize_from_hf, str):
-            converter = converter.replaced(reference_checkpoint=config.initialize_from_hf, tokenizer=tokenizer)
+        if isinstance(config.model, NativeLlamaLmConfig):
+            converter = config.model.hf_checkpoint_converter(
+                config.initialize_from_hf if isinstance(config.initialize_from_hf, str) else None,
+                tokenizer=tokenizer,
+            )
+            hf_config = converter.default_hf_config
+            config.model.validate_hf_config(hf_config)
+            source_vocab_size = hf_config.vocab_size
+            if len(tokenizer) > source_vocab_size:
+                raise ValueError("llama_native tokenizer vocabulary exceeds the HF checkpoint vocabulary")
         else:
-            converter = converter.replaced(tokenizer=tokenizer)
+            converter = config.model.hf_checkpoint_converter()
+            converter.warn_if_tokenizer_mismatch(tokenizer)
+            if isinstance(config.initialize_from_hf, str):
+                converter = converter.replaced(reference_checkpoint=config.initialize_from_hf, tokenizer=tokenizer)
+            else:
+                converter = converter.replaced(tokenizer=tokenizer)
 
         if config.pad_tokenizer_to_match_model:
             converter = converter.with_tokenizer_padded_to_match_model()
@@ -260,6 +282,8 @@ def main(config: TrainLmConfig):
             raise ValueError("llama_native hidden_dim must be divisible by the FSDP mesh size")
         if sharding.model_axis is not None:
             model_size = mesh.shape[sharding.model_axis]
+            if source_vocab_size is not None and source_vocab_size % model_size:
+                raise ValueError("llama_native HF vocabulary must be divisible by the tensor-parallel mesh size")
             if config.model.num_kv_heads % model_size:
                 raise ValueError("llama_native num_kv_heads must be divisible by the tensor-parallel mesh size")
             if config.model.intermediate_dim % model_size:
@@ -329,9 +353,13 @@ def main(config: TrainLmConfig):
         vocab_mapping = parameter_axis_mapping
         if native:
             vocab_mapping = {**parameter_axis_mapping, "vocab": _native_llama_sharding(config.trainer).model_axis}
-        Vocab = round_axis_for_partitioning(Axis("vocab", vocab_size), vocab_mapping)
+        Vocab = (
+            Axis("vocab", source_vocab_size)
+            if source_vocab_size is not None
+            else round_axis_for_partitioning(Axis("vocab", vocab_size), vocab_mapping)
+        )
         if vocab_size != Vocab.size:
-            logger.info(f"Rounding vocab size from {vocab_size} to {Vocab.size} for partitioning")
+            logger.info(f"Using model vocabulary {Vocab.size} for tokenizer vocabulary {vocab_size}")
 
         # Get the training dataset
         make_train_dataset = config.data.train_mixture if native else config.data.train_set
@@ -443,7 +471,7 @@ def main(config: TrainLmConfig):
                 max_eval_examples_per_dataset=max_eval_examples_per_ds,
             )
 
-        flops_per_token = config.model.flops_per_token(vocab_size, Pos.size)
+        flops_per_token = config.model.flops_per_token(Vocab.size if native else vocab_size, Pos.size)
         flops_per_example = 3 * flops_per_token * Pos.size if flops_per_token is not None else None
         trainer.add_hook(
             callbacks.log_performance_stats(Pos.size, trainer.config.batch_schedule, flops_per_example), every=1
