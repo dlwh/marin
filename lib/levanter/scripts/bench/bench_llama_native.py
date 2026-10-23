@@ -444,13 +444,19 @@ def _run_variant(
         jax.block_until_ready(result)
         state = result.new_state
     samples = []
+    measured_losses = []
     for _ in range(config.measured_steps):
         jax.block_until_ready(state)
         start = time.perf_counter()
         result = step_fn(state, (batch,), {})
         jax.block_until_ready(result)
         samples.append(time.perf_counter() - start)
+        measured_losses.append(result.loss)
         state = result.new_state
+    # Retain only device scalars during timing; transfer the trajectory after
+    # every measured step has finished.
+    measured_step_losses = [float(loss) for loss in measured_losses]
+    diagnostics["measured_step_losses"] = {"losses": np.asarray(measured_step_losses, dtype=np.float32)}
     result_report = {
         "kind": kind,
         "state_init_seconds": state_init_seconds,
@@ -459,7 +465,8 @@ def _run_variant(
         "first_execution_seconds": first_execution_seconds,
         "compiled_memory_analysis": memory,
         "timing": _timing_summary(samples, config.batch_size * config.seq_len),
-        "final_loss": float(result.loss),
+        "measured_step_losses": measured_step_losses,
+        "final_loss": measured_step_losses[-1],
         "final_step": int(state.step),
         "layouts": {
             "parameters": model_manifest,
