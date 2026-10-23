@@ -317,6 +317,10 @@ def _tpu_splash_attention(
     if Sk % 128 != 0:
         raise NotImplementedError("Splash attention requires key/value sequence length to be a multiple of 128.")
 
+    if q_.dtype == jnp.bfloat16:
+        # Preserve query-scale rounding before the RoPE adjoint in backward.
+        # TPU otherwise folds the scale into rounded BF16 sine/cosine values.
+        q_ = jax.lax.optimization_barrier(q_)
     q_ = q_ * (1.0 / math.sqrt(D))
 
     mesh = _get_mesh()
