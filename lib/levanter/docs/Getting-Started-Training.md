@@ -30,6 +30,57 @@ Configuration files are processed using [Draccus](https://github.com/dlwh/draccu
 It should mostly work like you would expect. Arguments may be passed in via the command line using arg-parse style
 flags like `--trainer.num_train_steps`, and will override the values in the config file.
 
+### Native JAX Llama
+
+Select `model.type: llama_native` to train the array-native Llama through the same
+`levanter.main.train_lm` entrypoint, dataset pipeline, validation callbacks and
+checkpoint hooks:
+
+```yaml
+model:
+  type: llama_native
+  hidden_dim: 2048
+  intermediate_dim: 5632
+  num_layers: 28
+  num_heads: 16
+  num_kv_heads: 4
+  max_seq_len: 2048
+  attn_backend: vanilla
+trainer:
+  mesh:
+    axes: {data: 2, model: 2}
+```
+
+The tokenizer determines vocabulary size, rounded to the tensor-parallel mesh
+size. Native training enables explicit mesh axes automatically. The existing
+batch mapping places examples; `mesh.param_mapping.embed` selects the FSDP axis
+and `mesh.compute_mapping.mlp` selects the tensor-parallel axis. The native model
+uses that same tensor-parallel axis for query/KV heads, MLP channels and vocabulary
+rows, and gathers the FSDP dimension for computation. KV heads and MLP channels
+must divide evenly across the tensor-parallel mesh. Compound FSDP/tensor-parallel
+mappings and sequence parallelism are unsupported.
+
+The shared LM loss gathers the full output head on each participant before the
+cross-entropy kernel; parameter and optimizer storage retain their native
+partitions. This entrypoint has offline CPU training, validation and resume
+coverage. Accelerator throughput and long-run convergence remain unvalidated for
+this entrypoint.
+
+The default native attention implementation is the portable reference kernel;
+`attn_backend: splash` selects native TPU Splash attention. SwiGLU, scanned layers,
+default/linear RoPE, causal masks, document segments and sliding windows are
+supported. Training can use `train_seq_len` shorter than `model.max_seq_len`.
+Reference attention also preserves dense masks, causal offsets and bidirectional
+windows; Splash rejects those mask forms explicitly.
+
+Resume a native run with the ordinary Trainer checkpoint settings. Native
+checkpoints include parameters, optimizer state, training step and RNG state.
+The named Llama and native Llama have different checkpoint trees; loading a named
+Trainer checkpoint directly into a native run is unsupported. HF initialization,
+HF export, LoRA and Haliax quantization are also unsupported by this training
+entrypoint and are rejected before initialization. Existing `model.type: llama`
+configurations retain their behavior.
+
 ## Set Custom Training Configuration
 In machine learning experiments, it is common to adjust model hyperparameters. In this section, we will provide examples of different use cases
 and explain the corresponding parameters that you can change.

@@ -2,33 +2,41 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import datetime
+import dataclasses
 import json
 import math
 import os
 import tempfile
 
 import equinox as eqx
+import draccus
 import jax
 import jax.numpy as jnp
 import jax.random as jrandom
+import jmp
+import numpy as np
 import pytest
 from chex import assert_trees_all_close
 
 from haliax import Axis
 from haliax.quantization import QuantizationConfig
+from jax.sharding import PartitionSpec as P
 
 import levanter.main.train_lm as train_lm
 from levanter.testing import tiny_corpus
 from levanter.adaptor import LoraAdaptorConfig
-from levanter.checkpoint import CheckpointerConfig, latest_checkpoint_path
+from levanter.checkpoint import CheckpointerConfig, latest_checkpoint_path, load_checkpoint
 from levanter.data.dataset import ListAsyncDataset
 from levanter.data.text.datasets import DirectDatasetComponent, LmDataConfig
 from levanter.data.text.examples import GrugLmExample
 from levanter.distributed import DistributedConfig
-from levanter.optim.config import AdamConfig
+from levanter.models.llama_native import NativeLlamaSharding
+from levanter.models.llama_native_lm import NativeLlamaLmConfig
+from levanter.optim.config import AdamConfig, ConstantLrSchedule
 from levanter.tracker.json_file import JsonFileTrackerConfig
-from levanter.trainer_state import trainables_only
+from levanter.trainer_state import TrainerState, trainables_only
 from levanter.testing.helpers import arrays_only
+from levanter.utils.mesh import MeshConfig
 
 
 def _array_leaves(tree):
@@ -198,6 +206,116 @@ def test_train_lm_direct_dataset():
         )
         train_lm.main(config)
         _assert_training_recorded(tmpdir)
+
+
+@pytest.mark.tpu
+@pytest.mark.timeout(120)
+def test_native_train_lm_validates_and_resumes_identical_checkpoint_state(tmp_path):
+    parsed = draccus.decode(
+        train_lm.TrainLmConfig,
+        {
+            "model": {
+                "type": "llama_native",
+                "hidden_dim": 16,
+                "intermediate_dim": 24,
+                "num_layers": 2,
+                "num_heads": 4,
+                "num_kv_heads": 2,
+                "max_seq_len": 16,
+            }
+        },
+    )
+    examples = ListAsyncDataset(
+        [
+            GrugLmExample.causal(
+                (jnp.arange(8) + index) % 31,
+                segment_ids=jnp.array([0, 0, 0, 0, 1, 1, 1, 1]),
+                sliding_window=3,
+            )
+            for index in range(16)
+        ]
+    )
+    data = LmDataConfig(
+        tokenizer="passthrough",
+        vocab_size=31,
+        shuffle=False,
+        components={"direct": DirectDatasetComponent(datasets={"train": examples, "validation": examples})},
+    )
+    model_size = 2 if len(jax.devices()) >= 4 else 1
+    data_size = len(jax.devices()) // model_size
+    batch_size = 2 * data_size
+    optimizer = AdamConfig(learning_rate=1e-3, warmup=0, lr_schedule=ConstantLrSchedule(), weight_decay=0.0)
+
+    def configuration(name, steps, *, resume=False):
+        run_dir = tmp_path / name
+        return dataclasses.replace(
+            parsed,
+            data=data,
+            data_seed=7,
+            train_seq_len=8,
+            optimizer=optimizer,
+            trainer=train_lm.TrainerConfig(
+                id="native",
+                seed=42,
+                num_train_steps=steps,
+                train_batch_size=batch_size,
+                per_device_parallelism=1,
+                per_device_eval_parallelism=1,
+                mp=jmp.get_policy("f32"),
+                max_eval_batches=1,
+                steps_per_eval=1,
+                mesh=MeshConfig(axes={"data": data_size, "model": model_size}, batch_axis_name="examples"),
+                tracker=JsonFileTrackerConfig(output_path=str(run_dir / "tracker")),
+                checkpointer=CheckpointerConfig(base_path=str(run_dir / "checkpoints"), keep=[{"every": 1}]),
+                load_checkpoint=resume,
+                require_accelerator=False,
+                distributed=DistributedConfig(initialize_jax_distributed=False),
+                log_xla_hlo=False,
+                log_jaxprs=False,
+            ),
+        )
+
+    full = configuration("full", 3)
+    train_lm.main(full)
+    train_lm.main(configuration("resumed", 2))
+    resumed = configuration("resumed", 3, resume=True)
+    train_lm.main(resumed)
+    for name in ("full", "resumed"):
+        metrics = _assert_training_recorded(str(tmp_path / name / "tracker"))
+        assert math.isfinite(metrics["eval/loss"])
+    mesh = dataclasses.replace(full.trainer, use_explicit_mesh_axes=True).device_mesh
+    with jax.set_mesh(mesh):
+        sharding = NativeLlamaSharding(
+            batch_axes=("replica_dcn", "replica", "data"), fsdp_axis="data", model_axis="model"
+        )
+        assert isinstance(full.model, NativeLlamaLmConfig)
+        model = full.model.build(
+            Axis("vocab", math.ceil(31 / model_size) * model_size), key=jrandom.PRNGKey(0), sharding=sharding
+        )
+        template = TrainerState.init(optimizer.build(3), model, key=jrandom.PRNGKey(0), mp=full.trainer.mp)
+        expected = load_checkpoint(template, latest_checkpoint_path(tmp_path / "full/checkpoints/native"), mesh=mesh)
+        actual = load_checkpoint(template, latest_checkpoint_path(tmp_path / "resumed/checkpoints/native"), mesh=mesh)
+    assert int(actual.step) == 3
+    for actual_leaf, expected_leaf in zip(_array_leaves(actual), _array_leaves(expected), strict=True):
+        np.testing.assert_array_equal(actual_leaf, expected_leaf)
+    assert actual.model.native.token_embeddings.sharding.spec == sharding.column_storage
+    assert actual.model.native.layers.stacked.mlp.down_proj.weight.sharding.spec == P(None, "data", "model")
+
+    weights_only = dataclasses.replace(
+        configuration("weights-only", 1),
+        optimizer=dataclasses.replace(optimizer, learning_rate=0.0),
+        initialize_model_from_checkpoint_path=str(tmp_path / "full/checkpoints/native"),
+    )
+    train_lm.main(weights_only)
+    with jax.set_mesh(mesh):
+        initialized = load_checkpoint(
+            template, latest_checkpoint_path(tmp_path / "weights-only/checkpoints/native"), mesh=mesh
+        )
+    assert int(initialized.step) == 1
+    for actual_leaf, expected_leaf in zip(
+        _array_leaves(initialized.model), _array_leaves(expected.model), strict=True
+    ):
+        np.testing.assert_array_equal(actual_leaf, expected_leaf)
 
 
 def _frozen_lm_config(tmpdir, data_config, *, out, seed, init_from=None, ckpt_base=None):
