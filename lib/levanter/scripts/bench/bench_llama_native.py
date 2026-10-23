@@ -111,7 +111,6 @@ def _native_config(config: BenchmarkConfig) -> NativeLlamaConfig:
         num_kv_heads=config.num_kv_heads,
         max_seq_len=config.seq_len,
         layer_norm_epsilon=1e-5,
-        initializer_range=0.02,
         tie_word_embeddings=False,
         use_bias=False,
         upcast_attn=False,
