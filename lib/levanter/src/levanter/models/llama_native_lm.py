@@ -18,14 +18,18 @@ from haliax.state_dict import ModuleWithStateDictSerialization
 from jax.sharding import PartitionSpec as P, get_abstract_mesh, reshard
 from jaxtyping import PRNGKeyArray
 from transformers import PretrainedConfig as HfConfig
+from transformers import LlamaConfig as HfLlamaConfig
 
+from levanter.compat.hf_checkpoints import HFCheckpointConverter
+from levanter.compat.hf_config import hf_rope_config
 from levanter.data.text.examples import grug_attention_mask_from_named
 from levanter.grug.attention import AttentionMask as RawAttentionMask
 from levanter.layers.attention import AttentionBackend, AttentionMask
-from levanter.layers.rotary import DefaultRotaryEmbeddingsConfig
+from levanter.layers.rotary import DefaultRotaryEmbeddingsConfig, RotaryEmbeddingsConfig
 from levanter.models.llama import LlamaConfig
 from levanter.models.llama_native import NativeLlamaConfig, NativeLlamaModel, NativeLlamaSharding
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel
+from levanter.tokenizers import MarinTokenizer
 from levanter.utils.activation import ActivationFunctionEnum
 
 
@@ -69,6 +73,62 @@ class NativeLlamaLmConfig(LlamaConfig):
     def from_hf_config(cls, hf_config: HfConfig) -> "NativeLlamaLmConfig":
         named_config = LlamaConfig.from_hf_config(hf_config)
         return cls(**{field.name: getattr(named_config, field.name) for field in dataclasses.fields(named_config)})
+
+    def hf_checkpoint_converter(
+        self, ref_checkpoint: str | None = None, *, tokenizer: MarinTokenizer | None = None
+    ) -> HFCheckpointConverter:
+        return HFCheckpointConverter(
+            type(self),
+            reference_checkpoint=self.reference_checkpoint if ref_checkpoint is None else ref_checkpoint,
+            HfConfigClass=HfLlamaConfig,
+            tokenizer=tokenizer if tokenizer is not None else self.tokenizer,
+        )
+
+    def validate_hf_config(self, hf_config: HfConfig) -> None:
+        """Reject HF architectures whose weights would change meaning under this configuration."""
+        if hf_config.model_type != "llama":
+            raise ValueError("llama_native HF initialization requires a Llama checkpoint")
+        if (
+            self.hybrid_norm
+            or self.input_embedding_norm
+            or self.use_qk_norm
+            or not self.use_layer_norm_weight
+            or any(getattr(hf_config, name, False) for name in ("hybrid_norm", "input_embedding_norm", "use_qk_norm"))
+            or not getattr(hf_config, "use_layer_norm_weight", True)
+        ):
+            raise ValueError("llama_native HF initialization requires standard weighted RMSNorm")
+        # The native use_bias also enables norm biases, which standard HF Llama
+        # does not serialize even when attention_bias or mlp_bias is enabled.
+        if self.use_bias or hf_config.attention_bias or hf_config.mlp_bias:
+            raise ValueError("llama_native HF initialization supports only bias-free Llama")
+        if hf_config.attention_dropout != 0:
+            raise ValueError("llama_native HF initialization does not support attention dropout")
+        expected = {
+            "hidden_size": self.hidden_dim,
+            "intermediate_size": self.intermediate_dim,
+            "num_hidden_layers": self.num_layers,
+            "num_attention_heads": self.num_heads,
+            "num_key_value_heads": self.num_kv_heads,
+            "head_dim": self.actual_head_size,
+            "tie_word_embeddings": self.tie_word_embeddings,
+            "hidden_act": self.activation_function.value,
+            "rms_norm_eps": self.layer_norm_epsilon,
+        }
+        for name, value in expected.items():
+            actual = getattr(hf_config, name)
+            if actual != value:
+                raise ValueError(f"llama_native HF {name} mismatch: checkpoint={actual}, configured={value}")
+        theta, scaling = hf_rope_config(hf_config)
+        if getattr(hf_config, "partial_rotary_factor", 1.0) != 1.0 or (
+            scaling is not None and scaling.get("partial_rotary_factor", 1.0) != 1.0
+        ):
+            raise ValueError("llama_native HF initialization requires full-head RoPE")
+        rope_type = (scaling.get("rope_type") or scaling.get("type") or "default") if scaling else "default"
+        if rope_type == "default" and scaling is not None and scaling.get("factor", 1.0) != 1.0:
+            raise ValueError("llama_native HF default RoPE ignores factor; scaled RoPE must declare linear")
+        rope = RotaryEmbeddingsConfig.from_hf_config(theta, scaling)
+        if not isinstance(rope, DefaultRotaryEmbeddingsConfig) or rope != self.rope:
+            raise ValueError("llama_native HF RoPE parameters must match the configured default/linear RoPE")
 
     def native_config(self, vocab_size: int) -> NativeLlamaConfig:
         """Resolve tokenizer vocabulary and the supported architecture fields."""

@@ -7,6 +7,7 @@ import json
 import math
 import os
 import tempfile
+from pathlib import Path
 
 import equinox as eqx
 import draccus
@@ -16,9 +17,11 @@ import jax.random as jrandom
 import jmp
 import numpy as np
 import pytest
+import safetensors.numpy
 from chex import assert_trees_all_close
 
 from haliax import Axis
+from haliax.state_dict import to_torch_compatible_state_dict
 from haliax.quantization import QuantizationConfig
 from jax.sharding import PartitionSpec as P
 
@@ -31,11 +34,13 @@ from levanter.data.text.datasets import DirectDatasetComponent, LmDataConfig
 from levanter.data.text.examples import GrugLmExample
 from levanter.distributed import DistributedConfig
 from levanter.models.llama_native import NativeLlamaSharding
+from levanter.layers.rotary import DefaultRotaryEmbeddingsConfig
+from levanter.models.llama import LlamaLMHeadModel
 from levanter.models.llama_native_lm import NativeLlamaLmConfig
 from levanter.optim.config import AdamConfig, ConstantLrSchedule
 from levanter.tracker.json_file import JsonFileTrackerConfig
 from levanter.trainer_state import TrainerState, trainables_only
-from levanter.testing.helpers import arrays_only
+from levanter.testing.helpers import arrays_only, use_test_mesh
 from levanter.utils.mesh import MeshConfig
 
 
@@ -316,6 +321,165 @@ def test_native_train_lm_validates_and_resumes_identical_checkpoint_state(tmp_pa
         _array_leaves(initialized.model), _array_leaves(expected.model), strict=True
     ):
         np.testing.assert_array_equal(actual_leaf, expected_leaf)
+
+
+@dataclasses.dataclass(frozen=True)
+class LocalLlamaCheckpoint:
+    path: Path
+    config: train_lm.LlamaConfig
+    weights: dict[str, np.ndarray]
+
+
+@pytest.fixture(params=[False, True], ids=["untied", "tied"])
+def native_hf_source(tmp_path, request):
+    config = train_lm.LlamaConfig(
+        hidden_dim=16,
+        intermediate_dim=24,
+        num_layers=2,
+        num_heads=4,
+        num_kv_heads=2,
+        max_seq_len=16,
+        tie_word_embeddings=request.param,
+    )
+    source = tmp_path / "hf-source"
+    source.mkdir()
+    with use_test_mesh():
+        model = LlamaLMHeadModel.init(Axis("vocab", 32), config, key=jrandom.PRNGKey(13))
+        weights = to_torch_compatible_state_dict(model)
+    config.to_hf_config(32).save_pretrained(source)
+    safetensors.numpy.save_file(weights, source / "model.safetensors", metadata={"format": "pt"})
+    return LocalLlamaCheckpoint(source, config, weights)
+
+
+@pytest.mark.tpu
+@pytest.mark.timeout(180)
+def test_native_train_lm_hf_preserves_source_vocab_weights_and_resume(tmp_path, native_hf_source):
+    source = native_hf_source.path
+    source_config = native_hf_source.config
+    weights = native_hf_source.weights
+    model_config = NativeLlamaLmConfig.from_hf_config(source_config.to_hf_config(32))
+    # Context length is a runtime limit, not a different weight architecture.
+    model_config = dataclasses.replace(
+        model_config, max_seq_len=32, reference_checkpoint=str(tmp_path / "unused-default-reference")
+    )
+    examples = ListAsyncDataset([GrugLmExample.causal((jnp.arange(8) + i) % 31) for i in range(16)])
+    data = LmDataConfig(
+        tokenizer="passthrough",
+        vocab_size=31,
+        shuffle=False,
+        components={"direct": DirectDatasetComponent(datasets={"train": examples, "validation": examples})},
+    )
+    model_size = 2 if len(jax.devices()) >= 4 else 1
+    data_size = len(jax.devices()) // model_size
+    optimizer = AdamConfig(learning_rate=1e-3, warmup=0, lr_schedule=ConstantLrSchedule(), weight_decay=0.0)
+
+    def configuration(name, steps, *, resume=False, learning_rate=1e-3):
+        run_dir = tmp_path / name
+        return train_lm.TrainLmConfig(
+            model=model_config,
+            data=data,
+            data_seed=7,
+            train_seq_len=8,
+            initialize_from_hf=str(source),
+            optimizer=dataclasses.replace(optimizer, learning_rate=learning_rate),
+            trainer=train_lm.TrainerConfig(
+                id="native-hf",
+                seed=42,
+                num_train_steps=steps,
+                train_batch_size=2 * data_size,
+                per_device_parallelism=1,
+                per_device_eval_parallelism=1,
+                mp=jmp.get_policy("f32"),
+                max_eval_batches=1,
+                steps_per_eval=1,
+                mesh=MeshConfig(axes={"data": data_size, "model": model_size}),
+                tracker=JsonFileTrackerConfig(output_path=str(run_dir / "tracker")),
+                checkpointer=CheckpointerConfig(base_path=str(run_dir / "checkpoints"), keep=[{"every": 1}]),
+                load_checkpoint=resume,
+                require_accelerator=False,
+                distributed=DistributedConfig(initialize_jax_distributed=False),
+                log_xla_hlo=False,
+                log_jaxprs=False,
+            ),
+        )
+
+    frozen = configuration("frozen", 1, learning_rate=0.0)
+    frozen = dataclasses.replace(
+        frozen, trainer=dataclasses.replace(frozen.trainer, mp=jmp.get_policy("p=f32,c=bf16"))
+    )
+    train_lm.main(frozen)
+    train_lm.main(configuration("full", 2))
+    train_lm.main(configuration("resumed", 1))
+    train_lm.main(configuration("resumed", 2, resume=True))
+    for name in ("frozen", "full", "resumed"):
+        metrics = _assert_training_recorded(str(tmp_path / name / "tracker"))
+        assert math.isfinite(metrics["eval/loss"])
+
+    mesh = dataclasses.replace(frozen.trainer, use_explicit_mesh_axes=True).device_mesh
+    sharding = NativeLlamaSharding(batch_axes=("replica_dcn", "replica", "data"), fsdp_axis="data", model_axis="model")
+    with jax.set_mesh(mesh):
+        model = model_config.build(Axis("vocab", 32), key=jrandom.PRNGKey(0), sharding=sharding)
+        template = TrainerState.init(optimizer.build(2), model, key=jrandom.PRNGKey(0), mp=frozen.trainer.mp)
+
+        def restored(name):
+            return load_checkpoint(
+                template, latest_checkpoint_path(tmp_path / name / "checkpoints/native-hf"), mesh=mesh
+            )
+
+        initialized, full, resumed = (restored(name) for name in ("frozen", "full", "resumed"))
+
+    # HF contains weights only: a new Trainer starts at zero, takes one step,
+    # and preserves every source row when its learning rate is zero.
+    assert int(initialized.step) == 1
+    counters = [leaf for leaf in _array_leaves(initialized.opt_state) if jnp.issubdtype(leaf.dtype, jnp.integer)]
+    assert counters
+    for count in counters:
+        np.testing.assert_array_equal(count, 1)
+    assert initialized.model.Vocab.size == 32
+    for name, actual in initialized.model.to_state_dict().items():
+        np.testing.assert_array_equal(actual, weights[name])
+    assert initialized.model.native.token_embeddings.sharding.spec == sharding.column_storage
+    assert initialized.model.native.layers.stacked.mlp.down_proj.weight.sharding.spec == P(None, "data", "model")
+    assert int(resumed.step) == 2
+    for actual, expected in zip(_array_leaves(resumed), _array_leaves(full), strict=True):
+        np.testing.assert_array_equal(actual, expected)
+
+
+def test_native_hf_rejects_equal_shape_different_attention_architecture(native_hf_source):
+    source = native_hf_source.path
+    source_config = native_hf_source.config
+    # Both architectures have q/o size 16x16 and k/v size 8x16, but the
+    # alternate interpretation splits them into different heads and RoPE pairs.
+    wrong = dataclasses.replace(
+        NativeLlamaLmConfig.from_hf_config(source_config.to_hf_config(32)), num_heads=2, num_kv_heads=1
+    )
+    config = train_lm.TrainLmConfig(
+        model=wrong,
+        initialize_from_hf=str(source),
+        data=LmDataConfig(tokenizer="passthrough", vocab_size=31),
+    )
+    with pytest.raises(ValueError, match="num_attention_heads mismatch"):
+        train_lm.main(config)
+
+
+def test_native_hf_rejects_default_rope_with_ignored_scaling_factor(native_hf_source):
+    source = native_hf_source.path
+    config_path = source / "config.json"
+    hf_config = json.loads(config_path.read_text())
+    # HF default RoPE ignores factor, while Levanter's linear RoPE applies it.
+    hf_config["rope_parameters"] = {"rope_type": "default", "rope_theta": 10000.0, "factor": 8.0}
+    config_path.write_text(json.dumps(hf_config))
+    model = dataclasses.replace(
+        NativeLlamaLmConfig.from_hf_config(native_hf_source.config.to_hf_config(32)),
+        rope=DefaultRotaryEmbeddingsConfig(factor=8.0),
+    )
+    config = train_lm.TrainLmConfig(
+        model=model,
+        initialize_from_hf=str(source),
+        data=LmDataConfig(tokenizer="passthrough", vocab_size=31),
+    )
+    with pytest.raises(ValueError, match="scaled RoPE must declare linear"):
+        train_lm.main(config)
 
 
 def _frozen_lm_config(tmpdir, data_config, *, out, seed, init_from=None, ckpt_base=None):
