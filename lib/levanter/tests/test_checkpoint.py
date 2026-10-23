@@ -1236,3 +1236,36 @@ def test_mpmd_checkpoint_uses_standard_format_across_destination_shardings(tmp_p
     assert loaded["weights"].sharding == source_sharding
     np.testing.assert_array_equal(loaded["progress"]["step"], 7)
     assert loaded["unused"] is None
+
+
+def test_async_checkpoint_snapshots_nested_application_metadata(monkeypatch, tmp_path):
+    # Delay delivery of TensorStore open results until staging returns; the commit and
+    # metadata publication must remain pending while the application mutates its dict.
+    original_open = tensorstore_serialization.ts.open
+    pending = []
+
+    def gated_open(*args, **kwargs):
+        store_future = original_open(*args, **kwargs)
+        store_future.force()
+        promise, future = tensorstore_serialization.ts.Promise.new()
+        pending.append((promise, store_future))
+        return future
+
+    monkeypatch.setattr(tensorstore_serialization.ts, "open", gated_open)
+    manager = array_ser.GlobalAsyncCheckpointManager()
+    metadata = {"application": {"geometry": [3], "precision": "float32"}}
+    path = tmp_path / "step-2"
+    try:
+        save_checkpoint({"weight": jnp.arange(3.0)}, 2, path, manager=manager, metadata=metadata)
+        assert not (path / "metadata.json").exists()
+        metadata["application"]["geometry"].append(99)
+    finally:
+        for promise, store_future in pending:
+            promise.set_result(store_future.result())
+        manager.wait_until_finished()
+    candidate = discover_checkpoint_candidates(path)[0]
+    assert candidate.metadata["application"] == {"geometry": [3], "precision": "float32"}
+    monkeypatch.undo()
+    with use_test_mesh():
+        restored = load_checkpoint({"weight": jax.ShapeDtypeStruct((3,), jnp.float32)}, path)
+    np.testing.assert_array_equal(restored["weight"], jnp.arange(3.0))

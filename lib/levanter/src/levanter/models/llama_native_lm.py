@@ -6,7 +6,7 @@
 import dataclasses
 import math
 from dataclasses import dataclass
-from typing import Optional, cast
+from typing import Any, Mapping, Optional, cast
 
 import equinox as eqx
 import haliax as hax
@@ -31,6 +31,27 @@ from levanter.models.llama_native import NativeLlamaConfig, NativeLlamaModel, Na
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel
 from levanter.tokenizers import MarinTokenizer
 from levanter.utils.activation import ActivationFunctionEnum
+
+
+def _checkpoint_architecture(config: NativeLlamaConfig) -> dict[str, Any]:
+    return {
+        "hidden_dim": config.hidden_dim,
+        "intermediate_dim": config.intermediate_dim,
+        "num_layers": config.num_layers,
+        "num_heads": config.num_heads,
+        "num_kv_heads": config.num_kv_heads,
+        "head_dim": config.actual_head_dim,
+        "layer_norm_epsilon": float(config.layer_norm_epsilon),
+        "tie_word_embeddings": config.tie_word_embeddings,
+        "use_bias": config.use_bias,
+        "use_layer_norm_weight": config.use_layer_norm_weight,
+        "input_embedding_norm": config.input_embedding_norm,
+        "hybrid_norm": config.hybrid_norm,
+        "use_qk_norm": config.use_qk_norm,
+        "upcast_attn": config.upcast_attn,
+        "rope_theta": float(config.rope_theta),
+        "rope_factor": float(config.rope_factor),
+    }
 
 
 @LmConfig.register_subclass("llama_native")
@@ -164,6 +185,41 @@ class NativeLlamaLmConfig(LlamaConfig):
         if not isinstance(rope, DefaultRotaryEmbeddingsConfig) or rope != self.rope:
             raise ValueError("llama_native HF RoPE parameters must match the configured default/linear RoPE")
 
+    def checkpoint_vocab_size(self, metadata: Mapping[str, Any]) -> int | None:
+        """Validate native checkpoint semantics and recover its complete model vocabulary.
+
+        Checkpoints without model metadata retain the explicit-config initialization path.
+        """
+        if "levanter_model" not in metadata:
+            return None
+        identity = metadata["levanter_model"]
+        if not isinstance(identity, dict) or set(identity) != {"version", "type", "vocab_size", "architecture"}:
+            raise ValueError("Malformed native checkpoint model metadata")
+        if type(identity["version"]) is not int or identity["version"] != 1 or identity["type"] != "llama_native":
+            raise ValueError("Unsupported checkpoint model metadata version or implementation")
+        vocab_size = identity["vocab_size"]
+        if type(vocab_size) is not int or vocab_size <= 0:
+            raise ValueError("Malformed native checkpoint vocabulary")
+        expected = _checkpoint_architecture(self.native_config(vocab_size))
+        actual = identity["architecture"]
+        if (
+            not isinstance(actual, dict)
+            or set(actual) != set(expected)
+            or any(
+                type(value) in (int, bool) and type(actual[name]) is not type(value)
+                for name, value in expected.items()
+            )
+            or any(
+                type(actual[name]) not in (int, float)
+                or (type(actual[name]) is float and not math.isfinite(actual[name]))
+                for name, value in expected.items()
+                if type(value) is float
+            )
+            or actual != expected
+        ):
+            raise ValueError("Native checkpoint architecture does not match the configured model semantics")
+        return vocab_size
+
     def native_config(self, vocab_size: int) -> NativeLlamaConfig:
         """Resolve tokenizer vocabulary and the supported architecture fields."""
         assert isinstance(self.rope, DefaultRotaryEmbeddingsConfig)
@@ -203,6 +259,17 @@ class NativeLlamaLmHeadModel(ModuleWithStateDictSerialization, LmHeadModel[Nativ
     @property
     def Vocab(self) -> Axis:
         return Axis("vocab", self.native.config.vocab_size)
+
+    def checkpoint_metadata(self) -> Mapping[str, Any]:
+        """Describe the actual stored model without source paths or runtime placement policy."""
+        return {
+            "levanter_model": {
+                "version": 1,
+                "type": "llama_native",
+                "vocab_size": self.Vocab.size,
+                "architecture": _checkpoint_architecture(self.native.config),
+            }
+        }
 
     @property
     def _batch_partition(self) -> tuple[str, ...] | None:
