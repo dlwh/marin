@@ -1239,7 +1239,7 @@ def test_mpmd_checkpoint_uses_standard_format_across_destination_shardings(tmp_p
 
 
 def test_async_checkpoint_snapshots_nested_application_metadata(monkeypatch, tmp_path):
-    # Delay real TensorStore opens until after staging returns; the commit and
+    # Delay delivery of TensorStore open results until staging returns; the commit and
     # metadata publication must remain pending while the application mutates its dict.
     original_open = tensorstore_serialization.ts.open
     pending = []
