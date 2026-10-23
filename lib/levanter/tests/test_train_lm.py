@@ -466,7 +466,32 @@ def test_native_train_lm_hf_preserves_source_vocab_weights_and_resume(tmp_path, 
         with pytest.raises(ValueError, match="checkpoint architecture"):
             train_lm.main(dataclasses.replace(resume, model=incompatible))
     train_lm.main(resume)
-    for name in ("frozen", "full", "resumed"):
+    # A real resume wins over unused initialization paths, including missing sources.
+    for field in ("initialize_model_from_checkpoint_path", "initialize_from_checkpoint_path"):
+        train_lm.main(dataclasses.replace(resume, initialize_from_hf=False, **{field: str(tmp_path / "missing")}))
+
+    trained_checkpoint = str(tmp_path / "full/checkpoints/native-hf")
+    for name, field, incompatible in (
+        (
+            "weights-init",
+            "initialize_model_from_checkpoint_path",
+            dataclasses.replace(model_config, rope=DefaultRotaryEmbeddingsConfig(factor=8.0)),
+        ),
+        (
+            "state-init",
+            "initialize_from_checkpoint_path",
+            dataclasses.replace(model_config, num_heads=8, num_kv_heads=4, head_dim=2),
+        ),
+    ):
+        initialize = dataclasses.replace(
+            configuration(name, 1, learning_rate=0.0),
+            initialize_from_hf=False,
+            **{field: trained_checkpoint},
+        )
+        with pytest.raises(ValueError, match="checkpoint architecture"):
+            train_lm.main(dataclasses.replace(initialize, model=incompatible))
+        train_lm.main(initialize)
+    for name in ("frozen", "full", "resumed", "weights-init", "state-init"):
         metrics = _assert_training_recorded(str(tmp_path / name / "tracker"))
         assert math.isfinite(metrics["eval/loss"])
 
@@ -481,7 +506,9 @@ def test_native_train_lm_hf_preserves_source_vocab_weights_and_resume(tmp_path, 
                 template, latest_checkpoint_path(tmp_path / name / "checkpoints/native-hf"), mesh=mesh
             )
 
-        initialized, full, resumed = (restored(name) for name in ("frozen", "full", "resumed"))
+        initialized, full, resumed, weights_initialized, state_initialized = (
+            restored(name) for name in ("frozen", "full", "resumed", "weights-init", "state-init")
+        )
 
     # HF contains weights only: a new Trainer starts at zero, takes one step,
     # and preserves every source row when its learning rate is zero.
@@ -498,6 +525,21 @@ def test_native_train_lm_hf_preserves_source_vocab_weights_and_resume(tmp_path, 
     assert int(resumed.step) == 3
     for actual, expected in zip(_array_leaves(resumed), _array_leaves(full), strict=True):
         np.testing.assert_array_equal(actual, expected)
+    assert any(not np.array_equal(value, weights[name]) for name, value in full.model.to_state_dict().items())
+    for initialized_state, expected_count in ((weights_initialized, 1), (state_initialized, 4)):
+        assert int(initialized_state.step) == 1
+        assert initialized_state.model.Vocab.size == 32
+        for actual, expected in zip(_array_leaves(initialized_state.model), _array_leaves(full.model), strict=True):
+            np.testing.assert_array_equal(actual, expected)
+        counts = [
+            leaf for leaf in _array_leaves(initialized_state.opt_state) if jnp.issubdtype(leaf.dtype, jnp.integer)
+        ]
+        assert counts
+        for count in counts:
+            np.testing.assert_array_equal(count, expected_count)
+    fresh_key = jrandom.split(jrandom.PRNGKey(42), 4)[3]
+    np.testing.assert_array_equal(weights_initialized.training_key, jrandom.split(fresh_key)[1])
+    np.testing.assert_array_equal(state_initialized.training_key, jrandom.split(full.training_key)[1])
 
 
 def test_native_hf_rejects_equal_shape_different_attention_architecture(native_hf_source):
