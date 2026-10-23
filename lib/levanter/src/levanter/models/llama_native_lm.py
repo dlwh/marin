@@ -33,6 +33,9 @@ from levanter.tokenizers import MarinTokenizer
 from levanter.utils.activation import ActivationFunctionEnum
 
 
+_NATIVE_CHECKPOINT_VERSION = 1
+
+
 def _checkpoint_architecture(config: NativeLlamaConfig) -> dict[str, Any]:
     return {
         "hidden_dim": config.hidden_dim,
@@ -195,7 +198,11 @@ class NativeLlamaLmConfig(LlamaConfig):
         identity = metadata["levanter_model"]
         if not isinstance(identity, dict) or set(identity) != {"version", "type", "vocab_size", "architecture"}:
             raise ValueError("Malformed native checkpoint model metadata")
-        if type(identity["version"]) is not int or identity["version"] != 1 or identity["type"] != "llama_native":
+        if (
+            type(identity["version"]) is not int
+            or identity["version"] != _NATIVE_CHECKPOINT_VERSION
+            or identity["type"] != "llama_native"
+        ):
             raise ValueError("Unsupported checkpoint model metadata version or implementation")
         vocab_size = identity["vocab_size"]
         if type(vocab_size) is not int or vocab_size <= 0:
@@ -264,7 +271,7 @@ class NativeLlamaLmHeadModel(ModuleWithStateDictSerialization, LmHeadModel[Nativ
         """Describe the actual stored model without source paths or runtime placement policy."""
         return {
             "levanter_model": {
-                "version": 1,
+                "version": _NATIVE_CHECKPOINT_VERSION,
                 "type": "llama_native",
                 "vocab_size": self.Vocab.size,
                 "architecture": _checkpoint_architecture(self.native.config),
