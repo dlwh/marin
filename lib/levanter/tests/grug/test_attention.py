@@ -96,27 +96,103 @@ def test_reference_attention_eval_shape_supports_model_sharded_grouped_query_hea
 
 
 @pytest.mark.tpu
-def test_real_tpu_splash_attention_matches_reference():
+@pytest.mark.parametrize(
+    "q_heads,kv_heads,seq_len,model_size,shard_query_sequence",
+    [
+        (16, 4, 512, 2, False),
+        (8, 8, 1024, 2, False),
+        (16, 4, 256, 2, False),
+        (16, 4, 512, 1, False),
+        (16, 4, 1024, 2, True),
+    ],
+)
+def test_tpu_splash_trace_keeps_mask_head_indices_local(q_heads, kv_heads, seq_len, model_size, shard_query_sequence):
+    mesh = AbstractMesh(
+        axis_sizes=(2, model_size),
+        axis_names=("data", "model"),
+        axis_types=(AxisType.Explicit, AxisType.Explicit),
+    )
+    q_sharding = NamedSharding(
+        mesh, P(None, "data", "model", None) if shard_query_sequence else P("data", None, "model", None)
+    )
+    kv_sharding = NamedSharding(
+        mesh, P(None, None, "model", None) if shard_query_sequence else P("data", None, "model", None)
+    )
+    q = jax.ShapeDtypeStruct((8, seq_len, q_heads, 64), jnp.float32, sharding=q_sharding)
+    kv = jax.ShapeDtypeStruct((8, seq_len, kv_heads, 64), jnp.float32, sharding=kv_sharding)
+
+    with use_abstract_mesh(mesh):
+        traced = jax.make_jaxpr(
+            lambda q, k, v: attention(q, k, v, AttentionMask.causal(), implementation="tpu_splash")
+        )(q, kv, kv)
+
+    shard_map = next(equation for equation in traced.jaxpr.eqns if equation.primitive.name == "shard_map")
+    local_inputs = [variable.aval for variable in shard_map.params["jaxpr"].invars]
+    qkv_inputs = [value for value in local_inputs if len(value.shape) == 4]
+    assert [value.shape[1] for value in qkv_inputs] == [
+        q_heads // model_size,
+        kv_heads // model_size,
+        kv_heads // model_size,
+    ]
+    local_q_length = seq_len // (2 if shard_query_sequence else 1)
+    assert qkv_inputs[0].shape[2] == local_q_length
+    assert qkv_inputs[1].shape[2] == seq_len
+    mask_metadata = [
+        value for value in local_inputs if len(value.shape) == 3 and np.issubdtype(value.dtype, np.integer)
+    ]
+    assert mask_metadata
+    # Splash indexes local heads directly unless the shared-mask dimension is one.
+    assert {value.shape[0] for value in mask_metadata} == {1}
+    query_metadata = [value for value in local_inputs if len(value.shape) == 1]
+    assert query_metadata and all(value.shape == (local_q_length,) for value in query_metadata)
+    assert traced.out_avals[0].sharding == q_sharding
+
+
+@pytest.mark.tpu
+@pytest.mark.parametrize(
+    "q_heads,kv_heads,head_dim,seq_len,data_size,model_size",
+    [(8, 8, 128, 256, 1, None), (16, 4, 64, 512, 2, 2)],
+)
+def test_real_tpu_splash_attention_matches_reference(q_heads, kv_heads, head_dim, seq_len, data_size, model_size):
     if jax.default_backend() != "tpu":
         pytest.skip("Splash attention requires a TPU backend.")
+    model_size = len(jax.devices()) if model_size is None else model_size
+    device_count = data_size * model_size
+    if len(jax.devices()) < device_count:
+        pytest.skip(f"Requires {device_count} TPU devices.")
 
     mesh = jax.sharding.Mesh(
-        np.asarray(jax.devices()).reshape(1, -1),
+        np.asarray(jax.devices()[:device_count]).reshape(data_size, model_size),
         ("data", "model"),
         axis_types=(AxisType.Explicit, AxisType.Explicit),
     )
-    sharding = NamedSharding(mesh, P(None, None, "model", None))
+    sharding = NamedSharding(mesh, P("data", None, "model", None))
     q_key, k_key, v_key = jax.random.split(jax.random.PRNGKey(0), 3)
-    q = jax.device_put(jax.random.normal(q_key, (1, 256, 8, 128), dtype=jnp.float32) * 0.02, sharding)
-    k = jax.device_put(jax.random.normal(k_key, (1, 256, 8, 128), dtype=jnp.float32) * 0.02, sharding)
-    v = jax.device_put(jax.random.normal(v_key, (1, 256, 8, 128), dtype=jnp.float32) * 0.02, sharding)
+    q = jax.device_put(
+        jax.random.normal(q_key, (data_size, seq_len, q_heads, head_dim), dtype=jnp.float32) * 0.02, sharding
+    )
+    k = jax.device_put(
+        jax.random.normal(k_key, (data_size, seq_len, kv_heads, head_dim), dtype=jnp.float32) * 0.02, sharding
+    )
+    v = jax.device_put(
+        jax.random.normal(v_key, (data_size, seq_len, kv_heads, head_dim), dtype=jnp.float32) * 0.02, sharding
+    )
     mask = AttentionMask.causal()
 
     with jax.set_mesh(mesh):
-        actual = jax.jit(lambda q, k, v: attention(q, k, v, mask, implementation="tpu_splash"))(q, k, v)
-        expected = jax.jit(lambda q, k, v: reference_attention(q, k, v, mask, logits_dtype=jnp.float32))(q, k, v)
+        actual, actual_vjp = jax.vjp(
+            jax.jit(lambda q, k, v: attention(q, k, v, mask, implementation="tpu_splash")), q, k, v
+        )
+        expected, expected_vjp = jax.vjp(
+            jax.jit(lambda q, k, v: reference_attention(q, k, v, mask, logits_dtype=jnp.float32)), q, k, v
+        )
+        cotangent = jax.device_put(jax.random.normal(jax.random.key(1), q.shape, dtype=q.dtype), sharding)
+        actual_grads = jax.jit(actual_vjp)(cotangent)
+        expected_grads = jax.jit(expected_vjp)(cotangent)
 
     np.testing.assert_allclose(actual, expected, atol=1e-3, rtol=1e-3)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+        np.testing.assert_allclose(actual_grad, expected_grad, atol=1e-3, rtol=1e-3)
 
 
 def test_token_validity_uses_padding_ids_without_excluding_packed_boundaries():
