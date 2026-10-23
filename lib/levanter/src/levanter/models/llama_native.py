@@ -21,7 +21,7 @@ from jaxtyping import Array, Float, Int, PRNGKeyArray
 
 from levanter.grug.attention import AttentionMask, GrugAttentionImplementation, attention, reference_attention
 from levanter.grug.loss import fused_linear_softmax_cross_entropy_loss
-from levanter.layers.linear import Linear
+from levanter.layers.linear import INITIALIZER_TRUNCATION_BOUND, Linear
 from levanter.layers.rms_norm import RmsNorm
 from levanter.layers.rotary_native import RotaryConfig, apply_rotary
 from levanter.layers.scan_checkpoint import ScanCheckpointSpec
@@ -330,7 +330,11 @@ class NativeLlamaModel(eqx.Module):
             raise ValueError("NativeLlamaModel requires an explicit mesh context via jax.set_mesh")
         layer_key, embed_key, head_key = jax.random.split(key, 3)
         embeddings = config.initializer_range * jax.random.truncated_normal(
-            embed_key, -3, 3, (config.vocab_size, config.hidden_dim), out_sharding=sharding.column_storage
+            embed_key,
+            -INITIALIZER_TRUNCATION_BOUND,
+            INITIALIZER_TRUNCATION_BOUND,
+            (config.vocab_size, config.hidden_dim),
+            out_sharding=sharding.column_storage,
         )
         layers = ArrayStacked.init(
             config.num_layers, NativeLlamaBlock, gradient_checkpointing=config.gradient_checkpointing

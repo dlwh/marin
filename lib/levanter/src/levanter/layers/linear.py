@@ -9,6 +9,8 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec, reshard
 from jaxtyping import Array, Float, PRNGKeyArray
 
+INITIALIZER_TRUNCATION_BOUND = 3.0
+
 
 class Linear(eqx.Module):
     """Output-first weights, optionally gathered from an FSDP storage layout."""
@@ -29,7 +31,11 @@ class Linear(eqx.Module):
         compute_spec: PartitionSpec,
     ) -> "Linear":
         weight = initializer_std * jax.random.truncated_normal(
-            key, -3, 3, (out_features, in_features), out_sharding=storage_spec
+            key,
+            -INITIALIZER_TRUNCATION_BOUND,
+            INITIALIZER_TRUNCATION_BOUND,
+            (out_features, in_features),
+            out_sharding=storage_spec,
         )
         bias = reshard(jnp.zeros(out_features), PartitionSpec(storage_spec[0])) if use_bias else None
         return Linear(weight, bias, compute_spec)
