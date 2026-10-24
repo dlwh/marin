@@ -80,6 +80,19 @@ Resume a native run with the ordinary Trainer checkpoint settings. Native
 checkpoints include parameters, optimizer state, training step and RNG state.
 The named Llama and native Llama have different checkpoint trees; loading a named
 Trainer checkpoint directly into a native run is unsupported.
+
+For one-time offline CPU conversion, strictly restore the named state using its
+original configuration and complete stored vocabulary, then call
+`levanter.main.convert_llama_checkpoint.convert_named_llama_state` with the original
+`AdamConfig`, schedule horizon and destination explicit sharding. The programmatic
+API preserves FP32 masters, Adam moments, dynamic schedule state and training RNG;
+it does not infer the original recipe or resume the data iterator. Averaging,
+adapters, quantization, muP, custom decay masks and extra update clipping/history
+transforms are unsupported.
+Save the result with native model metadata and the original completed-step index,
+which can differ from `TrainerState.step`. A new checkpoint gets its own write
+timestamp; retain the complete original metadata separately as conversion provenance.
+
 Non-default activations are part of the checkpoint architecture identity and
 must match on restore. Existing SiLU checkpoint metadata remains unchanged.
 
