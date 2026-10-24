@@ -543,31 +543,15 @@ class Trainer:
         trainer_state_shape = eqx.filter_eval_shape(init_state_and_model, model_init, training_key)
         saveable_train_state = saveable_training_mask(trainer_state_shape, is_trainable)
 
-        if self.explicit_layout is not None:
-            loaded_state = eqx.filter(trainer_state_shape, lambda _: False)
-            if checkpoint is not None:
-                loaded_state = levanter.checkpoint.load_checkpoint(
-                    eqx.filter(trainer_state_shape, saveable_train_state),
-                    checkpoint.path,
-                    mesh=self.device_mesh,
-                    allow_partial=self.config.allow_partial_checkpoint,
-                )
-
-            @eqx.filter_jit
-            def initialize_and_merge(loaded_state, model_init, key):
-                initialized = init_state_and_model(model_init, key)
-                loaded_state = eqx.filter(loaded_state, lambda leaf: not isinstance(leaf, jax.ShapeDtypeStruct))
-                return eqx.combine(loaded_state, initialized)
-
-            return initialize_and_merge(loaded_state, model_init, training_key)
-
+        # Explicit callers own placement and keep their initialization buffers reusable.
         state = load_checkpoint_or_initialize(
             init_state_and_model,
             [checkpoint.path] if checkpoint is not None else self.checkpoint_search_paths,
             discover_latest=False,
-            axis_mapping=self.parameter_axis_mapping,
+            axis_mapping=self.parameter_axis_mapping if self.explicit_layout is None else None,
             mesh=self.device_mesh,
             is_checkpointed=saveable_train_state,
+            donate_args=self.explicit_layout is None,
             do_load=load_checkpoint,
             allow_partial=self.config.allow_partial_checkpoint,
         )(model_init, training_key)

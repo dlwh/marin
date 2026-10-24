@@ -132,7 +132,7 @@ def test_explicit_trainer_checkpoint_resumes_same_next_step(tmp_path):
         id="native-checkpoint",
         tracker=NoopConfig(),
         load_checkpoint=False,
-        load_checkpoint_path=str(tmp_path),
+        load_checkpoint_path=[],
         train_batch_size=4,
         per_device_parallelism=2,
         log_jaxprs=False,
@@ -147,13 +147,21 @@ def test_explicit_trainer_checkpoint_resumes_same_next_step(tmp_path):
 
     batch = {"x": jnp.ones((4, 3)), "target": jnp.zeros((4, 3))}
     with trainer:
-        state = trainer.initial_state(jax.random.PRNGKey(12), model_init=initialize_model)
+        model = initialize_model()
+        key = jax.random.PRNGKey(12)
+        original_model = jax.tree.map(lambda leaf: np.asarray(leaf).copy(), model)
+        original_key = np.asarray(key).copy()
+        state = trainer.initial_state(key, model_init=eqx.Partial(lambda value: value, model))
+        # Initialization must leave array-bearing model factories and keys reusable.
+        np.testing.assert_array_equal(key, original_key)
+        for actual, expected in zip(jax.tree.leaves(model), jax.tree.leaves(original_model), strict=True):
+            np.testing.assert_array_equal(actual, expected)
         state = trainer.train_step(state, batch).state
         save_checkpoint(state.saveable_state, step=1, checkpoint_path=tmp_path / "step-1")
         expected = trainer.train_step(state, batch)
 
     restored_trainer = Trainer(
-        dataclasses.replace(config, load_checkpoint=True),
+        dataclasses.replace(config, load_checkpoint=True, load_checkpoint_path=str(tmp_path)),
         optimizer,
         _loss,
         add_default_hooks=False,
