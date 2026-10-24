@@ -43,6 +43,7 @@ from levanter.adaptor.lora import (
 )
 from levanter.models.lm_model import LmHeadModel
 from levanter.utils.types import FilterTree
+from levanter.models.llama_native_lm import NativeLlamaLmHeadModel
 
 
 logger = logging.getLogger(__name__)
@@ -160,7 +161,7 @@ class NoAdaptorConfig(AdaptorConfig):
 @dataclass(frozen=True)
 class LoraAdaptorConfig(LoraConfig, AdaptorConfig):
     def apply(self, model, *, key, axis_mapping=None):
-        if axis_mapping is None:
+        if axis_mapping is None or isinstance(model, NativeLlamaLmHeadModel):
             return loraize(model, self, key=key)
 
         @named_jit(axis_resources=axis_mapping, donate_args=(True,))

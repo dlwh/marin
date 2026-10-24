@@ -53,6 +53,7 @@ from typing import Callable, Dict, List, Literal, Optional, Tuple, TypeVar, Unio
 
 import equinox as eqx
 import jax
+import jax.numpy as jnp
 import numpy as np
 from jaxtyping import PRNGKeyArray, PyTree
 
@@ -68,8 +69,10 @@ from haliax.state_dict import (
     save_state_dict,
     to_state_dict,
 )
-from jax.sharding import PartitionSpec
+from jax.sharding import PartitionSpec, reshard
 
+from levanter.layers.linear import Linear as ArrayLinear
+from levanter.layers.stacked import ArrayStacked
 from levanter.callbacks import StepInfo
 from levanter.compat.hf_checkpoints import (
     GenerationConfigDict,
@@ -79,7 +82,7 @@ from levanter.compat.hf_checkpoints import (
     upload_to_hub,
 )
 from levanter.utils.cloud_utils import temp_dir_before_upload
-from levanter.utils.jax_utils import join_key, key_iterator, leaf_key_paths
+from levanter.utils.jax_utils import axis_resource_is_explicit, join_key, key_iterator, leaf_key_paths
 from levanter.utils.logging import silence_transformer_nag
 
 
@@ -159,7 +162,14 @@ def loraize(model: M, config: LoraConfig, key: PRNGKeyArray) -> M:
     """
     Applies LoRA transform to the given model by replacing Linear layers that match the given pattern with LoraLinear layers.
     """
-    return _loraize(model, config, key, "", batch_dims=())
+    adapted = _loraize(model, config, key, "", batch_dims=())
+    raw = jax.tree.leaves(model, is_leaf=lambda x: isinstance(x, ArrayLinear))
+    if any(isinstance(x, ArrayLinear) for x in raw) and not any(
+        isinstance(x, ArrayLoraLinear)
+        for x in jax.tree.leaves(adapted, is_leaf=lambda x: isinstance(x, ArrayLoraLinear))
+    ):
+        raise ValueError("LoRA target_modules did not select any array-native decoder projections")
+    return adapted
 
 
 class LowRankLinear(eqx.Module):
@@ -285,9 +295,90 @@ class LoraLinear(ModuleWithStateDictSerialization):
         return {"wrapped": None, "lora": None}
 
 
+class ArrayLowRankLinear(ModuleWithStateDictSerialization):
+    """Output-first array factors; rank stays replicated in storage and compute."""
+
+    lora_A: ArrayLinear
+    lora_B: ArrayLinear
+    scale: float = eqx.field(static=True)
+
+    def __call__(self, x, *, out_sharding):
+        # A's output rank is replicated; only the original leading input layout remains.
+        intermediate_spec = PartitionSpec(*out_sharding[:-1], None)
+        return self.lora_B(self.lora_A(x, out_sharding=intermediate_spec), out_sharding=out_sharding) * self.scale
+
+    def merge(self):
+        a = reshard(
+            self.lora_A.weight, PartitionSpec(*([None] * (self.lora_A.weight.ndim - 2)), *self.lora_A.compute_spec)
+        )
+        b = reshard(
+            self.lora_B.weight, PartitionSpec(*([None] * (self.lora_B.weight.ndim - 2)), *self.lora_B.compute_spec)
+        )
+        return (
+            jnp.einsum(
+                "...or,...ri->...oi",
+                b,
+                a,
+                out_sharding=PartitionSpec(
+                    *([None] * (a.ndim - 2)), self.lora_B.compute_spec[0], self.lora_A.compute_spec[1]
+                ),
+            )
+            * self.scale
+        )
+
+
+class ArrayLoraLinear(ModuleWithStateDictSerialization):
+    """Zero-dropout LoRA for an array-native projection."""
+
+    wrapped: ArrayLinear
+    lora: ArrayLowRankLinear
+
+    def __call__(self, x, *, out_sharding):
+        return self.wrapped(x, out_sharding=out_sharding) + self.lora(x, out_sharding=out_sharding)
+
+    @staticmethod
+    def init(wrapped: ArrayLinear, config: LoraConfig, *, key):
+        if config.dropout != 0:
+            raise ValueError("Array-native LoRA requires dropout=0; native projections do not receive RNG keys")
+        storage = jax.typeof(wrapped.weight).sharding.spec
+        compute = wrapped.compute_spec
+        out_features, in_features = wrapped.weight.shape
+        key_a, key_b = jax.random.split(key)
+        a = ArrayLinear.init(
+            in_features,
+            config.r,
+            key=key_a,
+            use_bias=False,
+            initializer_std=in_features**-0.5,
+            storage_spec=PartitionSpec(None, storage[-1]),
+            compute_spec=PartitionSpec(None, compute[-1]),
+        )
+        b = ArrayLinear.init(
+            config.r,
+            out_features,
+            key=key_b,
+            use_bias=False,
+            initializer_std=config.r**-0.5,
+            storage_spec=PartitionSpec(storage[-2], None),
+            compute_spec=PartitionSpec(compute[-2], None),
+        )
+        if config.a_init_mode == "zero":
+            a = dataclasses.replace(a, weight=jnp.zeros_like(a.weight))
+        if config.zero_init_b:
+            b = dataclasses.replace(b, weight=jnp.zeros_like(b.weight))
+        return ArrayLoraLinear(wrapped, ArrayLowRankLinear(a, b, config.alpha / config.r))
+
+    def merge(self):
+        delta = reshard(self.lora.merge(), jax.typeof(self.wrapped.weight).sharding.spec)
+        return dataclasses.replace(self.wrapped, weight=self.wrapped.weight + delta)
+
+    def _state_dict_key_map(self) -> Dict[str, Optional[str]]:
+        return {"wrapped": None, "lora": None}
+
+
 def _is_lora_compatible_module(module):
     # TODO: more modules
-    return isinstance(module, hnn.Linear)
+    return isinstance(module, (hnn.Linear, ArrayLinear))
 
 
 def filter_lora_params(params: M) -> M:
@@ -317,7 +408,7 @@ def combine_lora_params(params: M, lora_params: M) -> M:
 
 
 def is_lora_param(node):
-    return isinstance(node, LowRankLinear)
+    return isinstance(node, (LowRankLinear, ArrayLowRankLinear))
 
 
 def lora_trainable_params_filter(model: M) -> M:
@@ -358,7 +449,7 @@ def _loraize(model: M, config: LoraConfig, key: PRNGKeyArray, prefix: str, batch
     key_iter = key_iterator(key)
 
     def _is_special_module(module):
-        return _is_lora_compatible_module(module) or isinstance(module, hnn.Stacked)
+        return _is_lora_compatible_module(module) or isinstance(module, (hnn.Stacked, ArrayStacked))
 
     def _batchify_ctor(ctor):
         # this is gross but it basically just vmaps the ctor over each batch dimension
@@ -366,7 +457,13 @@ def _loraize(model: M, config: LoraConfig, key: PRNGKeyArray, prefix: str, batch
 
     def _loraize_module(module, key_path):
         # TODO: turn into a registry
-        if isinstance(module, hnn.Stacked):
+        if isinstance(module, ArrayStacked):
+            keys = jax.random.split(next(key_iter), module.num_layers)
+            stacked = eqx.filter_vmap(
+                lambda layer, layer_key: _loraize(layer, config, layer_key, join_key(key_path, "stacked"), ())
+            )(module.stacked, keys)
+            return dataclasses.replace(module, stacked=stacked)
+        elif isinstance(module, hnn.Stacked):
             new_inner = _loraize(
                 module.stacked,
                 config,
@@ -376,6 +473,10 @@ def _loraize(model: M, config: LoraConfig, key: PRNGKeyArray, prefix: str, batch
             )
             return dataclasses.replace(module, stacked=new_inner)
         elif config.matches_target(key_path) and _is_lora_compatible_module(module):
+            if isinstance(module, ArrayLinear):
+                if key_path.endswith("lm_head"):
+                    raise ValueError("Array-native LoRA does not support lm_head adaptation")
+                return ArrayLoraLinear.init(module, config, key=next(key_iter))
             my_key = next(key_iter)
             batched_key = shaped_rng_split(my_key, [axis.size for axis in batch_dims])
             return _batchify_ctor(LoraLinear.init)(
@@ -408,11 +509,13 @@ def unwrap_lora_modules(module: M) -> M:
     """
 
     def _unwrap(node):
-        if isinstance(node, LoraLinear):
+        if isinstance(node, (LoraLinear, ArrayLoraLinear)):
             return node.wrapped
         return node
 
-    return jax.tree_util.tree_map(_unwrap, module, is_leaf=lambda node: isinstance(node, LoraLinear))
+    return jax.tree_util.tree_map(
+        _unwrap, module, is_leaf=lambda node: isinstance(node, (LoraLinear, ArrayLoraLinear))
+    )
 
 
 @hax.named_jit  # needs to be inside (named) jit s.t. it works with sharded parameters
@@ -423,12 +526,14 @@ def merge_lora_modules(module: M) -> M:
     """
 
     def _merge_lora_modules(module):
-        if isinstance(module, LoraLinear):
+        if isinstance(module, (LoraLinear, ArrayLoraLinear)):
             return module.merge()
         else:
             return module
 
-    return jax.tree_util.tree_map(_merge_lora_modules, module, is_leaf=lambda node: isinstance(node, LoraLinear))
+    return jax.tree_util.tree_map(
+        _merge_lora_modules, module, is_leaf=lambda node: isinstance(node, (LoraLinear, ArrayLoraLinear))
+    )
 
 
 SAFETENSORS_WEIGHTS_NAME = "adapter_model.safetensors"
@@ -713,7 +818,10 @@ def _lora_state_dict_jax(model: M, prefix: str) -> StateDict:
     state_dict = to_state_dict(lora_params, prefix=prefix)
     mesh = jax.sharding.get_abstract_mesh()
     if mesh is not None and not mesh.empty:
-        state_dict = jax.lax.with_sharding_constraint(state_dict, PartitionSpec())
+        if axis_resource_is_explicit(mesh, mesh.axis_names):
+            state_dict = jax.tree.map(lambda value: reshard(value, PartitionSpec()), state_dict)
+        else:
+            state_dict = jax.lax.with_sharding_constraint(state_dict, PartitionSpec())
     return state_dict
 
 

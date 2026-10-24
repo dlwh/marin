@@ -27,7 +27,7 @@ import levanter.eval_harness
 from levanter import callbacks
 from levanter.callbacks._iris_status import iris_status_reporter
 from levanter.callbacks.labeled_eval import LabeledLmEvalConfig, add_labeled_lm_eval_callbacks
-from levanter.adaptor import AdaptorConfig, AdaptorExportConfig, NoAdaptorConfig
+from levanter.adaptor import AdaptorConfig, AdaptorExportConfig, LoraAdaptorConfig, NoAdaptorConfig
 from levanter.callbacks.tensorstore_callbacks import install_tensorstore_metrics_hook_if_enabled
 from levanter.checkpoint import discover_checkpoint_candidates, latest_checkpoint_path, load_checkpoint
 from levanter.compat.hf_checkpoints import HFCompatConfig, ModelWithHfSerializationMixin, build_generation_config
@@ -185,14 +185,13 @@ def main(config: TrainLmConfig):
             raise ValueError(
                 "llama_native HF initialization requires an explicit model config and unchanged tokenizer"
             )
-        if not isinstance(config.adapter, NoAdaptorConfig):
-            raise ValueError("llama_native training does not support adapters yet")
-        if config.hf_upload:
+        if config.hf_upload or config.peft_hf_upload or config.merged_hf_upload:
             raise ValueError("llama_native training supports local HF export only; Hub upload is unsupported")
-        if config.hf_save_path is not None:
-            if StoragePath(config.hf_save_path).is_remote:
-                raise ValueError("llama_native hf_save_path must be a local directory")
-            config.model.validate_hf_export()
+        for export_path in (config.hf_save_path, config.peft_save_path, config.merged_hf_save_path):
+            if export_path is not None:
+                if StoragePath(export_path).is_remote:
+                    raise ValueError("llama_native export paths must be local directories")
+                config.model.validate_hf_export()
         if config.trainer.quantization is not None:
             raise ValueError("llama_native training does not support Haliax quantization")
         config = dataclasses.replace(config, trainer=dataclasses.replace(config.trainer, use_explicit_mesh_axes=True))
@@ -293,7 +292,9 @@ def main(config: TrainLmConfig):
                     source_checkpoint = candidates[-1]
                     source_checkpoint_path = source_checkpoint.path
                     source_vocab_size = config.model.checkpoint_vocab_size(source_checkpoint.metadata)
-            if source_vocab_size is None and config.initialize_from_hf:
+            if config.initialize_from_hf and (
+                source_vocab_size is None or isinstance(config.adapter, LoraAdaptorConfig)
+            ):
                 if config.trainer.initialize_from is not None:
                     raise ValueError("Cannot specify both initialize_from_hf and initialize_from")
                 converter = config.model.hf_checkpoint_converter(
@@ -302,6 +303,8 @@ def main(config: TrainLmConfig):
                 )
                 hf_config = converter.default_hf_config
                 config.model.validate_hf_config(hf_config)
+                if source_vocab_size is not None and source_vocab_size != hf_config.vocab_size:
+                    raise ValueError("llama_native adapter source vocabulary does not match the checkpoint")
                 source_vocab_size = hf_config.vocab_size
             if source_vocab_size is not None:
                 if len(tokenizer) > source_vocab_size:
@@ -493,8 +496,12 @@ def main(config: TrainLmConfig):
             )
 
         export_converter = converter
-        if isinstance(config.model, NativeLlamaLmConfig) and config.hf_save_path is not None:
+        if native and any(
+            path is not None for path in (config.hf_save_path, config.peft_save_path, config.merged_hf_save_path)
+        ):
             export_converter = config.model.hf_export_converter(tokenizer)
+            if converter is not None:
+                export_converter = export_converter.replaced(reference_checkpoint=converter.reference_checkpoint)
         config.adapter.install_export_hooks(
             trainer=trainer,
             converter=export_converter,
