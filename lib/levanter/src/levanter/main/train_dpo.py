@@ -51,7 +51,7 @@ from levanter.dpo import (
     reference_eval_cache_metadata,
     reference_eval_cache_path,
 )
-from levanter.main.model_init import load_model_from_source, prepare_model_init_context
+from levanter.main.model_init import ModelInitContext, load_model_from_source, prepare_model_init_context
 from levanter.models.llama import LlamaConfig
 from levanter.models.llama_native_lm import NativeLlamaLmConfig, NativeLlamaLmHeadModel, native_llama_sharding
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel
@@ -590,6 +590,7 @@ def main(config: TrainDpoConfig) -> callbacks.StepInfo:
     """Train a DPO policy and return its final ordinary Trainer step."""
     _validate_dpo_config(config)
     native = isinstance(config.model, NativeLlamaLmConfig)
+    model_context: ModelInitContext | None = None
     explicit_layout = None
     export_config = AdaptorExportConfig(
         hf_save_path=config.hf_save_path,
@@ -606,6 +607,14 @@ def main(config: TrainDpoConfig) -> callbacks.StepInfo:
             raise ValueError("llama_native DPO supports only full-parameter training and LoRA adapters")
         if config.trainer.quantization is not None:
             raise ValueError("llama_native DPO does not support Haliax quantization")
+        if config.initialize_from_hf and config.use_hf_model_config:
+            model_context = prepare_model_init_context(
+                config.model,
+                tokenizer=config.data.the_tokenizer,
+                initialize_from_hf=config.initialize_from_hf,
+                use_hf_model_config=True,
+            )
+            config = dataclasses.replace(config, model=model_context.model)
         export_config.validate_native(config.model)
         config = dataclasses.replace(config, trainer=dataclasses.replace(config.trainer, use_explicit_mesh_axes=True))
         sharding = native_llama_sharding(
@@ -614,12 +623,13 @@ def main(config: TrainDpoConfig) -> callbacks.StepInfo:
 
     tokenizer = config.data.the_tokenizer
     generation_config = build_generation_config(tokenizer, config.hf_generation_eos_token_ids)
-    model_context = prepare_model_init_context(
-        config.model,
-        tokenizer=tokenizer,
-        initialize_from_hf=config.initialize_from_hf,
-        use_hf_model_config=config.use_hf_model_config,
-    )
+    if model_context is None:
+        model_context = prepare_model_init_context(
+            config.model,
+            tokenizer=tokenizer,
+            initialize_from_hf=config.initialize_from_hf,
+            use_hf_model_config=config.use_hf_model_config,
+        )
     if model_context.model is not config.model:
         config = dataclasses.replace(config, model=model_context.model)
 

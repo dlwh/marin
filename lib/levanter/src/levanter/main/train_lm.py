@@ -35,6 +35,7 @@ from levanter.data.text.datasets import LmDataConfig
 from levanter.data.text.examples import GrugLmExample, named_lm_example_from_grug
 from levanter.eval_harness import LmEvalHarnessConfig
 from levanter.model_loading import native_evaluation_axis_mapping
+from levanter.main.model_init import ModelInitContext, prepare_model_init_context
 from levanter.models.llama import LlamaConfig
 from levanter.models.llama_native import NativeLlamaSharding
 from levanter.models.llama_native_lm import NativeLlamaLmConfig, NativeLlamaLmHeadModel, native_llama_sharding
@@ -148,7 +149,11 @@ def _load_lm_model_from_configured_source(
             load_dtype = trainer.mp.param_dtype
         model = converter.load_pretrained(
             config.model.model_type,
-            config=config.model if not config.use_hf_model_config else None,
+            config=(
+                config.model
+                if isinstance(config.model, NativeLlamaLmConfig) or not config.use_hf_model_config
+                else None
+            ),
             axis_mapping=parameter_axis_mapping,
             dtype=load_dtype,
             model_init=model_init,
@@ -176,8 +181,10 @@ def _load_lm_model_from_configured_source(
     return model
 
 
-def main(config: TrainLmConfig):
+def main(config: TrainLmConfig) -> callbacks.StepInfo:
+    """Train a language model and return its final ordinary Trainer step."""
     native = isinstance(config.model, NativeLlamaLmConfig)
+    native_model_context: ModelInitContext | None = None
     explicit_layout = None
     export_config = AdaptorExportConfig(
         hf_save_path=config.hf_save_path,
@@ -190,10 +197,16 @@ def main(config: TrainLmConfig):
         merged_hf_upload=config.merged_hf_upload,
     )
     if native:
-        if config.use_hf_model_config or config.pad_tokenizer_to_match_model:
-            raise ValueError(
-                "llama_native HF initialization requires an explicit model config and unchanged tokenizer"
+        if config.pad_tokenizer_to_match_model:
+            raise ValueError("llama_native HF initialization requires an unchanged tokenizer")
+        if config.initialize_from_hf and config.use_hf_model_config:
+            native_model_context = prepare_model_init_context(
+                config.model,
+                tokenizer=config.data.the_tokenizer,
+                initialize_from_hf=config.initialize_from_hf,
+                use_hf_model_config=True,
             )
+            config = dataclasses.replace(config, model=native_model_context.model)
         export_config.validate_native(config.model)
         if config.trainer.quantization is not None:
             raise ValueError("llama_native training does not support Haliax quantization")
@@ -247,7 +260,7 @@ def main(config: TrainLmConfig):
         if config.pad_tokenizer_to_match_model:
             converter = converter.with_tokenizer_padded_to_match_model()
     else:
-        converter = None
+        converter = native_model_context.converter if native_model_context is not None else None
 
     levanter.trainer.initialize(config)
     if native:
@@ -300,10 +313,11 @@ def main(config: TrainLmConfig):
             ):
                 if config.trainer.initialize_from is not None:
                     raise ValueError("Cannot specify both initialize_from_hf and initialize_from")
-                converter = config.model.hf_checkpoint_converter(
-                    config.initialize_from_hf if isinstance(config.initialize_from_hf, str) else None,
-                    tokenizer=tokenizer,
-                )
+                if converter is None:
+                    converter = config.model.hf_checkpoint_converter(
+                        config.initialize_from_hf if isinstance(config.initialize_from_hf, str) else None,
+                        tokenizer=tokenizer,
+                    )
                 hf_config = converter.default_hf_config
                 config.model.validate_hf_config(hf_config)
                 if source_vocab_size is not None and source_vocab_size != hf_config.vocab_size:
@@ -556,10 +570,11 @@ def main(config: TrainLmConfig):
             train_loader = train_loader.iter_from_step(0)
 
         ## OK, actually run training!
-        trainer.train(state, train_loader)
+        final_info = trainer.train(state, train_loader)
 
     # This isn't necessary except when Levanter is run in a subprocess (as happens under Iris/Fray)
     trainer.tracker.finish()
+    return final_info
 
 
 if __name__ == "__main__":

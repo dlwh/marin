@@ -31,12 +31,23 @@ def prepare_model_init_context(
     use_hf_model_config: bool,
 ) -> ModelInitContext:
     if isinstance(model, NativeLlamaLmConfig):
-        if use_hf_model_config:
-            raise ValueError("llama_native initialization requires an explicit model configuration")
         converter = model.hf_checkpoint_converter(
             initialize_from_hf if isinstance(initialize_from_hf, str) else None, tokenizer=tokenizer
         )
-        return ModelInitContext(model=model, converter=converter, use_hf_model_config=False)
+        if initialize_from_hf and use_hf_model_config:
+            model = converter.config_from_hf_config(
+                converter.default_hf_config,
+                overrides={
+                    "attn_backend": model.attn_backend,
+                    "gradient_checkpointing": model.gradient_checkpointing,
+                    "scan_layers": model.scan_layers,
+                    "flash_attention_block_size": model.flash_attention_block_size,
+                    "upcast_attn": model.upcast_attn,
+                    "reference_checkpoint": str(converter.reference_checkpoint),
+                    "tokenizer": model.tokenizer,
+                },
+            )
+        return ModelInitContext(model=model, converter=converter, use_hf_model_config=use_hf_model_config)
 
     if initialize_from_hf:
         if not isinstance(model, HFCompatConfig):
