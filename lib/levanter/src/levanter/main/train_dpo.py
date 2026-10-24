@@ -15,6 +15,7 @@ import jax.random as jrandom
 from haliax import Axis
 from haliax.partitioning import named_jit, round_axis_for_partitioning
 from jaxtyping import PRNGKeyArray
+from jax.sharding import PartitionSpec as P
 
 import levanter
 import levanter.config
@@ -52,9 +53,10 @@ from levanter.dpo import (
 )
 from levanter.main.model_init import load_model_from_source, prepare_model_init_context
 from levanter.models.llama import LlamaConfig
+from levanter.models.llama_native_lm import NativeLlamaLmConfig, NativeLlamaLmHeadModel, native_llama_sharding
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel
 from levanter.optim.config import AdamConfig, OptimizerConfig
-from levanter.trainer import Trainer, TrainerConfig
+from levanter.trainer import ExplicitTrainingLayout, Trainer, TrainerConfig
 from levanter.trainer_state import trainables_only
 from levanter.utils.jax_utils import parameter_count
 from levanter.utils.tree_utils import inference_mode
@@ -76,6 +78,15 @@ def _restore_policy_model_from_partial_checkpoint(
     return eqx.combine(checkpointed_trainables, source_policy_model)
 
 
+def _build_model(model_config: LmConfig, Vocab: Axis, key, trainer: Trainer) -> LmHeadModel:
+    if isinstance(model_config, NativeLlamaLmConfig):
+        sharding = native_llama_sharding(
+            trainer.parameter_axis_mapping, trainer.compute_axis_mapping, trainer.config.batch_axis_name
+        )
+        return model_config.build(Vocab, key=key, sharding=sharding)
+    return model_config.build(Vocab, key=key)
+
+
 def _initialize_policy_model_from_source(
     *,
     config: "TrainDpoConfig",
@@ -94,6 +105,8 @@ def _initialize_policy_model_from_source(
             parameter_axis_mapping=parameter_axis_mapping,
             compute_dtype=trainer.mp.compute_dtype,
             cast_to_param=trainer.mp.cast_to_param,
+            compute_axis_mapping=trainer.compute_axis_mapping,
+            batch_axis_name=trainer.config.batch_axis_name,
             hf_ref=config.initialize_from_hf,
         )
     elif config.initialize_from_checkpoint_path is not None:
@@ -104,10 +117,12 @@ def _initialize_policy_model_from_source(
             parameter_axis_mapping=parameter_axis_mapping,
             compute_dtype=trainer.mp.compute_dtype,
             cast_to_param=trainer.mp.cast_to_param,
+            compute_axis_mapping=trainer.compute_axis_mapping,
+            batch_axis_name=trainer.config.batch_axis_name,
             checkpoint_path=config.initialize_from_checkpoint_path,
         )
     else:
-        policy_model = config.model.build(Vocab, key=policy_key)
+        policy_model = _build_model(config.model, Vocab, policy_key, trainer)
 
     return config.adapter.apply(
         policy_model,
@@ -424,6 +439,8 @@ def _load_separate_reference_model(
         parameter_axis_mapping=parameter_axis_mapping,
         compute_dtype=trainer.mp.compute_dtype,
         cast_to_param=trainer.mp.cast_to_param,
+        compute_axis_mapping=trainer.compute_axis_mapping,
+        batch_axis_name=trainer.config.batch_axis_name,
         hf_ref=config.reference.model_path if config.reference.is_hf else False,
         checkpoint_path=None if config.reference.is_hf else config.reference.model_path,
     )
@@ -569,8 +586,31 @@ def _install_separate_reference_export_hooks(
     trainer.add_hook(save_policy_hf_checkpoint, every=export.hf_save_steps)
 
 
-def main(config: TrainDpoConfig):
+def main(config: TrainDpoConfig) -> callbacks.StepInfo:
+    """Train a DPO policy and return its final ordinary Trainer step."""
     _validate_dpo_config(config)
+    native = isinstance(config.model, NativeLlamaLmConfig)
+    explicit_layout = None
+    export_config = AdaptorExportConfig(
+        hf_save_path=config.hf_save_path,
+        hf_upload=config.hf_upload,
+        hf_save_steps=config.hf_save_steps,
+        hf_save_dtype=config.hf_save_dtype,
+        peft_save_path=config.peft_save_path,
+        peft_hf_upload=config.peft_hf_upload,
+        merged_hf_save_path=config.merged_hf_save_path,
+        merged_hf_upload=config.merged_hf_upload,
+    )
+    if native:
+        if not isinstance(config.adapter, (NoAdaptorConfig, LoraAdaptorConfig)):
+            raise ValueError("llama_native DPO supports only full-parameter training and LoRA adapters")
+        if config.trainer.quantization is not None:
+            raise ValueError("llama_native DPO does not support Haliax quantization")
+        export_config.validate_native(config.model)
+        config = dataclasses.replace(config, trainer=dataclasses.replace(config.trainer, use_explicit_mesh_axes=True))
+        sharding = native_llama_sharding(
+            config.trainer.parameter_axis_mapping, config.trainer.compute_axis_mapping, config.trainer.batch_axis_name
+        )
 
     tokenizer = config.data.the_tokenizer
     generation_config = build_generation_config(tokenizer, config.hf_generation_eos_token_ids)
@@ -584,6 +624,9 @@ def main(config: TrainDpoConfig):
         config = dataclasses.replace(config, model=model_context.model)
 
     levanter.trainer.initialize(config)
+    if isinstance(config.model, NativeLlamaLmConfig):
+        config.model.validate_sharding(sharding, config.trainer.device_mesh)
+        explicit_layout = ExplicitTrainingLayout(config.trainer.device_mesh, P(sharding.batch, None))
     optimizer = config.optimizer.build(config.trainer.num_train_steps)
     reference_provider: AdapterBaseReferenceModelProvider | None = None
 
@@ -614,7 +657,17 @@ def main(config: TrainDpoConfig):
             key_rejected=key_rejected,
         )
 
-    with Trainer(config.trainer, optimizer, loss_function) as trainer:
+    with Trainer(
+        config.trainer,
+        optimizer,
+        loss_function,
+        explicit_layout=explicit_layout,
+        checkpoint_metadata=(
+            (lambda model: cast(NativeLlamaLmHeadModel, _policy_model_for_hf_save(model)).checkpoint_metadata())
+            if native
+            else None
+        ),
+    ) as trainer:
         seed = config.trainer.seed
         data_key, model_key, policy_key, adapter_key, training_key = _derive_training_keys(seed)
 
@@ -638,6 +691,28 @@ def main(config: TrainDpoConfig):
 
         vocab_size = len(tokenizer)
         Vocab = round_axis_for_partitioning(Axis("vocab", vocab_size), parameter_axis_mapping)
+        initial_policy_source = None
+        if isinstance(config.model, NativeLlamaLmConfig):
+            checkpoint = trainer.checkpoint_to_load
+            source_vocab = config.model.checkpoint_vocab_size(checkpoint.metadata) if checkpoint is not None else None
+            if source_vocab is not None:
+                if vocab_size > source_vocab:
+                    raise ValueError("llama_native tokenizer vocabulary exceeds the checkpoint vocabulary")
+                Vocab = Vocab.resize(source_vocab)
+            if checkpoint is None and (
+                config.initialize_from_hf or config.initialize_from_checkpoint_path is not None
+            ):
+                initial_policy_source = _initialize_policy_model_from_source(
+                    config=config,
+                    model_context=model_context,
+                    Vocab=Vocab,
+                    policy_key=policy_key,
+                    adapter_key=adapter_key,
+                    parameter_axis_mapping=parameter_axis_mapping,
+                    trainer=trainer,
+                )
+                Vocab = initial_policy_source.Vocab
+            config.model.validate_sharding(sharding, trainer.device_mesh, Vocab.size)
         if vocab_size != Vocab.size:
             logger.info(f"Rounding vocab size from {vocab_size} to {Vocab.size} for partitioning")
 
@@ -656,14 +731,17 @@ def main(config: TrainDpoConfig):
             train_dataset = _build_dpo_dataset(config.data, Pos, key=data_key)
             validation_specs = _build_validation_specs(config.data, Pos)
 
-        initial_policy_model = config.model.build(Vocab, key=policy_key)
-        initial_policy_model = config.adapter.apply(
-            initial_policy_model,
-            key=adapter_key,
-            axis_mapping=parameter_axis_mapping,
-        )
+        if initial_policy_source is not None:
+            # Source initialization already applies the adapter after loading the full vocabulary.
+            initial_policy_model = initial_policy_source
+        else:
+            initial_policy_model = config.adapter.apply(
+                _build_model(config.model, Vocab, policy_key, trainer),
+                key=adapter_key,
+                axis_mapping=parameter_axis_mapping,
+            )
         if isinstance(config.reference, SeparateReferenceConfig):
-            initial_reference_model = config.model.build(Vocab, key=model_key)
+            initial_reference_model = _build_model(config.model, Vocab, model_key, trainer)
             initial_model = DpoModel(policy=initial_policy_model, reference=initial_reference_model)
             trainable_filter = DpoModel(policy=config.adapter.trainable_filter(initial_policy_model), reference=False)
         else:
@@ -673,7 +751,9 @@ def main(config: TrainDpoConfig):
         state = trainer.initial_state(training_key, model=initial_model, is_trainable=trainable_filter)
 
         if int(state.step) == 0:
-            if config.initialize_from_hf:
+            if initial_policy_source is not None:
+                policy_model = initial_policy_source
+            elif config.initialize_from_hf:
                 logger.info(
                     f"No training checkpoint found. Initializing model from HF checkpoint '{config.initialize_from_hf}'"
                 )
@@ -857,17 +937,7 @@ def main(config: TrainDpoConfig):
         else:
             logger.warning("No validation datasets provided.")
 
-        export_config = AdaptorExportConfig(
-            hf_save_path=config.hf_save_path,
-            hf_upload=config.hf_upload,
-            hf_save_steps=config.hf_save_steps,
-            hf_save_dtype=config.hf_save_dtype,
-            generation_config=generation_config,
-            peft_save_path=config.peft_save_path,
-            peft_hf_upload=config.peft_hf_upload,
-            merged_hf_save_path=config.merged_hf_save_path,
-            merged_hf_upload=config.merged_hf_upload,
-        )
+        export_config = dataclasses.replace(export_config, generation_config=generation_config)
         if isinstance(config.reference, SeparateReferenceConfig) and isinstance(config.adapter, NoAdaptorConfig):
             _install_separate_reference_export_hooks(
                 trainer=trainer,
@@ -896,13 +966,14 @@ def main(config: TrainDpoConfig):
             for callback in initial_eval_callbacks:
                 callback(initial_eval_info, force=True)
 
-        trainer.train(state, train_loader)
+        final_info = trainer.train(state, train_loader)
 
         if trainer.config.checkpointer is not None:
             checkpointer = trainer.config.checkpointer.create(trainer.run_id)
             checkpointer.wait_until_finished()
 
     trainer.tracker.finish()
+    return final_info
 
 
 if __name__ == "__main__":

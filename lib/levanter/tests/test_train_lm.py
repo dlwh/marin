@@ -60,6 +60,7 @@ from levanter.tracker import NoopConfig, NoopTracker, current_tracker
 from levanter.tracker.json_file import JsonFileTrackerConfig
 from levanter.trainer_state import TrainerState, trainables_only
 from levanter.testing.helpers import arrays_only, use_test_mesh
+from levanter.testing.hf_checkpoints import write_llama_checkpoint
 from levanter.utils.mesh import MeshConfig
 
 
@@ -368,23 +369,6 @@ def test_native_train_lm_validates_and_resumes_identical_checkpoint_state(tmp_pa
         np.testing.assert_array_equal(actual_leaf, expected_leaf)
 
 
-@dataclasses.dataclass(frozen=True)
-class LocalLlamaCheckpoint:
-    path: Path
-    config: train_lm.LlamaConfig
-    weights: dict[str, np.ndarray]
-
-
-def _write_llama_checkpoint(source, config, hf_config):
-    source.mkdir()
-    with use_test_mesh():
-        model = LlamaLMHeadModel.init(Axis("vocab", 32), config, key=jrandom.PRNGKey(13))
-        weights = to_torch_compatible_state_dict(model)
-    hf_config.save_pretrained(source)
-    safetensors.numpy.save_file(weights, source / "model.safetensors", metadata={"format": "pt"})
-    return LocalLlamaCheckpoint(source, config, weights)
-
-
 @pytest.fixture(params=[False, True], ids=["untied", "tied"])
 def native_hf_source(tmp_path, request):
     config = train_lm.LlamaConfig(
@@ -396,7 +380,7 @@ def native_hf_source(tmp_path, request):
         max_seq_len=16,
         tie_word_embeddings=request.param,
     )
-    return _write_llama_checkpoint(tmp_path / "hf-source", config, config.to_hf_config(32))
+    return write_llama_checkpoint(tmp_path / "hf-source", config, config.to_hf_config(32), key=jrandom.PRNGKey(13))
 
 
 @pytest.mark.tpu
@@ -943,7 +927,9 @@ def test_native_train_lm_exports_portable_local_weights(
     named_config = train_lm.LlamaConfig(
         **{field.name: getattr(model_config, field.name) for field in dataclasses.fields(train_lm.LlamaConfig)}
     )
-    source = _write_llama_checkpoint(tmp_path / "source", named_config, model_config.to_hf_config(32))
+    source = write_llama_checkpoint(
+        tmp_path / "source", named_config, model_config.to_hf_config(32), key=jrandom.PRNGKey(13)
+    )
     examples = ListAsyncDataset([GrugLmExample.causal((jnp.arange(8) + i) % 31) for i in range(16)])
     model_size = 2 if len(jax.devices()) >= 4 else 1
     data_size = len(jax.devices()) // model_size

@@ -178,6 +178,32 @@ zero-based step names: completed update `N` writes `step-(N-1)`, so those update
 write `step-1`, `step-3`, and `step-5`.
 The final export is written once when the last update falls on the interval.
 
+### Native Llama training
+
+`model.type: llama_native` supports full-parameter DPO with `adapter.type: none`
+and `reference.type: separate`. The policy and frozen reference use the configured
+native storage and computation mappings on an Explicit mesh. HF initialization
+keeps the complete source vocabulary and FP32 source weights before the configured
+parameter cast; native checkpoint metadata validates the architecture and source vocabulary on restore. Keep the
+original model configuration and separate-reference source when resuming a DPO
+checkpoint; the frozen reference is reconstructed from that source.
+
+Set `use_hf_model_config: false` and configure `hidden_dim`, `intermediate_dim`,
+`num_layers`, `num_heads`, `num_kv_heads`, `activation_function`, `rope`, and other
+architecture settings to match the source checkpoint's `config.json`.
+
+Zero-dropout LoRA uses `adapter.type: lora` with either `reference.type: separate`
+or `reference.type: adapter_base`. The latter uses the frozen policy base as the
+reference and requires exactly one zero factor at initialization. Adapter
+checkpoints omit the frozen base, so resume requires the unchanged base source,
+model and adapter configuration. Base-source identity, adapter alpha and target
+selection are not validated by these checkpoints.
+
+Native DPO does not support Haliax quantization or Hub upload. Full-parameter HF
+policy exports use a local `hf_save_path`; LoRA uses local `peft_save_path` and
+`merged_hf_save_path` directories. See [LoRA adapters](../Training-On-Your-Data.md#lora-adapters)
+for export and resume details. The default remains Haliax Llama (`model.type: llama`).
+
 ### Reference Eval Cache
 
 Set `reference_eval_cache.mode: build_or_load` to precompute validation-set
