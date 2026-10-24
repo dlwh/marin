@@ -35,7 +35,7 @@ from levanter.data.text.datasets import LmDataConfig
 from levanter.data.text.examples import GrugLmExample, named_lm_example_from_grug
 from levanter.eval_harness import LmEvalHarnessConfig
 from levanter.model_loading import native_evaluation_axis_mapping
-from levanter.main.model_init import ModelInitContext, prepare_model_init_context
+from levanter.main.model_init import ModelInitContext, build_model, prepare_model_init_context
 from levanter.models.llama import LlamaConfig
 from levanter.models.llama_native import NativeLlamaSharding
 from levanter.models.llama_native_lm import NativeLlamaLmConfig, NativeLlamaLmHeadModel, native_llama_sharding
@@ -118,12 +118,6 @@ def _native_llama_sharding(config: TrainerConfig) -> NativeLlamaSharding:
     return native_llama_sharding(config.parameter_axis_mapping, config.compute_axis_mapping, config.batch_axis_name)
 
 
-def _build_lm_model(config: TrainLmConfig, Vocab: Axis, key, trainer: Trainer) -> LmHeadModel:
-    if isinstance(config.model, NativeLlamaLmConfig):
-        return config.model.build(Vocab, key=key, sharding=_native_llama_sharding(trainer.config))
-    return config.model.build(Vocab, key=key)
-
-
 def _load_lm_model_from_configured_source(
     *,
     config: TrainLmConfig,
@@ -142,7 +136,17 @@ def _load_lm_model_from_configured_source(
         if isinstance(config.model, NativeLlamaLmConfig):
 
             def initialize_native_model(vocab: Axis) -> ModelWithHfSerializationMixin:
-                return cast(ModelWithHfSerializationMixin, _build_lm_model(config, vocab, model_key, trainer))
+                return cast(
+                    ModelWithHfSerializationMixin,
+                    build_model(
+                        config.model,
+                        vocab,
+                        key=model_key,
+                        parameter_axis_mapping=trainer.parameter_axis_mapping,
+                        compute_axis_mapping=trainer.compute_axis_mapping,
+                        batch_axis_name=trainer.config.batch_axis_name,
+                    ),
+                )
 
             model_init = initialize_native_model
             # Compute precision must not round pretrained master weights before initialization.
@@ -166,14 +170,29 @@ def _load_lm_model_from_configured_source(
         # only in how main() uses the loaded weights.
         source = config.initialize_from_checkpoint_path or config.initialize_model_from_checkpoint_path
         checkpoint_path = source_checkpoint_path or latest_checkpoint_path(source)
-        model = eqx.filter_eval_shape(_build_lm_model, config, Vocab, model_key, trainer)
+        model = eqx.filter_eval_shape(
+            build_model,
+            config.model,
+            Vocab,
+            key=model_key,
+            parameter_axis_mapping=trainer.parameter_axis_mapping,
+            compute_axis_mapping=trainer.compute_axis_mapping,
+            batch_axis_name=trainer.config.batch_axis_name,
+        )
         model = load_checkpoint(
             model, checkpoint_path, subpath="model", axis_mapping=parameter_axis_mapping, mesh=trainer.device_mesh
         )
         model = hax.shard(model, parameter_axis_mapping)
         model = named_jit(trainer.mp.cast_to_param, parameter_axis_mapping)(model)
     else:
-        model = _build_lm_model(config, Vocab, model_key, trainer)
+        model = build_model(
+            config.model,
+            Vocab,
+            key=model_key,
+            parameter_axis_mapping=trainer.parameter_axis_mapping,
+            compute_axis_mapping=trainer.compute_axis_mapping,
+            batch_axis_name=trainer.config.batch_axis_name,
+        )
 
     if not isinstance(config.adapter, NoAdaptorConfig):
         model = config.adapter.apply(model, key=adapter_key, axis_mapping=parameter_axis_mapping)
@@ -420,11 +439,27 @@ def main(config: TrainLmConfig) -> callbacks.StepInfo:
             )
         elif isinstance(config.adapter, NoAdaptorConfig):
             state = trainer.initial_state(
-                training_key, model_init=lambda: _build_lm_model(config, Vocab, model_key, trainer)
+                training_key,
+                model_init=functools.partial(
+                    build_model,
+                    config.model,
+                    Vocab,
+                    key=model_key,
+                    parameter_axis_mapping=trainer.parameter_axis_mapping,
+                    compute_axis_mapping=trainer.compute_axis_mapping,
+                    batch_axis_name=trainer.config.batch_axis_name,
+                ),
             )
         else:
             initial_model = config.adapter.apply(
-                _build_lm_model(config, Vocab, model_key, trainer),
+                build_model(
+                    config.model,
+                    Vocab,
+                    key=model_key,
+                    parameter_axis_mapping=trainer.parameter_axis_mapping,
+                    compute_axis_mapping=trainer.compute_axis_mapping,
+                    batch_axis_name=trainer.config.batch_axis_name,
+                ),
                 key=adapter_key,
                 axis_mapping=parameter_axis_mapping,
             )

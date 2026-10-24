@@ -56,7 +56,7 @@ from levanter.dpo import (
 )
 from levanter.checkpoint import CheckpointerConfig, latest_checkpoint_path, load_checkpoint, save_checkpoint
 from levanter.distributed import DistributedConfig
-from levanter.main.model_init import prepare_model_init_context
+from levanter.main.model_init import build_model, prepare_model_init_context
 from levanter.model_loading import load_hf_checkpoint
 from levanter.layers.attention import AttentionBackend, AttentionMask
 from levanter.layers.rotary import DefaultRotaryEmbeddingsConfig
@@ -66,7 +66,6 @@ from levanter.main.train_dpo import (
     SeparateReferenceConfig,
     TrainDpoConfig,
     _build_dpo_dataset,
-    _build_model,
     _initialize_policy_model_from_source,
     _load_separate_reference_model,
     main as train_dpo_main,
@@ -1068,7 +1067,14 @@ def test_native_dpo_policy_updates_frozen_reference_and_checkpoint_next_step(
         ) as resumed,
     ):
         # Reconstruct the omitted frozen reference from its configured source.
-        policy = _build_model(config.model, Vocab, jrandom.PRNGKey(7), resumed)
+        policy = build_model(
+            config.model,
+            Vocab,
+            key=jrandom.PRNGKey(7),
+            parameter_axis_mapping=resumed.parameter_axis_mapping,
+            compute_axis_mapping=resumed.compute_axis_mapping,
+            batch_axis_name=resumed.config.batch_axis_name,
+        )
         reference = _load_separate_reference_model(
             config,
             reference_model_key=jrandom.PRNGKey(8),
@@ -1109,16 +1115,13 @@ def test_native_dpo_main_preserves_source_vocab_and_resumes_same_checkpoint(
     )
     train_dpo_main(continued)
     with dataclasses.replace(config.trainer, use_explicit_mesh_axes=True).use_device_mesh():
-        source_model = _build_model(
+        source_model = build_model(
             config.model,
             Axis("vocab", 32),
-            jrandom.PRNGKey(0),
-            Trainer(
-                dataclasses.replace(config.trainer, use_explicit_mesh_axes=True),
-                config.optimizer.build(2),
-                _separate_dpo_loss,
-                add_default_hooks=False,
-            ),
+            key=jrandom.PRNGKey(0),
+            parameter_axis_mapping=config.trainer.parameter_axis_mapping,
+            compute_axis_mapping=config.trainer.compute_axis_mapping,
+            batch_axis_name=config.trainer.batch_axis_name,
         )
         template = TrainerState.init(
             config.optimizer.build(2),

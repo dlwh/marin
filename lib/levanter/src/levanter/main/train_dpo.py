@@ -51,7 +51,7 @@ from levanter.dpo import (
     reference_eval_cache_metadata,
     reference_eval_cache_path,
 )
-from levanter.main.model_init import ModelInitContext, load_model_from_source, prepare_model_init_context
+from levanter.main.model_init import ModelInitContext, build_model, load_model_from_source, prepare_model_init_context
 from levanter.models.llama import LlamaConfig
 from levanter.models.llama_native_lm import NativeLlamaLmConfig, NativeLlamaLmHeadModel, native_llama_sharding
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel
@@ -76,15 +76,6 @@ def _restore_policy_model_from_partial_checkpoint(
 ) -> LmHeadModel:
     checkpointed_trainables = trainables_only(checkpointed_policy_model, trainable_filter)
     return eqx.combine(checkpointed_trainables, source_policy_model)
-
-
-def _build_model(model_config: LmConfig, Vocab: Axis, key, trainer: Trainer) -> LmHeadModel:
-    if isinstance(model_config, NativeLlamaLmConfig):
-        sharding = native_llama_sharding(
-            trainer.parameter_axis_mapping, trainer.compute_axis_mapping, trainer.config.batch_axis_name
-        )
-        return model_config.build(Vocab, key=key, sharding=sharding)
-    return model_config.build(Vocab, key=key)
 
 
 def _initialize_policy_model_from_source(
@@ -122,7 +113,14 @@ def _initialize_policy_model_from_source(
             checkpoint_path=config.initialize_from_checkpoint_path,
         )
     else:
-        policy_model = _build_model(config.model, Vocab, policy_key, trainer)
+        policy_model = build_model(
+            config.model,
+            Vocab,
+            key=policy_key,
+            parameter_axis_mapping=trainer.parameter_axis_mapping,
+            compute_axis_mapping=trainer.compute_axis_mapping,
+            batch_axis_name=trainer.config.batch_axis_name,
+        )
 
     return config.adapter.apply(
         policy_model,
@@ -746,12 +744,26 @@ def main(config: TrainDpoConfig) -> callbacks.StepInfo:
             initial_policy_model = initial_policy_source
         else:
             initial_policy_model = config.adapter.apply(
-                _build_model(config.model, Vocab, policy_key, trainer),
+                build_model(
+                    config.model,
+                    Vocab,
+                    key=policy_key,
+                    parameter_axis_mapping=trainer.parameter_axis_mapping,
+                    compute_axis_mapping=trainer.compute_axis_mapping,
+                    batch_axis_name=trainer.config.batch_axis_name,
+                ),
                 key=adapter_key,
                 axis_mapping=parameter_axis_mapping,
             )
         if isinstance(config.reference, SeparateReferenceConfig):
-            initial_reference_model = _build_model(config.model, Vocab, model_key, trainer)
+            initial_reference_model = build_model(
+                config.model,
+                Vocab,
+                key=model_key,
+                parameter_axis_mapping=trainer.parameter_axis_mapping,
+                compute_axis_mapping=trainer.compute_axis_mapping,
+                batch_axis_name=trainer.config.batch_axis_name,
+            )
             initial_model = DpoModel(policy=initial_policy_model, reference=initial_reference_model)
             trainable_filter = DpoModel(policy=config.adapter.trainable_filter(initial_policy_model), reference=False)
         else:
