@@ -18,12 +18,13 @@ from jax.sharding import PartitionSpec as P
 from levanter.checkpoint import CheckpointerConfig, load_checkpoint, save_checkpoint
 from levanter.distributed import DistributedConfig
 from levanter.main.convert_llama_checkpoint import convert_named_llama_state
-from levanter.models.llama import LlamaConfig
+from levanter.models.llama import LlamaConfig, LlamaLMHeadModel
 from levanter.models.llama_native_lm import NativeLlamaLmHeadModel, native_llama_sharding
 from levanter.models.lm_model import LmExample
 from levanter.optim.config import AdamConfig
 from levanter.tracker import NoopConfig
 from levanter.trainer import ExplicitTrainingLayout, Trainer, TrainerConfig
+from levanter.trainer_state import TrainerState
 from levanter.utils.mesh import MeshConfig
 
 
@@ -58,7 +59,14 @@ def _retained_arrays(state):
     }
 
 
-def _named_state(tmp_path, tied, compute_dtype):
+@dataclasses.dataclass(frozen=True)
+class _NamedTrainingFixture:
+    state: TrainerState[LlamaLMHeadModel]
+    optimizer_config: AdamConfig
+    trainer_config: TrainerConfig
+
+
+def _named_training_fixture(tmp_path, tied, compute_dtype) -> _NamedTrainingFixture:
     config = LlamaConfig(
         max_seq_len=8,
         hidden_dim=16,
@@ -101,14 +109,17 @@ def _named_state(tmp_path, tied, compute_dtype):
         )
         for index in range(2):
             state = trainer.train_step(state, _example(index)).state
-    return state, optimizer, trainer_config
+    return _NamedTrainingFixture(state=state, optimizer_config=optimizer, trainer_config=trainer_config)
 
 
 @pytest.mark.parametrize("tied", [False, True], ids=["untied", "tied"])
 @pytest.mark.parametrize("compute_dtype", [jnp.float32, jnp.bfloat16], ids=["fp32", "bf16"])
 @pytest.mark.timeout(180)
 def test_named_full_state_conversion_preserves_moments_and_next_trainer_update(tmp_path, tied, compute_dtype):
-    source, optimizer, trainer_config = _named_state(tmp_path, tied, compute_dtype)
+    fixture = _named_training_fixture(tmp_path, tied, compute_dtype)
+    source = fixture.state
+    optimizer = fixture.optimizer_config
+    trainer_config = fixture.trainer_config
     source_path = tmp_path / "named"
     with trainer_config.use_device_mesh():
         save_checkpoint(
@@ -235,7 +246,10 @@ def test_named_full_state_conversion_preserves_moments_and_next_trainer_update(t
 
 
 def test_named_conversion_preserves_int64_step_or_rejects_disabled_x64(tmp_path):
-    source, optimizer, trainer_config = _named_state(tmp_path, False, jnp.float32)
+    fixture = _named_training_fixture(tmp_path, False, jnp.float32)
+    source = fixture.state
+    optimizer = fixture.optimizer_config
+    trainer_config = fixture.trainer_config
     native_config = dataclasses.replace(trainer_config, use_explicit_mesh_axes=True)
     sharding = native_llama_sharding(native_config.parameter_axis_mapping, native_config.compute_axis_mapping)
     with trainer_config.use_device_mesh(), jax.enable_x64():
@@ -250,7 +264,10 @@ def test_named_conversion_preserves_int64_step_or_rejects_disabled_x64(tmp_path)
 
 
 def test_named_conversion_rejects_missing_moment_and_same_size_geometry_corruption(tmp_path):
-    source, optimizer, trainer_config = _named_state(tmp_path, False, jnp.float32)
+    fixture = _named_training_fixture(tmp_path, False, jnp.float32)
+    source = fixture.state
+    optimizer = fixture.optimizer_config
+    trainer_config = fixture.trainer_config
     adam = optax.tree_utils.tree_get(source.opt_state, "ScaleByAdamState")
     broken_mu = eqx.tree_at(lambda model: model.embeddings.token_embeddings.weight.array, adam.mu, None)
     broken = dataclasses.replace(source, opt_state=optax.tree_utils.tree_set(source.opt_state, mu=broken_mu))
