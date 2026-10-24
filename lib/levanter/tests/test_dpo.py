@@ -16,6 +16,7 @@ import jmp
 import numpy as np
 import pytest
 import safetensors.numpy
+from transformers import LlamaConfig as HfLlamaConfig
 import haliax as hax
 from haliax import Axis
 from haliax.partitioning import ResourceAxis, set_mesh
@@ -55,16 +56,16 @@ from levanter.dpo import (
 )
 from levanter.checkpoint import CheckpointerConfig, latest_checkpoint_path, load_checkpoint, save_checkpoint
 from levanter.distributed import DistributedConfig
-from levanter.main.model_init import prepare_model_init_context
+from levanter.main.model_init import build_model, prepare_model_init_context
 from levanter.model_loading import load_hf_checkpoint
-from levanter.layers.attention import AttentionMask
+from levanter.layers.attention import AttentionBackend, AttentionMask
+from levanter.layers.rotary import DefaultRotaryEmbeddingsConfig
 from levanter.main.lora_dpo import LoraDpoConfig, _translate_legacy_lora_dpo_config
 from levanter.main.train_dpo import (
     AdapterBaseReferenceConfig,
     SeparateReferenceConfig,
     TrainDpoConfig,
     _build_dpo_dataset,
-    _build_model,
     _initialize_policy_model_from_source,
     _load_separate_reference_model,
     main as train_dpo_main,
@@ -935,7 +936,7 @@ def _dpo_trainer_config(tmp_path, *, explicit=False, steps=2):
 
 def _native_dpo_configuration(tmp_path, source, tokenizer_path):
     model = dataclasses.replace(
-        NativeLlamaLmConfig.from_hf_config(source.config.to_hf_config(32)),
+        NativeLlamaLmConfig.from_hf_config(HfLlamaConfig.from_pretrained(source.path)),
         reference_checkpoint=str(source.path),
         tokenizer=tokenizer_path,
     )
@@ -1066,7 +1067,14 @@ def test_native_dpo_policy_updates_frozen_reference_and_checkpoint_next_step(
         ) as resumed,
     ):
         # Reconstruct the omitted frozen reference from its configured source.
-        policy = _build_model(config.model, Vocab, jrandom.PRNGKey(7), resumed)
+        policy = build_model(
+            config.model,
+            Vocab,
+            key=jrandom.PRNGKey(7),
+            parameter_axis_mapping=resumed.parameter_axis_mapping,
+            compute_axis_mapping=resumed.compute_axis_mapping,
+            batch_axis_name=resumed.config.batch_axis_name,
+        )
         reference = _load_separate_reference_model(
             config,
             reference_model_key=jrandom.PRNGKey(8),
@@ -1107,16 +1115,13 @@ def test_native_dpo_main_preserves_source_vocab_and_resumes_same_checkpoint(
     )
     train_dpo_main(continued)
     with dataclasses.replace(config.trainer, use_explicit_mesh_axes=True).use_device_mesh():
-        source_model = _build_model(
+        source_model = build_model(
             config.model,
             Axis("vocab", 32),
-            jrandom.PRNGKey(0),
-            Trainer(
-                dataclasses.replace(config.trainer, use_explicit_mesh_axes=True),
-                config.optimizer.build(2),
-                _separate_dpo_loss,
-                add_default_hooks=False,
-            ),
+            key=jrandom.PRNGKey(0),
+            parameter_axis_mapping=config.trainer.parameter_axis_mapping,
+            compute_axis_mapping=config.trainer.compute_axis_mapping,
+            batch_axis_name=config.trainer.batch_axis_name,
         )
         template = TrainerState.init(
             config.optimizer.build(2),
@@ -1180,6 +1185,7 @@ def dpo_preference_data(tmp_path, tiny_hf_tokenizer_path):
 @pytest.mark.tpu
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize("reference_type", ["separate", "adapter_base"])
+@pytest.mark.parametrize("hf_config_source", ["explicit", "inferred_string", "inferred_bool"])
 def test_native_lora_dpo_main_updates_only_factors_and_resumes_exact_state(
     tmp_path,
     dpo_llama_source,
@@ -1187,11 +1193,64 @@ def test_native_lora_dpo_main_updates_only_factors_and_resumes_exact_state(
     tiny_hf_tokenizer_path,
     dpo_preference_data,
     reference_type,
+    hf_config_source,
 ):
+    inferred = hf_config_source != "explicit"
+    if inferred:
+        source_config = dataclasses.replace(
+            dpo_llama_source.config,
+            head_dim=8,
+            max_seq_len=16,
+            rope=DefaultRotaryEmbeddingsConfig(theta=50000, factor=4),
+        )
+        source_hf_config = HfLlamaConfig(
+            **{
+                **dpo_llama_source.config.to_hf_config(32).to_dict(),
+                "head_dim": 8,
+                "max_position_embeddings": 16,
+                "rope_theta": 50000,
+                "rope_scaling": {"rope_type": "linear", "factor": 4},
+                "rope_parameters": {"rope_type": "linear", "rope_theta": 50000, "factor": 4},
+            }
+        )
+        dpo_llama_source = write_llama_checkpoint(
+            tmp_path / "hf-inferred-source", source_config, source_hf_config, key=jrandom.PRNGKey(13)
+        )
+        dpo_separate_reference_source = write_llama_checkpoint(
+            tmp_path / "hf-inferred-reference", source_config, source_hf_config, key=jrandom.PRNGKey(97)
+        )
     config = _native_dpo_configuration(tmp_path / "full", dpo_llama_source, tiny_hf_tokenizer_path)
+    effective_model = config.model
+    if inferred:
+        effective_model = dataclasses.replace(
+            effective_model, attn_backend=AttentionBackend.VANILLA, gradient_checkpointing="save_all"
+        )
+        placeholder = NativeLlamaLmConfig(
+            hidden_dim=8,
+            intermediate_dim=8,
+            num_layers=1,
+            num_heads=2,
+            num_kv_heads=1,
+            max_seq_len=4,
+            attn_backend=effective_model.attn_backend,
+            gradient_checkpointing=effective_model.gradient_checkpointing,
+            reference_checkpoint=(
+                str(dpo_llama_source.path)
+                if hf_config_source == "inferred_bool"
+                else str(tmp_path / "unused-default-reference")
+            ),
+            tokenizer=tiny_hf_tokenizer_path,
+        )
+        config = dataclasses.replace(
+            config,
+            model=placeholder,
+            initialize_from_hf=True if hf_config_source == "inferred_bool" else str(dpo_llama_source.path),
+            use_hf_model_config=True,
+        )
     config = dataclasses.replace(
         config,
         data=dpo_preference_data,
+        train_seq_len=8,
         adapter=LoraAdaptorConfig(r=3, alpha=6, dropout=0),
         reference=(
             SeparateReferenceConfig(model_path=str(dpo_separate_reference_source.path))
@@ -1251,6 +1310,18 @@ def test_native_lora_dpo_main_updates_only_factors_and_resumes_exact_state(
         assert policy.Vocab.size == 32 > len(dpo_preference_data.the_tokenizer)
         for info in (full, resumed):
             actual_policy = info.state.model.policy if isinstance(info.state.model, DpoModel) else info.state.model
+            assert isinstance(actual_policy.config, NativeLlamaLmConfig)
+            assert actual_policy.config.head_dim == effective_model.head_dim
+            assert actual_policy.config.max_seq_len == dpo_llama_source.config.max_seq_len
+            assert actual_policy.config.rope == dpo_llama_source.config.rope
+            if inferred:
+                assert actual_policy.native.config.head_dim == 8
+                assert actual_policy.native.layers.stacked.self_attn.q_proj.wrapped.weight.shape == (1, 32, 16)
+                assert actual_policy.config.max_seq_len == 16
+                assert actual_policy.config.attn_backend == AttentionBackend.VANILLA
+                assert actual_policy.config.gradient_checkpointing == "save_all"
+                assert actual_policy.config.reference_checkpoint == str(dpo_llama_source.path)
+                assert actual_policy.config.tokenizer == tiny_hf_tokenizer_path
             for name, value in unwrap_lora_modules(actual_policy).to_state_dict().items():
                 np.testing.assert_array_equal(value, dpo_llama_source.weights[name])
             reference = (
@@ -1264,7 +1335,7 @@ def test_native_lora_dpo_main_updates_only_factors_and_resumes_exact_state(
                 np.testing.assert_array_equal(value, expected_reference.weights[name])
 
         base = load_hf_checkpoint(
-            config.model,
+            effective_model,
             str(dpo_llama_source.path),
             tokenizer=dpo_preference_data.the_tokenizer,
             axis_mapping=config.trainer.parameter_axis_mapping,
@@ -1288,7 +1359,7 @@ def test_native_lora_dpo_main_updates_only_factors_and_resumes_exact_state(
         assert peft_config["base_model_name_or_path"] == str(dpo_llama_source.path)
         merged = merge_lora_modules(policy)
         reloaded = load_hf_checkpoint(
-            config.model,
+            effective_model,
             str(tmp_path / "full/merged/dpo/step-2"),
             tokenizer=dpo_preference_data.the_tokenizer,
             axis_mapping=config.trainer.parameter_axis_mapping,

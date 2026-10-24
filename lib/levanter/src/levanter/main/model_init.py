@@ -5,13 +5,15 @@ from dataclasses import dataclass
 from typing import cast
 
 import equinox as eqx
-from haliax.partitioning import named_jit
+from haliax import Axis
+from haliax.partitioning import ResourceMapping, named_jit
+from jaxtyping import PRNGKeyArray
 
 import haliax as hax
 from levanter.checkpoint import latest_checkpoint_path, load_checkpoint
 from levanter.compat.hf_checkpoints import HFCheckpointConverter, HFCompatConfig
 from levanter.model_loading import load_hf_checkpoint, load_levanter_checkpoint
-from levanter.models.llama_native_lm import NativeLlamaLmConfig
+from levanter.models.llama_native_lm import NativeLlamaLmConfig, native_llama_sharding
 from levanter.models.lm_model import LmConfig, LmHeadModel
 from levanter.utils.jax_utils import use_cpu_device
 
@@ -23,6 +25,22 @@ class ModelInitContext:
     use_hf_model_config: bool
 
 
+def build_model(
+    model_config: LmConfig,
+    Vocab: Axis,
+    *,
+    key: PRNGKeyArray,
+    parameter_axis_mapping: ResourceMapping,
+    compute_axis_mapping: ResourceMapping,
+    batch_axis_name: str,
+) -> LmHeadModel:
+    """Build a model with explicit native placement or its named-model constructor."""
+    if isinstance(model_config, NativeLlamaLmConfig):
+        sharding = native_llama_sharding(parameter_axis_mapping, compute_axis_mapping, batch_axis_name)
+        return model_config.build(Vocab, key=key, sharding=sharding)
+    return model_config.build(Vocab, key=key)
+
+
 def prepare_model_init_context(
     model: LmConfig,
     *,
@@ -31,12 +49,23 @@ def prepare_model_init_context(
     use_hf_model_config: bool,
 ) -> ModelInitContext:
     if isinstance(model, NativeLlamaLmConfig):
-        if use_hf_model_config:
-            raise ValueError("llama_native initialization requires an explicit model configuration")
         converter = model.hf_checkpoint_converter(
             initialize_from_hf if isinstance(initialize_from_hf, str) else None, tokenizer=tokenizer
         )
-        return ModelInitContext(model=model, converter=converter, use_hf_model_config=False)
+        if initialize_from_hf and use_hf_model_config:
+            model = converter.config_from_hf_config(
+                converter.default_hf_config,
+                overrides={
+                    "attn_backend": model.attn_backend,
+                    "gradient_checkpointing": model.gradient_checkpointing,
+                    "scan_layers": model.scan_layers,
+                    "flash_attention_block_size": model.flash_attention_block_size,
+                    "upcast_attn": model.upcast_attn,
+                    "reference_checkpoint": str(converter.reference_checkpoint),
+                    "tokenizer": model.tokenizer,
+                },
+            )
+        return ModelInitContext(model=model, converter=converter, use_hf_model_config=use_hf_model_config)
 
     if initialize_from_hf:
         if not isinstance(model, HFCompatConfig):

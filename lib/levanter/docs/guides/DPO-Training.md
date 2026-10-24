@@ -188,9 +188,17 @@ parameter cast; native checkpoint metadata validates the architecture and source
 original model configuration and separate-reference source when resuming a DPO
 checkpoint; the frozen reference is reconstructed from that source.
 
-Set `use_hf_model_config: false` and configure `hidden_dim`, `intermediate_dim`,
+With `use_hf_model_config: false`, configure `hidden_dim`, `intermediate_dim`,
 `num_layers`, `num_heads`, `num_kv_heads`, `activation_function`, `rope`, and other
 architecture settings to match the source checkpoint's `config.json`.
+Alternatively, set `use_hf_model_config: true` to derive that architecture,
+including head dimension, RoPE and maximum context, from the policy's HF source.
+The native model class, configured attention backend and rematerialization policy
+are retained. Use top-level `train_seq_len` for a shorter training length. This
+mode requires the original HF metadata on resume and validates the restored
+checkpoint against the inferred architecture. A Boolean `initialize_from_hf: true`
+uses the original `model.reference_checkpoint`; a string selects that source
+explicitly. Keep the policy base and separate-reference sources unchanged.
 
 Zero-dropout LoRA uses `adapter.type: lora` with either `reference.type: separate`
 or `reference.type: adapter_base`. The latter uses the frozen policy base as the
