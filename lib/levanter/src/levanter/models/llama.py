@@ -440,7 +440,7 @@ class LlamaTransformer(eqx.Module):
 
         for i in range(self.config.num_layers):
             with jax.named_scope("slice layer"):
-                layer = hax.tree_util.tree_map(lambda l: l["layer", i], self.layers.stacked)  # type: ignore
+                layer = self.layers.get_layer(i)
             with jax.named_scope("slice cache"):
                 this_cache = caches[i]
             x, this_cache = layer.decode(
