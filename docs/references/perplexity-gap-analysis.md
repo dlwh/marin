@@ -128,6 +128,17 @@ Score a model by constructing a `ModelPerplexityScoreConfig` and calling
 through the ambient `current_client()` and blocks until it finishes). The model
 is a `GapFinderModelConfig` — a checkpoint plus how to load and tokenize it.
 
+For native Llama, supply a matching `NativeLlamaLmConfig` as `model`, an explicit
+tokenizer, and either a native Levanter checkpoint or `checkpoint_is_hf=True` for
+an HF checkpoint. The Levanter scoring entrypoints use the shared loaders to
+preserve the complete source vocabulary and validate native checkpoint identity.
+For metadata-free native checkpoints, the tokenizer vocabulary rounded for the
+mesh must equal the original complete model vocabulary. The original model
+configuration is trusted; architecture identity cannot be verified from weights.
+Single-model scoring and paired scoring support native models. A mixed named/native
+pair preserves the named model's configured mesh axes and enables Explicit axes
+for the native model, sharing the physical mesh and logical placement mappings.
+
 ```python
 from fray.types import ResourceConfig
 from marin.evaluation.perplexity_gap import (
