@@ -1,13 +1,142 @@
 # Copyright The Levanter Authors
 # SPDX-License-Identifier: Apache-2.0
 
+import dataclasses
+import json
+
+import equinox as eqx
+import haliax as hax
+import jax
+import jax.numpy as jnp
+import jmp
+import numpy as np
 import pytest
 from levanter.testing.helpers import skip_if_module_missing
 from transformers import AutoTokenizer
 
+from levanter.checkpoint import save_checkpoint
 from levanter.data.packing import PromptCompletion
-from levanter.eval_harness import LmEvalHarnessConfig, _call_with_retry, _iterate_tokenized_requests
+from levanter.distributed import DistributedConfig
+from levanter.eval_harness import (
+    EvalHarnessMainConfig,
+    LmEvalHarnessConfig,
+    _call_with_retry,
+    _iterate_tokenized_requests,
+    run_eval_harness_main,
+)
 from levanter.eval_harness_config import TaskConfig
+from levanter.layers.attention import AttentionMask
+from levanter.models.llama import LlamaConfig
+from levanter.models.llama_native_lm import NativeLlamaLmConfig, native_llama_sharding
+from levanter.tokenizers import load_tokenizer
+from levanter.tracker import NoopConfig
+from levanter.trainer import TrainerConfig
+from levanter.utils.mesh import MeshConfig
+
+
+@skip_if_module_missing("lm_eval")
+@pytest.mark.tpu
+@pytest.mark.parametrize("model_kind", ["named", "native"])
+@pytest.mark.parametrize("checkpoint_format", ["levanter", "hf"])
+def test_eval_harness_main_local_checkpoint_matches_full_forward(
+    tmp_path, tiny_hf_tokenizer_path, monkeypatch, model_kind, checkpoint_format
+):
+    monkeypatch.chdir(tmp_path)
+    model_type = NativeLlamaLmConfig if model_kind == "native" else LlamaConfig
+    model_config = model_type(
+        hidden_dim=16, intermediate_dim=24, num_layers=1, num_heads=4, num_kv_heads=2, max_seq_len=16
+    )
+    model_size = 2 if len(jax.devices()) >= 4 else 1
+    trainer = TrainerConfig(
+        tracker=NoopConfig(),
+        require_accelerator=False,
+        distributed=DistributedConfig(initialize_jax_distributed=False),
+        mp=jmp.get_policy("p=f32,c=f32"),
+        per_device_eval_parallelism=2,
+        mesh=MeshConfig(
+            axes={"data": len(jax.devices()) // model_size, "model": model_size},
+            batch_axis_name="examples",
+            shared_mapping={"kv_head": "model"},
+            compute_mapping={"examples": ["data"]},
+        ),
+    )
+    tokenizer = load_tokenizer(tiny_hf_tokenizer_path)
+    build_trainer = dataclasses.replace(trainer, use_explicit_mesh_axes=model_config.requires_explicit_mesh_axes)
+    checkpoint = tmp_path / "checkpoint"
+    contexts = [[3, 4], [6]]
+    targets = [5, 7]
+    logprobs = []
+    with build_trainer.use_device_mesh():
+        key = jax.random.PRNGKey(23)
+        # Native checkpoint metadata must recover the padded row absent from the tokenizer.
+        vocab = hax.Axis("vocab", 32) if model_kind == "native" else hax.Axis("vocab", len(tokenizer))
+        if isinstance(model_config, NativeLlamaLmConfig):
+            sharding = native_llama_sharding(
+                trainer.parameter_axis_mapping, trainer.compute_axis_mapping, trainer.batch_axis_name
+            )
+            model = model_config.build(vocab, key=key, sharding=sharding)
+            metadata = model.checkpoint_metadata()
+        else:
+            model = model_config.build(vocab, key=key)
+            metadata = None
+        for context, target in zip(contexts, targets, strict=True):
+            tokens = hax.named(
+                jnp.broadcast_to(jnp.asarray(context, dtype=jnp.int32), (len(jax.devices()), len(context))),
+                (hax.Axis("examples", len(jax.devices())), "position"),
+            )
+            logits = eqx.filter_jit(lambda m, t: m(t, attn_mask=AttentionMask.causal()))(model, tokens)
+            last_logits = np.asarray(logits.array)[0, -1]
+            logprobs.append(float(last_logits[target] - np.logaddexp.reduce(last_logits)))
+        if checkpoint_format == "hf":
+            if isinstance(model_config, NativeLlamaLmConfig):
+                converter = model_config.hf_export_converter(tokenizer)
+            else:
+                converter = dataclasses.replace(
+                    model_config.hf_checkpoint_converter(tiny_hf_tokenizer_path),
+                    reference_checkpoint=None,
+                    tokenizer=tokenizer,
+                )
+            converter.save_pretrained(model, str(checkpoint), max_shard_size=512)
+            assert json.loads((checkpoint / "config.json").read_text())["vocab_size"] == vocab.size
+        else:
+            save_checkpoint({"model": model}, 0, checkpoint, metadata=metadata)
+
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    (dataset / "test.jsonl").write_text(
+        "".join(
+            json.dumps({"context": " ".join(f"token{token}" for token in context), "target": f" token{target}"}) + "\n"
+            for context, target in zip(contexts, targets, strict=True)
+        )
+    )
+    report = run_eval_harness_main(
+        EvalHarnessMainConfig(
+            model=model_config,
+            trainer=trainer,
+            tokenizer=tiny_hf_tokenizer_path,
+            checkpoint_path=str(checkpoint),
+            checkpoint_is_hf=checkpoint_format == "hf",
+            eval_harness=LmEvalHarnessConfig(
+                task_spec=[
+                    TaskConfig(
+                        task="lambada_openai",
+                        task_alias="local_likelihood",
+                        dataset_path=str(dataset),
+                        test_split="test",
+                        output_type="loglikelihood",
+                        doc_to_text="context",
+                        doc_to_target="target",
+                        metric_list=[{"metric": "perplexity", "aggregation": "perplexity", "higher_is_better": False}],
+                    )
+                ],
+                max_length=16,
+            ),
+        )
+    )
+    expected = np.exp(-np.mean(logprobs))
+    np.testing.assert_allclose(report["results"]["local_likelihood"]["perplexity,none"], expected, rtol=1e-5)
+    saved = json.loads((tmp_path / "lm_eval_harness_results.json").read_text())
+    np.testing.assert_allclose(saved["results"]["local_likelihood"]["perplexity,none"], expected, rtol=1e-5)
 
 
 @skip_if_module_missing("lm_eval")

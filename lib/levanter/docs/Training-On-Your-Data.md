@@ -446,6 +446,32 @@ Visualization uses the loaded model's vocabulary and supports evaluation sequenc
 shorter than the model's configured context. This path has offline CPU coverage;
 it does not add generation, KV caches, or an accelerator performance claim.
 
+Run standalone likelihood benchmarks with:
+
+```bash
+uv run python -m levanter.eval_harness --config_path likelihood.yaml
+```
+
+Copy the `model` and `trainer` sections from the training config into
+`likelihood.yaml`, preserving the architecture and parameter placement. Keep the
+vocabulary replicated in the evaluation compute mapping: `vocab: model` in
+`trainer.mesh.compute_mapping` or `trainer.mesh.shared_mapping` is unsupported by
+the harness's fused likelihood loss. Add the tokenizer, checkpoint and task settings:
+
+```yaml
+tokenizer: /path/to/tokenizer
+checkpoint_path: /path/to/checkpoint
+checkpoint_is_hf: false
+eval_harness:
+  task_spec: [lambada_openai]
+  max_length: 2048
+```
+
+Choose tasks that issue loglikelihood requests. Set `checkpoint_is_hf: true` for
+compatible HF Llama weights. Native checkpoints and HF weights have the architecture
+and padded-vocabulary requirements described above. The harness writes
+`lm_eval_harness_results.json` in the working directory.
+
 
 ## Huggingface Export
 

@@ -84,10 +84,11 @@ from tqdm_loggable.auto import tqdm
 import levanter.config
 from levanter.callbacks import StepInfo
 from levanter.data.loader import stack_batches
-from levanter.model_loading import load_hf_checkpoint, load_levanter_checkpoint
+from levanter.model_loading import load_hf_checkpoint, load_levanter_checkpoint, native_evaluation_axis_mapping
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel, split_activations
+from levanter.models.llama_native_lm import NativeLlamaLmConfig
 from levanter.trainer import TrainerConfig
-from levanter.utils.jax_utils import broadcast_shard, parameter_count
+from levanter.utils.jax_utils import broadcast_shard, local_cpu_mesh, parameter_count
 from levanter.utils.py_utils import FailSafeJSONEncoder
 from levanter.utils.tree_utils import inference_mode
 
@@ -308,14 +309,13 @@ class _LmEvalHarnessWorker:
 
             # we need + 1 because we use -1 as a padding value for segments
             max_Segments = hax.Axis("Segments", size=self.max_packed_segments + 1)
+            batched_segment_ids, batched_per_segment_losses = hax.vmap(
+                lambda example, values: per_segment_loss(example, values, max_Segments), self.EvalBatch
+            )(packed_example, loss)
 
-            batched_segment_ids, batched_per_segment_losses = hax.vmap(per_segment_loss, self.EvalBatch)(
-                packed_example, loss, max_Segments
-            )
-
-            _, batched_per_segment_correct = hax.vmap(per_segment_correct, self.EvalBatch)(
-                packed_example, is_correct, max_Segments
-            )
+            _, batched_per_segment_correct = hax.vmap(
+                lambda example, values: per_segment_correct(example, values, max_Segments), self.EvalBatch
+            )(packed_example, is_correct)
 
             segments = hax.flatten(batched_segment_ids, "segment")
             losses = hax.flatten(batched_per_segment_losses, "segment")
@@ -1426,6 +1426,8 @@ def run_eval_harness_main(config: EvalHarnessMainConfig):
     Args:
         config: Configuration containing model, tokenizer, and evaluation settings
     """
+    if config.model.requires_explicit_mesh_axes:
+        config = dataclasses.replace(config, trainer=dataclasses.replace(config.trainer, use_explicit_mesh_axes=True))
     config.trainer.initialize()
     # Ensure __main__ logger is at INFO level for profiler messages
     logger.setLevel(logging.INFO)
@@ -1433,6 +1435,14 @@ def run_eval_harness_main(config: EvalHarnessMainConfig):
 
     compute_axis_mapping = config.trainer.compute_axis_mapping
     parameter_axis_mapping = config.trainer.parameter_axis_mapping
+    if isinstance(config.model, NativeLlamaLmConfig):
+        compute_axis_mapping = native_evaluation_axis_mapping(
+            config.model,
+            parameter_axis_mapping,
+            compute_axis_mapping,
+            config.trainer.device_mesh,
+            config.trainer.batch_axis_name,
+        )
 
     with config.trainer.use_device_mesh():
         key = jax.random.PRNGKey(0)
@@ -1452,6 +1462,8 @@ def run_eval_harness_main(config: EvalHarnessMainConfig):
                 axis_mapping=parameter_axis_mapping,
                 tokenizer=tokenizer,
                 compute_dtype=config.trainer.mp.compute_dtype,
+                compute_axis_mapping=config.trainer.compute_axis_mapping,
+                batch_axis_name=config.trainer.batch_axis_name,
             )
         else:
             model = load_levanter_checkpoint(
@@ -1460,6 +1472,8 @@ def run_eval_harness_main(config: EvalHarnessMainConfig):
                 Vocab=Vocab,
                 axis_mapping=parameter_axis_mapping,
                 key=key,
+                compute_axis_mapping=config.trainer.compute_axis_mapping,
+                batch_axis_name=config.trainer.batch_axis_name,
             )
 
         model = typing.cast(LmHeadModel, inference_mode(model, True))
@@ -1692,12 +1706,13 @@ def _pack_requests(
 ) -> list[LmExample]:
     packed_iterator = _iterate_tokenized_requests(requests, tokenizer, Pos.size, batch_size=128)
     # TODO: use a better packing algorithm?
-    return greedy_pack_prompt_completions(
-        Pos,
-        packed_iterator,
-        max_segments_per_example=max_pack_size,
-        pad_token=pad_token_id,
-    )
+    with local_cpu_mesh():
+        return greedy_pack_prompt_completions(
+            Pos,
+            packed_iterator,
+            max_segments_per_example=max_pack_size,
+            pad_token=pad_token_id,
+        )
 
 
 def _make_dummy_batch(EvalBatch, EvalPos):
