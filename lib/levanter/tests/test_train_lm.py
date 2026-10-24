@@ -22,6 +22,7 @@ import numpy as np
 import optax
 import pytest
 import safetensors.numpy
+from transformers import LlamaConfig as HfLlamaConfig
 from chex import assert_trees_all_close
 
 from haliax import Axis
@@ -48,7 +49,7 @@ from levanter.data.text.examples import GrugLmExample
 from levanter.compat.hf_checkpoints import RepoRef
 from levanter.distributed import DistributedConfig
 from levanter.models.llama_native import NativeLlamaSharding
-from levanter.layers.attention import AttentionMask
+from levanter.layers.attention import AttentionBackend, AttentionMask
 from levanter.layers.rotary import DefaultRotaryEmbeddingsConfig
 from levanter.tokenizers import load_tokenizer
 from levanter.models.llama import LlamaLMHeadModel
@@ -60,6 +61,7 @@ from levanter.tracker import NoopConfig, NoopTracker, current_tracker
 from levanter.tracker.json_file import JsonFileTrackerConfig
 from levanter.trainer_state import TrainerState, trainables_only
 from levanter.testing.helpers import arrays_only, use_test_mesh
+from levanter.testing.hf_checkpoints import write_llama_checkpoint
 from levanter.utils.mesh import MeshConfig
 from levanter.utils.tree_utils import inference_mode
 
@@ -369,23 +371,6 @@ def test_native_train_lm_validates_and_resumes_identical_checkpoint_state(tmp_pa
         np.testing.assert_array_equal(actual_leaf, expected_leaf)
 
 
-@dataclasses.dataclass(frozen=True)
-class LocalLlamaCheckpoint:
-    path: Path
-    config: train_lm.LlamaConfig
-    weights: dict[str, np.ndarray]
-
-
-def _write_llama_checkpoint(source, config, hf_config):
-    source.mkdir()
-    with use_test_mesh():
-        model = LlamaLMHeadModel.init(Axis("vocab", 32), config, key=jrandom.PRNGKey(13))
-        weights = to_torch_compatible_state_dict(model)
-    hf_config.save_pretrained(source)
-    safetensors.numpy.save_file(weights, source / "model.safetensors", metadata={"format": "pt"})
-    return LocalLlamaCheckpoint(source, config, weights)
-
-
 @pytest.fixture(params=[False, True], ids=["untied", "tied"])
 def native_hf_source(tmp_path, request):
     config = train_lm.LlamaConfig(
@@ -397,7 +382,7 @@ def native_hf_source(tmp_path, request):
         max_seq_len=16,
         tie_word_embeddings=request.param,
     )
-    return _write_llama_checkpoint(tmp_path / "hf-source", config, config.to_hf_config(32))
+    return write_llama_checkpoint(tmp_path / "hf-source", config, config.to_hf_config(32), key=jrandom.PRNGKey(13))
 
 
 @pytest.mark.tpu
@@ -759,6 +744,35 @@ def test_native_train_lm_hf_preserves_source_vocab_weights_and_resume(tmp_path, 
     metadata_file.write_text(json.dumps(old_metadata))
     train_lm.main(configuration("resumed", 2, resume=True))
 
+    # Inferred full-state resumes need HF metadata, but not its pretrained weights.
+    inferred_model = NativeLlamaLmConfig(
+        hidden_dim=8,
+        intermediate_dim=8,
+        num_layers=1,
+        num_heads=2,
+        num_kv_heads=1,
+        max_seq_len=4,
+        reference_checkpoint=str(source),
+    )
+
+    def inferred_configuration(name, steps, *, resume=False):
+        return dataclasses.replace(
+            configuration(name, steps, resume=resume),
+            model=inferred_model,
+            initialize_from_hf=True,
+            use_hf_model_config=True,
+        )
+
+    inferred_full = train_lm.main(inferred_configuration("inferred-full", 3))
+    train_lm.main(inferred_configuration("inferred-resumed", 2))
+    (source / "model.safetensors").unlink()
+    inferred_resumed = train_lm.main(inferred_configuration("inferred-resumed", 3, resume=True))
+    np.testing.assert_array_equal(inferred_full.loss, inferred_resumed.loss)
+    for actual, expected in zip(
+        _array_leaves(inferred_resumed.state), _array_leaves(inferred_full.state), strict=True
+    ):
+        np.testing.assert_array_equal(actual, expected)
+
     # New metadata permits a full restore after the original pretrained source is removed.
     shutil.rmtree(source)
     resume = dataclasses.replace(
@@ -833,6 +847,10 @@ def test_native_train_lm_hf_preserves_source_vocab_weights_and_resume(tmp_path, 
         initialized, full, resumed, weights_initialized, state_initialized = (
             restored(name) for name in ("frozen", "full", "resumed", "weights-init", "state-init")
         )
+        for name in ("inferred-full", "inferred-resumed"):
+            saved = restored(name)
+            for actual, expected in zip(_array_leaves(saved), _array_leaves(inferred_full.state), strict=True):
+                np.testing.assert_array_equal(actual, expected)
 
     # HF contains weights only: a new Trainer starts at zero, takes one step,
     # and preserves every source row when its learning rate is zero.
@@ -944,7 +962,9 @@ def test_native_train_lm_exports_portable_local_weights(
     named_config = train_lm.LlamaConfig(
         **{field.name: getattr(model_config, field.name) for field in dataclasses.fields(train_lm.LlamaConfig)}
     )
-    source = _write_llama_checkpoint(tmp_path / "source", named_config, model_config.to_hf_config(32))
+    source = write_llama_checkpoint(
+        tmp_path / "source", named_config, model_config.to_hf_config(32), key=jrandom.PRNGKey(13)
+    )
     examples = ListAsyncDataset([GrugLmExample.causal((jnp.arange(8) + i) % 31) for i in range(16)])
     model_size = 2 if len(jax.devices()) >= 4 else 1
     data_size = len(jax.devices()) // model_size
@@ -1138,14 +1158,55 @@ def test_train_lm_rejects_weights_only_init_with_trainer_initialize_from():
 @pytest.mark.tpu
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize("dropout", [0.0, 0.25])
+@pytest.mark.parametrize("hf_config_source", ["explicit", "inferred_string", "inferred_bool"])
 def test_native_train_lm_lora_hf_update_resume_and_local_exports(
-    tmp_path, native_hf_source, tiny_hf_tokenizer_path, dropout
+    tmp_path, native_hf_source, tiny_hf_tokenizer_path, hf_config_source, dropout
 ):
-    source = native_hf_source.path
+    source_checkpoint = native_hf_source
+    inferred = hf_config_source != "explicit"
+    if inferred:
+        source_config = dataclasses.replace(
+            native_hf_source.config,
+            head_dim=8,
+            rope=DefaultRotaryEmbeddingsConfig(theta=50000, factor=4),
+        )
+        source_hf_config = HfLlamaConfig(
+            **{
+                **native_hf_source.config.to_hf_config(32).to_dict(),
+                "head_dim": 8,
+                "max_position_embeddings": 16,
+                "rope_theta": 50000,
+                "rope_scaling": {"rope_type": "linear", "factor": 4},
+                "rope_parameters": {"rope_type": "linear", "rope_theta": 50000, "factor": 4},
+            }
+        )
+        source_checkpoint = write_llama_checkpoint(
+            tmp_path / "hf-inferred-source", source_config, source_hf_config, key=jrandom.PRNGKey(13)
+        )
+    source = source_checkpoint.path
     model_config = dataclasses.replace(
-        NativeLlamaLmConfig.from_hf_config(native_hf_source.config.to_hf_config(32)),
+        NativeLlamaLmConfig.from_hf_config(HfLlamaConfig.from_pretrained(source)),
         reference_checkpoint=str(tmp_path / "unused-default-reference"),
     )
+    initial_model_config = model_config
+    if inferred:
+        model_config = dataclasses.replace(
+            model_config, attn_backend=AttentionBackend.VANILLA, gradient_checkpointing="save_all"
+        )
+        initial_model_config = NativeLlamaLmConfig(
+            hidden_dim=8,
+            intermediate_dim=8,
+            num_layers=1,
+            num_heads=2,
+            num_kv_heads=1,
+            max_seq_len=4,
+            attn_backend=model_config.attn_backend,
+            gradient_checkpointing=model_config.gradient_checkpointing,
+            reference_checkpoint=(
+                str(source) if hf_config_source == "inferred_bool" else model_config.reference_checkpoint
+            ),
+            tokenizer=tiny_hf_tokenizer_path,
+        )
     examples = ListAsyncDataset([GrugLmExample.causal((jnp.arange(8) + i) % 31) for i in range(16)])
     data = LmDataConfig(
         tokenizer=tiny_hf_tokenizer_path,
@@ -1160,11 +1221,12 @@ def test_native_train_lm_lora_hf_update_resume_and_local_exports(
     def configuration(name, steps, resume=False):
         directory = tmp_path / name
         return train_lm.TrainLmConfig(
-            model=model_config,
+            model=initial_model_config,
             data=data,
             data_seed=7,
             train_seq_len=8,
-            initialize_from_hf=str(source),
+            initialize_from_hf=True if hf_config_source == "inferred_bool" else str(source),
+            use_hf_model_config=inferred,
             adapter=adapter,
             optimizer=optimizer,
             peft_save_path=str(directory / "peft"),
@@ -1189,9 +1251,41 @@ def test_native_train_lm_lora_hf_update_resume_and_local_exports(
             ),
         )
 
-    train_lm.main(configuration("full", 3))
+    full_info = train_lm.main(configuration("full", 3))
     train_lm.main(configuration("resumed", 2))
-    train_lm.main(configuration("resumed", 3, resume=True))
+    if inferred:
+        # Same-shaped weights must not be reinterpreted through changed HF metadata on resume.
+        metadata_path = source / "config.json"
+        original_metadata = metadata_path.read_text()
+        incompatible = json.loads(original_metadata)
+        incompatible.update(num_attention_heads=8, num_key_value_heads=4, head_dim=4)
+        metadata_path.write_text(json.dumps(incompatible))
+        try:
+            with pytest.raises(ValueError, match="checkpoint architecture"):
+                train_lm.main(configuration("resumed", 3, resume=True))
+        finally:
+            metadata_path.write_text(original_metadata)
+    resumed_info = train_lm.main(configuration("resumed", 3, resume=True))
+    np.testing.assert_array_equal(full_info.loss, resumed_info.loss)
+    for actual, expected in zip(_array_leaves(resumed_info.state), _array_leaves(full_info.state), strict=True):
+        np.testing.assert_array_equal(actual, expected)
+    for info in (full_info, resumed_info):
+        actual_model = info.state.model
+        assert isinstance(actual_model.config, NativeLlamaLmConfig)
+        assert actual_model.Vocab.size == 32 > len(data.the_tokenizer)
+        assert actual_model.config.head_dim == model_config.head_dim
+        assert actual_model.config.max_seq_len == source_checkpoint.config.max_seq_len
+        assert actual_model.config.rope == source_checkpoint.config.rope
+        if inferred:
+            assert actual_model.native.config.head_dim == 8
+            assert actual_model.native.layers.stacked.self_attn.q_proj.wrapped.weight.shape == (2, 32, 16)
+            assert actual_model.config.max_seq_len == 16
+            assert actual_model.config.attn_backend == AttentionBackend.VANILLA
+            assert actual_model.config.gradient_checkpointing == "save_all"
+            assert actual_model.config.reference_checkpoint == str(source)
+            assert actual_model.config.tokenizer == tiny_hf_tokenizer_path
+        for name, value in unwrap_lora_modules(actual_model).to_state_dict().items():
+            np.testing.assert_array_equal(value, source_checkpoint.weights[name])
     mesh = dataclasses.replace(configuration("full", 3).trainer, use_explicit_mesh_axes=True).device_mesh
     sharding = native_llama_sharding(
         configuration("full", 3).trainer.parameter_axis_mapping,
@@ -1246,7 +1340,7 @@ def test_native_train_lm_lora_hf_update_resume_and_local_exports(
             True,
         )
         for name, actual in unwrap_lora_modules(trained).to_state_dict().items():
-            np.testing.assert_array_equal(actual, native_hf_source.weights[name])
+            np.testing.assert_array_equal(actual, source_checkpoint.weights[name])
         assert any(np.any(value != 0) for key, value in lora_state_dict(trained).items() if ".lora_A." in key)
         assert trained.native.layers.stacked.self_attn.q_proj.lora.lora_A.weight.sharding.spec == P(None, None, "data")
         wrong_base = model_config.build(Axis("vocab", 32), key=jrandom.PRNGKey(999), sharding=sharding)

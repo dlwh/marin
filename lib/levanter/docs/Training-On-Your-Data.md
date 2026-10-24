@@ -291,13 +291,13 @@ use_hf_model_config: true
 
 ### LoRA adapters
 
-The canonical `train_lm` entrypoint accepts `adapter.type: lora` with
+The canonical `train_lm` and `train_dpo` entrypoints accept `adapter.type: lora` with
 `model.type: llama_native`. Native adapters support dropout during training;
-evaluation and generation disable it through inference mode. Training calls with
-nonzero dropout require an explicit RNG key. The default targets are the
+evaluation and generation disable it through inference mode. Active training
+dropout requires an explicit RNG key. The default targets are the
 seven decoder projections (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`,
 `up_proj`, `down_proj`), excluding the output head. Native output-head adaptation
-and native LoRA-DPO remain unsupported.
+remains unsupported.
 
 ```yaml
 initialize_from_hf: ./base-weights
@@ -321,6 +321,17 @@ with the original base source, model and adapter configuration: frozen base
 weights are reconstructed before restoring the adapter. These checkpoints do not
 validate adapter alpha, target selection or base-source identity. A different base
 or adapter configuration can change the resumed model despite compatible shapes.
+For DPO, this also requires the unchanged reference source when using a separate
+reference; frozen reference weights are reloaded rather than stored in the
+training checkpoint.
+
+Native LoRA DPO uses the same preference dataset and Trainer as full-parameter
+DPO. Set `reference.type: separate` and `reference.model_path` for an independent
+frozen reference, or `reference.type: adapter_base` to use the policy's frozen
+unadapted base. The latter requires exactly one zero LoRA factor at initialization,
+as in the default A-zero convention above. Both modes preserve the HF source's
+full output vocabulary even when the tokenizer has fewer rows. Programmatic
+`train_dpo.main` returns the final ordinary Trainer step after saving checkpoints.
 
 Use `peft_save_path` for canonical PEFT factor files, and
 `merged_hf_save_path` for ordinary HF Llama weights with the delta merged once.

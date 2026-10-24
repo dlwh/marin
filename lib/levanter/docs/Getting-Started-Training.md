@@ -86,7 +86,7 @@ must match on restore. Existing SiLU checkpoint metadata remains unchanged.
 To initialize from a local Hugging Face Llama checkpoint, set
 `initialize_from_hf: /path/to/llama-checkpoint`. The directory must contain its
 `config.json` and safetensors weights (a single file or a sharded index). Configure
-the matching native architecture explicitly. Layer count, hidden/MLP sizes,
+the matching native architecture explicitly by default. Layer count, hidden/MLP sizes,
 query/KV heads, head dimension, tied embeddings, activation, RMSNorm epsilon and
 RoPE type, base/theta, frequency scaling and attention scaling must match; the maximum context
 length may differ. This path supports standard weighted RMSNorm, bias-free
@@ -94,7 +94,17 @@ projections and no attention
 dropout. YaRN initialization requires the integer correction ramp and the same
 effective attention multiplier as the configured model; HF metadata whose
 implicit scaling changes that multiplier is rejected. Automatic HF model-config
-replacement and tokenizer padding remain unsupported.
+replacement is available with `use_hf_model_config: true`; tokenizer padding
+remains unsupported.
+
+With `use_hf_model_config: true`, native `train_lm` and `train_dpo` derive the
+architecture, head dimension, RoPE and maximum context length from the resolved
+HF source before validating the model and mesh. The model remains native and
+retains the configured attention backend, attention upcasting and
+rematerialization policy. Top-level `train_seq_len` selects the training length
+independently and must not exceed the source maximum. A string
+`initialize_from_hf` selects that source; `initialize_from_hf: true` uses the
+original `model.reference_checkpoint`. Both retain the configured tokenizer.
 
 The checkpoint determines the complete model vocabulary, including any padded
 embedding/output rows beyond the tokenizer's length. Those rows are preserved
@@ -103,9 +113,12 @@ large as the tokenizer and divisible by the tensor-parallel mesh size; the loade
 does not resize it. New native Trainer checkpoints record the complete vocabulary
 and semantic architecture with the checkpoint completion marker. Full-parameter
 resume uses the selected checkpoint's metadata and saved training state without
-accessing the original HF directory, even if `initialize_from_hf` still names that
-directory. LoRA resume still requires the original frozen base weights and
-unchanged model and adapter configuration.
+accessing the original HF directory when `use_hf_model_config` is false, even if
+`initialize_from_hf` still names that directory. The opt-in inferred-config mode
+reads the original HF `config.json` on resume, then validates the checkpoint
+against that effective architecture. Keep this metadata available and unchanged.
+LoRA resume also requires the original frozen base weights and unchanged model
+and adapter configuration; see [adapter training](Training-On-Your-Data.md#lora-adapters).
 The configured tokenizer, training inputs and matching model configuration are
 still required.
 The configured attention geometry, normalization and RoPE must match; context

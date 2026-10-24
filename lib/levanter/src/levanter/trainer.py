@@ -355,9 +355,10 @@ class Trainer:
 
     @cached_property
     def loss_fn(self) -> WrappedLossFunction:
-        """
-        Wrapped loss function that always returns (loss, metrics_dict).
-        Casts the model to compute precision and sets the context axis mapping to compute.
+        """Wrap the loss to return (loss, metrics_dict), casting the model to compute precision.
+
+        Set the compute axis mapping unless an explicit training layout is active.
+        Explicit layouts preserve the caller's current axis-mapping context.
         """
         return WrappedLossFunction(
             self._raw_loss_function,

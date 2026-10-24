@@ -25,6 +25,7 @@ from dataclasses import dataclass
 import draccus
 import jax.numpy as jnp
 from haliax.partitioning import named_jit
+from rigging.filesystem.storage_path import StoragePath
 
 from levanter.compat.hf_checkpoints import (
     GenerationConfigDict,
@@ -43,7 +44,7 @@ from levanter.adaptor.lora import (
 )
 from levanter.models.lm_model import LmHeadModel
 from levanter.utils.types import FilterTree
-from levanter.models.llama_native_lm import NativeLlamaLmHeadModel
+from levanter.models.llama_native_lm import NativeLlamaLmConfig, NativeLlamaLmHeadModel
 
 
 logger = logging.getLogger(__name__)
@@ -61,6 +62,16 @@ class AdaptorExportConfig:
     peft_hf_upload: bool | str | RepoRef = False
     merged_hf_save_path: str | None = None
     merged_hf_upload: str | RepoRef | None = None
+
+    def validate_native(self, model: NativeLlamaLmConfig) -> None:
+        """Require local export destinations and an HF-compatible native architecture."""
+        if self.hf_upload or self.peft_hf_upload or self.merged_hf_upload:
+            raise ValueError("llama_native training supports local HF export only; Hub upload is unsupported")
+        for path in (self.hf_save_path, self.peft_save_path, self.merged_hf_save_path):
+            if path is not None:
+                if StoragePath(path).is_remote:
+                    raise ValueError("llama_native export paths must be local directories")
+                model.validate_hf_export()
 
 
 class AdaptorConfig(abc.ABC, draccus.ChoiceRegistry):
