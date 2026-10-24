@@ -90,6 +90,7 @@ from levanter.tracker import NoopTracker, current_tracker
 from levanter.tracker.json_file import JsonFileTrackerConfig
 from levanter.utils.mesh import MeshConfig
 from levanter.testing.helpers import use_test_mesh
+from levanter.testing.hf_checkpoints import write_llama_checkpoint
 from levanter.utils.jax_utils import local_cpu_mesh
 from levanter.utils.tree_utils import inference_mode
 
@@ -889,13 +890,6 @@ def test_vmapped_init_with_sharding_handles_layer_axis():
         assert out.axes[0].name == "layers"
 
 
-@dataclasses.dataclass(frozen=True)
-class _DpoLlamaSource:
-    path: Path
-    config: LlamaConfig
-    weights: dict[str, np.ndarray]
-
-
 @pytest.fixture
 def dpo_llama_source(tmp_path, tiny_hf_tokenizer_path):
     config = LlamaConfig(
@@ -908,27 +902,14 @@ def dpo_llama_source(tmp_path, tiny_hf_tokenizer_path):
         tokenizer=tiny_hf_tokenizer_path,
         reference_checkpoint=str(tmp_path / "hf-source"),
     )
-    source = tmp_path / "hf-source"
-    source.mkdir()
-    with use_test_mesh():
-        model = config.build(Axis("vocab", 32), key=jrandom.PRNGKey(13))
-        weights = to_torch_compatible_state_dict(model)
-    config.to_hf_config(32).save_pretrained(source)
-    safetensors.numpy.save_file(weights, source / "model.safetensors", metadata={"format": "pt"})
-    return _DpoLlamaSource(source, config, weights)
+    return write_llama_checkpoint(tmp_path / "hf-source", config, config.to_hf_config(32), key=jrandom.PRNGKey(13))
 
 
 @pytest.fixture
 def dpo_separate_reference_source(tmp_path, dpo_llama_source):
     source = tmp_path / "hf-reference"
-    source.mkdir()
     config = dataclasses.replace(dpo_llama_source.config, reference_checkpoint=str(source))
-    with use_test_mesh():
-        model = config.build(Axis("vocab", 32), key=jrandom.PRNGKey(97))
-        weights = to_torch_compatible_state_dict(model)
-    config.to_hf_config(32).save_pretrained(source)
-    safetensors.numpy.save_file(weights, source / "model.safetensors", metadata={"format": "pt"})
-    return _DpoLlamaSource(source, config, weights)
+    return write_llama_checkpoint(source, config, config.to_hf_config(32), key=jrandom.PRNGKey(97))
 
 
 def _dpo_trainer_config(tmp_path, *, explicit=False, steps=2):

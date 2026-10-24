@@ -16,7 +16,6 @@ from haliax import Axis
 from haliax.partitioning import named_jit, round_axis_for_partitioning
 from jaxtyping import PRNGKeyArray
 from jax.sharding import PartitionSpec as P
-from rigging.filesystem.storage_path import StoragePath
 
 import levanter
 import levanter.config
@@ -592,18 +591,22 @@ def main(config: TrainDpoConfig) -> callbacks.StepInfo:
     _validate_dpo_config(config)
     native = isinstance(config.model, NativeLlamaLmConfig)
     explicit_layout = None
+    export_config = AdaptorExportConfig(
+        hf_save_path=config.hf_save_path,
+        hf_upload=config.hf_upload,
+        hf_save_steps=config.hf_save_steps,
+        hf_save_dtype=config.hf_save_dtype,
+        peft_save_path=config.peft_save_path,
+        peft_hf_upload=config.peft_hf_upload,
+        merged_hf_save_path=config.merged_hf_save_path,
+        merged_hf_upload=config.merged_hf_upload,
+    )
     if native:
         if not isinstance(config.adapter, (NoAdaptorConfig, LoraAdaptorConfig)):
             raise ValueError("llama_native DPO supports only full-parameter training and LoRA adapters")
         if config.trainer.quantization is not None:
             raise ValueError("llama_native DPO does not support Haliax quantization")
-        if config.hf_upload or config.peft_hf_upload or config.merged_hf_upload:
-            raise ValueError("llama_native DPO supports local HF export only")
-        for export_path in (config.hf_save_path, config.peft_save_path, config.merged_hf_save_path):
-            if export_path is not None:
-                if StoragePath(export_path).is_remote:
-                    raise ValueError("llama_native DPO export paths must be local directories")
-                config.model.validate_hf_export()
+        export_config.validate_native(config.model)
         config = dataclasses.replace(config, trainer=dataclasses.replace(config.trainer, use_explicit_mesh_axes=True))
         sharding = native_llama_sharding(
             config.trainer.parameter_axis_mapping, config.trainer.compute_axis_mapping, config.trainer.batch_axis_name
@@ -934,17 +937,7 @@ def main(config: TrainDpoConfig) -> callbacks.StepInfo:
         else:
             logger.warning("No validation datasets provided.")
 
-        export_config = AdaptorExportConfig(
-            hf_save_path=config.hf_save_path,
-            hf_upload=config.hf_upload,
-            hf_save_steps=config.hf_save_steps,
-            hf_save_dtype=config.hf_save_dtype,
-            generation_config=generation_config,
-            peft_save_path=config.peft_save_path,
-            peft_hf_upload=config.peft_hf_upload,
-            merged_hf_save_path=config.merged_hf_save_path,
-            merged_hf_upload=config.merged_hf_upload,
-        )
+        export_config = dataclasses.replace(export_config, generation_config=generation_config)
         if isinstance(config.reference, SeparateReferenceConfig) and isinstance(config.adapter, NoAdaptorConfig):
             _install_separate_reference_export_hooks(
                 trainer=trainer,

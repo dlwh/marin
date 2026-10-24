@@ -15,7 +15,6 @@ import jax.random as jrandom
 from haliax import Axis
 from haliax.partitioning import named_jit, round_axis_for_partitioning
 from jax.sharding import PartitionSpec as P
-from rigging.filesystem.storage_path import StoragePath
 
 import levanter
 import levanter.analysis
@@ -180,18 +179,22 @@ def _load_lm_model_from_configured_source(
 def main(config: TrainLmConfig):
     native = isinstance(config.model, NativeLlamaLmConfig)
     explicit_layout = None
+    export_config = AdaptorExportConfig(
+        hf_save_path=config.hf_save_path,
+        hf_upload=config.hf_upload,
+        hf_save_steps=config.hf_save_steps,
+        hf_save_dtype=config.hf_save_dtype,
+        peft_save_path=config.peft_save_path,
+        peft_hf_upload=config.peft_hf_upload,
+        merged_hf_save_path=config.merged_hf_save_path,
+        merged_hf_upload=config.merged_hf_upload,
+    )
     if native:
         if config.use_hf_model_config or config.pad_tokenizer_to_match_model:
             raise ValueError(
                 "llama_native HF initialization requires an explicit model config and unchanged tokenizer"
             )
-        if config.hf_upload or config.peft_hf_upload or config.merged_hf_upload:
-            raise ValueError("llama_native training supports local HF export only; Hub upload is unsupported")
-        for export_path in (config.hf_save_path, config.peft_save_path, config.merged_hf_save_path):
-            if export_path is not None:
-                if StoragePath(export_path).is_remote:
-                    raise ValueError("llama_native export paths must be local directories")
-                config.model.validate_hf_export()
+        export_config.validate_native(config.model)
         if config.trainer.quantization is not None:
             raise ValueError("llama_native training does not support Haliax quantization")
         config = dataclasses.replace(config, trainer=dataclasses.replace(config.trainer, use_explicit_mesh_axes=True))
@@ -506,16 +509,9 @@ def main(config: TrainLmConfig):
             trainer=trainer,
             converter=export_converter,
             tokenizer=tokenizer,
-            export=AdaptorExportConfig(
-                hf_save_path=config.hf_save_path,
-                hf_upload=config.hf_upload,
-                hf_save_steps=config.hf_save_steps,
-                hf_save_dtype=config.hf_save_dtype,
+            export=dataclasses.replace(
+                export_config,
                 generation_config=build_generation_config(tokenizer, config.hf_generation_eos_token_ids),
-                peft_save_path=config.peft_save_path,
-                peft_hf_upload=config.peft_hf_upload,
-                merged_hf_save_path=config.merged_hf_save_path,
-                merged_hf_upload=config.merged_hf_upload,
             ),
         )
 
