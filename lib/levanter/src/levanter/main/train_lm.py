@@ -37,7 +37,7 @@ from levanter.data.text.examples import GrugLmExample, named_lm_example_from_gru
 from levanter.eval_harness import LmEvalHarnessConfig
 from levanter.models.llama import LlamaConfig
 from levanter.models.llama_native import NativeLlamaSharding
-from levanter.models.llama_native_lm import NativeLlamaLmConfig, NativeLlamaLmHeadModel
+from levanter.models.llama_native_lm import NativeLlamaLmConfig, NativeLlamaLmHeadModel, native_llama_sharding
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel, split_activations
 from levanter.optim.config import AdamConfig, OptimizerConfig
 from levanter.trainer import ExplicitTrainingLayout, Trainer, TrainerConfig
@@ -114,27 +114,7 @@ def _restore_lm_model_from_partial_checkpoint(
 
 
 def _native_llama_sharding(config: TrainerConfig) -> NativeLlamaSharding:
-    compute = config.compute_axis_mapping
-    parameters = config.parameter_axis_mapping
-    batch = compute.get(config.batch_axis_name, compute.get("batch"))
-    batch_axes = () if batch is None else (batch,) if isinstance(batch, str) else tuple(batch)
-    fsdp_axis = parameters.get("embed")
-    model_axis = compute.get("mlp")
-    if fsdp_axis is not None and not isinstance(fsdp_axis, str):
-        raise ValueError("llama_native requires one FSDP axis in mesh.param_mapping.embed")
-    if model_axis is not None and not isinstance(model_axis, str):
-        raise ValueError("llama_native requires one tensor-parallel axis in mesh.compute_mapping.mlp")
-    if model_axis is not None and (model_axis in batch_axes or model_axis == fsdp_axis):
-        raise ValueError("llama_native tensor-parallel placement must be distinct from batch/FSDP axes")
-    if compute.get("position") is not None:
-        raise ValueError("llama_native does not support sequence parallelism")
-    if compute.get("embed") is not None:
-        raise ValueError("llama_native gathers the FSDP embed dimension for computation")
-    for mapping in (compute, parameters):
-        for dimension in ("mlp", "heads", "kv_head", "vocab"):
-            if dimension in mapping and mapping[dimension] != model_axis:
-                raise ValueError(f"llama_native requires {dimension} to use the tensor-parallel axis {model_axis}")
-    return NativeLlamaSharding(batch_axes=batch_axes, fsdp_axis=fsdp_axis, model_axis=model_axis)
+    return native_llama_sharding(config.parameter_axis_mapping, config.compute_axis_mapping, config.batch_axis_name)
 
 
 def _build_lm_model(config: TrainLmConfig, Vocab: Axis, key, trainer: Trainer) -> LmHeadModel:
@@ -270,17 +250,7 @@ def main(config: TrainLmConfig):
     if native:
         sharding = _native_llama_sharding(config.trainer)
         mesh = config.trainer.device_mesh
-        for axis in (*sharding.batch_axes, sharding.fsdp_axis, sharding.model_axis):
-            if axis is not None and axis not in mesh.shape:
-                raise ValueError(f"llama_native placement axis {axis} is missing from the mesh")
-        if sharding.fsdp_axis is not None and config.model.hidden_dim % mesh.shape[sharding.fsdp_axis]:
-            raise ValueError("llama_native hidden_dim must be divisible by the FSDP mesh size")
-        if sharding.model_axis is not None:
-            model_size = mesh.shape[sharding.model_axis]
-            if config.model.num_kv_heads % model_size:
-                raise ValueError("llama_native num_kv_heads must be divisible by the tensor-parallel mesh size")
-            if config.model.intermediate_dim % model_size:
-                raise ValueError("llama_native intermediate_dim must be divisible by the tensor-parallel mesh size")
+        config.model.validate_sharding(sharding, mesh)
         explicit_layout = ExplicitTrainingLayout(mesh, P(sharding.batch, None))
     optimizer = config.optimizer.build(config.trainer.num_train_steps)
 
@@ -335,11 +305,9 @@ def main(config: TrainLmConfig):
             if source_vocab_size is not None:
                 if len(tokenizer) > source_vocab_size:
                     raise ValueError("llama_native tokenizer vocabulary exceeds the checkpoint vocabulary")
-                model_axis = _native_llama_sharding(config.trainer).model_axis
-                if model_axis is not None and source_vocab_size % trainer.device_mesh.shape[model_axis]:
-                    raise ValueError(
-                        "llama_native checkpoint vocabulary must be divisible by the tensor-parallel mesh size"
-                    )
+                config.model.validate_sharding(
+                    _native_llama_sharding(config.trainer), trainer.device_mesh, source_vocab_size
+                )
 
         # randomness in jax is tightly controlled by "keys" which are the states of the random number generators
         # this makes deterministic training pretty easy

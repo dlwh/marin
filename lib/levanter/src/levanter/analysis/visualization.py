@@ -294,7 +294,7 @@ def _concatenate(x):
 
 
 def _decode_tokens_pretty(tok: MarinTokenizer, ids):
-    return [str(t) for t in tok.convert_ids_to_tokens(list(ids))]
+    return [str(t) for t in tok.convert_ids_to_tokens(np.asarray(ids).tolist())]
 
 
 def cb_compute_and_visualize_log_probs(

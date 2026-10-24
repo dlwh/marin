@@ -67,7 +67,10 @@ coverage. Accelerator throughput and long-run convergence remain unvalidated for
 this entrypoint.
 
 The default native attention implementation is the portable reference kernel;
-`attn_backend: splash` selects native TPU Splash attention. SwiGLU, scanned layers,
+`attn_backend: splash` selects native TPU Splash attention. The gated MLP uses
+`activation_function: silu` by default and supports the stateless activation
+choices from `ActivationFunctionEnum`; parameterized `xielu` is unsupported.
+Scanned layers,
 default/linear, Llama3 and YaRN RoPE, causal masks, document segments and sliding windows are
 supported. Training can use `train_seq_len` shorter than `model.max_seq_len`.
 Reference attention also preserves dense masks, causal offsets and bidirectional
@@ -77,6 +80,8 @@ Resume a native run with the ordinary Trainer checkpoint settings. Native
 checkpoints include parameters, optimizer state, training step and RNG state.
 The named Llama and native Llama have different checkpoint trees; loading a named
 Trainer checkpoint directly into a native run is unsupported.
+Non-default activations are part of the checkpoint architecture identity and
+must match on restore. Existing SiLU checkpoint metadata remains unchanged.
 
 To initialize from a local Hugging Face Llama checkpoint, set
 `initialize_from_hf: /path/to/llama-checkpoint`. The directory must contain its

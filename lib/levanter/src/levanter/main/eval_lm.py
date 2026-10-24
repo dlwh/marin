@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional
 
 import jax
@@ -24,6 +24,7 @@ from levanter.data.text.datasets import LmDataConfig
 from levanter.eval import LossFnOutput, TaggedEvaluator, eval_model
 from levanter.model_loading import load_hf_checkpoint, load_levanter_checkpoint
 from levanter.models.llama import LlamaConfig
+from levanter.models.llama_native_lm import NativeLlamaLmConfig, native_llama_sharding
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel, split_activations
 from levanter.trainer import TrainerConfig
 from levanter.utils.tree_utils import inference_mode
@@ -50,6 +51,8 @@ class EvalLmConfig:
 
 
 def main(config: EvalLmConfig):
+    if config.model.requires_explicit_mesh_axes:
+        config = replace(config, trainer=replace(config.trainer, use_explicit_mesh_axes=True))
     levanter.trainer.initialize(config)
     tokenizer = config.data.the_tokenizer
 
@@ -74,6 +77,15 @@ def main(config: EvalLmConfig):
 
     compute_axis_mapping = config.trainer.compute_axis_mapping
     parameter_axis_mapping = config.trainer.parameter_axis_mapping
+    if isinstance(config.model, NativeLlamaLmConfig):
+        sharding = native_llama_sharding(parameter_axis_mapping, compute_axis_mapping, config.trainer.batch_axis_name)
+        mesh = config.trainer.device_mesh
+        config.model.validate_sharding(sharding, mesh)
+        # Empty/full slices in the shared named loss need canonical replicated batch axes.
+        compute_axis_mapping = dict(compute_axis_mapping)
+        compute_axis_mapping[config.trainer.EvalBatch.name] = tuple(
+            axis for axis in sharding.batch_axes if mesh.shape[axis] > 1
+        )
 
     if config.checkpoint_path is None and config.hf_checkpoint is None:
         raise ValueError("Must specify either checkpoint_path or hf_checkpoint")
@@ -103,6 +115,7 @@ def main(config: EvalLmConfig):
             tagged_eval_sets=datasets,
             loss_fn=eval_loss_fn,
             tokenizer=tokenizer,
+            device_mesh=config.trainer.device_mesh,
             axis_mapping=compute_axis_mapping,
             max_examples_per_dataset=max_examples,
         )
@@ -133,6 +146,8 @@ def main(config: EvalLmConfig):
                 Vocab=Vocab,
                 axis_mapping=parameter_axis_mapping,
                 key=key,
+                compute_axis_mapping=config.trainer.compute_axis_mapping,
+                batch_axis_name=config.trainer.batch_axis_name,
             )
         elif config.hf_checkpoint is not None:
             model = load_hf_checkpoint(
@@ -141,10 +156,13 @@ def main(config: EvalLmConfig):
                 axis_mapping=parameter_axis_mapping,
                 tokenizer=tokenizer,
                 compute_dtype=mp.compute_dtype,
+                compute_axis_mapping=config.trainer.compute_axis_mapping,
+                batch_axis_name=config.trainer.batch_axis_name,
             )
         else:
             assert False, "Should not get here"
 
+        Vocab = model.Vocab
         log_dict = eval_model(evaluator, model, prefix="eval")
 
         levanter.tracker.log(log_dict, step=0)
@@ -156,9 +174,7 @@ def main(config: EvalLmConfig):
             for name, dataset in config.data.validation_sets(Pos).items():
                 if config.trainer.max_eval_batches is not None:
                     dataset = dataset.take(config.trainer.max_eval_batches * config.trainer.eval_batch_size)
-                loader = DataLoader(
-                    dataset, batch_size=config.trainer.eval_batch_size, axis_resources=compute_axis_mapping
-                )
+                loader = DataLoader(dataset, batch_size=Batch, axis_resources=compute_axis_mapping)
                 entropy_hist = levanter.analysis.compute_entropy_histogram(
                     model,
                     Vocab,
@@ -178,9 +194,7 @@ def main(config: EvalLmConfig):
             for name, dataset in config.data.validation_sets(Pos).items():
                 if config.trainer.max_eval_batches is not None:
                     dataset = dataset.take(config.trainer.max_eval_batches * config.trainer.eval_batch_size)
-                loader = DataLoader(
-                    dataset, batch_size=config.trainer.eval_batch_size, axis_resources=compute_axis_mapping
-                )
+                loader = DataLoader(dataset, batch_size=Batch, axis_resources=compute_axis_mapping)
                 top2_gap_hist = levanter.analysis.compute_top2_gap_histogram(
                     model,
                     Vocab,

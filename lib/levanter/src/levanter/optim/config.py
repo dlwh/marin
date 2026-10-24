@@ -203,6 +203,9 @@ class OptimizerConfig(draccus.PluginRegistry, abc.ABC, discover_packages_path="l
                 return False
             if "Embedding" in path:
                 return False
+            # Array-native models store token embeddings without an Embedding module.
+            if path.rsplit(".", 1)[-1] == "token_embeddings":
+                return False
             if path.endswith("bias"):
                 return False
             return None
