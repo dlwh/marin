@@ -12,6 +12,7 @@ from typing import Any, Sequence
 import jax
 import jmp
 import numpy as np
+from jax.sharding import Mesh
 
 import haliax as hax
 from haliax import Axis
@@ -42,7 +43,8 @@ from levanter.analysis.perplexity_gap import (
 from levanter.compat.hf_checkpoints import HFCheckpointConverter, HFCompatConfig
 from levanter.data.text.examples import GrugLmExample, named_lm_example_from_grug
 from levanter.grug.attention import AttentionMask as GrugAttentionMask
-from levanter.model_loading import load_hf_checkpoint, load_levanter_checkpoint
+from levanter.model_loading import load_hf_checkpoint, load_levanter_checkpoint, native_evaluation_axis_mapping
+from levanter.models.llama_native_lm import NativeLlamaLmConfig
 from levanter.models.lm_model import LmConfig, LmHeadModel
 from levanter.tokenizers import MarinTokenizer, TokenizerBackend, load_tokenizer
 from levanter.trainer import TrainerConfig
@@ -91,6 +93,7 @@ class _ModelRunner:
     model: LmHeadModel
     tokenizer: MarinTokenizer
     hf_tokenizer: Any
+    device_mesh: Mesh
     eval_batch_size: int
     eval_length: int
     compute_losses: Any
@@ -130,12 +133,13 @@ class _ModelRunner:
             if length > 1:
                 loss_weight[row, : length - 1] = 1.0
 
-        batch = GrugLmExample(
-            tokens=jax.device_put(tokens),
-            loss_weight=jax.device_put(loss_weight),
-            attn_mask=GrugAttentionMask.causal(),
-        )
-        losses = self.compute_losses(self.model, batch)
+        with jax.set_mesh(self.device_mesh):
+            batch = GrugLmExample(
+                tokens=jax.device_put(tokens),
+                loss_weight=jax.device_put(loss_weight),
+                attn_mask=GrugAttentionMask.causal(),
+            )
+            losses = self.compute_losses(self.model, batch)
         return np.asarray(jax.device_get(losses), dtype=np.float64)
 
     def warmup(self) -> None:
@@ -367,13 +371,16 @@ def _load_model_runner(
 ) -> _ModelRunner:
     assert spec.model is not None
     assert spec.tokenizer is not None
+    # Each scorer keeps its mesh context through loading and execution. Native
+    # models require Explicit axes; named models retain the caller's mesh choice.
+    if spec.model.requires_explicit_mesh_axes:
+        trainer = dataclasses.replace(trainer, use_explicit_mesh_axes=True)
 
     tokenizer = load_tokenizer(spec.tokenizer, backend=spec.tokenizer_backend)
     hf_tokenizer = tokenizer.as_hf_tokenizer()
     if not getattr(hf_tokenizer, "is_fast", False):
         raise ValueError(f"Tokenizer {spec.tokenizer!r} does not expose a fast tokenizer with offset mappings.")
 
-    key = jax.random.PRNGKey(0)
     vocab_size = len(tokenizer)
     eval_length = min(max_eval_length, spec.model.max_Pos.size)
     EvalBatch = trainer.EvalBatch
@@ -383,32 +390,47 @@ def _load_model_runner(
         logger.info("Rounding vocab size from %s to %s for partitioning", vocab_size, Vocab.size)
 
     mp: jmp.Policy = trainer.mp
+    evaluation_axis_mapping = compute_axis_mapping
+    if isinstance(spec.model, NativeLlamaLmConfig):
+        evaluation_axis_mapping = native_evaluation_axis_mapping(
+            spec.model,
+            parameter_axis_mapping,
+            compute_axis_mapping,
+            trainer.device_mesh,
+            trainer.batch_axis_name,
+        )
 
-    @hax.named_jit(axis_resources=compute_axis_mapping)
+    @hax.named_jit(axis_resources=evaluation_axis_mapping)
     def compute_losses(model: LmHeadModel, batch: GrugLmExample):
         model = inference_mode(model, True)
         model = mp.cast_to_compute(model)
         named_batch = named_lm_example_from_grug(batch, Pos=Pos, batch_axis=EvalBatch)
         return model.compute_next_token_loss(named_batch, reduction=None, reduction_axis=()).array
 
-    if spec.checkpoint_is_hf:
-        if not isinstance(spec.model, HFCompatConfig):
-            raise ValueError(f"Model config {type(spec.model).__name__} cannot load HF checkpoints.")
-        model = load_hf_checkpoint(
-            spec.model,
-            spec.checkpoint_path,
-            axis_mapping=parameter_axis_mapping,
-            tokenizer=tokenizer,
-            compute_dtype=mp.compute_dtype,
-        )
-    else:
-        model = load_levanter_checkpoint(
-            spec.model,
-            spec.checkpoint_path,
-            Vocab=Vocab,
-            axis_mapping=parameter_axis_mapping,
-            key=key,
-        )
+    with trainer.use_device_mesh():
+        key = jax.random.PRNGKey(0)
+        if spec.checkpoint_is_hf:
+            if not isinstance(spec.model, HFCompatConfig):
+                raise ValueError(f"Model config {type(spec.model).__name__} cannot load HF checkpoints.")
+            model = load_hf_checkpoint(
+                spec.model,
+                spec.checkpoint_path,
+                axis_mapping=parameter_axis_mapping,
+                tokenizer=tokenizer,
+                compute_dtype=mp.compute_dtype,
+                compute_axis_mapping=compute_axis_mapping,
+                batch_axis_name=trainer.batch_axis_name,
+            )
+        else:
+            model = load_levanter_checkpoint(
+                spec.model,
+                spec.checkpoint_path,
+                Vocab=Vocab,
+                axis_mapping=parameter_axis_mapping,
+                key=key,
+                compute_axis_mapping=compute_axis_mapping,
+                batch_axis_name=trainer.batch_axis_name,
+            )
 
     label = _model_label(spec)
     return _ModelRunner(
@@ -416,6 +438,7 @@ def _load_model_runner(
         model=model,
         tokenizer=tokenizer,
         hf_tokenizer=hf_tokenizer,
+        device_mesh=trainer.device_mesh,
         eval_batch_size=trainer.eval_batch_size,
         eval_length=eval_length,
         compute_losses=compute_losses,
