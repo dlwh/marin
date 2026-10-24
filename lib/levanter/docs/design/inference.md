@@ -1,7 +1,8 @@
 # Draft Design Document for Inference
 
-> **Note**: This document contains the technical design and architecture for
-> the inference server.
+> The server sections preserve an earlier design and implementation snapshot.
+> Verify HTTP endpoint and streaming support against the current server.
+> The native model and sampling sections describe the current model/caller APIs.
 
 ## References
 
@@ -128,6 +129,33 @@ not validate the accelerator kernel or mixed query/cache dtype support.
 
 The native methods consume and return the existing donated cache state. Callers
 must retain the returned cache and use existing page-copy/reset behavior for
-clones and subsequent requests. Canonical model selection and sampling loaders
-are separate migration steps. All source vocabulary rows are retained; deciding
-which rows are valid tokenizer outputs remains an entrypoint policy.
+clones and subsequent requests. Canonical model selection remains a separate
+migration step. All source vocabulary rows are retained; deciding which rows
+are valid tokenizer outputs remains an entrypoint policy.
+
+### Sampling entrypoint
+
+`levanter.main.sample_lm` supports native sampling through the opt-in
+`model.type: llama_native`; its default remains `llama`. The caller uses the
+shared model initialization and source loaders, enables explicit mesh axes for
+native models, and passes the existing engine its configured computation mapping.
+HF sources determine the effective architecture before native layout validation.
+For local sampling, `checkpoint_path` names a run directory containing `step-*`
+checkpoints or a concrete checkpoint directory containing the `model/` subtree.
+Set the top-level `tokenizer` to its local tokenizer path and keep `model` set to
+the original architecture. This path does not resolve an HF reference.
+Native Levanter model-subtree checkpoints retain their saved architecture identity
+and full vocabulary through checkpoint metadata validation. For metadata-free native checkpoints, sampling derives the vocabulary size from
+the tokenizer and rounds it for the configured computation mapping. That size
+must equal the checkpoint embedding row count; this entrypoint has no separate
+vocabulary-size override. Use a compatible tokenizer or a metadata-bearing
+checkpoint when the stored model has extra rows.
+
+Both source paths cast loaded parameters to `trainer.mp.compute_dtype` for
+sampling. `engine.compute_dtype` separately controls the KV cache; set both when
+choosing computation precision. HF sources and metadata-bearing native checkpoints retain stored vocabulary
+rows beyond the tokenizer in logits and sampling. Such rows may decode to empty text, so token IDs
+and log probabilities are available from the final `GenerationResult` returned by
+`sample_lm.main`; zero sampling rounds return `None`. Printed per-round output is
+unchanged. This caller support does not establish accelerator kernel correctness,
+performance superiority, or larger-model training acceptance.
