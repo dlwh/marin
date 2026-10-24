@@ -48,6 +48,9 @@ from levanter.trainer_state import InsideJitInfo, TrainerState
 from levanter.utils.mesh import MeshConfig
 
 
+LAYER_NORM_EPSILON = 1e-5
+
+
 @dataclasses.dataclass(frozen=True)
 class BenchmarkConfig:
     vocab_size: int = 128
@@ -93,7 +96,7 @@ def _legacy_config(config: BenchmarkConfig) -> LlamaConfig:
         num_heads=config.num_heads,
         num_kv_heads=config.num_kv_heads,
         max_seq_len=config.seq_len,
-        layer_norm_epsilon=1e-5,
+        layer_norm_epsilon=LAYER_NORM_EPSILON,
         initializer_range=0.02,
         tie_word_embeddings=False,
         use_bias=False,
@@ -113,7 +116,7 @@ def _native_config(config: BenchmarkConfig) -> NativeLlamaConfig:
         num_heads=config.num_heads,
         num_kv_heads=config.num_kv_heads,
         max_seq_len=config.seq_len,
-        layer_norm_epsilon=1e-5,
+        layer_norm_epsilon=LAYER_NORM_EPSILON,
         tie_word_embeddings=False,
         use_bias=False,
         upcast_attn=False,

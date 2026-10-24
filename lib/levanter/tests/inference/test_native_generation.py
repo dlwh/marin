@@ -21,7 +21,7 @@ from levanter.distributed import DistributedConfig
 from levanter.main import sample_lm
 from levanter.models.llama import LlamaConfig
 from levanter.model_loading import load_hf_checkpoint
-from levanter.testing.hf_checkpoints import write_llama_checkpoint
+from levanter.testing.hf_checkpoints import LocalLlamaCheckpoint, write_llama_checkpoint
 from levanter.tracker import NoopConfig
 from levanter.trainer import TrainerConfig
 from levanter.utils.mesh import MeshConfig
@@ -344,8 +344,15 @@ def test_native_generate_until_uses_real_prefill_incremental_cache_and_stop(nati
     assert actual[1].strip() == harness.tokenizer.decode(expected_ids[1][:-1], skip_special_tokens=True)
 
 
+@dataclasses.dataclass(frozen=True)
+class SamplingSource:
+    checkpoint: LocalLlamaCheckpoint
+    kind: str
+    tokenizer_path: str
+
+
 @pytest.fixture(params=["hf", "levanter"])
-def sampling_source(tmp_path, tiny_hf_tokenizer_path, request):
+def sampling_source(tmp_path, tiny_hf_tokenizer_path, request) -> SamplingSource:
     named_config = LlamaConfig(
         hidden_dim=16,
         intermediate_dim=24,
@@ -358,11 +365,13 @@ def sampling_source(tmp_path, tiny_hf_tokenizer_path, request):
     source = write_llama_checkpoint(
         tmp_path / "sampling-source", named_config, named_config.to_hf_config(32), key=jax.random.PRNGKey(13)
     )
-    return source, request.param, tiny_hf_tokenizer_path
+    return SamplingSource(checkpoint=source, kind=request.param, tokenizer_path=tiny_hf_tokenizer_path)
 
 
 def _sampling_config(sampling_source, tmp_path, native, dtype):
-    source, source_kind, tokenizer_path = sampling_source
+    source = sampling_source.checkpoint
+    source_kind = sampling_source.kind
+    tokenizer_path = sampling_source.tokenizer_path
     config_type = NativeLlamaLmConfig if native else LlamaConfig
     model_config = config_type.from_hf_config(source.config.to_hf_config(32))
     model_size = 2 if len(jax.devices()) >= 4 else 1
@@ -439,7 +448,7 @@ def test_sampling_source_load_preserves_full_vocabulary_weights_and_compute_prec
     config = _sampling_config(sampling_source, tmp_path, native, dtype)
     tokenizer = load_tokenizer(config.tokenizer)
     trainer = dataclasses.replace(config.trainer, use_explicit_mesh_axes=native)
-    source = sampling_source[0]
+    source = sampling_source.checkpoint
     with hax.partitioning.set_mesh(Mesh(np.asarray(jax.devices()), ("data",))):
         oracle = source.config.build(hax.Axis("vocab", 32), key=jax.random.PRNGKey(13))
         tokens = hax.named(jnp.asarray([3, 4, 5, 6], dtype=jnp.int32), "position")
@@ -454,7 +463,7 @@ def test_sampling_source_load_preserves_full_vocabulary_weights_and_compute_prec
         assert loaded.Vocab.size == 32
         if native:
             assert len(tokenizer) == 31
-        for name, expected in sampling_source[0].weights.items():
+        for name, expected in source.weights.items():
             np.testing.assert_array_equal(actual[name], np.asarray(expected).astype(dtype))
         assert all(value.dtype == dtype for value in jax.tree.leaves(loaded) if eqx.is_inexact_array(value))
         if dtype == jnp.float32:
@@ -467,7 +476,7 @@ def test_sampling_source_load_preserves_full_vocabulary_weights_and_compute_prec
 @pytest.mark.parametrize("native", [False, True], ids=["named", "native"])
 def test_sampling_main_checkpoint_generation_matches_independent_named_oracle(sampling_source, tmp_path, native):
     config = _sampling_config(sampling_source, tmp_path, native, jnp.float32)
-    source = sampling_source[0]
+    source = sampling_source.checkpoint
     with hax.partitioning.set_mesh(Mesh(np.asarray(jax.devices()), ("data",))):
         oracle = source.config.build(hax.Axis("vocab", 32), key=jax.random.PRNGKey(13))
         for name, weights in to_torch_compatible_state_dict(oracle).items():
