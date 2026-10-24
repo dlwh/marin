@@ -473,22 +473,22 @@ def _zeros_like(mapping, dtype, n):
 
 
 def broadcast_shard(x: T, out_axis_specs: Any, source: int = 0) -> T:
-    """
-    Given a tree of arrays that are on a single source host, and other data (e.g. zeros) with
-    the same structure, broadcast and shard the data to all hosts, using the axis mapping provided.
+    """Broadcast an array pytree from one source process into requested shardings.
 
-    For some reason, I had a ton of trouble figuring this out.
+    Other processes supply the same shapes and tree structure. Copies are staged
+    along a device-sharded source dimension before selecting the source process.
+    All-Auto and all-Explicit meshes are supported; mixed mesh modes are not.
 
-    Our strategy is, for each leaf:
-     1. create a host_local_array_to_global_array with the data if we're the source, or zeros if we're not.
-        This gives us an array [num_devices, ...]
-     2. Then, inside jit, we select the source'th element of the array, then reshard with the out_axis_specs
-
+    Args:
+        x: Array pytree, including NamedArrays with their static metadata.
+        out_axis_specs: Matching pytree of PartitionSpecs or NamedShardings.
+        source: Process index whose values are broadcast.
     """
     current_mesh = hax.partitioning._get_mesh()
     assert current_mesh is not None, "broadcast_shard requires an active mesh"
 
     axis_names = current_mesh.axis_names
+    all_axes_explicit = axis_resource_is_explicit(current_mesh, axis_names)
 
     valid_device_for_process = index_where(lambda d: d.host_id == source, current_mesh.devices.flatten())
     sharding = NamedSharding(
@@ -515,7 +515,24 @@ def broadcast_shard(x: T, out_axis_specs: Any, source: int = 0) -> T:
             arr = x.array
         else:
             arr = x
-        arr = jax.lax.with_sharding_constraint(arr[valid_device_for_process], pspec)
+        if all_axes_explicit:
+
+            def select_source(value):
+                # Floating-point gather reductions can change signed zero.
+                floating = jnp.issubdtype(value.dtype, jnp.floating)
+                bits = jax.lax.bitcast_convert_type(value, jnp.uint8) if floating else value
+                bits = bits.at[jnp.asarray([valid_device_for_process])].get(
+                    out_sharding=NamedSharding(current_mesh, PartitionSpec())
+                )[0]
+                return jax.lax.bitcast_convert_type(bits, value.dtype) if floating else bits
+
+            if jnp.issubdtype(arr.dtype, jnp.complexfloating):
+                arr = jax.lax.complex(select_source(jax.lax.real(arr)), select_source(jax.lax.imag(arr)))
+            else:
+                arr = select_source(arr)
+            arr = jax.sharding.reshard(arr, pspec)
+        else:
+            arr = jax.lax.with_sharding_constraint(arr[valid_device_for_process], pspec)
 
         if isinstance(x, hax.NamedArray):
             return hax.named(arr, x.axis_names)
