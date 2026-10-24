@@ -116,7 +116,10 @@ class ExplicitTrainingLayout:
 
     The first positional loss argument after the model is a batch pytree whose
     nonscalar arrays all lead with the example dimension. Other loss arguments
-    are shared across microbatches.
+    are shared across microbatches. The first entry of ``batch_spec`` controls
+    example-axis placement in ``Trainer.data_loader`` and microbatch sizing.
+    That loader requires all trailing entries to be ``None``; callers may pass
+    manually feature-sharded batches directly to ``Trainer.train_step``.
     """
 
     mesh: Mesh
@@ -543,31 +546,15 @@ class Trainer:
         trainer_state_shape = eqx.filter_eval_shape(init_state_and_model, model_init, training_key)
         saveable_train_state = saveable_training_mask(trainer_state_shape, is_trainable)
 
-        if self.explicit_layout is not None:
-            loaded_state = eqx.filter(trainer_state_shape, lambda _: False)
-            if checkpoint is not None:
-                loaded_state = levanter.checkpoint.load_checkpoint(
-                    eqx.filter(trainer_state_shape, saveable_train_state),
-                    checkpoint.path,
-                    mesh=self.device_mesh,
-                    allow_partial=self.config.allow_partial_checkpoint,
-                )
-
-            @eqx.filter_jit
-            def initialize_and_merge(loaded_state, model_init, key):
-                initialized = init_state_and_model(model_init, key)
-                loaded_state = eqx.filter(loaded_state, lambda leaf: not isinstance(leaf, jax.ShapeDtypeStruct))
-                return eqx.combine(loaded_state, initialized)
-
-            return initialize_and_merge(loaded_state, model_init, training_key)
-
+        # Explicit callers own placement and keep their initialization buffers reusable.
         state = load_checkpoint_or_initialize(
             init_state_and_model,
             [checkpoint.path] if checkpoint is not None else self.checkpoint_search_paths,
             discover_latest=False,
-            axis_mapping=self.parameter_axis_mapping,
+            axis_mapping=self.parameter_axis_mapping if self.explicit_layout is None else None,
             mesh=self.device_mesh,
             is_checkpointed=saveable_train_state,
+            donate_args=self.explicit_layout is None,
             do_load=load_checkpoint,
             allow_partial=self.config.allow_partial_checkpoint,
         )(model_init, training_key)
@@ -780,6 +767,9 @@ class Trainer:
     def data_loader(self, dataset: AsyncDataset[X], batch: Optional[hax.Axis | int] = None) -> DataLoader[X]:
         """Creates a data loader for the given dataset and batch axis.
 
+        Explicit raw-array loading shards only the leading example dimension.
+        For feature-sharded inputs, place batches before calling ``train_step``.
+
         Args:
             dataset (AsyncDataset): the dataset to load
             batch: Optional batch axis or integer batch size. If None, uses the trainer batch axis
@@ -788,6 +778,11 @@ class Trainer:
         Returns:
             DataLoader: the data loader
         """
+        if self.explicit_layout is not None and any(axis is not None for axis in self.explicit_layout.batch_spec[1:]):
+            raise ValueError(
+                "Explicit data loaders only shard the leading example dimension; "
+                "provide feature-sharded batches directly to train_step"
+            )
         if isinstance(batch, int):
             batch_name = self.config.batch_axis_name
             batch_size = batch
