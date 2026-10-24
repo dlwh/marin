@@ -19,6 +19,7 @@ import jax.numpy as jnp
 import jax.random as jrandom
 import jmp
 import numpy as np
+import optax
 import pytest
 import safetensors.numpy
 from chex import assert_trees_all_close
@@ -33,6 +34,7 @@ import levanter.main.eval_lm as eval_lm
 import levanter.main.viz_logprobs as viz_logprobs
 from levanter.testing import tiny_corpus
 from levanter.adaptor import LoraAdaptorConfig
+from levanter.adaptor.lora import lora_state_dict, merge_lora_modules, unwrap_lora_modules
 from levanter.checkpoint import (
     CheckpointerConfig,
     discover_checkpoint_candidates,
@@ -1130,3 +1132,163 @@ def test_train_lm_rejects_weights_only_init_with_trainer_initialize_from():
         )
         with pytest.raises(ValueError, match="trainer.initialize_from"):
             train_lm.main(config)
+
+
+@pytest.mark.tpu
+@pytest.mark.timeout(180)
+def test_native_train_lm_lora_hf_update_resume_and_local_exports(tmp_path, native_hf_source, tiny_hf_tokenizer_path):
+    source = native_hf_source.path
+    model_config = dataclasses.replace(
+        NativeLlamaLmConfig.from_hf_config(native_hf_source.config.to_hf_config(32)),
+        reference_checkpoint=str(tmp_path / "unused-default-reference"),
+    )
+    examples = ListAsyncDataset([GrugLmExample.causal((jnp.arange(8) + i) % 31) for i in range(16)])
+    data = LmDataConfig(
+        tokenizer=tiny_hf_tokenizer_path,
+        shuffle=False,
+        components={"direct": DirectDatasetComponent(datasets={"train": examples})},
+    )
+    model_size = 2 if jax.device_count() >= 4 else 1
+    data_size = jax.device_count() // model_size
+    optimizer = AdamConfig(learning_rate=1e-3, warmup=0, lr_schedule=ConstantLrSchedule(), weight_decay=0.0)
+    adapter = LoraAdaptorConfig(r=3, alpha=6)
+
+    def configuration(name, steps, resume=False):
+        directory = tmp_path / name
+        return train_lm.TrainLmConfig(
+            model=model_config,
+            data=data,
+            data_seed=7,
+            train_seq_len=8,
+            initialize_from_hf=str(source),
+            adapter=adapter,
+            optimizer=optimizer,
+            peft_save_path=str(directory / "peft"),
+            merged_hf_save_path=str(directory / "merged"),
+            hf_save_steps=1,
+            trainer=train_lm.TrainerConfig(
+                id="native-lora",
+                seed=42,
+                num_train_steps=steps,
+                train_batch_size=2 * data_size,
+                per_device_parallelism=1,
+                mp=jmp.get_policy("f32"),
+                max_eval_batches=0,
+                mesh=MeshConfig(axes={"data": data_size, "model": model_size}),
+                tracker=JsonFileTrackerConfig(output_path=str(directory / "tracker")),
+                checkpointer=CheckpointerConfig(base_path=str(directory / "checkpoints"), keep=[{"every": 1}]),
+                load_checkpoint=resume,
+                require_accelerator=False,
+                distributed=DistributedConfig(initialize_jax_distributed=False),
+                log_xla_hlo=False,
+                log_jaxprs=False,
+            ),
+        )
+
+    train_lm.main(configuration("full", 3))
+    train_lm.main(configuration("resumed", 2))
+    train_lm.main(configuration("resumed", 3, resume=True))
+    mesh = dataclasses.replace(configuration("full", 3).trainer, use_explicit_mesh_axes=True).device_mesh
+    sharding = native_llama_sharding(
+        configuration("full", 3).trainer.parameter_axis_mapping,
+        configuration("full", 3).trainer.compute_axis_mapping,
+        "batch",
+    )
+    tokenizer = data.the_tokenizer
+    with jax.set_mesh(mesh):
+        base = load_hf_checkpoint(
+            model_config,
+            str(source),
+            tokenizer=tokenizer,
+            compute_dtype=jnp.float32,
+            axis_mapping=configuration("full", 3).trainer.parameter_axis_mapping,
+            compute_axis_mapping=configuration("full", 3).trainer.compute_axis_mapping,
+            batch_axis_name="batch",
+        )
+        skeleton = adapter.apply(base, key=jrandom.PRNGKey(0))
+        template = TrainerState.init(
+            optimizer.build(3),
+            skeleton,
+            key=jrandom.PRNGKey(0),
+            mp=jmp.get_policy("f32"),
+            is_trainable=adapter.trainable_filter(skeleton),
+        )
+
+        def restored(name):
+            return load_checkpoint(
+                template.saveable_state, latest_checkpoint_path(tmp_path / name / "checkpoints/native-lora"), mesh=mesh
+            )
+
+        full, resumed = restored("full"), restored("resumed")
+        assert int(full.step) == int(resumed.step) == 3
+        for actual, expected in zip(_array_leaves(full), _array_leaves(resumed), strict=True):
+            np.testing.assert_array_equal(actual, expected)
+        counts = [v for v in _array_leaves(full.opt_state) if jnp.issubdtype(v.dtype, jnp.integer)]
+        assert counts
+        for count in counts:
+            np.testing.assert_array_equal(count, 3)
+        adam_states = jax.tree.leaves(full.opt_state, is_leaf=lambda node: isinstance(node, optax.ScaleByAdamState))
+        adam_states = [node for node in adam_states if isinstance(node, optax.ScaleByAdamState)]
+        assert adam_states
+        for adam in adam_states:
+            for moments in (adam.mu, adam.nu):
+                factors = moments.native.layers.stacked.self_attn.q_proj.lora
+                assert np.any(factors.lora_A.weight != 0)
+                assert np.any(factors.lora_B.weight != 0)
+        trained = train_lm._restore_lm_model_from_partial_checkpoint(
+            full.model, skeleton, adapter.trainable_filter(skeleton)
+        )
+        for name, actual in unwrap_lora_modules(trained).to_state_dict().items():
+            np.testing.assert_array_equal(actual, native_hf_source.weights[name])
+        assert any(np.any(value != 0) for key, value in lora_state_dict(trained).items() if ".lora_A." in key)
+        assert trained.native.layers.stacked.self_attn.q_proj.lora.lora_A.weight.sharding.spec == P(None, None, "data")
+        wrong_base = model_config.build(Axis("vocab", 32), key=jrandom.PRNGKey(999), sharding=sharding)
+        wrong_skeleton = adapter.apply(wrong_base, key=jrandom.PRNGKey(0))
+        wrong = train_lm._restore_lm_model_from_partial_checkpoint(
+            full.model, wrong_skeleton, adapter.trainable_filter(wrong_skeleton)
+        )
+        tokens = hax.named(
+            jnp.arange(8 * data_size).reshape(2 * data_size, 4) % 31,
+            (Axis("batch", 2 * data_size), Axis("position", 4)),
+        )
+        assert not np.allclose(
+            trained(tokens, AttentionMask.causal()).array, wrong(tokens, AttentionMask.causal()).array
+        )
+        merged = merge_lora_modules(trained)
+        peft_path = tmp_path / "full/peft/native-lora/step-2"
+        peft_config = json.loads((peft_path / "adapter_config.json").read_text())
+        assert peft_config["base_model_name_or_path"] == str(source)
+        assert peft_config["target_modules"] == [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ]
+        exported = safetensors.numpy.load_file(peft_path / "adapter_model.safetensors")
+        for key, value in lora_state_dict(trained).items():
+            np.testing.assert_array_equal(exported[key], value)
+        converter = model_config.hf_checkpoint_converter(
+            str(tmp_path / "full/merged/native-lora/step-2"), tokenizer=tokenizer
+        )
+        reloaded = converter.load_pretrained(
+            model_config.model_type,
+            config=model_config,
+            model_init=lambda vocab: model_config.build(vocab, key=jrandom.PRNGKey(1), sharding=sharding),
+        )
+        for name, value in reloaded.to_state_dict().items():
+            np.testing.assert_array_equal(value, merged.to_state_dict()[name])
+        tokens = hax.named(
+            jnp.arange(8 * data_size).reshape(2 * data_size, 4) % 31,
+            (Axis("batch", 2 * data_size), Axis("position", 4)),
+        )
+        np.testing.assert_allclose(
+            trained(tokens, AttentionMask.causal()).array,
+            reloaded(tokens, AttentionMask.causal()).array,
+            atol=1e-5,
+            rtol=1e-5,
+        )
+    for name in ("full", "resumed"):
+        _assert_training_recorded(str(tmp_path / name / "tracker"))

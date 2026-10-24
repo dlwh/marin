@@ -135,8 +135,10 @@ can initialize a new native run or a standard HF Llama consumer; they do not
 contain optimizer or RNG state.
 
 Local export requires standard weighted RMSNorm and bias-free projections. Hub
-upload, remote export destinations, LoRA and Haliax quantization remain
+upload, remote export destinations and Haliax quantization remain
 unsupported by this training entrypoint and are rejected before initialization.
+Zero-dropout LoRA is available through `adapter.type: lora`; see
+[adapter training](Training-On-Your-Data.md#lora-adapters).
 Existing `model.type: llama` configurations retain their behavior.
 
 ## Set Custom Training Configuration

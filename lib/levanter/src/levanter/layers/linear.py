@@ -3,6 +3,8 @@
 
 """Array-native linear projections with separate storage and compute layouts."""
 
+from typing import Protocol
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -10,6 +12,10 @@ from jax.sharding import PartitionSpec, reshard
 from jaxtyping import Array, Float, PRNGKeyArray
 
 INITIALIZER_TRUNCATION_BOUND = 3.0
+
+
+class LinearProjection(Protocol):
+    def __call__(self, x: Float[Array, "... In"], *, out_sharding: PartitionSpec) -> Float[Array, "... Out"]: ...
 
 
 class Linear(eqx.Module):

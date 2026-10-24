@@ -26,7 +26,7 @@ class ModuleInit(Protocol[M]):
 
 
 @runtime_checkable
-class _StateDictWriter(Protocol):
+class StateDictWriter(Protocol):
     def to_state_dict(self, prefix: str | None = None) -> StateDict: ...
 
 
@@ -426,7 +426,7 @@ def _with_prefix(prefix: str | None, key: str | None) -> str | None:
 def _to_state_dict(tree: Any, prefix: str | None) -> StateDict:
     if tree is None:
         return {}
-    if isinstance(tree, _StateDictWriter):
+    if isinstance(tree, StateDictWriter):
         return tree.to_state_dict(prefix)
     if isinstance(tree, eqx.Module):
         key_map = tree._state_dict_key_map() if isinstance(tree, _StateDictKeyMap) else {}

@@ -22,11 +22,11 @@ from jaxtyping import Array, Float, Int, PRNGKeyArray
 
 from levanter.grug.attention import AttentionMask, GrugAttentionImplementation, attention, reference_attention
 from levanter.grug.loss import fused_linear_softmax_cross_entropy_loss
-from levanter.layers.linear import INITIALIZER_TRUNCATION_BOUND, Linear
+from levanter.layers.linear import INITIALIZER_TRUNCATION_BOUND, Linear, LinearProjection
 from levanter.layers.rms_norm import RmsNorm
 from levanter.layers.rotary_native import NativeRotaryConfig, RotaryConfig, apply_rotary
 from levanter.layers.scan_checkpoint import ScanCheckpointSpec
-from levanter.layers.stacked import ArrayStacked
+from levanter.layers.stacked import ArrayStacked, StateDictWriter
 from levanter.utils.activation import ActivationFunctionEnum, JaxActivationFunction
 
 
@@ -156,10 +156,10 @@ def _norm(config: NativeLlamaConfig, dim: int, storage_spec: P) -> RmsNorm:
 class NativeLlamaAttention(eqx.Module):
     """Grouped-query attention with explicitly placed head and residual arrays."""
 
-    q_proj: Linear
-    k_proj: Linear
-    v_proj: Linear
-    o_proj: Linear
+    q_proj: LinearProjection
+    k_proj: LinearProjection
+    v_proj: LinearProjection
+    o_proj: LinearProjection
     q_norm: RmsNorm | None
     k_norm: RmsNorm | None
     config: NativeLlamaConfig = eqx.field(static=True)
@@ -247,9 +247,9 @@ class NativeLlamaAttention(eqx.Module):
 class NativeLlamaMlp(eqx.Module):
     """Gated MLP with column-parallel inputs and a row-parallel output."""
 
-    gate_proj: Linear
-    up_proj: Linear
-    down_proj: Linear
+    gate_proj: LinearProjection
+    up_proj: LinearProjection
+    down_proj: LinearProjection
     act: JaxActivationFunction = eqx.field(static=True)
     sharding: NativeLlamaSharding = eqx.field(static=True)
 
@@ -555,7 +555,11 @@ def _put(state: dict[str, jax.Array], key: str, value: jax.Array | None) -> None
         state[key] = value
 
 
-def _put_module(state: dict[str, jax.Array], prefix: str, module: Linear | RmsNorm) -> None:
+def _put_module(state: dict[str, jax.Array], prefix: str, module: LinearProjection | RmsNorm) -> None:
+    if isinstance(module, StateDictWriter):
+        state.update(module.to_state_dict(prefix))
+        return
+    assert isinstance(module, (Linear, RmsNorm))
     _put(state, f"{prefix}.weight", module.weight)
     _put(state, f"{prefix}.bias", module.bias)
 
@@ -564,7 +568,9 @@ def _load(value: jax.Array, template: jax.Array, spec: P) -> jax.Array:
     return reshard(jnp.asarray(value, dtype=template.dtype).reshape(template.shape), spec)
 
 
-def _load_module(module: Linear | RmsNorm, state: Mapping[str, jax.Array], prefix: str, spec: P):
+def _load_module(module: LinearProjection | RmsNorm, state: Mapping[str, jax.Array], prefix: str, spec: P):
+    if not isinstance(module, (Linear, RmsNorm)):
+        raise ValueError("Load native base weights before applying adapters")
     weight = None if module.weight is None else _load(state[f"{prefix}.weight"], module.weight, spec)
     bias = None if module.bias is None else _load(state[f"{prefix}.bias"], module.bias, P(spec[0]))
     return dataclasses.replace(module, weight=weight, bias=bias)

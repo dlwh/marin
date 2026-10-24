@@ -587,21 +587,23 @@ def _install_separate_reference_export_hooks(
     trainer.add_hook(save_policy_hf_checkpoint, every=export.hf_save_steps)
 
 
-def main(config: TrainDpoConfig):
+def main(config: TrainDpoConfig) -> callbacks.StepInfo:
+    """Train a DPO policy and return its final ordinary Trainer step."""
     _validate_dpo_config(config)
     native = isinstance(config.model, NativeLlamaLmConfig)
     explicit_layout = None
     if native:
-        if not isinstance(config.adapter, NoAdaptorConfig):
-            raise ValueError("llama_native DPO does not support adapters yet")
+        if not isinstance(config.adapter, (NoAdaptorConfig, LoraAdaptorConfig)):
+            raise ValueError("llama_native DPO supports only full-parameter training and LoRA adapters")
         if config.trainer.quantization is not None:
             raise ValueError("llama_native DPO does not support Haliax quantization")
-        if config.hf_upload:
+        if config.hf_upload or config.peft_hf_upload or config.merged_hf_upload:
             raise ValueError("llama_native DPO supports local HF export only")
-        if config.hf_save_path is not None:
-            if StoragePath(config.hf_save_path).is_remote:
-                raise ValueError("llama_native DPO hf_save_path must be a local directory")
-            config.model.validate_hf_export()
+        for export_path in (config.hf_save_path, config.peft_save_path, config.merged_hf_save_path):
+            if export_path is not None:
+                if StoragePath(export_path).is_remote:
+                    raise ValueError("llama_native DPO export paths must be local directories")
+                config.model.validate_hf_export()
         config = dataclasses.replace(config, trainer=dataclasses.replace(config.trainer, use_explicit_mesh_axes=True))
         sharding = native_llama_sharding(
             config.trainer.parameter_axis_mapping, config.trainer.compute_axis_mapping, config.trainer.batch_axis_name
@@ -726,16 +728,15 @@ def main(config: TrainDpoConfig):
             train_dataset = _build_dpo_dataset(config.data, Pos, key=data_key)
             validation_specs = _build_validation_specs(config.data, Pos)
 
-        initial_policy_model = (
-            initial_policy_source
-            if initial_policy_source is not None
-            else _build_model(config.model, Vocab, policy_key, trainer)
-        )
-        initial_policy_model = config.adapter.apply(
-            initial_policy_model,
-            key=adapter_key,
-            axis_mapping=parameter_axis_mapping,
-        )
+        if initial_policy_source is not None:
+            # Source initialization already applies the adapter after loading the full vocabulary.
+            initial_policy_model = initial_policy_source
+        else:
+            initial_policy_model = config.adapter.apply(
+                _build_model(config.model, Vocab, policy_key, trainer),
+                key=adapter_key,
+                axis_mapping=parameter_axis_mapping,
+            )
         if isinstance(config.reference, SeparateReferenceConfig):
             initial_reference_model = _build_model(config.model, Vocab, model_key, trainer)
             initial_model = DpoModel(policy=initial_policy_model, reference=initial_reference_model)
@@ -972,13 +973,14 @@ def main(config: TrainDpoConfig):
             for callback in initial_eval_callbacks:
                 callback(initial_eval_info, force=True)
 
-        trainer.train(state, train_loader)
+        final_info = trainer.train(state, train_loader)
 
         if trainer.config.checkpointer is not None:
             checkpointer = trainer.config.checkpointer.create(trainer.run_id)
             checkpointer.wait_until_finished()
 
     trainer.tracker.finish()
+    return final_info
 
 
 if __name__ == "__main__":

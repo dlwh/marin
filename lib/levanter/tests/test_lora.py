@@ -8,8 +8,12 @@ import equinox as eqx
 import haliax as hax
 import haliax.nn as hnn
 import jax
+import jax.numpy as jnp
+import pytest
+from jax.sharding import AxisType, Mesh, PartitionSpec as P, reshard
 import numpy as np
 import optax
+from safetensors.numpy import load_file
 from chex import assert_trees_all_close
 from haliax.quantization import DefaultDotGeneralOp, DotGeneralOp
 from safetensors import safe_open
@@ -23,6 +27,8 @@ from transformers import AutoModelForCausalLM
 
 from levanter.adaptor.lora import (
     LoraConfig,
+    lora_state_dict,
+    unwrap_lora_modules,
     LoraLinear,
     lora_trainable_params_filter,
     loraize,
@@ -34,6 +40,10 @@ from levanter.callbacks import StepInfo
 from levanter.checkpoint import Checkpointer
 from levanter.compat.hf_checkpoints import HFCheckpointConverter
 from levanter.layers.attention import AttentionMask
+from levanter.layers.linear import Linear as ArrayLinear
+from levanter.models.llama_native import NativeLlamaConfig
+from levanter.models.llama_native_lm import NativeLlamaLmConfig
+from levanter.tokenizers import load_tokenizer
 from levanter.models.gpt2 import Gpt2Config, Gpt2LMHeadModel
 from levanter.models.llama import LlamaConfig, LlamaLMHeadModel
 from levanter.trainer_state import TrainerState
@@ -453,3 +463,123 @@ def test_loraize_a_zero_and_b_zero_degenerate():
     )
     assert hax.all(loraized.first.lora.lora_A.weight == 0.0)
     assert hax.all(loraized.first.lora.lora_B.weight == 0.0)
+
+
+@pytest.mark.tpu
+@pytest.mark.parametrize("row", [False, True], ids=["column", "row"])
+def test_array_lora_matches_independent_values_gradients_and_placements(row):
+    model_size = 2 if jax.device_count() >= 4 else 1
+    mesh = Mesh(
+        np.array(jax.devices()).reshape(-1, model_size), ("data", "model"), axis_types=(AxisType.Explicit,) * 2
+    )
+    storage, compute = (P("data", "model"), P(None, "model")) if row else (P("model", "data"), P("model", None))
+    x_host = np.arange(32, dtype=np.float32).reshape(4, 8) / 32
+    g_host = np.arange(32, dtype=np.float32).reshape(4, 8) / 32
+    with jax.set_mesh(mesh):
+        base = ArrayLinear.init(
+            8,
+            8,
+            key=jax.random.PRNGKey(1),
+            use_bias=True,
+            initializer_std=0.2,
+            storage_spec=storage,
+            compute_spec=compute,
+        )
+        config = LoraConfig(r=3, alpha=2, a_init_mode="random")
+        module = loraize(base, config, key=jax.random.PRNGKey(2))
+        x = reshard(jnp.array(x_host), P("data", "model" if row else None))
+        output_spec = P("data", None if row else "model")
+        cotangent = reshard(jnp.array(g_host), output_spec)
+        value, (gradient, dx) = eqx.filter_value_and_grad(
+            lambda args: jnp.sum(args[0](args[1], out_sharding=output_spec) * cotangent)
+        )((module, x))
+        w, a, b = (np.asarray(v) for v in (base.weight, module.lora.lora_A.weight, module.lora.lora_B.weight))
+        scale = config.alpha / config.r
+        expected = x_host @ (w + scale * b @ a).T + np.asarray(base.bias)
+        np.testing.assert_allclose(module(x, out_sharding=output_spec), expected, atol=1e-5, rtol=1e-5)
+        assert module(x, out_sharding=output_spec).sharding.spec == output_spec
+        np.testing.assert_allclose(value, (expected * g_host).sum(), atol=1e-5, rtol=1e-5)
+        np.testing.assert_allclose(dx, g_host @ (w + scale * b @ a), atol=1e-5, rtol=1e-5)
+        np.testing.assert_allclose(gradient.wrapped.weight, g_host.T @ x_host, atol=1e-5, rtol=1e-5)
+        np.testing.assert_allclose(gradient.lora.lora_A.weight, scale * b.T @ g_host.T @ x_host, atol=1e-5, rtol=1e-5)
+        np.testing.assert_allclose(gradient.lora.lora_B.weight, scale * g_host.T @ x_host @ a.T, atol=1e-5, rtol=1e-5)
+        assert module.lora.lora_A.weight.sharding.spec == P(None, storage[1])
+        assert module.lora.lora_B.weight.sharding.spec == P(storage[0], None)
+        assert gradient.lora.lora_A.weight.sharding == module.lora.lora_A.weight.sharding
+        assert gradient.lora.lora_B.weight.sharding == module.lora.lora_B.weight.sharding
+        np.testing.assert_allclose(module.merge()(x, out_sharding=output_spec), expected, atol=1e-5, rtol=1e-5)
+
+
+def test_array_lora_multilayer_canonical_export_and_base_view():
+    mesh = Mesh(np.array(jax.devices()), ("data",), axis_types=(AxisType.Explicit,))
+    config = NativeLlamaConfig(
+        vocab_size=32, hidden_dim=16, intermediate_dim=24, num_layers=2, num_heads=4, num_kv_heads=2, max_seq_len=8
+    )
+    with jax.set_mesh(mesh):
+        base = config.build(key=jax.random.PRNGKey(1))
+        adapted = loraize(base, LoraConfig(r=3), key=jax.random.PRNGKey(2))
+        tokens = jnp.arange(8, dtype=jnp.int32).reshape(2, 4)
+        np.testing.assert_array_equal(base(tokens), adapted(tokens))
+        for actual, expected in zip(jax.tree.leaves(unwrap_lora_modules(adapted)), jax.tree.leaves(base), strict=True):
+            np.testing.assert_array_equal(actual, expected)
+        factors = adapted.layers.stacked.self_attn.q_proj.lora
+        assert not np.array_equal(factors.lora_B.weight[0], factors.lora_B.weight[1])
+        adapted = loraize(base, LoraConfig(r=3, a_init_mode="random"), key=jax.random.PRNGKey(2))
+        merged = merge_lora_modules(adapted)
+        np.testing.assert_allclose(adapted(tokens), merged(tokens), atol=1e-5, rtol=1e-5)
+        exported = lora_state_dict(adapted)
+        assert len(exported) == 2 * 7 * 2
+        for index, layer in enumerate(adapted.layers.unstacked()):
+            for category, names in (
+                ("self_attn", ("q_proj", "k_proj", "v_proj", "o_proj")),
+                ("mlp", ("gate_proj", "up_proj", "down_proj")),
+            ):
+                for name in names:
+                    projection = getattr(getattr(layer, category), name)
+                    for factor in ("lora_A", "lora_B"):
+                        np.testing.assert_array_equal(
+                            exported[f"base_model.model.model.layers.{index}.{category}.{name}.{factor}.weight"],
+                            getattr(projection.lora, factor).weight,
+                        )
+        with pytest.raises(ValueError, match="dropout=0"):
+            loraize(base, LoraConfig(dropout=0.1), key=jax.random.PRNGKey(2))
+        with pytest.raises(ValueError, match="did not select"):
+            loraize(base, LoraConfig(target_modules=["missing"]), key=jax.random.PRNGKey(2))
+
+
+@skip_if_no_torch
+def test_array_lora_local_peft_and_merged_exports_match_independent_torch(tmp_path, tiny_hf_tokenizer_path):
+    import torch  # noqa: PLC0415  # optional dependency
+
+    mesh = Mesh(np.array(jax.devices()), ("data",), axis_types=(AxisType.Explicit,))
+    config = NativeLlamaLmConfig(
+        hidden_dim=16, intermediate_dim=24, num_layers=2, num_heads=4, num_kv_heads=2, max_seq_len=8
+    )
+    adapter = LoraConfig(r=3, alpha=6, a_init_mode="random", target_modules=["q_proj"])
+    converter = config.hf_export_converter(load_tokenizer(tiny_hf_tokenizer_path))
+    with jax.set_mesh(mesh):
+        base = config.build(hax.Axis("vocab", 32), key=jax.random.PRNGKey(1))
+        adapted = loraize(base, adapter, key=jax.random.PRNGKey(2))
+        converter.save_pretrained(base, str(tmp_path / "base"))
+        save_peft_pretrained(adapted, adapter, str(tmp_path / "base"), str(tmp_path / "adapter"))
+        save_merged_hf_model(adapted, converter, str(tmp_path / "merged"))
+        tokens = hax.named(jnp.arange(8).reshape(2, 4), (hax.Axis("batch", 2), hax.Axis("position", 4)))
+        expected = np.array(adapted(tokens, AttentionMask.causal()).array)
+        assert not np.array_equal(expected, base(tokens, AttentionMask.causal()).array)
+    fields = json.loads((tmp_path / "adapter/adapter_config.json").read_text())
+    factors = load_file(tmp_path / "adapter/adapter_model.safetensors")
+    assert len(factors) == 4
+    independent = AutoModelForCausalLM.from_pretrained(tmp_path / "base", local_files_only=True).eval()
+    state = independent.state_dict()
+    for key, a in factors.items():
+        if ".lora_A." not in key:
+            continue
+        b = factors[key.replace("lora_A", "lora_B")]
+        weight_key = key.removeprefix("base_model.model.").replace(".lora_A.weight", ".weight")
+        state[weight_key] += torch.from_numpy(b @ a) * (fields["lora_alpha"] / fields["r"])
+    independent.load_state_dict(state, strict=True)
+    merged = AutoModelForCausalLM.from_pretrained(tmp_path / "merged", local_files_only=True).eval()
+    with torch.no_grad():
+        torch_tokens = torch.arange(8).reshape(2, 4)
+        for model in (independent, merged):
+            np.testing.assert_allclose(model(torch_tokens).logits.numpy(), expected, atol=1e-4, rtol=1e-4)
