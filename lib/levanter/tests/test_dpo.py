@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import dataclasses
+import json
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,12 +15,14 @@ import jax.random as jrandom
 import jmp
 import numpy as np
 import pytest
+import safetensors.numpy
 import haliax as hax
 from haliax import Axis
 from haliax.partitioning import ResourceAxis, set_mesh
+from haliax.state_dict import from_torch_compatible_state_dict, to_torch_compatible_state_dict
 from haliax.quantization import apply_updates, partition_for_grad_overwrite
 from haliax.jax_utils import is_jax_array_like
-from jax.sharding import Mesh
+from jax.sharding import Mesh, PartitionSpec as P
 from safetensors import safe_open
 
 from levanter.data.loader import DataLoader
@@ -49,12 +52,19 @@ from levanter.dpo import (
     reference_eval_cache_metadata,
     reference_eval_cache_path,
 )
+from levanter.checkpoint import CheckpointerConfig, latest_checkpoint_path, load_checkpoint, save_checkpoint
+from levanter.distributed import DistributedConfig
+from levanter.main.model_init import prepare_model_init_context
 from levanter.main.lora_dpo import LoraDpoConfig, _translate_legacy_lora_dpo_config
 from levanter.main.train_dpo import (
     AdapterBaseReferenceConfig,
     SeparateReferenceConfig,
     TrainDpoConfig,
     _build_dpo_dataset,
+    _build_model,
+    _initialize_policy_model_from_source,
+    _load_separate_reference_model,
+    main as train_dpo_main,
     _derive_training_keys,
     _install_separate_reference_export_hooks,
     _periodic_eval_callback,
@@ -65,12 +75,18 @@ from levanter.main.train_dpo import (
 from levanter.metrics import Metric
 from levanter.models.gpt2 import Gpt2Config, Gpt2LMHeadModel
 from levanter.models.lm_model import LmExample
+from levanter.models.llama import LlamaConfig
+from levanter.models.llama_native_lm import NativeLlamaLmConfig, native_llama_sharding
 from levanter.optim.config import AdamConfig
 from levanter.optim.model_averaging import ModelAveraging
-from levanter.store.cache import SerialCacheWriter
+from levanter.store.cache import CacheMetadata, SerialCacheWriter
 from levanter.tokenizers import MarinTokenizer, load_tokenizer as load_marin_tokenizer
 from levanter.trainer_state import TrainerState, saveable_training_mask, trainables_only
-from levanter.trainer import Trainer, TrainerHooks
+from levanter.trainer import ExplicitTrainingLayout, Trainer, TrainerConfig, TrainerHooks
+from levanter.tracker import NoopTracker, current_tracker
+from levanter.tracker.json_file import JsonFileTrackerConfig
+from levanter.utils.mesh import MeshConfig
+from levanter.testing.helpers import use_test_mesh
 from levanter.utils.jax_utils import local_cpu_mesh
 from levanter.utils.tree_utils import inference_mode
 
@@ -868,3 +884,294 @@ def test_vmapped_init_with_sharding_handles_layer_axis():
         keys = jax.random.split(jax.random.PRNGKey(0), Layers.size)
         out = hax.vmap(init_fn, Layers)(keys)
         assert out.axes[0].name == "layers"
+
+
+@dataclasses.dataclass(frozen=True)
+class _DpoLlamaSource:
+    path: Path
+    config: LlamaConfig
+    weights: dict[str, np.ndarray]
+
+
+@pytest.fixture
+def dpo_llama_source(tmp_path, tiny_hf_tokenizer_path):
+    config = LlamaConfig(
+        hidden_dim=16,
+        intermediate_dim=24,
+        num_layers=1,
+        num_heads=4,
+        num_kv_heads=2,
+        max_seq_len=8,
+        tokenizer=tiny_hf_tokenizer_path,
+        reference_checkpoint=str(tmp_path / "hf-source"),
+    )
+    source = tmp_path / "hf-source"
+    source.mkdir()
+    with use_test_mesh():
+        model = config.build(Axis("vocab", 32), key=jrandom.PRNGKey(13))
+        weights = to_torch_compatible_state_dict(model)
+    config.to_hf_config(32).save_pretrained(source)
+    safetensors.numpy.save_file(weights, source / "model.safetensors", metadata={"format": "pt"})
+    return _DpoLlamaSource(source, config, weights)
+
+
+def _dpo_trainer_config(tmp_path, *, explicit=False, steps=2):
+    model_size = 2 if len(jax.devices()) >= 4 else 1
+    data_size = len(jax.devices()) // model_size
+    return TrainerConfig(
+        id="dpo",
+        mesh=MeshConfig(axes={"data": data_size, "model": model_size}),
+        use_explicit_mesh_axes=explicit,
+        tracker=JsonFileTrackerConfig(output_path=str(tmp_path)),
+        checkpointer=CheckpointerConfig(base_path=str(tmp_path / "checkpoints"), save_interval=None),
+        load_checkpoint=False,
+        train_batch_size=max(4, 2 * data_size),
+        per_device_parallelism=2,
+        num_train_steps=steps,
+        max_eval_batches=0,
+        require_accelerator=False,
+        distributed=DistributedConfig(initialize_jax_distributed=False),
+        log_jaxprs=False,
+        log_xla_hlo=False,
+    )
+
+
+def _native_dpo_configuration(tmp_path, source, tokenizer_path):
+    model = dataclasses.replace(
+        NativeLlamaLmConfig.from_hf_config(source.config.to_hf_config(32)),
+        reference_checkpoint=str(source.path),
+        tokenizer=tokenizer_path,
+    )
+    return TrainDpoConfig(
+        model=model,
+        trainer=_dpo_trainer_config(tmp_path, explicit=True),
+        initialize_from_hf=str(source.path),
+        reference=SeparateReferenceConfig(model_path=str(source.path), is_hf=True),
+        optimizer=AdamConfig(learning_rate=0.01, warmup=0, weight_decay=0, lr_schedule="constant"),
+        validation_split_fraction=None,
+    )
+
+
+def _separate_dpo_loss(model, example, *, key):
+    return dpo_loss(model.policy, model.reference, example, beta=0.1)
+
+
+@pytest.mark.tpu
+def test_native_dpo_policy_updates_frozen_reference_and_checkpoint_next_step(
+    tmp_path, dpo_llama_source, tiny_hf_tokenizer_path
+):
+    config = _native_dpo_configuration(tmp_path, dpo_llama_source, tiny_hf_tokenizer_path)
+    tokenizer = load_marin_tokenizer(tiny_hf_tokenizer_path)
+    context = prepare_model_init_context(
+        config.model, tokenizer=tokenizer, initialize_from_hf=config.initialize_from_hf, use_hf_model_config=False
+    )
+    sharding = native_llama_sharding(config.trainer.parameter_axis_mapping, config.trainer.compute_axis_mapping)
+    layout = ExplicitTrainingLayout(config.trainer.device_mesh, P(sharding.batch, None))
+    optimizer = config.optimizer.build(2)
+    with (
+        current_tracker(NoopTracker()),
+        Trainer(
+            config.trainer, optimizer, _separate_dpo_loss, add_default_hooks=False, explicit_layout=layout
+        ) as trainer,
+    ):
+        Vocab = Axis("vocab", 32)
+        policy = _initialize_policy_model_from_source(
+            config=config,
+            model_context=context,
+            Vocab=Vocab,
+            policy_key=jrandom.PRNGKey(2),
+            adapter_key=jrandom.PRNGKey(3),
+            parameter_axis_mapping=trainer.parameter_axis_mapping,
+            trainer=trainer,
+        )
+        reference = _load_separate_reference_model(
+            config,
+            reference_model_key=jrandom.PRNGKey(4),
+            model_context=context,
+            Vocab=Vocab,
+            parameter_axis_mapping=trainer.parameter_axis_mapping,
+            trainer=trainer,
+        )
+        for model in (policy, reference):
+            assert model.Vocab.size == 32
+            assert model.native.token_embeddings.sharding.spec == sharding.column_storage
+            assert model.native.layers.stacked.mlp.down_proj.weight.sharding.spec == P(None, "data", "model")
+            for name, value in model.to_state_dict().items():
+                np.testing.assert_array_equal(value, dpo_llama_source.weights[name])
+        axes = config.trainer.TrainBatch, config.model.max_Pos
+        token_ids = np.arange(axes[0].size * axes[1].size, dtype=np.int32).reshape(axes[0].size, axes[1].size)
+        chosen = hax.named(jnp.asarray(token_ids % 31), axes)
+        rejected = hax.named(jnp.asarray((token_ids * 3 + 2) % 31), axes)
+        batch = DpoExample(
+            chosen=hax.vmap(LmExample.causal, axes[0])(chosen),
+            rejected=hax.vmap(LmExample.causal, axes[0])(rejected),
+        )
+        # Copy before donation; the reference is excluded from trainable/checkpointed state.
+        frozen_reference = {name: np.array(value, copy=True) for name, value in reference.to_state_dict().items()}
+        initial_policy = {name: np.array(value, copy=True) for name, value in policy.to_state_dict().items()}
+        model = DpoModel(policy=policy, reference=reference)
+        state = trainer.initial_state(
+            jrandom.PRNGKey(5), model=model, is_trainable=DpoModel(policy=True, reference=False)
+        )
+        first = trainer.train_step(state, batch)
+        assert int(first.state.step) == 1
+        assert any(
+            not np.array_equal(value, initial_policy[name])
+            for name, value in first.state.model.policy.to_state_dict().items()
+        )
+        for name, value in first.state.model.reference.to_state_dict().items():
+            np.testing.assert_array_equal(value, frozen_reference[name])
+        # Compare a nontrivial policy (after its first real DPO update) with the
+        # independent named implementation at exactly those canonical weights.
+        updated_weights = {
+            name: np.array(value, copy=True) for name, value in first.state.model.policy.to_state_dict().items()
+        }
+        actual_loss, actual_grad = eqx.filter_jit(
+            eqx.filter_value_and_grad(lambda policy: dpo_loss(policy, first.state.model.reference, batch, beta=0.1)[0])
+        )(first.state.model.policy)
+        actual_grad_weights = {name: np.array(value, copy=True) for name, value in actual_grad.to_state_dict().items()}
+        with use_test_mesh(), hax.axis_mapping({}):
+            named_template = dpo_llama_source.config.build(Vocab, key=jrandom.PRNGKey(13))
+            named_policy = from_torch_compatible_state_dict(
+                named_template, {name: jnp.asarray(value) for name, value in updated_weights.items()}
+            )
+            named_reference = from_torch_compatible_state_dict(
+                named_template, {name: jnp.asarray(value) for name, value in frozen_reference.items()}
+            )
+            named_batch = DpoExample(
+                chosen=hax.vmap(LmExample.causal, axes[0])(hax.named(jnp.asarray(token_ids % 31), axes)),
+                rejected=hax.vmap(LmExample.causal, axes[0])(hax.named(jnp.asarray((token_ids * 3 + 2) % 31), axes)),
+            )
+            expected_loss, expected_grad = eqx.filter_jit(
+                eqx.filter_value_and_grad(lambda policy: dpo_loss(policy, named_reference, named_batch, beta=0.1)[0])
+            )(named_policy)
+            np.testing.assert_allclose(actual_loss, expected_loss, atol=1e-5, rtol=1e-4)
+            assert float(expected_loss) != float(first.loss)
+            expected_grad_weights = to_torch_compatible_state_dict(expected_grad)
+            assert any(np.any(value != 0) for value in expected_grad_weights.values())
+            for name, value in actual_grad_weights.items():
+                np.testing.assert_allclose(value, expected_grad_weights[name], atol=1e-5, rtol=1e-4)
+        save_checkpoint(
+            first.state.saveable_state, 1, tmp_path / "step-1", metadata=first.state.model.policy.checkpoint_metadata()
+        )
+        expected = trainer.train_step(first.state, batch)
+        assert float(expected.loss) != float(first.loss)
+        expected_arrays = [
+            np.array(value, copy=True) for value in jax.tree.leaves(eqx.filter(expected.state, eqx.is_array))
+        ]
+    resumed_config = dataclasses.replace(
+        config.trainer, load_checkpoint=True, load_checkpoint_path=str(tmp_path / "step-1")
+    )
+    with (
+        current_tracker(NoopTracker()),
+        Trainer(
+            resumed_config, optimizer, _separate_dpo_loss, add_default_hooks=False, explicit_layout=layout
+        ) as resumed,
+    ):
+        # Reconstruct the omitted frozen reference from its configured source.
+        policy = _build_model(config.model, Vocab, jrandom.PRNGKey(7), resumed)
+        reference = _load_separate_reference_model(
+            config,
+            reference_model_key=jrandom.PRNGKey(8),
+            model_context=context,
+            Vocab=Vocab,
+            parameter_axis_mapping=resumed.parameter_axis_mapping,
+            trainer=resumed,
+        )
+        state = resumed.initial_state(
+            jrandom.PRNGKey(9),
+            model=DpoModel(policy=policy, reference=reference),
+            is_trainable=DpoModel(policy=True, reference=False),
+        )
+        assert int(state.step) == 1
+        actual = resumed.train_step(state, batch)
+        np.testing.assert_array_equal(actual.loss, expected.loss)
+        for value, expected_value in zip(
+            jax.tree.leaves(eqx.filter(actual.state, eqx.is_array)), expected_arrays, strict=True
+        ):
+            np.testing.assert_array_equal(value, expected_value)
+
+
+@pytest.mark.tpu
+@pytest.mark.timeout(120)
+def test_native_dpo_main_preserves_source_vocab_and_resumes_same_checkpoint(
+    tmp_path, dpo_llama_source, tiny_hf_tokenizer_path
+):
+    config = _native_dpo_configuration(tmp_path / "full", dpo_llama_source, tiny_hf_tokenizer_path)
+    tokenizer = load_marin_tokenizer(tiny_hf_tokenizer_path)
+    format = PreferenceChatLmDatasetFormat(chat_template="{{ messages }}", mask_user_turns=False)
+    processor = format.build_preprocessor(tokenizer)
+    cache_path = tmp_path / "preference-cache"
+    example_count = 2 * config.trainer.train_batch_size
+    with SerialCacheWriter(
+        str(cache_path), processor.output_exemplar, metadata=CacheMetadata(preprocessor_metadata=processor.metadata)
+    ) as writer:
+        writer.write_batch(
+            {
+                "chosen_input_ids": [((np.arange(8) + i) % 31).astype(np.int32) for i in range(example_count)],
+                "rejected_input_ids": [
+                    ((np.arange(8) * 3 + i + 2) % 31).astype(np.int32) for i in range(example_count)
+                ],
+                "chosen_assistant_masks": [np.ones(8, dtype=np.int32) for _ in range(example_count)],
+                "rejected_assistant_masks": [np.ones(8, dtype=np.int32) for _ in range(example_count)],
+            }
+        )
+    config = dataclasses.replace(
+        config,
+        data=PreferenceLmDataConfig(
+            tokenizer=tiny_hf_tokenizer_path,
+            shuffle=False,
+            mixture_block_size=config.trainer.train_batch_size,
+            components={"preference": DatasetComponent(cache_dir=str(cache_path), flat_cache=True, format=format)},
+        ),
+    )
+    train_dpo_main(config)
+    split = dataclasses.replace(config, trainer=_dpo_trainer_config(tmp_path / "split", steps=1))
+    train_dpo_main(split)
+    checkpoint = latest_checkpoint_path(tmp_path / "split/checkpoints/dpo")
+    continued = dataclasses.replace(
+        config,
+        initialize_from_hf=False,
+        trainer=dataclasses.replace(_dpo_trainer_config(tmp_path / "continued"), initialize_from=checkpoint),
+    )
+    train_dpo_main(continued)
+    with dataclasses.replace(config.trainer, use_explicit_mesh_axes=True).use_device_mesh():
+        source_model = _build_model(
+            config.model,
+            Axis("vocab", 32),
+            jrandom.PRNGKey(0),
+            Trainer(
+                dataclasses.replace(config.trainer, use_explicit_mesh_axes=True),
+                config.optimizer.build(2),
+                _separate_dpo_loss,
+                add_default_hooks=False,
+            ),
+        )
+        template = TrainerState.init(
+            config.optimizer.build(2),
+            DpoModel(policy=source_model, reference=source_model),
+            key=jrandom.PRNGKey(0),
+            is_trainable=DpoModel(policy=True, reference=False),
+            mp=config.trainer.mp,
+        )
+        template = template.saveable_state
+        full = load_checkpoint(
+            template,
+            latest_checkpoint_path(tmp_path / "full/checkpoints/dpo"),
+            mesh=dataclasses.replace(config.trainer, use_explicit_mesh_axes=True).device_mesh,
+        )
+        resumed = load_checkpoint(
+            template,
+            latest_checkpoint_path(tmp_path / "continued/checkpoints/dpo"),
+            mesh=dataclasses.replace(config.trainer, use_explicit_mesh_axes=True).device_mesh,
+        )
+    assert int(full.step) == int(resumed.step) == 2
+    assert full.model.policy.Vocab.size == resumed.model.policy.Vocab.size == 32
+    for value, expected in zip(
+        jax.tree.leaves(eqx.filter(resumed, eqx.is_array)),
+        jax.tree.leaves(eqx.filter(full, eqx.is_array)),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(value, expected)
+    metrics = json.loads((tmp_path / "continued/eval_results.json").read_text())
+    assert np.isfinite(metrics["train/loss"])

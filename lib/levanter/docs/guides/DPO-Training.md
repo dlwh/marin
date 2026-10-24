@@ -178,6 +178,22 @@ zero-based step names: completed update `N` writes `step-(N-1)`, so those update
 write `step-1`, `step-3`, and `step-5`.
 The final export is written once when the last update falls on the interval.
 
+### Native Llama full fine-tuning
+
+`model.type: llama_native` supports full-parameter DPO with `adapter.type: none`
+and `reference.type: separate`. The policy and frozen reference use the configured
+native storage and computation mappings on an Explicit mesh. HF initialization
+keeps the complete source vocabulary and FP32 source weights before the configured
+parameter cast; native checkpoint metadata validates the architecture and source vocabulary on restore. Keep the
+original model configuration and separate-reference source when resuming a DPO
+checkpoint; the frozen reference is reconstructed from that source.
+
+Set `use_hf_model_config: false` and configure `hidden_dim`, `intermediate_dim`,
+`num_layers`, `num_heads`, `num_kv_heads`, `activation_function`, `rope`, and other
+architecture settings to match the source checkpoint's `config.json`. Native DPO
+does not support adapters, Haliax quantization, or Hub upload. HF policy exports
+must use a local `hf_save_path`. The default remains Haliax Llama (`model.type: llama`).
+
 ### Reference Eval Cache
 
 Set `reference_eval_cache.mode: build_or_load` to precompute validation-set
