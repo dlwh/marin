@@ -22,6 +22,7 @@ from jaxtyping import Array, Float, Int, PRNGKeyArray
 
 from levanter.grug.attention import AttentionMask, GrugAttentionImplementation, attention, reference_attention
 from levanter.grug.loss import fused_linear_softmax_cross_entropy_loss
+from levanter.layers.dropout import DropoutLayout
 from levanter.layers.linear import INITIALIZER_TRUNCATION_BOUND, Linear, LinearProjection
 from levanter.layers.rms_norm import RmsNorm
 from levanter.layers.rotary_native import NativeRotaryConfig, RotaryConfig, apply_rotary
@@ -206,23 +207,54 @@ class NativeLlamaAttention(eqx.Module):
         x: Float[Array, "B S D"],
         mask: AttentionMask | Array,
         pos_ids: Int[Array, "B S"],
+        *,
+        key: PRNGKeyArray | None = None,
+        dropout_batch_size: int | None = None,
+        dropout_order: tuple[int, ...] = (0, 1, 2),
     ) -> Float[Array, "B S D"]:
-        q, k, v = self.project_qkv(x, pos_ids, sharding=self.sharding)
+        projection_key, output_key = jax.random.split(key) if key is not None else (None, None)
+        q, k, v = self.project_qkv(
+            x,
+            pos_ids,
+            sharding=self.sharding,
+            key=projection_key,
+            dropout_batch_size=dropout_batch_size,
+            dropout_order=dropout_order,
+        )
         if self.config.attention_implementation == "reference":
             output = reference_attention(q, k, v, mask, logits_dtype=None)
         else:
             output = attention(q, k, v, mask, implementation=self.config.attention_implementation)
-        return self.project_output(output, dtype=x.dtype, sharding=self.sharding)
+        return self.project_output(
+            output, dtype=x.dtype, sharding=self.sharding, key=output_key, dropout_batch_size=dropout_batch_size
+        )
 
     def project_qkv(
-        self, x: Float[Array, "B S D"], pos_ids: Int[Array, "B S"], *, sharding: NativeLlamaSharding
+        self,
+        x: Float[Array, "B S D"],
+        pos_ids: Int[Array, "B S"],
+        *,
+        sharding: NativeLlamaSharding,
+        key: PRNGKeyArray | None = None,
+        dropout_batch_size: int | None = None,
+        dropout_order: tuple[int, ...] = (0, 1, 2),
     ) -> tuple[Array, Array, Array]:
         """Project and rotate queries/keys using the caller's token layout."""
         batch, sequence = x.shape[:2]
         dim = self.config.actual_head_dim
-        q = self.q_proj(x, out_sharding=sharding.intermediate).reshape(batch, sequence, self.config.num_heads, dim)
-        k = self.k_proj(x, out_sharding=sharding.intermediate).reshape(batch, sequence, self.config.num_kv_heads, dim)
-        v = self.v_proj(x, out_sharding=sharding.intermediate).reshape(batch, sequence, self.config.num_kv_heads, dim)
+        q_key, k_key, v_key = jax.random.split(key, 3) if key is not None else (None, None, None)
+        dropout_layout = DropoutLayout(
+            (batch if dropout_batch_size is None else dropout_batch_size, sequence, x.shape[-1]), dropout_order
+        )
+        q = self.q_proj(x, out_sharding=sharding.intermediate, key=q_key, dropout_layout=dropout_layout).reshape(
+            batch, sequence, self.config.num_heads, dim
+        )
+        k = self.k_proj(x, out_sharding=sharding.intermediate, key=k_key, dropout_layout=dropout_layout).reshape(
+            batch, sequence, self.config.num_kv_heads, dim
+        )
+        v = self.v_proj(x, out_sharding=sharding.intermediate, key=v_key, dropout_layout=dropout_layout).reshape(
+            batch, sequence, self.config.num_kv_heads, dim
+        )
         q = reshard(q, sharding.query)
         k = reshard(k, sharding.query)
         v = reshard(v, sharding.query)
@@ -237,11 +269,22 @@ class NativeLlamaAttention(eqx.Module):
         return q, k, v
 
     def project_output(
-        self, output: Float[Array, "B S H D"], *, dtype: jnp.dtype, sharding: NativeLlamaSharding
+        self,
+        output: Float[Array, "B S H D"],
+        *,
+        dtype: jnp.dtype,
+        sharding: NativeLlamaSharding,
+        key: PRNGKeyArray | None = None,
+        dropout_batch_size: int | None = None,
+        dropout_order: tuple[int, ...] = (0, 2, 1, 3),
     ) -> Float[Array, "B S D"]:
         """Restore the residual layout after either dense or paged attention."""
+        # Dense named attention samples its adapter mask in (batch, head, position, dim) order.
+        dropout_layout = DropoutLayout(
+            (output.shape[0] if dropout_batch_size is None else dropout_batch_size, *output.shape[1:]), dropout_order
+        )
         output = output.astype(dtype).reshape(*output.shape[:2], self.config.num_heads * self.config.actual_head_dim)
-        return self.o_proj(output, out_sharding=sharding.residual)
+        return self.o_proj(output, out_sharding=sharding.residual, key=key, dropout_layout=dropout_layout)
 
 
 class NativeLlamaMlp(eqx.Module):
@@ -285,13 +328,30 @@ class NativeLlamaMlp(eqx.Module):
         )
 
     @jax.named_call
-    def __call__(self, x: Float[Array, "B S D"]) -> Float[Array, "B S D"]:
-        return self.forward(x, sharding=self.sharding)
+    def __call__(self, x: Float[Array, "B S D"], *, key: PRNGKeyArray | None = None) -> Float[Array, "B S D"]:
+        return self.forward(x, sharding=self.sharding, key=key)
 
-    def forward(self, x: Float[Array, "B S D"], *, sharding: NativeLlamaSharding) -> Float[Array, "B S D"]:
-        gate = self.act(self.gate_proj(x, out_sharding=sharding.intermediate))
-        hidden = gate * self.up_proj(x, out_sharding=sharding.intermediate)
-        return self.down_proj(hidden, out_sharding=sharding.residual)
+    def forward(
+        self,
+        x: Float[Array, "B S D"],
+        *,
+        sharding: NativeLlamaSharding,
+        key: PRNGKeyArray | None = None,
+        dropout_batch_size: int | None = None,
+        dropout_order: tuple[int, ...] = (0, 1, 2),
+    ) -> Float[Array, "B S D"]:
+        gate_key, up_key, down_key = jax.random.split(key, 3) if key is not None else (None, None, None)
+        input_layout = DropoutLayout(
+            (x.shape[0] if dropout_batch_size is None else dropout_batch_size, *x.shape[1:]), dropout_order
+        )
+        gate = self.act(
+            self.gate_proj(x, out_sharding=sharding.intermediate, key=gate_key, dropout_layout=input_layout)
+        )
+        hidden = gate * self.up_proj(x, out_sharding=sharding.intermediate, key=up_key, dropout_layout=input_layout)
+        hidden_layout = DropoutLayout(
+            (x.shape[0] if dropout_batch_size is None else dropout_batch_size, *hidden.shape[1:]), dropout_order
+        )
+        return self.down_proj(hidden, out_sharding=sharding.residual, key=down_key, dropout_layout=hidden_layout)
 
 
 class NativeLlamaBlock(eqx.Module):
@@ -318,17 +378,52 @@ class NativeLlamaBlock(eqx.Module):
 
     @jax.named_call
     def __call__(
-        self, x: Float[Array, "B S D"], mask: AttentionMask | Array, pos_ids: Int[Array, "B S"]
+        self,
+        x: Float[Array, "B S D"],
+        mask: AttentionMask | Array,
+        pos_ids: Int[Array, "B S"],
+        *,
+        key: PRNGKeyArray | None = None,
+        dropout_batch_size: int | None = None,
+        dropout_order: tuple[int, ...] = (0, 1, 2),
     ) -> Float[Array, "B S D"]:
-        attn = self.self_attn(self.input_layernorm(x), mask, pos_ids)
-        return self.finish_attention(x, attn, sharding=self.self_attn.sharding)
+        attention_key, mlp_key = jax.random.split(key) if key is not None else (None, None)
+        attn = self.self_attn(
+            self.input_layernorm(x),
+            mask,
+            pos_ids,
+            key=attention_key,
+            dropout_batch_size=dropout_batch_size,
+            dropout_order=dropout_order,
+        )
+        return self.finish_attention(
+            x,
+            attn,
+            sharding=self.self_attn.sharding,
+            key=mlp_key,
+            dropout_batch_size=dropout_batch_size,
+            dropout_order=dropout_order,
+        )
 
     def finish_attention(
-        self, x: Float[Array, "B S D"], attn: Float[Array, "B S D"], *, sharding: NativeLlamaSharding
+        self,
+        x: Float[Array, "B S D"],
+        attn: Float[Array, "B S D"],
+        *,
+        sharding: NativeLlamaSharding,
+        key: PRNGKeyArray | None = None,
+        dropout_batch_size: int | None = None,
+        dropout_order: tuple[int, ...] = (0, 1, 2),
     ) -> Float[Array, "B S D"]:
         """Apply the shared residual/MLP computation after attention."""
         x = x + (self.post_attn_layernorm(attn) if self.post_attn_layernorm is not None else attn)
-        mlp = self.mlp.forward(self.post_attention_layernorm(x), sharding=sharding)
+        mlp = self.mlp.forward(
+            self.post_attention_layernorm(x),
+            sharding=sharding,
+            key=key,
+            dropout_batch_size=dropout_batch_size,
+            dropout_order=dropout_order,
+        )
         return x + (self.post_mlp_layernorm(mlp) if self.post_mlp_layernorm is not None else mlp)
 
 
@@ -397,9 +492,10 @@ class NativeLlamaModel(eqx.Module):
         *,
         pos_ids: Int[Array, "B S"] | None = None,
         key: PRNGKeyArray | None = None,
+        dropout_batch_size: int | None = None,
+        dropout_order: tuple[int, ...] = (0, 1, 2),
     ) -> Float[Array, "B S D"]:
         """Return final normalized hidden states for a batch of token sequences."""
-        del key
         if tokens.shape[1] > self.config.max_seq_len:
             raise ValueError("Input sequence exceeds max_seq_len")
         tokens = reshard(tokens, self.sharding.tokens)
@@ -408,7 +504,20 @@ class NativeLlamaModel(eqx.Module):
         pos_ids = reshard(pos_ids, self.sharding.tokens)
         mask = AttentionMask.causal() if mask is None else mask
         hidden = self.embed_tokens(tokens, sharding=self.sharding)
-        hidden = self.layers.fold(hidden, mask, pos_ids)
+        layer_keys = (
+            None
+            if key is None
+            else key[None] if self.config.num_layers == 1 else jax.random.split(key, self.config.num_layers)
+        )
+        hidden = self.layers.fold(
+            hidden,
+            mask,
+            pos_ids,
+            key=layer_keys,
+            dropout_batch_size=dropout_batch_size,
+            dropout_order=dropout_order,
+            in_axes=(None, {"key": 0 if key is not None else None, "dropout_batch_size": None, "dropout_order": None}),
+        )
         return self.norm(hidden)
 
     def embed_tokens(self, tokens: Int[Array, "B S"], *, sharding: NativeLlamaSharding) -> Float[Array, "B S D"]:
@@ -428,7 +537,8 @@ class NativeLlamaModel(eqx.Module):
         pos_ids: Int[Array, "B S"] | None = None,
         key: PRNGKeyArray | None = None,
     ) -> Float[Array, "B S V"]:
-        hidden = self.activations(tokens, mask, pos_ids=pos_ids, key=key)
+        transformer_key = None if key is None else jax.random.split(key)[0]
+        hidden = self.activations(tokens, mask, pos_ids=pos_ids, key=transformer_key)
         return self.unembed(hidden, sharding=self.sharding)
 
     def unembed(self, hidden: Float[Array, "B S D"], *, sharding: NativeLlamaSharding) -> Float[Array, "B S V"]:

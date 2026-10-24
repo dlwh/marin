@@ -83,6 +83,7 @@ from levanter.compat.hf_checkpoints import (
 )
 from levanter.utils.cloud_utils import temp_dir_before_upload
 from levanter.utils.jax_utils import axis_resource_is_explicit, join_key, key_iterator, leaf_key_paths
+from levanter.layers.dropout import ArrayDropout, DropoutLayout
 from levanter.utils.logging import silence_transformer_nag
 
 
@@ -301,8 +302,10 @@ class ArrayLowRankLinear(ModuleWithStateDictSerialization):
     lora_A: ArrayLinear
     lora_B: ArrayLinear
     scale: float = eqx.field(static=True)
+    dropout: ArrayDropout
 
-    def __call__(self, x, *, out_sharding):
+    def __call__(self, x, *, out_sharding, key=None, dropout_layout: DropoutLayout | None = None):
+        x = self.dropout(x, key=key, layout=dropout_layout)
         # A's output rank is replicated; only the original leading input layout remains.
         intermediate_spec = PartitionSpec(*out_sharding[:-1], None)
         return self.lora_B(self.lora_A(x, out_sharding=intermediate_spec), out_sharding=out_sharding) * self.scale
@@ -328,18 +331,19 @@ class ArrayLowRankLinear(ModuleWithStateDictSerialization):
 
 
 class ArrayLoraLinear(ModuleWithStateDictSerialization):
-    """Zero-dropout LoRA for an array-native projection."""
+    """LoRA for an array-native projection with explicit forward randomness."""
 
     wrapped: ArrayLinear
     lora: ArrayLowRankLinear
 
-    def __call__(self, x, *, out_sharding):
-        return self.wrapped(x, out_sharding=out_sharding) + self.lora(x, out_sharding=out_sharding)
+    def __call__(self, x, *, out_sharding, key=None, dropout_layout: DropoutLayout | None = None):
+        base_key, adapter_key = jax.random.split(key) if key is not None else (None, None)
+        return self.wrapped(x, out_sharding=out_sharding, key=base_key) + self.lora(
+            x, out_sharding=out_sharding, key=adapter_key, dropout_layout=dropout_layout
+        )
 
     @staticmethod
     def init(wrapped: ArrayLinear, config: LoraConfig, *, key):
-        if config.dropout != 0:
-            raise ValueError("Array-native LoRA requires dropout=0; native projections do not receive RNG keys")
         storage = jax.typeof(wrapped.weight).sharding.spec
         compute = wrapped.compute_spec
         out_features, in_features = wrapped.weight.shape
@@ -366,7 +370,9 @@ class ArrayLoraLinear(ModuleWithStateDictSerialization):
             a = dataclasses.replace(a, weight=jnp.zeros_like(a.weight))
         if config.zero_init_b:
             b = dataclasses.replace(b, weight=jnp.zeros_like(b.weight))
-        return ArrayLoraLinear(wrapped, ArrayLowRankLinear(a, b, config.alpha / config.r))
+        return ArrayLoraLinear(
+            wrapped, ArrayLowRankLinear(a, b, config.alpha / config.r, ArrayDropout(config.dropout))
+        )
 
     def merge(self):
         delta = reshard(self.lora.merge(), jax.typeof(self.wrapped.weight).sharding.spec)

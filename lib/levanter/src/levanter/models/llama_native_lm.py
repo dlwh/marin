@@ -472,6 +472,10 @@ class NativeLlamaLmHeadModel(ModuleWithStateDictSerialization, LmHeadModel[Nativ
         # Named masks use truth values; raw attention also accepts additive biases.
         return dense.astype(jnp.bool_).broadcast_to((*batch_axes, Pos, KeyPos)).array
 
+    def __call__(self, input_ids, attn_mask=None, *, key=None, pos_ids=None):
+        transformer_key, _ = maybe_rng_split(key, 2)
+        return super().__call__(input_ids, attn_mask, key=transformer_key, pos_ids=pos_ids)
+
     def activations(
         self,
         input_ids: NamedArray,
@@ -497,12 +501,21 @@ class NativeLlamaLmHeadModel(ModuleWithStateDictSerialization, LmHeadModel[Nativ
             if unbatched:
                 positions = jnp.broadcast_to(positions, tokens.shape)
         mask = self._attention_mask(attn_mask, ordered.axes)
-        hidden = self.native.activations(tokens, mask, pos_ids=positions, key=key)
+        hidden = self.native.activations(
+            tokens,
+            mask,
+            pos_ids=positions,
+            key=key,
+            dropout_batch_size=1 if unbatched else None,
+            dropout_order=(0, 1, 2) if ordered.axes == input_ids.axes else (1, 0, 2),
+        )
         if unbatched:
-            hidden = hidden.at[0].get(out_sharding=P(None, None))
+            # Gather before removing the data-sharded dimension so its transpose
+            # restores the original cotangent layout, including unit mesh axes.
+            hidden = reshard(hidden, P(None, None, None))[0]
         else:
             hidden = reshard(hidden, P(self._batch_partition, None, None))
-        return hax.named(hidden, (*ordered.axes, self.Embed))
+        return hax.named(hidden, (*ordered.axes, self.Embed)).rearrange((*input_ids.axes, self.Embed))
 
     def get_lm_head(self) -> NamedArray:
         # The shared CE kernel partitions examples and requires a complete head
@@ -544,7 +557,6 @@ class NativeLlamaLmHeadModel(ModuleWithStateDictSerialization, LmHeadModel[Nativ
         Positions are absolute within each sequence. Only the valid prefix in
         ``batch_info`` updates cache; trailing padded logits are not sampled.
         """
-        del key
         if input_ids.ndim != 1 or input_ids.axes[0].name != self.Pos.name or pos_ids.axes != input_ids.axes:
             raise ValueError("Paged native Llama expects matching flat position token/position arrays")
         if len(kv_cache) != self.native.config.num_layers:
@@ -556,9 +568,14 @@ class NativeLlamaLmHeadModel(ModuleWithStateDictSerialization, LmHeadModel[Nativ
         config = self.native.config
         count = input_ids.axes[0].size
         caches = []
+        layer_keys = maybe_rng_split(key, config.num_layers)
         for index in range(config.num_layers):
             layer = self.native.layers.get_layer(index)
-            q, k, v = layer.self_attn.project_qkv(layer.input_layernorm(hidden), positions, sharding=layout)
+            attention_key, mlp_key = maybe_rng_split(layer_keys[index], 2)
+            projection_key, output_key = maybe_rng_split(attention_key, 2)
+            q, k, v = layer.self_attn.project_qkv(
+                layer.input_layernorm(hidden), positions, sharding=layout, key=projection_key
+            )
             q = q.reshape(count, config.num_kv_heads, config.num_heads // config.num_kv_heads, config.actual_head_dim)
             k = k.reshape(count, config.num_kv_heads, config.actual_head_dim)
             v = v.reshape(count, config.num_kv_heads, config.actual_head_dim)
@@ -572,8 +589,11 @@ class NativeLlamaLmHeadModel(ModuleWithStateDictSerialization, LmHeadModel[Nativ
                 sm_scale=1 / math.sqrt(config.actual_head_dim),
             )
             output = output.reshape(1, count, config.num_heads, config.actual_head_dim)
-            attn = layer.self_attn.project_output(output, dtype=hidden.dtype, sharding=layout)
-            hidden = layer.finish_attention(hidden, attn, sharding=layout)
+            # Paged named attention returns position before heads, unlike dense attention.
+            attn = layer.self_attn.project_output(
+                output, dtype=hidden.dtype, sharding=layout, key=output_key, dropout_order=(0, 1, 2, 3)
+            )
+            hidden = layer.finish_attention(hidden, attn, sharding=layout, key=mlp_key)
             caches.append(cache)
         logits = self.native.unembed(self.native.norm(hidden), sharding=layout)
         logits = logits.reshape(count, self.Vocab.size)
@@ -603,7 +623,7 @@ class NativeLlamaLmHeadModel(ModuleWithStateDictSerialization, LmHeadModel[Nativ
         # explicit-sharding concatenate reject a single-example microbatch.
         example = dataclasses.replace(
             example,
-            tokens=hax.named(reshard(tokens.array, token_spec), tokens.axes),
+            tokens=hax.named(reshard(tokens.array, token_spec), tokens.axes).rearrange(example.tokens.axes),
             loss_weight=hax.named(reshard(weights.array, token_spec), weights.axes),
         )
         # The loss's shard_map must agree with explicit array types, independently

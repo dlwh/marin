@@ -200,7 +200,7 @@ checkpoint against the inferred architecture. A Boolean `initialize_from_hf: tru
 uses the original `model.reference_checkpoint`; a string selects that source
 explicitly. Keep the policy base and separate-reference sources unchanged.
 
-Zero-dropout LoRA uses `adapter.type: lora` with either `reference.type: separate`
+LoRA, including training dropout, uses `adapter.type: lora` with either `reference.type: separate`
 or `reference.type: adapter_base`. The latter uses the frozen policy base as the
 reference and requires exactly one zero factor at initialization. Adapter
 checkpoints omit the frozen base, so resume requires the unchanged base source,

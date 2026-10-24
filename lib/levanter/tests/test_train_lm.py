@@ -63,6 +63,7 @@ from levanter.trainer_state import TrainerState, trainables_only
 from levanter.testing.helpers import arrays_only, use_test_mesh
 from levanter.testing.hf_checkpoints import write_llama_checkpoint
 from levanter.utils.mesh import MeshConfig
+from levanter.utils.tree_utils import inference_mode
 
 
 def _array_leaves(tree):
@@ -1156,9 +1157,10 @@ def test_train_lm_rejects_weights_only_init_with_trainer_initialize_from():
 
 @pytest.mark.tpu
 @pytest.mark.timeout(180)
+@pytest.mark.parametrize("dropout", [0.0, 0.25])
 @pytest.mark.parametrize("hf_config_source", ["explicit", "inferred_string", "inferred_bool"])
 def test_native_train_lm_lora_hf_update_resume_and_local_exports(
-    tmp_path, native_hf_source, tiny_hf_tokenizer_path, hf_config_source
+    tmp_path, native_hf_source, tiny_hf_tokenizer_path, hf_config_source, dropout
 ):
     source_checkpoint = native_hf_source
     inferred = hf_config_source != "explicit"
@@ -1214,7 +1216,7 @@ def test_native_train_lm_lora_hf_update_resume_and_local_exports(
     model_size = 2 if jax.device_count() >= 4 else 1
     data_size = jax.device_count() // model_size
     optimizer = AdamConfig(learning_rate=1e-3, warmup=0, lr_schedule=ConstantLrSchedule(), weight_decay=0.0)
-    adapter = LoraAdaptorConfig(r=3, alpha=6)
+    adapter = LoraAdaptorConfig(r=3, alpha=6, dropout=dropout, a_init_mode="random")
 
     def configuration(name, steps, resume=False):
         directory = tmp_path / name
@@ -1331,8 +1333,11 @@ def test_native_train_lm_lora_hf_update_resume_and_local_exports(
                 factors = moments.native.layers.stacked.self_attn.q_proj.lora
                 assert np.any(factors.lora_A.weight != 0)
                 assert np.any(factors.lora_B.weight != 0)
-        trained = train_lm._restore_lm_model_from_partial_checkpoint(
-            full.model, skeleton, adapter.trainable_filter(skeleton)
+        trained = inference_mode(
+            train_lm._restore_lm_model_from_partial_checkpoint(
+                full.model, skeleton, adapter.trainable_filter(skeleton)
+            ),
+            True,
         )
         for name, actual in unwrap_lora_modules(trained).to_state_dict().items():
             np.testing.assert_array_equal(actual, source_checkpoint.weights[name])
@@ -1340,8 +1345,11 @@ def test_native_train_lm_lora_hf_update_resume_and_local_exports(
         assert trained.native.layers.stacked.self_attn.q_proj.lora.lora_A.weight.sharding.spec == P(None, None, "data")
         wrong_base = model_config.build(Axis("vocab", 32), key=jrandom.PRNGKey(999), sharding=sharding)
         wrong_skeleton = adapter.apply(wrong_base, key=jrandom.PRNGKey(0))
-        wrong = train_lm._restore_lm_model_from_partial_checkpoint(
-            full.model, wrong_skeleton, adapter.trainable_filter(wrong_skeleton)
+        wrong = inference_mode(
+            train_lm._restore_lm_model_from_partial_checkpoint(
+                full.model, wrong_skeleton, adapter.trainable_filter(wrong_skeleton)
+            ),
+            True,
         )
         tokens = hax.named(
             jnp.arange(8 * data_size).reshape(2 * data_size, 4) % 31,

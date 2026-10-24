@@ -76,8 +76,8 @@ supported. Training can use `train_seq_len` shorter than `model.max_seq_len`.
 Reference attention also preserves dense masks, causal offsets and bidirectional
 windows; Splash rejects those mask forms explicitly.
 
-Resume a native run with the ordinary Trainer checkpoint settings. Native
-checkpoints include parameters, optimizer state, training step and RNG state.
+Resume a native run with the ordinary Trainer checkpoint settings. Full-parameter native
+checkpoints include model parameters, optimizer state, training step and RNG state.
 The named Llama and native Llama have different checkpoint trees; loading a named
 Trainer checkpoint directly into a native run is unsupported.
 Non-default activations are part of the checkpoint architecture identity and
@@ -111,14 +111,14 @@ embedding/output rows beyond the tokenizer's length. Those rows are preserved
 and participate in the output softmax. The source vocabulary must be at least as
 large as the tokenizer and divisible by the tensor-parallel mesh size; the loader
 does not resize it. New native Trainer checkpoints record the complete vocabulary
-and semantic architecture with the checkpoint completion marker. Resume uses the
-selected checkpoint's metadata and full training state without accessing the
-original HF directory, even if `initialize_from_hf` still names that directory,
-when `use_hf_model_config` is false. The opt-in inferred-config mode reads the
-original HF `config.json` on resume, then validates the checkpoint against that
-effective architecture. Keep this metadata available and unchanged. LoRA resumes
-also require the original base weights, as described in
-[adapter training](Training-On-Your-Data.md#lora-adapters).
+and semantic architecture with the checkpoint completion marker. Full-parameter
+resume uses the selected checkpoint's metadata and saved training state without
+accessing the original HF directory when `use_hf_model_config` is false, even if
+`initialize_from_hf` still names that directory. The opt-in inferred-config mode
+reads the original HF `config.json` on resume, then validates the checkpoint
+against that effective architecture. Keep this metadata available and unchanged.
+LoRA resume also requires the original frozen base weights and unchanged model
+and adapter configuration; see [adapter training](Training-On-Your-Data.md#lora-adapters).
 The configured tokenizer, training inputs and matching model configuration are
 still required.
 The configured attention geometry, normalization and RoPE must match; context
@@ -152,7 +152,7 @@ contain optimizer or RNG state.
 Local export requires standard weighted RMSNorm and bias-free projections. Hub
 upload, remote export destinations and Haliax quantization remain
 unsupported by this training entrypoint and are rejected before initialization.
-Zero-dropout LoRA is available through `adapter.type: lora`; see
+LoRA, including adapter dropout, is available through `adapter.type: lora`; see
 [adapter training](Training-On-Your-Data.md#lora-adapters).
 Existing `model.type: llama` configurations retain their behavior.
 

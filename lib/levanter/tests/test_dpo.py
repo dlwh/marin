@@ -1184,6 +1184,7 @@ def dpo_preference_data(tmp_path, tiny_hf_tokenizer_path):
 
 @pytest.mark.tpu
 @pytest.mark.timeout(180)
+@pytest.mark.parametrize("dropout", [0.0, 0.25])
 @pytest.mark.parametrize("reference_type", ["separate", "adapter_base"])
 @pytest.mark.parametrize("hf_config_source", ["explicit", "inferred_string", "inferred_bool"])
 def test_native_lora_dpo_main_updates_only_factors_and_resumes_exact_state(
@@ -1194,6 +1195,7 @@ def test_native_lora_dpo_main_updates_only_factors_and_resumes_exact_state(
     dpo_preference_data,
     reference_type,
     hf_config_source,
+    dropout,
 ):
     inferred = hf_config_source != "explicit"
     if inferred:
@@ -1251,7 +1253,7 @@ def test_native_lora_dpo_main_updates_only_factors_and_resumes_exact_state(
         config,
         data=dpo_preference_data,
         train_seq_len=8,
-        adapter=LoraAdaptorConfig(r=3, alpha=6, dropout=0),
+        adapter=LoraAdaptorConfig(r=3, alpha=6, dropout=dropout),
         reference=(
             SeparateReferenceConfig(model_path=str(dpo_separate_reference_source.path))
             if reference_type == "separate"
@@ -1344,7 +1346,7 @@ def test_native_lora_dpo_main_updates_only_factors_and_resumes_exact_state(
         )
         _, _, _, adapter_key, _ = _derive_training_keys(config.trainer.seed)
         initial_factors = lora_state_dict(config.adapter.apply(base, key=adapter_key))
-        factors = lora_state_dict(policy)
+        factors = lora_state_dict(inference_mode(policy, True))
         for factor in ("lora_A", "lora_B"):
             assert any(
                 not np.array_equal(value, initial_factors[name])
@@ -1373,8 +1375,88 @@ def test_native_lora_dpo_main_updates_only_factors_and_resumes_exact_state(
         axes = Axis("batch", 2 * data_size), Axis("position", 4)
         tokens = hax.named(jnp.arange(8 * data_size).reshape(axes[0].size, axes[1].size) % 31, axes)
         np.testing.assert_allclose(
-            policy(tokens, AttentionMask.causal()).array,
+            inference_mode(policy, True)(tokens, AttentionMask.causal()).array,
             reloaded(tokens, AttentionMask.causal()).array,
             atol=1e-5,
             rtol=1e-5,
         )
+        # Probe the trained, nonzero factors with independent named DPO math.
+        # The canonical loss splits a training key into distinct preference keys.
+        policy = inference_mode(policy, False)
+        reference = inference_mode(reference, True)
+        chosen_key, rejected_key = jrandom.split(jrandom.PRNGKey(31))
+        batch = DpoExample(
+            chosen=hax.vmap(LmExample.causal, axes[0])(tokens),
+            rejected=hax.vmap(LmExample.causal, axes[0])((tokens * 3 + 2) % 31),
+        )
+        actual_loss, actual_grad = eqx.filter_jit(
+            eqx.filter_value_and_grad(
+                lambda model: dpo_loss(
+                    model,
+                    reference,
+                    batch,
+                    beta=config.beta,
+                    key_chosen=chosen_key,
+                    key_rejected=rejected_key,
+                )[0]
+            )
+        )(policy)
+        actual_loss = np.asarray(actual_loss)
+        actual_grad_factors = lora_state_dict(actual_grad)
+        actual_logps = tuple(
+            np.asarray(logp_sum(policy, example, key=key).array)
+            for example, key in ((batch.chosen, chosen_key), (batch.rejected, rejected_key))
+        )
+        if dropout:
+            for example, key in ((batch.chosen, chosen_key), (batch.rejected, rejected_key)):
+                assert not np.allclose(
+                    logp_sum(policy, example, key=key).array,
+                    logp_sum(policy, example, key=jrandom.PRNGKey(32)).array,
+                    atol=1e-5,
+                    rtol=1e-5,
+                )
+        reference_weights = {name: np.asarray(value) for name, value in reference.to_state_dict().items()}
+
+    with use_test_mesh(), hax.axis_mapping({}):
+        chosen_key, rejected_key = jrandom.split(jrandom.PRNGKey(31))
+        named_config = dataclasses.replace(dpo_llama_source.config, attn_backend=AttentionBackend.VANILLA)
+        named_base = named_config.build(Axis("vocab", 32), key=jrandom.PRNGKey(13))
+        named_policy = config.adapter.apply(named_base, key=jrandom.PRNGKey(19))
+        named_policy = from_torch_compatible_state_dict(
+            named_policy,
+            {
+                **{name: jnp.asarray(value) for name, value in dpo_llama_source.weights.items()},
+                **{name.removeprefix("base_model.model."): jnp.asarray(value) for name, value in factors.items()},
+            },
+        )
+        named_reference = from_torch_compatible_state_dict(
+            named_base, {name: jnp.asarray(value) for name, value in reference_weights.items()}
+        )
+        named_tokens = hax.named(jnp.arange(8 * data_size).reshape(axes[0].size, axes[1].size) % 31, axes)
+        named_batch = DpoExample(
+            chosen=hax.vmap(LmExample.causal, axes[0])(named_tokens),
+            rejected=hax.vmap(LmExample.causal, axes[0])((named_tokens * 3 + 2) % 31),
+        )
+        expected_loss, expected_grad = eqx.filter_jit(
+            eqx.filter_value_and_grad(
+                lambda model: dpo_loss(
+                    model,
+                    named_reference,
+                    named_batch,
+                    beta=config.beta,
+                    key_chosen=chosen_key,
+                    key_rejected=rejected_key,
+                )[0]
+            )
+        )(named_policy)
+        np.testing.assert_allclose(actual_loss, expected_loss, atol=1e-5, rtol=1e-4)
+        for (example, key), actual in zip(
+            ((named_batch.chosen, chosen_key), (named_batch.rejected, rejected_key)), actual_logps, strict=True
+        ):
+            np.testing.assert_allclose(actual, logp_sum(named_policy, example, key=key).array, atol=1e-5, rtol=1e-4)
+        expected_grad_factors = lora_state_dict(expected_grad)
+        assert any(np.any(value != 0) for value in expected_grad_factors.values())
+        for name, actual in actual_grad_factors.items():
+            np.testing.assert_allclose(
+                actual, expected_grad_factors[name].reshape(actual.shape), atol=1e-5, rtol=1e-4, err_msg=name
+            )

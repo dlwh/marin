@@ -292,8 +292,9 @@ use_hf_model_config: true
 ### LoRA adapters
 
 The canonical `train_lm` and `train_dpo` entrypoints accept `adapter.type: lora` with
-`model.type: llama_native`. Native adapters require `dropout: 0`; projections do
-not receive the RNG keys needed for adapter dropout. The default targets are the
+`model.type: llama_native`. Native adapters support dropout during training;
+evaluation and generation disable it through inference mode. Active training
+dropout requires an explicit RNG key. The default targets are the
 seven decoder projections (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`,
 `up_proj`, `down_proj`), excluding the output head. Native output-head adaptation
 remains unsupported.
