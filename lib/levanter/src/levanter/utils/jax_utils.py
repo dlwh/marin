@@ -475,8 +475,8 @@ def _zeros_like(mapping, dtype, n):
 def broadcast_shard(x: T, out_axis_specs: Any, source: int = 0) -> T:
     """Broadcast an array pytree from one source process into requested shardings.
 
-    Other processes supply the same shapes and tree structure. Copies are staged
-    along a device-sharded source dimension before selecting the source process.
+    Every process must provide matching shapes, dtypes and pytree metadata.
+    Values are taken from the source process.
     All-Auto and all-Explicit meshes are supported; mixed mesh modes are not.
 
     Args:
