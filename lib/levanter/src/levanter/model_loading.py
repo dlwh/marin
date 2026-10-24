@@ -26,6 +26,7 @@ import jax
 import jax.numpy as jnp
 from haliax import Axis
 from haliax.partitioning import ResourceMapping
+from jax.sharding import Mesh
 from rigging.filesystem.storage_path import StoragePath, prefix_join
 
 from levanter.checkpoint import (
@@ -44,6 +45,23 @@ from levanter.utils.jax_utils import use_cpu_device
 _HF_CACHE_PREFIX = "hf-models"
 # Days a mirrored HuggingFace snapshot is kept before the bucket lifecycle deletes it.
 _DEFAULT_HF_CACHE_TTL_DAYS = 30
+
+
+def native_evaluation_axis_mapping(
+    model_config: NativeLlamaLmConfig,
+    parameter_axis_mapping: ResourceMapping,
+    compute_axis_mapping: ResourceMapping,
+    mesh: Mesh,
+    batch_axis_name: str,
+) -> ResourceMapping:
+    """Validate native placement and normalize batch axes for named evaluation."""
+    sharding = native_llama_sharding(parameter_axis_mapping, compute_axis_mapping, batch_axis_name)
+    model_config.validate_sharding(sharding, mesh)
+    # Named loss slices and rolls need canonical replicated placement on unit axes.
+    return {
+        **compute_axis_mapping,
+        batch_axis_name: tuple(axis for axis in sharding.batch_axes if mesh.shape[axis] > 1),
+    }
 
 
 def load_levanter_checkpoint(

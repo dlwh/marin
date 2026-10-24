@@ -17,9 +17,9 @@ import levanter
 import levanter.config
 from levanter.data.loader import DataLoader
 from levanter.data.text.datasets import LmDataConfig
-from levanter.model_loading import load_hf_checkpoint, load_levanter_checkpoint
+from levanter.model_loading import load_hf_checkpoint, load_levanter_checkpoint, native_evaluation_axis_mapping
 from levanter.models.llama import LlamaConfig
-from levanter.models.llama_native_lm import NativeLlamaLmConfig, native_llama_sharding
+from levanter.models.llama_native_lm import NativeLlamaLmConfig
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel, split_activations
 from levanter.models.loss import next_token_loss
 from levanter.trainer import TrainerConfig
@@ -65,13 +65,12 @@ def main(config: VizLmConfig):
     compute_axis_mapping = config.trainer.compute_axis_mapping
     parameter_axis_mapping = config.trainer.parameter_axis_mapping
     if isinstance(config.model, NativeLlamaLmConfig):
-        sharding = native_llama_sharding(parameter_axis_mapping, compute_axis_mapping, config.trainer.batch_axis_name)
-        mesh = config.trainer.device_mesh
-        config.model.validate_sharding(sharding, mesh)
-        # Empty/full slices in the shared named loss need canonical replicated batch axes.
-        compute_axis_mapping = dict(compute_axis_mapping)
-        compute_axis_mapping[config.trainer.EvalBatch.name] = tuple(
-            axis for axis in sharding.batch_axes if mesh.shape[axis] > 1
+        compute_axis_mapping = native_evaluation_axis_mapping(
+            config.model,
+            parameter_axis_mapping,
+            compute_axis_mapping,
+            config.trainer.device_mesh,
+            config.trainer.batch_axis_name,
         )
 
     with config.trainer.use_device_mesh():

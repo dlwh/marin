@@ -35,6 +35,7 @@ from levanter.data.mixture import MixtureDataset
 from levanter.data.text.datasets import LmDataConfig
 from levanter.data.text.examples import GrugLmExample, named_lm_example_from_grug
 from levanter.eval_harness import LmEvalHarnessConfig
+from levanter.model_loading import native_evaluation_axis_mapping
 from levanter.models.llama import LlamaConfig
 from levanter.models.llama_native import NativeLlamaSharding
 from levanter.models.llama_native_lm import NativeLlamaLmConfig, NativeLlamaLmHeadModel, native_llama_sharding
@@ -323,12 +324,12 @@ def main(config: TrainLmConfig):
         compute_axis_mapping = trainer.compute_axis_mapping
         parameter_axis_mapping = trainer.parameter_axis_mapping
         if native:
-            # Named evaluation also rolls token IDs outside the model's loss
-            # boundary. Keep its loader/JIT batch placement canonical on unit axes.
-            compute_axis_mapping = dict(compute_axis_mapping)
-            batch_axes = _native_llama_sharding(config.trainer).batch_axes
-            compute_axis_mapping[config.trainer.EvalBatch.name] = tuple(
-                axis for axis in batch_axes if trainer.device_mesh.shape[axis] > 1
+            compute_axis_mapping = native_evaluation_axis_mapping(
+                config.model,
+                parameter_axis_mapping,
+                compute_axis_mapping,
+                trainer.device_mesh,
+                config.trainer.batch_axis_name,
             )
 
         # some axes we need
