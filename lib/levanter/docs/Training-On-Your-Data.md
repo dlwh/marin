@@ -289,6 +289,49 @@ initialize_from_hf: "NousResearch/Llama-2-7b-hf"
 use_hf_model_config: true
 ```
 
+### LoRA adapters
+
+The canonical `train_lm` entrypoint accepts `adapter.type: lora` with
+`model.type: llama_native`. Native adapters require `dropout: 0`; projections do
+not receive the RNG keys needed for adapter dropout. The default targets are the
+seven decoder projections (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`,
+`up_proj`, `down_proj`), excluding the output head. Native output-head adaptation
+and native LoRA-DPO remain unsupported.
+
+```yaml
+initialize_from_hf: ./base-weights
+adapter:
+  type: lora
+  r: 8
+  alpha: 8
+  dropout: 0
+peft_save_path: ./adapter-exports
+merged_hf_save_path: ./merged-exports
+hf_save_steps: 1000
+```
+
+The existing initialization convention is A zero and B random; set
+`a_init_mode: random` and `zero_init_b: true` for the alternative zero-delta
+initialization. Rank stays replicated while input/output factor dimensions follow
+the base projection's FSDP and tensor-parallel layouts.
+
+Adapter checkpoints store trainable factors and optimizer/RNG/step state. Resume
+with the original base source, model and adapter configuration: frozen base
+weights are reconstructed before restoring the adapter. These checkpoints do not
+validate adapter alpha, target selection or base-source identity. A different base
+or adapter configuration can change the resumed model despite compatible shapes.
+
+Use `peft_save_path` for canonical PEFT factor files, and
+`merged_hf_save_path` for ordinary HF Llama weights with the delta merged once.
+Both paths must be local for native training; Hub uploads remain unsupported.
+`hf_save_path` is for full-parameter training. PEFT exports initialized from HF
+record the actual initialization source. For portable PEFT factors, initialize
+from a local HF base as above and retain that original directory. For randomly
+initialized or native-only bases, use the merged export for standalone HF weights;
+factors alone cannot reconstruct their unmerged base. CPU tests cover training,
+continuation and local exports;
+this does not establish accelerator performance or adapter memory savings.
+
 ### Checkpointing
 
 See also the [Checkpointing section of the Configuration Guide](./reference/Configuration.md#checkpointing-and-initialization).
