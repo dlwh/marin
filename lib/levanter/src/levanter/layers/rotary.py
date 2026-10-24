@@ -189,7 +189,6 @@ class YarnRotaryEmbeddings(RotaryEmbeddings):
 
     def __call__(self, q: NamedArray, position_ids: NamedArray) -> NamedArray:
         with jax.ensure_compile_time_eval():
-            half_dim = self.HeadDim.size // 2
             head_dim = self.HeadDim.size
             HeadHalfSize = self.HeadDim.resize(self.HeadDim.size // 2)
             inv_freq: NamedArray = 1.0 / (
@@ -205,7 +204,7 @@ class YarnRotaryEmbeddings(RotaryEmbeddings):
 
             low = int(math.floor(_find_dim(self.config.beta_fast)))
             high = int(math.ceil(_find_dim(self.config.beta_slow)))
-            low, high = max(low, 0), min(high, half_dim - 1)
+            low, high = max(low, 0), min(high, head_dim - 1)
             ramp = hax.clip((hax.arange(HeadHalfSize, dtype=jnp.float32) - low) / max(high - low, 1), 0.0, 1.0)
             inv_extrap = inv_freq
             inv_interp = inv_freq / self.config.factor

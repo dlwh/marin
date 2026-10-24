@@ -68,7 +68,7 @@ this entrypoint.
 
 The default native attention implementation is the portable reference kernel;
 `attn_backend: splash` selects native TPU Splash attention. SwiGLU, scanned layers,
-default/linear RoPE, causal masks, document segments and sliding windows are
+default/linear, Llama3 and YaRN RoPE, causal masks, document segments and sliding windows are
 supported. Training can use `train_seq_len` shorter than `model.max_seq_len`.
 Reference attention also preserves dense masks, causal offsets and bidirectional
 windows; Splash rejects those mask forms explicitly.
@@ -83,11 +83,13 @@ To initialize from a local Hugging Face Llama checkpoint, set
 `config.json` and safetensors weights (a single file or a sharded index). Configure
 the matching native architecture explicitly. Layer count, hidden/MLP sizes,
 query/KV heads, head dimension, tied embeddings, activation, RMSNorm epsilon and
-RoPE type, base/theta and linear scaling factor must match; the maximum context
+RoPE type, base/theta, frequency scaling and attention scaling must match; the maximum context
 length may differ. This path supports standard weighted RMSNorm, bias-free
 projections and no attention
-dropout. Automatic HF model-config replacement and tokenizer padding remain
-unsupported.
+dropout. YaRN initialization requires the integer correction ramp and the same
+effective attention multiplier as the configured model; HF metadata whose
+implicit scaling changes that multiplier is rejected. Automatic HF model-config
+replacement and tokenizer padding remain unsupported.
 
 The checkpoint determines the complete model vocabulary, including any padded
 embedding/output rows beyond the tokenizer's length. Those rows are preserved
@@ -120,7 +122,7 @@ require an explicit matching model configuration and vocabulary.
 
 Set `hf_save_path` to a local directory and `hf_save_steps` to export updated
 weights through the existing training hooks. Exports contain canonical
-safetensors, the actual model vocabulary, explicit head dimension, default/linear
+safetensors, the actual model vocabulary, explicit head dimension, matching
 RoPE metadata, and the tokenizer. Both tied and untied output heads are supported.
 The default export preserves parameter precision; `hf_save_dtype: bfloat16`
 explicitly rounds floating-point weights for the saved artifact. Exported weights

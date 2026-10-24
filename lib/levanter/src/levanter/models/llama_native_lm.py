@@ -25,7 +25,19 @@ from levanter.compat.hf_config import hf_rope_config
 from levanter.data.text.examples import grug_attention_mask_from_named
 from levanter.grug.attention import AttentionMask as RawAttentionMask
 from levanter.layers.attention import AttentionBackend, AttentionMask
-from levanter.layers.rotary import DefaultRotaryEmbeddingsConfig, RotaryEmbeddingsConfig
+from levanter.layers.rotary import (
+    DefaultRotaryEmbeddingsConfig,
+    Llama3RotaryEmbeddingsConfig,
+    RotaryEmbeddingsConfig,
+    YarnRotaryEmbeddingsConfig,
+)
+from levanter.layers.rotary_native import (
+    Llama3RotaryConfig,
+    NativeRotaryConfig,
+    RotaryConfig,
+    YarnRotaryConfig,
+    yarn_attention_factor,
+)
 from levanter.layers.scan_checkpoint import ScanCheckpointPolicy as NativeScanCheckpointPolicy
 from levanter.models.llama import LlamaConfig
 from levanter.models.llama_native import NativeLlamaConfig, NativeLlamaModel, NativeLlamaSharding
@@ -35,7 +47,7 @@ from levanter.utils.activation import ActivationFunctionEnum
 
 
 def _checkpoint_architecture(config: NativeLlamaConfig) -> dict[str, Any]:
-    return {
+    architecture: dict[str, Any] = {
         "hidden_dim": config.hidden_dim,
         "intermediate_dim": config.intermediate_dim,
         "num_layers": config.num_layers,
@@ -50,9 +62,27 @@ def _checkpoint_architecture(config: NativeLlamaConfig) -> dict[str, Any]:
         "hybrid_norm": config.hybrid_norm,
         "use_qk_norm": config.use_qk_norm,
         "upcast_attn": config.upcast_attn,
-        "rope_theta": float(config.rope_theta),
-        "rope_factor": float(config.rope_factor),
+        "rope_theta": float(config.rope.theta),
+        "rope_factor": float(config.rope.factor),
     }
+    # Default/linear metadata is already a checkpoint wire contract. Scaled
+    # variants add their semantic fields without changing that existing shape.
+    if not isinstance(config.rope, RotaryConfig):
+        architecture["rope_type"] = "llama3" if isinstance(config.rope, Llama3RotaryConfig) else "yarn"
+        architecture.update(
+            {name: value for name, value in dataclasses.asdict(config.rope).items() if name not in {"theta", "factor"}}
+        )
+    return architecture
+
+
+def _native_rotary_config(config: RotaryEmbeddingsConfig) -> NativeRotaryConfig:
+    if isinstance(config, DefaultRotaryEmbeddingsConfig):
+        return RotaryConfig(theta=config.theta, factor=config.factor)
+    if isinstance(config, Llama3RotaryEmbeddingsConfig):
+        return Llama3RotaryConfig(**dataclasses.asdict(config))
+    if isinstance(config, YarnRotaryEmbeddingsConfig):
+        return YarnRotaryConfig(**dataclasses.asdict(config))
+    raise ValueError(f"Unsupported native Llama RoPE configuration: {type(config).__name__}")
 
 
 @LmConfig.register_subclass("llama_native")
@@ -70,8 +100,6 @@ class NativeLlamaLmConfig(LlamaConfig):
             raise ValueError("llama_native supports only the silu activation")
         if not self.scan_layers:
             raise ValueError("llama_native requires scan_layers: true")
-        if not isinstance(self.rope, DefaultRotaryEmbeddingsConfig):
-            raise ValueError("llama_native supports only default or linear RoPE")
         if self.attn_backend not in (
             None,
             AttentionBackend.DEFAULT,
@@ -96,7 +124,9 @@ class NativeLlamaLmConfig(LlamaConfig):
         named_config = LlamaConfig.from_hf_config(hf_config)
         fields = {field.name: getattr(named_config, field.name) for field in dataclasses.fields(named_config)}
         fields["head_dim"] = hf_config.head_dim
-        return cls(**fields)
+        config = cls(**fields)
+        config.validate_hf_config(hf_config)
+        return config
 
     def validate_hf_export(self) -> None:
         """Require the standard HF Llama normalization and bias conventions."""
@@ -111,15 +141,20 @@ class NativeLlamaLmConfig(LlamaConfig):
 
     def to_hf_config(self, vocab_size: int, config_overrides: Optional[dict] = None) -> HfLlamaConfig:
         self.validate_hf_export()
-        assert isinstance(self.rope, DefaultRotaryEmbeddingsConfig)
         # Reuse the architecture translation without its untyped legacy linear
         # scaling dictionary, then emit matching Transformers 4/5 RoPE metadata.
         unscaled = dataclasses.replace(self, rope=DefaultRotaryEmbeddingsConfig(theta=self.rope.theta))
         fields = LlamaConfig.to_hf_config(unscaled, vocab_size).to_dict()
-        scaling = None if self.rope.factor == 1 else {"rope_type": "linear", "factor": self.rope.factor}
+        _, scaling = self.rope.to_hf_config()
+        if isinstance(self.rope, DefaultRotaryEmbeddingsConfig):
+            scaling = None if self.rope.factor == 1 else {"rope_type": "linear", "factor": self.rope.factor}
+        elif isinstance(self.rope, YarnRotaryEmbeddingsConfig):
+            assert scaling is not None
+            scaling["attention_factor"] = yarn_attention_factor(self.rope.factor, self.rope.mscale)
         fields.update(
             architectures=["LlamaForCausalLM"],
             head_dim=self.actual_head_size,
+            rope_theta=self.rope.theta,
             rope_scaling=scaling,
             rope_parameters={"rope_theta": self.rope.theta, **(scaling or {"rope_type": "default"})},
         )
@@ -183,8 +218,22 @@ class NativeLlamaLmConfig(LlamaConfig):
         if rope_type == "default" and scaling is not None and scaling.get("factor", 1.0) != 1.0:
             raise ValueError("llama_native HF default RoPE ignores factor; scaled RoPE must declare linear")
         rope = RotaryEmbeddingsConfig.from_hf_config(theta, scaling)
-        if not isinstance(rope, DefaultRotaryEmbeddingsConfig) or rope != self.rope:
-            raise ValueError("llama_native HF RoPE parameters must match the configured default/linear RoPE")
+        if rope != self.rope:
+            raise ValueError("llama_native HF RoPE parameters must match the configured RoPE")
+        if isinstance(rope, YarnRotaryEmbeddingsConfig) and scaling is not None:
+            if not scaling.get("truncate", True):
+                raise ValueError("llama_native HF YaRN requires the integer correction ramp")
+            expected_factor = yarn_attention_factor(rope.factor, rope.mscale)
+            attention_factor = scaling.get("attention_factor")
+            if attention_factor is None:
+                mscale, mscale_all_dim = scaling.get("mscale"), scaling.get("mscale_all_dim")
+                attention_factor = (
+                    yarn_attention_factor(rope.factor, mscale) / yarn_attention_factor(rope.factor, mscale_all_dim)
+                    if mscale and mscale_all_dim
+                    else yarn_attention_factor(rope.factor, 1.0)
+                )
+            if attention_factor != expected_factor:
+                raise ValueError("llama_native HF YaRN attention factor does not match the configured RoPE")
 
     def checkpoint_vocab_size(self, metadata: Mapping[str, Any]) -> int | None:
         """Validate native checkpoint semantics and recover its complete model vocabulary.
@@ -223,11 +272,10 @@ class NativeLlamaLmConfig(LlamaConfig):
 
     def native_config(self, vocab_size: int) -> NativeLlamaConfig:
         """Resolve tokenizer vocabulary and the supported architecture fields."""
-        assert isinstance(self.rope, DefaultRotaryEmbeddingsConfig)
         fields = {
             field.name: getattr(self, field.name)
             for field in dataclasses.fields(NativeLlamaConfig)
-            if field.name not in {"vocab_size", "rope_theta", "rope_factor", "attention_implementation"}
+            if field.name not in {"vocab_size", "rope", "attention_implementation"}
         }
         if isinstance(self.gradient_checkpointing, hax.ScanCheckpointPolicy):
             fields["gradient_checkpointing"] = NativeScanCheckpointPolicy(
@@ -235,8 +283,7 @@ class NativeLlamaLmConfig(LlamaConfig):
             )
         return NativeLlamaConfig(
             vocab_size=vocab_size,
-            rope_theta=self.rope.theta,
-            rope_factor=self.rope.factor,
+            rope=_native_rotary_config(self.rope),
             attention_implementation="tpu_splash" if self.attn_backend == AttentionBackend.SPLASH else "reference",
             **fields,
         )

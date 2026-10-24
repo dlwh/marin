@@ -117,7 +117,6 @@ def _native_config(config: BenchmarkConfig) -> NativeLlamaConfig:
         tie_word_embeddings=False,
         use_bias=False,
         upcast_attn=False,
-        rope_theta=10000.0,
         attention_implementation="reference",
         gradient_checkpointing=config.gradient_checkpointing,
     )
