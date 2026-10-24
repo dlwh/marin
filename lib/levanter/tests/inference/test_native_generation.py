@@ -7,12 +7,24 @@ import equinox as eqx
 import haliax as hax
 import jax
 import jax.numpy as jnp
+import jmp
 import numpy as np
 import pytest
+from haliax.state_dict import to_torch_compatible_state_dict
 from jax.sharding import AxisType, Mesh, PartitionSpec as P
 from tokenizers.processors import TemplateProcessing
 from transformers import AutoTokenizer
 
+from levanter.checkpoint import save_checkpoint
+from levanter.compat.hf_checkpoints import RepoRef
+from levanter.distributed import DistributedConfig
+from levanter.main import sample_lm
+from levanter.models.llama import LlamaConfig
+from levanter.model_loading import load_hf_checkpoint
+from levanter.testing.hf_checkpoints import LocalLlamaCheckpoint, write_llama_checkpoint
+from levanter.tracker import NoopConfig
+from levanter.trainer import TrainerConfig
+from levanter.utils.mesh import MeshConfig
 from levanter.eval_harness import LevanterHarnessLM, _LmEvalHarnessWorker
 
 from levanter.grug.attention import AttentionMask
@@ -20,6 +32,7 @@ from levanter.inference.engine import InferenceEngine, InferenceEngineConfig, Re
 from levanter.inference.jit_scheduler import SeqDecodingParams, SequenceTable
 from levanter.inference.page_table import PageTable
 from levanter.inference.utils import INVALID
+from levanter.layers.attention import AttentionMask as NamedAttentionMask
 from levanter.layers.rotary import (
     DefaultRotaryEmbeddingsConfig,
     Llama3RotaryEmbeddingsConfig,
@@ -329,3 +342,159 @@ def test_native_generate_until_uses_real_prefill_incremental_cache_and_stop(nati
     assert actual == expected
     assert actual[0]
     assert actual[1].strip() == harness.tokenizer.decode(expected_ids[1][:-1], skip_special_tokens=True)
+
+
+@dataclasses.dataclass(frozen=True)
+class SamplingSource:
+    checkpoint: LocalLlamaCheckpoint
+    kind: str
+    tokenizer_path: str
+
+
+@pytest.fixture(params=["hf", "levanter"])
+def sampling_source(tmp_path, tiny_hf_tokenizer_path, request) -> SamplingSource:
+    named_config = LlamaConfig(
+        hidden_dim=16,
+        intermediate_dim=24,
+        num_layers=1,
+        num_heads=4,
+        num_kv_heads=2,
+        max_seq_len=16,
+        activation_function=ActivationFunctionEnum.gelu_new,
+    )
+    source = write_llama_checkpoint(
+        tmp_path / "sampling-source", named_config, named_config.to_hf_config(32), key=jax.random.PRNGKey(13)
+    )
+    return SamplingSource(checkpoint=source, kind=request.param, tokenizer_path=tiny_hf_tokenizer_path)
+
+
+def _sampling_config(sampling_source, tmp_path, native, dtype):
+    source = sampling_source.checkpoint
+    source_kind = sampling_source.kind
+    tokenizer_path = sampling_source.tokenizer_path
+    config_type = NativeLlamaLmConfig if native else LlamaConfig
+    model_config = config_type.from_hf_config(source.config.to_hf_config(32))
+    model_size = 2 if len(jax.devices()) >= 4 else 1
+    trainer = TrainerConfig(
+        mp=jmp.Policy(param_dtype=jnp.float32, compute_dtype=dtype, output_dtype=dtype),
+        mesh=MeshConfig(axes={"data": len(jax.devices()) // model_size, "model": model_size}),
+        require_accelerator=False,
+        distributed=DistributedConfig(initialize_jax_distributed=False),
+        tracker=NoopConfig(),
+        log_dir=tmp_path / "logs",
+    )
+    path = str(source.path)
+    if source_kind == "levanter":
+        with dataclasses.replace(trainer, use_explicit_mesh_axes=native).use_device_mesh():
+            model = load_hf_checkpoint(
+                model_config,
+                path,
+                tokenizer=load_tokenizer(tokenizer_path),
+                compute_dtype=jnp.float32,
+                axis_mapping=trainer.parameter_axis_mapping,
+                compute_axis_mapping=trainer.compute_axis_mapping,
+                batch_axis_name=trainer.batch_axis_name,
+            )
+            path = str(tmp_path / "sampling-checkpoint")
+            metadata = model.checkpoint_metadata() if native else None
+            save_checkpoint({"model": model}, 1, path, metadata=metadata)
+        if not native:
+            # Named checkpoints retain their existing tokenizer-sized template contract.
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+            tokenizer.add_tokens(["token31"])
+            tokenizer_path = str(tmp_path / "named-tokenizer")
+            tokenizer.save_pretrained(tokenizer_path)
+            # Local checkpoint sampling must only need the outer tokenizer.
+            model_config = dataclasses.replace(
+                model_config, tokenizer=None, reference_checkpoint=str(tmp_path / "unavailable-hf-reference")
+            )
+    else:
+        # Sampling has always inferred the source architecture from HF. A placeholder
+        # config must not become an accidental architecture override for native loads.
+        model_config = dataclasses.replace(model_config, hidden_dim=32, num_layers=2)
+    return sample_lm.SampleLmConfig(
+        model=model_config,
+        trainer=trainer,
+        tokenizer=tokenizer_path,
+        hf_checkpoint=RepoRef.from_string(path) if source_kind == "hf" else None,
+        checkpoint_path=path if source_kind == "levanter" else None,
+        prompts=["token3 token4 token5", "token7"],
+        stop_sequence=None,
+        n_rounds=1,
+        n_generations=1,
+        max_new_tokens=3,
+        temperature=0.0,
+        engine=InferenceEngineConfig(
+            max_seq_len=16,
+            max_seqs=3,
+            max_pages=24,
+            page_size=2,
+            max_queued_tokens=16,
+            max_seqs_in_prefill=2,
+            max_prefill_size=8,
+            max_rounds=4,
+            max_tokens_per_round=2,
+            compute_dtype=dtype,
+        ),
+    )
+
+
+@pytest.mark.tpu
+@pytest.mark.parametrize("native", [False, True], ids=["named", "native"])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=["fp32", "bf16"])
+def test_sampling_source_load_preserves_full_vocabulary_weights_and_compute_precision(
+    sampling_source, tmp_path, native, dtype
+):
+    config = _sampling_config(sampling_source, tmp_path, native, dtype)
+    tokenizer = load_tokenizer(config.tokenizer)
+    trainer = dataclasses.replace(config.trainer, use_explicit_mesh_axes=native)
+    source = sampling_source.checkpoint
+    with hax.partitioning.set_mesh(Mesh(np.asarray(jax.devices()), ("data",))):
+        oracle = source.config.build(hax.Axis("vocab", 32), key=jax.random.PRNGKey(13))
+        tokens = hax.named(jnp.asarray([3, 4, 5, 6], dtype=jnp.int32), "position")
+        expected_logits = np.asarray(
+            eqx.filter_jit(lambda m, t: m(t, NamedAttentionMask.causal()).array)(oracle, tokens)
+        )
+    with trainer.use_device_mesh():
+        loaded = sample_lm._load_model(
+            config, hax.Axis("vocab", len(tokenizer)), tokenizer=tokenizer, key=jax.random.PRNGKey(0)
+        )
+        actual = to_torch_compatible_state_dict(loaded)
+        assert loaded.Vocab.size == 32
+        if native:
+            assert len(tokenizer) == 31
+        for name, expected in source.weights.items():
+            np.testing.assert_array_equal(actual[name], np.asarray(expected).astype(dtype))
+        assert all(value.dtype == dtype for value in jax.tree.leaves(loaded) if eqx.is_inexact_array(value))
+        if dtype == jnp.float32:
+            tokens = hax.named(jnp.asarray([3, 4, 5, 6], dtype=jnp.int32), "position")
+            logits = eqx.filter_jit(lambda m, t: m(t, NamedAttentionMask.causal()).array)(loaded, tokens)
+            np.testing.assert_allclose(logits, expected_logits, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.tpu
+@pytest.mark.parametrize("native", [False, True], ids=["named", "native"])
+def test_sampling_main_checkpoint_generation_matches_independent_named_oracle(sampling_source, tmp_path, native):
+    config = _sampling_config(sampling_source, tmp_path, native, jnp.float32)
+    source = sampling_source.checkpoint
+    with hax.partitioning.set_mesh(Mesh(np.asarray(jax.devices()), ("data",))):
+        oracle = source.config.build(hax.Axis("vocab", 32), key=jax.random.PRNGKey(13))
+        for name, weights in to_torch_compatible_state_dict(oracle).items():
+            np.testing.assert_array_equal(weights, source.weights[name])
+        expected_tokens, expected_logprobs = [], []
+        for prompt in [[3, 4, 5], [7]]:
+            sequence = list(prompt)
+            logprobs = []
+            for _ in range(3):
+                tokens = hax.named(jnp.asarray(sequence, dtype=jnp.int32), "position")
+                logits = eqx.filter_jit(lambda m, t: m(t, NamedAttentionMask.causal()).array)(oracle, tokens)[-1]
+                token = int(jnp.argmax(logits))
+                logprobs.append(float(jax.nn.log_softmax(logits)[token]))
+                sequence.append(token)
+            expected_tokens.append(sequence[len(prompt) :])
+            expected_logprobs.append(logprobs)
+    result = sample_lm.main(config)
+    assert result is not None
+    assert result.tokens == expected_tokens
+    assert result.total_generated == 6
+    np.testing.assert_allclose(result.logprobs, expected_logprobs, atol=1e-4, rtol=1e-4)

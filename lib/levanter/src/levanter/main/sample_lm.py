@@ -3,10 +3,9 @@
 import logging
 import time
 from contextlib import ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional, cast
 
-import equinox as eqx
 import haliax as hax
 import jax.numpy as jnp
 import jax.random as jrandom
@@ -17,15 +16,14 @@ import levanter
 import levanter.config
 import levanter.tracker
 from levanter.callbacks import profile_ctx
-from levanter.checkpoint import latest_checkpoint_path, load_checkpoint
-from levanter.compat.hf_checkpoints import HFCheckpointConverter, RepoRef, load_tokenizer
-from levanter.inference.engine import InferenceEngine, InferenceEngineConfig, Request
+from levanter.compat.hf_checkpoints import RepoRef, load_tokenizer
+from levanter.inference.engine import GenerationResult, InferenceEngine, InferenceEngineConfig, Request
 from levanter.inference.jit_scheduler import SeqDecodingParams
 from levanter.inference.utils import INVALID
-from levanter.models.llama import LlamaConfig, LlamaLMHeadModel
+from levanter.main.model_init import ModelInitContext, load_model_from_source, prepare_model_init_context
+from levanter.models.llama import LlamaConfig
 from levanter.models.lm_model import LmConfig, LmHeadModel
 from levanter.trainer import TrainerConfig
-from levanter.utils.jax_utils import use_cpu_device
 
 logger = logging.getLogger(__name__)
 
@@ -66,44 +64,41 @@ class SampleLmConfig:
     log_kernel_jaxprs_path: Optional[str] = None
 
 
-def _load_model(config: SampleLmConfig, Vocab: Axis, *, key) -> LmHeadModel:
-    """Load a model either from a checkpoint or HF repo."""
-
+def _load_model(config: SampleLmConfig, Vocab: Axis, *, tokenizer, key) -> LmHeadModel:
+    """Load sampling parameters in computation precision under the active mesh."""
     if config.checkpoint_path is None and config.hf_checkpoint is None:
         raise ValueError("Must specify either checkpoint_path or hf_checkpoint")
     if config.checkpoint_path is not None and config.hf_checkpoint is not None:
         raise ValueError("Specify only one of checkpoint_path or hf_checkpoint")
 
-    mp = config.trainer.mp
-
-    if config.checkpoint_path is not None:
-        with use_cpu_device():
-            model = eqx.filter_eval_shape(config.model.build, Vocab, key=key)
-            checkpoint_path = latest_checkpoint_path(config.checkpoint_path)
-            model = load_checkpoint(
-                model,
-                checkpoint_path,
-                subpath="model",
-                axis_mapping=config.trainer.parameter_axis_mapping,
-            )
-            model = mp.cast_to_compute(model)
-        return model
+    hf_ref = str(config.hf_checkpoint) if config.hf_checkpoint is not None else False
+    if hf_ref:
+        context = prepare_model_init_context(
+            config.model,
+            tokenizer=tokenizer,
+            initialize_from_hf=hf_ref,
+            use_hf_model_config=True,
+        )
     else:
-        assert hasattr(config.model, "hf_checkpoint_converter"), "model config lacks HF loader"
-        converter: HFCheckpointConverter = config.model.hf_checkpoint_converter()
-        converter = converter.replaced(
-            reference_checkpoint=config.hf_checkpoint, tokenizer=load_tokenizer(config.tokenizer)
-        )
-        model = converter.load_pretrained(
-            config.model.model_type,
-            ref=config.hf_checkpoint,
-            axis_mapping=config.trainer.parameter_axis_mapping,
-            dtype=config.trainer.mp.compute_dtype,
-        )
-        return model  # type: ignore[return-value]
+        context = ModelInitContext(model=config.model, converter=None, use_hf_model_config=False)
+    return load_model_from_source(
+        context=context,
+        Vocab=Vocab,
+        model_key=key,
+        parameter_axis_mapping=config.trainer.parameter_axis_mapping,
+        compute_axis_mapping=config.trainer.compute_axis_mapping,
+        batch_axis_name=config.trainer.batch_axis_name,
+        compute_dtype=config.trainer.mp.compute_dtype,
+        cast_to_param=config.trainer.mp.cast_to_compute,
+        hf_ref=hf_ref,
+        checkpoint_path=config.checkpoint_path,
+    )
 
 
-def main(config: SampleLmConfig):
+def main(config: SampleLmConfig) -> GenerationResult | None:
+    """Sample and print text, returning the final round's token IDs and log probabilities."""
+    if config.model.requires_explicit_mesh_axes:
+        config = replace(config, trainer=replace(config.trainer, use_explicit_mesh_axes=True))
     levanter.trainer.initialize(config)
     tok_string: str | None = config.tokenizer
     if tok_string is None and config.hf_checkpoint is not None:
@@ -117,12 +112,13 @@ def main(config: SampleLmConfig):
 
     key = jrandom.PRNGKey(config.seed)
 
+    result = None
+
     # NB: we use the compute_axis_mapping b/c we're doing inference
     with config.trainer.use_device_mesh():
         vocab_size = len(tokenizer)
         Vocab = round_axis_for_partitioning(Axis("vocab", vocab_size), config.trainer.compute_axis_mapping)
-        model = _load_model(config, Vocab, key=key)
-        assert isinstance(model, LlamaLMHeadModel), "Only LlamaLMHeadModel supported"
+        model = _load_model(config, Vocab, tokenizer=tokenizer, key=key)
 
         prompts = config.prompts
 
@@ -215,6 +211,7 @@ def main(config: SampleLmConfig):
                     print(f"Tokens with text for sequence {seq_id}: {tokens_with_text}")
 
     levanter.tracker.current_tracker().finish()
+    return result
 
 
 if __name__ == "__main__":
