@@ -15,8 +15,12 @@ from jax.sharding import AxisType, Mesh, PartitionSpec as P
 from levanter.grug.attention import AttentionMask
 from levanter.grug.loss import fused_linear_softmax_cross_entropy_loss
 from levanter.layers.attention import AttentionBackend, AttentionMask as NamedAttentionMask
-from levanter.layers.rotary import DefaultRotaryEmbeddingsConfig
-from levanter.layers.rotary_native import RotaryConfig, apply_rotary
+from levanter.layers.rotary import (
+    DefaultRotaryEmbeddingsConfig,
+    Llama3RotaryEmbeddingsConfig,
+    YarnRotaryEmbeddingsConfig,
+)
+from levanter.layers.rotary_native import Llama3RotaryConfig, RotaryConfig, YarnRotaryConfig, apply_rotary
 from levanter.models.llama import LlamaConfig, LlamaLMHeadModel
 from levanter.models.llama_native import NativeLlamaConfig, NativeLlamaModel, NativeLlamaSharding
 from levanter.models.llama_native_lm import NativeLlamaLmConfig
@@ -27,9 +31,21 @@ from levanter.tokenizers import load_tokenizer
 
 @pytest.mark.tpu
 @pytest.mark.parametrize("save_dtype", [None, jnp.bfloat16], ids=["master", "bf16"])
-def test_native_hf_export_sharded_dtype_and_layout_roundtrip(tmp_path, tiny_hf_tokenizer_path, save_dtype):
+@pytest.mark.parametrize(
+    "rope",
+    [DefaultRotaryEmbeddingsConfig(), Llama3RotaryEmbeddingsConfig(), YarnRotaryEmbeddingsConfig(factor=8.0)],
+    ids=["default", "llama3", "yarn"],
+)
+def test_native_hf_export_sharded_dtype_and_layout_roundtrip(tmp_path, tiny_hf_tokenizer_path, save_dtype, rope):
     config = NativeLlamaLmConfig(
-        hidden_dim=16, intermediate_dim=24, num_layers=1, num_heads=4, num_kv_heads=2, head_dim=8, max_seq_len=8
+        hidden_dim=16,
+        intermediate_dim=24,
+        num_layers=1,
+        num_heads=4,
+        num_kv_heads=2,
+        head_dim=8,
+        max_seq_len=8,
+        rope=rope,
     )
     model_size = 2 if len(jax.devices()) >= 4 else 1
     mesh = Mesh(
@@ -47,14 +63,25 @@ def test_native_hf_export_sharded_dtype_and_layout_roundtrip(tmp_path, tiny_hf_t
         assert (output / "model.safetensors.index.json").exists()
         converter = converter.replaced(reference_checkpoint=str(output))
         restored_config = NativeLlamaLmConfig.from_hf_config(converter.default_hf_config)
+        restored_config.validate_hf_config(converter.default_hf_config)
         restored = converter.load_pretrained(
             restored_config.model_type,
             config=restored_config,
             model_init=lambda vocab: restored_config.build(vocab, key=jax.random.PRNGKey(1), sharding=sharding),
         )
+        expected_state = {}
         for name, value in model.to_state_dict().items():
             expected = value if save_dtype is None else value.astype(save_dtype).astype(value.dtype)
+            expected_state[name] = expected
             np.testing.assert_array_equal(restored.to_state_dict()[name], expected)
+        tokens = hax.named(jnp.arange(8).reshape(2, 4), (hax.Axis("batch", 2), hax.Axis("position", 4)))
+        expected_model = model.from_state_dict(expected_state)
+        np.testing.assert_allclose(
+            restored(tokens, NamedAttentionMask.causal()).array,
+            expected_model(tokens, NamedAttentionMask.causal()).array,
+            atol=1e-5,
+            rtol=1e-5,
+        )
         assert restored.Vocab.size == 32
         assert restored.config.actual_head_size == 8
         assert restored.native.token_embeddings.sharding.spec == sharding.column_storage
@@ -62,9 +89,21 @@ def test_native_hf_export_sharded_dtype_and_layout_roundtrip(tmp_path, tiny_hf_t
 
 
 @skip_if_no_torch
-@pytest.mark.parametrize("factor", [1.0, 8.0], ids=["default", "linear"])
+@pytest.mark.parametrize(
+    "rope",
+    [
+        DefaultRotaryEmbeddingsConfig(),
+        DefaultRotaryEmbeddingsConfig(factor=8.0),
+        DefaultRotaryEmbeddingsConfig(theta=500000.0),
+        Llama3RotaryEmbeddingsConfig(),
+        YarnRotaryEmbeddingsConfig(factor=8.0),
+        YarnRotaryEmbeddingsConfig(factor=8.0, mscale=1.5),
+        YarnRotaryEmbeddingsConfig(factor=8.0, original_max_position_embeddings=131072),
+    ],
+    ids=["default", "linear", "custom-base", "llama3", "yarn", "yarn-mscale", "yarn-long-context"],
+)
 @pytest.mark.parametrize("tied", [False, True], ids=["untied", "tied"])
-def test_native_hf_export_transformers_local_logits(tmp_path, tiny_hf_tokenizer_path, factor, tied):
+def test_native_hf_export_transformers_local_logits(tmp_path, tiny_hf_tokenizer_path, rope, tied):
     import torch  # noqa: PLC0415  # optional dependency
     from transformers import AutoModelForCausalLM  # noqa: PLC0415  # optional Torch model
 
@@ -77,7 +116,7 @@ def test_native_hf_export_transformers_local_logits(tmp_path, tiny_hf_tokenizer_
         head_dim=8,
         max_seq_len=8,
         tie_word_embeddings=tied,
-        rope=DefaultRotaryEmbeddingsConfig(factor=factor),
+        rope=rope,
     )
     mesh = Mesh(np.asarray(jax.devices()[:1]), ("data",), axis_types=(AxisType.Explicit,))
     ids = np.arange(16, dtype=np.int32).reshape(2, 8)
@@ -211,7 +250,9 @@ def test_native_lm_hf_config_and_vocab_resize_preserve_model_values_and_placemen
         ({}, jnp.float32),
         ({"num_kv_heads": 1, "tie_word_embeddings": True, "use_bias": True}, jnp.float32),
         ({"use_qk_norm": True, "hybrid_norm": True, "input_embedding_norm": True}, jnp.float32),
-        ({"head_dim": 6, "use_layer_norm_weight": False, "rope_factor": 2.0}, jnp.float32),
+        ({"head_dim": 6, "use_layer_norm_weight": False, "rope": RotaryConfig(factor=2.0)}, jnp.float32),
+        ({"rope": Llama3RotaryConfig()}, jnp.float32),
+        ({"rope": YarnRotaryConfig(factor=8.0, mscale=1.5)}, jnp.float32),
         pytest.param({}, jnp.bfloat16, id="bfloat16-compute-float32-parameters"),
     ],
 )
@@ -229,6 +270,12 @@ def test_native_llama_matches_named_logits_loss_and_gradients(options, compute_d
         ),
         **options,
     )
+    if isinstance(config.rope, Llama3RotaryConfig):
+        named_rope = Llama3RotaryEmbeddingsConfig(**dataclasses.asdict(config.rope))
+    elif isinstance(config.rope, YarnRotaryConfig):
+        named_rope = YarnRotaryEmbeddingsConfig(**dataclasses.asdict(config.rope))
+    else:
+        named_rope = DefaultRotaryEmbeddingsConfig(**dataclasses.asdict(config.rope))
     legacy_config = LlamaConfig(
         **{
             field.name: getattr(config, field.name)
@@ -253,7 +300,7 @@ def test_native_llama_matches_named_logits_loss_and_gradients(options, compute_d
             }
         },
         attn_backend=AttentionBackend.VANILLA,
-        rope=DefaultRotaryEmbeddingsConfig(theta=config.rope_theta, factor=config.rope_factor),
+        rope=named_rope,
     )
     Batch, Pos = hax.Axis("batch", 2), hax.Axis("position", 8)
     tokens = (jnp.arange(16).reshape(2, 8) * 3) % config.vocab_size
@@ -443,3 +490,87 @@ def test_native_rotary_long_positions_match_named_values_and_input_gradients(fac
 
     np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-5)
     np.testing.assert_allclose(actual_grad, expected_grad, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "named_config,native_config",
+    [
+        (Llama3RotaryEmbeddingsConfig(), Llama3RotaryConfig()),
+        (
+            Llama3RotaryEmbeddingsConfig(factor=32.0, original_max_position_embeddings=4096),
+            Llama3RotaryConfig(factor=32.0, original_max_position_embeddings=4096),
+        ),
+        (YarnRotaryEmbeddingsConfig(), YarnRotaryConfig()),
+        (YarnRotaryEmbeddingsConfig(factor=8.0), YarnRotaryConfig(factor=8.0)),
+        (
+            YarnRotaryEmbeddingsConfig(factor=8.0, original_max_position_embeddings=131072),
+            YarnRotaryConfig(factor=8.0, original_max_position_embeddings=131072),
+        ),
+        (
+            YarnRotaryEmbeddingsConfig(factor=8.0, mscale=1.5, beta_fast=16.0, beta_slow=2.0),
+            YarnRotaryConfig(factor=8.0, mscale=1.5, beta_fast=16.0, beta_slow=2.0),
+        ),
+    ],
+    ids=["llama3", "llama3-context", "yarn-unscaled", "yarn", "yarn-long-context", "yarn-temperature-ramp"],
+)
+@pytest.mark.parametrize("compute_dtype", [jnp.float32, jnp.bfloat16], ids=["float32", "bfloat16"])
+def test_native_scaled_rotary_long_positions_match_named_values_and_gradients(
+    named_config, native_config, compute_dtype
+):
+    shape = (2, 9, 4, 64)
+    axes = tuple(hax.Axis(name, size) for name, size in zip(("batch", "position", "heads", "head_size"), shape))
+    rng = np.random.default_rng(173)
+    host_x = rng.standard_normal(shape).astype(np.float32)
+    host_cotangent = rng.standard_normal(shape).astype(np.float32)
+    host_positions = np.broadcast_to(
+        np.asarray([0, 1, 4095, 8191, 8192, 65536, 131071, 131072, 262143], dtype=np.int32), shape[:2]
+    ).copy()
+    named = named_config.build(axes[-1])
+    mesh = Mesh(np.asarray(jax.devices()[:1]), ("data",), axis_types=(AxisType.Explicit,))
+
+    def expected_forward(master, positions):
+        return (
+            named(hax.named(master.astype(compute_dtype), axes), hax.named(positions, axes[:2])).rearrange(axes).array
+        )
+
+    def actual_forward(master, positions):
+        return apply_rotary(master.astype(compute_dtype), positions, native_config)
+
+    def objective(forward, master, positions, cotangent):
+        return jnp.sum(forward(master, positions).astype(jnp.float32) * cotangent)
+
+    with jax.set_mesh(mesh):
+        x, positions, cotangent = jnp.asarray(host_x), jnp.asarray(host_positions), jnp.asarray(host_cotangent)
+        expected = jax.jit(expected_forward)(x, positions)
+        actual = jax.jit(actual_forward)(x, positions)
+        expected_grad = jax.jit(jax.grad(lambda master, pos, ct: objective(expected_forward, master, pos, ct)))(
+            x, positions, cotangent
+        )
+        actual_grad = jax.jit(jax.grad(lambda master, pos, ct: objective(actual_forward, master, pos, ct)))(
+            x, positions, cotangent
+        )
+    np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(actual_grad, expected_grad, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "rope,parameters,message",
+    [
+        (YarnRotaryEmbeddingsConfig(factor=8.0, mscale=1.5), {}, "attention factor"),
+        (YarnRotaryEmbeddingsConfig(factor=8.0), {"mscale_all_dim": 1.0}, "attention factor"),
+        (YarnRotaryEmbeddingsConfig(factor=8.0), {"truncate": False}, "integer correction ramp"),
+    ],
+    ids=["implicit-mscale", "mscale-ratio", "floating-ramp"],
+)
+def test_native_hf_yarn_rejects_different_scaling_semantics(rope, parameters, message):
+    config = NativeLlamaLmConfig(rope=rope)
+    hf_config = config.to_hf_config(32)
+    # External HF checkpoints can infer a different multiplier from identical
+    # mscale fields, or use a floating rather than integer correction ramp.
+    hf_config.rope_parameters.pop("attention_factor")
+    hf_config.rope_parameters.update(parameters)
+    hf_config.rope_scaling = hf_config.rope_parameters
+    with pytest.raises(ValueError, match=message):
+        config.validate_hf_config(hf_config)
+    with pytest.raises(ValueError, match=message):
+        NativeLlamaLmConfig.from_hf_config(hf_config)

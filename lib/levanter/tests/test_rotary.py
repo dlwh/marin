@@ -125,7 +125,8 @@ def test_yarn_rotary_embedding():
 
 @skip_if_no_torch
 @pytest.mark.parametrize("factor", [1.0, 2.0, 4.0, 8.0])
-def test_yarn_rotary_embedding_vs_hf(factor):
+@pytest.mark.parametrize("original_max_position_embeddings,theta", [(16, 500000.0), (131072, 10000.0)])
+def test_yarn_rotary_embedding_vs_hf(factor, original_max_position_embeddings, theta):
     """Test that YARN rotary embeddings match HuggingFace implementation."""
     import torch  # noqa: PLC0415  # optional dep: torch
     from transformers.models.llama import modeling_llama  # noqa: PLC0415  # optional dep: torch
@@ -135,8 +136,6 @@ def test_yarn_rotary_embedding_vs_hf(factor):
 
     head_dim = 64
     seq_len = 32
-    original_max_position_embeddings = 16  # Scaled down for testing
-    theta = 500000.0
 
     HeadSize = hax.Axis("HeadSize", head_dim)
     Pos = hax.Axis("Pos", seq_len)
@@ -169,7 +168,7 @@ def test_yarn_rotary_embedding_vs_hf(factor):
         hidden_size=head_dim * Heads.size,
         num_attention_heads=Heads.size,
         head_dim=head_dim,
-        max_position_embeddings=seq_len * int(factor),
+        max_position_embeddings=max(seq_len, original_max_position_embeddings) * int(factor),
         rope_theta=rope_theta,
         rope_scaling=rope_scaling,
     )

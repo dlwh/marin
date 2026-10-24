@@ -24,7 +24,7 @@ from levanter.grug.attention import AttentionMask, GrugAttentionImplementation, 
 from levanter.grug.loss import fused_linear_softmax_cross_entropy_loss
 from levanter.layers.linear import INITIALIZER_TRUNCATION_BOUND, Linear
 from levanter.layers.rms_norm import RmsNorm
-from levanter.layers.rotary_native import RotaryConfig, apply_rotary
+from levanter.layers.rotary_native import NativeRotaryConfig, RotaryConfig, apply_rotary
 from levanter.layers.scan_checkpoint import ScanCheckpointSpec
 from levanter.layers.stacked import ArrayStacked
 
@@ -112,8 +112,7 @@ class NativeLlamaConfig:
     hybrid_norm: bool = False
     use_qk_norm: bool = False
     upcast_attn: bool = False
-    rope_theta: float = 10000.0
-    rope_factor: float = 1.0
+    rope: NativeRotaryConfig = RotaryConfig()
     attention_implementation: GrugAttentionImplementation = "reference"
     gradient_checkpointing: ScanCheckpointSpec = True
 
@@ -217,9 +216,8 @@ class NativeLlamaAttention(eqx.Module):
         if self.q_norm is not None and self.k_norm is not None:
             q = self.q_norm(q)
             k = self.k_norm(k)
-        rope = RotaryConfig(self.config.rope_theta, self.config.rope_factor)
-        q = apply_rotary(q, pos_ids, rope)
-        k = apply_rotary(k, pos_ids, rope)
+        q = apply_rotary(q, pos_ids, self.config.rope)
+        k = apply_rotary(k, pos_ids, self.config.rope)
         if self.config.upcast_attn:
             q = q.astype(jnp.float32)
             k = k.astype(jnp.float32)
