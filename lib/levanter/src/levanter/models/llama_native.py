@@ -27,6 +27,12 @@ from levanter.layers.rms_norm import RmsNorm
 from levanter.layers.rotary_native import NativeRotaryConfig, RotaryConfig, apply_rotary
 from levanter.layers.scan_checkpoint import ScanCheckpointSpec
 from levanter.layers.stacked import ArrayStacked
+from levanter.utils.activation import ActivationFunctionEnum, JaxActivationFunction
+
+
+_LAYER_NORM_FIELDS = ("input_layernorm", "post_attention_layernorm", "post_attn_layernorm", "post_mlp_layernorm")
+_ATTENTION_FIELDS = ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm")
+_MLP_FIELDS = ("gate_proj", "up_proj", "down_proj")
 
 
 @dataclass(frozen=True)
@@ -102,6 +108,7 @@ class NativeLlamaConfig:
     num_layers: int = 32
     num_heads: int = 32
     num_kv_heads: int = 32
+    activation_function: ActivationFunctionEnum = ActivationFunctionEnum.silu
     head_dim: int | None = None
     max_seq_len: int = 2048
     layer_norm_epsilon: float = 1e-5
@@ -117,6 +124,7 @@ class NativeLlamaConfig:
     gradient_checkpointing: ScanCheckpointSpec = True
 
     def __post_init__(self):
+        self.activation_function.to_jax_fn()
         if self.attention_implementation == "xla_flash":
             raise ValueError("xla_flash still uses named-array operations; select a native attention implementation")
         if self.num_heads % self.num_kv_heads:
@@ -199,20 +207,25 @@ class NativeLlamaAttention(eqx.Module):
         mask: AttentionMask | Array,
         pos_ids: Int[Array, "B S"],
     ) -> Float[Array, "B S D"]:
+        q, k, v = self.project_qkv(x, pos_ids, sharding=self.sharding)
+        if self.config.attention_implementation == "reference":
+            output = reference_attention(q, k, v, mask, logits_dtype=None)
+        else:
+            output = attention(q, k, v, mask, implementation=self.config.attention_implementation)
+        return self.project_output(output, dtype=x.dtype, sharding=self.sharding)
+
+    def project_qkv(
+        self, x: Float[Array, "B S D"], pos_ids: Int[Array, "B S"], *, sharding: NativeLlamaSharding
+    ) -> tuple[Array, Array, Array]:
+        """Project and rotate queries/keys using the caller's token layout."""
         batch, sequence = x.shape[:2]
         dim = self.config.actual_head_dim
-        q = self.q_proj(x, out_sharding=self.sharding.intermediate).reshape(
-            batch, sequence, self.config.num_heads, dim
-        )
-        k = self.k_proj(x, out_sharding=self.sharding.intermediate).reshape(
-            batch, sequence, self.config.num_kv_heads, dim
-        )
-        v = self.v_proj(x, out_sharding=self.sharding.intermediate).reshape(
-            batch, sequence, self.config.num_kv_heads, dim
-        )
-        q = reshard(q, self.sharding.query)
-        k = reshard(k, self.sharding.query)
-        v = reshard(v, self.sharding.query)
+        q = self.q_proj(x, out_sharding=sharding.intermediate).reshape(batch, sequence, self.config.num_heads, dim)
+        k = self.k_proj(x, out_sharding=sharding.intermediate).reshape(batch, sequence, self.config.num_kv_heads, dim)
+        v = self.v_proj(x, out_sharding=sharding.intermediate).reshape(batch, sequence, self.config.num_kv_heads, dim)
+        q = reshard(q, sharding.query)
+        k = reshard(k, sharding.query)
+        v = reshard(v, sharding.query)
         if self.q_norm is not None and self.k_norm is not None:
             q = self.q_norm(q)
             k = self.k_norm(k)
@@ -221,20 +234,23 @@ class NativeLlamaAttention(eqx.Module):
         if self.config.upcast_attn:
             q = q.astype(jnp.float32)
             k = k.astype(jnp.float32)
-        if self.config.attention_implementation == "reference":
-            output = reference_attention(q, k, v, mask, logits_dtype=None)
-        else:
-            output = attention(q, k, v, mask, implementation=self.config.attention_implementation)
-        output = output.astype(x.dtype).reshape(batch, sequence, self.config.num_heads * dim)
-        return self.o_proj(output, out_sharding=self.sharding.residual)
+        return q, k, v
+
+    def project_output(
+        self, output: Float[Array, "B S H D"], *, dtype: jnp.dtype, sharding: NativeLlamaSharding
+    ) -> Float[Array, "B S D"]:
+        """Restore the residual layout after either dense or paged attention."""
+        output = output.astype(dtype).reshape(*output.shape[:2], self.config.num_heads * self.config.actual_head_dim)
+        return self.o_proj(output, out_sharding=sharding.residual)
 
 
 class NativeLlamaMlp(eqx.Module):
-    """SwiGLU with column-parallel inputs and a row-parallel output."""
+    """Gated MLP with column-parallel inputs and a row-parallel output."""
 
     gate_proj: Linear
     up_proj: Linear
     down_proj: Linear
+    act: JaxActivationFunction = eqx.field(static=True)
     sharding: NativeLlamaSharding = eqx.field(static=True)
 
     @staticmethod
@@ -264,14 +280,18 @@ class NativeLlamaMlp(eqx.Module):
                 storage_spec=sharding.row_storage,
                 compute_spec=sharding.row_compute,
             ),
+            config.activation_function.to_jax_fn(),
             sharding,
         )
 
     @jax.named_call
     def __call__(self, x: Float[Array, "B S D"]) -> Float[Array, "B S D"]:
-        gate = jax.nn.silu(self.gate_proj(x, out_sharding=self.sharding.intermediate))
-        hidden = gate * self.up_proj(x, out_sharding=self.sharding.intermediate)
-        return self.down_proj(hidden, out_sharding=self.sharding.residual)
+        return self.forward(x, sharding=self.sharding)
+
+    def forward(self, x: Float[Array, "B S D"], *, sharding: NativeLlamaSharding) -> Float[Array, "B S D"]:
+        gate = self.act(self.gate_proj(x, out_sharding=sharding.intermediate))
+        hidden = gate * self.up_proj(x, out_sharding=sharding.intermediate)
+        return self.down_proj(hidden, out_sharding=sharding.residual)
 
 
 class NativeLlamaBlock(eqx.Module):
@@ -301,8 +321,14 @@ class NativeLlamaBlock(eqx.Module):
         self, x: Float[Array, "B S D"], mask: AttentionMask | Array, pos_ids: Int[Array, "B S"]
     ) -> Float[Array, "B S D"]:
         attn = self.self_attn(self.input_layernorm(x), mask, pos_ids)
+        return self.finish_attention(x, attn, sharding=self.self_attn.sharding)
+
+    def finish_attention(
+        self, x: Float[Array, "B S D"], attn: Float[Array, "B S D"], *, sharding: NativeLlamaSharding
+    ) -> Float[Array, "B S D"]:
+        """Apply the shared residual/MLP computation after attention."""
         x = x + (self.post_attn_layernorm(attn) if self.post_attn_layernorm is not None else attn)
-        mlp = self.mlp(self.post_attention_layernorm(x))
+        mlp = self.mlp.forward(self.post_attention_layernorm(x), sharding=sharding)
         return x + (self.post_mlp_layernorm(mlp) if self.post_mlp_layernorm is not None else mlp)
 
 
@@ -381,12 +407,14 @@ class NativeLlamaModel(eqx.Module):
             pos_ids = jnp.broadcast_to(jnp.arange(tokens.shape[1]), tokens.shape)
         pos_ids = reshard(pos_ids, self.sharding.tokens)
         mask = AttentionMask.causal() if mask is None else mask
-        weight = reshard(self.token_embeddings, self.sharding.column_compute)
-        hidden = weight.at[tokens].get(out_sharding=self.sharding.residual)
-        if self.embedding_norm is not None:
-            hidden = self.embedding_norm(hidden)
+        hidden = self.embed_tokens(tokens, sharding=self.sharding)
         hidden = self.layers.fold(hidden, mask, pos_ids)
         return self.norm(hidden)
+
+    def embed_tokens(self, tokens: Int[Array, "B S"], *, sharding: NativeLlamaSharding) -> Float[Array, "B S D"]:
+        weight = reshard(self.token_embeddings, sharding.column_compute)
+        hidden = weight.at[tokens].get(out_sharding=sharding.residual)
+        return self.embedding_norm(hidden) if self.embedding_norm is not None else hidden
 
     def get_lm_head(self) -> Float[Array, "V D"]:
         """Return output-first head weights, sharing embeddings when tied."""
@@ -401,8 +429,11 @@ class NativeLlamaModel(eqx.Module):
         key: PRNGKeyArray | None = None,
     ) -> Float[Array, "B S V"]:
         hidden = self.activations(tokens, mask, pos_ids=pos_ids, key=key)
-        head = reshard(self.get_lm_head(), self.sharding.column_compute)
-        return jnp.einsum("bsd,vd->bsv", hidden, head, out_sharding=self.sharding.logits)
+        return self.unembed(hidden, sharding=self.sharding)
+
+    def unembed(self, hidden: Float[Array, "B S D"], *, sharding: NativeLlamaSharding) -> Float[Array, "B S V"]:
+        head = reshard(self.get_lm_head(), sharding.column_compute)
+        return jnp.einsum("bsd,vd->bsv", hidden, head, out_sharding=sharding.logits)
 
     def __call__(
         self,
@@ -453,15 +484,15 @@ class NativeLlamaModel(eqx.Module):
             _put_module(state, "lm_head", self.lm_head)
         for index, layer in enumerate(self.layers.unstacked()):
             path = f"model.layers.{index}"
-            for name in ("input_layernorm", "post_attention_layernorm", "post_attn_layernorm", "post_mlp_layernorm"):
+            for name in _LAYER_NORM_FIELDS:
                 module = getattr(layer, name)
                 if module is not None:
                     _put_module(state, f"{path}.{name}", module)
-            for name in ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm"):
+            for name in _ATTENTION_FIELDS:
                 module = getattr(layer.self_attn, name)
                 if module is not None:
                     _put_module(state, f"{path}.self_attn.{name}", module)
-            for name in ("gate_proj", "up_proj", "down_proj"):
+            for name in _MLP_FIELDS:
                 _put_module(state, f"{path}.mlp.{name}", getattr(layer.mlp, name))
         return {f"{prefix}.{name}" if prefix else name: value for name, value in state.items()}
 
@@ -491,14 +522,14 @@ class NativeLlamaModel(eqx.Module):
         layers = []
         for index, layer in enumerate(model.layers.unstacked()):
             path = f"model.layers.{index}"
-            for name in ("input_layernorm", "post_attention_layernorm", "post_attn_layernorm", "post_mlp_layernorm"):
+            for name in _LAYER_NORM_FIELDS:
                 module = getattr(layer, name)
                 if module is not None:
                     layer = dataclasses.replace(
                         layer, **{name: _load_module(module, source, f"{path}.{name}", self.sharding.norm_storage)}
                     )
             attn = layer.self_attn
-            for name in ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm"):
+            for name in _ATTENTION_FIELDS:
                 module = getattr(attn, name)
                 if module is None:
                     continue
@@ -509,7 +540,7 @@ class NativeLlamaModel(eqx.Module):
                     attn, **{name: _load_module(module, source, f"{path}.self_attn.{name}", spec)}
                 )
             mlp = layer.mlp
-            for name in ("gate_proj", "up_proj", "down_proj"):
+            for name in _MLP_FIELDS:
                 spec = self.sharding.row_storage if name == "down_proj" else self.sharding.column_storage
                 mlp = dataclasses.replace(
                     mlp, **{name: _load_module(getattr(mlp, name), source, f"{path}.mlp.{name}", spec)}

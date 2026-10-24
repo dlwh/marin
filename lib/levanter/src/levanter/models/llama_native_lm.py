@@ -5,6 +5,7 @@
 
 import dataclasses
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, cast
 
@@ -14,8 +15,9 @@ import jax
 import jax.numpy as jnp
 from haliax import Axis, NamedArray
 from haliax.jax_utils import maybe_rng_split
+from haliax.partitioning import ResourceMapping
 from haliax.state_dict import ModuleWithStateDictSerialization
-from jax.sharding import PartitionSpec as P, get_abstract_mesh, reshard
+from jax.sharding import AxisType, Mesh, PartitionSpec as P, auto_axes, get_abstract_mesh, reshard
 from jaxtyping import PRNGKeyArray
 from transformers import PretrainedConfig as HfConfig
 from transformers import LlamaConfig as HfLlamaConfig
@@ -24,7 +26,10 @@ from levanter.compat.hf_checkpoints import HFCheckpointConverter
 from levanter.compat.hf_config import hf_rope_config
 from levanter.data.text.examples import grug_attention_mask_from_named
 from levanter.grug.attention import AttentionMask as RawAttentionMask
-from levanter.layers.attention import AttentionBackend, AttentionMask
+from levanter.inference.page_table import PageBatchInfo, PageTableSpec
+from levanter.kernels.pallas.autotune_utils import named_sharding_of
+from levanter.layers.attention import AttentionBackend, AttentionMask, ragged_paged_attention
+from levanter.layers.kv_cache import KvPageCache, ListCache
 from levanter.layers.rotary import (
     DefaultRotaryEmbeddingsConfig,
     Llama3RotaryEmbeddingsConfig,
@@ -46,6 +51,76 @@ from levanter.tokenizers import MarinTokenizer
 from levanter.utils.activation import ActivationFunctionEnum
 
 
+_NATIVE_CHECKPOINT_VERSION = 1
+
+
+def _paged_attention(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    cache: KvPageCache,
+    batch_info: PageBatchInfo,
+    *,
+    model_axis: str | None,
+    sm_scale: float,
+) -> tuple[jax.Array, KvPageCache]:
+    # Named cache/reference math uses Auto axes; return to the native explicit
+    # layout at this shared infrastructure boundary, including donated pages.
+    def attend(query, keys, values, pages, info):
+        query = hax.named(query, ("position", "kv_head", "q_heads_per_group", "head_size"))
+        cache = KvPageCache(hax.named(pages, ("page", "slot", "kv_head", "head_size")))
+        with hax.axis_mapping({} if model_axis is None else {"kv_head": model_axis}, merge=False):
+            cache = cache.update(
+                info,
+                hax.named(keys, ("position", "kv_head", "head_size")),
+                hax.named(values, ("position", "kv_head", "head_size")),
+            )
+            output = ragged_paged_attention(
+                query,
+                cache.kv_pages,
+                info.seq_lens,
+                info.page_indices,
+                info.cu_q_lens,
+                info.num_seqs,
+                sm_scale=sm_scale,
+            )
+        return output.array, cache.kv_pages.array
+
+    # pyrefly: ignore[bad-assignment]  # auto_axes decorator overload erases the callable signature.
+    wrapped: Callable[..., tuple[jax.Array, jax.Array]] = auto_axes(
+        attend, out_sharding=(named_sharding_of(q), named_sharding_of(cache.kv_pages.array))
+    )
+    output, pages = wrapped(q, k, v, cache.kv_pages.array, batch_info)
+    return output, dataclasses.replace(cache, kv_pages=hax.named(pages, cache.kv_pages.axes))
+
+
+def native_llama_sharding(
+    parameter_axis_mapping: ResourceMapping,
+    compute_axis_mapping: ResourceMapping,
+    batch_axis_name: str = "batch",
+) -> NativeLlamaSharding:
+    """Resolve native storage and computation roles from Levanter's named mappings."""
+    batch = compute_axis_mapping.get(batch_axis_name, compute_axis_mapping.get("batch"))
+    batch_axes = () if batch is None else (batch,) if isinstance(batch, str) else tuple(batch)
+    fsdp_axis = parameter_axis_mapping.get("embed")
+    model_axis = compute_axis_mapping.get("mlp")
+    if fsdp_axis is not None and not isinstance(fsdp_axis, str):
+        raise ValueError("llama_native requires one FSDP axis in mesh.param_mapping.embed")
+    if model_axis is not None and not isinstance(model_axis, str):
+        raise ValueError("llama_native requires one tensor-parallel axis in mesh.compute_mapping.mlp")
+    if model_axis is not None and (model_axis in batch_axes or model_axis == fsdp_axis):
+        raise ValueError("llama_native tensor-parallel placement must be distinct from batch/FSDP axes")
+    if compute_axis_mapping.get("position") is not None:
+        raise ValueError("llama_native does not support sequence parallelism")
+    if compute_axis_mapping.get("embed") is not None:
+        raise ValueError("llama_native gathers the FSDP embed dimension for computation")
+    for mapping in (compute_axis_mapping, parameter_axis_mapping):
+        for dimension in ("mlp", "heads", "kv_head", "vocab"):
+            if dimension in mapping and mapping[dimension] != model_axis:
+                raise ValueError(f"llama_native requires {dimension} to use the tensor-parallel axis {model_axis}")
+    return NativeLlamaSharding(batch_axes=batch_axes, fsdp_axis=fsdp_axis, model_axis=model_axis)
+
+
 def _checkpoint_architecture(config: NativeLlamaConfig) -> dict[str, Any]:
     architecture: dict[str, Any] = {
         "hidden_dim": config.hidden_dim,
@@ -65,8 +140,11 @@ def _checkpoint_architecture(config: NativeLlamaConfig) -> dict[str, Any]:
         "rope_theta": float(config.rope.theta),
         "rope_factor": float(config.rope.factor),
     }
-    # Default/linear metadata is already a checkpoint wire contract. Scaled
-    # variants add their semantic fields without changing that existing shape.
+    # SiLU/default-linear metadata is already a checkpoint wire contract.
+    # Other activations and scaled RoPE add their semantic fields without
+    # changing that existing shape.
+    if config.activation_function is not ActivationFunctionEnum.silu:
+        architecture["activation_function"] = config.activation_function.value
     if not isinstance(config.rope, RotaryConfig):
         architecture["rope_type"] = "llama3" if isinstance(config.rope, Llama3RotaryConfig) else "yarn"
         architecture.update(
@@ -96,8 +174,6 @@ class NativeLlamaLmConfig(LlamaConfig):
 
     def __post_init__(self):
         super().__post_init__()
-        if self.activation_function != ActivationFunctionEnum.silu:
-            raise ValueError("llama_native supports only the silu activation")
         if not self.scan_layers:
             raise ValueError("llama_native requires scan_layers: true")
         if self.attn_backend not in (
@@ -235,6 +311,24 @@ class NativeLlamaLmConfig(LlamaConfig):
             if attention_factor != expected_factor:
                 raise ValueError("llama_native HF YaRN attention factor does not match the configured RoPE")
 
+    def validate_sharding(self, sharding: NativeLlamaSharding, mesh: Mesh, vocab_size: int | None = None) -> None:
+        """Validate a native model's dimensions against its concrete explicit mesh."""
+        if mesh.empty or any(axis_type != AxisType.Explicit for axis_type in mesh.axis_types):
+            raise ValueError("llama_native requires an active mesh with explicit axis types")
+        for axis in (*sharding.batch_axes, sharding.fsdp_axis, sharding.model_axis):
+            if axis is not None and axis not in mesh.shape:
+                raise ValueError(f"llama_native placement axis {axis} is missing from the mesh")
+        if sharding.fsdp_axis is not None and self.hidden_dim % mesh.shape[sharding.fsdp_axis]:
+            raise ValueError("llama_native hidden_dim must be divisible by the FSDP mesh size")
+        if sharding.model_axis is not None:
+            model_size = mesh.shape[sharding.model_axis]
+            if self.num_kv_heads % model_size:
+                raise ValueError("llama_native num_kv_heads must be divisible by the tensor-parallel mesh size")
+            if self.intermediate_dim % model_size:
+                raise ValueError("llama_native intermediate_dim must be divisible by the tensor-parallel mesh size")
+            if vocab_size is not None and vocab_size % model_size:
+                raise ValueError("llama_native source vocabulary must be divisible by the tensor-parallel mesh size")
+
     def checkpoint_vocab_size(self, metadata: Mapping[str, Any]) -> int | None:
         """Validate native checkpoint semantics and recover its complete model vocabulary.
 
@@ -245,7 +339,11 @@ class NativeLlamaLmConfig(LlamaConfig):
         identity = metadata["levanter_model"]
         if not isinstance(identity, dict) or set(identity) != {"version", "type", "vocab_size", "architecture"}:
             raise ValueError("Malformed native checkpoint model metadata")
-        if type(identity["version"]) is not int or identity["version"] != 1 or identity["type"] != "llama_native":
+        if (
+            type(identity["version"]) is not int
+            or identity["version"] != _NATIVE_CHECKPOINT_VERSION
+            or identity["type"] != "llama_native"
+        ):
             raise ValueError("Unsupported checkpoint model metadata version or implementation")
         vocab_size = identity["vocab_size"]
         if type(vocab_size) is not int or vocab_size <= 0:
@@ -316,7 +414,7 @@ class NativeLlamaLmHeadModel(ModuleWithStateDictSerialization, LmHeadModel[Nativ
         """Describe the actual stored model without source paths or runtime placement policy."""
         return {
             "levanter_model": {
-                "version": 1,
+                "version": _NATIVE_CHECKPOINT_VERSION,
                 "type": "llama_native",
                 "vocab_size": self.Vocab.size,
                 "architecture": _checkpoint_architecture(self.native.config),
@@ -371,7 +469,8 @@ class NativeLlamaLmHeadModel(ModuleWithStateDictSerialization, LmHeadModel[Nativ
                 "Dense, offset and bidirectional attention masks require llama_native reference attention"
             )
         assert dense is not None
-        return dense.broadcast_to((*batch_axes, Pos, KeyPos)).array
+        # Named masks use truth values; raw attention also accepts additive biases.
+        return dense.astype(jnp.bool_).broadcast_to((*batch_axes, Pos, KeyPos)).array
 
     def activations(
         self,
@@ -409,6 +508,76 @@ class NativeLlamaLmHeadModel(ModuleWithStateDictSerialization, LmHeadModel[Nativ
         # The shared CE kernel partitions examples and requires a complete head
         # on each participant. Storage remains FSDP/tensor-parallel.
         return hax.named(reshard(self.native.get_lm_head(), P(None, None)), (self.Vocab, self.Embed))
+
+    def initial_cache(self, spec: PageTableSpec, *, dtype) -> ListCache[KvPageCache]:
+        """Allocate per-layer paged KV storage, replicated except for TP heads."""
+        model_axis = self.native.sharding.model_axis
+        model_size = 1 if model_axis is None else get_abstract_mesh().shape[model_axis]
+        if self.native.config.num_kv_heads % model_size:
+            raise ValueError("Paged native Llama requires KV heads divisible by tensor parallel size")
+        caches = []
+        with hax.axis_mapping({} if model_axis is None else {"kv_head": model_axis}, merge=False):
+            for _ in range(self.native.config.num_layers):
+                cache = KvPageCache.init(
+                    spec,
+                    Axis("kv_head", self.native.config.num_kv_heads),
+                    Axis("head_size", self.native.config.actual_head_dim),
+                    dtype=dtype,
+                )
+                pages = reshard(cache.kv_pages.array, P(None, None, model_axis, None))
+                caches.append(dataclasses.replace(cache, kv_pages=hax.named(pages, cache.kv_pages.axes)))
+        return ListCache(caches)
+
+    def decode(
+        self,
+        input_ids: NamedArray,
+        kv_cache: ListCache[KvPageCache],
+        batch_info: PageBatchInfo,
+        pos_ids: NamedArray,
+        *,
+        key=None,
+    ) -> tuple[NamedArray, ListCache[KvPageCache]]:
+        """Run packed causal prefill or decode using the existing paged engine.
+
+        The packed stream and page table are replicated over data axes; weights
+        retain FSDP storage and attention/cache heads retain tensor parallelism.
+        Positions are absolute within each sequence. Only the valid prefix in
+        ``batch_info`` updates cache; trailing padded logits are not sampled.
+        """
+        del key
+        if input_ids.ndim != 1 or input_ids.axes[0].name != self.Pos.name or pos_ids.axes != input_ids.axes:
+            raise ValueError("Paged native Llama expects matching flat position token/position arrays")
+        if len(kv_cache) != self.native.config.num_layers:
+            raise ValueError("Paged native Llama requires one cache per decoder layer")
+        layout = dataclasses.replace(self.native.sharding, batch_axes=())
+        tokens = reshard(input_ids.array[None], layout.tokens)
+        positions = reshard(pos_ids.array[None], layout.tokens)
+        hidden = self.native.embed_tokens(tokens, sharding=layout)
+        config = self.native.config
+        count = input_ids.axes[0].size
+        caches = []
+        for index in range(config.num_layers):
+            layer = self.native.layers.get_layer(index)
+            q, k, v = layer.self_attn.project_qkv(layer.input_layernorm(hidden), positions, sharding=layout)
+            q = q.reshape(count, config.num_kv_heads, config.num_heads // config.num_kv_heads, config.actual_head_dim)
+            k = k.reshape(count, config.num_kv_heads, config.actual_head_dim)
+            v = v.reshape(count, config.num_kv_heads, config.actual_head_dim)
+            output, cache = _paged_attention(
+                q,
+                k,
+                v,
+                kv_cache[index],
+                batch_info,
+                model_axis=layout.model_axis,
+                sm_scale=1 / math.sqrt(config.actual_head_dim),
+            )
+            output = output.reshape(1, count, config.num_heads, config.actual_head_dim)
+            attn = layer.self_attn.project_output(output, dtype=hidden.dtype, sharding=layout)
+            hidden = layer.finish_attention(hidden, attn, sharding=layout)
+            caches.append(cache)
+        logits = self.native.unembed(self.native.norm(hidden), sharding=layout)
+        logits = logits.reshape(count, self.Vocab.size)
+        return hax.named(logits, (input_ids.axes[0], self.Vocab)), ListCache(caches)
 
     def compute_next_token_loss(
         self,

@@ -424,6 +424,28 @@ python -m levanter.main.eval_lm --config_path gs://path/to/config.yaml --checkpo
 
 You can also use this script to evaluate on other datasets by modifying the config.
 
+`model.type: llama_native` also works with `eval_lm` and `viz_logprobs`. Configure
+the native architecture, attention backend, rematerialization and mesh mappings
+explicitly, as for [native training](Getting-Started-Training.md). The entrypoints
+select an explicit mesh and load either native Trainer checkpoints or compatible
+HF Llama weights through the shared model loader. Native checkpoint metadata and
+HF `config.json` determine the complete vocabulary, including padded output rows;
+the tokenizer may be smaller. Native checkpoint metadata must match the configured
+semantics. A concrete checkpoint's semantic metadata is validated even when its
+step or timestamp bookkeeping is absent or invalid. For older checkpoints without
+metadata, the entrypoints need the
+original model configuration and a tokenizer vocabulary that already matches the
+checkpoint. Programmatic loaders can instead supply its complete vocabulary axis.
+Metadata-free loading trusts that original configuration; same-shaped weights
+cannot independently verify architecture or activation identity. HF source architecture must
+match the native configuration, and source FP32 master weights remain FP32 until
+evaluation casts them to computation precision. The named-model HF loader retains
+its existing source-config behavior.
+
+Visualization uses the loaded model's vocabulary and supports evaluation sequences
+shorter than the model's configured context. This path has offline CPU coverage;
+it does not add generation, KV caches, or an accelerator performance claim.
+
 
 ## Huggingface Export
 

@@ -1,0 +1,331 @@
+# Copyright The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
+import dataclasses
+
+import equinox as eqx
+import haliax as hax
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from jax.sharding import AxisType, Mesh, PartitionSpec as P
+from tokenizers.processors import TemplateProcessing
+from transformers import AutoTokenizer
+
+from levanter.eval_harness import LevanterHarnessLM, _LmEvalHarnessWorker
+
+from levanter.grug.attention import AttentionMask
+from levanter.inference.engine import InferenceEngine, InferenceEngineConfig, Request
+from levanter.inference.jit_scheduler import SeqDecodingParams, SequenceTable
+from levanter.inference.page_table import PageTable
+from levanter.inference.utils import INVALID
+from levanter.layers.rotary import (
+    DefaultRotaryEmbeddingsConfig,
+    Llama3RotaryEmbeddingsConfig,
+    YarnRotaryEmbeddingsConfig,
+)
+from levanter.models.llama_native import NativeLlamaSharding
+from levanter.models.llama_native_lm import NativeLlamaLmConfig
+from levanter.testing.helpers import skip_if_module_missing
+from levanter.tokenizers import load_tokenizer
+from levanter.utils.activation import ActivationFunctionEnum
+
+
+def _mesh():
+    model_size = 2 if len(jax.devices()) >= 4 else 1
+    return Mesh(
+        np.asarray(jax.devices()).reshape(-1, model_size),
+        ("data", "model"),
+        axis_types=(AxisType.Explicit,) * 2,
+    )
+
+
+def _model(config):
+    return config.build(
+        hax.Axis("vocab", 32),
+        key=jax.random.key(0),
+        sharding=NativeLlamaSharding(batch_axes=("data",), fsdp_axis="data", model_axis="model"),
+    )
+
+
+def _full_logits(model, tokens):
+    batch = jax.sharding.get_abstract_mesh().shape["data"]
+    values = eqx.filter_jit(lambda m, t: m.native(t, AttentionMask.causal()))(
+        model, jnp.asarray([tokens] * batch, dtype=jnp.int32)
+    )
+    return np.asarray(values)[0]
+
+
+@eqx.filter_jit(donate="all-except-first")
+def _decode(operands, cache):
+    model, tokens, positions, info = operands
+    return model.decode(tokens, cache, info, positions)
+
+
+@pytest.mark.tpu
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"num_kv_heads": 4},
+        {"tie_word_embeddings": True, "rope": Llama3RotaryEmbeddingsConfig()},
+        {
+            "use_bias": True,
+            "hybrid_norm": True,
+            "input_embedding_norm": True,
+            "use_qk_norm": True,
+            "rope": YarnRotaryEmbeddingsConfig(factor=8.0),
+        },
+        {"rope": DefaultRotaryEmbeddingsConfig(factor=2.0)},
+        {"activation_function": ActivationFunctionEnum.relu2},
+        {"activation_function": ActivationFunctionEnum.gelu_new, "rope": YarnRotaryEmbeddingsConfig(factor=8.0)},
+    ],
+    ids=["mha", "gqa-tied-llama3", "gqa-norms-yarn", "linear-rope", "relu2", "gelu-new-yarn"],
+)
+def test_native_paged_prefill_continuation_clone_and_reset(options):
+    config = dataclasses.replace(
+        NativeLlamaLmConfig(
+            hidden_dim=16, intermediate_dim=24, num_layers=2, num_heads=4, num_kv_heads=2, max_seq_len=16
+        ),
+        **options,
+    )
+    with jax.set_mesh(_mesh()):
+        model = _model(config)
+        if config.use_bias:
+            model = model.from_state_dict(
+                {
+                    name: value + 0.1 if name.endswith(".bias") else value
+                    for name, value in model.to_state_dict().items()
+                }
+            )
+        sequences = {2: [3, 4, 5, 6, 11, 12], 0: [7, 8, 9, 13, 14]}
+        expected = {slot: _full_logits(model, tokens) for slot, tokens in sequences.items()}
+        table = PageTable.init(max_pages=12, max_seqs=3, page_size=2, max_pages_per_seq=8)
+        state = SequenceTable.init(table.max_seqs, table.pages_per_seq, table.page_size)
+        for slot in [2, 0]:
+            state, _ = state.reserve_slot(slot)
+        cache = model.initial_cache(table.spec(), dtype=jnp.float32)
+        assert cache[0].kv_pages.array.sharding.spec == P(None, None, "model", None)
+        assert model.native.layers.stacked.self_attn.q_proj.weight.sharding.spec == P(None, "model", "data")
+
+        # Slot order differs from slot number, and the continuation changes the
+        # order. Padding is excluded from both page writes and result checks.
+        for values, slots, positions in [
+            ([3, 4, 7], [2, 2, 0], [0, 1, 0]),
+            ([8, 9, 5, 6], [0, 0, 2, 2], [1, 2, 2, 3]),
+            ([11, 13], [2, 0], [4, 3]),
+            ([14, 12], [0, 2], [4, 5]),
+        ]:
+            count = len(values)
+            tokens = hax.named(jnp.asarray(values + [INVALID], dtype=jnp.int32), "position")
+            pos = hax.named(jnp.asarray(positions + [INVALID], dtype=jnp.int32), "position")
+            slot_ids = hax.named(jnp.asarray(slots + [INVALID], dtype=jnp.int32), "position")
+            state, table, info = state.allocate_for_seq(table, slot_ids, pos)
+            logits, cache = _decode((model, tokens, pos, info), cache)
+            np.testing.assert_allclose(
+                np.asarray(logits.array)[:count],
+                np.stack([expected[slot][position] for slot, position in zip(slots, positions, strict=True)]),
+                atol=1e-4,
+                rtol=1e-4,
+            )
+            assert logits.array.sharding.spec == P(None, "model")
+            for layer_cache in cache:
+                pages = np.asarray(layer_cache.kv_pages.array)
+                used_pages = np.asarray(table.page_ref_counts.array) > 0
+                np.testing.assert_array_equal(pages[~used_pages], 0)
+
+        # Clone an actual partial page, then change only the child's next token.
+        state, _ = state.reserve_slot(1)
+        source_page = int(np.asarray(state.page_indices.array)[0, 2])
+        state, table = state.clone_pages_from(table, 0, 1)
+        dest_page = int(np.asarray(state.page_indices.array)[1, 2])
+        assert source_page != dest_page
+        cache = cache.copy_page(source_page, dest_page)
+        parent_pages = np.asarray(state.page_indices.array)[0, :3]
+        parent_before = [np.asarray(c.kv_pages.array)[parent_pages].copy() for c in cache]
+        tokens = hax.named(jnp.asarray([10], dtype=jnp.int32), "position")
+        pos = hax.named(jnp.asarray([5], dtype=jnp.int32), "position")
+        state, table, info = state.allocate_for_seq(table, hax.named(jnp.asarray([1]), "position"), pos)
+        logits, cache = _decode((model, tokens, pos, info), cache)
+        np.testing.assert_allclose(logits.array, _full_logits(model, [7, 8, 9, 13, 14, 10])[5:6], atol=1e-4, rtol=1e-4)
+        for before, layer_cache in zip(parent_before, cache, strict=True):
+            np.testing.assert_array_equal(np.asarray(layer_cache.kv_pages.array)[parent_pages], before)
+        reset = eqx.filter_jit(lambda c: c.reset(), donate="all")(cache)
+        for layer_cache in reset:
+            np.testing.assert_array_equal(layer_cache.kv_pages.array, 0)
+            assert layer_cache.kv_pages.array.sharding.spec == P(None, None, "model", None)
+
+
+def _greedy_tokens(model, prompt, count):
+    sequence = list(prompt)
+    for _ in range(count):
+        sequence.append(int(np.argmax(_full_logits(model, sequence)[-1])))
+    return sequence[len(prompt) :]
+
+
+@pytest.mark.tpu
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=["fp32", "bf16-greedy-only"])
+def test_native_engine_prefill_incremental_generation_and_reuse(dtype):
+    with jax.set_mesh(_mesh()):
+        model = _model(
+            NativeLlamaLmConfig(
+                hidden_dim=16, intermediate_dim=24, num_layers=1, num_heads=4, num_kv_heads=2, max_seq_len=16
+            )
+        )
+        model = jax.tree.map(lambda value: value.astype(dtype) if eqx.is_inexact_array(value) else value, model)
+        prompts = [[3, 4, 5], [7]]
+        expected = [_greedy_tokens(model, prompt, 3) for prompt in prompts]
+        engine = InferenceEngine.from_model_with_config(
+            model,
+            None,
+            InferenceEngineConfig(
+                max_seq_len=16,
+                max_seqs=3,
+                max_pages=24,
+                page_size=2,
+                max_queued_tokens=16,
+                max_seqs_in_prefill=2,
+                max_prefill_size=8,
+                max_rounds=4,
+                max_tokens_per_round=2,
+                compute_dtype=dtype,
+            ),
+            axis_resources={"kv_head": "model"},
+        )
+        requests = [
+            Request(
+                prompt_tokens=prompt,
+                request_id=index,
+                n_generations=1,
+                decode_params=SeqDecodingParams(
+                    max_num_tokens=jnp.asarray(len(prompt) + 3, dtype=jnp.int32),
+                    temperature=jnp.asarray(0.0),
+                    top_p=jnp.asarray(1.0),
+                    stop_tokens=None,
+                    key=jax.random.PRNGKey(index),
+                ),
+            )
+            for index, prompt in enumerate(prompts)
+        ]
+        for _ in range(2):
+            result = engine.generate(requests)
+            actual = [result.tokens[index] for index in range(len(prompts))]
+            assert actual == expected
+        assert engine.gen_state.cache[0].kv_pages.array.sharding.spec == P(None, None, "model", None)
+
+
+@pytest.mark.tpu
+def test_native_bf16_paged_chunks_preserve_prefill_logits_and_cache():
+    # This checks temporal cache semantics. Full-forward BF16 numerical parity
+    # remains separate: the shared paged reference has different accumulation.
+    with jax.set_mesh(_mesh()):
+        model = _model(
+            NativeLlamaLmConfig(
+                hidden_dim=16, intermediate_dim=24, num_layers=2, num_heads=4, num_kv_heads=2, max_seq_len=16
+            )
+        )
+        model = jax.tree.map(lambda value: value.astype(jnp.bfloat16) if eqx.is_inexact_array(value) else value, model)
+        outputs = []
+        for chunks in [
+            [([3, 4, 5, 6, 7, 8, 9], [2, 2, 2, 2, 0, 0, 0], [0, 1, 2, 3, 0, 1, 2])],
+            [([3, 4, 7], [2, 2, 0], [0, 1, 0]), ([5, 6, 8, 9], [2, 2, 0, 0], [2, 3, 1, 2])],
+        ]:
+            table = PageTable.init(8, 3, 2, 8)
+            state = SequenceTable.init(3, 8, 2)
+            for slot in [2, 0]:
+                state, _ = state.reserve_slot(slot)
+            cache = model.initial_cache(table.spec(), dtype=jnp.bfloat16)
+            logits_by_position = {}
+            for values, slots, positions in chunks:
+                tokens = hax.named(jnp.asarray(values, dtype=jnp.int32), "position")
+                pos = hax.named(jnp.asarray(positions, dtype=jnp.int32), "position")
+                state, table, info = state.allocate_for_seq(
+                    table, hax.named(jnp.asarray(slots, dtype=jnp.int32), "position"), pos
+                )
+                logits, cache = _decode((model, tokens, pos, info), cache)
+                for row, slot, position in zip(np.asarray(logits.array), slots, positions, strict=True):
+                    logits_by_position[slot, position] = row
+            outputs.append((logits_by_position, cache, state))
+        for coordinate, logits in outputs[0][0].items():
+            np.testing.assert_array_equal(outputs[1][0][coordinate], logits)
+        for reference, actual in zip(outputs[0][1], outputs[1][1], strict=True):
+            assert actual.kv_pages.dtype == jnp.bfloat16
+            # Allocation order changes physical page numbers; compare the
+            # sequence-addressed cache, not incidental allocator page ids.
+            for slot, count in [(2, 4), (0, 3)]:
+                ref_pages = np.asarray(outputs[0][2].page_indices.array)[slot, : (count + 1) // 2]
+                out_pages = np.asarray(outputs[1][2].page_indices.array)[slot, : (count + 1) // 2]
+                ref = np.asarray(reference.kv_pages.array)[ref_pages].reshape(-1, *reference.kv_pages.array.shape[2:])
+                out = np.asarray(actual.kv_pages.array)[out_pages].reshape(-1, *actual.kv_pages.array.shape[2:])
+                np.testing.assert_array_equal(out[:count], ref[:count])
+
+
+@pytest.fixture
+def native_generation_harness(tmp_path, tiny_hf_tokenizer_path):
+    hf_tokenizer = AutoTokenizer.from_pretrained(tiny_hf_tokenizer_path, model_max_length=4, truncation_side="left")
+    hf_tokenizer.add_tokens(["token31"])
+    hf_tokenizer.backend_tokenizer.post_processor = TemplateProcessing(single="<s> $A", special_tokens=[("<s>", 1)])
+    destination = tmp_path / "generation-tokenizer"
+    hf_tokenizer.save_pretrained(destination)
+    tokenizer = load_tokenizer(str(destination))
+    with jax.set_mesh(_mesh()):
+        model = _model(
+            NativeLlamaLmConfig(
+                hidden_dim=16, intermediate_dim=24, num_layers=1, num_heads=4, num_kv_heads=2, max_seq_len=64
+            )
+        )
+        model = jax.tree.map(lambda value: value.astype(jnp.bfloat16) if eqx.is_inexact_array(value) else value, model)
+        worker = _LmEvalHarnessWorker(
+            hax.Axis("batch", 2),
+            hax.Axis("position", 64),
+            model,
+            {"kv_head": "model", "heads": "model", "mlp": "model", "vocab": "model"},
+            tokenizer,
+            None,
+            2,
+            generation_kwargs={"max_gen_toks": 3, "temperature": 0.0, "n": 1, "seed": 0},
+        )
+        yield LevanterHarnessLM(worker)
+
+
+def test_harness_marin_tokenization_preserves_specials_and_explicit_hf_truncation(native_generation_harness):
+    harness = native_generation_harness
+    text = "token3 token4 token5 token6 token7"
+    assert harness.tok_encode(text) == [3, 4, 5, 6, 7]
+    assert harness.tok_encode(text, add_special_tokens=True) == [1, 3, 4, 5, 6, 7]
+    assert harness.tok_encode([text, "token8"], add_special_tokens=True) == [[1, 3, 4, 5, 6, 7], [1, 8]]
+    assert harness.tok_encode(text, left_truncate_len=2, add_special_tokens=True) == [6, 7]
+    assert harness.tok_encode([text, "token8"], left_truncate_len=2) == [[6, 7], [8]]
+    assert harness.tok_encode(text, truncation=True, add_special_tokens=True) == [1, 5, 6, 7]
+    assert harness.tok_encode([text, "token8"], truncation=True, add_special_tokens=True, left_truncate_len=3) == [
+        [5, 6, 7],
+        [1, 8],
+    ]
+
+
+@pytest.mark.tpu
+@skip_if_module_missing("lm_eval")
+def test_native_generate_until_uses_real_prefill_incremental_cache_and_stop(native_generation_harness):
+    from lm_eval.api.instance import Instance  # noqa: PLC0415  # optional dep: lm_eval
+
+    harness = native_generation_harness
+    prompts = ["token3 token4 token5", "token7"]
+    tokens = harness.tokenizer.encode_batch(prompts)
+    expected_ids = [_greedy_tokens(harness.leader.model, prompt, 3) for prompt in tokens]
+    stop = harness.tokenizer.decode([expected_ids[1][-1]])
+    requests = [
+        Instance(
+            request_type="generate_until",
+            doc={},
+            arguments=(prompt, {"until": ["token31"] if index == 0 else [stop], "max_gen_toks": 3}),
+            idx=index,
+            metadata=("native-local", index, None),
+        )
+        for index, prompt in enumerate(prompts)
+    ]
+    actual = harness.generate_until(requests)
+    expected = [harness.tokenizer.decode(ids, skip_special_tokens=True) for ids in expected_ids]
+    expected[1] = expected[1].split(stop)[0]
+    assert actual == expected
+    assert actual[0]
+    assert actual[1].strip() == harness.tokenizer.decode(expected_ids[1][:-1], skip_special_tokens=True)

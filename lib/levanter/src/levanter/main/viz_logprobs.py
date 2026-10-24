@@ -4,7 +4,7 @@
 import logging
 import os
 import typing
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import jax
 import jmp
@@ -17,8 +17,9 @@ import levanter
 import levanter.config
 from levanter.data.loader import DataLoader
 from levanter.data.text.datasets import LmDataConfig
-from levanter.model_loading import load_hf_checkpoint, load_levanter_checkpoint
+from levanter.model_loading import load_hf_checkpoint, load_levanter_checkpoint, native_evaluation_axis_mapping
 from levanter.models.llama import LlamaConfig
+from levanter.models.llama_native_lm import NativeLlamaLmConfig
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel, split_activations
 from levanter.models.loss import next_token_loss
 from levanter.trainer import TrainerConfig
@@ -50,6 +51,8 @@ class VizLmConfig:
 
 
 def main(config: VizLmConfig):
+    if config.model.requires_explicit_mesh_axes:
+        config = replace(config, trainer=replace(config.trainer, use_explicit_mesh_axes=True))
     levanter.trainer.initialize(config)
     tokenizer = config.data.the_tokenizer
 
@@ -61,6 +64,14 @@ def main(config: VizLmConfig):
 
     compute_axis_mapping = config.trainer.compute_axis_mapping
     parameter_axis_mapping = config.trainer.parameter_axis_mapping
+    if isinstance(config.model, NativeLlamaLmConfig):
+        compute_axis_mapping = native_evaluation_axis_mapping(
+            config.model,
+            parameter_axis_mapping,
+            compute_axis_mapping,
+            config.trainer.device_mesh,
+            config.trainer.batch_axis_name,
+        )
 
     with config.trainer.use_device_mesh():
         key = jax.random.PRNGKey(0)
@@ -83,7 +94,7 @@ def main(config: VizLmConfig):
             logits = hax.dot(activations, model.get_lm_head(), axis=model.Embed)
 
             loss = next_token_loss(
-                model.Pos,
+                Pos,
                 model.Vocab,
                 logits=logits,
                 true_ids=example.tokens,
@@ -94,7 +105,7 @@ def main(config: VizLmConfig):
             # roll forward to get the loss for each predicted token
             logprobs = hax.roll(logprobs, 1, Pos)
             logits = hax.roll(logits, 1, Pos)
-            argmaxes = hax.argmax(logits, axis=Vocab)
+            argmaxes = hax.argmax(logits, axis=model.Vocab)
             return logprobs.rearrange((EvalBatch, Pos)).array, argmaxes.rearrange((EvalBatch, Pos)).array
 
         model: LmHeadModel
@@ -105,6 +116,8 @@ def main(config: VizLmConfig):
                 axis_mapping=parameter_axis_mapping,
                 tokenizer=tokenizer,
                 compute_dtype=mp.compute_dtype,
+                compute_axis_mapping=config.trainer.compute_axis_mapping,
+                batch_axis_name=config.trainer.batch_axis_name,
             )
         else:
             model = load_levanter_checkpoint(
@@ -113,6 +126,8 @@ def main(config: VizLmConfig):
                 Vocab=Vocab,
                 axis_mapping=parameter_axis_mapping,
                 key=key,
+                compute_axis_mapping=config.trainer.compute_axis_mapping,
+                batch_axis_name=config.trainer.batch_axis_name,
             )
         model = typing.cast(LmHeadModel, inference_mode(model, True))
 
@@ -125,6 +140,8 @@ def main(config: VizLmConfig):
                     axis_mapping=parameter_axis_mapping,
                     tokenizer=tokenizer,
                     compute_dtype=mp.compute_dtype,
+                    compute_axis_mapping=config.trainer.compute_axis_mapping,
+                    batch_axis_name=config.trainer.batch_axis_name,
                 )
             else:
                 comparison_model = load_levanter_checkpoint(
@@ -133,6 +150,8 @@ def main(config: VizLmConfig):
                     Vocab=Vocab,
                     axis_mapping=parameter_axis_mapping,
                     key=key,
+                    compute_axis_mapping=config.trainer.compute_axis_mapping,
+                    batch_axis_name=config.trainer.batch_axis_name,
                 )
             comparison_model = typing.cast(LmHeadModel, inference_mode(comparison_model, True))
 
@@ -145,9 +164,9 @@ def main(config: VizLmConfig):
 
             loader = DataLoader(
                 dataset,
-                config.trainer.eval_batch_size,
+                EvalBatch,
                 mesh=config.trainer.device_mesh,
-                axis_resources=config.trainer.compute_axis_mapping,
+                axis_resources=compute_axis_mapping,
             )
 
             if name:

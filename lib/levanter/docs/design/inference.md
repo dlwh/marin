@@ -90,3 +90,44 @@ The inference server is built around a `GenerationService` that encapsulates:
 - **Configuration**: Uses `draccus` for configuration management, consistent with other Levanter components
 - **Error Handling**: Comprehensive error reporting with proper HTTP status codes
 - **Logging**: Structured logging with configurable verbosity levels
+
+## Native Llama paged model boundary
+
+`NativeLlamaLmHeadModel.initial_cache(spec, dtype=...)` allocates the existing
+`ListCache[KvPageCache]`, one cache per layer. `decode(tokens, cache, batch_info,
+pos_ids)` serves both packed prefill and incremental decoding through the existing
+`InferenceEngine`. The model math remains array-native; the named boundary reuses
+`PageBatchInfo`, KV updates and ragged paged attention. Ordinary forward and
+cached decoding share the configured stateless MLP activation, including
+non-default activations.
+
+Tokens and absolute per-sequence position IDs have one packed `position` axis.
+Sequence tokens must be contiguous, and padding must follow the valid prefix in
+`batch_info`. The page table supplies cached-prefix lengths and causal sequence
+boundaries. This API does not accept arbitrary attention masks or implement
+sequence-parallel or multihost serving.
+
+The packed stream and page table are replicated across data axes. Stored weights
+retain their FSDP layout, while computation gathers that storage dimension and
+partitions attention/cache heads over the model axis. The KV head count must be divisible by the
+model-axis size so each shard retains whole interleaved K/V pairs. Cache arrays
+use `[page, slot, 2 * kv_heads, head_size]`; page and slot axes are replicated.
+Output projection retains vocabulary shards. The engine selects the rows to
+sample before the shared sampler gathers their full vocabulary for sampling,
+selected-token log-probabilities and optional nucleus sorting. This also applies
+when the nucleus cutoff is omitted; other axis mappings remain in place. This
+layout does not imply a throughput improvement over the existing decoder.
+
+Cache dtype is the explicit `initial_cache` argument; engine `compute_dtype`
+controls cache allocation and does not cast model parameters. KV updates cast to
+that cache dtype. BF16 paged reference accumulation can differ from ordinary
+full-sequence attention. Cache/chunk consistency and a matching greedy example
+are narrower checks than full-forward numerical parity. TPU ragged attention
+may fall back to its reference implementation, so a dispatcher result alone does
+not validate the accelerator kernel or mixed query/cache dtype support.
+
+The native methods consume and return the existing donated cache state. Callers
+must retain the returned cache and use existing page-copy/reset behavior for
+clones and subsequent requests. Canonical model selection and sampling loaders
+are separate migration steps. All source vocabulary rows are retained; deciding
+which rows are valid tokenizer outputs remains an entrypoint policy.

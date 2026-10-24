@@ -6,12 +6,14 @@ import dataclasses
 import json
 import math
 import os
+import re
 import shutil
 import tempfile
 from pathlib import Path
 
 import equinox as eqx
 import draccus
+import haliax as hax
 import jax
 import jax.numpy as jnp
 import jax.random as jrandom
@@ -27,6 +29,8 @@ from haliax.quantization import QuantizationConfig
 from jax.sharding import PartitionSpec as P
 
 import levanter.main.train_lm as train_lm
+import levanter.main.eval_lm as eval_lm
+import levanter.main.viz_logprobs as viz_logprobs
 from levanter.testing import tiny_corpus
 from levanter.adaptor import LoraAdaptorConfig
 from levanter.checkpoint import (
@@ -34,18 +38,23 @@ from levanter.checkpoint import (
     discover_checkpoint_candidates,
     latest_checkpoint_path,
     load_checkpoint,
+    save_checkpoint,
 )
 from levanter.data.dataset import ListAsyncDataset
 from levanter.data.text.datasets import DirectDatasetComponent, LmDataConfig
 from levanter.data.text.examples import GrugLmExample
+from levanter.compat.hf_checkpoints import RepoRef
 from levanter.distributed import DistributedConfig
 from levanter.models.llama_native import NativeLlamaSharding
+from levanter.layers.attention import AttentionMask
 from levanter.layers.rotary import DefaultRotaryEmbeddingsConfig
 from levanter.tokenizers import load_tokenizer
 from levanter.models.llama import LlamaLMHeadModel
-from levanter.models.llama_native_lm import NativeLlamaLmConfig
+from levanter.models.llama_native_lm import NativeLlamaLmConfig, native_llama_sharding
+from levanter.utils.activation import ActivationFunctionEnum
+from levanter.model_loading import load_hf_checkpoint, load_levanter_checkpoint
 from levanter.optim.config import AdamConfig, ConstantLrSchedule
-from levanter.tracker import NoopConfig
+from levanter.tracker import NoopConfig, NoopTracker, current_tracker
 from levanter.tracker.json_file import JsonFileTrackerConfig
 from levanter.trainer_state import TrainerState, trainables_only
 from levanter.testing.helpers import arrays_only, use_test_mesh
@@ -223,7 +232,8 @@ def test_train_lm_direct_dataset():
 
 @pytest.mark.tpu
 @pytest.mark.timeout(120)
-def test_native_train_lm_validates_and_resumes_identical_checkpoint_state(tmp_path):
+@pytest.mark.parametrize("activation_function", ["silu", "gelu_new"])
+def test_native_train_lm_validates_and_resumes_identical_checkpoint_state(tmp_path, activation_function):
     parsed = draccus.decode(
         train_lm.TrainLmConfig,
         {
@@ -236,6 +246,7 @@ def test_native_train_lm_validates_and_resumes_identical_checkpoint_state(tmp_pa
                 "num_kv_heads": 2,
                 "max_seq_len": 16,
                 "gradient_checkpointing": {"save_carries": False, "save_inputs": True, "nested": 2},
+                "activation_function": activation_function,
             }
         },
     )
@@ -294,6 +305,29 @@ def test_native_train_lm_validates_and_resumes_identical_checkpoint_state(tmp_pa
     train_lm.main(configuration("resumed", 2))
     resumed = configuration("resumed", 3, resume=True)
     train_lm.main(resumed)
+    incompatible = dataclasses.replace(
+        resumed,
+        model=dataclasses.replace(
+            resumed.model,
+            activation_function=(
+                ActivationFunctionEnum.gelu_new if activation_function == "silu" else ActivationFunctionEnum.silu
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="checkpoint architecture"):
+        train_lm.main(incompatible)
+    if activation_function != "silu":
+        checkpoint = discover_checkpoint_candidates(tmp_path / "resumed/checkpoints/native")[-1]
+        metadata_path = Path(checkpoint.path) / "metadata.json"
+        original_metadata = metadata_path.read_text()
+        metadata = json.loads(original_metadata)
+        del metadata["levanter_model"]["architecture"]["activation_function"]
+        metadata_path.write_text(json.dumps(metadata))
+        try:
+            with pytest.raises(ValueError, match="checkpoint architecture"):
+                train_lm.main(resumed)
+        finally:
+            metadata_path.write_text(original_metadata)
     for name in ("full", "resumed"):
         metrics = _assert_training_recorded(str(tmp_path / name / "tracker"))
         assert math.isfinite(metrics["eval/loss"])
@@ -361,6 +395,292 @@ def native_hf_source(tmp_path, request):
         tie_word_embeddings=request.param,
     )
     return _write_llama_checkpoint(tmp_path / "hf-source", config, config.to_hf_config(32))
+
+
+@pytest.mark.tpu
+@pytest.mark.parametrize("activation_function", [ActivationFunctionEnum.silu, ActivationFunctionEnum.gelu_new])
+def test_native_shared_loaders_preserve_master_weights_vocab_and_semantics(
+    tmp_path, native_hf_source, tiny_hf_tokenizer_path, activation_function
+):
+    source_config = dataclasses.replace(native_hf_source.config, activation_function=activation_function)
+    source_config.to_hf_config(32).save_pretrained(native_hf_source.path)
+    model_config = dataclasses.replace(
+        NativeLlamaLmConfig.from_hf_config(source_config.to_hf_config(32)),
+        max_seq_len=32,
+        reference_checkpoint=str(tmp_path / "unused-default-reference"),
+    )
+    model_size = 2 if len(jax.devices()) >= 4 else 1
+    trainer = train_lm.TrainerConfig(
+        use_explicit_mesh_axes=True,
+        mesh=MeshConfig(axes={"data": len(jax.devices()) // model_size, "model": model_size}),
+    )
+    tokenizer = load_tokenizer(tiny_hf_tokenizer_path)
+    loader_args = dict(
+        axis_mapping=trainer.parameter_axis_mapping,
+        compute_axis_mapping=trainer.compute_axis_mapping,
+        batch_axis_name=trainer.batch_axis_name,
+    )
+    batch, position = Axis("batch", 2 * trainer.device_mesh.shape["data"]), Axis("position", 4)
+    tokens = hax.named(
+        (jnp.arange(batch.size * position.size).reshape(batch.size, position.size) * 3) % 31, (batch, position)
+    )
+    optimizer_config = AdamConfig(
+        learning_rate=0.1, weight_decay=0.2, warmup=0, lr_schedule="constant", max_grad_norm=None
+    )
+    with current_tracker(NoopTracker()), use_test_mesh(), hax.axis_mapping({}):
+        named = source_config.build(Axis("vocab", 32), key=jrandom.PRNGKey(13))
+        for name, value in to_torch_compatible_state_dict(named).items():
+            np.testing.assert_array_equal(value, native_hf_source.weights[name])
+        expected_logits = np.asarray(eqx.filter_jit(lambda m: m(tokens, AttentionMask.causal()).array)(named))
+        optimizer = optimizer_config.build(4)
+        named_updates, _ = optimizer.update(jax.tree.map(jnp.zeros_like, named), optimizer.init(named), params=named)
+        expected_updates = to_torch_compatible_state_dict(named_updates)
+    checkpoint_root = tmp_path / "native-checkpoints"
+    with current_tracker(NoopTracker()), trainer.use_device_mesh():
+        model = load_hf_checkpoint(
+            model_config, str(native_hf_source.path), tokenizer=tokenizer, compute_dtype=jnp.bfloat16, **loader_args
+        )
+        assert model.Vocab.size == 32
+        assert isinstance(model.config, NativeLlamaLmConfig)
+        assert model.config.max_seq_len == 32
+        assert model.native.token_embeddings.sharding.spec == P("model", "data")
+        actual = to_torch_compatible_state_dict(model)
+        for name, expected in native_hf_source.weights.items():
+            np.testing.assert_array_equal(actual[name], expected)
+            assert actual[name].dtype == np.float32
+        np.testing.assert_allclose(
+            eqx.filter_jit(lambda m: m(tokens, AttentionMask.causal()).array)(model),
+            expected_logits,
+            atol=1e-5,
+            rtol=1e-5,
+        )
+        optimizer = optimizer_config.build(4)
+        # Real zero-gradient updates isolate default decay on the source-loaded tree.
+        updates, _ = optimizer.update(jax.tree.map(jnp.zeros_like, model), optimizer.init(model), params=model)
+        for name, update in to_torch_compatible_state_dict(updates).items():
+            np.testing.assert_allclose(update, expected_updates[name], atol=1e-5, rtol=1e-5, err_msg=name)
+        save_checkpoint({"model": model}, 1, str(checkpoint_root / "step-1"), metadata=model.checkpoint_metadata())
+        shutil.rmtree(native_hf_source.path)
+        restored = load_levanter_checkpoint(
+            model_config,
+            str(checkpoint_root),
+            Vocab=Axis("vocab", len(tokenizer)),
+            key=jrandom.PRNGKey(0),
+            **loader_args,
+        )
+        for name, expected in actual.items():
+            np.testing.assert_array_equal(to_torch_compatible_state_dict(restored)[name], expected)
+        assert restored.native.layers.stacked.mlp.down_proj.weight.sharding.spec == P(None, "data", "model")
+        np.testing.assert_allclose(
+            eqx.filter_jit(lambda m: m(tokens, AttentionMask.causal()).array)(restored),
+            expected_logits,
+            atol=1e-5,
+            rtol=1e-5,
+        )
+        # Equal q/k/v/out tensor shapes do not imply equal attention geometry.
+        different_heads = dataclasses.replace(model_config, num_heads=2, num_kv_heads=1, head_dim=8)
+        for incompatible in (
+            different_heads,
+            dataclasses.replace(model_config, rope=DefaultRotaryEmbeddingsConfig(factor=8)),
+            dataclasses.replace(
+                model_config,
+                activation_function=(
+                    ActivationFunctionEnum.gelu_new
+                    if activation_function == ActivationFunctionEnum.silu
+                    else ActivationFunctionEnum.silu
+                ),
+            ),
+        ):
+            with pytest.raises(ValueError, match="architecture"):
+                load_levanter_checkpoint(
+                    incompatible,
+                    str(checkpoint_root),
+                    Vocab=Axis("vocab", len(tokenizer)),
+                    key=jrandom.PRNGKey(0),
+                    **loader_args,
+                )
+
+
+@pytest.mark.tpu
+@pytest.mark.parametrize("bookkeeping", ["missing-step", "invalid-step", "invalid-timestamp"])
+def test_native_shared_checkpoint_validates_identity_without_discovery_bookkeeping(tmp_path, bookkeeping):
+    model_config = NativeLlamaLmConfig(
+        hidden_dim=8,
+        intermediate_dim=16,
+        num_layers=1,
+        num_heads=2,
+        num_kv_heads=2,
+        max_seq_len=4,
+        activation_function=ActivationFunctionEnum.gelu_new,
+    )
+    model_size = 2 if len(jax.devices()) >= 4 else 1
+    trainer = train_lm.TrainerConfig(
+        use_explicit_mesh_axes=True,
+        mesh=MeshConfig(axes={"data": len(jax.devices()) // model_size, "model": model_size}),
+    )
+    loader_args = dict(
+        Vocab=Axis("vocab", 32),
+        key=jrandom.PRNGKey(1),
+        axis_mapping=trainer.parameter_axis_mapping,
+        compute_axis_mapping=trainer.compute_axis_mapping,
+        batch_axis_name=trainer.batch_axis_name,
+    )
+    checkpoint = tmp_path / "checkpoint"
+    with trainer.use_device_mesh():
+        sharding = native_llama_sharding(
+            trainer.parameter_axis_mapping, trainer.compute_axis_mapping, trainer.batch_axis_name
+        )
+        model = model_config.build(Axis("vocab", 32), key=jrandom.PRNGKey(0), sharding=sharding)
+        expected = to_torch_compatible_state_dict(model)
+        batch, position = Axis("batch", 2 * trainer.device_mesh.shape["data"]), Axis("position", 4)
+        tokens = hax.named(
+            jnp.arange(batch.size * position.size).reshape(batch.size, position.size) % 31, (batch, position)
+        )
+        expected_logits = np.asarray(eqx.filter_jit(lambda m: m(tokens, AttentionMask.causal()).array)(model))
+        save_checkpoint({"model": model}, 1, str(checkpoint), metadata=model.checkpoint_metadata())
+        metadata_path = checkpoint / "metadata.json"
+        metadata = json.loads(metadata_path.read_text())
+        if bookkeeping == "missing-step":
+            del metadata["step"]
+        elif bookkeeping == "invalid-step":
+            metadata["step"] = "invalid"
+        else:
+            metadata["timestamp"] = "invalid"
+        metadata_path.write_text(json.dumps(metadata))
+        assert discover_checkpoint_candidates(checkpoint) == []
+        with pytest.raises(ValueError, match="architecture"):
+            load_levanter_checkpoint(
+                dataclasses.replace(model_config, activation_function=ActivationFunctionEnum.silu),
+                str(checkpoint),
+                **loader_args,
+            )
+        invalid_version = {**metadata, "levanter_model": {**metadata["levanter_model"], "version": 99}}
+        metadata_path.write_text(json.dumps(invalid_version))
+        with pytest.raises(ValueError, match="Unsupported checkpoint model metadata"):
+            load_levanter_checkpoint(model_config, str(checkpoint), **loader_args)
+        metadata_path.write_text(json.dumps(metadata))
+        restored = load_levanter_checkpoint(
+            model_config, str(checkpoint), **{**loader_args, "Vocab": Axis("vocab", 31)}
+        )
+        assert restored.Vocab.size == 32
+        # Missing semantic identity deliberately trusts the ORIGINAL nondefault
+        # configuration and complete vocabulary; it does not infer SiLU.
+        without_identity = {key: value for key, value in metadata.items() if key != "levanter_model"}
+        metadata_path.write_text(json.dumps(without_identity))
+        legacy = load_levanter_checkpoint(model_config, str(checkpoint), **loader_args)
+        for loaded in (restored, legacy):
+            for name, value in to_torch_compatible_state_dict(loaded).items():
+                np.testing.assert_array_equal(value, expected[name])
+            np.testing.assert_allclose(
+                eqx.filter_jit(lambda m: m(tokens, AttentionMask.causal()).array)(loaded),
+                expected_logits,
+                atol=1e-5,
+                rtol=1e-5,
+            )
+        metadata_path.write_text("{")
+        with pytest.raises(json.JSONDecodeError):
+            load_levanter_checkpoint(model_config, str(checkpoint), **loader_args)
+
+
+def test_named_shared_hf_loader_retains_source_config_reconstruction(native_hf_source, tiny_hf_tokenizer_path):
+    tokenizer = load_tokenizer(tiny_hf_tokenizer_path)
+    supplied_config = dataclasses.replace(
+        native_hf_source.config,
+        hidden_dim=32,
+        num_layers=1,
+        reference_checkpoint=tiny_hf_tokenizer_path,
+    )
+    with use_test_mesh():
+        model = load_hf_checkpoint(
+            supplied_config,
+            str(native_hf_source.path),
+            tokenizer=tokenizer,
+            compute_dtype=jnp.float32,
+            axis_mapping={},
+        )
+        actual = to_torch_compatible_state_dict(model)
+    assert isinstance(model, LlamaLMHeadModel)
+    assert model.config.hidden_dim != supplied_config.hidden_dim
+    for name, expected in native_hf_source.weights.items():
+        np.testing.assert_array_equal(actual[name], expected)
+
+
+@pytest.mark.tpu
+@pytest.mark.parametrize("source_kind", ["hf", "levanter"])
+def test_native_eval_and_visualization_use_shared_loaders(
+    tmp_path, native_hf_source, tiny_hf_tokenizer_path, source_kind
+):
+    model_config = dataclasses.replace(
+        NativeLlamaLmConfig.from_hf_config(native_hf_source.config.to_hf_config(32)),
+        reference_checkpoint=str(tmp_path / "unused-default-reference"),
+    )
+    model_size = 2 if len(jax.devices()) >= 4 else 1
+    data_size = len(jax.devices()) // model_size
+    trainer = train_lm.TrainerConfig(
+        id="native-eval",
+        per_device_eval_parallelism=1,
+        max_eval_batches=1,
+        mesh=MeshConfig(axes={"data": data_size, "model": model_size}, batch_axis_name="examples"),
+        tracker=JsonFileTrackerConfig(output_path=str(tmp_path / "eval")),
+        require_accelerator=False,
+        distributed=DistributedConfig(initialize_jax_distributed=False),
+        log_xla_hlo=False,
+        log_jaxprs=False,
+    )
+    examples = ListAsyncDataset([GrugLmExample.causal((jnp.arange(8) + i) % 31) for i in range(data_size)])
+    data = LmDataConfig(
+        tokenizer=tiny_hf_tokenizer_path,
+        shuffle=False,
+        components={"direct": DirectDatasetComponent(datasets={"validation": examples})},
+    )
+    source = str(native_hf_source.path)
+    if source_kind == "levanter":
+        with dataclasses.replace(trainer, use_explicit_mesh_axes=True).use_device_mesh():
+            model = load_hf_checkpoint(
+                model_config,
+                source,
+                tokenizer=data.the_tokenizer,
+                compute_dtype=jnp.float32,
+                axis_mapping=trainer.parameter_axis_mapping,
+                compute_axis_mapping=trainer.compute_axis_mapping,
+                batch_axis_name=trainer.batch_axis_name,
+            )
+            source = str(tmp_path / "checkpoint")
+            save_checkpoint({"model": model}, 1, source, metadata=model.checkpoint_metadata())
+        shutil.rmtree(native_hf_source.path)
+    eval_lm.main(
+        eval_lm.EvalLmConfig(
+            model=model_config,
+            data=data,
+            trainer=trainer,
+            max_eval_length=8,
+            hf_checkpoint=RepoRef.from_string(source) if source_kind == "hf" else None,
+            checkpoint_path=source if source_kind == "levanter" else None,
+        )
+    )
+    metrics = json.loads((tmp_path / "eval/eval_results.json").read_text())
+    assert math.isfinite(metrics["eval/loss"])
+    viz_logprobs.main(
+        viz_logprobs.VizLmConfig(
+            model=model_config,
+            data=data,
+            trainer=dataclasses.replace(trainer, tracker=NoopConfig()),
+            max_eval_length=8,
+            checkpoint_path=source,
+            checkpoint_is_hf=source_kind == "hf",
+            comparison_model_path=source,
+            comparison_is_hf=source_kind == "hf",
+            path=str(tmp_path / "visualization"),
+            num_docs=data_size,
+        )
+    )
+    html = (tmp_path / "visualization/direct.html").read_text()
+    diff = (tmp_path / "visualization/direct_diff.html").read_text()
+    log_probs = [float(value) for value in re.findall("data-lp='([^']+)'", html)]
+    differences = [float(value) for value in re.findall("data-diff='([^']+)'", diff)]
+    assert len(log_probs) == 8 * data_size
+    assert np.isfinite(log_probs).all()
+    np.testing.assert_array_equal(differences, np.zeros(8 * data_size))
 
 
 @pytest.mark.tpu

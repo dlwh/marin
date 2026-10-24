@@ -717,14 +717,16 @@ class LevanterHarnessLM(TemplateLM):
         Returns:
             Token IDs as a list (for single string) or list of lists (for multiple strings).
         """
-        if not add_special_tokens:
-            add_special_tokens = False
-        encoding: Union[List[List[int]], List[int]] = self.tokenizer(
-            string,
-            add_special_tokens=add_special_tokens,
-            truncation=truncation,
-            return_attention_mask=False,
-        ).input_ids
+        if truncation:
+            # Retain HF model_max_length/truncation_side semantics for this
+            # explicit option; the Marin encode APIs do not expose truncation.
+            encoding = self.tokenizer.as_hf_tokenizer()(
+                string, add_special_tokens=add_special_tokens, truncation=True, return_attention_mask=False
+            ).input_ids
+        elif isinstance(string, str):
+            encoding = self.tokenizer.encode(string, add_special_tokens=add_special_tokens)
+        else:
+            encoding = self.tokenizer.encode_batch(list(string), add_special_tokens=add_special_tokens)
 
         # left-truncate the encoded context to be at most `left_truncate_len` tokens long
         if left_truncate_len:
@@ -843,7 +845,7 @@ class LevanterHarnessLM(TemplateLM):
 
         # Process stop sequences for each request individually
         # Get EOS token for stop sequence handling
-        eos = self.tokenizer.decode(self.eot_token_id)
+        eos = self.tokenizer.decode([self.eot_token_id])
 
         # Process stop sequences and tokenize them for each request
         for gen_kwargs in processed_kwargs_list:
@@ -877,7 +879,7 @@ class LevanterHarnessLM(TemplateLM):
             model=self.leader.model,
             tokenizer=self.tokenizer,
             config=engine_cfg,
-            axis_resources=self.compute_axis_resources,
+            axis_resources=self.axis_resources,
         )
 
         # Build generation requests

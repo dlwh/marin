@@ -25,18 +25,28 @@ from levanter.models.llama import LlamaConfig, LlamaLMHeadModel
 from levanter.models.llama_native import NativeLlamaConfig, NativeLlamaModel, NativeLlamaSharding
 from levanter.models.llama_native_lm import NativeLlamaLmConfig
 from levanter.models.lm_model import LmExample
+from levanter.optim.config import AdamConfig
+from levanter.tracker import NoopTracker, current_tracker
 from levanter.testing.helpers import skip_if_no_torch
 from levanter.tokenizers import load_tokenizer
+from levanter.utils.activation import ActivationFunctionEnum
 
 
 @pytest.mark.tpu
 @pytest.mark.parametrize("save_dtype", [None, jnp.bfloat16], ids=["master", "bf16"])
 @pytest.mark.parametrize(
-    "rope",
-    [DefaultRotaryEmbeddingsConfig(), Llama3RotaryEmbeddingsConfig(), YarnRotaryEmbeddingsConfig(factor=8.0)],
-    ids=["default", "llama3", "yarn"],
+    ("rope", "activation_function"),
+    [
+        (DefaultRotaryEmbeddingsConfig(), ActivationFunctionEnum.silu),
+        (Llama3RotaryEmbeddingsConfig(), ActivationFunctionEnum.silu),
+        (YarnRotaryEmbeddingsConfig(factor=8.0), ActivationFunctionEnum.silu),
+        (DefaultRotaryEmbeddingsConfig(), ActivationFunctionEnum.gelu_new),
+    ],
+    ids=["default", "llama3", "yarn", "gelu-new"],
 )
-def test_native_hf_export_sharded_dtype_and_layout_roundtrip(tmp_path, tiny_hf_tokenizer_path, save_dtype, rope):
+def test_native_hf_export_sharded_dtype_and_layout_roundtrip(
+    tmp_path, tiny_hf_tokenizer_path, save_dtype, rope, activation_function
+):
     config = NativeLlamaLmConfig(
         hidden_dim=16,
         intermediate_dim=24,
@@ -46,6 +56,7 @@ def test_native_hf_export_sharded_dtype_and_layout_roundtrip(tmp_path, tiny_hf_t
         head_dim=8,
         max_seq_len=8,
         rope=rope,
+        activation_function=activation_function,
     )
     model_size = 2 if len(jax.devices()) >= 4 else 1
     mesh = Mesh(
@@ -137,7 +148,9 @@ def test_native_hf_export_transformers_local_logits(tmp_path, tiny_hf_tokenizer_
     np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-5)
 
 
-@pytest.mark.parametrize("mask_kind", ["causal", "dense", "bidirectional", "offset", "none"])
+@pytest.mark.parametrize(
+    "mask_kind", ["causal", "dense", "dense_float", "explicit_int", "bidirectional", "offset", "none"]
+)
 @pytest.mark.parametrize("unbatched", [False, True])
 def test_native_lm_boundary_preserves_short_positions_masks_loss_and_gradients(mask_kind, unbatched):
     config = draccus.decode(
@@ -165,8 +178,12 @@ def test_native_lm_boundary_preserves_short_positions_masks_loss_and_gradients(m
         positions = positions.rearrange((Pos, Batch))
         segments = segments.rearrange((Pos, Batch))
     mask = NamedAttentionMask.causal().with_segment_ids(segments).with_sliding_window(3)
-    if mask_kind == "dense":
+    if mask_kind in ("dense", "dense_float", "explicit_int"):
         mask = mask.materialize(Pos, Pos.alias("key_position"))
+        if mask_kind == "dense_float":
+            mask = mask.astype(jnp.float32)
+        elif mask_kind == "explicit_int":
+            mask = NamedAttentionMask.explicit(mask.astype(jnp.int32))
     elif mask_kind == "bidirectional":
         mask = NamedAttentionMask.bidirectional_sliding_window(2).with_segment_ids(segments)
     elif mask_kind == "offset":
@@ -254,6 +271,18 @@ def test_native_lm_hf_config_and_vocab_resize_preserve_model_values_and_placemen
         ({"rope": Llama3RotaryConfig()}, jnp.float32),
         ({"rope": YarnRotaryConfig(factor=8.0, mscale=1.5)}, jnp.float32),
         pytest.param({}, jnp.bfloat16, id="bfloat16-compute-float32-parameters"),
+        *[
+            pytest.param({"activation_function": activation}, jnp.float32, id=activation.value)
+            for activation in (
+                ActivationFunctionEnum.relu,
+                ActivationFunctionEnum.relu2,
+                ActivationFunctionEnum.swish,
+                ActivationFunctionEnum.gelu,
+                ActivationFunctionEnum.gelu_new,
+                ActivationFunctionEnum.quick_gelu,
+                ActivationFunctionEnum.tanh,
+            )
+        ],
     ],
 )
 def test_native_llama_matches_named_logits_loss_and_gradients(options, compute_dtype):
@@ -297,6 +326,7 @@ def test_native_llama_matches_named_logits_loss_and_gradients(options, compute_d
                 "hybrid_norm",
                 "use_qk_norm",
                 "upcast_attn",
+                "activation_function",
             }
         },
         attn_backend=AttentionBackend.VANILLA,
@@ -368,7 +398,10 @@ def test_native_llama_matches_named_logits_loss_and_gradients(options, compute_d
 
 
 @pytest.mark.tpu
-def test_native_llama_explicit_fsdp_tensor_parallel_forward_and_gradient_layout():
+@pytest.mark.parametrize(
+    "activation_function", [ActivationFunctionEnum.silu, ActivationFunctionEnum.relu2, ActivationFunctionEnum.gelu_new]
+)
+def test_native_llama_explicit_fsdp_tensor_parallel_forward_and_gradient_layout(activation_function):
     device_count = len(jax.devices())
     if device_count < 4:
         pytest.skip("Requires at least four CPU devices; run with JAX_NUM_CPU_DEVICES=4")
@@ -381,6 +414,7 @@ def test_native_llama_explicit_fsdp_tensor_parallel_forward_and_gradient_layout(
         num_heads=4,
         num_kv_heads=2,
         max_seq_len=8,
+        activation_function=activation_function,
     )
     with jax.set_mesh(mesh):
         reference = config.build(key=jax.random.key(0))
@@ -447,24 +481,17 @@ def test_native_llama_initialization_matches_named_parameters_and_forward(
         np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-5)
 
 
-@pytest.mark.tpu
-@pytest.mark.parametrize("factor", [1.0, 8.0], ids=["default", "linear-scaled"])
-@pytest.mark.parametrize("compute_dtype", [jnp.float32, jnp.bfloat16], ids=["float32", "bfloat16"])
-def test_native_rotary_long_positions_match_named_values_and_input_gradients(factor, compute_dtype):
-    # Match the sequence length/head width that exposed TPU device-power error.
-    shape = (8, 512, 16, 64)
+def _assert_rotary_values_and_gradients_match_named(named_config, native_config, compute_dtype, shape, host_positions):
     axes = tuple(hax.Axis(name, size) for name, size in zip(("batch", "position", "heads", "head_size"), shape))
     rng = np.random.default_rng(173)
     host_x = rng.standard_normal(shape).astype(np.float32)
     host_cotangent = rng.standard_normal(shape).astype(np.float32)
-    host_positions = np.broadcast_to(np.arange(shape[1], dtype=np.int32), shape[:2]).copy()
-    legacy = DefaultRotaryEmbeddingsConfig(theta=10000.0, factor=factor).build(axes[-1])
-    native_config = RotaryConfig(theta=10000.0, factor=factor)
+    named = named_config.build(axes[-1])
     mesh = Mesh(np.asarray(jax.devices()[:1]), ("data",), axis_types=(AxisType.Explicit,))
 
     def expected_forward(master, positions):
         return (
-            legacy(hax.named(master.astype(compute_dtype), axes), hax.named(positions, axes[:2])).rearrange(axes).array
+            named(hax.named(master.astype(compute_dtype), axes), hax.named(positions, axes[:2])).rearrange(axes).array
         )
 
     def actual_forward(master, positions):
@@ -490,6 +517,22 @@ def test_native_rotary_long_positions_match_named_values_and_input_gradients(fac
 
     np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-5)
     np.testing.assert_allclose(actual_grad, expected_grad, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.tpu
+@pytest.mark.parametrize("factor", [1.0, 8.0], ids=["default", "linear-scaled"])
+@pytest.mark.parametrize("compute_dtype", [jnp.float32, jnp.bfloat16], ids=["float32", "bfloat16"])
+def test_native_rotary_long_positions_match_named_values_and_input_gradients(factor, compute_dtype):
+    # Match the sequence length/head width that exposed TPU device-power error.
+    shape = (8, 512, 16, 64)
+    host_positions = np.broadcast_to(np.arange(shape[1], dtype=np.int32), shape[:2]).copy()
+    _assert_rotary_values_and_gradients_match_named(
+        DefaultRotaryEmbeddingsConfig(theta=10000.0, factor=factor),
+        RotaryConfig(theta=10000.0, factor=factor),
+        compute_dtype,
+        shape,
+        host_positions,
+    )
 
 
 @pytest.mark.parametrize(
@@ -518,39 +561,10 @@ def test_native_scaled_rotary_long_positions_match_named_values_and_gradients(
     named_config, native_config, compute_dtype
 ):
     shape = (2, 9, 4, 64)
-    axes = tuple(hax.Axis(name, size) for name, size in zip(("batch", "position", "heads", "head_size"), shape))
-    rng = np.random.default_rng(173)
-    host_x = rng.standard_normal(shape).astype(np.float32)
-    host_cotangent = rng.standard_normal(shape).astype(np.float32)
     host_positions = np.broadcast_to(
         np.asarray([0, 1, 4095, 8191, 8192, 65536, 131071, 131072, 262143], dtype=np.int32), shape[:2]
     ).copy()
-    named = named_config.build(axes[-1])
-    mesh = Mesh(np.asarray(jax.devices()[:1]), ("data",), axis_types=(AxisType.Explicit,))
-
-    def expected_forward(master, positions):
-        return (
-            named(hax.named(master.astype(compute_dtype), axes), hax.named(positions, axes[:2])).rearrange(axes).array
-        )
-
-    def actual_forward(master, positions):
-        return apply_rotary(master.astype(compute_dtype), positions, native_config)
-
-    def objective(forward, master, positions, cotangent):
-        return jnp.sum(forward(master, positions).astype(jnp.float32) * cotangent)
-
-    with jax.set_mesh(mesh):
-        x, positions, cotangent = jnp.asarray(host_x), jnp.asarray(host_positions), jnp.asarray(host_cotangent)
-        expected = jax.jit(expected_forward)(x, positions)
-        actual = jax.jit(actual_forward)(x, positions)
-        expected_grad = jax.jit(jax.grad(lambda master, pos, ct: objective(expected_forward, master, pos, ct)))(
-            x, positions, cotangent
-        )
-        actual_grad = jax.jit(jax.grad(lambda master, pos, ct: objective(actual_forward, master, pos, ct)))(
-            x, positions, cotangent
-        )
-    np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-5)
-    np.testing.assert_allclose(actual_grad, expected_grad, atol=1e-5, rtol=1e-5)
+    _assert_rotary_values_and_gradients_match_named(named_config, native_config, compute_dtype, shape, host_positions)
 
 
 @pytest.mark.parametrize(
@@ -574,3 +588,75 @@ def test_native_hf_yarn_rejects_different_scaling_semantics(rope, parameters, me
         config.validate_hf_config(hf_config)
     with pytest.raises(ValueError, match=message):
         NativeLlamaLmConfig.from_hf_config(hf_config)
+
+
+@pytest.mark.parametrize(
+    "mask_config,embedding_decays",
+    [
+        ({}, False),
+        ({"weight_decay_modules": ["token_embeddings"], "default_weight_decay_mask": True}, True),
+        ({"weight_decay_modules": r".*token_embeddings.*", "default_weight_decay_mask": True}, True),
+        ({"default_weight_decay_mask": False}, True),
+    ],
+    ids=["default", "embedding-list-override", "embedding-regex-override", "unmasked"],
+)
+def test_native_default_adam_weight_decay_matches_named(mask_config, embedding_decays):
+    config = LlamaConfig(
+        hidden_dim=8,
+        intermediate_dim=16,
+        num_layers=1,
+        num_heads=2,
+        num_kv_heads=1,
+        max_seq_len=8,
+        use_bias=True,
+    )
+    optimizer_config = AdamConfig(
+        learning_rate=0.1,
+        weight_decay=0.2,
+        warmup=0,
+        lr_schedule="constant",
+        max_grad_norm=None,
+        **mask_config,
+    )
+    devices = np.asarray(jax.devices()[:1])
+    named_mesh = Mesh(devices, ("data",), axis_types=(AxisType.Auto,))
+    native_mesh = Mesh(devices, ("data",), axis_types=(AxisType.Explicit,))
+    with current_tracker(NoopTracker()), jax.set_mesh(named_mesh), hax.axis_mapping({}):
+        named = config.build(hax.Axis("vocab", 16), key=jax.random.PRNGKey(0))
+        # Nonzero biases make an accidental change to their decay policy visible.
+        named = jax.tree.map(lambda value: value + 0.25, named)
+        source = jax.tree.map(np.asarray, named.to_state_dict())
+        optimizer = optimizer_config.build(4)
+        named_updates, _ = optimizer.update(jax.tree.map(jnp.zeros_like, named), optimizer.init(named), params=named)
+        expected = jax.tree.map(np.asarray, named_updates.to_state_dict())
+        mask = optimizer_config.build_weight_decay_mask()
+        if mask is not None:
+            assert mask(named).embeddings.token_embeddings.weight == embedding_decays
+
+    native_config = NativeLlamaLmConfig(
+        **{field.name: getattr(config, field.name) for field in dataclasses.fields(config)}
+    )
+    with current_tracker(NoopTracker()), jax.set_mesh(native_mesh):
+        native = native_config.build(hax.Axis("vocab", 16), key=jax.random.PRNGKey(1)).from_state_dict(source)
+        optimizer = optimizer_config.build(4)
+        # Zero gradients isolate the real optimizer's decoupled weight-decay contribution.
+        native_updates, _ = optimizer.update(
+            jax.tree.map(jnp.zeros_like, native), optimizer.init(native), params=native
+        )
+        actual = native_updates.to_state_dict()
+        for name, update in actual.items():
+            np.testing.assert_allclose(
+                update, expected[name].reshape(update.shape), atol=1e-5, rtol=1e-5, err_msg=name
+            )
+        if mask is not None:
+            assert mask(native).native.token_embeddings == embedding_decays
+
+    embedding_update = expected["model.embed_tokens.weight"]
+    if embedding_decays:
+        np.testing.assert_allclose(embedding_update, -0.02 * source["model.embed_tokens.weight"], atol=1e-5, rtol=1e-5)
+    else:
+        np.testing.assert_array_equal(embedding_update, np.zeros_like(embedding_update))
+    assert np.max(np.abs(expected["model.layers.0.mlp.gate_proj.weight"])) > 0
+    if mask_config.get("default_weight_decay_mask") is not False:
+        for name in ("model.norm.weight", "model.layers.0.mlp.gate_proj.bias"):
+            np.testing.assert_array_equal(expected[name], np.zeros_like(expected[name]))

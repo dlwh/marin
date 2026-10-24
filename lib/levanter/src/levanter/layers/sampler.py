@@ -63,6 +63,14 @@ class Sampler(eqx.Module):
 
         # Ensure float32 for numerical stability
         logits_f32 = logits.astype(jnp.float32)
+        # Sampling and selected-token log-probabilities need the complete
+        # vocabulary, as does nucleus sorting. Preserve the other axis mappings.
+        # The paged engine selects the rows to sample before this boundary.
+        vocab_axis = logits_f32.resolve_axis(self.Vocab)
+        mapping = dict(hax.partitioning.current_thread_local_mapping() or {})
+        mapping.pop(vocab_axis.name, None)
+        if not jax.sharding.get_abstract_mesh().empty:
+            logits_f32 = hax.shard(logits_f32, mapping)
 
         # Greedy tokens for temperature == 0
         greedy = hax.argmax(logits_f32, axis=self.Vocab)
