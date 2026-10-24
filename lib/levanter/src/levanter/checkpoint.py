@@ -1028,7 +1028,8 @@ def load_checkpoint_or_initialize(
 
     Args:
         init_fn: a function to initialize if needed
-        checkpoint_search_paths: paths to search for a checkpoint. If discover_latest is False, this must contain exactly one concrete checkpoint path.
+        checkpoint_search_paths: paths to search for a checkpoint. May be empty when do_load is False.
+            If discover_latest is False and loading is enabled, this must contain exactly one concrete checkpoint path.
         subpath: the subpath to load from the checkpoint
         discover_latest: whether to discover the latest checkpoint in the search paths
         axis_mapping: the axis mapping to use for loading the checkpoint
@@ -1044,7 +1045,7 @@ def load_checkpoint_or_initialize(
         loaded state.
 
     """
-    if len(checkpoint_search_paths) == 0:
+    if len(checkpoint_search_paths) == 0 and do_load is not False:
         raise ValueError("checkpoint_search_paths must contain at least one path")
     checkpoint_search_paths = [str(path) for path in checkpoint_search_paths]
 

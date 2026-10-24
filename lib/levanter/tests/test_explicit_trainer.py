@@ -132,7 +132,7 @@ def test_explicit_trainer_checkpoint_resumes_same_next_step(tmp_path):
         id="native-checkpoint",
         tracker=NoopConfig(),
         load_checkpoint=False,
-        load_checkpoint_path=str(tmp_path),
+        load_checkpoint_path=[],
         train_batch_size=4,
         per_device_parallelism=2,
         log_jaxprs=False,
@@ -147,13 +147,21 @@ def test_explicit_trainer_checkpoint_resumes_same_next_step(tmp_path):
 
     batch = {"x": jnp.ones((4, 3)), "target": jnp.zeros((4, 3))}
     with trainer:
-        state = trainer.initial_state(jax.random.PRNGKey(12), model_init=initialize_model)
+        model = initialize_model()
+        key = jax.random.PRNGKey(12)
+        original_model = jax.tree.map(lambda leaf: np.asarray(leaf).copy(), model)
+        original_key = np.asarray(key).copy()
+        state = trainer.initial_state(key, model_init=eqx.Partial(lambda value: value, model))
+        # Initialization must leave array-bearing model factories and keys reusable.
+        np.testing.assert_array_equal(key, original_key)
+        for actual, expected in zip(jax.tree.leaves(model), jax.tree.leaves(original_model), strict=True):
+            np.testing.assert_array_equal(actual, expected)
         state = trainer.train_step(state, batch).state
         save_checkpoint(state.saveable_state, step=1, checkpoint_path=tmp_path / "step-1")
         expected = trainer.train_step(state, batch)
 
     restored_trainer = Trainer(
-        dataclasses.replace(config, load_checkpoint=True),
+        dataclasses.replace(config, load_checkpoint=True, load_checkpoint_path=str(tmp_path)),
         optimizer,
         _loss,
         add_default_hooks=False,
@@ -176,7 +184,9 @@ def test_explicit_trainer_microbatch_preserves_data_and_parameter_sharding():
         import numpy as np
         import optax
         from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
+        import pytest
         from levanter.callbacks import JitCallback
+        from levanter.data.dataset import ListAsyncDataset
         from levanter.tracker import NoopConfig
         from levanter.trainer import ExplicitTrainingLayout, Trainer, TrainerConfig
 
@@ -202,6 +212,9 @@ def test_explicit_trainer_microbatch_preserves_data_and_parameter_sharding():
         capture = CaptureGradients()
         trainer.add_hook(capture)
         with trainer:
+            dataset = ListAsyncDataset(list(np.arange(32, dtype=np.float32).reshape(8, 4)/32))
+            with pytest.raises(ValueError):
+                trainer.data_loader(dataset)
             weight = jax.device_put(jnp.arange(4, dtype=jnp.float32)/4, NamedSharding(mesh, P("context")))
             batch = jax.device_put(jnp.arange(32, dtype=jnp.float32).reshape(8, 4)/32,
                                    NamedSharding(mesh, P("replica_dcn", "context")))
