@@ -53,6 +53,7 @@ from levanter.utils.activation import ActivationFunctionEnum
 
 _LEVANTER_MODEL_METADATA_KEY = "levanter_model"
 _NATIVE_CHECKPOINT_VERSION = 1
+_NATIVE_MODEL_TYPE = "llama_native"
 
 
 def _paged_attention(
@@ -164,7 +165,7 @@ def _native_rotary_config(config: RotaryEmbeddingsConfig) -> NativeRotaryConfig:
     raise ValueError(f"Unsupported native Llama RoPE configuration: {type(config).__name__}")
 
 
-@LmConfig.register_subclass("llama_native")
+@LmConfig.register_subclass(_NATIVE_MODEL_TYPE)
 @dataclass(frozen=True)
 class NativeLlamaLmConfig(LlamaConfig):
     """Llama training configuration with raw-array parameters and explicit placement.
@@ -343,7 +344,7 @@ class NativeLlamaLmConfig(LlamaConfig):
         if (
             type(identity["version"]) is not int
             or identity["version"] != _NATIVE_CHECKPOINT_VERSION
-            or identity["type"] != "llama_native"
+            or identity["type"] != _NATIVE_MODEL_TYPE
         ):
             raise ValueError("Unsupported checkpoint model metadata version or implementation")
         vocab_size = identity["vocab_size"]
@@ -416,7 +417,7 @@ class NativeLlamaLmHeadModel(ModuleWithStateDictSerialization, LmHeadModel[Nativ
         return {
             _LEVANTER_MODEL_METADATA_KEY: {
                 "version": _NATIVE_CHECKPOINT_VERSION,
-                "type": "llama_native",
+                "type": _NATIVE_MODEL_TYPE,
                 "vocab_size": self.Vocab.size,
                 "architecture": _checkpoint_architecture(self.native.config),
             }
