@@ -164,9 +164,19 @@ def dot_general_transpose_lhs(
         ans_batch, _, ans_y = _ranges_like(x_batch, x_kept, y_kept)
     dims = ((ans_y, y_kept), (ans_batch, y_batch))
     x_contract_sorted_by_y = list(np.take(x_contract, np.argsort(y_contract)))
-    out_axes = np.argsort(list(x_batch) + x_kept + x_contract_sorted_by_y)
+    unsorted_axes = list(x_batch) + x_kept + x_contract_sorted_by_y
+    out_axes = np.argsort(unsorted_axes)
+    input_sharding = x.aval.sharding
+    out_sharding = None
+    if not input_sharding.mesh.empty and input_sharding.mesh.are_all_axes_explicit:
+        # The dot produces the cotangent before the final transpose. Preserve the
+        # primal's placement in that intermediate axis order, including reductions.
+        inverse_spec = tuple(input_sharding.spec.partitions[axis] for axis in unsorted_axes)
+        out_sharding = input_sharding.update(spec=input_sharding.spec.update(partitions=inverse_spec))
     x_bar = lax.transpose(
-        lax.dot_general(g, y, dims, precision=precision, preferred_element_type=preferred_element_type),
+        lax.dot_general(
+            g, y, dims, precision=precision, preferred_element_type=preferred_element_type, out_sharding=out_sharding
+        ),
         tuple(out_axes),
     )
     return x_bar
