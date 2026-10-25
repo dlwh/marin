@@ -197,7 +197,7 @@ def dot_general_transpose_rhs(g, x, y, *, dimension_numbers, precision, preferre
     return y_bar
 
 
-@partial(custom_vjp, nondiff_argnums=(8, 9, 10))
+@partial(custom_vjp, nondiff_argnums=(8, 9, 10, 11))
 def quantized_dot(
     lhs,
     q_lhs,
@@ -210,6 +210,7 @@ def quantized_dot(
     dimension_numbers,
     preferred_element_type=None,
     rev_dtype=jnp.float8_e5m2,
+    out_sharding=None,
 ):
     return lax.dot_general(
         q_lhs,
@@ -217,6 +218,7 @@ def quantized_dot(
         dimension_numbers,
         preferred_element_type=preferred_element_type,
         precision=lax.Precision.DEFAULT,
+        out_sharding=out_sharding,
     )
 
 
@@ -232,6 +234,7 @@ def quantized_dot_fwd(
     dimension_numbers,
     preferred_element_type,
     rev_dtype,
+    out_sharding,
 ):
     out = lax.dot_general(
         q_lhs,
@@ -239,12 +242,13 @@ def quantized_dot_fwd(
         dimension_numbers,
         preferred_element_type=preferred_element_type,
         precision=lax.Precision.DEFAULT,
+        out_sharding=out_sharding,
     )
     res = (lhs, q_lhs, lhs_scale, rhs, q_rhs, rhs_scale, out_grad_scale, out_grad_amax_history)
     return out, res
 
 
-def quantized_dot_bwd(dimension_numbers, preferred_element_type, rev_dtype, res, g):
+def quantized_dot_bwd(dimension_numbers, preferred_element_type, rev_dtype, _out_sharding, res, g):
     (lhs, q_lhs, lhs_scale, rhs, q_rhs, rhs_scale, out_grad_scale, out_grad_amax_history) = res
 
     new_out_grad_scale, new_out_grad_amax_history = update_fp8_meta(
@@ -292,6 +296,7 @@ def fp8_scaled_dot_general(
     lhs_amax_history,
     rhs_amax_history,
     grad_amax_history,
+    out_sharding=None,
     quantize_compute_type=jnp.float32,
     fwd_dtype=jnp.float8_e4m3fn,
     rev_dtype=jnp.float8_e5m2,
@@ -301,7 +306,8 @@ def fp8_scaled_dot_general(
     `quantized_dot`'s custom VJP. The scale / amax-history arrays carry the
     delayed-scaling state and are updated through the custom VJP (overwrites).
 
-    `fwd_dtype` / `rev_dtype` default to E4M3 / E5M2."""
+    `fwd_dtype` / `rev_dtype` default to E4M3 / E5M2. `out_sharding`
+    specifies the forward result placement, including when differentiating."""
     if precision is not None:
         warnings.warn(
             'fp8_scaled_dot_general will set the "precision" and disregard any provided "precision" argument.'
@@ -320,6 +326,7 @@ def fp8_scaled_dot_general(
         dimension_numbers,
         preferred_element_type,
         rev_dtype,
+        out_sharding,
     )
     y = out_dq(dq_type=preferred_element_type, lhs_scale=new_lhs_scale, rhs_scale=new_rhs_scale, out=y)
     return y
