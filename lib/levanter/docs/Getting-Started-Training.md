@@ -160,11 +160,13 @@ checkpoint. Omit `targets` to quantize every linear projection, use a list for
 final module names such as `[q_proj, up_proj]`, or a regex for the full native
 pytree path such as `native\.layers\.stacked\.self_attn\.q_proj$`. The untied head
 uses FP8 for logits; the fused training loss continues to use its raw weights.
-Tied embeddings remain unquantized. Native INT8 and combining native FP8 with
-LoRA or frozen parameters remain unqualified and are rejected.
+Tied embeddings remain unquantized. Native INT8 remains unsupported.
 
-LoRA, including adapter dropout, is available without quantization through
-`adapter.type: lora`; see [adapter training](Training-On-Your-Data.md#lora-adapters).
+`train_lm` also supports native FP8 with LoRA, including adapter dropout. Frozen
+base weights and quantization state stay fixed; trainable factors and their FP8
+state resume from partial checkpoints after reconstructing the original base.
+See [adapter training](Training-On-Your-Data.md#lora-adapters) for source and
+precision requirements. Native DPO quantization remains unsupported.
 Existing `model.type: llama` configurations retain their behavior.
 
 ## Set Custom Training Configuration

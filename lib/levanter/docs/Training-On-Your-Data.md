@@ -358,11 +358,12 @@ reference; frozen reference weights are reloaded rather than stored in the
 training checkpoint.
 
 In `train_lm`, native LoRA also supports `trainer.quantization.fp8: true`.
-FP8 operations attach to the frozen projections and trainable factors. Frozen
+With `targets` omitted, FP8 operations attach to frozen projections and trainable
+factors. Frozen
 weights, scales and histories stay fixed; factors update their FP32 scales and
 histories through the custom-gradient state path, outside Adam. Partial
-checkpoints retain factor quantization state along with weights and optimizer
-state. Resume requires the original base and unchanged precision, quantization
+checkpoints retain factor quantization state along with LoRA factor weights and
+optimizer state. Resume requires the original base and unchanged precision, quantization
 and adapter settings. Portable PEFT/HF exports contain ordinary weights, not
 FP8 histories. Native INT8 and native DPO quantization remain unsupported.
 

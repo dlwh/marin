@@ -26,13 +26,14 @@ from levanter.layers.dropout import DropoutLayout
 from levanter.layers.linear import INITIALIZER_TRUNCATION_BOUND, Linear, LinearProjection
 from levanter.layers.rms_norm import RmsNorm
 from levanter.layers.rotary_native import NativeRotaryConfig, RotaryConfig, apply_rotary
-from levanter.layers.scan_checkpoint import ScanCheckpointSpec
+from haliax.nn.scan import ScanCheckpointSpec
 from levanter.layers.stacked import ArrayStacked, StateDictWriter
 from levanter.utils.activation import ActivationFunctionEnum, JaxActivationFunction
 
 
 _HF_TOKEN_EMBEDDING_WEIGHT_KEY = "model.embed_tokens.weight"
 _HF_FINAL_NORM_PREFIX = "model.norm"
+_HF_LAYER_PREFIX = "model.layers."
 _LAYER_NORM_FIELDS = ("input_layernorm", "post_attention_layernorm", "post_attn_layernorm", "post_mlp_layernorm")
 _ATTENTION_FIELDS = ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm")
 _MLP_FIELDS = ("gate_proj", "up_proj", "down_proj")
@@ -598,7 +599,7 @@ class NativeLlamaModel(eqx.Module):
         if self.lm_head is not None:
             _put_module(state, "lm_head", self.lm_head)
         for index, layer in enumerate(self.layers.unstacked()):
-            path = f"model.layers.{index}"
+            path = f"{_HF_LAYER_PREFIX}{index}"
             for name in _LAYER_NORM_FIELDS:
                 module = getattr(layer, name)
                 if module is not None:
@@ -638,7 +639,7 @@ class NativeLlamaModel(eqx.Module):
             )
         layers = []
         for index, layer in enumerate(model.layers.unstacked()):
-            path = f"model.layers.{index}"
+            path = f"{_HF_LAYER_PREFIX}{index}"
             for name in _LAYER_NORM_FIELDS:
                 module = getattr(layer, name)
                 if module is not None:
