@@ -47,6 +47,10 @@ class CustomGradientAccumulation(eqx.Module):
         """Combines state produced by two gradient evaluations."""
         raise NotImplementedError
 
+    def apply_overwrite(self, other: Self) -> Self:
+        """Apply gradient-carried state to the persisted state."""
+        return other
+
 
 def partition_for_grad_overwrite(grad: T) -> tuple[T, T]:
     """
@@ -102,7 +106,9 @@ def accumulate_gradients(accumulated: T, gradient: T) -> T:
 
 def apply_updates(tree, updates, overwrites):
     """
-    A `jax.tree_util.tree_map`-broadcasted version of
+    Apply optimizer updates and gradient-carried state throughout a tree.
+
+    Custom gradient accumulation objects apply their overwrite policy. Other leaves follow
     ```python
     if overwrite is not None:
         return overwrite
@@ -114,6 +120,8 @@ def apply_updates(tree, updates, overwrites):
 
     def _apply_update(tree, update, overwrite):
         if overwrite is not None:
+            if isinstance(tree, CustomGradientAccumulation):
+                return tree.apply_overwrite(overwrite)
             return overwrite
         if update is None:
             return tree
@@ -264,13 +272,25 @@ class Fp8DotGeneralOp(CustomGradientAccumulation):
 
     def accumulate(self, other: Self) -> Self:
         # Every microbatch starts from the same persisted state, so its scale values and the rolled
-        # history tail match. Keep the latest copy and reduce the new amax entry across microbatches.
+        # history tail match. Keep the latest active copy and reduce the new amax entry across microbatches.
         return dataclasses.replace(
-            other,
+            self.apply_overwrite(other),
             input_amax_history=jnp.maximum(self.input_amax_history, other.input_amax_history),
             output_grad_amax_history=jnp.maximum(self.output_grad_amax_history, other.output_grad_amax_history),
             kernel_amax_history=jnp.maximum(self.kernel_amax_history, other.kernel_amax_history),
         )
+
+    def apply_overwrite(self, other: Self) -> Self:
+        """Retain persisted state where AD returned the zero-like accumulation identity."""
+        # Unused differentiable operations receive the zero-like accumulation identity from AD.
+        # Valid FP8 updates retain positive scales even for zero operands/cotangents. Check all
+        # six arrays, independently for each stacked layer, rather than treating a zero amax or
+        # an individual zero scale as inactivity. The final axis holds each metadata vector.
+        identity = functools.reduce(
+            jnp.logical_and,
+            (jnp.all(value == 0, axis=-1, keepdims=True) for value in jax.tree.leaves(other)),
+        )
+        return jax.tree.map(lambda prior, value: jnp.where(identity, prior, value), self, other)
 
 
 class Int8DotGeneralOp(CustomGradientAccumulation):

@@ -23,10 +23,118 @@ from haliax.quantization import (
     DefaultDotGeneralOp,
     Fp8DotGeneralOp,
     QuantizationConfig,
+    accumulate_gradients,
     apply_updates,
     partition_for_grad_overwrite,
     quantize_linear_layers,
 )
+
+
+@pytest.mark.tpu
+@pytest.mark.parametrize("activity", ["unused", "alternating", "active-zero"])
+def test_fp8_overwrites_preserve_unused_layers_and_accumulate_active_state(activity):
+    devices = jax.devices()[:4] if len(jax.devices()) >= 4 else jax.devices()[:1]
+    model_size = 2 if len(devices) == 4 else 1
+    mesh = Mesh(
+        np.asarray(devices).reshape(-1, model_size),
+        ("data", "model"),
+        axis_types=(AxisType.Explicit,) * 2,
+    )
+    with jax.set_mesh(mesh):
+        replicated = NamedSharding(mesh, P())
+
+        def initialize(multiplier):
+            return dataclasses.replace(
+                Fp8DotGeneralOp.init(amax_history_length=4),
+                input_scale=jnp.array([2], jnp.float32) * multiplier,
+                kernel_scale=jnp.array([0.5], jnp.float32) * multiplier,
+                output_grad_scale=jnp.array([4], jnp.float32) * multiplier,
+                input_amax_history=jnp.array([896, 448, 224, 112], jnp.float32) * multiplier,
+                kernel_amax_history=jnp.array([224, 112, 56, 28], jnp.float32) * multiplier,
+                output_grad_amax_history=jnp.array([229376, 114688, 57344, 28672], jnp.float32) * multiplier,
+            )
+
+        operations = eqx.filter_vmap(initialize)(jnp.array([1, 2], jnp.float32))
+        operations = jax.tree.map(lambda value: jax.device_put(value, replicated), operations)
+        weight_values = np.full((2, 4, 8), 0 if activity == "active-zero" else 0.125, np.float32)
+        inputs = jax.device_put(
+            np.full((4, 8), 0 if activity == "active-zero" else 2, np.float32),
+            NamedSharding(mesh, P("data", None)),
+        )
+        weights = jax.device_put(weight_values, NamedSharding(mesh, P(None, "model", None)))
+        cotangent = jax.device_put(
+            np.full((4, 4), 0 if activity == "active-zero" else 1, np.float32),
+            NamedSharding(mesh, P("data", "model")),
+        )
+        activities = (
+            ((False, False), (False, False))
+            if activity == "unused"
+            else (((True, True), (True, True)) if activity == "active-zero" else ((True, False), (False, True)))
+        )
+        dimension_numbers = (((1,), (1,)), ((), ()))
+
+        def gradients(active):
+            def objective(parameters):
+                states, kernels = parameters
+                loss = jnp.zeros(())
+                for layer in range(2):
+                    operation = jax.tree.map(lambda value: value[layer], states)
+                    if active[layer]:
+                        output = operation(inputs, kernels[layer], dimension_numbers, out_sharding=P("data", "model"))
+                    else:
+                        # Fused CE also consumes raw weights without using the installed operation.
+                        output = jnp.einsum("bi,oi->bo", inputs, kernels[layer], out_sharding=P("data", "model"))
+                    loss = loss + jnp.sum(output * cotangent)
+                return loss
+
+            return eqx.filter_grad(objective)((operations, weights))
+
+        first = eqx.filter_jit(lambda: gradients(activities[0]))()
+        second = eqx.filter_jit(lambda: gradients(activities[1]))()
+        batches = jax.tree.map(lambda a, b: jnp.stack((a, b)), first, second)
+        zero = jax.tree.map(jnp.zeros_like, first)
+
+        def apply(gradient_batches):
+            accumulated, _ = jax.lax.scan(
+                lambda carry, value: (accumulate_gradients(carry, value), None), zero, gradient_batches
+            )
+            overwrites, ordinary = partition_for_grad_overwrite(accumulated)
+            updates = jax.tree.map(lambda value: value * 0, ordinary)
+            return apply_updates((operations, weights), updates, overwrites)
+
+        updated, updated_weights = eqx.filter_jit(apply)(batches)
+        expected = {
+            "input_scale": np.asarray(operations.input_scale),
+            "kernel_scale": np.asarray(operations.kernel_scale),
+            "output_grad_scale": np.asarray(operations.output_grad_scale),
+        }
+        for name, maximum in (
+            ("input", np.max(np.abs(inputs))),
+            ("kernel", np.max(np.abs(weight_values))),
+            ("output_grad", np.max(np.abs(cotangent))),
+        ):
+            history = np.asarray(getattr(operations, name + "_amax_history"))
+            if activity != "unused":
+                history = np.roll(history, -1, axis=-1)
+                history[:, 0] = maximum
+            expected[name + "_amax_history"] = history
+        for name, value in expected.items():
+            actual = getattr(updated, name)
+            np.testing.assert_array_equal(actual, value, err_msg=name)
+            original = getattr(operations, name)
+            assert actual.sharding.is_equivalent_to(original.sharding, actual.ndim), name
+        np.testing.assert_array_equal(updated_weights, weight_values)
+        assert updated_weights.sharding == weights.sharding
+
+        query = jax.device_put(np.ones((4, 8), np.float32), NamedSharding(mesh, P("data", None)))
+        query_weight = jax.device_put(np.full((4, 8), 0.125, np.float32), NamedSharding(mesh, P("model", None)))
+        logits = eqx.filter_jit(
+            eqx.filter_vmap(
+                lambda operation: operation(query, query_weight, dimension_numbers, out_sharding=P("data", "model"))
+            )
+        )(updated)
+        np.testing.assert_array_equal(logits, np.ones((2, 4, 4), np.float32))
+        assert logits.sharding == NamedSharding(mesh, P(None, "data", "model"))
 
 
 def test_fp8_is_reasonable():

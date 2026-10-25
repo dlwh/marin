@@ -82,9 +82,11 @@ class BenchmarkConfig:
 
 class _CaptureStep(JitCallback):
     def inside_step(self, state: TrainerState, inside_info: InsideJitInfo):
+        del state
         return inside_info.grads, inside_info.updates
 
     def on_step(self, step_info, cb_info):
+        del step_info, cb_info
         return None
 
 
