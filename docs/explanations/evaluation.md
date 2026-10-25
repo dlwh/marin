@@ -11,13 +11,42 @@ For step-by-step usage, start with:
 
 ## Evaluation modes
 
-Marin supports three evaluation paths:
+Marin supports these evaluation paths:
 
 - **In-loop training evals**: [`train_lm`][marin.experiment.train.train_lm] runs periodic multiple-choice evaluations through Levanter's lm-evaluation-harness integration and logs to W&B when an `EvalSuite` is provided.
 - **Post-hoc evals**: the shared launcher or composable `EvalGroup`s evaluate multiple-choice and
   generation tasks with the vendored Evalchemy package.
 - **Harbor tasks**: the shared launcher runs containerized agent benchmarks and registry datasets
   through Marin's Harbor integration.
+- **Trace-labeled loss**: `trace_labeled_eval(TraceLabeledEvalConfig(...))` scores configured trace
+  spans, such as patches and outcomes, through Levanter's labeled evaluator.
+
+## Trace-labeled loss
+
+Call `marin.evaluation.trace_labeled_eval.trace_labeled_eval(config)` with a
+`TraceLabeledEvalConfig`. Its `model` field defaults to the Haliax-based `LlamaConfig`; set it to a matching
+`NativeLlamaLmConfig` for native evaluation. Supply `checkpoint_path` and `tokenizer` paths.
+`checkpoint_is_hf: true` selects HF weights; `false` selects a Levanter checkpoint with a `model`
+subtree. Native evaluation requires an explicit model architecture matching either source.
+
+The `datasets` mapping holds `TraceLabeledEvalDatasetConfig` values describing chat-message sources
+and the `trace_format.loss_tags` to score. A `row_adapter` can append patch text and a CORRECT/INCORRECT outcome token as labeled targets
+from other row fields. Results aggregate next-token loss and token counts by label within each dataset.
+
+For `NativeLlamaLmConfig`, HF sources and Levanter checkpoints with native metadata preserve the
+complete source vocabulary, including rows beyond the tokenizer length. A metadata-free Levanter
+checkpoint requires the original matching model configuration, and its stored vocabulary size must
+equal the tokenizer vocabulary rounded for the compute mapping. This entrypoint has no independent
+vocabulary override; without metadata, it cannot verify architecture or activation identity.
+
+The entrypoint selects explicit mesh axes automatically for native models. Configure placement through
+`trainer.mesh.param_mapping` and `trainer.mesh.compute_mapping`, or retain their defaults;
+`trainer.mesh.batch_axis_name` selects the logical batch name.
+
+`output_path/results.json` records dataset metrics; caches are stored under `output_path/cache`.
+A rerun skips completed datasets. Resume checks the checkpoint path/type, tokenizer path and
+`max_eval_length` against the results file. Use a fresh output path when changing model or dataset
+configuration, which those checks do not compare.
 
 ## Post-hoc evaluation (evalchemy over a served endpoint)
 
