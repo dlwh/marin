@@ -15,9 +15,8 @@ from jax import numpy as jnp
 from jaxtyping import PRNGKeyArray, PyTree
 from optax import GradientTransformation, OptState
 
-from levanter.quantization import cast_model_preserving_quantization_state
 from levanter.optim.model_averaging import ModelAveraging, ModelAveragingConfig
-from levanter.quantization import has_array_linears, quantize_linear_layers
+from levanter.quantization import cast_model_preserving_quantization_state, quantize_linear_layers
 from levanter.utils.jax_utils import is_inexact_arrayish
 from levanter.utils.tree_utils import inference_mode
 from levanter.utils.types import FilterTree
@@ -102,8 +101,6 @@ class TrainerState(eqx.Module, Generic[M]):
             mp = jmp.get_policy("f32")
 
         if quantization is not None:
-            if is_trainable is not True and has_array_linears(model):
-                raise ValueError("Array-native FP8 requires all model parameters to be trainable")
             model = quantize_linear_layers(model, quantization)
 
         trainable_model = trainables_only(model, is_trainable)

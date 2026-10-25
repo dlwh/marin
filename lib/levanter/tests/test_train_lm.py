@@ -1661,10 +1661,23 @@ def test_native_fp8_ema_selects_averaged_state_and_resumes_next_update(tmp_path,
 
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize("native_hf_source", [False], indirect=True, ids=["untied"])
-def test_named_fp8_lora_partial_checkpoint_resumes_next_update(tmp_path, native_hf_source, tiny_hf_tokenizer_path):
+@pytest.mark.parametrize(
+    "model_kind,policy,dropout",
+    [
+        ("named", "params=float32,compute=bfloat16,output=float32", 0.0),
+        pytest.param("native", "f32", 0.0, marks=pytest.mark.tpu),
+        pytest.param("native", "params=float32,compute=bfloat16,output=float32", 0.25, marks=pytest.mark.tpu),
+    ],
+    ids=["named-bf16", "native-f32", "native-bf16-dropout"],
+)
+def test_train_lm_fp8_lora_partial_checkpoint_resumes_next_update(
+    tmp_path, native_hf_source, tiny_hf_tokenizer_path, model_kind, policy, dropout
+):
     source = native_hf_source
+    native = model_kind == "native"
+    base_config = NativeLlamaLmConfig.from_hf_config(source.config.to_hf_config(32)) if native else source.config
     model_config = dataclasses.replace(
-        source.config,
+        base_config,
         reference_checkpoint=str(source.path),
         tokenizer=tiny_hf_tokenizer_path,
         attn_backend=AttentionBackend.VANILLA,
@@ -1675,10 +1688,11 @@ def test_named_fp8_lora_partial_checkpoint_resumes_next_update(tmp_path, native_
         shuffle=False,
         components={"direct": DirectDatasetComponent(datasets={"train": examples})},
     )
-    data_size = len(jax.devices())
+    model_size = 2 if native and len(jax.devices()) % 4 == 0 else 1
+    data_size = len(jax.devices()) // model_size
     optimizer = AdamConfig(learning_rate=1e-3, warmup=0, lr_schedule=ConstantLrSchedule(), weight_decay=0.0)
-    adapter = LoraAdaptorConfig(r=3, alpha=6, dropout=0.0, a_init_mode="random", target_modules=["q_proj"])
-    mp = jmp.get_policy("params=float32,compute=bfloat16,output=float32")
+    adapter = LoraAdaptorConfig(r=3, alpha=6, dropout=dropout, a_init_mode="random", target_modules=["q_proj"])
+    mp = jmp.get_policy(policy)
 
     def configuration(name, steps, *, resume=False):
         directory = tmp_path / name
@@ -1700,7 +1714,7 @@ def test_named_fp8_lora_partial_checkpoint_resumes_next_update(tmp_path, native_
                 mp=mp,
                 quantization=QuantizationConfig(fp8=True, amax_history_length=4),
                 max_eval_batches=0,
-                mesh=MeshConfig(axes={"data": data_size, "model": 1}),
+                mesh=MeshConfig(axes={"data": data_size, "model": model_size}),
                 tracker=JsonFileTrackerConfig(output_path=str(directory / "tracker")),
                 checkpointer=CheckpointerConfig(base_path=str(directory / "checkpoints"), keep=[{"every": 1}]),
                 load_checkpoint=resume,
@@ -1724,9 +1738,15 @@ def test_named_fp8_lora_partial_checkpoint_resumes_next_update(tmp_path, native_
     assert int(full.state.step) == int(resumed.state.step) == 2
     for actual, expected in zip(_array_leaves(resumed.state), _array_leaves(full.state), strict=True):
         np.testing.assert_array_equal(actual, expected)
+        if isinstance(actual, jax.Array):
+            assert actual.sharding == expected.sharding
 
-    projection = full.state.model.transformer.layers.stacked.self_attn.q_proj
-    previous = first.state.model.transformer.layers.stacked.self_attn.q_proj
+    def q_projection(model):
+        decoder = model.native if native else model.transformer
+        return decoder.layers.stacked.self_attn.q_proj
+
+    projection = q_projection(full.state.model)
+    previous = q_projection(first.state.model)
     metadata_names = (
         "input_scale",
         "kernel_scale",
@@ -1740,7 +1760,7 @@ def test_named_fp8_lora_partial_checkpoint_resumes_next_update(tmp_path, native_
         factor = getattr(projection.lora, name)
         prior_factor = getattr(previous.lora, name)
         assert factor.weight.dtype == jnp.float32
-        assert not np.array_equal(factor.weight.array, prior_factor.weight.array)
+        assert not np.array_equal(_array_leaves(factor.weight)[0], _array_leaves(prior_factor.weight)[0])
         operation = factor.dot_general
         assert isinstance(operation, Fp8DotGeneralOp)
         for field in metadata_names:
@@ -1762,7 +1782,7 @@ def test_named_fp8_lora_partial_checkpoint_resumes_next_update(tmp_path, native_
             assert value.dtype == jnp.float32
             expected = np.zeros(value.shape, np.float32) if "history" in field else np.ones(value.shape, np.float32)
             np.testing.assert_array_equal(value, expected)
-    frozen_weights = to_torch_compatible_state_dict(frozen)
+    frozen_weights = frozen.to_state_dict() if native else to_torch_compatible_state_dict(frozen)
     for name, value in source.weights.items():
         np.testing.assert_array_equal(frozen_weights[name], np.asarray(jnp.asarray(value, dtype=mp.compute_dtype)))
 
@@ -1774,17 +1794,17 @@ def test_named_fp8_lora_partial_checkpoint_resumes_next_update(tmp_path, native_
     for adam in adam_states:
         np.testing.assert_array_equal(adam.count, 2)
         for moments in (adam.mu, adam.nu):
-            values = moments.transformer.layers.stacked.self_attn.q_proj
+            values = q_projection(moments)
             assert not _array_leaves(values.wrapped.weight)
             assert not _array_leaves(values.wrapped.dot_general)
             for name in ("lora_A", "lora_B"):
                 factor = getattr(values.lora, name)
                 assert not _array_leaves(factor.dot_general)
-                assert np.any(factor.weight.array != 0)
+                assert np.any(_array_leaves(factor.weight)[0] != 0)
 
     # These are genuinely partial checkpoints. The canonical resume above must reload
     # the source base as well as restoring adapter weights, FP8 state, optimizer and key.
-    mesh = configuration("full", 2).trainer.device_mesh
+    mesh = dataclasses.replace(configuration("full", 2).trainer, use_explicit_mesh_axes=native).device_mesh
     with jax.set_mesh(mesh):
         partials = [
             load_checkpoint(
@@ -1796,8 +1816,10 @@ def test_named_fp8_lora_partial_checkpoint_resumes_next_update(tmp_path, native_
         ]
     for actual, expected in zip(_array_leaves(partials[1]), _array_leaves(partials[0]), strict=True):
         np.testing.assert_array_equal(actual, expected)
+        if isinstance(actual, jax.Array):
+            assert actual.sharding == expected.sharding
     for partial in partials:
-        values = partial.model.transformer.layers.stacked.self_attn.q_proj
+        values = q_projection(partial.model)
         assert not _array_leaves(values.wrapped.weight)
         assert not _array_leaves(values.wrapped.dot_general)
         for name in ("lora_A", "lora_B"):
