@@ -43,7 +43,6 @@ from levanter.layers.rotary_native import (
     YarnRotaryConfig,
     yarn_attention_factor,
 )
-from levanter.layers.scan_checkpoint import ScanCheckpointPolicy as NativeScanCheckpointPolicy
 from levanter.models.llama import LlamaConfig
 from levanter.models.llama_native import NativeLlamaConfig, NativeLlamaModel, NativeLlamaSharding
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel
@@ -377,10 +376,6 @@ class NativeLlamaLmConfig(LlamaConfig):
             for field in dataclasses.fields(NativeLlamaConfig)
             if field.name not in {"vocab_size", "rope", "attention_implementation"}
         }
-        if isinstance(self.gradient_checkpointing, hax.ScanCheckpointPolicy):
-            fields["gradient_checkpointing"] = NativeScanCheckpointPolicy(
-                **dataclasses.asdict(self.gradient_checkpointing)
-            )
         return NativeLlamaConfig(
             vocab_size=vocab_size,
             rope=_native_rotary_config(self.rope),

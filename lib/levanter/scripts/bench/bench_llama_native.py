@@ -49,6 +49,16 @@ from levanter.utils.mesh import MeshConfig
 
 
 LAYER_NORM_EPSILON = 1e-5
+LOSS = "loss"
+PARAMETERS = "parameters"
+GRADIENTS = "gradients"
+ACTIVATIONS = "activations"
+ADAM_MU = "adam_mu"
+ADAM_NU = "adam_nu"
+ADAM_COUNT = "adam_count"
+EXECUTION_ADAM_MU = "execution_adam_mu"
+EXECUTION_ADAM_NU = "execution_adam_nu"
+EXECUTION_ADAM_COUNT = "execution_adam_count"
 UPDATES = "updates"
 PARAMETERS_AFTER_ONE_STEP = "parameters_after_one_step"
 EXECUTION_PARAMETERS_AFTER_ONE_STEP = "execution_parameters_after_one_step"
@@ -432,26 +442,26 @@ def _run_variant(
     jax.block_until_ready(diagnostic)
     gradients, updates = diagnostic.hook_infos[0]
     diagnostic_data = {
-        "loss": {"loss": diagnostic.loss},
-        "gradients": _canonical_parameters(gradients),
+        LOSS: {LOSS: diagnostic.loss},
+        GRADIENTS: _canonical_parameters(gradients),
         UPDATES: _canonical_parameters(updates),
         PARAMETERS_AFTER_ONE_STEP: _canonical_parameters(diagnostic.new_state.model),
-        "adam_mu": _canonical_parameters(diagnostic.new_state.opt_state[0].mu),
-        "adam_nu": _canonical_parameters(diagnostic.new_state.opt_state[0].nu),
-        "adam_count": {"count": diagnostic.new_state.opt_state[0].count},
+        ADAM_MU: _canonical_parameters(diagnostic.new_state.opt_state[0].mu),
+        ADAM_NU: _canonical_parameters(diagnostic.new_state.opt_state[0].nu),
+        ADAM_COUNT: {"count": diagnostic.new_state.opt_state[0].count},
     }
     # Materialize parity outputs on the host so they do not pollute live device
     # memory while measuring subsequent full training steps.
     diagnostics = {label: jax.tree.map(np.asarray, tensors) for label, tensors in diagnostic_data.items()}
     diagnostic_manifests = {
-        "gradients": _array_manifest(diagnostic_data["gradients"]),
+        GRADIENTS: _array_manifest(diagnostic_data[GRADIENTS]),
         "gradients_raw": _tree_manifest(gradients),
         "updates_raw": _tree_manifest(updates),
         UPDATES: _array_manifest(diagnostic_data[UPDATES]),
         PARAMETERS_AFTER_ONE_STEP: _array_manifest(diagnostic_data[PARAMETERS_AFTER_ONE_STEP]),
-        "adam_mu": _array_manifest(diagnostic_data["adam_mu"]),
-        "adam_nu": _array_manifest(diagnostic_data["adam_nu"]),
-        "adam_count": _array_manifest(diagnostic_data["adam_count"]),
+        ADAM_MU: _array_manifest(diagnostic_data[ADAM_MU]),
+        ADAM_NU: _array_manifest(diagnostic_data[ADAM_NU]),
+        ADAM_COUNT: _array_manifest(diagnostic_data[ADAM_COUNT]),
         "optimizer_state_after_one_step": _tree_manifest(diagnostic.new_state.opt_state),
     }
     del diagnostic_state, diagnostic, diagnostic_data, gradients, updates
@@ -479,9 +489,9 @@ def _run_variant(
     del result
     execution_data = {
         EXECUTION_PARAMETERS_AFTER_ONE_STEP: _canonical_parameters(state.model),
-        "execution_adam_mu": _canonical_parameters(state.opt_state[0].mu),
-        "execution_adam_nu": _canonical_parameters(state.opt_state[0].nu),
-        "execution_adam_count": {"count": state.opt_state[0].count},
+        EXECUTION_ADAM_MU: _canonical_parameters(state.opt_state[0].mu),
+        EXECUTION_ADAM_NU: _canonical_parameters(state.opt_state[0].nu),
+        EXECUTION_ADAM_COUNT: {"count": state.opt_state[0].count},
     }
     for label, tensors in execution_data.items():
         # The state is donated again below; keep independent host snapshots.
@@ -532,10 +542,10 @@ def _run_variant(
         "final_step": final_step,
         "profile": {"path": str(profile_path), "steps": config.profile_steps} if profile_path is not None else None,
         "layouts": {
-            "parameters": model_manifest,
+            PARAMETERS: model_manifest,
             "parameters_raw": raw_model_manifest,
             "optimizer_state_initial": optimizer_manifest,
-            "activations": activations_manifest,
+            ACTIVATIONS: activations_manifest,
             **diagnostic_manifests,
         },
     }
@@ -695,18 +705,18 @@ def run_benchmark(
         for label in diagnostics["legacy"]:
             parity[label] = _numerical_comparison(diagnostics["legacy"][label], diagnostics["native"][label], config)
         for label in (
-            "parameters",
-            "gradients",
+            PARAMETERS,
+            GRADIENTS,
             UPDATES,
             PARAMETERS_AFTER_ONE_STEP,
-            "adam_mu",
-            "adam_nu",
-            "adam_count",
+            ADAM_MU,
+            ADAM_NU,
+            ADAM_COUNT,
             EXECUTION_PARAMETERS_AFTER_ONE_STEP,
-            "execution_adam_mu",
-            "execution_adam_nu",
-            "execution_adam_count",
-            "activations",
+            EXECUTION_ADAM_MU,
+            EXECUTION_ADAM_NU,
+            EXECUTION_ADAM_COUNT,
+            ACTIVATIONS,
         ):
             _assert_matching_manifests(
                 variants["legacy"]["layouts"][label], variants["native"]["layouts"][label], label=label

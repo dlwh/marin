@@ -9,7 +9,7 @@ from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
 import pytest
 
 from levanter.layers.stacked import ArrayStacked
-from levanter.layers.scan_checkpoint import ScanCheckpointPolicy
+from haliax.nn.scan import ScanCheckpointPolicy
 from levanter.utils.tree_utils import scan_aware_tree_map
 
 

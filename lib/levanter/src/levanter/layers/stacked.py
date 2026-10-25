@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.ad_checkpoint import checkpoint_name
 
-from levanter.layers.scan_checkpoint import ScanCheckpointPolicy, ScanCheckpointSpec
+from haliax.nn.scan import ScanCheckpointPolicy, ScanCheckpointSpec
 
 M = TypeVar("M", bound=eqx.Module)
 CarryT = TypeVar("CarryT")
@@ -90,7 +90,8 @@ class ArrayStacked(eqx.Module, Generic[M]):
     ) -> ModuleInit["ArrayStacked[M]"]:
         if num_layers < 1:
             raise ValueError(f"num_layers must be >= 1; got {num_layers}.")
-        gradient_checkpointing = ScanCheckpointPolicy.from_spec(gradient_checkpointing)
+        if not isinstance(gradient_checkpointing, ScanCheckpointPolicy):
+            gradient_checkpointing = ScanCheckpointPolicy.from_bool_or_str(gradient_checkpointing)
 
         @functools.wraps(module)
         def init_fn(*args, **kwargs):

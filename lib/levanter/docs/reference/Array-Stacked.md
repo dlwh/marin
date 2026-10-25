@@ -131,7 +131,7 @@ Pass `gradient_checkpointing` to `ArrayStacked.init`; it defaults to `False`.
 For example, `ArrayStacked.init(num_layers, Block, gradient_checkpointing="nested")`
 returns an initializer that uses nested rematerialization. The setting accepts a
 boolean, a shorthand string, or
-[levanter.layers.scan_checkpoint.ScanCheckpointPolicy][]. `True` checkpoints
+[haliax.ScanCheckpointPolicy][]. `True` checkpoints
 each block, `False` disables rematerialization, `"full"` recomputes carries during
 the backward pass, `"nested"` checkpoints groups of layers for backward-pass
 recomputation, and `"offload"` saves carries and inputs
@@ -145,7 +145,7 @@ Use an explicit JAX mesh and native parameter shardings. Sharding is independent
 of layer count and shape names; the stack does not infer distribution from a
 logical-axis mapping.
 
-::: levanter.layers.scan_checkpoint.ScanCheckpointPolicy
+::: haliax.ScanCheckpointPolicy
 
 
 ## Native Llama
