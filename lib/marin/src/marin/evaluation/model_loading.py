@@ -18,21 +18,25 @@ def load_eval_model(
     checkpoint_is_hf: bool,
     Vocab: Axis,
     axis_mapping: ResourceMapping,
+    compute_axis_mapping: ResourceMapping,
+    batch_axis_name: str,
     tokenizer,
     mp: jmp.Policy,
     key: jax.Array,
 ) -> LmHeadModel:
     """Load an eval model from an HF or Levanter checkpoint.
 
-    ``checkpoint_is_hf`` selects the loader: HF checkpoints resolve the vocab from
-    ``tokenizer`` and cast to ``mp.compute_dtype``, while Levanter checkpoints partition
-    against the precomputed ``Vocab`` axis. Both loaders must run under an active device mesh.
+    ``axis_mapping`` controls parameter storage; ``compute_axis_mapping`` and
+    ``batch_axis_name`` supply native computation roles. The shared loaders preserve
+    native source vocabulary and precision policies. Both require an active device mesh.
     """
     if checkpoint_is_hf:
         return load_hf_checkpoint(
             model_config,
             checkpoint_path,
             axis_mapping=axis_mapping,
+            compute_axis_mapping=compute_axis_mapping,
+            batch_axis_name=batch_axis_name,
             tokenizer=tokenizer,
             compute_dtype=mp.compute_dtype,
         )
@@ -41,5 +45,7 @@ def load_eval_model(
         checkpoint_path,
         Vocab=Vocab,
         axis_mapping=axis_mapping,
+        compute_axis_mapping=compute_axis_mapping,
+        batch_axis_name=batch_axis_name,
         key=key,
     )

@@ -9,7 +9,7 @@ import math
 import os
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, TypeVar
 
 import fsspec
@@ -27,7 +27,9 @@ from levanter.data.text.trace_chat import (
     dataset_for_trace_chat_format,
 )
 from levanter.eval import LabeledEvaluator, eval_labeled_model
+from levanter.model_loading import native_evaluation_axis_mapping
 from levanter.models.llama import LlamaConfig
+from levanter.models.llama_native_lm import NativeLlamaLmConfig
 from levanter.models.lm_model import LmConfig
 from levanter.tokenizers import load_tokenizer as load_marin_tokenizer
 from levanter.trainer import TrainerConfig
@@ -494,6 +496,8 @@ def trace_labeled_eval(config: TraceLabeledEvalConfig) -> None:
 
     _validate_eval_config(config)
 
+    if config.model.requires_explicit_mesh_axes:
+        config = replace(config, trainer=replace(config.trainer, use_explicit_mesh_axes=True))
     levanter.trainer.initialize(config)
     try:
         tokenizer = load_marin_tokenizer(config.tokenizer)
@@ -503,6 +507,14 @@ def trace_labeled_eval(config: TraceLabeledEvalConfig) -> None:
 
         compute_axis_mapping = config.trainer.compute_axis_mapping
         parameter_axis_mapping = config.trainer.parameter_axis_mapping
+        if isinstance(config.model, NativeLlamaLmConfig):
+            compute_axis_mapping = native_evaluation_axis_mapping(
+                config.model,
+                parameter_axis_mapping,
+                compute_axis_mapping,
+                config.trainer.device_mesh,
+                config.trainer.batch_axis_name,
+            )
 
         with config.trainer.use_device_mesh():
             key = jax.random.PRNGKey(0)
@@ -521,6 +533,8 @@ def trace_labeled_eval(config: TraceLabeledEvalConfig) -> None:
                 checkpoint_is_hf=config.checkpoint_is_hf,
                 Vocab=Vocab,
                 axis_mapping=parameter_axis_mapping,
+                compute_axis_mapping=config.trainer.compute_axis_mapping,
+                batch_axis_name=config.trainer.batch_axis_name,
                 tokenizer=tokenizer,
                 mp=mp,
                 key=key,
