@@ -568,3 +568,16 @@ checkpoint dtype. Use `checkpoint_subpath: model/policy` to export the policy fr
 With `use_cpu: true`, the exporter restores the selected subtree on CPU. Host memory must hold the
 restored weights as well as the export buffers.
 Pin an explicit tokenizer with `tokenizer: model_name_or_path@revision`.
+
+For `model.type: llama_native`, the exporter validates stored model metadata and restores the complete
+checkpoint vocabulary before applying `override_vocab_size`. The configured architecture must match
+the checkpoint, including activation and RoPE semantics. Full model subtrees such as `model/policy`
+are supported; adapter-only checkpoints require separate reconstruction.
+
+Native CPU export uses a replicated explicit mesh on one local CPU, independently of the trainer's
+placement mappings. Otherwise, export uses the trainer's parameter and computation mappings with
+explicit mesh axes. Native export resolves the explicit `tokenizer` or `model.tokenizer` without
+loading an unrelated HF reference. Set `save_tokenizer: false` to export without a tokenizer.
+Checkpoints lacking native model metadata require the original configuration and stored vocabulary size
+from the tokenizer or `override_vocab_size`. In this case, `override_vocab_size` must equal the stored
+vocabulary size; resizing requires model metadata. Their stored semantic identity cannot be verified.
