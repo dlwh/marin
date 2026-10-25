@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Union
 
 import jax.numpy as jnp
+import jmp
 from jax.sharding import AxisType
 from jax.experimental.array_serialization.serialization import GlobalAsyncCheckpointManager
 
@@ -23,6 +24,7 @@ import levanter.config
 from levanter.checkpoint import save_checkpoint
 from levanter.compat.hf_checkpoints import RepoRef, load_tokenizer
 from levanter.models.llama import LlamaConfig
+from levanter.models.llama_native_lm import NativeLlamaLmConfig, NativeLlamaLmHeadModel
 from levanter.models.lm_model import LmConfig
 from levanter.utils.jax_utils import local_cpu_mesh
 
@@ -98,18 +100,32 @@ def main(config: ImportHfConfig):
     tokenizer = load_tokenizer(tokenizer_path, revision=config.tokenizer_revision)
 
     logger.info("Setting up HF checkpoint converter")
-    converter = config.model.hf_checkpoint_converter()
-    converter = converter.replaced(reference_checkpoint=hf_checkpoint, tokenizer=tokenizer)
+    model_config = config.model if not config.use_hf_model_config else None
+    if isinstance(config.model, NativeLlamaLmConfig):
+        converter = config.model.hf_checkpoint_converter(str(hf_checkpoint), tokenizer=tokenizer)
+        hf_config = converter.default_hf_config
+        native_config = type(config.model).from_hf_config(hf_config) if config.use_hf_model_config else config.model
+        native_config.validate_hf_config(hf_config)
+        model_config = native_config
+    else:
+        converter = config.model.hf_checkpoint_converter()
+        converter = converter.replaced(reference_checkpoint=hf_checkpoint, tokenizer=tokenizer)
 
     logger.info("Loading HF model...")
     mesh_axis_type = AxisType.Explicit if config.model.requires_explicit_mesh_axes else AxisType.Auto
+    target_dtype = getattr(jnp, config.dtype) if config.dtype else None
     with local_cpu_mesh(mesh_axis_type):
         model = converter.load_pretrained(
             config.model.model_type,
-            config=config.model if not config.use_hf_model_config else None,
-            dtype=getattr(jnp, config.dtype) if config.dtype else None,
+            config=model_config,
+            dtype=target_dtype,
             resize_vocab_to_match_tokenizer=config.resize_vocab_to_match_tokenizer,
         )
+        if isinstance(model, NativeLlamaLmHeadModel) and target_dtype is not None:
+            # Native HF loading retains FP32 masters; persisted weights use the requested dtype.
+            model = jmp.Policy(
+                param_dtype=target_dtype, compute_dtype=target_dtype, output_dtype=target_dtype
+            ).cast_to_param(model)
 
     StoragePath(config.output_path).mkdirs()
     logger.info(f"Output directory ready: {config.output_path}")
@@ -132,6 +148,7 @@ def main(config: ImportHfConfig):
         commit_callback=commit_callback,
         step=0,
         is_temporary=False,
+        metadata=model.checkpoint_metadata() if isinstance(model, NativeLlamaLmHeadModel) else None,
     )
     # Block until the async commit lands, so a caller (or an artifact record) never observes an
     # incomplete checkpoint after main() returns.
