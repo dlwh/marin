@@ -51,6 +51,7 @@ from levanter.tokenizers import MarinTokenizer
 from levanter.utils.activation import ActivationFunctionEnum
 
 
+_LEVANTER_MODEL_METADATA_KEY = "levanter_model"
 _NATIVE_CHECKPOINT_VERSION = 1
 
 
@@ -334,9 +335,9 @@ class NativeLlamaLmConfig(LlamaConfig):
 
         Checkpoints without model metadata retain the explicit-config initialization path.
         """
-        if "levanter_model" not in metadata:
+        if _LEVANTER_MODEL_METADATA_KEY not in metadata:
             return None
-        identity = metadata["levanter_model"]
+        identity = metadata[_LEVANTER_MODEL_METADATA_KEY]
         if not isinstance(identity, dict) or set(identity) != {"version", "type", "vocab_size", "architecture"}:
             raise ValueError("Malformed native checkpoint model metadata")
         if (
@@ -413,7 +414,7 @@ class NativeLlamaLmHeadModel(ModuleWithStateDictSerialization, LmHeadModel[Nativ
     def checkpoint_metadata(self) -> Mapping[str, Any]:
         """Describe the actual stored model without source paths or runtime placement policy."""
         return {
-            "levanter_model": {
+            _LEVANTER_MODEL_METADATA_KEY: {
                 "version": _NATIVE_CHECKPOINT_VERSION,
                 "type": "llama_native",
                 "vocab_size": self.Vocab.size,
