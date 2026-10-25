@@ -232,6 +232,8 @@ class Fp8DotGeneralOp(CustomGradientAccumulation):
         dimension_numbers,
         precision: PrecisionLike = None,
         preferred_element_type: DTypeLike | None = None,
+        *,
+        out_sharding=None,
         **kwargs,
     ):
         # Use the kernel (`rhs`) dtype as the compute dtype since it aligns with
@@ -248,6 +250,7 @@ class Fp8DotGeneralOp(CustomGradientAccumulation):
             dimension_numbers,
             precision=precision,
             preferred_element_type=comp_dtype,
+            out_sharding=out_sharding,
             lhs_scale=self.input_scale,
             rhs_scale=self.kernel_scale,
             grad_scale=self.output_grad_scale,

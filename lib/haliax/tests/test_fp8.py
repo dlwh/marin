@@ -20,6 +20,7 @@ import haliax as hax
 from haliax._src.fp8 import compute_scale, fp8_scaled_dot_general
 from haliax.nn import Linear
 from haliax.quantization import (
+    DefaultDotGeneralOp,
     Fp8DotGeneralOp,
     QuantizationConfig,
     apply_updates,
@@ -571,3 +572,94 @@ def test_fp8ize_stacking():
     assert isinstance(dg, Fp8DotGeneralOp)
     dg = tformer_q.blocks.stacked.down_proj.dot_general
     assert not isinstance(dg, Fp8DotGeneralOp)
+
+
+@pytest.mark.tpu
+@pytest.mark.parametrize("route", ["raw", "named"])
+def test_fp8_contracting_shards_preserve_requested_output_and_gradients(route):
+    devices = jax.devices()
+    model_size = 2 if len(devices) >= 4 and len(devices) % 2 == 0 else 1
+    data_size = len(devices) // model_size
+    mesh = Mesh(
+        np.array(devices).reshape(data_size, model_size),
+        ("data", "model"),
+        axis_types=(AxisType.Explicit, AxisType.Explicit),
+    )
+    Batch = hax.Axis("batch", 8 * data_size)
+    In = hax.Axis("contract", lcm(16, model_size))
+    Out = hax.Axis("features", 8)
+    operands = np.array([-3, -2, -1.5, -1, -0.5, 0.5, 1, 1.5, 2, 3], np.float32)
+    cotangents = np.array([-2, -1, -0.5, 0.5, 1, 2], np.float32)
+    input_values = np.resize(operands, (Batch.size, In.size))
+    weight_values = np.resize(operands[::-1], (Out.size, In.size))
+    cotangent_values = np.resize(cotangents, (Batch.size, Out.size))
+    expected_output = input_values @ weight_values.T
+    expected_input_gradient = cotangent_values @ weight_values
+    expected_weight_gradient = cotangent_values.T @ input_values
+
+    with jax.set_mesh(mesh), hax.axis_mapping({"batch": "data", "contract": "model"}):
+        output_sharding = NamedSharding(mesh, P("data", None))
+        inputs = jax.device_put(input_values, NamedSharding(mesh, P("data", "model")))
+        weight = jax.device_put(weight_values, NamedSharding(mesh, P(None, "model")))
+        cotangent = jax.device_put(cotangent_values, output_sharding)
+
+        def forward(state):
+            operation, values, parameter = state
+            if route == "raw":
+                return operation(
+                    values,
+                    parameter,
+                    (((1,), (1,)), ((), ())),
+                    preferred_element_type=jnp.float32,
+                    out_sharding=output_sharding,
+                )
+            return hax.dot(
+                hax.named(values, (Batch, In)),
+                hax.named(parameter, (Out, In)),
+                axis=In,
+                dot_general=operation,
+            ).array
+
+        def loss(state):
+            output = forward(state)
+            return jnp.sum(output * cotangent), output
+
+        operation = dataclasses.replace(
+            Fp8DotGeneralOp.init(amax_history_length=16),
+            input_scale=jnp.array([2.0], jnp.float32),
+            kernel_scale=jnp.array([0.5], jnp.float32),
+            output_grad_scale=jnp.array([4.0], jnp.float32),
+        )
+        operation = jax.tree.map(lambda value: jax.device_put(value, NamedSharding(mesh, P())), operation)
+        # The standard JAX operation establishes that the same contraction and
+        # requested result layout are legal before exercising the FP8 replacement.
+        for dot_operation in (DefaultDotGeneralOp.init(), operation):
+            state = (dot_operation, inputs, weight)
+            output = eqx.filter_jit(forward)(state)
+            (_, differentiated_output), gradients = eqx.filter_jit(eqx.filter_value_and_grad(loss, has_aux=True))(
+                state
+            )
+            operation_gradient, input_gradient, weight_gradient = gradients
+            np.testing.assert_array_equal(output, expected_output)
+            np.testing.assert_array_equal(differentiated_output, expected_output)
+            np.testing.assert_array_equal(input_gradient, expected_input_gradient)
+            np.testing.assert_array_equal(weight_gradient, expected_weight_gradient)
+            assert output.sharding == output_sharding
+            assert differentiated_output.sharding == output_sharding
+            assert input_gradient.sharding == inputs.sharding
+            assert weight_gradient.sharding == weight.sharding
+
+        overwritten = apply_updates(operation, None, operation_gradient)
+        for name, maximum in (
+            ("input", np.max(np.abs(input_values))),
+            ("kernel", np.max(np.abs(weight_values))),
+            ("output_grad", np.max(np.abs(cotangent_values))),
+        ):
+            expected_history = np.zeros(16, np.float32)
+            expected_history[0] = maximum
+            history = getattr(overwritten, name + "_amax_history")
+            scale = getattr(overwritten, name + "_scale")
+            np.testing.assert_array_equal(history, expected_history)
+            np.testing.assert_array_equal(scale, getattr(operation, name + "_scale"))
+            assert history.sharding.is_equivalent_to(getattr(operation, name + "_amax_history").sharding, history.ndim)
+            assert scale.sharding.is_equivalent_to(getattr(operation, name + "_scale").sharding, scale.ndim)
