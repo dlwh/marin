@@ -289,6 +289,38 @@ initialize_from_hf: "NousResearch/Llama-2-7b-hf"
 use_hf_model_config: true
 ```
 
+#### Saving an HF model as a Levanter checkpoint
+
+To convert HF weights once before training, run
+`uv run python -m levanter.main.export_hf_to_lm --config_path import.yaml` with:
+
+```yaml
+hf_checkpoint: /path/to/hf-llama
+output_path: /path/to/levanter-checkpoint
+model:
+  type: llama_native
+use_hf_model_config: true
+dtype: float32
+subpath: model
+```
+
+Native import derives the architecture from the requested HF source in this mode. With
+`use_hf_model_config: false`, the supplied native architecture must match the source, including
+activation and RoPE. The importer uses an explicit local CPU mesh. `dtype` controls the stored weights.
+The complete source vocabulary is preserved by default; `resize_vocab_to_match_tokenizer: true`
+instead saves the resized vocabulary. Set `emit_padded_tokenizer: true` to also save a tokenizer padded
+to the source vocabulary.
+
+If `tokenizer` is omitted, the tokenizer is loaded from the `hf_checkpoint` path. Set `tokenizer` to
+select a different tokenizer path and `tokenizer_revision` to pin the tokenizer revision.
+`subpath: model` stores an internal `model` subtree in the checkpoint at `output_path`, matching the
+shared model loaders. Pass `output_path` as the checkpoint directory when restoring.
+
+For later restore, retain the source `config.json` and tokenizer, or a matching explicit native
+configuration and tokenizer. Use `NativeLlamaLmConfig.from_hf_config` to derive the native architecture
+from the saved HF config. The checkpoint metadata records the resulting vocabulary and semantic
+identity to validate the supplied configuration; it does not construct that configuration.
+
 ### LoRA adapters
 
 The canonical `train_lm` and `train_dpo` entrypoints accept `adapter.type: lora` with
