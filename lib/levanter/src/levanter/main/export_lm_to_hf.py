@@ -11,14 +11,13 @@ import haliax
 import jax
 import jax.numpy as jnp
 from jax.sharding import AxisType
-from rigging.filesystem.storage_path import StoragePath, prefix_join
 
 from haliax import Axis
 
 import levanter
 import levanter.config
 import levanter.utils.logging as logging_utils
-from levanter.checkpoint import _load_metadata, discover_checkpoint_candidates, latest_checkpoint_path, load_checkpoint
+from levanter.checkpoint import latest_checkpoint_path, load_checkpoint, resolve_checkpoint
 from levanter.compat.hf_checkpoints import (
     DEFAULT_EXPORT_HOST_BUDGET_BYTES,
     DEFAULT_MAX_SHARD_SIZE,
@@ -77,15 +76,9 @@ def main(config: ConvertLmConfig):
             tokenizer_ref = RepoRef.from_string(tokenizer_spec)
             tokenizer = load_tokenizer(tokenizer_ref.model_name_or_path, revision=tokenizer_ref.revision)
         converter = native_config.hf_export_converter(tokenizer)
-        candidates = discover_checkpoint_candidates(checkpoint_path)
-        candidate = candidates[-1] if candidates else None
-        if candidate is not None:
-            checkpoint_path, metadata = candidate.path, candidate.metadata
-        elif StoragePath(prefix_join(checkpoint_path, "metadata.json")).exists():
-            metadata = _load_metadata(checkpoint_path)
-        else:
-            metadata = {}
-        source_vocab = native_config.checkpoint_vocab_size(metadata)
+        resolved = resolve_checkpoint(checkpoint_path)
+        checkpoint_path = resolved.path
+        source_vocab = native_config.checkpoint_vocab_size(resolved.metadata)
     else:
         converter = config.model.hf_checkpoint_converter()
         tokenizer_spec = config.tokenizer

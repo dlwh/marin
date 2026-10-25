@@ -90,7 +90,7 @@ class ArrayStacked(eqx.Module, Generic[M]):
     ) -> ModuleInit["ArrayStacked[M]"]:
         if num_layers < 1:
             raise ValueError(f"num_layers must be >= 1; got {num_layers}.")
-        gradient_checkpointing = ScanCheckpointPolicy._mk(gradient_checkpointing)
+        gradient_checkpointing = ScanCheckpointPolicy.from_spec(gradient_checkpointing)
 
         @functools.wraps(module)
         def init_fn(*args, **kwargs):
