@@ -18,6 +18,7 @@ import levanter
 import levanter.analysis
 import levanter.config
 import levanter.tracker
+from levanter.quantization import cast_model_preserving_quantization_state
 from levanter.compat.hf_checkpoints import RepoRef
 from levanter.data.loader import DataLoader
 from levanter.data.text.datasets import LmDataConfig
@@ -103,7 +104,7 @@ def main(config: EvalLmConfig):
 
         def eval_loss_fn(model: LmHeadModel, batch: LmExample) -> LossFnOutput:
             model = inference_mode(model, True)
-            model = mp.cast_to_compute(model)
+            model = cast_model_preserving_quantization_state(model, mp.cast_to_compute)
             per_pos_loss = model.compute_next_token_loss(batch, reduction=None, reduction_axis=()).array
             per_pos_weight = batch.loss_weight.array
             per_pos_token_id = jnp.roll(batch.tokens.array, -1, axis=-1)
@@ -122,12 +123,12 @@ def main(config: EvalLmConfig):
         @hax.named_jit(axis_resources=compute_axis_mapping)
         def compute_loss(model: LmHeadModel, example: LmExample):
             model = inference_mode(model, True)
-            model = mp.cast_to_compute(model)
+            model = cast_model_preserving_quantization_state(model, mp.cast_to_compute)
             return model.compute_next_token_loss(example, key=None)
 
         @hax.named_jit(axis_resources=compute_axis_mapping)
         def compute_logits(model: LmHeadModel, example: LmExample):
-            model = mp.cast_to_compute(model)
+            model = cast_model_preserving_quantization_state(model, mp.cast_to_compute)
             activations, _ = split_activations(
                 model.activations(example.tokens, key=None, attn_mask=example.attn_mask)
             )

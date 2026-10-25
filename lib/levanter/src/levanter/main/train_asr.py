@@ -18,6 +18,7 @@ import levanter
 import levanter.config
 import levanter.tracker
 from levanter import callbacks
+from levanter.quantization import cast_model_preserving_quantization_state
 from levanter.callbacks._iris_status import iris_status_reporter
 from levanter.compat.hf_checkpoints import HFCompatConfig, ModelWithHfSerializationMixin, save_hf_checkpoint_callback
 from levanter.data.audio import AudioIODatasetConfig, AudioMixtureDatasetConfig, AudioTextDataset
@@ -200,7 +201,7 @@ def main(config: TrainASRConfig):
             out_axis_resources=compute_axis_mapping,
         )
         def compute_log_probs(model, example):
-            model = trainer.mp.cast_to_compute(model)
+            model = cast_model_preserving_quantization_state(model, trainer.mp.cast_to_compute)
             logprobs = model.compute_loss(example, key=None, reduction=None)
             # roll forward to get the loss for each predicted token
             logprobs = hax.roll(logprobs, 1, Pos)

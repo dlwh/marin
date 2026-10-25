@@ -43,6 +43,7 @@ from haliax import NamedArray
 from jax.sharding import PartitionSpec
 
 import levanter.tracker
+from levanter.quantization import cast_model_preserving_quantization_state
 from levanter.compat.hf_checkpoints import load_tokenizer
 from levanter.data.packing import (
     PromptCompletion,
@@ -278,7 +279,7 @@ class _LmEvalHarnessWorker:
             """
 
             if self.mp is not None:
-                model = self.mp.cast_to_compute(model)
+                model = cast_model_preserving_quantization_state(model, self.mp.cast_to_compute)
 
             activations, _ = split_activations(
                 model.activations(packed_example.tokens, attn_mask=packed_example.attn_mask)

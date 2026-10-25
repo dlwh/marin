@@ -5,6 +5,7 @@ import dataclasses
 from math import lcm
 
 import equinox as eqx
+import haliax as hax
 import jax
 import jax.numpy as jnp
 import jmp
@@ -13,14 +14,14 @@ import optax
 import pytest
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P, reshard
 
-from haliax.quantization import Fp8DotGeneralOp
+from haliax.quantization import Fp8DotGeneralOp, QuantizationConfig
 
 from levanter.grad_accum import microbatched_arrays
-from levanter.checkpoint import CheckpointerConfig, discover_checkpoint_candidates, save_checkpoint
+from levanter.checkpoint import CheckpointerConfig, discover_checkpoint_candidates, load_checkpoint, save_checkpoint
 from levanter.metrics import Metric, ReductionType
 from levanter.optim.model_averaging import EmaModelAveragingConfig
 from levanter.tracker import NoopConfig
-from levanter.trainer import ExplicitTrainingLayout, Trainer, TrainerConfig
+from levanter.trainer import ExplicitTrainingLayout, Trainer, TrainerConfig, WrappedLossFunction
 from levanter.trainer_state import TrainerState
 from levanter.testing.cpu_devices import run_on_cpu_devices
 
@@ -406,3 +407,92 @@ def test_raw_microbatch_fp8_state_uses_maxima_without_averaging():
             assert value.sharding.is_equivalent_to(replicated, value.ndim)
         for name, expected in expected_states.items():
             np.testing.assert_array_equal(getattr(state, name), expected)
+
+
+class _Fp8NamedBlock(eqx.Module):
+    projection: hax.nn.Linear
+
+    @staticmethod
+    def init(axis, *, key):
+        return _Fp8NamedBlock(hax.nn.Linear.init(axis, axis.alias("out"), key=key, use_bias=False))
+
+    def __call__(self, value):
+        return self.projection(value).rename({"out": "feature"})
+
+
+@pytest.mark.parametrize("policy", ["f32", "params=float32,compute=bfloat16,output=float32"])
+def test_fp8_compute_cast_preserves_metadata_through_remat_and_checkpoint_next_update(tmp_path, policy):
+    mesh = Mesh(np.asarray(jax.devices()[:1]), ("data",), axis_types=(AxisType.Auto,))
+    mp = jmp.get_policy(policy)
+    feature = hax.Axis("feature", 8)
+    layer = hax.Axis("layer", 2)
+    with jax.set_mesh(mesh), hax.axis_mapping({}):
+        model = hax.nn.Stacked.init(layer, _Fp8NamedBlock, gradient_checkpointing=True)(
+            feature, key=jax.random.split(jax.random.PRNGKey(51), layer.size)
+        )
+        state = TrainerState.init(
+            optax.adam(1e-3),
+            model,
+            key=jax.random.PRNGKey(71),
+            mp=mp,
+            quantization=QuantizationConfig(fp8=True, amax_history_length=4),
+        )
+        operation = state.model.stacked.projection.dot_general
+        operation = dataclasses.replace(
+            operation,
+            input_scale=jnp.array([[1.003], [2.007]], jnp.float32),
+            kernel_scale=jnp.array([[0.503], [1.007]], jnp.float32),
+            output_grad_scale=jnp.array([[2.007], [4.013]], jnp.float32),
+            input_amax_history=jnp.array([[1.003, 2.007, 3.011, 4.013], [2.007, 4.013, 6.017, 8.021]]),
+            kernel_amax_history=jnp.array([[0.503, 1.007, 1.511, 2.013], [1.007, 2.013, 3.017, 4.021]]),
+            output_grad_amax_history=jnp.array([[2.007, 4.013, 6.017, 8.021], [4.013, 8.021, 12.029, 16.037]]),
+        )
+        state = eqx.tree_at(lambda s: s.model.stacked.projection.dot_general, state, operation)
+        inputs = hax.named(jnp.arange(32, dtype=jnp.float32).reshape(4, 8) / 16, (hax.Axis("batch", 4), feature))
+        observed_compute_dtypes = []
+
+        def loss(model, batch, *, key):
+            del key
+            projection = model.stacked.projection
+            observed_compute_dtypes.append((projection.weight.dtype, projection.dot_general.input_scale.dtype))
+            output = model.fold(batch)
+            return hax.mean(hax.square(output).astype(jnp.float32)).array
+
+        wrapped = WrappedLossFunction(loss, mp, None)
+
+        def reference_loss(model):
+            # An independent precision control casts only the known model weights.
+            # The FP8 operation and every one of its state arrays stay untouched.
+            weights = model.stacked.projection.weight.astype(mp.compute_dtype)
+            compute_model = eqx.tree_at(lambda m: m.stacked.projection.weight, model, weights)
+            return loss(compute_model, inputs, key=None)
+
+        expected_loss, expected_gradient = eqx.filter_jit(eqx.filter_value_and_grad(reference_loss))(state.model)
+        (actual_loss, _), gradient = eqx.filter_jit(eqx.filter_value_and_grad(wrapped, has_aux=True))(
+            state.model, inputs, key=None
+        )
+        np.testing.assert_array_equal(actual_loss, expected_loss)
+        for actual, expected in zip(jax.tree.leaves(gradient), jax.tree.leaves(expected_gradient), strict=True):
+            np.testing.assert_array_equal(actual, expected)
+        assert all(
+            weight == mp.compute_dtype and metadata == jnp.float32 for weight, metadata in observed_compute_dtypes
+        )
+
+        @eqx.filter_jit
+        def step(state):
+            key, next_key = jax.random.split(state.training_key)
+            (loss_value, _), grads = eqx.filter_value_and_grad(wrapped, has_aux=True)(state.model, inputs, key=key)
+            return state.take_step(grads, key=next_key, loss=loss_value)[0]
+
+        first = step(state)
+        checkpoint_path = tmp_path / "step-1"
+        save_checkpoint(first.saveable_state, step=1, checkpoint_path=checkpoint_path)
+        expected = step(first)
+        restored = load_checkpoint(state, checkpoint_path, mesh=mesh)
+        actual = step(restored)
+        assert int(actual.step) == 2
+        for actual_leaf, expected_leaf in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+            np.testing.assert_array_equal(actual_leaf, expected_leaf)
+        assert actual.model.stacked.projection.weight.dtype == jnp.float32
+        for leaf in jax.tree.leaves(actual.model.stacked.projection.dot_general):
+            assert leaf.dtype == jnp.float32

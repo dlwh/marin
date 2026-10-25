@@ -38,6 +38,7 @@ from rich.panel import Panel
 
 import levanter
 import levanter.config
+from levanter.quantization import cast_model_preserving_quantization_state
 from levanter.checkpoint import latest_checkpoint_path, load_checkpoint
 from levanter.compat.hf_checkpoints import HFCheckpointConverter, load_tokenizer
 from levanter.tokenizers import MarinTokenizer
@@ -95,7 +96,7 @@ def _load_model(
                 subpath="model",
                 axis_mapping=trainer_config.parameter_axis_mapping,
             )
-            model = mp.cast_to_compute(model)
+            model = cast_model_preserving_quantization_state(model, mp.cast_to_compute)
             return model, None
         else:
             assert hf_checkpoint

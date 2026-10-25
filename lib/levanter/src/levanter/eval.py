@@ -25,6 +25,7 @@ import haliax as hax
 from haliax.partitioning import ResourceMapping
 
 import levanter.tracker
+from levanter.quantization import cast_model_preserving_quantization_state
 from levanter.callbacks import ProgressEvent, StepInfo, progress_event_scope
 from levanter.data.dataset import AsyncDataset
 from levanter.data.loader import DataLoader
@@ -232,7 +233,7 @@ def _default_lm_eval_loss_fn(
     model = inference_mode(model, True)
     named_batch = _ensure_named_lm_example(batch, EvalBatch=EvalBatch, model_pos=model.Pos)
     if mp is not None:
-        model = mp.cast_to_compute(model)
+        model = cast_model_preserving_quantization_state(model, mp.cast_to_compute)
     per_pos_loss = model.compute_next_token_loss(named_batch, reduction=None, reduction_axis=()).array
     per_pos_weight = named_batch.loss_weight.array
     per_pos_token_id = jnp.roll(named_batch.tokens.array, -1, axis=-1)
@@ -272,7 +273,7 @@ def _default_labeled_lm_eval_loss_fn(
         pos_axis_name=model.Pos.name,
     )
     if mp is not None:
-        model = mp.cast_to_compute(model)
+        model = cast_model_preserving_quantization_state(model, mp.cast_to_compute)
     per_pos_loss = model.compute_next_token_loss(named_batch, reduction=None, reduction_axis=()).array
     per_pos_token_id = jnp.roll(named_batch.tokens.array, -1, axis=-1)
     return per_pos_loss, loss_labels.array, per_pos_token_id

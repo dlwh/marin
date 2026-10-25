@@ -15,6 +15,7 @@ from jax import numpy as jnp
 from jaxtyping import PRNGKeyArray, PyTree
 from optax import GradientTransformation, OptState
 
+from levanter.quantization import cast_model_preserving_quantization_state
 from levanter.optim.model_averaging import ModelAveraging, ModelAveragingConfig
 from levanter.utils.jax_utils import is_inexact_arrayish
 from levanter.utils.tree_utils import inference_mode
@@ -208,8 +209,8 @@ def cast_params_by_trainability(model, mp, is_trainable):
     Trainable parameters are cast to param precision, non-trainable parameters are cast to compute precision.
     """
     trainable, non_trainable = _partition_trainable_params(model, is_trainable)
-    trainable = mp.cast_to_param(trainable)
-    non_trainable = mp.cast_to_compute(non_trainable)
+    trainable = cast_model_preserving_quantization_state(trainable, mp.cast_to_param)
+    non_trainable = cast_model_preserving_quantization_state(non_trainable, mp.cast_to_compute)
     return eqx.combine(trainable, non_trainable, is_leaf=lambda x: isinstance(x, haliax.NamedArray))
 
 

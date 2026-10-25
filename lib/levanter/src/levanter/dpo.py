@@ -19,6 +19,7 @@ from haliax.partitioning import ResourceMapping, named_jit
 
 from rigging.filesystem.storage_path import StoragePath, prefix_join
 
+from levanter.quantization import cast_model_preserving_quantization_state
 from levanter.data.dataset import AsyncDataset
 from levanter.data.loader import DataLoader
 from levanter.data.text.preference import DpoExample
@@ -276,7 +277,7 @@ def build_reference_eval_cache(
 
     @named_jit(axis_resources=compute_axis_mapping)
     def ref_logprobs_fn(ref_model, batch: DpoExample):
-        ref_model = mp.cast_to_compute(ref_model)
+        ref_model = cast_model_preserving_quantization_state(ref_model, mp.cast_to_compute)
         ref_model = inference_mode(ref_model, True)
         return (
             jax.lax.stop_gradient(logp_sum(ref_model, batch.chosen, key=None)),

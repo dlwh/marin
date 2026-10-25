@@ -15,6 +15,7 @@ from haliax.partitioning import round_axis_for_partitioning
 import levanter
 import levanter.config
 import levanter.tracker
+from levanter.quantization import cast_model_preserving_quantization_state
 from levanter.callbacks import profile_ctx
 from levanter.compat.hf_checkpoints import RepoRef, load_tokenizer
 from levanter.inference.engine import GenerationResult, InferenceEngine, InferenceEngineConfig, Request
@@ -89,7 +90,7 @@ def _load_model(config: SampleLmConfig, Vocab: Axis, *, tokenizer, key) -> LmHea
         compute_axis_mapping=config.trainer.compute_axis_mapping,
         batch_axis_name=config.trainer.batch_axis_name,
         compute_dtype=config.trainer.mp.compute_dtype,
-        cast_to_param=config.trainer.mp.cast_to_compute,
+        cast_to_param=lambda model: cast_model_preserving_quantization_state(model, config.trainer.mp.cast_to_compute),
         hf_ref=hf_ref,
         checkpoint_path=config.checkpoint_path,
     )
