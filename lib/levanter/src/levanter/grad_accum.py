@@ -34,8 +34,9 @@ def microbatched_arrays(
     ``fn(batch, **kwargs)`` returns ``((loss, metrics), gradients)``. Every
     nonscalar array in ``batch`` leads with the same example dimension; scalar
     and Python leaves, and keyword arguments other than ``key``, are shared.
-    Equal-size microbatch losses and ordinary gradients are averaged. Metrics
-    retain their own reductions and the RNG key is split once per microbatch.
+    Equal-size microbatch losses and ordinary gradients are averaged. Custom
+    gradient state uses its own reduction without averaging. Metrics retain
+    their own reductions and the RNG key is split once per microbatch.
     """
     if microbatch_size <= 0:
         raise ValueError("microbatch_size must be positive")
@@ -96,11 +97,16 @@ def microbatched_arrays(
             (loss, metrics), gradients = evaluate(*inputs)
             (acc_loss, acc_metrics), acc_gradients = accumulator
             metrics = jax.tree.map(fold_metric, acc_metrics, metrics, is_leaf=lambda leaf: isinstance(leaf, Metric))
-            gradients = jax.tree.map(lambda left, right: left + right, acc_gradients, gradients)
+            gradients = hq.accumulate_gradients(acc_gradients, gradients)
             return ((acc_loss + loss, metrics), gradients), None
 
         ((loss, metrics), gradients), _ = jax.lax.scan(accumulate, initial, (mapped, keys))
-        return (loss / num_microbatches, metrics), jax.tree.map(lambda leaf: leaf / num_microbatches, gradients)
+        gradients = jax.tree.map(
+            lambda leaf: leaf if isinstance(leaf, hq.CustomGradientAccumulation) else leaf / num_microbatches,
+            gradients,
+            is_leaf=lambda leaf: isinstance(leaf, hq.CustomGradientAccumulation),
+        )
+        return (loss / num_microbatches, metrics), gradients
 
     return wrapped
 
