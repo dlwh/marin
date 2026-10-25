@@ -20,6 +20,7 @@ from haliax.partitioning import round_axis_for_partitioning
 import levanter
 import levanter.config
 import levanter.tracker
+from levanter.quantization import cast_model_preserving_quantization_state
 from levanter.analysis.model_perplexity import (
     ModelScoreReportBuilder,
     ScoredDocument,
@@ -387,7 +388,7 @@ def _load_model_runner(
     @hax.named_jit(axis_resources=compute_axis_mapping)
     def compute_losses(model: LmHeadModel, batch: GrugLmExample):
         model = inference_mode(model, True)
-        model = mp.cast_to_compute(model)
+        model = cast_model_preserving_quantization_state(model, mp.cast_to_compute)
         named_batch = named_lm_example_from_grug(batch, Pos=Pos, batch_axis=EvalBatch)
         return model.compute_next_token_loss(named_batch, reduction=None, reduction_axis=()).array
 

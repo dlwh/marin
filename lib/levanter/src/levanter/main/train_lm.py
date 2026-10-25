@@ -24,6 +24,7 @@ import levanter.callbacks
 import levanter.eval
 import levanter.eval_harness
 from levanter import callbacks
+from levanter.quantization import cast_model_preserving_quantization_state
 from levanter.callbacks._iris_status import iris_status_reporter
 from levanter.callbacks.labeled_eval import LabeledLmEvalConfig, add_labeled_lm_eval_callbacks
 from levanter.adaptor import AdaptorConfig, AdaptorExportConfig, LoraAdaptorConfig, NoAdaptorConfig
@@ -575,7 +576,7 @@ def main(config: TrainLmConfig) -> callbacks.StepInfo:
 
         @named_jit(axis_resources=compute_axis_mapping)
         def compute_logits(model: LmHeadModel, example: LmExample):
-            model = trainer.mp.cast_to_compute(model)
+            model = cast_model_preserving_quantization_state(model, trainer.mp.cast_to_compute)
             activations, _ = split_activations(
                 model.activations(example.tokens, key=None, attn_mask=example.attn_mask)
             )

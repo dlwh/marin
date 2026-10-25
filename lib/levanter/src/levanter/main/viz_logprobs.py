@@ -15,6 +15,7 @@ from haliax.partitioning import round_axis_for_partitioning
 
 import levanter
 import levanter.config
+from levanter.quantization import cast_model_preserving_quantization_state
 from levanter.data.loader import DataLoader
 from levanter.data.text.datasets import LmDataConfig
 from levanter.model_loading import load_hf_checkpoint, load_levanter_checkpoint, native_evaluation_axis_mapping
@@ -88,7 +89,7 @@ def main(config: VizLmConfig):
         @hax.named_jit(axis_resources=compute_axis_mapping)
         def compute_log_probs(model: LmHeadModel, example: LmExample):
             model = inference_mode(model, True)
-            model = mp.cast_to_compute(model)
+            model = cast_model_preserving_quantization_state(model, mp.cast_to_compute)
 
             activations, _ = split_activations(model.activations(example.tokens, example.attn_mask, key=key))
             logits = hax.dot(activations, model.get_lm_head(), axis=model.Embed)

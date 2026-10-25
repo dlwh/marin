@@ -23,6 +23,7 @@ import levanter.tracker
 import levanter.callbacks
 import levanter.eval
 from levanter import callbacks
+from levanter.quantization import cast_model_preserving_quantization_state
 from levanter.callbacks._iris_status import iris_status_reporter
 from levanter.adaptor import (
     AdaptorConfig,
@@ -443,7 +444,10 @@ def _load_separate_reference_model(
         checkpoint_path=None if config.reference.is_hf else config.reference.model_path,
     )
     reference_model = inference_mode(reference_model, True)
-    return named_jit(trainer.mp.cast_to_compute, parameter_axis_mapping)(reference_model)
+    return named_jit(
+        lambda model: cast_model_preserving_quantization_state(model, trainer.mp.cast_to_compute),
+        parameter_axis_mapping,
+    )(reference_model)
 
 
 def _reference_eval_cache_identity(config: TrainDpoConfig) -> dict[str, Any]:
@@ -897,7 +901,7 @@ def main(config: TrainDpoConfig) -> callbacks.StepInfo:
 
                 def lm_eval_loss(model: DpoModel | LmHeadModel, batch: LmExample) -> levanter.eval.LossFnOutput:
                     policy_model = inference_mode(_policy_model_for_hf_save(model), True)
-                    policy_model = trainer.mp.cast_to_compute(policy_model)
+                    policy_model = cast_model_preserving_quantization_state(policy_model, trainer.mp.cast_to_compute)
                     per_pos_loss = policy_model.compute_next_token_loss(batch, reduction=None, reduction_axis=()).array
                     per_pos_weight = batch.loss_weight.array
                     per_pos_token_id = jnp.roll(batch.tokens.array, -1, axis=-1)
@@ -933,7 +937,7 @@ def main(config: TrainDpoConfig) -> callbacks.StepInfo:
 
                 @eqx.filter_jit
                 def eval_loss(model, *batch, **batch_kwargs):
-                    model = trainer.mp.cast_to_compute(model)
+                    model = cast_model_preserving_quantization_state(model, trainer.mp.cast_to_compute)
                     return trainer.loss_fn(model, *batch, **batch_kwargs, key=None)
 
                 compute_loss = callbacks.compute_validation_loss(

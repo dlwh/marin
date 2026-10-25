@@ -55,6 +55,7 @@ import levanter.checkpoint
 import levanter.tracker
 import levanter.tracker.wandb
 import levanter.utils.logging
+from levanter.quantization import cast_model_preserving_quantization_state
 from levanter.callbacks import (
     Callback,
     CBInfo,
@@ -271,7 +272,7 @@ class WrappedLossFunction:
         Always returns (loss, wrapped_metrics) where metrics are Metric objects.
         """
         with nullcontext() if self._compute_axis_mapping is None else hax.axis_mapping(self._compute_axis_mapping):
-            model = self._mp.cast_to_compute(model)
+            model = cast_model_preserving_quantization_state(model, self._mp.cast_to_compute)
             result = self._raw_fn(model, *batch, **batch_kwargs)
 
         if isinstance(result, tuple) and len(result) == 2:
@@ -752,7 +753,7 @@ class Trainer:
 
             @eqx.filter_jit
             def eval_loss(model, *batch, **batch_kwargs):
-                model = self.mp.cast_to_compute(model)
+                model = cast_model_preserving_quantization_state(model, self.mp.cast_to_compute)
                 return self.loss_fn(model, *batch, **batch_kwargs, key=None)
 
             self.add_hook(
@@ -844,7 +845,7 @@ class Trainer:
         def obj_fun(trainable_model):
             model = eqx.combine(trainable_model, state.model)
             with self._compute_context():
-                model = self.mp.cast_to_compute(model)
+                model = cast_model_preserving_quantization_state(model, self.mp.cast_to_compute)
                 result = self._raw_loss_function(model, *batch, **batch_kwargs, key=key)
                 # result is (loss, metrics) tuple
                 loss_for_opt, _metrics = result
