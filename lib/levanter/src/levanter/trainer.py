@@ -116,7 +116,10 @@ class ExplicitTrainingLayout:
 
     The first positional loss argument after the model is a batch pytree whose
     nonscalar arrays all lead with the example dimension. Other loss arguments
-    are shared across microbatches.
+    are shared across microbatches. The first entry of ``batch_spec`` controls
+    example-axis placement in ``Trainer.data_loader`` and microbatch sizing.
+    That loader requires all trailing entries to be ``None``; callers may pass
+    manually feature-sharded batches directly to ``Trainer.train_step``.
     """
 
     mesh: Mesh
@@ -352,9 +355,10 @@ class Trainer:
 
     @cached_property
     def loss_fn(self) -> WrappedLossFunction:
-        """
-        Wrapped loss function that always returns (loss, metrics_dict).
-        Casts the model to compute precision and sets the context axis mapping to compute.
+        """Wrap the loss to return (loss, metrics_dict), casting the model to compute precision.
+
+        Set the compute axis mapping unless an explicit training layout is active.
+        Explicit layouts preserve the caller's current axis-mapping context.
         """
         return WrappedLossFunction(
             self._raw_loss_function,
@@ -764,6 +768,9 @@ class Trainer:
     def data_loader(self, dataset: AsyncDataset[X], batch: Optional[hax.Axis | int] = None) -> DataLoader[X]:
         """Creates a data loader for the given dataset and batch axis.
 
+        Explicit raw-array loading shards only the leading example dimension.
+        For feature-sharded inputs, place batches before calling ``train_step``.
+
         Args:
             dataset (AsyncDataset): the dataset to load
             batch: Optional batch axis or integer batch size. If None, uses the trainer batch axis
@@ -772,6 +779,11 @@ class Trainer:
         Returns:
             DataLoader: the data loader
         """
+        if self.explicit_layout is not None and any(axis is not None for axis in self.explicit_layout.batch_spec[1:]):
+            raise ValueError(
+                "Explicit data loaders only shard the leading example dimension; "
+                "provide feature-sharded batches directly to train_step"
+            )
         if isinstance(batch, int):
             batch_name = self.config.batch_axis_name
             batch_size = batch

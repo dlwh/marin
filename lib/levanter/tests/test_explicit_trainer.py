@@ -184,7 +184,9 @@ def test_explicit_trainer_microbatch_preserves_data_and_parameter_sharding():
         import numpy as np
         import optax
         from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
+        import pytest
         from levanter.callbacks import JitCallback
+        from levanter.data.dataset import ListAsyncDataset
         from levanter.tracker import NoopConfig
         from levanter.trainer import ExplicitTrainingLayout, Trainer, TrainerConfig
 
@@ -210,6 +212,9 @@ def test_explicit_trainer_microbatch_preserves_data_and_parameter_sharding():
         capture = CaptureGradients()
         trainer.add_hook(capture)
         with trainer:
+            dataset = ListAsyncDataset(list(np.arange(32, dtype=np.float32).reshape(8, 4)/32))
+            with pytest.raises(ValueError):
+                trainer.data_loader(dataset)
             weight = jax.device_put(jnp.arange(4, dtype=jnp.float32)/4, NamedSharding(mesh, P("context")))
             batch = jax.device_put(jnp.arange(32, dtype=jnp.float32).reshape(8, 4)/32,
                                    NamedSharding(mesh, P("replica_dcn", "context")))

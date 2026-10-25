@@ -55,7 +55,7 @@ class ScanCheckpointPolicy:
             raise ValueError(f"Invalid checkpoint policy {remat_policy}")
 
     @staticmethod
-    def _mk(remat_policy: bool | str | "ScanCheckpointPolicy") -> "ScanCheckpointPolicy":
+    def from_spec(remat_policy: bool | str | "ScanCheckpointPolicy") -> "ScanCheckpointPolicy":
         if isinstance(remat_policy, ScanCheckpointPolicy):
             return remat_policy
         else:

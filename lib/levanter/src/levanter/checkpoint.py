@@ -398,6 +398,14 @@ class CheckpointCandidate:
     metadata: Mapping[str, Any]
 
 
+@dataclass(frozen=True)
+class ResolvedCheckpoint:
+    """A concrete checkpoint path and its available stored metadata."""
+
+    path: str
+    metadata: Mapping[str, Any]
+
+
 @dataclass
 class CheckpointDebugConfig:
     enabled: bool = False
@@ -1143,6 +1151,22 @@ def discover_checkpoint_candidates(
             candidates_by_path[candidate.path] = candidate
 
     return sorted(candidates_by_path.values(), key=_checkpoint_candidate_sort_key)
+
+
+def resolve_checkpoint(checkpoint_path: PathLike) -> ResolvedCheckpoint:
+    """Resolve the latest candidate or a direct checkpoint with optional metadata.
+
+    Present direct metadata is read even when its discovery bookkeeping is unusable;
+    unreadable metadata raises. A metadata-free direct checkpoint returns empty metadata.
+    """
+    checkpoint_path = str(checkpoint_path)
+    candidates = discover_checkpoint_candidates(checkpoint_path)
+    if candidates:
+        candidate = candidates[-1]
+        return ResolvedCheckpoint(path=candidate.path, metadata=candidate.metadata)
+    if StoragePath(prefix_join(checkpoint_path, "metadata.json")).exists():
+        return ResolvedCheckpoint(path=checkpoint_path, metadata=_load_metadata(checkpoint_path))
+    return ResolvedCheckpoint(path=checkpoint_path, metadata={})
 
 
 def _checkpoint_candidate_sort_key(candidate: CheckpointCandidate) -> tuple[int, datetime.datetime, str]:

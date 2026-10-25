@@ -289,6 +289,61 @@ initialize_from_hf: "NousResearch/Llama-2-7b-hf"
 use_hf_model_config: true
 ```
 
+### LoRA adapters
+
+The canonical `train_lm` and `train_dpo` entrypoints accept `adapter.type: lora` with
+`model.type: llama_native`. Native adapters support dropout during training;
+evaluation and generation disable it through inference mode. Active training
+dropout requires an explicit RNG key. The default targets are the
+seven decoder projections (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`,
+`up_proj`, `down_proj`), excluding the output head. Native output-head adaptation
+remains unsupported.
+
+```yaml
+initialize_from_hf: ./base-weights
+adapter:
+  type: lora
+  r: 8
+  alpha: 8
+  dropout: 0
+peft_save_path: ./adapter-exports
+merged_hf_save_path: ./merged-exports
+hf_save_steps: 1000
+```
+
+The existing initialization convention is A zero and B random; set
+`a_init_mode: random` and `zero_init_b: true` for the alternative zero-delta
+initialization. Rank stays replicated while input/output factor dimensions follow
+the base projection's FSDP and tensor-parallel layouts.
+
+Adapter checkpoints store trainable factors and optimizer/RNG/step state. Resume
+with the original base source, model and adapter configuration: frozen base
+weights are reconstructed before restoring the adapter. These checkpoints do not
+validate adapter alpha, target selection or base-source identity. A different base
+or adapter configuration can change the resumed model despite compatible shapes.
+For DPO, this also requires the unchanged reference source when using a separate
+reference; frozen reference weights are reloaded rather than stored in the
+training checkpoint.
+
+Native LoRA DPO uses the same preference dataset and Trainer as full-parameter
+DPO. Set `reference.type: separate` and `reference.model_path` for an independent
+frozen reference, or `reference.type: adapter_base` to use the policy's frozen
+unadapted base. The latter requires exactly one zero LoRA factor at initialization,
+as in the default A-zero convention above. Both modes preserve the HF source's
+full output vocabulary even when the tokenizer has fewer rows. Programmatic
+`train_dpo.main` returns the final ordinary Trainer step after saving checkpoints.
+
+Use `peft_save_path` for canonical PEFT factor files, and
+`merged_hf_save_path` for ordinary HF Llama weights with the delta merged once.
+Both paths must be local for native training; Hub uploads remain unsupported.
+`hf_save_path` is for full-parameter training. PEFT exports initialized from HF
+record the actual initialization source. For portable PEFT factors, initialize
+from a local HF base as above and retain that original directory. For randomly
+initialized or native-only bases, use the merged export for standalone HF weights;
+factors alone cannot reconstruct their unmerged base. CPU tests cover training,
+continuation and local exports;
+this does not establish accelerator performance or adapter memory savings.
+
 ### Checkpointing
 
 See also the [Checkpointing section of the Configuration Guide](./reference/Configuration.md#checkpointing-and-initialization).
@@ -446,6 +501,32 @@ Visualization uses the loaded model's vocabulary and supports evaluation sequenc
 shorter than the model's configured context. This path has offline CPU coverage;
 it does not add generation, KV caches, or an accelerator performance claim.
 
+Run standalone likelihood benchmarks with:
+
+```bash
+uv run python -m levanter.eval_harness --config_path likelihood.yaml
+```
+
+Copy the `model` and `trainer` sections from the training config into
+`likelihood.yaml`, preserving the architecture and parameter placement. Keep the
+vocabulary replicated in the evaluation compute mapping: `vocab: model` in
+`trainer.mesh.compute_mapping` or `trainer.mesh.shared_mapping` is unsupported by
+the harness's fused likelihood loss. Add the tokenizer, checkpoint and task settings:
+
+```yaml
+tokenizer: /path/to/tokenizer
+checkpoint_path: /path/to/checkpoint
+checkpoint_is_hf: false
+eval_harness:
+  task_spec: [lambada_openai]
+  max_length: 2048
+```
+
+Choose tasks that issue loglikelihood requests. Set `checkpoint_is_hf: true` for
+compatible HF Llama weights. Native checkpoints and HF weights have the architecture
+and padded-vocabulary requirements described above. The harness writes
+`lm_eval_harness_results.json` in the working directory.
+
 
 ## Huggingface Export
 
@@ -487,3 +568,16 @@ checkpoint dtype. Use `checkpoint_subpath: model/policy` to export the policy fr
 With `use_cpu: true`, the exporter restores the selected subtree on CPU. Host memory must hold the
 restored weights as well as the export buffers.
 Pin an explicit tokenizer with `tokenizer: model_name_or_path@revision`.
+
+For `model.type: llama_native`, the exporter validates stored model metadata and restores the complete
+checkpoint vocabulary before applying `override_vocab_size`. The configured architecture must match
+the checkpoint, including activation and RoPE semantics. Full model subtrees such as `model/policy`
+are supported; adapter-only checkpoints require separate reconstruction.
+
+Native CPU export uses a replicated explicit mesh on one local CPU, independently of the trainer's
+placement mappings. Otherwise, export uses the trainer's parameter and computation mappings with
+explicit mesh axes. Native export resolves the explicit `tokenizer` or `model.tokenizer` without
+loading an unrelated HF reference. Set `save_tokenizer: false` to export without a tokenizer.
+Checkpoints lacking native model metadata require the original configuration and stored vocabulary size
+from the tokenizer or `override_vocab_size`. In this case, `override_vocab_size` must equal the stored
+vocabulary size; resizing requires model metadata. Their stored semantic identity cannot be verified.

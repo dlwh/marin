@@ -1,6 +1,9 @@
 # Copyright The Levanter Authors
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+import subprocess
+import sys
 import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -12,8 +15,15 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from haliax.partitioning import ResourceAxis
+from iris.cluster.platforms.types import find_free_port
+from iris.cluster.types import Entrypoint
+from iris.jax.multigpu import IRIS_MULTIGPU_PROCESS_INDEX_ENV, MultiGpuHook
+from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
+from rigging.tunnel import terminate_process_group
 
 import levanter.utils.jax_utils as jax_utils
+from levanter.layers.attention_mask import AttentionMask
+from levanter.models.lm_model import LmExample
 from levanter.utils.jax_utils import (
     axis_resource_is_explicit,
     barrier_sync,
@@ -373,3 +383,97 @@ def test_multihost_allgather_can_use_a_pipeline_stage_without_world_rank_zero(mo
         results = list(executor.map(gather, (1, 2)))
 
     assert results == [[{"rank": 1}, {"rank": 2}]] * 2
+
+
+def _broadcast_on_cpu_rank(coordinator, axis_type):
+    jax.distributed.initialize(
+        coordinator_address=coordinator,
+        num_processes=2,
+        process_id=int(os.environ[IRIS_MULTIGPU_PROCESS_INDEX_ENV]),
+        local_device_ids=[0],
+    )
+    mesh = Mesh(np.asarray(jax.devices()), ("data",), axis_types=(axis_type,))
+    axes = (hax.Axis("examples", 8), hax.Axis("position", 4))
+
+    def payload(rank):
+        values = np.arange(32, dtype=np.int32).reshape(8, 4) + 100 * rank
+        segments = hax.NamedArray(np.broadcast_to(np.arange(8, dtype=np.int32)[:, None], (8, 4)), axes)
+        float_bits = np.asarray([0x80000000, 0x3F800001 + rank, 0xBF800001, 0x7FC01234], dtype=np.uint32)
+        return {
+            "message": np.asarray(7 + rank, dtype=np.int32),
+            "vector": float_bits.view(np.float32),
+            "complex": float_bits.view(np.complex64),
+            "bfloat16": np.asarray([0x8000, 0x3F81 + rank, 0xBF81, 0x7FC5], dtype=np.uint16).view(jnp.bfloat16),
+            "bool": np.asarray([True, bool(rank)]),
+            "matrix": values,
+            "named": hax.NamedArray(values, axes),
+            "example": LmExample(
+                hax.NamedArray(values, axes),
+                hax.NamedArray((values % 2).astype(np.float32), axes),
+                AttentionMask.causal(sliding_window=3).with_segment_ids(segments),
+            ),
+        }
+
+    with jax.set_mesh(mesh):
+        inputs = payload(jax.process_index())
+        specs = hax.partitioning.infer_resource_partitions(inputs, {"examples": "data"}, mesh)
+        specs["message"] = P()
+        for name in ("vector", "complex", "bfloat16", "bool"):
+            specs[name] = P("data")
+        specs["matrix"] = NamedSharding(mesh, P("data", None))
+        for source in (0, 1):
+            expected = payload(source)
+            actual = jax_utils.broadcast_shard(inputs, specs, source=source)
+            assert jax.tree.structure(actual) == jax.tree.structure(expected)
+            for leaf, reference, spec in zip(
+                jax.tree.leaves(actual),
+                jax.tree.leaves(expected),
+                hax.tree_util.tree_leaves(specs),
+                strict=True,
+            ):
+                assert leaf.shape == reference.shape
+                assert leaf.dtype == reference.dtype
+                for shard in leaf.addressable_shards:
+                    actual_shard = np.asarray(shard.data)
+                    expected_shard = np.asarray(reference)[shard.index]
+                    if axis_type is AxisType.Explicit:
+                        assert actual_shard.tobytes() == expected_shard.tobytes()
+                    else:
+                        # Existing Auto collectives may canonicalize NaNs; Explicit transport preserves their bits.
+                        for component in (np.real, np.imag):
+                            actual_values = component(actual_shard)
+                            expected_values = component(expected_shard)
+                            assert np.all(
+                                (actual_values == expected_values)
+                                | (np.isnan(actual_values) & np.isnan(expected_values))
+                            )
+                target = NamedSharding(mesh, spec) if isinstance(spec, P) else spec
+                assert leaf.sharding.is_equivalent_to(target, leaf.ndim)
+            assert actual["example"].attn_mask.is_causal
+            assert actual["example"].attn_mask.sliding_window == 3
+    jax.distributed.shutdown()
+
+
+@pytest.mark.parametrize("axis_type", [AxisType.Auto, AxisType.Explicit])
+def test_broadcast_shard_selects_source_process_and_preserves_layout(tmp_path, axis_type):
+    entrypoint = Entrypoint.from_callable(_broadcast_on_cpu_rank, f"127.0.0.1:{find_free_port()}", axis_type)
+    for name, contents in entrypoint.workdir_files.items():
+        (tmp_path / name).write_bytes(contents)
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key.lower() not in ("http_proxy", "https_proxy", "all_proxy")
+    }
+    env.update(
+        JAX_PLATFORMS="cpu",
+        JAX_NUM_CPU_DEVICES="1",
+        XLA_FLAGS="--xla_force_host_platform_device_count=1",
+        IRIS_PYTHON=sys.executable,
+        IRIS_WORKDIR=str(tmp_path),
+    )
+    command = MultiGpuHook(nproc=2).wrap(entrypoint.command)
+    with subprocess.Popen([sys.executable, *command[1:]], env=env, start_new_session=True) as process:
+        try:
+            assert process.wait(timeout=45) == 0
+        finally:
+            terminate_process_group(process)

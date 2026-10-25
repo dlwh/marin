@@ -85,7 +85,11 @@ def test_native_hf_export_sharded_dtype_and_layout_roundtrip(
             expected = value if save_dtype is None else value.astype(save_dtype).astype(value.dtype)
             expected_state[name] = expected
             np.testing.assert_array_equal(restored.to_state_dict()[name], expected)
-        tokens = hax.named(jnp.arange(8).reshape(2, 4), (hax.Axis("batch", 2), hax.Axis("position", 4)))
+        batch_size = max(2, mesh.shape["data"])
+        tokens = hax.named(
+            jnp.arange(batch_size * 4).reshape(batch_size, 4) % model.Vocab.size,
+            (hax.Axis("batch", batch_size), hax.Axis("position", 4)),
+        )
         expected_model = model.from_state_dict(expected_state)
         np.testing.assert_allclose(
             restored(tokens, NamedAttentionMask.causal()).array,

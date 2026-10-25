@@ -27,14 +27,8 @@ import jax.numpy as jnp
 from haliax import Axis
 from haliax.partitioning import ResourceMapping
 from jax.sharding import Mesh
-from rigging.filesystem.storage_path import StoragePath, prefix_join
 
-from levanter.checkpoint import (
-    _load_metadata,
-    discover_checkpoint_candidates,
-    discover_latest_checkpoint,
-    load_checkpoint,
-)
+from levanter.checkpoint import discover_latest_checkpoint, load_checkpoint, resolve_checkpoint
 from levanter.compat.hf_checkpoints import HFCheckpointConverter, RepoRef
 from levanter.model_cache import resolve_cached_model_path
 from levanter.models.lm_model import LmConfig, LmHeadModel
@@ -100,23 +94,15 @@ def load_levanter_checkpoint(
         if compute_axis_mapping is None:
             raise ValueError("Loading llama_native requires compute_axis_mapping")
         sharding = native_llama_sharding(axis_mapping, compute_axis_mapping, batch_axis_name)
-        candidates = discover_checkpoint_candidates(checkpoint)
-        candidate = candidates[-1] if candidates else None
-        resolved = candidate.path if candidate is not None else checkpoint
-        if candidate is not None:
-            metadata = candidate.metadata
-        elif StoragePath(prefix_join(resolved, "metadata.json")).exists():
-            metadata = _load_metadata(resolved)
-        else:
-            metadata = {}
-        source_vocab = model_config.checkpoint_vocab_size(metadata)
+        resolved = resolve_checkpoint(checkpoint)
+        source_vocab = model_config.checkpoint_vocab_size(resolved.metadata)
         if source_vocab is not None and Vocab.size > source_vocab:
             raise ValueError("Tokenizer vocabulary exceeds the native checkpoint vocabulary")
         Vocab = Vocab.resize(source_vocab) if source_vocab is not None else Vocab
         mesh = jax.sharding.get_mesh()
         model_config.validate_sharding(sharding, mesh, Vocab.size)
         model = eqx.filter_eval_shape(model_config.build, Vocab, key=key, sharding=sharding)
-        return load_checkpoint(model, resolved, subpath="model", mesh=mesh)
+        return load_checkpoint(model, resolved.path, subpath="model", mesh=mesh)
 
     resolved = discover_latest_checkpoint(checkpoint) or checkpoint
     with use_cpu_device():

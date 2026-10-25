@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import dataclasses
+import json
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,12 +15,15 @@ import jax.random as jrandom
 import jmp
 import numpy as np
 import pytest
+import safetensors.numpy
+from transformers import LlamaConfig as HfLlamaConfig
 import haliax as hax
 from haliax import Axis
 from haliax.partitioning import ResourceAxis, set_mesh
+from haliax.state_dict import from_torch_compatible_state_dict, to_torch_compatible_state_dict
 from haliax.quantization import apply_updates, partition_for_grad_overwrite
 from haliax.jax_utils import is_jax_array_like
-from jax.sharding import Mesh
+from jax.sharding import Mesh, PartitionSpec as P
 from safetensors import safe_open
 
 from levanter.data.loader import DataLoader
@@ -35,6 +39,7 @@ from levanter.data.text.preference import (
     PreferencePairDataset,
 )
 from levanter.adaptor import AdaptorExportConfig, LoraAdaptorConfig, NoAdaptorConfig
+from levanter.adaptor.lora import lora_state_dict, merge_lora_modules, unwrap_lora_modules
 from levanter.callbacks import StepInfo
 from levanter.dpo import (
     CachedDpoExample,
@@ -49,12 +54,21 @@ from levanter.dpo import (
     reference_eval_cache_metadata,
     reference_eval_cache_path,
 )
+from levanter.checkpoint import CheckpointerConfig, latest_checkpoint_path, load_checkpoint, save_checkpoint
+from levanter.distributed import DistributedConfig
+from levanter.main.model_init import build_model, prepare_model_init_context
+from levanter.model_loading import load_hf_checkpoint
+from levanter.layers.attention import AttentionBackend, AttentionMask
+from levanter.layers.rotary import DefaultRotaryEmbeddingsConfig
 from levanter.main.lora_dpo import LoraDpoConfig, _translate_legacy_lora_dpo_config
 from levanter.main.train_dpo import (
     AdapterBaseReferenceConfig,
     SeparateReferenceConfig,
     TrainDpoConfig,
     _build_dpo_dataset,
+    _initialize_policy_model_from_source,
+    _load_separate_reference_model,
+    main as train_dpo_main,
     _derive_training_keys,
     _install_separate_reference_export_hooks,
     _periodic_eval_callback,
@@ -65,12 +79,19 @@ from levanter.main.train_dpo import (
 from levanter.metrics import Metric
 from levanter.models.gpt2 import Gpt2Config, Gpt2LMHeadModel
 from levanter.models.lm_model import LmExample
+from levanter.models.llama import LlamaConfig
+from levanter.models.llama_native_lm import NativeLlamaLmConfig, native_llama_sharding
 from levanter.optim.config import AdamConfig
 from levanter.optim.model_averaging import ModelAveraging
-from levanter.store.cache import SerialCacheWriter
+from levanter.store.cache import CacheMetadata, SerialCacheWriter
 from levanter.tokenizers import MarinTokenizer, load_tokenizer as load_marin_tokenizer
 from levanter.trainer_state import TrainerState, saveable_training_mask, trainables_only
-from levanter.trainer import Trainer, TrainerHooks
+from levanter.trainer import ExplicitTrainingLayout, Trainer, TrainerConfig, TrainerHooks
+from levanter.tracker import NoopTracker, current_tracker
+from levanter.tracker.json_file import JsonFileTrackerConfig
+from levanter.utils.mesh import MeshConfig
+from levanter.testing.helpers import use_test_mesh
+from levanter.testing.hf_checkpoints import write_llama_checkpoint
 from levanter.utils.jax_utils import local_cpu_mesh
 from levanter.utils.tree_utils import inference_mode
 
@@ -868,3 +889,574 @@ def test_vmapped_init_with_sharding_handles_layer_axis():
         keys = jax.random.split(jax.random.PRNGKey(0), Layers.size)
         out = hax.vmap(init_fn, Layers)(keys)
         assert out.axes[0].name == "layers"
+
+
+@pytest.fixture
+def dpo_llama_source(tmp_path, tiny_hf_tokenizer_path):
+    config = LlamaConfig(
+        hidden_dim=16,
+        intermediate_dim=24,
+        num_layers=1,
+        num_heads=4,
+        num_kv_heads=2,
+        max_seq_len=8,
+        tokenizer=tiny_hf_tokenizer_path,
+        reference_checkpoint=str(tmp_path / "hf-source"),
+    )
+    return write_llama_checkpoint(tmp_path / "hf-source", config, config.to_hf_config(32), key=jrandom.PRNGKey(13))
+
+
+@pytest.fixture
+def dpo_separate_reference_source(tmp_path, dpo_llama_source):
+    source = tmp_path / "hf-reference"
+    config = dataclasses.replace(dpo_llama_source.config, reference_checkpoint=str(source))
+    return write_llama_checkpoint(source, config, config.to_hf_config(32), key=jrandom.PRNGKey(97))
+
+
+def _dpo_trainer_config(tmp_path, *, explicit=False, steps=2):
+    model_size = 2 if len(jax.devices()) >= 4 else 1
+    data_size = len(jax.devices()) // model_size
+    return TrainerConfig(
+        id="dpo",
+        mesh=MeshConfig(axes={"data": data_size, "model": model_size}),
+        use_explicit_mesh_axes=explicit,
+        tracker=JsonFileTrackerConfig(output_path=str(tmp_path)),
+        checkpointer=CheckpointerConfig(base_path=str(tmp_path / "checkpoints"), save_interval=None),
+        load_checkpoint=False,
+        train_batch_size=max(4, 2 * data_size),
+        per_device_parallelism=2,
+        num_train_steps=steps,
+        max_eval_batches=0,
+        require_accelerator=False,
+        distributed=DistributedConfig(initialize_jax_distributed=False),
+        log_jaxprs=False,
+        log_xla_hlo=False,
+    )
+
+
+def _native_dpo_configuration(tmp_path, source, tokenizer_path):
+    model = dataclasses.replace(
+        NativeLlamaLmConfig.from_hf_config(HfLlamaConfig.from_pretrained(source.path)),
+        reference_checkpoint=str(source.path),
+        tokenizer=tokenizer_path,
+    )
+    return TrainDpoConfig(
+        model=model,
+        trainer=_dpo_trainer_config(tmp_path, explicit=True),
+        initialize_from_hf=str(source.path),
+        reference=SeparateReferenceConfig(model_path=str(source.path), is_hf=True),
+        optimizer=AdamConfig(learning_rate=0.01, warmup=0, weight_decay=0, lr_schedule="constant"),
+        validation_split_fraction=None,
+    )
+
+
+def _separate_dpo_loss(model, example, *, key):
+    return dpo_loss(model.policy, model.reference, example, beta=0.1)
+
+
+@pytest.mark.tpu
+def test_native_dpo_policy_updates_frozen_reference_and_checkpoint_next_step(
+    tmp_path, dpo_llama_source, tiny_hf_tokenizer_path
+):
+    config = _native_dpo_configuration(tmp_path, dpo_llama_source, tiny_hf_tokenizer_path)
+    tokenizer = load_marin_tokenizer(tiny_hf_tokenizer_path)
+    context = prepare_model_init_context(
+        config.model, tokenizer=tokenizer, initialize_from_hf=config.initialize_from_hf, use_hf_model_config=False
+    )
+    sharding = native_llama_sharding(config.trainer.parameter_axis_mapping, config.trainer.compute_axis_mapping)
+    layout = ExplicitTrainingLayout(config.trainer.device_mesh, P(sharding.batch, None))
+    optimizer = config.optimizer.build(2)
+    with (
+        current_tracker(NoopTracker()),
+        Trainer(
+            config.trainer, optimizer, _separate_dpo_loss, add_default_hooks=False, explicit_layout=layout
+        ) as trainer,
+    ):
+        Vocab = Axis("vocab", 32)
+        policy = _initialize_policy_model_from_source(
+            config=config,
+            model_context=context,
+            Vocab=Vocab,
+            policy_key=jrandom.PRNGKey(2),
+            adapter_key=jrandom.PRNGKey(3),
+            parameter_axis_mapping=trainer.parameter_axis_mapping,
+            trainer=trainer,
+        )
+        reference = _load_separate_reference_model(
+            config,
+            reference_model_key=jrandom.PRNGKey(4),
+            model_context=context,
+            Vocab=Vocab,
+            parameter_axis_mapping=trainer.parameter_axis_mapping,
+            trainer=trainer,
+        )
+        for model in (policy, reference):
+            assert model.Vocab.size == 32
+            assert model.native.token_embeddings.sharding.spec == sharding.column_storage
+            assert model.native.layers.stacked.mlp.down_proj.weight.sharding.spec == P(None, "data", "model")
+            for name, value in model.to_state_dict().items():
+                np.testing.assert_array_equal(value, dpo_llama_source.weights[name])
+        axes = config.trainer.TrainBatch, config.model.max_Pos
+        token_ids = np.arange(axes[0].size * axes[1].size, dtype=np.int32).reshape(axes[0].size, axes[1].size)
+        chosen = hax.named(jnp.asarray(token_ids % 31), axes)
+        rejected = hax.named(jnp.asarray((token_ids * 3 + 2) % 31), axes)
+        batch = DpoExample(
+            chosen=hax.vmap(LmExample.causal, axes[0])(chosen),
+            rejected=hax.vmap(LmExample.causal, axes[0])(rejected),
+        )
+        # Copy before donation; the reference is excluded from trainable/checkpointed state.
+        frozen_reference = {name: np.array(value, copy=True) for name, value in reference.to_state_dict().items()}
+        initial_policy = {name: np.array(value, copy=True) for name, value in policy.to_state_dict().items()}
+        model = DpoModel(policy=policy, reference=reference)
+        state = trainer.initial_state(
+            jrandom.PRNGKey(5), model=model, is_trainable=DpoModel(policy=True, reference=False)
+        )
+        first = trainer.train_step(state, batch)
+        assert int(first.state.step) == 1
+        assert any(
+            not np.array_equal(value, initial_policy[name])
+            for name, value in first.state.model.policy.to_state_dict().items()
+        )
+        for name, value in first.state.model.reference.to_state_dict().items():
+            np.testing.assert_array_equal(value, frozen_reference[name])
+        # Compare a nontrivial policy (after its first real DPO update) with the
+        # independent named implementation at exactly those canonical weights.
+        updated_weights = {
+            name: np.array(value, copy=True) for name, value in first.state.model.policy.to_state_dict().items()
+        }
+        actual_loss, actual_grad = eqx.filter_jit(
+            eqx.filter_value_and_grad(lambda policy: dpo_loss(policy, first.state.model.reference, batch, beta=0.1)[0])
+        )(first.state.model.policy)
+        actual_grad_weights = {name: np.array(value, copy=True) for name, value in actual_grad.to_state_dict().items()}
+        with use_test_mesh(), hax.axis_mapping({}):
+            named_template = dpo_llama_source.config.build(Vocab, key=jrandom.PRNGKey(13))
+            named_policy = from_torch_compatible_state_dict(
+                named_template, {name: jnp.asarray(value) for name, value in updated_weights.items()}
+            )
+            named_reference = from_torch_compatible_state_dict(
+                named_template, {name: jnp.asarray(value) for name, value in frozen_reference.items()}
+            )
+            named_batch = DpoExample(
+                chosen=hax.vmap(LmExample.causal, axes[0])(hax.named(jnp.asarray(token_ids % 31), axes)),
+                rejected=hax.vmap(LmExample.causal, axes[0])(hax.named(jnp.asarray((token_ids * 3 + 2) % 31), axes)),
+            )
+            expected_loss, expected_grad = eqx.filter_jit(
+                eqx.filter_value_and_grad(lambda policy: dpo_loss(policy, named_reference, named_batch, beta=0.1)[0])
+            )(named_policy)
+            np.testing.assert_allclose(actual_loss, expected_loss, atol=1e-5, rtol=1e-4)
+            assert float(expected_loss) != float(first.loss)
+            expected_grad_weights = to_torch_compatible_state_dict(expected_grad)
+            assert any(np.any(value != 0) for value in expected_grad_weights.values())
+            for name, value in actual_grad_weights.items():
+                np.testing.assert_allclose(value, expected_grad_weights[name], atol=1e-5, rtol=1e-4)
+        save_checkpoint(
+            first.state.saveable_state, 1, tmp_path / "step-1", metadata=first.state.model.policy.checkpoint_metadata()
+        )
+        expected = trainer.train_step(first.state, batch)
+        assert float(expected.loss) != float(first.loss)
+        expected_arrays = [
+            np.array(value, copy=True) for value in jax.tree.leaves(eqx.filter(expected.state, eqx.is_array))
+        ]
+    resumed_config = dataclasses.replace(
+        config.trainer, load_checkpoint=True, load_checkpoint_path=str(tmp_path / "step-1")
+    )
+    with (
+        current_tracker(NoopTracker()),
+        Trainer(
+            resumed_config, optimizer, _separate_dpo_loss, add_default_hooks=False, explicit_layout=layout
+        ) as resumed,
+    ):
+        # Reconstruct the omitted frozen reference from its configured source.
+        policy = build_model(
+            config.model,
+            Vocab,
+            key=jrandom.PRNGKey(7),
+            parameter_axis_mapping=resumed.parameter_axis_mapping,
+            compute_axis_mapping=resumed.compute_axis_mapping,
+            batch_axis_name=resumed.config.batch_axis_name,
+        )
+        reference = _load_separate_reference_model(
+            config,
+            reference_model_key=jrandom.PRNGKey(8),
+            model_context=context,
+            Vocab=Vocab,
+            parameter_axis_mapping=resumed.parameter_axis_mapping,
+            trainer=resumed,
+        )
+        state = resumed.initial_state(
+            jrandom.PRNGKey(9),
+            model=DpoModel(policy=policy, reference=reference),
+            is_trainable=DpoModel(policy=True, reference=False),
+        )
+        assert int(state.step) == 1
+        actual = resumed.train_step(state, batch)
+        np.testing.assert_array_equal(actual.loss, expected.loss)
+        for value, expected_value in zip(
+            jax.tree.leaves(eqx.filter(actual.state, eqx.is_array)), expected_arrays, strict=True
+        ):
+            np.testing.assert_array_equal(value, expected_value)
+
+
+@pytest.mark.tpu
+@pytest.mark.timeout(120)
+def test_native_dpo_main_preserves_source_vocab_and_resumes_same_checkpoint(
+    tmp_path, dpo_llama_source, tiny_hf_tokenizer_path, dpo_preference_data
+):
+    config = _native_dpo_configuration(tmp_path / "full", dpo_llama_source, tiny_hf_tokenizer_path)
+    config = dataclasses.replace(config, data=dpo_preference_data)
+    train_dpo_main(config)
+    split = dataclasses.replace(config, trainer=_dpo_trainer_config(tmp_path / "split", steps=1))
+    train_dpo_main(split)
+    checkpoint = latest_checkpoint_path(tmp_path / "split/checkpoints/dpo")
+    continued = dataclasses.replace(
+        config,
+        initialize_from_hf=False,
+        trainer=dataclasses.replace(_dpo_trainer_config(tmp_path / "continued"), initialize_from=checkpoint),
+    )
+    train_dpo_main(continued)
+    with dataclasses.replace(config.trainer, use_explicit_mesh_axes=True).use_device_mesh():
+        source_model = build_model(
+            config.model,
+            Axis("vocab", 32),
+            key=jrandom.PRNGKey(0),
+            parameter_axis_mapping=config.trainer.parameter_axis_mapping,
+            compute_axis_mapping=config.trainer.compute_axis_mapping,
+            batch_axis_name=config.trainer.batch_axis_name,
+        )
+        template = TrainerState.init(
+            config.optimizer.build(2),
+            DpoModel(policy=source_model, reference=source_model),
+            key=jrandom.PRNGKey(0),
+            is_trainable=DpoModel(policy=True, reference=False),
+            mp=config.trainer.mp,
+        )
+        template = template.saveable_state
+        full = load_checkpoint(
+            template,
+            latest_checkpoint_path(tmp_path / "full/checkpoints/dpo"),
+            mesh=dataclasses.replace(config.trainer, use_explicit_mesh_axes=True).device_mesh,
+        )
+        resumed = load_checkpoint(
+            template,
+            latest_checkpoint_path(tmp_path / "continued/checkpoints/dpo"),
+            mesh=dataclasses.replace(config.trainer, use_explicit_mesh_axes=True).device_mesh,
+        )
+    assert int(full.step) == int(resumed.step) == 2
+    assert full.model.policy.Vocab.size == resumed.model.policy.Vocab.size == 32
+    for value, expected in zip(
+        jax.tree.leaves(eqx.filter(resumed, eqx.is_array)),
+        jax.tree.leaves(eqx.filter(full, eqx.is_array)),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(value, expected)
+    metrics = json.loads((tmp_path / "continued/eval_results.json").read_text())
+    assert np.isfinite(metrics["train/loss"])
+
+
+@pytest.fixture
+def dpo_preference_data(tmp_path, tiny_hf_tokenizer_path):
+    batch_size = _dpo_trainer_config(tmp_path).train_batch_size
+    tokenizer = load_marin_tokenizer(tiny_hf_tokenizer_path)
+    format = PreferenceChatLmDatasetFormat(chat_template="{{ messages }}", mask_user_turns=False)
+    processor = format.build_preprocessor(tokenizer)
+    cache_path = tmp_path / "preference-cache"
+    example_count = 3 * batch_size
+    with SerialCacheWriter(
+        str(cache_path), processor.output_exemplar, metadata=CacheMetadata(preprocessor_metadata=processor.metadata)
+    ) as writer:
+        writer.write_batch(
+            {
+                "chosen_input_ids": [((np.arange(8) + i) % 31).astype(np.int32) for i in range(example_count)],
+                "rejected_input_ids": [
+                    ((np.arange(8) * 3 + i + 2) % 31).astype(np.int32) for i in range(example_count)
+                ],
+                "chosen_assistant_masks": [np.ones(8, dtype=np.int32) for _ in range(example_count)],
+                "rejected_assistant_masks": [np.ones(8, dtype=np.int32) for _ in range(example_count)],
+            }
+        )
+    return PreferenceLmDataConfig(
+        tokenizer=tiny_hf_tokenizer_path,
+        shuffle=False,
+        mixture_block_size=batch_size,
+        components={"preference": DatasetComponent(cache_dir=str(cache_path), flat_cache=True, format=format)},
+    )
+
+
+@pytest.mark.tpu
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize("dropout", [0.0, 0.25])
+@pytest.mark.parametrize("reference_type", ["separate", "adapter_base"])
+@pytest.mark.parametrize("hf_config_source", ["explicit", "inferred_string", "inferred_bool"])
+def test_native_lora_dpo_main_updates_only_factors_and_resumes_exact_state(
+    tmp_path,
+    dpo_llama_source,
+    dpo_separate_reference_source,
+    tiny_hf_tokenizer_path,
+    dpo_preference_data,
+    reference_type,
+    hf_config_source,
+    dropout,
+):
+    inferred = hf_config_source != "explicit"
+    if inferred:
+        source_config = dataclasses.replace(
+            dpo_llama_source.config,
+            head_dim=8,
+            max_seq_len=16,
+            rope=DefaultRotaryEmbeddingsConfig(theta=50000, factor=4),
+        )
+        source_hf_config = HfLlamaConfig(
+            **{
+                **dpo_llama_source.config.to_hf_config(32).to_dict(),
+                "head_dim": 8,
+                "max_position_embeddings": 16,
+                "rope_theta": 50000,
+                "rope_scaling": {"rope_type": "linear", "factor": 4},
+                "rope_parameters": {"rope_type": "linear", "rope_theta": 50000, "factor": 4},
+            }
+        )
+        dpo_llama_source = write_llama_checkpoint(
+            tmp_path / "hf-inferred-source", source_config, source_hf_config, key=jrandom.PRNGKey(13)
+        )
+        dpo_separate_reference_source = write_llama_checkpoint(
+            tmp_path / "hf-inferred-reference", source_config, source_hf_config, key=jrandom.PRNGKey(97)
+        )
+    config = _native_dpo_configuration(tmp_path / "full", dpo_llama_source, tiny_hf_tokenizer_path)
+    effective_model = config.model
+    if inferred:
+        effective_model = dataclasses.replace(
+            effective_model, attn_backend=AttentionBackend.VANILLA, gradient_checkpointing="save_all"
+        )
+        placeholder = NativeLlamaLmConfig(
+            hidden_dim=8,
+            intermediate_dim=8,
+            num_layers=1,
+            num_heads=2,
+            num_kv_heads=1,
+            max_seq_len=4,
+            attn_backend=effective_model.attn_backend,
+            gradient_checkpointing=effective_model.gradient_checkpointing,
+            reference_checkpoint=(
+                str(dpo_llama_source.path)
+                if hf_config_source == "inferred_bool"
+                else str(tmp_path / "unused-default-reference")
+            ),
+            tokenizer=tiny_hf_tokenizer_path,
+        )
+        config = dataclasses.replace(
+            config,
+            model=placeholder,
+            initialize_from_hf=True if hf_config_source == "inferred_bool" else str(dpo_llama_source.path),
+            use_hf_model_config=True,
+        )
+    config = dataclasses.replace(
+        config,
+        data=dpo_preference_data,
+        train_seq_len=8,
+        adapter=LoraAdaptorConfig(r=3, alpha=6, dropout=dropout),
+        reference=(
+            SeparateReferenceConfig(model_path=str(dpo_separate_reference_source.path))
+            if reference_type == "separate"
+            else AdapterBaseReferenceConfig()
+        ),
+        trainer=dataclasses.replace(config.trainer, num_train_steps=3, mp=jmp.get_policy("f32")),
+        peft_save_path=str(tmp_path / "full/peft"),
+        merged_hf_save_path=str(tmp_path / "full/merged"),
+        hf_save_steps=1,
+    )
+    full = train_dpo_main(config)
+    split_config = dataclasses.replace(
+        config,
+        trainer=dataclasses.replace(
+            config.trainer,
+            tracker=JsonFileTrackerConfig(output_path=str(tmp_path / "resumed")),
+            checkpointer=CheckpointerConfig(base_path=str(tmp_path / "resumed/checkpoints"), save_interval=None),
+            num_train_steps=2,
+        ),
+        peft_save_path=None,
+        merged_hf_save_path=None,
+    )
+    split = train_dpo_main(split_config)
+    assert int(split.state.step) == 2
+    resumed = train_dpo_main(
+        dataclasses.replace(
+            split_config, trainer=dataclasses.replace(split_config.trainer, num_train_steps=3, load_checkpoint=True)
+        )
+    )
+    assert int(full.state.step) == int(resumed.state.step) == 3
+    np.testing.assert_array_equal(full.loss, resumed.loss)
+    for actual, expected in zip(
+        jax.tree.leaves(eqx.filter(resumed.state, eqx.is_array)),
+        jax.tree.leaves(eqx.filter(full.state, eqx.is_array)),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(actual, expected)
+
+    mesh_config = dataclasses.replace(config.trainer, use_explicit_mesh_axes=True)
+    with mesh_config.use_device_mesh():
+        # Read the persisted partial state independently of main's returned ordinary state.
+        for name in ("full", "resumed"):
+            saved = load_checkpoint(
+                full.state.saveable_state,
+                latest_checkpoint_path(tmp_path / name / "checkpoints/dpo"),
+                mesh=mesh_config.device_mesh,
+            )
+            for actual, expected in zip(
+                jax.tree.leaves(eqx.filter(saved, eqx.is_array)),
+                jax.tree.leaves(eqx.filter(full.state.saveable_state, eqx.is_array)),
+                strict=True,
+            ):
+                np.testing.assert_array_equal(actual, expected)
+
+        policy = full.state.model.policy if isinstance(full.state.model, DpoModel) else full.state.model
+        assert policy.Vocab.size == 32 > len(dpo_preference_data.the_tokenizer)
+        for info in (full, resumed):
+            actual_policy = info.state.model.policy if isinstance(info.state.model, DpoModel) else info.state.model
+            assert isinstance(actual_policy.config, NativeLlamaLmConfig)
+            assert actual_policy.config.head_dim == effective_model.head_dim
+            assert actual_policy.config.max_seq_len == dpo_llama_source.config.max_seq_len
+            assert actual_policy.config.rope == dpo_llama_source.config.rope
+            if inferred:
+                assert actual_policy.native.config.head_dim == 8
+                assert actual_policy.native.layers.stacked.self_attn.q_proj.wrapped.weight.shape == (1, 32, 16)
+                assert actual_policy.config.max_seq_len == 16
+                assert actual_policy.config.attn_backend == AttentionBackend.VANILLA
+                assert actual_policy.config.gradient_checkpointing == "save_all"
+                assert actual_policy.config.reference_checkpoint == str(dpo_llama_source.path)
+                assert actual_policy.config.tokenizer == tiny_hf_tokenizer_path
+            for name, value in unwrap_lora_modules(actual_policy).to_state_dict().items():
+                np.testing.assert_array_equal(value, dpo_llama_source.weights[name])
+            reference = (
+                info.state.model.reference
+                if isinstance(info.state.model, DpoModel)
+                else config.adapter.base_model_view(actual_policy)
+            )
+            expected_reference = dpo_separate_reference_source if reference_type == "separate" else dpo_llama_source
+            assert reference.Vocab.size == 32
+            for name, value in reference.to_state_dict().items():
+                np.testing.assert_array_equal(value, expected_reference.weights[name])
+
+        base = load_hf_checkpoint(
+            effective_model,
+            str(dpo_llama_source.path),
+            tokenizer=dpo_preference_data.the_tokenizer,
+            axis_mapping=config.trainer.parameter_axis_mapping,
+            compute_axis_mapping=config.trainer.compute_axis_mapping,
+            compute_dtype=jnp.float32,
+        )
+        _, _, _, adapter_key, _ = _derive_training_keys(config.trainer.seed)
+        initial_factors = lora_state_dict(config.adapter.apply(base, key=adapter_key))
+        factors = lora_state_dict(inference_mode(policy, True))
+        for factor in ("lora_A", "lora_B"):
+            assert any(
+                not np.array_equal(value, initial_factors[name])
+                for name, value in factors.items()
+                if f".{factor}." in name
+            )
+        exported_factors = safetensors.numpy.load_file(tmp_path / "full/peft/dpo/step-2/adapter_model.safetensors")
+        assert exported_factors.keys() == factors.keys()
+        for name, value in factors.items():
+            np.testing.assert_array_equal(exported_factors[name], value)
+        peft_config = json.loads((tmp_path / "full/peft/dpo/step-2/adapter_config.json").read_text())
+        assert peft_config["base_model_name_or_path"] == str(dpo_llama_source.path)
+        merged = merge_lora_modules(policy)
+        reloaded = load_hf_checkpoint(
+            effective_model,
+            str(tmp_path / "full/merged/dpo/step-2"),
+            tokenizer=dpo_preference_data.the_tokenizer,
+            axis_mapping=config.trainer.parameter_axis_mapping,
+            compute_axis_mapping=config.trainer.compute_axis_mapping,
+            compute_dtype=jnp.float32,
+        )
+        for name, value in reloaded.to_state_dict().items():
+            np.testing.assert_array_equal(value, merged.to_state_dict()[name])
+        # Probe batches follow the data mesh, including CPU8's data4/model2 layout.
+        data_size = mesh_config.device_mesh.shape["data"]
+        axes = Axis("batch", 2 * data_size), Axis("position", 4)
+        tokens = hax.named(jnp.arange(8 * data_size).reshape(axes[0].size, axes[1].size) % 31, axes)
+        np.testing.assert_allclose(
+            inference_mode(policy, True)(tokens, AttentionMask.causal()).array,
+            reloaded(tokens, AttentionMask.causal()).array,
+            atol=1e-5,
+            rtol=1e-5,
+        )
+        # Probe the trained, nonzero factors with independent named DPO math.
+        # The canonical loss splits a training key into distinct preference keys.
+        policy = inference_mode(policy, False)
+        reference = inference_mode(reference, True)
+        chosen_key, rejected_key = jrandom.split(jrandom.PRNGKey(31))
+        batch = DpoExample(
+            chosen=hax.vmap(LmExample.causal, axes[0])(tokens),
+            rejected=hax.vmap(LmExample.causal, axes[0])((tokens * 3 + 2) % 31),
+        )
+        actual_loss, actual_grad = eqx.filter_jit(
+            eqx.filter_value_and_grad(
+                lambda model: dpo_loss(
+                    model,
+                    reference,
+                    batch,
+                    beta=config.beta,
+                    key_chosen=chosen_key,
+                    key_rejected=rejected_key,
+                )[0]
+            )
+        )(policy)
+        actual_loss = np.asarray(actual_loss)
+        actual_grad_factors = lora_state_dict(actual_grad)
+        actual_logps = tuple(
+            np.asarray(logp_sum(policy, example, key=key).array)
+            for example, key in ((batch.chosen, chosen_key), (batch.rejected, rejected_key))
+        )
+        if dropout:
+            for example, key in ((batch.chosen, chosen_key), (batch.rejected, rejected_key)):
+                assert not np.allclose(
+                    logp_sum(policy, example, key=key).array,
+                    logp_sum(policy, example, key=jrandom.PRNGKey(32)).array,
+                    atol=1e-5,
+                    rtol=1e-5,
+                )
+        reference_weights = {name: np.asarray(value) for name, value in reference.to_state_dict().items()}
+
+    with use_test_mesh(), hax.axis_mapping({}):
+        chosen_key, rejected_key = jrandom.split(jrandom.PRNGKey(31))
+        named_config = dataclasses.replace(dpo_llama_source.config, attn_backend=AttentionBackend.VANILLA)
+        named_base = named_config.build(Axis("vocab", 32), key=jrandom.PRNGKey(13))
+        named_policy = config.adapter.apply(named_base, key=jrandom.PRNGKey(19))
+        named_policy = from_torch_compatible_state_dict(
+            named_policy,
+            {
+                **{name: jnp.asarray(value) for name, value in dpo_llama_source.weights.items()},
+                **{name.removeprefix("base_model.model."): jnp.asarray(value) for name, value in factors.items()},
+            },
+        )
+        named_reference = from_torch_compatible_state_dict(
+            named_base, {name: jnp.asarray(value) for name, value in reference_weights.items()}
+        )
+        named_tokens = hax.named(jnp.arange(8 * data_size).reshape(axes[0].size, axes[1].size) % 31, axes)
+        named_batch = DpoExample(
+            chosen=hax.vmap(LmExample.causal, axes[0])(named_tokens),
+            rejected=hax.vmap(LmExample.causal, axes[0])((named_tokens * 3 + 2) % 31),
+        )
+        expected_loss, expected_grad = eqx.filter_jit(
+            eqx.filter_value_and_grad(
+                lambda model: dpo_loss(
+                    model,
+                    named_reference,
+                    named_batch,
+                    beta=config.beta,
+                    key_chosen=chosen_key,
+                    key_rejected=rejected_key,
+                )[0]
+            )
+        )(named_policy)
+        np.testing.assert_allclose(actual_loss, expected_loss, atol=1e-5, rtol=1e-4)
+        for (example, key), actual in zip(
+            ((named_batch.chosen, chosen_key), (named_batch.rejected, rejected_key)), actual_logps, strict=True
+        ):
+            np.testing.assert_allclose(actual, logp_sum(named_policy, example, key=key).array, atol=1e-5, rtol=1e-4)
+        expected_grad_factors = lora_state_dict(expected_grad)
+        assert any(np.any(value != 0) for value in expected_grad_factors.values())
+        for name, actual in actual_grad_factors.items():
+            np.testing.assert_allclose(
+                actual, expected_grad_factors[name].reshape(actual.shape), atol=1e-5, rtol=1e-4, err_msg=name
+            )

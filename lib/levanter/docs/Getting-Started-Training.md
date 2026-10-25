@@ -76,8 +76,8 @@ supported. Training can use `train_seq_len` shorter than `model.max_seq_len`.
 Reference attention also preserves dense masks, causal offsets and bidirectional
 windows; Splash rejects those mask forms explicitly.
 
-Resume a native run with the ordinary Trainer checkpoint settings. Native
-checkpoints include parameters, optimizer state, training step and RNG state.
+Resume a native run with the ordinary Trainer checkpoint settings. Full-parameter native
+checkpoints include model parameters, optimizer state, training step and RNG state.
 The named Llama and native Llama have different checkpoint trees; loading a named
 Trainer checkpoint directly into a native run is unsupported.
 Non-default activations are part of the checkpoint architecture identity and
@@ -86,7 +86,7 @@ must match on restore. Existing SiLU checkpoint metadata remains unchanged.
 To initialize from a local Hugging Face Llama checkpoint, set
 `initialize_from_hf: /path/to/llama-checkpoint`. The directory must contain its
 `config.json` and safetensors weights (a single file or a sharded index). Configure
-the matching native architecture explicitly. Layer count, hidden/MLP sizes,
+the matching native architecture explicitly by default. Layer count, hidden/MLP sizes,
 query/KV heads, head dimension, tied embeddings, activation, RMSNorm epsilon and
 RoPE type, base/theta, frequency scaling and attention scaling must match; the maximum context
 length may differ. This path supports standard weighted RMSNorm, bias-free
@@ -94,16 +94,31 @@ projections and no attention
 dropout. YaRN initialization requires the integer correction ramp and the same
 effective attention multiplier as the configured model; HF metadata whose
 implicit scaling changes that multiplier is rejected. Automatic HF model-config
-replacement and tokenizer padding remain unsupported.
+replacement is available with `use_hf_model_config: true`; tokenizer padding
+remains unsupported.
+
+With `use_hf_model_config: true`, native `train_lm` and `train_dpo` derive the
+architecture, head dimension, RoPE and maximum context length from the resolved
+HF source before validating the model and mesh. The model remains native and
+retains the configured attention backend, attention upcasting and
+rematerialization policy. Top-level `train_seq_len` selects the training length
+independently and must not exceed the source maximum. A string
+`initialize_from_hf` selects that source; `initialize_from_hf: true` uses the
+original `model.reference_checkpoint`. Both retain the configured tokenizer.
 
 The checkpoint determines the complete model vocabulary, including any padded
 embedding/output rows beyond the tokenizer's length. Those rows are preserved
 and participate in the output softmax. The source vocabulary must be at least as
 large as the tokenizer and divisible by the tensor-parallel mesh size; the loader
 does not resize it. New native Trainer checkpoints record the complete vocabulary
-and semantic architecture with the checkpoint completion marker. Resume uses the
-selected checkpoint's metadata and full training state without accessing the
-original HF directory, even if `initialize_from_hf` still names that directory.
+and semantic architecture with the checkpoint completion marker. Full-parameter
+resume uses the selected checkpoint's metadata and saved training state without
+accessing the original HF directory when `use_hf_model_config` is false, even if
+`initialize_from_hf` still names that directory. The opt-in inferred-config mode
+reads the original HF `config.json` on resume, then validates the checkpoint
+against that effective architecture. Keep this metadata available and unchanged.
+LoRA resume also requires the original frozen base weights and unchanged model
+and adapter configuration; see [adapter training](Training-On-Your-Data.md#lora-adapters).
 The configured tokenizer, training inputs and matching model configuration are
 still required.
 The configured attention geometry, normalization and RoPE must match; context
@@ -135,8 +150,10 @@ can initialize a new native run or a standard HF Llama consumer; they do not
 contain optimizer or RNG state.
 
 Local export requires standard weighted RMSNorm and bias-free projections. Hub
-upload, remote export destinations, LoRA and Haliax quantization remain
+upload, remote export destinations and Haliax quantization remain
 unsupported by this training entrypoint and are rejected before initialization.
+LoRA, including adapter dropout, is available through `adapter.type: lora`; see
+[adapter training](Training-On-Your-Data.md#lora-adapters).
 Existing `model.type: llama` configurations retain their behavior.
 
 ## Set Custom Training Configuration
