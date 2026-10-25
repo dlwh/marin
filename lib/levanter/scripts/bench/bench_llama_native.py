@@ -49,6 +49,10 @@ from levanter.utils.mesh import MeshConfig
 
 
 LAYER_NORM_EPSILON = 1e-5
+UPDATES = "updates"
+PARAMETERS_AFTER_ONE_STEP = "parameters_after_one_step"
+EXECUTION_PARAMETERS_AFTER_ONE_STEP = "execution_parameters_after_one_step"
+MEASURED_STEP_LOSSES = "measured_step_losses"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -257,9 +261,9 @@ def numerical_acceptance(parity: dict, config: BenchmarkConfig) -> dict:
     for label, comparison in parity.items():
         relative_l2_limit = None
         if config.compute_dtype == "float32":
-            if label in ("updates", "parameters_after_one_step", "execution_parameters_after_one_step"):
+            if label in (UPDATES, PARAMETERS_AFTER_ONE_STEP, EXECUTION_PARAMETERS_AFTER_ONE_STEP):
                 relative_l2_limit = config.update_parameter_relative_l2
-            elif label == "measured_step_losses":
+            elif label == MEASURED_STEP_LOSSES:
                 relative_l2_limit = config.loss_trajectory_relative_l2
         acceptance[label] = {
             "metric": "elementwise" if relative_l2_limit is None else "relative_l2",
@@ -430,8 +434,8 @@ def _run_variant(
     diagnostic_data = {
         "loss": {"loss": diagnostic.loss},
         "gradients": _canonical_parameters(gradients),
-        "updates": _canonical_parameters(updates),
-        "parameters_after_one_step": _canonical_parameters(diagnostic.new_state.model),
+        UPDATES: _canonical_parameters(updates),
+        PARAMETERS_AFTER_ONE_STEP: _canonical_parameters(diagnostic.new_state.model),
         "adam_mu": _canonical_parameters(diagnostic.new_state.opt_state[0].mu),
         "adam_nu": _canonical_parameters(diagnostic.new_state.opt_state[0].nu),
         "adam_count": {"count": diagnostic.new_state.opt_state[0].count},
@@ -443,8 +447,8 @@ def _run_variant(
         "gradients": _array_manifest(diagnostic_data["gradients"]),
         "gradients_raw": _tree_manifest(gradients),
         "updates_raw": _tree_manifest(updates),
-        "updates": _array_manifest(diagnostic_data["updates"]),
-        "parameters_after_one_step": _array_manifest(diagnostic_data["parameters_after_one_step"]),
+        UPDATES: _array_manifest(diagnostic_data[UPDATES]),
+        PARAMETERS_AFTER_ONE_STEP: _array_manifest(diagnostic_data[PARAMETERS_AFTER_ONE_STEP]),
         "adam_mu": _array_manifest(diagnostic_data["adam_mu"]),
         "adam_nu": _array_manifest(diagnostic_data["adam_nu"]),
         "adam_count": _array_manifest(diagnostic_data["adam_count"]),
@@ -474,7 +478,7 @@ def _run_variant(
     state = result.new_state
     del result
     execution_data = {
-        "execution_parameters_after_one_step": _canonical_parameters(state.model),
+        EXECUTION_PARAMETERS_AFTER_ONE_STEP: _canonical_parameters(state.model),
         "execution_adam_mu": _canonical_parameters(state.opt_state[0].mu),
         "execution_adam_nu": _canonical_parameters(state.opt_state[0].nu),
         "execution_adam_count": {"count": state.opt_state[0].count},
@@ -501,7 +505,7 @@ def _run_variant(
     # Retain only device scalars during timing; transfer the trajectory after
     # every measured step has finished.
     measured_step_losses = [float(loss) for loss in measured_losses]
-    diagnostics["measured_step_losses"] = {"losses": np.asarray(measured_step_losses, dtype=np.float32)}
+    diagnostics[MEASURED_STEP_LOSSES] = {"losses": np.asarray(measured_step_losses, dtype=np.float32)}
     final_step = int(state.step)
     profile_path = None
     if config.profile_steps:
@@ -523,7 +527,7 @@ def _run_variant(
         "first_execution_seconds": first_execution_seconds,
         "compiled_memory_analysis": memory,
         "timing": _timing_summary(samples, config.batch_size * config.seq_len),
-        "measured_step_losses": measured_step_losses,
+        MEASURED_STEP_LOSSES: measured_step_losses,
         "final_loss": measured_step_losses[-1],
         "final_step": final_step,
         "profile": {"path": str(profile_path), "steps": config.profile_steps} if profile_path is not None else None,
@@ -693,12 +697,12 @@ def run_benchmark(
         for label in (
             "parameters",
             "gradients",
-            "updates",
-            "parameters_after_one_step",
+            UPDATES,
+            PARAMETERS_AFTER_ONE_STEP,
             "adam_mu",
             "adam_nu",
             "adam_count",
-            "execution_parameters_after_one_step",
+            EXECUTION_PARAMETERS_AFTER_ONE_STEP,
             "execution_adam_mu",
             "execution_adam_nu",
             "execution_adam_count",
