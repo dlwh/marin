@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import dataclasses
+from math import lcm
 
 import equinox as eqx
 import jax
@@ -10,7 +11,9 @@ import jmp
 import numpy as np
 import optax
 import pytest
-from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P, reshard
+
+from haliax.quantization import Fp8DotGeneralOp
 
 from levanter.grad_accum import microbatched_arrays
 from levanter.checkpoint import CheckpointerConfig, discover_checkpoint_candidates, save_checkpoint
@@ -317,3 +320,89 @@ def test_trainer_checkpoint_hook_commits_model_metadata(tmp_path):
     assert candidate.metadata["application"] == {"geometry": [3], "precision": "float32"}
     np.testing.assert_array_equal(seen_weights[-1], result.state.model.weight)
     assert not np.array_equal(seen_weights[-1], result.state.model_averaging.model.weight)
+
+
+@pytest.mark.tpu
+def test_raw_microbatch_fp8_state_uses_maxima_without_averaging():
+    devices = jax.devices()
+    # Keep mean divisors powers of two for the exact NumPy oracle.
+    devices = devices[: 1 << (len(devices).bit_length() - 1)]
+    model_size = 2 if len(devices) >= 4 and len(devices) % 2 == 0 else 1
+    data_size = len(devices) // model_size
+    contracting_size = lcm(8, data_size)
+    microbatch_size = 2 * data_size
+    mesh = Mesh(
+        np.asarray(devices).reshape(data_size, model_size),
+        ("data", "model"),
+        axis_types=(AxisType.Explicit, AxisType.Explicit),
+    )
+    values = np.concatenate(
+        [
+            np.full((microbatch_size, contracting_size), 32, np.float32),
+            np.ones((microbatch_size, contracting_size), np.float32),
+        ]
+    )
+    weight_values = np.full((4, contracting_size), 0.125, np.float32)
+    expected_output = values @ weight_values.T
+    full_cotangent = 2 * expected_output / np.float32(expected_output.size)
+    expected_gradient = full_cotangent.T @ values
+    microbatch_cotangent = 2 * expected_output / np.float32(microbatch_size * weight_values.shape[0])
+    expected_states = {
+        "input_scale": np.array([2], np.float32),
+        "kernel_scale": np.array([0.5], np.float32),
+        "output_grad_scale": np.array([4], np.float32),
+        "input_amax_history": np.array([32, 224, 112, 896], np.float32),
+        "kernel_amax_history": np.array([0.125, 56, 28, 224], np.float32),
+        "output_grad_amax_history": np.array([np.max(np.abs(microbatch_cotangent)), 57344, 28672, 229376], np.float32),
+    }
+
+    with jax.set_mesh(mesh):
+        replicated = NamedSharding(mesh, P())
+        operation = dataclasses.replace(
+            Fp8DotGeneralOp.init(amax_history_length=4),
+            input_scale=jnp.array([2], jnp.float32),
+            kernel_scale=jnp.array([0.5], jnp.float32),
+            output_grad_scale=jnp.array([4], jnp.float32),
+            # The history maxima retain scales 2, .5 and 4 for both calls.
+            input_amax_history=jnp.array([896, 448, 224, 112], jnp.float32),
+            kernel_amax_history=jnp.array([224, 112, 56, 28], jnp.float32),
+            output_grad_amax_history=jnp.array([229376, 114688, 57344, 28672], jnp.float32),
+        )
+        operation = jax.tree.map(lambda value: jax.device_put(value, replicated), operation)
+        inputs = jax.device_put(values, NamedSharding(mesh, P("data", None)))
+        weight = jax.device_put(weight_values, NamedSharding(mesh, P("model", "data")))
+        parameters = (operation, weight)
+        output_sharding = NamedSharding(mesh, P("data", "model"))
+
+        def forward(parameters, batch):
+            op, parameter = parameters
+            return op(
+                batch,
+                reshard(parameter, P("model", None)),
+                (((1,), (1,)), ((), ())),
+                out_sharding=output_sharding,
+            )
+
+        def evaluate(batch):
+            def loss(parameters):
+                return jnp.mean(jnp.square(forward(parameters, batch))), {}
+
+            return eqx.filter_value_and_grad(loss, has_aux=True)(parameters)
+
+        output = eqx.filter_jit(forward)(parameters, inputs)
+        (loss, _), (state, gradient) = eqx.filter_jit(microbatched_arrays(evaluate, microbatch_size))(inputs)
+        np.testing.assert_array_equal(output, expected_output)
+        np.testing.assert_array_equal(loss, np.mean(expected_output**2))
+        np.testing.assert_array_equal(gradient, expected_gradient)
+        assert output.sharding == output_sharding
+        assert loss.sharding.is_equivalent_to(replicated, loss.ndim)
+        assert gradient.sharding == weight.sharding
+        assert inputs.sharding == NamedSharding(mesh, P("data", None))
+        assert weight.sharding == NamedSharding(mesh, P("model", "data"))
+        np.testing.assert_array_equal(inputs, values)
+        np.testing.assert_array_equal(weight, weight_values)
+        for name in expected_states:
+            value = getattr(state, name)
+            assert value.sharding.is_equivalent_to(replicated, value.ndim)
+        for name, expected in expected_states.items():
+            np.testing.assert_array_equal(getattr(state, name), expected)

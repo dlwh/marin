@@ -31,6 +31,8 @@ from levanter.layers.stacked import ArrayStacked, StateDictWriter
 from levanter.utils.activation import ActivationFunctionEnum, JaxActivationFunction
 
 
+_HF_TOKEN_EMBEDDING_WEIGHT_KEY = "model.embed_tokens.weight"
+_HF_FINAL_NORM_PREFIX = "model.norm"
 _LAYER_NORM_FIELDS = ("input_layernorm", "post_attention_layernorm", "post_attn_layernorm", "post_mlp_layernorm")
 _ATTENTION_FIELDS = ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm")
 _MLP_FIELDS = ("gate_proj", "up_proj", "down_proj")
@@ -586,8 +588,8 @@ class NativeLlamaModel(eqx.Module):
     def to_state_dict(self, prefix: str | None = None) -> dict[str, jax.Array]:
         """Export canonical HF keys and output-first arrays, also for gradients."""
         state: dict[str, jax.Array] = {}
-        _put(state, "model.embed_tokens.weight", self.token_embeddings)
-        _put_module(state, "model.norm", self.norm)
+        _put(state, _HF_TOKEN_EMBEDDING_WEIGHT_KEY, self.token_embeddings)
+        _put_module(state, _HF_FINAL_NORM_PREFIX, self.norm)
         if self.embedding_norm is not None:
             _put_module(state, "norm", self.embedding_norm)
         if self.lm_head is not None:
@@ -612,10 +614,12 @@ class NativeLlamaModel(eqx.Module):
         model = eqx.tree_at(
             lambda m: m.token_embeddings,
             self,
-            _load(source["model.embed_tokens.weight"], self.token_embeddings, self.sharding.column_storage),
+            _load(source[_HF_TOKEN_EMBEDDING_WEIGHT_KEY], self.token_embeddings, self.sharding.column_storage),
         )
         model = eqx.tree_at(
-            lambda m: m.norm, model, _load_module(model.norm, source, "model.norm", self.sharding.norm_storage)
+            lambda m: m.norm,
+            model,
+            _load_module(model.norm, source, _HF_FINAL_NORM_PREFIX, self.sharding.norm_storage),
         )
         if model.embedding_norm is not None:
             model = eqx.tree_at(
