@@ -27,12 +27,26 @@ class LinearProjection(Protocol):
     ) -> Float[Array, "... Out"]: ...
 
 
+class RawDotGeneralOp(Protocol):
+    """Array contraction with an explicit result layout."""
+
+    def __call__(
+        self,
+        lhs: Array,
+        rhs: Array,
+        dimension_numbers: tuple[tuple[tuple[int, ...], tuple[int, ...]], tuple[tuple[int, ...], tuple[int, ...]]],
+        *,
+        out_sharding: PartitionSpec,
+    ) -> Array: ...
+
+
 class Linear(eqx.Module):
     """Output-first weights, optionally gathered from an FSDP storage layout."""
 
     weight: Float[Array, "Out In"]
     bias: Float[Array, "Out"] | None
     compute_spec: PartitionSpec = eqx.field(static=True)
+    dot_general: RawDotGeneralOp | None = None
 
     @staticmethod
     def init(
@@ -65,7 +79,10 @@ class Linear(eqx.Module):
     ) -> Float[Array, "... Out"]:
         del key, dropout_layout
         weight = reshard(self.weight, self.compute_spec)
-        output = jnp.einsum("...i,oi->...o", x, weight, out_sharding=out_sharding)
+        if self.dot_general is None:
+            output = jnp.einsum("...i,oi->...o", x, weight, out_sharding=out_sharding)
+        else:
+            output = self.dot_general(x, weight, (((x.ndim - 1,), (1,)), ((), ())), out_sharding=out_sharding)
         if self.bias is not None:
             output = output + reshard(self.bias, PartitionSpec(self.compute_spec[0]))
         return output

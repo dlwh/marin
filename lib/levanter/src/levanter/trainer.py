@@ -332,8 +332,8 @@ class Trainer:
         self.optimizer = optimizer
         self.explicit_layout = explicit_layout
         self._checkpoint_metadata = checkpoint_metadata
-        if explicit_layout is not None and config.quantization is not None:
-            raise ValueError("Explicit raw-array training does not support Haliax linear quantization")
+        if explicit_layout is not None and config.quantization is not None and not config.quantization.fp8:
+            raise ValueError("Explicit raw-array quantization supports FP8 only")
         self._raw_loss_function = loss_fn
         self._checkpointer: Optional[Checkpointer] = None
         self._xla_dump_upload: Callable[[StepInfo], None] | None = None

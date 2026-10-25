@@ -150,10 +150,21 @@ can initialize a new native run or a standard HF Llama consumer; they do not
 contain optimizer or RNG state.
 
 Local export requires standard weighted RMSNorm and bias-free projections. Hub
-upload, remote export destinations and Haliax quantization remain
-unsupported by this training entrypoint and are rejected before initialization.
-LoRA, including adapter dropout, is available through `adapter.type: lora`; see
-[adapter training](Training-On-Your-Data.md#lora-adapters).
+upload and remote export destinations remain unsupported by this training
+entrypoint and are rejected before initialization.
+
+Native training supports `trainer.quantization.fp8: true` for full-parameter
+training. FP8 scales and amax histories remain float32 under mixed precision,
+are stored separately for each scanned layer, and resume with the full Trainer
+checkpoint. Omit `targets` to quantize every linear projection, use a list for
+final module names such as `[q_proj, up_proj]`, or a regex for the full native
+pytree path such as `native\.layers\.stacked\.self_attn\.q_proj$`. The untied head
+uses FP8 for logits; the fused training loss continues to use its raw weights.
+Tied embeddings remain unquantized. Native INT8 and combining native FP8 with
+LoRA or frozen parameters remain unqualified and are rejected.
+
+LoRA, including adapter dropout, is available without quantization through
+`adapter.type: lora`; see [adapter training](Training-On-Your-Data.md#lora-adapters).
 Existing `model.type: llama` configurations retain their behavior.
 
 ## Set Custom Training Configuration
