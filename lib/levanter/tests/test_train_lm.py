@@ -1657,3 +1657,152 @@ def test_native_fp8_ema_selects_averaged_state_and_resumes_next_update(tmp_path,
     exported = safetensors.numpy.load_file(tmp_path / "export/step-1/model.safetensors")
     for name, value in actual.model_averaging.model.to_state_dict().items():
         np.testing.assert_array_equal(exported[name], value)
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize("native_hf_source", [False], indirect=True, ids=["untied"])
+def test_named_fp8_lora_partial_checkpoint_resumes_next_update(tmp_path, native_hf_source, tiny_hf_tokenizer_path):
+    source = native_hf_source
+    model_config = dataclasses.replace(
+        source.config,
+        reference_checkpoint=str(source.path),
+        tokenizer=tiny_hf_tokenizer_path,
+        attn_backend=AttentionBackend.VANILLA,
+    )
+    examples = ListAsyncDataset([GrugLmExample.causal((jnp.arange(8) + i) % 31) for i in range(16)])
+    data = LmDataConfig(
+        tokenizer=tiny_hf_tokenizer_path,
+        shuffle=False,
+        components={"direct": DirectDatasetComponent(datasets={"train": examples})},
+    )
+    data_size = len(jax.devices())
+    optimizer = AdamConfig(learning_rate=1e-3, warmup=0, lr_schedule=ConstantLrSchedule(), weight_decay=0.0)
+    adapter = LoraAdaptorConfig(r=3, alpha=6, dropout=0.0, a_init_mode="random", target_modules=["q_proj"])
+    mp = jmp.get_policy("params=float32,compute=bfloat16,output=float32")
+
+    def configuration(name, steps, *, resume=False):
+        directory = tmp_path / name
+        return train_lm.TrainLmConfig(
+            model=model_config,
+            data=data,
+            data_seed=7,
+            train_seq_len=8,
+            initialize_from_hf=str(source.path),
+            use_hf_model_config=False,
+            adapter=adapter,
+            optimizer=optimizer,
+            trainer=train_lm.TrainerConfig(
+                id="named-fp8-lora",
+                seed=42,
+                num_train_steps=steps,
+                train_batch_size=2 * data_size,
+                per_device_parallelism=1,
+                mp=mp,
+                quantization=QuantizationConfig(fp8=True, amax_history_length=4),
+                max_eval_batches=0,
+                mesh=MeshConfig(axes={"data": data_size, "model": 1}),
+                tracker=JsonFileTrackerConfig(output_path=str(directory / "tracker")),
+                checkpointer=CheckpointerConfig(base_path=str(directory / "checkpoints"), keep=[{"every": 1}]),
+                load_checkpoint=resume,
+                require_accelerator=False,
+                distributed=DistributedConfig(initialize_jax_distributed=False),
+                log_xla_hlo=False,
+                log_jaxprs=False,
+            ),
+        )
+
+    # Exercise the canonical adapter/filter/quantization ordering unchanged. In particular,
+    # do not rebuild the filter after quantization just to make this composition initialize.
+    full = train_lm.main(configuration("full", 2))
+    first = train_lm.main(configuration("resumed", 1))
+    resumed = train_lm.main(configuration("resumed", 2, resume=True))
+    np.testing.assert_array_equal(full.loss, resumed.loss)
+    np.testing.assert_array_equal(
+        _assert_training_recorded(str(tmp_path / "full/tracker"))["train/loss"],
+        _assert_training_recorded(str(tmp_path / "resumed/tracker"))["train/loss"],
+    )
+    assert int(full.state.step) == int(resumed.state.step) == 2
+    for actual, expected in zip(_array_leaves(resumed.state), _array_leaves(full.state), strict=True):
+        np.testing.assert_array_equal(actual, expected)
+
+    projection = full.state.model.transformer.layers.stacked.self_attn.q_proj
+    previous = first.state.model.transformer.layers.stacked.self_attn.q_proj
+    metadata_names = (
+        "input_scale",
+        "kernel_scale",
+        "output_grad_scale",
+        "input_amax_history",
+        "kernel_amax_history",
+        "output_grad_amax_history",
+    )
+    assert isinstance(projection.wrapped.dot_general, Fp8DotGeneralOp)
+    for name in ("lora_A", "lora_B"):
+        factor = getattr(projection.lora, name)
+        prior_factor = getattr(previous.lora, name)
+        assert factor.weight.dtype == jnp.float32
+        assert not np.array_equal(factor.weight.array, prior_factor.weight.array)
+        operation = factor.dot_general
+        assert isinstance(operation, Fp8DotGeneralOp)
+        for field in metadata_names:
+            value = getattr(operation, field)
+            assert value.dtype == jnp.float32
+            assert value.shape == (2, 4 if "history" in field else 1)
+        for field in ("input_amax_history", "kernel_amax_history", "output_grad_amax_history"):
+            assert np.all(np.any(getattr(operation, field) != 0, axis=-1))
+
+    # The existing LoRA filter freezes wrapped/base operations along with ordinary weights.
+    # Their FP8 metadata must retain its initialized identity, while factor metadata trains.
+    frozen = unwrap_lora_modules(full.state.model)
+    operations = jax.tree.leaves(frozen, is_leaf=lambda value: isinstance(value, Fp8DotGeneralOp))
+    operations = [value for value in operations if isinstance(value, Fp8DotGeneralOp)]
+    assert operations
+    for operation in operations:
+        for field in metadata_names:
+            value = getattr(operation, field)
+            assert value.dtype == jnp.float32
+            expected = np.zeros(value.shape, np.float32) if "history" in field else np.ones(value.shape, np.float32)
+            np.testing.assert_array_equal(value, expected)
+    frozen_weights = to_torch_compatible_state_dict(frozen)
+    for name, value in source.weights.items():
+        np.testing.assert_array_equal(frozen_weights[name], np.asarray(jnp.asarray(value, dtype=mp.compute_dtype)))
+
+    adam_states = jax.tree.leaves(
+        full.state.opt_state, is_leaf=lambda value: isinstance(value, optax.ScaleByAdamState)
+    )
+    adam_states = [value for value in adam_states if isinstance(value, optax.ScaleByAdamState)]
+    assert adam_states
+    for adam in adam_states:
+        np.testing.assert_array_equal(adam.count, 2)
+        for moments in (adam.mu, adam.nu):
+            values = moments.transformer.layers.stacked.self_attn.q_proj
+            assert not _array_leaves(values.wrapped.weight)
+            assert not _array_leaves(values.wrapped.dot_general)
+            for name in ("lora_A", "lora_B"):
+                factor = getattr(values.lora, name)
+                assert not _array_leaves(factor.dot_general)
+                assert np.any(factor.weight.array != 0)
+
+    # These are genuinely partial checkpoints. The canonical resume above must reload
+    # the source base as well as restoring adapter weights, FP8 state, optimizer and key.
+    mesh = configuration("full", 2).trainer.device_mesh
+    with jax.set_mesh(mesh):
+        partials = [
+            load_checkpoint(
+                full.state.saveable_state,
+                latest_checkpoint_path(tmp_path / name / "checkpoints/named-fp8-lora"),
+                mesh=mesh,
+            )
+            for name in ("full", "resumed")
+        ]
+    for actual, expected in zip(_array_leaves(partials[1]), _array_leaves(partials[0]), strict=True):
+        np.testing.assert_array_equal(actual, expected)
+    for partial in partials:
+        values = partial.model.transformer.layers.stacked.self_attn.q_proj
+        assert not _array_leaves(values.wrapped.weight)
+        assert not _array_leaves(values.wrapped.dot_general)
+        for name in ("lora_A", "lora_B"):
+            for field in metadata_names:
+                np.testing.assert_array_equal(
+                    getattr(getattr(values.lora, name).dot_general, field),
+                    getattr(getattr(projection.lora, name).dot_general, field),
+                )

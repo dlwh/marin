@@ -427,16 +427,14 @@ def lora_trainable_params_filter(model: M) -> M:
        except every LoRA param is replaced with True and every other leaf (really, every array) is replaced with False.
     """
 
-    # We only want to train on the lora params. The way to do this in Equinox is generally with
-    # a filter tree (cf https://docs.kidger.site/equinox/examples/frozen_layer/),
-    # which is a tree with the same structure (or a "tree prefix" thereof) as the model, but with
-    # bools or Callable[..., bool] at the leaves. We can then pass this tree to the trainer and it
-    # will only train the parameters that are True in the tree.
-    # Levanter defines `is_lora_param` for this purpose, but we need to be careful about how we use it.
-    # Equinox's primitives don't really have a "match all tree nodes matching a predicate" function (just
-    # a "match all tree leaves matching a predicate" function), so we need to be just a bit careful.
-    # Basically, we want to halt recursion in the tree whenever we hit a node that is a lora param.
-    return haliax.tree_util.tree_map(is_lora_param, model, is_leaf=is_lora_param)
+    # Keep whole frozen projections as False prefixes: quantization can replace their
+    # dot operations after this filter is built. Low-rank factors remain True prefixes,
+    # including any quantization metadata subsequently added to their linears.
+    return haliax.tree_util.tree_map(
+        is_lora_param,
+        model,
+        is_leaf=lambda node: is_lora_param(node) or isinstance(node, (hnn.Linear, ArrayLinear)),
+    )
 
 
 def _loraize(model: M, config: LoraConfig, key: PRNGKeyArray, prefix: str, batch_dims: Tuple[Axis, ...]) -> M:

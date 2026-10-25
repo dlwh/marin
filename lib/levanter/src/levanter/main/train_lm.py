@@ -24,7 +24,7 @@ import levanter.callbacks
 import levanter.eval
 import levanter.eval_harness
 from levanter import callbacks
-from levanter.quantization import cast_model_preserving_quantization_state
+from levanter.quantization import cast_model_preserving_quantization_state, quantize_linear_layers
 from levanter.callbacks._iris_status import iris_status_reporter
 from levanter.callbacks.labeled_eval import LabeledLmEvalConfig, add_labeled_lm_eval_callbacks
 from levanter.adaptor import AdaptorConfig, AdaptorExportConfig, LoraAdaptorConfig, NoAdaptorConfig
@@ -43,7 +43,7 @@ from levanter.models.llama_native_lm import NativeLlamaLmConfig, NativeLlamaLmHe
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel, split_activations
 from levanter.optim.config import AdamConfig, OptimizerConfig
 from levanter.trainer import ExplicitTrainingLayout, Trainer, TrainerConfig
-from levanter.trainer_state import trainables_only
+from levanter.trainer_state import cast_params_by_trainability, trainables_only
 from levanter.training_control import TrainingDashboard
 from levanter.utils.jax_utils import parameter_count
 
@@ -455,18 +455,9 @@ def main(config: TrainLmConfig) -> callbacks.StepInfo:
                 ),
             )
         else:
-            initial_model = config.adapter.apply(
-                build_model(
-                    config.model,
-                    Vocab,
-                    key=model_key,
-                    parameter_axis_mapping=trainer.parameter_axis_mapping,
-                    compute_axis_mapping=trainer.compute_axis_mapping,
-                    batch_axis_name=trainer.config.batch_axis_name,
-                ),
-                key=adapter_key,
-                axis_mapping=parameter_axis_mapping,
-            )
+            # Adapter checkpoint templates must use the configured base source's vocabulary
+            # and architecture, which can differ from the tokenizer-derived fresh model.
+            initial_model = load_source_model()
             state = trainer.initial_state(
                 training_key,
                 model=initial_model,
@@ -484,13 +475,18 @@ def main(config: TrainLmConfig) -> callbacks.StepInfo:
                 "Adapter checkpoints only store trainable weights. Reconstructing the base LM model from the "
                 "configured source before overlaying resumed adapter parameters."
             )
+            # Reload independently: named initialization may donate its model buffers.
             source_model = load_source_model()
+            trainable_filter = config.adapter.trainable_filter(source_model)
+            source_model = cast_params_by_trainability(source_model, trainer.mp, trainable_filter)
+            if config.trainer.quantization is not None:
+                source_model = quantize_linear_layers(source_model, config.trainer.quantization)
             state = dataclasses.replace(
                 state,
                 model=_restore_lm_model_from_partial_checkpoint(
                     state.model,
                     source_model,
-                    config.adapter.trainable_filter(source_model),
+                    trainable_filter,
                 ),
             )
 

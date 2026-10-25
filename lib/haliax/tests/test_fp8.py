@@ -20,6 +20,7 @@ import haliax as hax
 from haliax._src.fp8 import compute_scale, fp8_scaled_dot_general
 from haliax.nn import Linear
 from haliax.quantization import (
+    CustomGradientAccumulation,
     DefaultDotGeneralOp,
     Fp8DotGeneralOp,
     QuantizationConfig,
@@ -28,6 +29,42 @@ from haliax.quantization import (
     partition_for_grad_overwrite,
     quantize_linear_layers,
 )
+
+
+class _OverwriteState(CustomGradientAccumulation):
+    value: jax.Array
+
+    def accumulate(self, other):
+        return dataclasses.replace(self, value=self.value + other.value)
+
+
+@pytest.mark.parametrize("state_kind", ["fp8", "custom"])
+def test_apply_updates_retains_frozen_custom_state_and_applies_active_updates(state_kind):
+    if state_kind == "fp8":
+        state = jax.tree.map(lambda value: value + 2, Fp8DotGeneralOp.init(amax_history_length=4))
+    else:
+        state = _OverwriteState(jnp.array([3, 5], dtype=jnp.float32))
+    Axis = hax.Axis("weight", 2)
+    model = {"frozen": state, "active": state, "weight": hax.named(jnp.array([1.0, 2.0]), Axis)}
+    gradient = {
+        "frozen": jax.tree.map(lambda value: value * 3, state),
+        "active": jax.tree.map(lambda value: value * 2, state),
+        "weight": hax.named(jnp.array([2.0, 4.0]), Axis),
+    }
+    filtered = eqx.filter(gradient, {"frozen": False, "active": True, "weight": True})
+
+    @eqx.filter_jit
+    def step(model, gradient):
+        overwrites, ordinary = partition_for_grad_overwrite(gradient)
+        updates = jax.tree.map(lambda value: -0.25 * value, ordinary)
+        return apply_updates(model, updates, overwrites)
+
+    actual = step(model, filtered)
+    for value, expected in zip(jax.tree.leaves(actual["frozen"]), jax.tree.leaves(state), strict=True):
+        np.testing.assert_array_equal(value, expected)
+    for value, expected in zip(jax.tree.leaves(actual["active"]), jax.tree.leaves(gradient["active"]), strict=True):
+        np.testing.assert_array_equal(value, expected)
+    np.testing.assert_array_equal(actual["weight"].array, np.array([0.5, 1.0], np.float32))
 
 
 @pytest.mark.tpu
