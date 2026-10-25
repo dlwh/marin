@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import contextlib
+import dataclasses
 import json
 import math
 import os
@@ -59,6 +60,11 @@ from levanter.main.perplexity_gap import (
     score_main,
 )
 from levanter.models.llama import LlamaConfig, LlamaLMHeadModel
+from levanter.models.llama_native_lm import NativeLlamaLmConfig, native_llama_sharding
+from levanter.utils.mesh import MeshConfig
+from levanter.tokenizers import load_tokenizer
+from levanter.utils.activation import ActivationFunctionEnum
+from jax.sharding import AxisType, Mesh
 from levanter.tracker import current_tracker
 from levanter.tracker.tracker import DictTracker
 from levanter.tracker import NoopConfig
@@ -956,3 +962,101 @@ def test_perplexity_gap_main_same_model_zero_gap(local_gpt2_tokenizer, local_gpt
 
         assert summary["datasets"]
         assert math.isclose(summary["datasets"][0]["gap_bpb"], 0.0, abs_tol=1e-7)
+
+
+@pytest.mark.tpu
+@pytest.mark.parametrize("source_kind", ["hf", "levanter"])
+@pytest.mark.parametrize("activation", [ActivationFunctionEnum.silu, ActivationFunctionEnum.gelu_new])
+def test_native_perplexity_reports_match_named(tmp_path, tiny_hf_tokenizer_path, source_kind, activation):
+    named_config = LlamaConfig(
+        hidden_dim=16,
+        intermediate_dim=24,
+        num_layers=1,
+        num_heads=4,
+        num_kv_heads=2,
+        max_seq_len=16,
+        activation_function=activation,
+        attn_backend="vanilla",
+    )
+    native_config = NativeLlamaLmConfig(
+        **{field.name: getattr(named_config, field.name) for field in dataclasses.fields(named_config)}
+    )
+    model_size = 2 if len(jax.devices()) >= 4 else 1
+    trainer = TrainerConfig(
+        per_device_eval_parallelism=1,
+        mesh=MeshConfig(
+            axes={"data": len(jax.devices()) // model_size, "model": model_size}, batch_axis_name="examples"
+        ),
+        tracker=NoopConfig(),
+        require_accelerator=False,
+        distributed=DistributedConfig(initialize_jax_distributed=False),
+        log_xla_hlo=False,
+        log_jaxprs=False,
+    )
+    named_mesh = Mesh(np.asarray(jax.devices()[:1]), ("data",), axis_types=(AxisType.Auto,))
+    with jax.set_mesh(named_mesh), haliax.axis_mapping({}):
+        named = named_config.build(haliax.Axis("vocab", 32), key=jax.random.PRNGKey(13))
+        # Amplify the gated MLP so an incorrect activation changes report values
+        # beyond the model-parity tolerance, even for this tiny random model.
+        weights = {
+            name: np.asarray(value) * (4 if ".mlp." in name else 1) for name, value in named.to_state_dict().items()
+        }
+    tokenizer = load_tokenizer(tiny_hf_tokenizer_path)
+    hf_source = tmp_path / "hf"
+    with dataclasses.replace(trainer, use_explicit_mesh_axes=True).use_device_mesh():
+        sharding = native_llama_sharding(
+            trainer.parameter_axis_mapping, trainer.compute_axis_mapping, trainer.batch_axis_name
+        )
+        native = native_config.build(haliax.Axis("vocab", 32), key=jax.random.PRNGKey(0), sharding=sharding)
+        native = native.from_state_dict(weights)
+        native_config.hf_export_converter(tokenizer).save_pretrained(native, str(hf_source))
+        if source_kind == "levanter":
+            native_source = tmp_path / "native"
+            save_checkpoint({"model": native}, 1, str(native_source), metadata=native.checkpoint_metadata())
+        else:
+            native_source = hf_source
+
+    data_path = tmp_path / "validation.jsonl"
+    texts = ["token3 token4 token5 token6 token7 token8 token9 token10 token11", "token12 token13 token14"]
+    data_path.write_text("".join(json.dumps({"text": text}) + "\n" for text in texts))
+    datasets = {"tiny/raw": GapScoringDataset(source=UrlDatasetSourceConfig(validation_urls=[str(data_path)]))}
+    named_spec = GapFinderModelConfig(
+        checkpoint_path=str(hf_source), model=named_config, checkpoint_is_hf=True, tokenizer=tiny_hf_tokenizer_path
+    )
+    native_spec = dataclasses.replace(
+        named_spec, checkpoint_path=str(native_source), model=native_config, checkpoint_is_hf=source_kind == "hf"
+    )
+    for name, spec in (("named", named_spec), ("native", native_spec)):
+        score_main(
+            ModelPerplexityConfig(
+                model=spec,
+                datasets=datasets,
+                trainer=trainer,
+                output_path=str(tmp_path / name),
+                max_eval_length=8,
+            )
+        )
+    expected = read_scored_documents(str(tmp_path / "named"))
+    actual = read_scored_documents(str(tmp_path / "native"))
+    assert len(expected) == len(actual) == len(texts)
+    for reference, result in zip(expected, actual, strict=True):
+        assert reference.document == result.document
+        np.testing.assert_array_equal(reference.tokenized.token_ids, result.tokenized.token_ids)
+        assert np.max(reference.per_byte_loss) > 0
+        np.testing.assert_allclose(result.per_byte_loss, reference.per_byte_loss, atol=1e-5, rtol=1e-5)
+
+    # Both orders exercise independent model contexts and the host report join.
+    for name, first, second in (("named-first", named_spec, native_spec), ("native-first", native_spec, named_spec)):
+        main(
+            GapFinderConfig(
+                model_a=first,
+                model_b=second,
+                datasets=datasets,
+                trainer=trainer,
+                output_path=str(tmp_path / name),
+                max_eval_length=8,
+            )
+        )
+        summary = json.loads((tmp_path / name / "summary.json").read_text())
+        assert summary["datasets"]
+        assert summary["datasets"][0]["gap_bpb"] == pytest.approx(0.0, abs=1e-5)
