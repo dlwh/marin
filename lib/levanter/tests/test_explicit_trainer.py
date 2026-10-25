@@ -19,6 +19,9 @@ from haliax.quantization import Fp8DotGeneralOp, QuantizationConfig
 from levanter.grad_accum import microbatched_arrays
 from levanter.checkpoint import CheckpointerConfig, discover_checkpoint_candidates, load_checkpoint, save_checkpoint
 from levanter.metrics import Metric, ReductionType
+from levanter.models.llama_native import NativeLlamaConfig
+from levanter.quantization import quantize_linear_layers
+from levanter.grug.attention import AttentionMask
 from levanter.optim.model_averaging import EmaModelAveragingConfig
 from levanter.tracker import NoopConfig
 from levanter.trainer import ExplicitTrainingLayout, Trainer, TrainerConfig, WrappedLossFunction
@@ -496,3 +499,66 @@ def test_fp8_compute_cast_preserves_metadata_through_remat_and_checkpoint_next_u
         assert actual.model.stacked.projection.weight.dtype == jnp.float32
         for leaf in jax.tree.leaves(actual.model.stacked.projection.dot_general):
             assert leaf.dtype == jnp.float32
+
+
+@pytest.mark.parametrize("targets", [["q_proj"], r"layers\.stacked\.self_attn\.q_proj$"])
+def test_native_fp8_conversion_batches_state_and_remat_matches_unrolled_layers(targets):
+    mesh = Mesh(np.asarray(jax.devices()[:1]), ("data",), axis_types=(AxisType.Explicit,))
+    with jax.set_mesh(mesh):
+        model = NativeLlamaConfig(
+            vocab_size=16,
+            hidden_dim=8,
+            intermediate_dim=16,
+            num_heads=2,
+            num_kv_heads=2,
+            num_layers=2,
+            max_seq_len=4,
+            gradient_checkpointing="nested",
+        ).build(key=jax.random.PRNGKey(21))
+        model = quantize_linear_layers(model, QuantizationConfig(fp8=True, targets=targets, amax_history_length=4))
+        operation = model.layers.stacked.self_attn.q_proj.dot_general
+        assert model.layers.stacked.self_attn.k_proj.dot_general is None
+        assert model.lm_head.dot_general is None
+        for name in ("input_scale", "kernel_scale", "output_grad_scale"):
+            np.testing.assert_array_equal(getattr(operation, name), np.ones((2, 1), np.float32))
+        for name in ("input_amax_history", "kernel_amax_history", "output_grad_amax_history"):
+            np.testing.assert_array_equal(getattr(operation, name), np.zeros((2, 4), np.float32))
+        operation = dataclasses.replace(
+            operation,
+            input_scale=jnp.array([[1.0], [2.0]]),
+            kernel_scale=jnp.array([[0.5], [1.0]]),
+            output_grad_scale=jnp.array([[2.0], [4.0]]),
+            input_amax_history=jnp.array([[448.0, 224.0, 112.0, 56.0], [896.0, 448.0, 224.0, 112.0]]),
+            kernel_amax_history=jnp.array([[224.0, 112.0, 56.0, 28.0], [448.0, 224.0, 112.0, 56.0]]),
+            output_grad_amax_history=jnp.array(
+                [[114688.0, 57344.0, 28672.0, 14336.0], [229376.0, 114688.0, 57344.0, 28672.0]]
+            ),
+        )
+        model = eqx.tree_at(lambda m: m.layers.stacked.self_attn.q_proj.dot_general, model, operation)
+        tokens = jnp.arange(16).reshape(4, 4) % 16
+
+        def scanned(model):
+            return jnp.square(model.activations(tokens)).mean()
+
+        def unrolled(model):
+            hidden = model.embed_tokens(tokens, sharding=model.sharding)
+            positions = jnp.broadcast_to(jnp.arange(4), tokens.shape)
+            for layer in model.layers.unstacked():
+                hidden = layer(hidden, AttentionMask.causal(), positions)
+            return jnp.square(model.norm(hidden)).mean()
+
+        actual_loss, actual = eqx.filter_jit(eqx.filter_value_and_grad(scanned))(model)
+        expected_loss, expected = eqx.filter_jit(eqx.filter_value_and_grad(unrolled))(model)
+        np.testing.assert_allclose(actual_loss, expected_loss, atol=1e-5, rtol=1e-5)
+        for actual_leaf, expected_leaf in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+            np.testing.assert_allclose(actual_leaf, expected_leaf, atol=1e-5, rtol=1e-5)
+        state = actual.layers.stacked.self_attn.q_proj.dot_general
+        for name in (
+            "input_scale",
+            "kernel_scale",
+            "output_grad_scale",
+            "input_amax_history",
+            "kernel_amax_history",
+            "output_grad_amax_history",
+        ):
+            assert not np.array_equal(getattr(state, name)[0], getattr(state, name)[1])

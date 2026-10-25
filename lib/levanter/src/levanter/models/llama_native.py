@@ -544,6 +544,9 @@ class NativeLlamaModel(eqx.Module):
         return self.unembed(hidden, sharding=self.sharding)
 
     def unembed(self, hidden: Float[Array, "B S D"], *, sharding: NativeLlamaSharding) -> Float[Array, "B S V"]:
+        if self.lm_head is not None and self.lm_head.dot_general is not None:
+            projection = dataclasses.replace(self.lm_head, compute_spec=sharding.column_compute)
+            return projection(hidden, out_sharding=sharding.logits)
         head = reshard(self.get_lm_head(), sharding.column_compute)
         return jnp.einsum("bsd,vd->bsv", hidden, head, out_sharding=sharding.logits)
 

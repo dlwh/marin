@@ -10,11 +10,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.sharding import AxisType, Mesh, PartitionSpec as P
+from haliax.quantization import Fp8DotGeneralOp
+from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
 
 from levanter.grug.attention import AttentionMask
 from levanter.grug.loss import fused_linear_softmax_cross_entropy_loss
 from levanter.layers.attention import AttentionBackend, AttentionMask as NamedAttentionMask
+from levanter.layers.linear import Linear
 from levanter.layers.rotary import (
     DefaultRotaryEmbeddingsConfig,
     Llama3RotaryEmbeddingsConfig,
@@ -30,6 +32,158 @@ from levanter.tracker import NoopTracker, current_tracker
 from levanter.testing.helpers import skip_if_no_torch
 from levanter.tokenizers import load_tokenizer
 from levanter.utils.activation import ActivationFunctionEnum
+
+
+def _native_fp8_operation():
+    return dataclasses.replace(
+        Fp8DotGeneralOp.init(amax_history_length=4),
+        input_scale=jnp.array([7], jnp.float32),
+        kernel_scale=jnp.array([3], jnp.float32),
+        output_grad_scale=jnp.array([9], jnp.float32),
+        input_amax_history=jnp.array([896, 448, 224, 112], jnp.float32),
+        kernel_amax_history=jnp.array([224, 112, 56, 28], jnp.float32),
+        output_grad_amax_history=jnp.array([229376, 114688, 57344, 28672], jnp.float32),
+    )
+
+
+def _assert_native_fp8_state(operation, update, inputs, weight, cotangent):
+    expected = {
+        "input_scale": [2],
+        "kernel_scale": [0.5],
+        "output_grad_scale": [4],
+        "input_amax_history": [np.max(np.abs(inputs)), 224, 112, 896],
+        "kernel_amax_history": [np.max(np.abs(weight)), 56, 28, 224],
+        "output_grad_amax_history": [np.max(np.abs(cotangent)), 57344, 28672, 229376],
+    }
+    for name, values in expected.items():
+        actual = getattr(update, name)
+        np.testing.assert_array_equal(actual, np.asarray(values, np.float32), err_msg=name)
+        source = getattr(operation, name)
+        assert actual.sharding.is_equivalent_to(source.sharding, actual.ndim), name
+
+
+@pytest.mark.tpu
+@pytest.mark.parametrize("projection", ["column", "row"])
+def test_native_linear_fp8_values_gradients_state_and_storage_layout(projection):
+    model_size = 2 if len(jax.devices()) >= 4 else 1
+    devices = jax.devices()[: 2 * model_size if model_size == 2 else 1]
+    mesh = Mesh(
+        np.asarray(devices).reshape(-1, model_size),
+        ("data", "model"),
+        axis_types=(AxisType.Explicit,) * 2,
+    )
+    layout = NativeLlamaSharding(batch_axes=("data",), fsdp_axis="data", model_axis="model")
+    column = projection == "column"
+    storage = layout.column_storage if column else layout.row_storage
+    compute = layout.column_compute if column else layout.row_compute
+    input_spec = layout.residual if column else layout.intermediate
+    output_spec = layout.intermediate if column else layout.residual
+    # Exact FP8 values make NumPy's ordinary matmul an independent forward/VJP oracle.
+    inputs = ((np.arange(64).reshape(4, 2, 8) % 9) - 4).astype(np.float32) / 2
+    weight = ((np.arange(64).reshape(8, 8) % 7) - 3).astype(np.float32) / 8
+    bias = np.arange(8, dtype=np.float32) / 16
+    cotangent = ((np.arange(64).reshape(4, 2, 8) % 5) - 2).astype(np.float32) / 4
+    expected_output = inputs @ weight.T + bias
+    expected_input_grad = cotangent @ weight
+    expected_weight_grad = cotangent.reshape(-1, 8).T @ inputs.reshape(-1, 8)
+    with jax.set_mesh(mesh):
+        operation = jax.tree.map(
+            lambda value: jax.device_put(value, NamedSharding(mesh, P())), _native_fp8_operation()
+        )
+        linear = Linear(
+            jax.device_put(weight, NamedSharding(mesh, storage)),
+            jax.device_put(bias, NamedSharding(mesh, P(storage[0]))),
+            compute,
+            operation,
+        )
+        x = jax.device_put(inputs, NamedSharding(mesh, input_spec))
+        ct = jax.device_put(cotangent, NamedSharding(mesh, output_spec))
+
+        def objective(parameters, output_cotangent):
+            model, inputs = parameters
+            output = model(inputs, out_sharding=output_spec)
+            return jnp.sum(output * output_cotangent), output
+
+        (_, output), (gradient, input_gradient) = eqx.filter_jit(eqx.filter_value_and_grad(objective, has_aux=True))(
+            (linear, x), ct
+        )
+        np.testing.assert_array_equal(output, expected_output)
+        np.testing.assert_array_equal(input_gradient, expected_input_grad)
+        np.testing.assert_array_equal(gradient.weight, expected_weight_grad)
+        np.testing.assert_array_equal(gradient.bias, cotangent.sum(axis=(0, 1)))
+        assert output.sharding == NamedSharding(mesh, output_spec)
+        assert input_gradient.sharding == x.sharding
+        assert gradient.weight.sharding == linear.weight.sharding
+        assert gradient.bias.sharding == linear.bias.sharding
+        _assert_native_fp8_state(operation, gradient.dot_general, inputs, weight, cotangent)
+
+
+@pytest.mark.tpu
+@pytest.mark.parametrize("tied", [False, True], ids=["untied-fp8", "tied"])
+def test_native_llama_logits_and_unembed_preserve_quantized_and_tied_head_behavior(tied):
+    model_size = 2 if len(jax.devices()) >= 4 else 1
+    devices = jax.devices()[: 2 * model_size if model_size == 2 else 1]
+    mesh = Mesh(
+        np.asarray(devices).reshape(-1, model_size),
+        ("data", "model"),
+        axis_types=(AxisType.Explicit,) * 2,
+    )
+    layout = NativeLlamaSharding(batch_axes=("data",), fsdp_axis="data", model_axis="model")
+    config = NativeLlamaConfig(
+        vocab_size=16,
+        hidden_dim=8,
+        intermediate_dim=16,
+        num_layers=1,
+        num_heads=2,
+        num_kv_heads=2,
+        max_seq_len=4,
+        tie_word_embeddings=tied,
+    )
+    with jax.set_mesh(mesh):
+        model = config.build(key=jax.random.key(0), sharding=layout)
+        if not tied:
+            operation = jax.tree.map(
+                lambda value: jax.device_put(value, NamedSharding(mesh, P())), _native_fp8_operation()
+            )
+            model = eqx.tree_at(lambda value: value.lm_head.dot_general, model, operation, is_leaf=lambda x: x is None)
+        tokens = jax.device_put(np.arange(16, dtype=np.int32).reshape(4, 4), NamedSharding(mesh, layout.tokens))
+        hidden = eqx.filter_jit(lambda value: value.activations(tokens))(model)
+        weight = np.asarray(model.get_lm_head())
+        if tied:
+            expected_logits = np.asarray(hidden) @ weight.T
+        else:
+            # Delayed histories select scales 2 and .5; NumPy performs only the
+            # elementwise FP8 casts and an ordinary, dequantized reference matmul.
+            quantized_hidden = (np.asarray(hidden) / 2).astype(jnp.float8_e4m3fn).astype(np.float32) * 2
+            quantized_weight = (weight / 0.5).astype(jnp.float8_e4m3fn).astype(np.float32) * 0.5
+            expected_logits = quantized_hidden @ quantized_weight.T
+            assert np.max(np.abs(expected_logits - np.asarray(hidden) @ weight.T)) > 1e-5
+        logits = eqx.filter_jit(lambda value: value.logits(tokens))(model)
+        np.testing.assert_allclose(logits, expected_logits, atol=1e-5, rtol=1e-5)
+        assert logits.sharding == NamedSharding(mesh, layout.logits)
+
+        # Override compute placement separately from the model's configured
+        # tensor parallelism, as callers of the shared unembed method may do.
+        override = NativeLlamaSharding(batch_axes=("data",), fsdp_axis="data")
+        standalone_hidden = jax.device_put(np.full((4, 2, 8), 0.3, np.float32), NamedSharding(mesh, override.residual))
+
+        def objective(value):
+            output = value.unembed(standalone_hidden, sharding=override)
+            return output.sum(), output
+
+        (_, output), gradient = eqx.filter_jit(eqx.filter_value_and_grad(objective, has_aux=True))(model)
+        if tied:
+            expected_output = np.asarray(standalone_hidden) @ weight.T
+            assert gradient.lm_head is None
+            np.testing.assert_allclose(gradient.token_embeddings, np.full_like(weight, 8 * 0.3), atol=1e-5, rtol=1e-5)
+        else:
+            expected_output = np.full((4, 2, 8), 0.3125, np.float32) @ quantized_weight.T
+            _assert_native_fp8_state(
+                operation, gradient.lm_head.dot_general, np.asarray(standalone_hidden), weight, np.ones((4, 2, 16))
+            )
+            assert gradient.lm_head.weight.sharding == model.lm_head.weight.sharding
+        np.testing.assert_allclose(output, expected_output, atol=1e-5, rtol=1e-5)
+        assert output.sharding == NamedSharding(mesh, override.logits)
 
 
 @pytest.mark.tpu

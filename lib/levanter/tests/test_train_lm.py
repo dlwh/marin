@@ -27,7 +27,7 @@ from chex import assert_trees_all_close
 
 from haliax import Axis
 from haliax.state_dict import to_torch_compatible_state_dict
-from haliax.quantization import QuantizationConfig
+from haliax.quantization import Fp8DotGeneralOp, QuantizationConfig
 from jax.sharding import PartitionSpec as P
 
 import levanter.main.train_lm as train_lm
@@ -46,7 +46,9 @@ from levanter.checkpoint import (
 from levanter.data.dataset import ListAsyncDataset
 from levanter.data.text.datasets import DirectDatasetComponent, LmDataConfig
 from levanter.data.text.examples import GrugLmExample
-from levanter.compat.hf_checkpoints import RepoRef
+from levanter.compat.hf_checkpoints import RepoRef, save_hf_checkpoint_callback
+from levanter.callbacks import StepInfo, compute_validation_loss
+from levanter.optim.model_averaging import EmaModelAveragingConfig
 from levanter.distributed import DistributedConfig
 from levanter.models.llama_native import NativeLlamaSharding
 from levanter.layers.attention import AttentionBackend, AttentionMask
@@ -60,6 +62,7 @@ from levanter.optim.config import AdamConfig, ConstantLrSchedule
 from levanter.tracker import NoopConfig, NoopTracker, current_tracker
 from levanter.tracker.json_file import JsonFileTrackerConfig
 from levanter.trainer_state import TrainerState, trainables_only
+from levanter.quantization import cast_model_preserving_quantization_state
 from levanter.testing.helpers import arrays_only, use_test_mesh
 from levanter.testing.hf_checkpoints import write_llama_checkpoint
 from levanter.utils.mesh import MeshConfig
@@ -1396,3 +1399,261 @@ def test_native_train_lm_lora_hf_update_resume_and_local_exports(
         )
     for name in ("full", "resumed"):
         _assert_training_recorded(str(tmp_path / name / "tracker"))
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize("policy", ["f32", "params=float32,compute=bfloat16,output=float32"])
+@pytest.mark.parametrize("microbatch", [False, True])
+def test_native_train_lm_fp8_checkpoint_resume_preserves_next_update(tmp_path, policy, microbatch):
+    examples = ListAsyncDataset(
+        [GrugLmExample.causal((jnp.arange(4) + index) % 16) for index in range(8 * len(jax.devices()))]
+    )
+    data = LmDataConfig(
+        tokenizer="passthrough",
+        vocab_size=16,
+        shuffle=False,
+        components={"direct": DirectDatasetComponent(datasets={"train": examples})},
+    )
+    parallel_size = 2 if len(jax.devices()) % 4 == 0 else 1
+    optimizer = AdamConfig(learning_rate=1e-3, warmup=0, lr_schedule=ConstantLrSchedule(), weight_decay=0.0)
+    mp = jmp.get_policy(policy)
+
+    def configuration(name, steps, *, resume=False):
+        return train_lm.TrainLmConfig(
+            model=NativeLlamaLmConfig(
+                hidden_dim=8,
+                intermediate_dim=16,
+                num_layers=2,
+                num_heads=2,
+                num_kv_heads=2,
+                max_seq_len=4,
+                gradient_checkpointing="nested",
+            ),
+            data=data,
+            data_seed=7,
+            train_seq_len=4,
+            optimizer=optimizer,
+            trainer=train_lm.TrainerConfig(
+                id="native-fp8",
+                seed=42,
+                num_train_steps=steps,
+                train_batch_size=4 * len(jax.devices()) // parallel_size,
+                per_device_parallelism=2 if microbatch else -1,
+                mp=mp,
+                quantization=QuantizationConfig(fp8=True, amax_history_length=4),
+                mesh=MeshConfig(
+                    axes={"replica": -1, "data": parallel_size, "model": parallel_size}, batch_axis_name="examples"
+                ),
+                tracker=NoopConfig(),
+                checkpointer=CheckpointerConfig(base_path=str(tmp_path / name), keep=[{"every": 1}]),
+                load_checkpoint=resume,
+                require_accelerator=False,
+                distributed=DistributedConfig(initialize_jax_distributed=False),
+                log_xla_hlo=False,
+                log_jaxprs=False,
+            ),
+        )
+
+    full = configuration("full", 2)
+    train_lm.main(full)
+    train_lm.main(configuration("resumed", 1))
+    train_lm.main(configuration("resumed", 2, resume=True))
+    mesh = dataclasses.replace(full.trainer, use_explicit_mesh_axes=True).device_mesh
+    sharding = native_llama_sharding(
+        full.trainer.parameter_axis_mapping, full.trainer.compute_axis_mapping, full.trainer.batch_axis_name
+    )
+    with jax.set_mesh(mesh):
+        model = full.model.build(Axis("vocab", 16), key=jrandom.PRNGKey(0), sharding=sharding)
+        template = TrainerState.init(
+            optimizer.build(2), model, key=jrandom.PRNGKey(0), mp=mp, quantization=full.trainer.quantization
+        )
+        expected = load_checkpoint(template, latest_checkpoint_path(tmp_path / "full/native-fp8"), mesh=mesh)
+        actual = load_checkpoint(template, latest_checkpoint_path(tmp_path / "resumed/native-fp8"), mesh=mesh)
+        first = load_checkpoint(
+            template, discover_checkpoint_candidates(tmp_path / "resumed/native-fp8")[0].path, mesh=mesh
+        )
+    assert int(actual.step) == 2
+    for actual_leaf, expected_leaf in zip(_array_leaves(actual), _array_leaves(expected), strict=True):
+        np.testing.assert_array_equal(actual_leaf, expected_leaf)
+    assert actual.model.native.layers.stacked.self_attn.q_proj.weight.dtype == jnp.float32
+    assert not np.array_equal(
+        actual.model.native.layers.stacked.self_attn.q_proj.weight,
+        first.model.native.layers.stacked.self_attn.q_proj.weight,
+    )
+    operation = actual.model.native.layers.stacked.self_attn.q_proj.dot_general
+    for name in ("input_scale", "kernel_scale", "output_grad_scale"):
+        assert getattr(operation, name).shape == (2, 1)
+        assert getattr(operation, name).dtype == jnp.float32
+    for name in ("input_amax_history", "kernel_amax_history", "output_grad_amax_history"):
+        value = getattr(operation, name)
+        assert value.shape == (2, 4)
+        assert value.dtype == jnp.float32
+        assert np.any(value != 0)
+    # The production fused CE takes raw head weights, so attaching its operation
+    # preserves logits quantization without inventing a quantized training GEMM.
+    head_state = actual.model.native.lm_head.dot_general
+    for name in ("input_scale", "kernel_scale", "output_grad_scale"):
+        np.testing.assert_array_equal(getattr(head_state, name), np.ones(1, np.float32))
+    for name in ("input_amax_history", "kernel_amax_history", "output_grad_amax_history"):
+        np.testing.assert_array_equal(getattr(head_state, name), np.zeros(4, np.float32))
+    with jax.set_mesh(mesh):
+        compute_model = cast_model_preserving_quantization_state(actual.model, mp.cast_to_compute)
+        tokens = jnp.arange(4 * len(jax.devices())).reshape(len(jax.devices()), 4) % 16
+        hidden, logits = eqx.filter_jit(lambda model: (model.native.activations(tokens), model.native.logits(tokens)))(
+            compute_model
+        )
+    # The unused head keeps unit scales. Its independent reference quantizes
+    # operands with NumPy and rounds the ordinary matmul to the compute dtype.
+    quantized_hidden = np.asarray(hidden).astype(jnp.float8_e4m3fn).astype(np.float32)
+    quantized_weight = np.asarray(compute_model.native.lm_head.weight).astype(jnp.float8_e4m3fn).astype(np.float32)
+    expected_logits = (quantized_hidden @ quantized_weight.T).astype(mp.compute_dtype).astype(np.float32)
+    assert np.all(np.isfinite(logits))
+    assert np.any(logits != 0)
+    np.testing.assert_allclose(np.asarray(logits).astype(np.float32), expected_logits, atol=1e-5, rtol=1e-5)
+    adam_states = jax.tree.leaves(actual.opt_state, is_leaf=lambda node: isinstance(node, optax.ScaleByAdamState))
+    adam_states = [node for node in adam_states if isinstance(node, optax.ScaleByAdamState)]
+    assert adam_states
+    for adam in adam_states:
+        for moments in (adam.mu, adam.nu):
+            assert moments.native.layers.stacked.self_attn.q_proj.dot_general is None
+            assert np.any(moments.native.layers.stacked.self_attn.q_proj.weight != 0)
+
+
+@pytest.mark.timeout(180)
+def test_native_fp8_ema_selects_averaged_state_and_resumes_next_update(tmp_path, tiny_hf_tokenizer_path):
+    examples = ListAsyncDataset(
+        [GrugLmExample.causal((jnp.arange(4) + index) % 16) for index in range(8 * len(jax.devices()))]
+    )
+    data = LmDataConfig(
+        tokenizer="passthrough",
+        vocab_size=16,
+        shuffle=False,
+        components={"direct": DirectDatasetComponent(datasets={"train": examples})},
+    )
+    parallel_size = 2 if len(jax.devices()) % 4 == 0 else 1
+    optimizer = AdamConfig(learning_rate=1e-3, warmup=0, lr_schedule=ConstantLrSchedule(), weight_decay=0.0)
+    mp = jmp.get_policy("params=float32,compute=bfloat16,output=float32")
+
+    def configuration(name, steps, *, resume=False):
+        return train_lm.TrainLmConfig(
+            model=NativeLlamaLmConfig(
+                hidden_dim=8,
+                intermediate_dim=16,
+                num_layers=2,
+                num_heads=2,
+                num_kv_heads=2,
+                max_seq_len=4,
+                gradient_checkpointing="nested",
+            ),
+            data=data,
+            data_seed=7,
+            train_seq_len=4,
+            optimizer=optimizer,
+            trainer=train_lm.TrainerConfig(
+                id="native-fp8",
+                seed=42,
+                num_train_steps=steps,
+                train_batch_size=4 * len(jax.devices()) // parallel_size,
+                per_device_parallelism=2,
+                mp=mp,
+                quantization=QuantizationConfig(fp8=True, amax_history_length=4),
+                model_averaging=EmaModelAveragingConfig(beta=0.8),
+                mesh=MeshConfig(
+                    axes={"replica": -1, "data": parallel_size, "model": parallel_size}, batch_axis_name="examples"
+                ),
+                tracker=JsonFileTrackerConfig(output_path=str(tmp_path / name / "tracker")),
+                checkpointer=CheckpointerConfig(base_path=str(tmp_path / name), keep=[{"every": 1}]),
+                load_checkpoint=resume,
+                require_accelerator=False,
+                distributed=DistributedConfig(initialize_jax_distributed=False),
+                log_xla_hlo=False,
+                log_jaxprs=False,
+            ),
+        )
+
+    full = configuration("full", 2)
+    train_lm.main(full)
+    train_lm.main(configuration("resumed", 1))
+    train_lm.main(configuration("resumed", 2, resume=True))
+    mesh = dataclasses.replace(full.trainer, use_explicit_mesh_axes=True).device_mesh
+    sharding = native_llama_sharding(
+        full.trainer.parameter_axis_mapping, full.trainer.compute_axis_mapping, full.trainer.batch_axis_name
+    )
+    with jax.set_mesh(mesh):
+        model = full.model.build(Axis("vocab", 16), key=jrandom.PRNGKey(0), sharding=sharding)
+        template = TrainerState.init(
+            optimizer.build(2),
+            model,
+            key=jrandom.PRNGKey(0),
+            mp=mp,
+            quantization=full.trainer.quantization,
+            model_averaging=full.trainer.model_averaging,
+        )
+        expected = load_checkpoint(template, latest_checkpoint_path(tmp_path / "full/native-fp8"), mesh=mesh)
+        actual = load_checkpoint(template, latest_checkpoint_path(tmp_path / "resumed/native-fp8"), mesh=mesh)
+        first = load_checkpoint(
+            template, discover_checkpoint_candidates(tmp_path / "resumed/native-fp8")[0].path, mesh=mesh
+        )
+    np.testing.assert_array_equal(
+        _assert_training_recorded(str(tmp_path / "full/tracker"))["train/loss"],
+        _assert_training_recorded(str(tmp_path / "resumed/tracker"))["train/loss"],
+    )
+    assert int(actual.step) == 2
+    for observed, uninterrupted in zip(_array_leaves(actual), _array_leaves(expected), strict=True):
+        np.testing.assert_array_equal(observed, uninterrupted)
+    previous = first.model_averaging.model.native.layers.stacked.self_attn.q_proj
+    live = actual.model.native.layers.stacked.self_attn.q_proj
+    averaged = actual.model_averaging.model.native.layers.stacked.self_attn.q_proj
+    np.testing.assert_allclose(
+        averaged.weight, 0.8 * np.asarray(previous.weight) + 0.2 * np.asarray(live.weight), atol=1e-5, rtol=1e-5
+    )
+    assert not np.array_equal(averaged.weight, live.weight)
+    metadata_names = (
+        "input_scale",
+        "kernel_scale",
+        "output_grad_scale",
+        "input_amax_history",
+        "kernel_amax_history",
+        "output_grad_amax_history",
+    )
+    for name in metadata_names:
+        before = np.asarray(getattr(previous.dot_general, name))
+        current = np.asarray(getattr(live.dot_general, name))
+        value = getattr(averaged.dot_general, name)
+        assert value.dtype == jnp.float32
+        np.testing.assert_allclose(value, 0.8 * before + 0.2 * current, atol=1e-5, rtol=1e-5)
+    history = averaged.dot_general.input_amax_history
+    assert np.any(history != 0)
+    assert not np.array_equal(history, history.astype(jnp.bfloat16).astype(jnp.float32))
+    assert not np.array_equal(history, live.dot_general.input_amax_history)
+
+    # The callback must select both the averaged weights and the averaged FP8 state.
+    # Cast ordinary leaves independently, keeping each known FP8 operation intact.
+    reference = jax.tree.map(
+        lambda leaf: leaf if isinstance(leaf, Fp8DotGeneralOp) else mp.cast_to_compute(leaf),
+        actual.model_averaging.model,
+        is_leaf=lambda leaf: isinstance(leaf, Fp8DotGeneralOp),
+    )
+    tokens = jnp.arange(4 * len(jax.devices())).reshape(len(jax.devices()), 4) % 16
+    with jax.set_mesh(mesh):
+
+        @eqx.filter_jit
+        def validation_loss(model, batch):
+            model = cast_model_preserving_quantization_state(model, mp.cast_to_compute)
+            return jnp.mean(jnp.square(model.native.logits(batch).astype(jnp.float32))), {}
+
+        reference_loss = eqx.filter_jit(
+            lambda model: jnp.mean(jnp.square(model.native.logits(tokens).astype(jnp.float32)))
+        )(reference)
+        with NoopTracker():
+            observed_loss = compute_validation_loss(validation_loss, [tokens], max_batches=1)(
+                StepInfo(actual, 0.0, 0.0)
+            )
+        np.testing.assert_array_equal(observed_loss, reference_loss)
+        live_loss, _ = validation_loss(actual.model, tokens)
+        assert not np.array_equal(observed_loss, live_loss)
+        converter = full.model.hf_export_converter(load_tokenizer(tiny_hf_tokenizer_path))
+        save_hf_checkpoint_callback(str(tmp_path / "export"), converter)(StepInfo(actual, 0.0, 0.0))
+    exported = safetensors.numpy.load_file(tmp_path / "export/step-1/model.safetensors")
+    for name, value in actual.model_averaging.model.to_state_dict().items():
+        np.testing.assert_array_equal(exported[name], value)

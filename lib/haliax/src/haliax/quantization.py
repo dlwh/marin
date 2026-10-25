@@ -338,6 +338,15 @@ class QuantizationConfig:
     def __post_init__(self):
         assert not (self.fp8 and self.int8), "Cannot use FP8 and INT8 quantization at the same time."
 
+    def matches_target(self, key_path: tuple) -> bool:
+        """Match final names in a target list or regexes against the full dotted path."""
+        if self.targets is None:
+            return True
+        if isinstance(self.targets, list):
+            key = _key_path_to_str(key_path[-1:]) if key_path else ""
+            return key in self.targets
+        return re.match(self.targets, _key_path_to_str(key_path)) is not None
+
 
 def quantize_linear_layers(tree: T, config: QuantizationConfig) -> T:
     """
@@ -379,7 +388,7 @@ def _quantize_linear_layers(tree: T, config: QuantizationConfig, dot_general_cls
             )
             return dataclasses.replace(module, stacked=new_inner)  # type: ignore
         elif isinstance(module, hnn.Linear):
-            if _matches_target(path, config):
+            if config.matches_target(path):
                 vmapped_dg = _batchify_ctor(dot_general_cls.init, batch_dims)(*args, **kwargs)
                 module = dataclasses.replace(module, dot_general=vmapped_dg)  # type: ignore
             return module
@@ -389,21 +398,6 @@ def _quantize_linear_layers(tree: T, config: QuantizationConfig, dot_general_cls
     return jax.tree_util.tree_map_with_path(
         lambda p, m: quantize_module((), (), p, m), tree, is_leaf=_is_special_module
     )
-
-
-def _matches_target(key_path, config: QuantizationConfig) -> bool:
-    if not key_path:
-        key = ""
-    else:
-        key = _key_path_to_str(key_path[-1:])
-
-    if config.targets is None:
-        return True
-    if isinstance(config.targets, list):
-        return key in config.targets
-
-    key_path_str = _key_path_to_str(key_path)
-    return re.match(config.targets, key_path_str) is not None
 
 
 def _key_path_to_str(key_path: tuple) -> str:

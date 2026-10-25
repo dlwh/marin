@@ -229,7 +229,10 @@ def main(config: TrainLmConfig) -> callbacks.StepInfo:
             config = dataclasses.replace(config, model=native_model_context.model)
         export_config.validate_native(config.model)
         if config.trainer.quantization is not None:
-            raise ValueError("llama_native training does not support Haliax quantization")
+            if not config.trainer.quantization.fp8:
+                raise ValueError("llama_native quantization supports FP8 only")
+            if not isinstance(config.adapter, NoAdaptorConfig):
+                raise ValueError("llama_native FP8 does not support adapters")
         config = dataclasses.replace(config, trainer=dataclasses.replace(config.trainer, use_explicit_mesh_axes=True))
         _native_llama_sharding(config.trainer)
     tokenizer = config.data.the_tokenizer
