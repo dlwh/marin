@@ -21,9 +21,9 @@ import haliax as hax
 from haliax import Axis
 from haliax.partitioning import ResourceAxis, set_mesh
 from haliax.state_dict import from_torch_compatible_state_dict, to_torch_compatible_state_dict
-from haliax.quantization import apply_updates, partition_for_grad_overwrite
+from haliax.quantization import Fp8DotGeneralOp, QuantizationConfig, apply_updates, partition_for_grad_overwrite
 from haliax.jax_utils import is_jax_array_like
-from jax.sharding import Mesh, PartitionSpec as P
+from jax.sharding import AxisType, Mesh, PartitionSpec as P
 from safetensors import safe_open
 
 from levanter.data.loader import DataLoader
@@ -81,6 +81,7 @@ from levanter.models.gpt2 import Gpt2Config, Gpt2LMHeadModel
 from levanter.models.lm_model import LmExample
 from levanter.models.llama import LlamaConfig
 from levanter.models.llama_native_lm import NativeLlamaLmConfig, native_llama_sharding
+from levanter.quantization import quantize_linear_layers
 from levanter.optim.config import AdamConfig
 from levanter.optim.model_averaging import ModelAveraging
 from levanter.store.cache import CacheMetadata, SerialCacheWriter
@@ -462,6 +463,101 @@ def test_dpo_loss_matches_cached_reference_values():
     assert np.isclose(float(uncached_loss), float(cached_loss))
     assert np.isclose(float(uncached_metrics["dpo_loss"]), float(cached_metrics["dpo_loss"]))
     assert np.isclose(float(uncached_metrics["dpo_accuracy"]), float(cached_metrics["dpo_accuracy"]))
+
+
+@pytest.mark.tpu
+@pytest.mark.parametrize(
+    "model_type,fp8",
+    [(LlamaConfig, False), (LlamaConfig, True), (NativeLlamaLmConfig, True)],
+    ids=["named-dense", "named-fp8", "native-fp8"],
+)
+def test_dpo_shared_policy_merges_gradients_and_fp8_state(model_type, fp8):
+    config = model_type(
+        max_seq_len=8,
+        hidden_dim=16,
+        intermediate_dim=24,
+        num_layers=1,
+        num_heads=4,
+        num_kv_heads=2,
+        attn_backend=AttentionBackend.VANILLA,
+    )
+    axis_type = AxisType.Explicit if config.requires_explicit_mesh_axes else AxisType.Auto
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("data", "model"), axis_types=(axis_type,) * 2)
+    with set_mesh(mesh), hax.axis_mapping({}):
+        policy = config.build(Axis("vocab", 32), key=jrandom.PRNGKey(3))
+        if fp8:
+            policy = quantize_linear_layers(policy, QuantizationConfig(fp8=True, amax_history_length=4))
+
+            def seed_history(operation):
+                if not isinstance(operation, Fp8DotGeneralOp):
+                    return operation
+                # Persisted nonzero tails distinguish a maximum merge from an additive cotangent.
+                return dataclasses.replace(
+                    operation,
+                    input_amax_history=jnp.broadcast_to(
+                        jnp.array([896.0, 448.0, 224.0, 112.0]), operation.input_amax_history.shape
+                    ),
+                    kernel_amax_history=jnp.broadcast_to(
+                        jnp.array([224.0, 112.0, 56.0, 28.0]), operation.kernel_amax_history.shape
+                    ),
+                    output_grad_amax_history=jnp.broadcast_to(
+                        jnp.array([229376.0, 114688.0, 57344.0, 28672.0]), operation.output_grad_amax_history.shape
+                    ),
+                )
+
+            policy = jax.tree.map(seed_history, policy, is_leaf=lambda node: isinstance(node, Fp8DotGeneralOp))
+        example = _make_dpo_example(key=jrandom.PRNGKey(9))
+        cached = CachedDpoExample(
+            chosen=example.chosen,
+            rejected=example.rejected,
+            logp_ref_chosen=0.2,
+            logp_ref_rejected=-0.1,
+        )
+        chosen_key, rejected_key = jrandom.split(jrandom.PRNGKey(11))
+        beta = 0.3
+        chosen_logp = logp_sum(policy, example.chosen, key=chosen_key).scalar()
+        rejected_logp = logp_sum(policy, example.rejected, key=rejected_key).scalar()
+
+        def scalar_loss(chosen, rejected):
+            return jax.nn.softplus(-beta * (chosen - rejected - 0.3))
+
+        expected_loss = scalar_loss(chosen_logp, rejected_logp)
+        chosen_cotangent, rejected_cotangent = jax.grad(scalar_loss, argnums=(0, 1))(chosen_logp, rejected_logp)
+        # Independent one-use AD passes never add custom-state cotangents inside reverse mode.
+        chosen_gradient = eqx.filter_jit(
+            eqx.filter_grad(lambda model: logp_sum(model, example.chosen, key=chosen_key).scalar() * chosen_cotangent)
+        )(policy)
+        rejected_gradient = eqx.filter_jit(
+            eqx.filter_grad(
+                lambda model: logp_sum(model, example.rejected, key=rejected_key).scalar() * rejected_cotangent
+            )
+        )(policy)
+
+        def loss(model):
+            return dpo_loss(model, None, cached, beta=beta, key_chosen=chosen_key, key_rejected=rejected_key)[0]
+
+        actual_loss, actual_gradient = eqx.filter_jit(eqx.filter_value_and_grad(eqx.filter_checkpoint(loss)))(policy)
+        np.testing.assert_allclose(actual_loss, expected_loss, atol=1e-5, rtol=1e-4)
+        actual_state, actual_parameters = partition_for_grad_overwrite(actual_gradient)
+        chosen_state, chosen_parameters = partition_for_grad_overwrite(chosen_gradient)
+        rejected_state, rejected_parameters = partition_for_grad_overwrite(rejected_gradient)
+        for actual, chosen, rejected in zip(
+            jax.tree.leaves(actual_parameters),
+            jax.tree.leaves(chosen_parameters),
+            jax.tree.leaves(rejected_parameters),
+            strict=True,
+        ):
+            np.testing.assert_allclose(actual, np.asarray(chosen) + np.asarray(rejected), atol=1e-5, rtol=1e-4)
+        if fp8:
+            state_leaves = jax.tree.leaves(actual_state)
+            assert state_leaves
+            for actual, chosen, rejected in zip(
+                state_leaves,
+                jax.tree.leaves(chosen_state),
+                jax.tree.leaves(rejected_state),
+                strict=True,
+            ):
+                np.testing.assert_allclose(actual, np.maximum(chosen, rejected), atol=1e-5, rtol=1e-4)
 
 
 def test_reference_eval_cache_path_changes_with_slice_bounds():
