@@ -3,7 +3,7 @@
 
 import logging
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Optional, Protocol, runtime_checkable
 
 import equinox as eqx
@@ -11,13 +11,14 @@ import haliax
 import jax
 import jax.numpy as jnp
 from jax.sharding import AxisType
+from rigging.filesystem.storage_path import StoragePath, prefix_join
 
 from haliax import Axis
 
 import levanter
 import levanter.config
 import levanter.utils.logging as logging_utils
-from levanter.checkpoint import latest_checkpoint_path, load_checkpoint
+from levanter.checkpoint import _load_metadata, discover_checkpoint_candidates, latest_checkpoint_path, load_checkpoint
 from levanter.compat.hf_checkpoints import (
     DEFAULT_EXPORT_HOST_BUDGET_BYTES,
     DEFAULT_MAX_SHARD_SIZE,
@@ -26,6 +27,8 @@ from levanter.compat.hf_checkpoints import (
     load_tokenizer,
 )
 from levanter.models.llama import LlamaConfig
+from levanter.models.llama_native import NativeLlamaSharding
+from levanter.models.llama_native_lm import NativeLlamaLmConfig, native_llama_sharding
 from levanter.models.lm_model import LmConfig, LmHeadModel
 from levanter.trainer import TrainerConfig
 from levanter.utils.jax_utils import is_inexact_arrayish, local_cpu_mesh
@@ -63,15 +66,38 @@ def main(config: ConvertLmConfig):
     logging_utils.init_logging("logs", "export")
     if not isinstance(config.model, _HFCheckpointConvertible):
         raise TypeError("model must provide hf_checkpoint_converter()")
-    converter = config.model.hf_checkpoint_converter()
-    tokenizer_spec = config.tokenizer
-    if tokenizer_spec is None:
-        tokenizer = converter.tokenizer
+    native_config = config.model if isinstance(config.model, NativeLlamaLmConfig) else None
+    checkpoint_path = config.checkpoint_path
+    source_vocab = None
+    if native_config is not None:
+        tokenizer_spec = config.tokenizer or native_config.tokenizer
+        if tokenizer_spec is None:
+            tokenizer = None
+        else:
+            tokenizer_ref = RepoRef.from_string(tokenizer_spec)
+            tokenizer = load_tokenizer(tokenizer_ref.model_name_or_path, revision=tokenizer_ref.revision)
+        converter = native_config.hf_export_converter(tokenizer)
+        candidates = discover_checkpoint_candidates(checkpoint_path)
+        candidate = candidates[-1] if candidates else None
+        if candidate is not None:
+            checkpoint_path, metadata = candidate.path, candidate.metadata
+        elif StoragePath(prefix_join(checkpoint_path, "metadata.json")).exists():
+            metadata = _load_metadata(checkpoint_path)
+        else:
+            metadata = {}
+        source_vocab = native_config.checkpoint_vocab_size(metadata)
     else:
-        tokenizer_ref = RepoRef.from_string(tokenizer_spec)
-        tokenizer = load_tokenizer(tokenizer_ref.model_name_or_path, revision=tokenizer_ref.revision)
+        converter = config.model.hf_checkpoint_converter()
+        tokenizer_spec = config.tokenizer
+        if tokenizer_spec is None:
+            tokenizer = converter.tokenizer
+        else:
+            tokenizer_ref = RepoRef.from_string(tokenizer_spec)
+            tokenizer = load_tokenizer(tokenizer_ref.model_name_or_path, revision=tokenizer_ref.revision)
 
-    if tokenizer is None:
+    if source_vocab is not None:
+        vocab_size = source_vocab
+    elif tokenizer is None:
         vocab_size = config.override_vocab_size or getattr(config.model, "vocab_size", None)
         if vocab_size is None:
             raise ValueError("override_vocab_size is required when exporting without a tokenizer")
@@ -81,22 +107,39 @@ def main(config: ConvertLmConfig):
 
     key = jax.random.PRNGKey(0)
 
-    exit_stack = ExitStack()
-    if config.use_cpu:
-        mesh_axis_type = AxisType.Explicit if config.model.requires_explicit_mesh_axes else AxisType.Auto
-        exit_stack.enter_context(local_cpu_mesh(mesh_axis_type))
-    else:
-        # exit_stack.enter_context(Mesh(jax.local_devices(), "dev"))
-        exit_stack.enter_context(config.trainer.device_mesh)
-        exit_stack.enter_context(haliax.axis_mapping(config.trainer.parameter_axis_mapping))
+    with ExitStack() as exit_stack:
+        sharding = NativeLlamaSharding()
+        if config.use_cpu:
+            mesh_axis_type = AxisType.Explicit if config.model.requires_explicit_mesh_axes else AxisType.Auto
+            exit_stack.enter_context(local_cpu_mesh(mesh_axis_type))
+        elif native_config is not None:
+            trainer = replace(config.trainer, use_explicit_mesh_axes=True)
+            exit_stack.enter_context(trainer.use_device_mesh())
+            sharding = native_llama_sharding(
+                trainer.parameter_axis_mapping, trainer.compute_axis_mapping, trainer.batch_axis_name
+            )
+        else:
+            exit_stack.enter_context(config.trainer.device_mesh)
+            exit_stack.enter_context(haliax.axis_mapping(config.trainer.parameter_axis_mapping))
 
-    with exit_stack:
-        model: LmHeadModel = eqx.filter_eval_shape(config.model.build, Vocab, key=key)
+        mesh = jax.sharding.get_mesh()
+        model: LmHeadModel
+        if native_config is not None:
+            native_config.validate_sharding(sharding, mesh, Vocab.size)
+            model = eqx.filter_eval_shape(native_config.build, Vocab, key=key, sharding=sharding)
+        else:
+            model = eqx.filter_eval_shape(config.model.build, Vocab, key=key)
         trainable, non_trainable = eqx.partition(model, is_inexact_arrayish)
         # TODO: don't load the entire checkpoint into CPU memory when we only need our share of the model
-        checkpoint_path = latest_checkpoint_path(config.checkpoint_path)
+        if native_config is None:
+            checkpoint_path = latest_checkpoint_path(config.checkpoint_path)
         logger.info(f"Loading checkpoint from {checkpoint_path}...")
-        trainable = load_checkpoint(trainable, checkpoint_path, subpath=config.checkpoint_subpath)
+        trainable = load_checkpoint(
+            trainable,
+            checkpoint_path,
+            subpath=config.checkpoint_subpath,
+            mesh=mesh if native_config is not None else None,
+        )
 
         assert trainable is not None
         model = eqx.combine(trainable, non_trainable)
