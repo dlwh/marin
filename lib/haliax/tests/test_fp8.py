@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import dataclasses
+from math import lcm
 
 import chex
 import equinox as eqx
@@ -12,6 +13,7 @@ import jax.random as jrandom
 import jax.tree_util
 import numpy as np
 import pytest
+from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P, reshard
 from chex import assert_trees_all_close
 
 import haliax as hax
@@ -228,6 +230,89 @@ def test_fp8_exact_for_representable_inputs():
     np.testing.assert_array_equal(np.asarray(y), np.asarray(lhs @ rhs))
     np.testing.assert_array_equal(np.asarray(grad_lhs), np.asarray(cot @ rhs.T))
     np.testing.assert_array_equal(np.asarray(grad_rhs), np.asarray(lhs.T @ cot))
+
+
+@pytest.mark.tpu
+@pytest.mark.parametrize("transpose_operand", ["none", "input", "weight"])
+def test_fp8_explicit_values_gradients_and_state_preserve_placement(transpose_operand):
+    devices = jax.devices()
+    model_size = 2 if len(devices) >= 4 and len(devices) % 2 == 0 else 1
+    data_size = len(devices) // model_size
+    contracting_size = lcm(16, data_size)
+    mesh = Mesh(
+        np.array(devices).reshape(data_size, model_size),
+        ("data", "model"),
+        axis_types=(AxisType.Explicit, AxisType.Explicit),
+    )
+    operands = np.array([-3, -2, -1.5, -1, -0.5, 0.5, 1, 1.5, 2, 3], np.float32)
+    cotangents = np.array([-2, -1, -0.5, 0.5, 1, 2], np.float32)
+    input_values = np.resize(operands, (8 * data_size, contracting_size))
+    weight_values = np.resize(operands[::-1], (8 * model_size, contracting_size))
+    cotangent_values = np.resize(cotangents, (input_values.shape[0], weight_values.shape[0]))
+    expected_output = input_values @ weight_values.T
+    expected_input_gradient = cotangent_values @ weight_values
+    expected_weight_gradient = cotangent_values.T @ input_values
+    input_spec = P("data", None)
+    weight_storage_spec = P("model", "data")
+    weight_compute_spec = P("model", None)
+    input_contract = 1
+    weight_contract = 1
+    if transpose_operand == "input":
+        input_values = input_values.T
+        expected_input_gradient = expected_input_gradient.T
+        input_spec = P(None, "data")
+        input_contract = 0
+    elif transpose_operand == "weight":
+        weight_values = weight_values.T
+        expected_weight_gradient = expected_weight_gradient.T
+        weight_storage_spec = P("data", "model")
+        weight_compute_spec = P(None, "model")
+        weight_contract = 0
+    dimensions = (((input_contract,), (weight_contract,)), ((), ()))
+    output_spec = P("data", "model")
+
+    with jax.set_mesh(mesh):
+        operation = dataclasses.replace(
+            Fp8DotGeneralOp.init(amax_history_length=16),
+            input_scale=jnp.array([2.0], jnp.float32),
+            kernel_scale=jnp.array([0.5], jnp.float32),
+            output_grad_scale=jnp.array([4.0], jnp.float32),
+        )
+        operation = jax.tree.map(lambda value: jax.device_put(value, NamedSharding(mesh, P())), operation)
+        inputs = jax.device_put(input_values, NamedSharding(mesh, input_spec))
+        weight = jax.device_put(weight_values, NamedSharding(mesh, weight_storage_spec))
+        cotangent = jax.device_put(cotangent_values, NamedSharding(mesh, output_spec))
+
+        def forward(state):
+            op, values, parameter = state
+            parameter = reshard(parameter, weight_compute_spec)
+            return reshard(op(values, parameter, dimensions), output_spec)
+
+        state = (operation, inputs, weight)
+        output = eqx.filter_jit(forward)(state)
+        gradients = eqx.filter_jit(eqx.filter_grad(lambda value: jnp.sum(forward(value) * cotangent)))(state)
+        operation_gradient, input_gradient, weight_gradient = gradients
+        np.testing.assert_array_equal(output, expected_output)
+        np.testing.assert_array_equal(input_gradient, expected_input_gradient)
+        np.testing.assert_array_equal(weight_gradient, expected_weight_gradient)
+        assert output.sharding == NamedSharding(mesh, output_spec)
+        assert input_gradient.sharding == inputs.sharding
+        assert weight_gradient.sharding == weight.sharding
+
+        overwritten = apply_updates(operation, None, operation_gradient)
+        for name, maximum in (
+            ("input", np.max(np.abs(input_values))),
+            ("kernel", np.max(np.abs(weight_values))),
+            ("output_grad", np.max(np.abs(cotangent_values))),
+        ):
+            expected_history = np.zeros(16, np.float32)
+            expected_history[0] = maximum
+            np.testing.assert_array_equal(getattr(overwritten, name + "_amax_history"), expected_history)
+            np.testing.assert_array_equal(getattr(overwritten, name + "_scale"), getattr(operation, name + "_scale"))
+            history = getattr(overwritten, name + "_amax_history")
+            scale = getattr(overwritten, name + "_scale")
+            assert history.sharding.is_equivalent_to(getattr(operation, name + "_amax_history").sharding, history.ndim)
+            assert scale.sharding.is_equivalent_to(getattr(operation, name + "_scale").sharding, scale.ndim)
 
 
 def test_fp8_backward_uses_distinct_operand_scales():
