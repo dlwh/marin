@@ -108,7 +108,8 @@ def apply_updates(tree, updates, overwrites):
     """
     Apply optimizer updates and gradient-carried state throughout a tree.
 
-    Custom gradient accumulation objects apply their overwrite policy. Other leaves follow
+    Custom gradient accumulation objects apply their overwrite policy. Empty filtered
+    custom-state overwrites retain the persisted state. Other leaves follow
     ```python
     if overwrite is not None:
         return overwrite
@@ -121,6 +122,9 @@ def apply_updates(tree, updates, overwrites):
     def _apply_update(tree, update, overwrite):
         if overwrite is not None:
             if isinstance(tree, CustomGradientAccumulation):
+                # Filtering a frozen module keeps its structure with every array set to None.
+                if not jax.tree_util.tree_leaves(overwrite):
+                    return tree
                 return tree.apply_overwrite(overwrite)
             return overwrite
         if update is None:
