@@ -142,6 +142,10 @@ gcp = [
 
 [dependency-groups]
 test = [
+  "fastapi>=0.100.0",
+  "uvicorn[standard]>=0.23.0",
+  "openai>=1.0.0",
+  "prompt_toolkit>=3.0.0",
   "pytest",
   "pytest-forked",
   "pytest-asyncio",
