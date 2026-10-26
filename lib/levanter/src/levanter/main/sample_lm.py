@@ -89,7 +89,7 @@ def _load_model(config: SampleLmConfig, Vocab: Axis, *, tokenizer, key) -> LmHea
         parameter_axis_mapping=config.trainer.parameter_axis_mapping,
         compute_axis_mapping=config.trainer.compute_axis_mapping,
         batch_axis_name=config.trainer.batch_axis_name,
-        compute_dtype=config.trainer.mp.compute_dtype,
+        load_dtype=config.trainer.mp.compute_dtype,
         cast_to_param=lambda model: cast_model_preserving_quantization_state(model, config.trainer.mp.cast_to_compute),
         hf_ref=hf_ref,
         checkpoint_path=config.checkpoint_path,

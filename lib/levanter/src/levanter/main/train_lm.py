@@ -133,7 +133,8 @@ def _load_lm_model_from_configured_source(
     if config.initialize_from_hf:
         assert converter is not None
         model_init = None
-        load_dtype = trainer.mp.compute_dtype
+        # Preserve the requested master precision before Trainer casts computation copies.
+        load_dtype = trainer.mp.param_dtype
         if isinstance(config.model, NativeLlamaLmConfig):
 
             def initialize_native_model(vocab: Axis) -> ModelWithHfSerializationMixin:
@@ -150,8 +151,6 @@ def _load_lm_model_from_configured_source(
                 )
 
             model_init = initialize_native_model
-            # Compute precision must not round pretrained master weights before initialization.
-            load_dtype = trainer.mp.param_dtype
         model = converter.load_pretrained(
             config.model.model_type,
             config=(
