@@ -24,7 +24,8 @@ import shlex
 import subprocess
 import sys
 from collections import Counter
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -318,6 +319,42 @@ def _collected_test_ids(report: dict[str, Any], repo_root: Path) -> tuple[str, .
     return tuple(sorted(ids))
 
 
+class CiBatchStatus(StrEnum):
+    COLLECTING = "collecting"
+    PENDING = "pending"
+    RUNNING = "running"
+    EMPTY = "empty"
+    FAILED = "failed"
+    PASSED = "passed"
+
+
+@dataclass
+class CiBatchRecord:
+    """Planned cases and observed completion for one pytest session."""
+
+    ids: tuple[str, ...]
+    status: CiBatchStatus = CiBatchStatus.PENDING
+    exit_code: int | None = None
+    report_error: str | None = None
+    reported: list[str] = field(default_factory=list)
+    missing: list[str] = field(default_factory=list)
+    unknown: list[str] = field(default_factory=list)
+    duplicates: list[str] = field(default_factory=list)
+    failed_or_error: list[str] = field(default_factory=list)
+
+
+@dataclass
+class CiBatchManifest:
+    """Collection and session lifecycle written to the CI artifact."""
+
+    test_paths: tuple[str, ...]
+    status: CiBatchStatus = CiBatchStatus.COLLECTING
+    batches: list[CiBatchRecord] = field(default_factory=list)
+    collection_exit_code: int | None = None
+    collection_error: str | None = None
+    ids: tuple[str, ...] = ()
+
+
 def run_ci_batches(
     repo_root: Path,
     test_paths: tuple[str, ...],
@@ -341,10 +378,10 @@ def run_ci_batches(
     manifest_path = report_dir / "manifest.json"
     if manifest_path.exists():
         raise ValueError(f"Refusing to reuse existing test reports: {report_dir}")
-    manifest: dict[str, Any] = {"status": "collecting", "test_paths": paths, "batches": []}
+    manifest = CiBatchManifest(test_paths=paths)
 
     def save_manifest() -> None:
-        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+        manifest_path.write_text(json.dumps(asdict(manifest), indent=2) + "\n")
 
     environment = pytest_environment(1)
     command = (sys.executable, "-m", "pytest", *pytest_args)
@@ -364,35 +401,39 @@ def run_ci_batches(
         env=environment,
         check=False,
     )
-    manifest["collection_exit_code"] = collection.returncode
+    manifest.collection_exit_code = collection.returncode
     if collection.returncode not in (0, 5) or not collection_path.exists():
-        manifest["status"] = "failed"
+        manifest.status = CiBatchStatus.FAILED
         save_manifest()
         return collection.returncode or 1
     try:
         ids = _collected_test_ids(json.loads(collection_path.read_text()), repo_root)
     except ValueError as error:
-        manifest.update(status="failed", collection_error=str(error))
+        manifest.status = CiBatchStatus.FAILED
+        manifest.collection_error = str(error)
         save_manifest()
         return 1
     if collection.returncode == 5 and ids:
-        manifest.update(status="failed", collection_error="Nonempty collection exited with no-tests status")
+        manifest.status = CiBatchStatus.FAILED
+        manifest.collection_error = "Nonempty collection exited with no-tests status"
         save_manifest()
         return 5
     batches = [ids[index::batch_count] for index in range(batch_count)]
     assert Counter(nodeid for batch in batches for nodeid in batch) == Counter(ids)
-    manifest.update(status="running", ids=ids, batches=[{"ids": batch, "status": "pending"} for batch in batches])
+    manifest.status = CiBatchStatus.RUNNING
+    manifest.ids = ids
+    manifest.batches = [CiBatchRecord(ids=batch) for batch in batches]
     save_manifest()
     failure = 0
     for index, batch in enumerate(batches, 1):
-        entry = manifest["batches"][index - 1]
+        entry = manifest.batches[index - 1]
         if not batch:
-            entry["status"] = "empty"
+            entry.status = CiBatchStatus.EMPTY
             save_manifest()
             continue
         json_path = report_dir / f"batch-{index}.json"
         junit_path = report_dir / f"batch-{index}.xml"
-        entry["status"] = "running"
+        entry.status = CiBatchStatus.RUNNING
         save_manifest()
         print(f"==> pytest session {index}/{batch_count}: {len(batch)} cases", flush=True)
         result = subprocess.run(
@@ -407,13 +448,15 @@ def run_ci_batches(
             env=environment,
             check=False,
         )
-        entry["exit_code"] = result.returncode
+        entry.exit_code = result.returncode
         failure = failure or result.returncode
         if not junit_path.exists():
-            entry["report_error"] = "Missing pytest JUnit report"
+            entry.report_error = "Missing pytest JUnit report"
             failure = failure or 1
         if not json_path.exists():
-            entry.update(status="failed", report_error="Missing pytest JSON report", missing=list(batch))
+            entry.status = CiBatchStatus.FAILED
+            entry.report_error = "Missing pytest JSON report"
+            entry.missing = list(batch)
             failure = failure or 1
             save_manifest()
             continue
@@ -425,7 +468,9 @@ def run_ci_batches(
                 _repo_test_id(test["nodeid"], report_root, repo_root) for test in report["tests"] if "teardown" in test
             }
         except ValueError as error:
-            entry.update(status="failed", report_error=str(error), missing=list(batch))
+            entry.status = CiBatchStatus.FAILED
+            entry.report_error = str(error)
+            entry.missing = list(batch)
             failure = failure or 1
             save_manifest()
             continue
@@ -434,19 +479,19 @@ def run_ci_batches(
         unknown = sorted(set(reported) - set(batch))
         duplicates = sorted(nodeid for nodeid, count in counts.items() if count > 1)
         bad_outcomes = [test["nodeid"] for test in report["tests"] if test["outcome"] in ("failed", "error")]
-        valid = not (result.returncode or missing or unknown or duplicates or bad_outcomes or "report_error" in entry)
-        entry.update(
-            status="passed" if valid else "failed",
-            reported=reported,
-            missing=missing,
-            unknown=unknown,
-            duplicates=duplicates,
-            failed_or_error=bad_outcomes,
+        valid = not (
+            result.returncode or missing or unknown or duplicates or bad_outcomes or entry.report_error is not None
         )
+        entry.status = CiBatchStatus.PASSED if valid else CiBatchStatus.FAILED
+        entry.reported = reported
+        entry.missing = missing
+        entry.unknown = unknown
+        entry.duplicates = duplicates
+        entry.failed_or_error = bad_outcomes
         if not valid:
             failure = failure or 1
         save_manifest()
-    manifest["status"] = "failed" if failure else "passed"
+    manifest.status = CiBatchStatus.FAILED if failure else CiBatchStatus.PASSED
     save_manifest()
     return failure
 
