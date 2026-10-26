@@ -237,15 +237,21 @@ def _cache_identity_payload(
     reference_identity: dict[str, Any],
     seq_len: int,
 ) -> dict[str, Any]:
-    return {
-        "kind": REFERENCE_LOGPROBS_CACHE_KIND,
-        "source_cache_path": spec.source_cache_path,
-        "source_split": spec.source_split,
-        "slice_start": spec.slice_start,
-        "slice_end": spec.slice_end,
-        "reference_identity": reference_identity,
-        "seq_len": seq_len,
-    }
+    # Compare the same JSON representation that the cache ledger persists.
+    return json.loads(
+        json.dumps(
+            {
+                "kind": REFERENCE_LOGPROBS_CACHE_KIND,
+                "source_cache_path": spec.source_cache_path,
+                "source_split": spec.source_split,
+                "slice_start": spec.slice_start,
+                "slice_end": spec.slice_end,
+                "reference_identity": reference_identity,
+                "seq_len": seq_len,
+            },
+            cls=FailSafeJSONEncoder,
+        )
+    )
 
 
 def reference_eval_cache_metadata(

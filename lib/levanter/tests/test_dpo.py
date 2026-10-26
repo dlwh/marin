@@ -73,6 +73,7 @@ from levanter.main.train_dpo import (
     _install_separate_reference_export_hooks,
     _periodic_eval_callback,
     _restore_policy_model_from_partial_checkpoint,
+    _reference_eval_cache_identity,
     _scheduled_eval_callback,
     _validate_dpo_config,
 )
@@ -81,7 +82,7 @@ from levanter.models.gpt2 import Gpt2Config, Gpt2LMHeadModel
 from levanter.models.lm_model import LmExample
 from levanter.models.llama import LlamaConfig
 from levanter.models.llama_native_lm import NativeLlamaLmConfig, native_llama_sharding
-from levanter.quantization import quantize_linear_layers
+from levanter.quantization import cast_model_preserving_quantization_state, quantize_linear_layers
 from levanter.optim.config import AdamConfig
 from levanter.optim.model_averaging import ModelAveraging
 from levanter.store.cache import CacheMetadata, SerialCacheWriter
@@ -615,9 +616,36 @@ def test_load_reference_eval_cache_rejects_metadata_mismatch(tmp_path: Path):
         load_reference_eval_cache(str(cache_dir), metadata=mismatched_metadata)
 
 
-def test_build_or_load_reference_eval_cache_matches_direct_logps(tmp_path: Path):
+@pytest.mark.parametrize(
+    "precision,quantization",
+    [
+        ("f32", None),
+        ("f32", QuantizationConfig(fp8=True, amax_history_length=4)),
+        ("f32", QuantizationConfig(fp8=True, amax_history_length=4, targets=r"policy\..*")),
+        ("f32", QuantizationConfig(fp8=True, amax_history_length=4, targets=r"reference\..*")),
+        ("p=f32,c=bf16,o=f32", None),
+    ],
+    ids=["dense", "fp8", "policy-only-fp8", "reference-only-fp8", "bf16"],
+)
+def test_build_or_load_reference_eval_cache_matches_direct_logps(tmp_path: Path, precision, quantization):
     config = _tiny_gpt2_config()
-    reference_model = inference_mode(_build_policy_model(config), True)
+    model = _build_policy_model(config)
+    trainer_config = dataclasses.replace(
+        _dpo_trainer_config(tmp_path), mp=jmp.get_policy(precision), quantization=quantization
+    )
+    dpo_config = TrainDpoConfig(
+        model=config, trainer=trainer_config, reference=SeparateReferenceConfig(model_path="hf/model")
+    )
+    state = TrainerState.init(
+        dpo_config.optimizer.build(1),
+        DpoModel(policy=model, reference=model),
+        key=jrandom.PRNGKey(3),
+        is_trainable=DpoModel(policy=True, reference=False),
+        mp=trainer_config.mp,
+        quantization=quantization,
+    )
+    reference_model = inference_mode(state.model.reference, True)
+    reference_model = cast_model_preserving_quantization_state(reference_model, trainer_config.mp.cast_to_compute)
 
     examples = [_make_dpo_example(key=jrandom.PRNGKey(i)) for i in range(3)]
     dataset = ListAsyncDataset(examples)
@@ -627,7 +655,32 @@ def test_build_or_load_reference_eval_cache_matches_direct_logps(tmp_path: Path)
         source_cache_path=str(tmp_path / "validation"),
         source_split="validation",
     )
-    reference_identity = {"reference_type": "separate", "reference": {"model_path": "hf/model"}}
+    reference_identity = _reference_eval_cache_identity(dpo_config)
+    # A cache written for dense reference arithmetic must not satisfy an FP8/precision request.
+    for reference in (SeparateReferenceConfig(model_path="hf/model"), AdapterBaseReferenceConfig()):
+        identities = [
+            _reference_eval_cache_identity(
+                dataclasses.replace(
+                    dpo_config,
+                    reference=reference,
+                    trainer=dataclasses.replace(trainer_config, mp=jmp.get_policy(mp), quantization=quant),
+                )
+            )
+            for mp, quant in (
+                ("f32", None),
+                ("f32", QuantizationConfig(fp8=True)),
+                ("f32", QuantizationConfig(fp8=True, targets=r"policy\..*")),
+                ("p=f32,c=bf16,o=f32", None),
+            )
+        ]
+        assert len(
+            {
+                reference_eval_cache_path(
+                    spec, reference_identity=identity, seq_len=8, cache_dir=str(tmp_path / "cache")
+                )
+                for identity in identities
+            }
+        ) == len(identities)
     cache_dir = reference_eval_cache_path(
         spec, reference_identity=reference_identity, seq_len=8, cache_dir=str(tmp_path / "cache")
     )
@@ -648,7 +701,7 @@ def test_build_or_load_reference_eval_cache_matches_direct_logps(tmp_path: Path)
             dataset=dataset,
             eval_loader=loader,
             compute_axis_mapping=None,
-            mp=jmp.get_policy("f32"),
+            mp=trainer_config.mp,
             cache_dir=cache_dir,
             metadata=metadata,
         )
@@ -1247,6 +1300,80 @@ def test_native_dpo_main_preserves_source_vocab_and_resumes_same_checkpoint(
         np.testing.assert_array_equal(value, expected)
     metrics = json.loads((tmp_path / "continued/eval_results.json").read_text())
     assert np.isfinite(metrics["train/loss"])
+
+
+@pytest.mark.tpu
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize(
+    "quantization,reference_fp8",
+    [
+        (None, False),
+        (QuantizationConfig(fp8=True, amax_history_length=4), True),
+        (QuantizationConfig(fp8=True, amax_history_length=4, targets=r"policy\..*"), False),
+    ],
+    ids=["dense", "fp8", "policy-only-fp8"],
+)
+def test_named_dpo_pretrained_policy_keeps_source_vocab_and_quantized_state(
+    tmp_path, dpo_llama_source, dpo_preference_data, quantization, reference_fp8
+):
+    config = TrainDpoConfig(
+        model=dpo_llama_source.config,
+        data=dpo_preference_data,
+        trainer=dataclasses.replace(
+            _dpo_trainer_config(tmp_path / "full"),
+            quantization=quantization,
+            mp=jmp.get_policy("f32"),
+        ),
+        initialize_from_hf=str(dpo_llama_source.path),
+        reference=SeparateReferenceConfig(model_path=str(dpo_llama_source.path), is_hf=True),
+        optimizer=AdamConfig(learning_rate=0.01, warmup=0, weight_decay=0, lr_schedule="constant"),
+        validation_split_fraction=None,
+    )
+    full = train_dpo_main(config)
+    assert int(full.state.step) == 2
+    assert full.state.model.policy.Vocab.size == full.state.model.reference.Vocab.size == 32
+    assert len(dpo_preference_data.the_tokenizer) == 31
+    for model, frozen in ((full.state.model.policy, False), (full.state.model.reference, True)):
+        decoder_operations = [
+            node
+            for node in jax.tree.leaves(model.transformer, is_leaf=lambda node: isinstance(node, Fp8DotGeneralOp))
+            if isinstance(node, Fp8DotGeneralOp)
+        ]
+        assert bool(decoder_operations) == (reference_fp8 if frozen else quantization is not None)
+        for operation in decoder_operations:
+            if frozen:
+                np.testing.assert_array_equal(operation.input_amax_history, 0)
+                np.testing.assert_array_equal(operation.kernel_amax_history, 0)
+                np.testing.assert_array_equal(operation.output_grad_amax_history, 0)
+                np.testing.assert_array_equal(operation.input_scale, 1)
+                np.testing.assert_array_equal(operation.kernel_scale, 1)
+                np.testing.assert_array_equal(operation.output_grad_scale, 1)
+            else:
+                assert np.any(np.asarray(operation.input_amax_history) > 0)
+                assert np.any(np.asarray(operation.kernel_amax_history) > 0)
+        # The loss consumes get_lm_head() weights directly, bypassing the head's dot operation.
+        head_operation = model.lm_head.dot_general
+        if isinstance(head_operation, Fp8DotGeneralOp):
+            np.testing.assert_array_equal(head_operation.input_amax_history, 0)
+            np.testing.assert_array_equal(head_operation.kernel_amax_history, 0)
+            np.testing.assert_array_equal(head_operation.output_grad_amax_history, 0)
+    for name, value in to_torch_compatible_state_dict(full.state.model.reference).items():
+        if name in dpo_llama_source.weights:
+            np.testing.assert_array_equal(value, dpo_llama_source.weights[name])
+    template = full.state.saveable_state
+    with config.trainer.use_device_mesh():
+        stored = load_checkpoint(
+            template,
+            latest_checkpoint_path(tmp_path / "full/checkpoints/dpo"),
+            mesh=config.trainer.device_mesh,
+        )
+    for value, expected in zip(
+        jax.tree.leaves(eqx.filter(stored, eqx.is_array)),
+        jax.tree.leaves(eqx.filter(template, eqx.is_array)),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(value, expected)
+    assert np.isfinite(full.loss)
 
 
 @pytest.fixture
