@@ -3,6 +3,7 @@
 
 import dataclasses
 import json
+import shutil
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -72,7 +73,6 @@ from levanter.main.train_dpo import (
     _derive_training_keys,
     _install_separate_reference_export_hooks,
     _periodic_eval_callback,
-    _restore_policy_model_from_partial_checkpoint,
     _reference_eval_cache_identity,
     _scheduled_eval_callback,
     _validate_dpo_config,
@@ -87,7 +87,7 @@ from levanter.optim.config import AdamConfig
 from levanter.optim.model_averaging import ModelAveraging
 from levanter.store.cache import CacheMetadata, SerialCacheWriter
 from levanter.tokenizers import MarinTokenizer, load_tokenizer as load_marin_tokenizer
-from levanter.trainer_state import TrainerState, saveable_training_mask, trainables_only
+from levanter.trainer_state import TrainerState, saveable_training_mask
 from levanter.trainer import ExplicitTrainingLayout, Trainer, TrainerConfig, TrainerHooks
 from levanter.tracker import NoopTracker, current_tracker
 from levanter.tracker.json_file import JsonFileTrackerConfig
@@ -848,34 +848,6 @@ def test_eval_model_fills_missing_namedarrays_from_model():
     weight = eval_model.embeddings.token_embeddings.weight
 
     assert is_jax_array_like(weight.array)
-
-
-def test_restore_policy_model_from_partial_checkpoint_recovers_base_model():
-    config = _tiny_gpt2_config()
-    Vocab = Axis("vocab", 32)
-    base_key, wrong_base_key, adapter_key, wrong_adapter_key, example_key = jrandom.split(jrandom.PRNGKey(0), 5)
-
-    adapter = LoraAdaptorConfig(r=4, zero_init_b=False, a_init_mode="random")
-    trained_policy = adapter.apply(config.build(Vocab, key=base_key), key=adapter_key)
-    wrong_resume_skeleton = adapter.apply(config.build(Vocab, key=wrong_base_key), key=wrong_adapter_key)
-    correct_source_skeleton = adapter.apply(config.build(Vocab, key=base_key), key=wrong_adapter_key)
-    trainable_filter = adapter.trainable_filter(trained_policy)
-
-    checkpointed_trainables = trainables_only(trained_policy, trainable_filter)
-    wrong_resumed_policy = eqx.combine(checkpointed_trainables, wrong_resume_skeleton)
-    restored_policy = _restore_policy_model_from_partial_checkpoint(
-        wrong_resumed_policy,
-        correct_source_skeleton,
-        trainable_filter,
-    )
-
-    example = _make_dpo_example(seq_len=8, vocab_size=Vocab.size, key=example_key)
-    trained_logp = logp_sum(inference_mode(trained_policy, True), example.chosen).scalar()
-    wrong_logp = logp_sum(inference_mode(wrong_resumed_policy, True), example.chosen).scalar()
-    restored_logp = logp_sum(inference_mode(restored_policy, True), example.chosen).scalar()
-
-    assert wrong_logp != pytest.approx(trained_logp)
-    assert restored_logp == pytest.approx(trained_logp)
 
 
 class _CapturingConverter:
@@ -1683,3 +1655,151 @@ def test_native_lora_dpo_main_updates_only_factors_and_resumes_exact_state(
             np.testing.assert_allclose(
                 actual, expected_grad_factors[name].reshape(actual.shape), atol=1e-5, rtol=1e-4, err_msg=name
             )
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize("source_vocab", [31, 32])
+@pytest.mark.parametrize(
+    "reference_type,quantization",
+    [
+        ("separate", None),
+        ("separate", QuantizationConfig(fp8=True, amax_history_length=4, targets=r"policy\..*")),
+        ("adapter_base", QuantizationConfig(fp8=True, amax_history_length=4)),
+    ],
+    ids=["dense-bf16", "policy-only-fp8-bf16", "adapter-base-fp8-bf16"],
+)
+def test_named_lora_dpo_partial_checkpoint_preserves_source_topology_and_next_update(
+    tmp_path,
+    dpo_llama_source,
+    dpo_separate_reference_source,
+    dpo_preference_data,
+    quantization,
+    source_vocab,
+    reference_type,
+):
+    if source_vocab == 31:
+        dpo_llama_source = write_llama_checkpoint(
+            tmp_path / "hf-policy-31",
+            dpo_llama_source.config,
+            dpo_llama_source.config.to_hf_config(31),
+            key=jrandom.PRNGKey(13),
+        )
+        dpo_separate_reference_source = write_llama_checkpoint(
+            tmp_path / "hf-reference-31",
+            dpo_separate_reference_source.config,
+            dpo_separate_reference_source.config.to_hf_config(31),
+            key=jrandom.PRNGKey(97),
+        )
+    config = TrainDpoConfig(
+        model=dpo_llama_source.config,
+        data=dpo_preference_data,
+        trainer=dataclasses.replace(
+            _dpo_trainer_config(tmp_path / "full"),
+            quantization=quantization,
+            mp=jmp.get_policy("params=float32,compute=bfloat16,output=float32"),
+        ),
+        initialize_from_hf=str(dpo_llama_source.path),
+        reference=(
+            SeparateReferenceConfig(model_path=str(dpo_separate_reference_source.path), is_hf=True)
+            if reference_type == "separate"
+            else AdapterBaseReferenceConfig()
+        ),
+        adapter=LoraAdaptorConfig(r=3, alpha=6, dropout=0.25, target_modules=["q_proj"]),
+        optimizer=AdamConfig(learning_rate=0.01, warmup=0, weight_decay=0, lr_schedule="constant"),
+        validation_split_fraction=None,
+    )
+    full = train_dpo_main(config)
+    split_config = dataclasses.replace(
+        config,
+        trainer=dataclasses.replace(
+            _dpo_trainer_config(tmp_path / "resumed", steps=1),
+            quantization=quantization,
+            mp=config.trainer.mp,
+        ),
+    )
+    split = train_dpo_main(split_config)
+    resumed = train_dpo_main(
+        dataclasses.replace(
+            split_config, trainer=dataclasses.replace(split_config.trainer, num_train_steps=2, load_checkpoint=True)
+        )
+    )
+    assert int(split.state.step) == 1
+    assert int(full.state.step) == int(resumed.state.step) == 2
+    for info in (full, resumed):
+        policy = info.state.model.policy if isinstance(info.state.model, DpoModel) else info.state.model
+        assert policy.Vocab.size == source_vocab >= len(dpo_preference_data.the_tokenizer)
+        frozen_policy = unwrap_lora_modules(policy)
+        for name, value in to_torch_compatible_state_dict(frozen_policy).items():
+            if name in dpo_llama_source.weights:
+                assert value.dtype == jnp.bfloat16
+                np.testing.assert_array_equal(value, jnp.asarray(dpo_llama_source.weights[name], dtype=jnp.bfloat16))
+        policy_ops = [
+            node
+            for node in jax.tree.leaves(policy, is_leaf=lambda node: isinstance(node, Fp8DotGeneralOp))
+            if isinstance(node, Fp8DotGeneralOp)
+        ]
+        assert bool(policy_ops) == (quantization is not None)
+        if reference_type == "separate":
+            reference_ops = [
+                node
+                for node in jax.tree.leaves(
+                    info.state.model.reference, is_leaf=lambda node: isinstance(node, Fp8DotGeneralOp)
+                )
+                if isinstance(node, Fp8DotGeneralOp)
+            ]
+            assert not reference_ops
+            for name, value in to_torch_compatible_state_dict(info.state.model.reference).items():
+                if name in dpo_separate_reference_source.weights:
+                    np.testing.assert_array_equal(
+                        value, jnp.asarray(dpo_separate_reference_source.weights[name], dtype=jnp.bfloat16)
+                    )
+    np.testing.assert_array_equal(full.loss, resumed.loss)
+    assert jax.tree.structure(full.state.model) == jax.tree.structure(resumed.state.model)
+    assert jax.tree.structure(full.state.opt_state) == jax.tree.structure(resumed.state.opt_state)
+    for actual, expected in zip(
+        jax.tree.leaves(eqx.filter(resumed.state, eqx.is_array)),
+        jax.tree.leaves(eqx.filter(full.state, eqx.is_array)),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(actual, expected)
+        assert actual.dtype == expected.dtype
+        assert actual.sharding == expected.sharding
+
+
+@pytest.mark.timeout(180)
+def test_named_full_dpo_checkpoint_resumes_without_pretrained_policy_source(
+    tmp_path, dpo_llama_source, dpo_separate_reference_source, dpo_preference_data
+):
+    source_path = tmp_path / "full-policy-source"
+    model_config = dataclasses.replace(dpo_llama_source.config, reference_checkpoint=str(source_path))
+    source = write_llama_checkpoint(source_path, model_config, model_config.to_hf_config(31), key=jrandom.PRNGKey(13))
+    config = TrainDpoConfig(
+        model=model_config,
+        data=dpo_preference_data,
+        trainer=_dpo_trainer_config(tmp_path / "full"),
+        initialize_from_hf=str(source.path),
+        use_hf_model_config=False,
+        reference=SeparateReferenceConfig(model_path=str(dpo_separate_reference_source.path), is_hf=True),
+        optimizer=AdamConfig(learning_rate=0.01, warmup=0, weight_decay=0, lr_schedule="constant"),
+        validation_split_fraction=None,
+    )
+    full = train_dpo_main(config)
+    split_config = dataclasses.replace(config, trainer=_dpo_trainer_config(tmp_path / "resumed", steps=1))
+    split = train_dpo_main(split_config)
+    assert int(split.state.step) == 1
+    shutil.rmtree(source.path)
+    resumed = train_dpo_main(
+        dataclasses.replace(
+            split_config,
+            initialize_from_hf=False,
+            trainer=dataclasses.replace(split_config.trainer, num_train_steps=2, load_checkpoint=True),
+        )
+    )
+    assert int(full.state.step) == int(resumed.state.step) == 2
+    np.testing.assert_array_equal(full.loss, resumed.loss)
+    for actual, expected in zip(
+        jax.tree.leaves(eqx.filter(resumed.state, eqx.is_array)),
+        jax.tree.leaves(eqx.filter(full.state, eqx.is_array)),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(actual, expected)
