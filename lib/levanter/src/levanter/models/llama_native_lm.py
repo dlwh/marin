@@ -28,7 +28,7 @@ from levanter.layers.attention import AttentionBackend, AttentionMask
 from levanter.layers.rotary import DefaultRotaryEmbeddingsConfig, RotaryEmbeddingsConfig
 from levanter.models.llama import LlamaConfig
 from levanter.models.llama_native import NativeLlamaConfig, NativeLlamaModel, NativeLlamaSharding
-from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel
+from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel, LmInitContext
 from levanter.tokenizers import MarinTokenizer
 from levanter.utils.activation import ActivationFunctionEnum
 
@@ -185,6 +185,30 @@ class NativeLlamaLmConfig(LlamaConfig):
         if not isinstance(rope, DefaultRotaryEmbeddingsConfig) or rope != self.rope:
             raise ValueError("llama_native HF RoPE parameters must match the configured default/linear RoPE")
 
+    def prepare_init_context(
+        self,
+        *,
+        tokenizer: MarinTokenizer,
+        checkpoint_metadata: Mapping[str, Any] | None = None,
+        initialize_from_hf: bool | str = False,
+        initialize_from: str | None = None,
+    ) -> tuple[LmInitContext, HFCheckpointConverter | None]:
+        """Resolve an optional legacy HF fallback before entering traced initialization."""
+        metadata = {} if checkpoint_metadata is None else checkpoint_metadata
+        converter = None
+        hf_config = None
+        # Even malformed model metadata belongs to the constructor; do not mask it
+        # by opening the original source. Older metadata needs the explicit fallback.
+        if "levanter_model" not in metadata and initialize_from_hf:
+            if initialize_from is not None:
+                raise ValueError("Cannot specify both initialize_from_hf and initialize_from")
+            converter = self.hf_checkpoint_converter(
+                initialize_from_hf if isinstance(initialize_from_hf, str) else None,
+                tokenizer=tokenizer,
+            )
+            hf_config = converter.default_hf_config
+        return LmInitContext(len(tokenizer), metadata, hf_config), converter
+
     def checkpoint_vocab_size(self, metadata: Mapping[str, Any]) -> int | None:
         """Validate native checkpoint semantics and recover its complete model vocabulary.
 
@@ -242,8 +266,9 @@ class NativeLlamaLmConfig(LlamaConfig):
         *,
         key: PRNGKeyArray,
         sharding: NativeLlamaSharding = NativeLlamaSharding(),
+        init_context: LmInitContext | None = None,
     ) -> "NativeLlamaLmHeadModel":
-        return NativeLlamaLmHeadModel.init(Vocab, self, key=key, sharding=sharding)
+        return NativeLlamaLmHeadModel.init(Vocab, self, key=key, sharding=sharding, init_context=init_context)
 
 
 class NativeLlamaLmHeadModel(ModuleWithStateDictSerialization, LmHeadModel[NativeLlamaLmConfig]):
@@ -284,7 +309,21 @@ class NativeLlamaLmHeadModel(ModuleWithStateDictSerialization, LmHeadModel[Nativ
         *,
         key: PRNGKeyArray,
         sharding: NativeLlamaSharding = NativeLlamaSharding(),
+        init_context: LmInitContext | None = None,
     ) -> "NativeLlamaLmHeadModel":
+        if init_context is not None:
+            source_vocab_size = config.checkpoint_vocab_size(init_context.checkpoint_metadata)
+            if source_vocab_size is None and init_context.hf_config is not None:
+                config.validate_hf_config(init_context.hf_config)
+                source_vocab_size = init_context.hf_config.vocab_size
+            if source_vocab_size is not None:
+                if init_context.tokenizer_vocab_size > source_vocab_size:
+                    raise ValueError("llama_native tokenizer vocabulary exceeds the checkpoint vocabulary")
+                Vocab = Vocab.resize(source_vocab_size)
+        if sharding.model_axis is not None:
+            model_size = get_abstract_mesh().shape[sharding.model_axis]
+            if Vocab.size % model_size:
+                raise ValueError("llama_native vocabulary must be divisible by the tensor-parallel mesh size")
         return cls(config.native_config(Vocab.size).build(key=key, sharding=sharding), config)
 
     def _attention_mask(

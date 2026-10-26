@@ -37,8 +37,8 @@ from levanter.data.text.examples import GrugLmExample, named_lm_example_from_gru
 from levanter.eval_harness import LmEvalHarnessConfig
 from levanter.models.llama import LlamaConfig
 from levanter.models.llama_native import NativeLlamaSharding
-from levanter.models.llama_native_lm import NativeLlamaLmConfig, NativeLlamaLmHeadModel
-from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel, split_activations
+from levanter.models.llama_native_lm import NativeLlamaLmConfig
+from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel, LmInitContext, split_activations
 from levanter.optim.config import AdamConfig, OptimizerConfig
 from levanter.trainer import ExplicitTrainingLayout, Trainer, TrainerConfig
 from levanter.trainer_state import trainables_only
@@ -137,10 +137,14 @@ def _native_llama_sharding(config: TrainerConfig) -> NativeLlamaSharding:
     return NativeLlamaSharding(batch_axes=batch_axes, fsdp_axis=fsdp_axis, model_axis=model_axis)
 
 
-def _build_lm_model(config: TrainLmConfig, Vocab: Axis, key, trainer: Trainer) -> LmHeadModel:
+def _build_lm_model(
+    config: TrainLmConfig, Vocab: Axis, key, trainer: Trainer, init_context: LmInitContext | None = None
+) -> LmHeadModel:
     if isinstance(config.model, NativeLlamaLmConfig):
-        return config.model.build(Vocab, key=key, sharding=_native_llama_sharding(trainer.config))
-    return config.model.build(Vocab, key=key)
+        return config.model.build(
+            Vocab, key=key, sharding=_native_llama_sharding(trainer.config), init_context=init_context
+        )
+    return config.model.build(Vocab, key=key, init_context=init_context)
 
 
 def _load_lm_model_from_configured_source(
@@ -152,6 +156,7 @@ def _load_lm_model_from_configured_source(
     adapter_key,
     parameter_axis_mapping,
     trainer: Trainer,
+    init_context: LmInitContext,
 ) -> LmHeadModel:
     if config.initialize_from_hf:
         assert converter is not None
@@ -160,7 +165,9 @@ def _load_lm_model_from_configured_source(
         if isinstance(config.model, NativeLlamaLmConfig):
 
             def initialize_native_model(vocab: Axis) -> ModelWithHfSerializationMixin:
-                return cast(ModelWithHfSerializationMixin, _build_lm_model(config, vocab, model_key, trainer))
+                return cast(
+                    ModelWithHfSerializationMixin, _build_lm_model(config, vocab, model_key, trainer, init_context)
+                )
 
             model_init = initialize_native_model
             # Compute precision must not round pretrained master weights before initialization.
@@ -180,14 +187,14 @@ def _load_lm_model_from_configured_source(
         # only in how main() uses the loaded weights.
         source = config.initialize_from_checkpoint_path or config.initialize_model_from_checkpoint_path
         checkpoint_path = latest_checkpoint_path(source)
-        model = eqx.filter_eval_shape(_build_lm_model, config, Vocab, model_key, trainer)
+        model = eqx.filter_eval_shape(_build_lm_model, config, Vocab, model_key, trainer, init_context)
         model = load_checkpoint(
             model, checkpoint_path, subpath="model", axis_mapping=parameter_axis_mapping, mesh=trainer.device_mesh
         )
         model = hax.shard(model, parameter_axis_mapping)
         model = named_jit(trainer.mp.cast_to_param, parameter_axis_mapping)(model)
     else:
-        model = _build_lm_model(config, Vocab, model_key, trainer)
+        model = _build_lm_model(config, Vocab, model_key, trainer, init_context)
 
     if not isinstance(config.adapter, NoAdaptorConfig):
         model = config.adapter.apply(model, key=adapter_key, axis_mapping=parameter_axis_mapping)
@@ -216,8 +223,6 @@ def main(config: TrainLmConfig):
         config = dataclasses.replace(config, trainer=dataclasses.replace(config.trainer, use_explicit_mesh_axes=True))
         _native_llama_sharding(config.trainer)
     tokenizer = config.data.the_tokenizer
-    source_vocab_size = None
-
     # The three weight-init sources are mutually exclusive: HF conversion, native full-state restore, and
     # native weights-only init.
     _init_sources = [
@@ -300,35 +305,20 @@ def main(config: TrainLmConfig):
             optimizer,
             loss_function,
             explicit_layout=explicit_layout,
-            checkpoint_metadata=(
-                (lambda model: cast(NativeLlamaLmHeadModel, model).checkpoint_metadata()) if native else None
-            ),
+            checkpoint_metadata=lambda model: model.checkpoint_metadata(),
         ) as trainer,
         TrainingDashboard(config, trainer.request_checkpoint, config.trainer.id or "unknown"),
     ):
         checkpoint = trainer.checkpoint_to_load
         resuming = checkpoint is not None
-        if isinstance(config.model, NativeLlamaLmConfig):
-            if checkpoint is not None:
-                source_vocab_size = config.model.checkpoint_vocab_size(checkpoint.metadata)
-            if source_vocab_size is None and config.initialize_from_hf:
-                if config.trainer.initialize_from is not None:
-                    raise ValueError("Cannot specify both initialize_from_hf and initialize_from")
-                converter = config.model.hf_checkpoint_converter(
-                    config.initialize_from_hf if isinstance(config.initialize_from_hf, str) else None,
-                    tokenizer=tokenizer,
-                )
-                hf_config = converter.default_hf_config
-                config.model.validate_hf_config(hf_config)
-                source_vocab_size = hf_config.vocab_size
-            if source_vocab_size is not None:
-                if len(tokenizer) > source_vocab_size:
-                    raise ValueError("llama_native tokenizer vocabulary exceeds the checkpoint vocabulary")
-                model_axis = _native_llama_sharding(config.trainer).model_axis
-                if model_axis is not None and source_vocab_size % trainer.device_mesh.shape[model_axis]:
-                    raise ValueError(
-                        "llama_native checkpoint vocabulary must be divisible by the tensor-parallel mesh size"
-                    )
+        init_context, source_converter = config.model.prepare_init_context(
+            tokenizer=tokenizer,
+            checkpoint_metadata=checkpoint.metadata if checkpoint is not None else None,
+            initialize_from_hf=config.initialize_from_hf,
+            initialize_from=config.trainer.initialize_from,
+        )
+        if source_converter is not None:
+            converter = source_converter
 
         # randomness in jax is tightly controlled by "keys" which are the states of the random number generators
         # this makes deterministic training pretty easy
@@ -377,11 +367,10 @@ def main(config: TrainLmConfig):
         vocab_mapping = parameter_axis_mapping
         if native:
             vocab_mapping = {**parameter_axis_mapping, "vocab": _native_llama_sharding(config.trainer).model_axis}
-        Vocab = (
-            Axis("vocab", source_vocab_size)
-            if source_vocab_size is not None
-            else round_axis_for_partitioning(Axis("vocab", vocab_size), vocab_mapping)
-        )
+        Vocab = round_axis_for_partitioning(Axis("vocab", vocab_size), vocab_mapping)
+        # Constructor-owned source checks run before reading weights or allocating
+        # the training model. Its resolved axis also handles padded vocabularies.
+        Vocab = eqx.filter_eval_shape(_build_lm_model, config, Vocab, model_key, trainer, init_context).Vocab
         if vocab_size != Vocab.size:
             logger.info(f"Using model vocabulary {Vocab.size} for tokenizer vocabulary {vocab_size}")
 
@@ -407,6 +396,7 @@ def main(config: TrainLmConfig):
             adapter_key=adapter_key,
             parameter_axis_mapping=parameter_axis_mapping,
             trainer=trainer,
+            init_context=init_context,
         )
         weight_source = config.initialize_from_hf or config.initialize_model_from_checkpoint_path is not None
         if weight_source and not resuming:
@@ -419,11 +409,11 @@ def main(config: TrainLmConfig):
             )
         elif isinstance(config.adapter, NoAdaptorConfig):
             state = trainer.initial_state(
-                training_key, model_init=lambda: _build_lm_model(config, Vocab, model_key, trainer)
+                training_key, model_init=lambda: _build_lm_model(config, Vocab, model_key, trainer, init_context)
             )
         else:
             initial_model = config.adapter.apply(
-                _build_lm_model(config, Vocab, model_key, trainer),
+                _build_lm_model(config, Vocab, model_key, trainer, init_context),
                 key=adapter_key,
                 axis_mapping=parameter_axis_mapping,
             )

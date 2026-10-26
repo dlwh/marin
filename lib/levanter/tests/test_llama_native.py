@@ -19,9 +19,74 @@ from levanter.layers.rotary_native import RotaryConfig, apply_rotary
 from levanter.models.llama import LlamaConfig, LlamaLMHeadModel
 from levanter.models.llama_native import NativeLlamaConfig, NativeLlamaModel, NativeLlamaSharding
 from levanter.models.llama_native_lm import NativeLlamaLmConfig
-from levanter.models.lm_model import LmExample
+from levanter.models.lm_model import LmExample, LmInitContext
 from levanter.testing.helpers import skip_if_no_torch
 from levanter.tokenizers import load_tokenizer
+
+
+@pytest.mark.tpu
+@pytest.mark.parametrize("source_kind", ["checkpoint", "hf"])
+def test_native_model_init_owns_source_vocab_and_semantic_validation(source_kind):
+    config = NativeLlamaLmConfig(
+        hidden_dim=16,
+        intermediate_dim=24,
+        num_layers=1,
+        num_heads=4,
+        num_kv_heads=2,
+        max_seq_len=8,
+        reference_checkpoint="unused-source",
+    )
+    model_size = 2 if len(jax.devices()) >= 4 else 1
+    mesh = Mesh(
+        np.asarray(jax.devices()).reshape(-1, model_size),
+        ("data", "model"),
+        axis_types=(AxisType.Explicit,) * 2,
+    )
+    sharding = NativeLlamaSharding(batch_axes=("data",), fsdp_axis="data", model_axis="model")
+    key = jax.random.PRNGKey(0)
+    with jax.set_mesh(mesh):
+        expected = config.build(hax.Axis("vocab", 32), key=key, sharding=sharding)
+        context = LmInitContext(
+            tokenizer_vocab_size=31,
+            checkpoint_metadata=expected.checkpoint_metadata() if source_kind == "checkpoint" else {},
+            hf_config=config.to_hf_config(32) if source_kind == "hf" else None,
+        )
+        # The provisional rounded axis is not the tokenizer size or the stored model size.
+        # Source information is already materialized: traced construction needs no source directory.
+        template = eqx.filter_eval_shape(
+            config.build, hax.Axis("vocab", 64), key=key, sharding=sharding, init_context=context
+        )
+        actual = config.build(hax.Axis("vocab", 64), key=key, sharding=sharding, init_context=context)
+        assert template.Vocab.size == actual.Vocab.size == 32
+        assert actual.native.token_embeddings.sharding.spec == sharding.column_storage
+        for name, value in actual.to_state_dict().items():
+            np.testing.assert_array_equal(value, expected.to_state_dict()[name])
+        with pytest.raises(ValueError, match="tokenizer vocabulary exceeds"):
+            config.build(
+                hax.Axis("vocab", 64),
+                key=key,
+                sharding=sharding,
+                init_context=dataclasses.replace(context, tokenizer_vocab_size=33),
+            )
+        for incompatible in (
+            dataclasses.replace(config, num_heads=8, num_kv_heads=4, head_dim=2),
+            dataclasses.replace(config, rope=DefaultRotaryEmbeddingsConfig(factor=8.0)),
+        ):
+            with pytest.raises(ValueError):
+                eqx.filter_eval_shape(
+                    incompatible.build, hax.Axis("vocab", 64), key=key, sharding=sharding, init_context=context
+                )
+        if model_size > 1:
+            odd = config.build(hax.Axis("vocab", 31), key=key)
+            odd_context = LmInitContext(
+                tokenizer_vocab_size=31,
+                checkpoint_metadata=odd.checkpoint_metadata() if source_kind == "checkpoint" else {},
+                hf_config=config.to_hf_config(31) if source_kind == "hf" else None,
+            )
+            with pytest.raises(ValueError, match="divisible by the tensor-parallel"):
+                eqx.filter_eval_shape(
+                    config.build, hax.Axis("vocab", 32), key=key, sharding=sharding, init_context=odd_context
+                )
 
 
 @pytest.mark.tpu
