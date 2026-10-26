@@ -671,7 +671,8 @@ def test_layer_splicing():
             assert not isinstance(layer.dot_general, Fp8DotGeneralOp)
 
 
-def test_fp8ize_stacking():
+@pytest.mark.parametrize("target_root", ["policy", "reference"])
+def test_fp8ize_stacking(target_root):
     class Block(eqx.Module):
         up_proj: hax.nn.Linear
         down_proj: hax.nn.Linear
@@ -717,6 +718,34 @@ def test_fp8ize_stacking():
     assert isinstance(dg, Fp8DotGeneralOp)
     dg = tformer_q.blocks.stacked.down_proj.dot_general
     assert not isinstance(dg, Fp8DotGeneralOp)
+
+    models = {"policy": tformer, "reference": tformer}
+    selected = quantize_linear_layers(
+        models, QuantizationConfig(targets=rf"{target_root}\.blocks\.stacked\.up_proj$", fp8=True)
+    )
+    for name, model in selected.items():
+        assert isinstance(model.blocks.stacked.up_proj.dot_general, Fp8DotGeneralOp) == (name == target_root)
+        assert isinstance(model.blocks.stacked.down_proj.dot_general, DefaultDotGeneralOp)
+    input = hax.random.normal(jrandom.PRNGKey(3), In)
+
+    @eqx.filter_jit
+    def update_state(models):
+        output, gradient = eqx.filter_value_and_grad(lambda tree: hax.sum(tree[target_root](input)).scalar())(models)
+        overwrites, ordinary = partition_for_grad_overwrite(gradient)
+        return output, apply_updates(models, jax.tree.map(jnp.zeros_like, ordinary), overwrites)
+
+    output, updated = update_state(selected)
+    np.testing.assert_array_equal(output, hax.sum(tformer_q(input)).scalar())
+    operation = updated[target_root].blocks.stacked.up_proj.dot_general
+    assert operation.input_amax_history.shape == (Layer.size, 1024)
+    assert np.all(np.max(np.asarray(operation.input_amax_history), axis=-1) > 0)
+    for name in models:
+        for value, original in zip(
+            jax.tree.leaves(updated[name].blocks.stacked.up_proj.weight),
+            jax.tree.leaves(tformer.blocks.stacked.up_proj.weight),
+            strict=True,
+        ):
+            np.testing.assert_array_equal(value, original)
 
 
 @pytest.mark.tpu

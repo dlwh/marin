@@ -386,7 +386,7 @@ def _quantize_linear_layers(tree: T, config: QuantizationConfig, dot_general_cls
         path = path_prefix + path
         if isinstance(module, hnn.Stacked):
             new_inner = jax.tree_util.tree_map_with_path(
-                functools.partial(quantize_module, path_prefix + (GetAttrKey("stacked"),), batch_dims + (module.Block,)),  # type: ignore
+                functools.partial(quantize_module, path + (GetAttrKey("stacked"),), batch_dims + (module.Block,)),  # type: ignore
                 module.stacked,
                 is_leaf=_is_special_module,
             )
