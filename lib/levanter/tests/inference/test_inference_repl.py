@@ -51,17 +51,18 @@ def repl_source(tmp_path, tiny_hf_tokenizer_path):
 
 @pytest.mark.tpu
 @pytest.mark.parametrize(
-    "native,source_kind,dtype",
+    "native,source_kind,dtype,cache_mapping",
     [
-        pytest.param(True, "hf", jnp.float32, id="native-hf-f32"),
-        pytest.param(True, "hf", jnp.bfloat16, id="native-hf-bf16"),
-        pytest.param(True, "checkpoint", jnp.float32, id="native-checkpoint-f32"),
-        pytest.param(True, "checkpoint", jnp.bfloat16, id="native-checkpoint-bf16"),
-        pytest.param(False, "checkpoint", jnp.float32, id="named-checkpoint-source-absent"),
+        pytest.param(True, "hf", jnp.float32, "explicit", id="native-hf-f32"),
+        pytest.param(True, "hf", jnp.bfloat16, "explicit", id="native-hf-bf16"),
+        pytest.param(True, "checkpoint", jnp.float32, "explicit", id="native-checkpoint-f32"),
+        pytest.param(True, "checkpoint", jnp.bfloat16, "explicit", id="native-checkpoint-bf16"),
+        pytest.param(False, "checkpoint", jnp.float32, "ordinary", id="named-checkpoint-source-absent"),
+        pytest.param(True, "hf", jnp.float32, "ordinary", id="native-hf-f32-ordinary-cache"),
     ],
 )
 def test_repl_main_local_source_completion_preserves_precision_and_matches_named_oracle(
-    repl_source, tmp_path, monkeypatch, record_property, native, source_kind, dtype
+    repl_source, tmp_path, monkeypatch, record_property, native, source_kind, dtype, cache_mapping
 ):
     source = repl_source
     tokenizer_path = tmp_path / "outer-tokenizer"
@@ -90,7 +91,7 @@ def test_repl_main_local_source_completion_preserves_precision_and_matches_named
         mp=policy,
         mesh=MeshConfig(
             axes={"data": len(jax.devices()) // model_size, "model": model_size},
-            compute_mapping={"kv_head": "model"} if native else {},
+            compute_mapping={"kv_head": "model"} if cache_mapping == "explicit" else {},
         ),
         require_accelerator=False,
         distributed=DistributedConfig(initialize_jax_distributed=False),

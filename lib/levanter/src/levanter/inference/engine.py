@@ -28,7 +28,7 @@ from levanter.inference.jit_scheduler import (
     TokenQueue,
     _DecodeOutputs,
 )
-from levanter.inference.page_table import PageTable
+from levanter.inference.page_table import PageTable, PageTableSpec
 from levanter.inference.utils import INVALID, is_valid
 from levanter.layers.attention import AttentionMask
 from levanter.layers.kv_cache import PageCache
@@ -796,6 +796,12 @@ def score_token_sequence_logprobs(
     return TokenSequenceLogprobs(token_logprobs=token_logprobs, top_token_logprobs=top_token_logprobs)
 
 
+@eqx.filter_jit
+def _initialize_cache(model, spec: PageTableSpec, dtype: jnp.dtype, axis_resources: ResourceMapping) -> PageCache:
+    with hax.axis_mapping(axis_resources, merge=False):
+        return model.initial_cache(spec, dtype=dtype)
+
+
 class InferenceEngine:
     """Encapsulates batch inference: prefill + decode + output extraction.
 
@@ -866,9 +872,11 @@ class InferenceEngine:
         assert config.max_pages is not None
 
         table = PageTable.init(config.max_pages, config.max_seqs, config.page_size, max_pages_per_seq)
-        cache = hax.named_jit(model.initial_cache, axis_resources=axis_resources)(
-            table.spec(), dtype=config.compute_dtype
-        )
+        cache_mapping = axis_resources
+        if cache_mapping is None:
+            cache_mapping = hax.partitioning.current_thread_local_mapping()
+        # The initializer owns cache placement; a named output map can override it.
+        cache = _initialize_cache(model, table.spec(), config.compute_dtype, dict(cache_mapping or {}))
         decode_state = DecodeState.init(
             table,
             max_stop_seqs=config.max_stop_seqs,

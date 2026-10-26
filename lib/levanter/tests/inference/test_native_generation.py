@@ -11,7 +11,7 @@ import jmp
 import numpy as np
 import pytest
 from haliax.state_dict import to_torch_compatible_state_dict
-from jax.sharding import AxisType, Mesh, PartitionSpec as P
+from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
 from tokenizers.processors import TemplateProcessing
 from transformers import AutoTokenizer
 
@@ -28,6 +28,7 @@ from levanter.utils.mesh import MeshConfig
 from levanter.eval_harness import LevanterHarnessLM, _LmEvalHarnessWorker
 
 from levanter.grug.attention import AttentionMask
+import levanter.inference.engine as engine_module
 from levanter.inference.engine import InferenceEngine, InferenceEngineConfig, Request
 from levanter.inference.jit_scheduler import SeqDecodingParams, SequenceTable
 from levanter.inference.page_table import PageTable
@@ -43,6 +44,7 @@ from levanter.models.llama_native_lm import NativeLlamaLmConfig
 from levanter.testing.helpers import skip_if_module_missing
 from levanter.tokenizers import load_tokenizer
 from levanter.utils.activation import ActivationFunctionEnum
+from levanter.utils.jax_utils import sharded_tree_size
 
 
 def _mesh():
@@ -176,9 +178,35 @@ def _greedy_tokens(model, prompt, count):
     return sequence[len(prompt) :]
 
 
+def _generation_requests(prompts, count):
+    return [
+        Request(
+            prompt_tokens=prompt,
+            request_id=index,
+            n_generations=1,
+            decode_params=SeqDecodingParams(
+                max_num_tokens=jnp.asarray(len(prompt) + count, dtype=jnp.int32),
+                temperature=jnp.asarray(0.0),
+                top_p=jnp.asarray(1.0),
+                stop_tokens=None,
+                key=jax.random.PRNGKey(index),
+            ),
+        )
+        for index, prompt in enumerate(prompts)
+    ]
+
+
 @pytest.mark.tpu
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=["fp32", "bf16-greedy-only"])
-def test_native_engine_prefill_incremental_generation_and_reuse(dtype):
+@pytest.mark.parametrize(
+    "dtype,cache_mapping",
+    [
+        pytest.param(jnp.float32, "ordinary", id="ordinary-fp32"),
+        pytest.param(jnp.bfloat16, "ordinary", id="ordinary-bf16-greedy-only"),
+        pytest.param(jnp.float32, "explicit", id="explicit-fp32"),
+        pytest.param(jnp.bfloat16, "explicit", id="explicit-bf16-greedy-only"),
+    ],
+)
+def test_native_engine_prefill_incremental_generation_and_reuse(dtype, cache_mapping):
     with jax.set_mesh(_mesh()):
         model = _model(
             NativeLlamaLmConfig(
@@ -203,28 +231,127 @@ def test_native_engine_prefill_incremental_generation_and_reuse(dtype):
                 max_tokens_per_round=2,
                 compute_dtype=dtype,
             ),
-            axis_resources={"kv_head": "model"},
+            axis_resources=(
+                MeshConfig().resolved_compute_mapping if cache_mapping == "ordinary" else {"kv_head": "model"}
+            ),
         )
-        requests = [
-            Request(
-                prompt_tokens=prompt,
-                request_id=index,
-                n_generations=1,
-                decode_params=SeqDecodingParams(
-                    max_num_tokens=jnp.asarray(len(prompt) + 3, dtype=jnp.int32),
-                    temperature=jnp.asarray(0.0),
-                    top_p=jnp.asarray(1.0),
-                    stop_tokens=None,
-                    key=jax.random.PRNGKey(index),
-                ),
-            )
-            for index, prompt in enumerate(prompts)
-        ]
+        for cache in engine.gen_state.cache:
+            assert cache.kv_pages.array.sharding.spec == P(None, None, "model", None)
+            assert cache.kv_pages.dtype == dtype
+            np.testing.assert_array_equal(cache.kv_pages.array, 0)
+        requests = _generation_requests(prompts, 3)
         for _ in range(2):
             result = engine.generate(requests)
             actual = [result.tokens[index] for index in range(len(prompts))]
             assert actual == expected
         assert engine.gen_state.cache[0].kv_pages.array.sharding.spec == P(None, None, "model", None)
+
+
+@pytest.mark.tpu
+def test_named_gqa_engine_keeps_kv_replicated_when_tensor_parallel_exceeds_kv_heads():
+    if len(jax.devices()) < 4:
+        pytest.skip("Requires four devices for data2/model2")
+    mesh = Mesh(np.asarray(jax.devices()[:4]).reshape(2, 2), ("data", "model"))
+    mapping = MeshConfig().resolved_compute_mapping
+    with hax.partitioning.set_mesh(mesh), hax.axis_mapping(mapping):
+        model = LlamaConfig(
+            hidden_dim=16, intermediate_dim=24, num_layers=1, num_heads=4, num_kv_heads=1, max_seq_len=16
+        ).build(hax.Axis("vocab", 32), key=jax.random.key(0))
+        prompt = [3, 4, 5]
+        sequence = list(prompt)
+        for _ in range(3):
+            tokens = hax.named(jnp.asarray(sequence, dtype=jnp.int32), "position")
+            logits = eqx.filter_jit(lambda m, t: m(t, NamedAttentionMask.causal()))(model, tokens)
+            sequence.append(int(jnp.argmax(logits.array[-1])))
+        engine = InferenceEngine.from_model_with_config(
+            model,
+            None,
+            InferenceEngineConfig(
+                max_seq_len=16,
+                max_seqs=2,
+                max_pages=8,
+                page_size=2,
+                max_queued_tokens=8,
+                max_seqs_in_prefill=1,
+                max_rounds=4,
+                compute_dtype=jnp.float32,
+            ),
+            axis_resources=mapping,
+        )
+        assert all(cache.kv_pages.array.sharding.is_fully_replicated for cache in engine.gen_state.cache)
+        result = engine.generate(_generation_requests([prompt], 3))
+        assert result.tokens[0] == sequence[len(prompt) :]
+        assert all(cache.kv_pages.array.sharding.is_fully_replicated for cache in engine.gen_state.cache)
+
+
+@pytest.mark.tpu
+def test_named_engine_cache_mapping_changes_are_part_of_the_compilation_key():
+    if len(jax.devices()) < 4:
+        pytest.skip("Requires four devices for data2/model2")
+    mesh = Mesh(np.asarray(jax.devices()[:4]).reshape(2, 2), ("data", "model"))
+    ordinary = MeshConfig().resolved_compute_mapping
+    sharded = {**ordinary, "kv_head": "model"}
+    config = InferenceEngineConfig(
+        max_seq_len=8,
+        max_seqs=2,
+        max_pages=8,
+        page_size=2,
+        max_queued_tokens=8,
+        max_seqs_in_prefill=1,
+        compute_dtype=jnp.float32,
+    )
+    with hax.partitioning.set_mesh(mesh), hax.axis_mapping(ordinary):
+        model = LlamaConfig(
+            hidden_dim=16, intermediate_dim=24, num_layers=1, num_heads=4, num_kv_heads=2, max_seq_len=8
+        ).build(hax.Axis("vocab", 32), key=jax.random.key(0))
+        for mapping in (ordinary, sharded, ordinary):
+            engine = InferenceEngine.from_model_with_config(model, None, config, axis_resources=mapping)
+            expected = NamedSharding(mesh, P(None, None, "model" if "kv_head" in mapping else None, None))
+            for cache in engine.gen_state.cache:
+                assert cache.kv_pages.array.sharding.is_equivalent_to(expected, ndim=4)
+                np.testing.assert_array_equal(cache.kv_pages.array, 0)
+        for mapping in (ordinary, sharded, ordinary, {}):
+            with hax.axis_mapping(mapping, merge=False):
+                engine = InferenceEngine.from_model_with_config(model, None, config, axis_resources=None)
+            expected = NamedSharding(mesh, P(None, None, "model" if "kv_head" in mapping else None, None))
+            for cache in engine.gen_state.cache:
+                assert cache.kv_pages.array.sharding.is_equivalent_to(expected, ndim=4)
+                np.testing.assert_array_equal(cache.kv_pages.array, 0)
+    # No ambient mapping must not inherit the previous sharded invocation.
+    assert hax.partitioning.current_thread_local_mapping() is None
+    with hax.partitioning.set_mesh(mesh):
+        engine = InferenceEngine.from_model_with_config(model, None, config, axis_resources=None)
+        assert all(cache.kv_pages.array.sharding.is_fully_replicated for cache in engine.gen_state.cache)
+
+
+@pytest.mark.tpu
+def test_native_ordinary_cache_auto_sizing_stays_within_the_device_budget(monkeypatch):
+    if len(jax.devices()) < 4:
+        pytest.skip("Requires four devices for data2/model2")
+    budget = 256
+    monkeypatch.setattr(engine_module, "estimated_free_device_memory", lambda _device: budget / 1024**3)
+    mapping = MeshConfig().resolved_compute_mapping
+    with jax.set_mesh(_mesh()), hax.axis_mapping(mapping):
+        model = _model(
+            NativeLlamaLmConfig(
+                hidden_dim=16, intermediate_dim=24, num_layers=1, num_heads=4, num_kv_heads=2, max_seq_len=8
+            )
+        )
+        config = InferenceEngineConfig(
+            max_seq_len=8,
+            max_seqs=2,
+            page_size=2,
+            hbm_utilization=1.0,
+            max_queued_tokens=8,
+            max_seqs_in_prefill=1,
+            compute_dtype=jnp.float32,
+        )
+        engine = InferenceEngine.from_model_with_config(model, None, config, axis_resources=mapping)
+        cache = engine.gen_state.cache
+        estimate = sharded_tree_size(cache, mapping=mapping)
+        actual = sum(layer.kv_pages.array.addressable_shards[0].data.nbytes for layer in cache)
+        assert 0 < actual <= estimate <= budget
+        assert all(layer.kv_pages.array.sharding.spec == P(None, None, "model", None) for layer in cache)
 
 
 @pytest.mark.tpu

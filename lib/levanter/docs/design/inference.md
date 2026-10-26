@@ -176,7 +176,6 @@ trainer:
   mp: p=f32,c=bf16
   mesh:
     axes: {data: 2, model: 2}
-    compute_mapping: {kv_head: model}
 server:
   temperature: 0.0
 command: complete
@@ -194,13 +193,16 @@ beyond the tokenizer. This path does not resolve the original HF source.
 
 The REPL uses the top-level Trainer for loading and serving, enables Explicit
 mesh axes for native models, and casts model weights and KV storage to
-`trainer.mp.compute_dtype`. Keep the explicit `kv_head` mapping shown above:
-the ordinary Trainer shared defaults map `heads` and `mlp` to `model`. The
-explicit `compute_mapping` extends those defaults with the paged cache's
-singular `kv_head` axis. Omitting it leaves that cache replicated;
-automatic cache placement from the native model is not qualified by this caller.
-The Native configuration requires `kv_head` to use the same tensor-parallel axis
-as `mlp`. Model storage retains its separate FSDP placement.
+`trainer.mp.compute_dtype`. Native cache initialization retains the model's
+explicit tensor-parallel head placement. The ordinary Trainer shared defaults
+still map only `heads` and `mlp` to `model`; an additional `kv_head` mapping is
+optional for Native serving. If explicitly supplied for Native model loading,
+it must use the same tensor-parallel axis as `mlp`. Named models continue to
+place caches according to their logical mapping, including replication when
+`kv_head` is unmapped. Model storage retains its separate FSDP placement.
+Automatic page sizing uses the logical map and can conservatively allocate
+fewer Native cache pages when `kv_head` is omitted; this does not qualify
+optimal HBM utilization.
 
 This configured path has bounded CPU completion coverage for HF and
 metadata-bearing native checkpoints in F32 and BF16, including a data2/model2
