@@ -16,6 +16,7 @@ import jax.numpy as jnp
 import jmp
 import numpy as np
 from haliax.partitioning import ResourceMapping, named_jit
+from haliax.quantization import accumulate_gradients
 
 from rigging.filesystem.storage_path import StoragePath, prefix_join
 
@@ -135,6 +136,42 @@ def logp_sum(model: LmHeadModel, example, *, key=None) -> hax.NamedArray:
     return cast(hax.NamedArray, -nll)
 
 
+@eqx.filter_custom_vjp
+def _policy_logps(policy_model, chosen, rejected, *, key_chosen=None, key_rejected=None):
+    # Shared parameters need additive gradients, but gradient-carried state needs its own reducer.
+    with jax.named_scope("policy_chosen"):
+        chosen_logp = logp_sum(policy_model, chosen, key=key_chosen)
+    with jax.named_scope("policy_rejected"):
+        rejected_logp = logp_sum(policy_model, rejected, key=key_rejected)
+    return chosen_logp, rejected_logp
+
+
+@_policy_logps.def_fwd
+def _policy_logps_fwd(perturbed, policy_model, chosen, rejected, *, key_chosen=None, key_rejected=None):
+    del perturbed
+    with jax.named_scope("policy_chosen"):
+        chosen_logp, chosen_pullback = eqx.filter_vjp(
+            eqx.Partial(logp_sum, example=chosen, key=key_chosen), policy_model
+        )
+    with jax.named_scope("policy_rejected"):
+        rejected_logp, rejected_pullback = eqx.filter_vjp(
+            eqx.Partial(logp_sum, example=rejected, key=key_rejected), policy_model
+        )
+    # JAX pullbacks are PyTrees: captured residual arrays remain visible to JIT/rematerialization.
+    return (chosen_logp, rejected_logp), (chosen_pullback, rejected_pullback)
+
+
+@_policy_logps.def_bwd
+def _policy_logps_bwd(residuals, cotangents, perturbed, policy_model, chosen, rejected, **kwargs):
+    del perturbed, chosen, rejected, kwargs
+    chosen_pullback, rejected_pullback = residuals
+    chosen_cotangent, rejected_cotangent = cotangents
+    zero_gradient = jax.tree.map(jnp.zeros_like, eqx.filter(policy_model, eqx.is_inexact_array))
+    chosen_gradient = zero_gradient if chosen_cotangent.array is None else chosen_pullback(chosen_cotangent)[0]
+    rejected_gradient = zero_gradient if rejected_cotangent.array is None else rejected_pullback(rejected_cotangent)[0]
+    return accumulate_gradients(chosen_gradient, rejected_gradient)
+
+
 def _cached_logp_named(logps: Any, axes: tuple[hax.Axis, ...]) -> hax.NamedArray:
     return hax.named(jnp.reshape(jnp.asarray(logps), tuple(axis.size for axis in axes)), axes)
 
@@ -171,10 +208,9 @@ def dpo_loss(
     key_chosen=None,
     key_rejected=None,
 ) -> tuple[jnp.ndarray, dict[str, Metric]]:
-    with jax.named_scope("policy_chosen"):
-        logp_pi_chosen = logp_sum(policy_model, example.chosen, key=key_chosen)
-    with jax.named_scope("policy_rejected"):
-        logp_pi_rejected = logp_sum(policy_model, example.rejected, key=key_rejected)
+    logp_pi_chosen, logp_pi_rejected = _policy_logps(
+        policy_model, example.chosen, example.rejected, key_chosen=key_chosen, key_rejected=key_rejected
+    )
 
     logp_ref_chosen, logp_ref_rejected = _reference_logps_for_example(
         example,
