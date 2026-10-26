@@ -4,7 +4,7 @@
 import abc
 import dataclasses
 from dataclasses import dataclass
-from typing import Generic, Optional, Protocol, Type, TypeVar, cast
+from typing import Any, Generic, Mapping, Optional, Protocol, Type, TypeVar, cast
 
 import draccus
 import equinox as eqx
@@ -13,12 +13,14 @@ import haliax.nn as hnn
 from haliax.jax_utils import maybe_rng_split
 from jaxtyping import PRNGKeyArray
 from typing_extensions import Self
+from transformers import PretrainedConfig as HfConfig
 
 import haliax as hax
 from haliax import Axis, NamedArray, NamedOrNumeric
 
 from levanter.layers.attention import AttentionMask
 from levanter.models.loss import maybe_fused_next_token_loss
+from levanter.tokenizers import MarinTokenizer
 
 
 LmConfigT = TypeVar("LmConfigT", bound="LmConfig")
@@ -150,6 +152,15 @@ class LmExample(eqx.Module):
         return loss_weight
 
 
+@dataclass(frozen=True)
+class LmInitContext:
+    """Materialized source information for model construction, with no deferred I/O."""
+
+    tokenizer_vocab_size: int
+    checkpoint_metadata: Mapping[str, Any]
+    hf_config: HfConfig | None = None
+
+
 # TODO: for some reason, pyrefly doesn't like the discover_packages_path argument?
 @dataclass(frozen=True)
 class LmConfig(draccus.PluginRegistry, abc.ABC, Generic[LmT], discover_packages_path="levanter.models"):  # type: ignore
@@ -191,7 +202,21 @@ class LmConfig(draccus.PluginRegistry, abc.ABC, Generic[LmT], discover_packages_
     def total_trainable_params(self, vocab_size: int) -> Optional[float]:
         return None
 
-    def build(self, Vocab: Axis, *, key: PRNGKeyArray) -> "LmT":
+    def prepare_init_context(
+        self,
+        *,
+        tokenizer: MarinTokenizer,
+        checkpoint_metadata: Mapping[str, Any] | None = None,
+        initialize_from_hf: bool | str = False,
+        initialize_from: str | None = None,
+    ) -> LmInitContext:
+        """Prepare source information on the host before traced model construction."""
+        del initialize_from_hf, initialize_from
+        metadata = {} if checkpoint_metadata is None else checkpoint_metadata
+        return LmInitContext(len(tokenizer), metadata)
+
+    def build(self, Vocab: Axis, *, key: PRNGKeyArray, init_context: LmInitContext | None = None) -> "LmT":
+        del init_context
         return self.model_type.init(Vocab, self, key=key)  # type: ignore
 
 
@@ -245,6 +270,10 @@ class LmHeadModel(eqx.Module, Generic[LmConfigT]):
     @abc.abstractmethod
     def init(cls, Vocab: Axis, config: LmConfigT, *, key: PRNGKeyArray) -> "LmHeadModel[LmConfigT]":
         pass
+
+    def checkpoint_metadata(self) -> Mapping[str, Any]:
+        """Return model-owned metadata needed to reconstruct a checkpoint template."""
+        return {}
 
     def __call__(
         self,

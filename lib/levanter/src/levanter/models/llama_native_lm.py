@@ -6,7 +6,7 @@
 import dataclasses
 import math
 from dataclasses import dataclass
-from typing import Optional, cast
+from typing import Any, Mapping, Optional, cast
 
 import equinox as eqx
 import haliax as hax
@@ -28,9 +28,33 @@ from levanter.layers.attention import AttentionBackend, AttentionMask
 from levanter.layers.rotary import DefaultRotaryEmbeddingsConfig, RotaryEmbeddingsConfig
 from levanter.models.llama import LlamaConfig
 from levanter.models.llama_native import NativeLlamaConfig, NativeLlamaModel, NativeLlamaSharding
-from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel
+from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel, LmInitContext
 from levanter.tokenizers import MarinTokenizer
 from levanter.utils.activation import ActivationFunctionEnum
+
+
+_CHECKPOINT_MODEL_KEY = "levanter_model"
+
+
+def _checkpoint_architecture(config: NativeLlamaConfig) -> dict[str, Any]:
+    return {
+        "hidden_dim": config.hidden_dim,
+        "intermediate_dim": config.intermediate_dim,
+        "num_layers": config.num_layers,
+        "num_heads": config.num_heads,
+        "num_kv_heads": config.num_kv_heads,
+        "head_dim": config.actual_head_dim,
+        "layer_norm_epsilon": float(config.layer_norm_epsilon),
+        "tie_word_embeddings": config.tie_word_embeddings,
+        "use_bias": config.use_bias,
+        "use_layer_norm_weight": config.use_layer_norm_weight,
+        "input_embedding_norm": config.input_embedding_norm,
+        "hybrid_norm": config.hybrid_norm,
+        "use_qk_norm": config.use_qk_norm,
+        "upcast_attn": config.upcast_attn,
+        "rope_theta": float(config.rope_theta),
+        "rope_factor": float(config.rope_factor),
+    }
 
 
 @LmConfig.register_subclass("llama_native")
@@ -164,6 +188,64 @@ class NativeLlamaLmConfig(LlamaConfig):
         if not isinstance(rope, DefaultRotaryEmbeddingsConfig) or rope != self.rope:
             raise ValueError("llama_native HF RoPE parameters must match the configured default/linear RoPE")
 
+    def prepare_init_context(
+        self,
+        *,
+        tokenizer: MarinTokenizer,
+        checkpoint_metadata: Mapping[str, Any] | None = None,
+        initialize_from_hf: bool | str = False,
+        initialize_from: str | None = None,
+    ) -> LmInitContext:
+        """Resolve an optional legacy HF fallback before entering traced initialization."""
+        metadata = {} if checkpoint_metadata is None else checkpoint_metadata
+        hf_config = None
+        # Even malformed model metadata belongs to the constructor; do not mask it
+        # by opening the original source. Older metadata needs the explicit fallback.
+        if _CHECKPOINT_MODEL_KEY not in metadata and initialize_from_hf:
+            if initialize_from is not None:
+                raise ValueError("Cannot specify both initialize_from_hf and initialize_from")
+            converter = self.hf_checkpoint_converter(
+                initialize_from_hf if isinstance(initialize_from_hf, str) else None,
+                tokenizer=tokenizer,
+            )
+            hf_config = converter.default_hf_config
+        return LmInitContext(len(tokenizer), metadata, hf_config)
+
+    def checkpoint_vocab_size(self, metadata: Mapping[str, Any]) -> int | None:
+        """Validate native checkpoint semantics and recover its complete model vocabulary.
+
+        Checkpoints without model metadata retain the explicit-config initialization path.
+        """
+        if _CHECKPOINT_MODEL_KEY not in metadata:
+            return None
+        identity = metadata[_CHECKPOINT_MODEL_KEY]
+        if not isinstance(identity, dict) or set(identity) != {"version", "type", "vocab_size", "architecture"}:
+            raise ValueError("Malformed native checkpoint model metadata")
+        if type(identity["version"]) is not int or identity["version"] != 1 or identity["type"] != "llama_native":
+            raise ValueError("Unsupported checkpoint model metadata version or implementation")
+        vocab_size = identity["vocab_size"]
+        if type(vocab_size) is not int or vocab_size <= 0:
+            raise ValueError("Malformed native checkpoint vocabulary")
+        expected = _checkpoint_architecture(self.native_config(vocab_size))
+        actual = identity["architecture"]
+        if (
+            not isinstance(actual, dict)
+            or set(actual) != set(expected)
+            or any(
+                type(value) in (int, bool) and type(actual[name]) is not type(value)
+                for name, value in expected.items()
+            )
+            or any(
+                type(actual[name]) not in (int, float)
+                or (type(actual[name]) is float and not math.isfinite(actual[name]))
+                for name, value in expected.items()
+                if type(value) is float
+            )
+            or actual != expected
+        ):
+            raise ValueError("Native checkpoint architecture does not match the configured model semantics")
+        return vocab_size
+
     def native_config(self, vocab_size: int) -> NativeLlamaConfig:
         """Resolve tokenizer vocabulary and the supported architecture fields."""
         assert isinstance(self.rope, DefaultRotaryEmbeddingsConfig)
@@ -186,8 +268,9 @@ class NativeLlamaLmConfig(LlamaConfig):
         *,
         key: PRNGKeyArray,
         sharding: NativeLlamaSharding = NativeLlamaSharding(),
+        init_context: LmInitContext | None = None,
     ) -> "NativeLlamaLmHeadModel":
-        return NativeLlamaLmHeadModel.init(Vocab, self, key=key, sharding=sharding)
+        return NativeLlamaLmHeadModel.init(Vocab, self, key=key, sharding=sharding, init_context=init_context)
 
 
 class NativeLlamaLmHeadModel(ModuleWithStateDictSerialization, LmHeadModel[NativeLlamaLmConfig]):
@@ -204,6 +287,17 @@ class NativeLlamaLmHeadModel(ModuleWithStateDictSerialization, LmHeadModel[Nativ
     def Vocab(self) -> Axis:
         return Axis("vocab", self.native.config.vocab_size)
 
+    def checkpoint_metadata(self) -> Mapping[str, Any]:
+        """Describe the actual stored model without source paths or runtime placement policy."""
+        return {
+            _CHECKPOINT_MODEL_KEY: {
+                "version": 1,
+                "type": "llama_native",
+                "vocab_size": self.Vocab.size,
+                "architecture": _checkpoint_architecture(self.native.config),
+            }
+        }
+
     @property
     def _batch_partition(self) -> tuple[str, ...] | None:
         mesh = get_abstract_mesh()
@@ -217,7 +311,21 @@ class NativeLlamaLmHeadModel(ModuleWithStateDictSerialization, LmHeadModel[Nativ
         *,
         key: PRNGKeyArray,
         sharding: NativeLlamaSharding = NativeLlamaSharding(),
+        init_context: LmInitContext | None = None,
     ) -> "NativeLlamaLmHeadModel":
+        if init_context is not None:
+            source_vocab_size = config.checkpoint_vocab_size(init_context.checkpoint_metadata)
+            if source_vocab_size is None and init_context.hf_config is not None:
+                config.validate_hf_config(init_context.hf_config)
+                source_vocab_size = init_context.hf_config.vocab_size
+            if source_vocab_size is not None:
+                if init_context.tokenizer_vocab_size > source_vocab_size:
+                    raise ValueError("llama_native tokenizer vocabulary exceeds the checkpoint vocabulary")
+                Vocab = Vocab.resize(source_vocab_size)
+        if sharding.model_axis is not None:
+            model_size = get_abstract_mesh().shape[sharding.model_axis]
+            if Vocab.size % model_size:
+                raise ValueError("llama_native vocabulary must be divisible by the tensor-parallel mesh size")
         return cls(config.native_config(Vocab.size).build(key=key, sharding=sharding), config)
 
     def _attention_mask(

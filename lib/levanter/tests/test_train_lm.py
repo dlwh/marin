@@ -6,6 +6,7 @@ import dataclasses
 import json
 import math
 import os
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -28,7 +29,12 @@ from jax.sharding import PartitionSpec as P
 import levanter.main.train_lm as train_lm
 from levanter.testing import tiny_corpus
 from levanter.adaptor import LoraAdaptorConfig
-from levanter.checkpoint import CheckpointerConfig, latest_checkpoint_path, load_checkpoint
+from levanter.checkpoint import (
+    CheckpointerConfig,
+    discover_checkpoint_candidates,
+    latest_checkpoint_path,
+    load_checkpoint,
+)
 from levanter.data.dataset import ListAsyncDataset
 from levanter.data.text.datasets import DirectDatasetComponent, LmDataConfig
 from levanter.data.text.examples import GrugLmExample
@@ -39,6 +45,7 @@ from levanter.tokenizers import load_tokenizer
 from levanter.models.llama import LlamaLMHeadModel
 from levanter.models.llama_native_lm import NativeLlamaLmConfig
 from levanter.optim.config import AdamConfig, ConstantLrSchedule
+from levanter.tracker import NoopConfig
 from levanter.tracker.json_file import JsonFileTrackerConfig
 from levanter.trainer_state import TrainerState, trainables_only
 from levanter.testing.helpers import arrays_only, use_test_mesh
@@ -412,9 +419,53 @@ def test_native_train_lm_hf_preserves_source_vocab_weights_and_resume(tmp_path, 
         frozen, trainer=dataclasses.replace(frozen.trainer, mp=jmp.get_policy("p=f32,c=bf16"))
     )
     train_lm.main(frozen)
-    train_lm.main(configuration("full", 2))
+    train_lm.main(configuration("full", 3))
     train_lm.main(configuration("resumed", 1))
+    checkpoint_root = tmp_path / "resumed/checkpoints/native-hf"
+    candidate = discover_checkpoint_candidates(checkpoint_root)[-1]
+    identity = candidate.metadata["levanter_model"]
+    assert identity["vocab_size"] == 32
+    assert identity["architecture"]["head_dim"] == 4
+    assert "reference_checkpoint" not in identity["architecture"]
+
+    # Older checkpoints still reconstruct padded vocabulary from the explicit HF source.
+    metadata_file = Path(candidate.path) / "metadata.json"
+    old_metadata = json.loads(metadata_file.read_text())
+    del old_metadata["levanter_model"]
+    metadata_file.write_text(json.dumps(old_metadata))
     train_lm.main(configuration("resumed", 2, resume=True))
+
+    # New metadata permits a full restore after the original pretrained source is removed.
+    shutil.rmtree(source)
+    resume = dataclasses.replace(
+        configuration("resumed", 3, resume=True),
+        model=dataclasses.replace(model_config, max_seq_len=64, head_dim=4),
+    )
+    candidate = discover_checkpoint_candidates(checkpoint_root)[-1]
+    metadata_file = Path(candidate.path) / "metadata.json"
+    current_metadata = json.loads(metadata_file.read_text())
+    unknown_metadata = {**current_metadata, "levanter_model": {**current_metadata["levanter_model"], "version": 99}}
+    metadata_file.write_text(json.dumps(unknown_metadata))
+    with pytest.raises(ValueError, match="Unsupported checkpoint model metadata"):
+        train_lm.main(resume)
+    malformed_metadata = {
+        **current_metadata,
+        "levanter_model": {
+            **current_metadata["levanter_model"],
+            "architecture": {**current_metadata["levanter_model"]["architecture"], "rope_factor": True},
+        },
+    }
+    metadata_file.write_text(json.dumps(malformed_metadata))
+    with pytest.raises(ValueError, match="checkpoint architecture"):
+        train_lm.main(resume)
+    metadata_file.write_text(json.dumps(current_metadata))
+    for incompatible in (
+        dataclasses.replace(model_config, num_heads=8, num_kv_heads=4, head_dim=2),
+        dataclasses.replace(model_config, rope=DefaultRotaryEmbeddingsConfig(factor=8.0)),
+    ):
+        with pytest.raises(ValueError, match="checkpoint architecture"):
+            train_lm.main(dataclasses.replace(resume, model=incompatible))
+    train_lm.main(resume)
     for name in ("frozen", "full", "resumed"):
         metrics = _assert_training_recorded(str(tmp_path / name / "tracker"))
         assert math.isfinite(metrics["eval/loss"])
@@ -444,7 +495,7 @@ def test_native_train_lm_hf_preserves_source_vocab_weights_and_resume(tmp_path, 
         np.testing.assert_array_equal(actual, weights[name])
     assert initialized.model.native.token_embeddings.sharding.spec == sharding.column_storage
     assert initialized.model.native.layers.stacked.mlp.down_proj.weight.sharding.spec == P(None, "data", "model")
-    assert int(resumed.step) == 2
+    assert int(resumed.step) == 3
     for actual, expected in zip(_array_leaves(resumed), _array_leaves(full), strict=True):
         np.testing.assert_array_equal(actual, expected)
 
@@ -461,6 +512,15 @@ def test_native_hf_rejects_equal_shape_different_attention_architecture(native_h
         model=wrong,
         initialize_from_hf=str(source),
         data=LmDataConfig(tokenizer="passthrough", vocab_size=31),
+        trainer=train_lm.TrainerConfig(
+            id="incompatible-native-hf",
+            tracker=NoopConfig(),
+            load_checkpoint=False,
+            require_accelerator=False,
+            distributed=DistributedConfig(initialize_jax_distributed=False),
+            checkpointer=CheckpointerConfig(base_path=str(source.parent / "checkpoints")),
+            mesh=MeshConfig(axes={"data": len(jax.devices()), "model": 1}),
+        ),
     )
     with pytest.raises(ValueError, match="num_attention_heads mismatch"):
         train_lm.main(config)
@@ -481,6 +541,15 @@ def test_native_hf_rejects_default_rope_with_ignored_scaling_factor(native_hf_so
         model=model,
         initialize_from_hf=str(source),
         data=LmDataConfig(tokenizer="passthrough", vocab_size=31),
+        trainer=train_lm.TrainerConfig(
+            id="incompatible-native-hf",
+            tracker=NoopConfig(),
+            load_checkpoint=False,
+            require_accelerator=False,
+            distributed=DistributedConfig(initialize_jax_distributed=False),
+            checkpointer=CheckpointerConfig(base_path=str(source.parent / "checkpoints")),
+            mesh=MeshConfig(axes={"data": len(jax.devices()), "model": 1}),
+        ),
     )
     with pytest.raises(ValueError, match="scaled RoPE must declare linear"):
         train_lm.main(config)

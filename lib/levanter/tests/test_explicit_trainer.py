@@ -13,11 +13,12 @@ import pytest
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
 
 from levanter.grad_accum import microbatched_arrays
-from levanter.checkpoint import save_checkpoint
+from levanter.checkpoint import CheckpointerConfig, discover_checkpoint_candidates, save_checkpoint
 from levanter.metrics import Metric, ReductionType
 from levanter.optim.model_averaging import EmaModelAveragingConfig
 from levanter.tracker import NoopConfig
 from levanter.trainer import ExplicitTrainingLayout, Trainer, TrainerConfig
+from levanter.trainer_state import TrainerState
 from levanter.testing.cpu_devices import run_on_cpu_devices
 
 
@@ -218,3 +219,88 @@ def test_explicit_trainer_microbatch_preserves_data_and_parameter_sharding():
         """,
         device_count=4,
     )
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_trainer_pins_checkpoint_or_fresh_start_before_model_initialization(tmp_path, explicit):
+    mesh = Mesh(
+        np.asarray(jax.devices()[:1]),
+        ("data",),
+        axis_types=(AxisType.Explicit if explicit else AxisType.Auto,),
+    )
+    config = TrainerConfig(
+        id="pinned",
+        tracker=NoopConfig(),
+        load_checkpoint=None,
+        load_checkpoint_path=str(tmp_path),
+        log_jaxprs=False,
+        log_xla_hlo=False,
+    )
+    optimizer = optax.adam(0.01)
+    layout = ExplicitTrainingLayout(mesh, P("data")) if explicit else None
+    fresh = Trainer(config, optimizer, _loss, add_default_hooks=False, explicit_layout=layout)
+    assert fresh.checkpoint_to_load is None
+
+    def initialize_model():
+        return _Model(jnp.array([0.2, 0.4]), jnp.array([0.1, 0.3]))
+
+    def save(step):
+        with jax.set_mesh(mesh):
+            state = TrainerState.init(optimizer, initialize_model(), key=jax.random.PRNGKey(step))
+            state = eqx.tree_at(lambda value: value.step, state, step)
+            save_checkpoint(state.saveable_state, step=step, checkpoint_path=tmp_path / f"step-{step}")
+        return state
+
+    first = save(1)
+    pinned = Trainer(config, optimizer, _loss, add_default_hooks=False, explicit_layout=layout)
+    assert pinned.checkpoint_to_load.path == str(tmp_path / "step-1")
+    second = save(2)
+    with fresh:
+        initialized = fresh.initial_state(jax.random.PRNGKey(77), model_init=initialize_model)
+    assert int(initialized.step) == 0
+    with pinned:
+        restored = pinned.initial_state(jax.random.PRNGKey(99), model_init=initialize_model)
+    assert int(restored.step) == 1
+    np.testing.assert_array_equal(restored.training_key, first.training_key)
+    latest = Trainer(config, optimizer, _loss, add_default_hooks=False, explicit_layout=layout)
+    with latest:
+        restored = latest.initial_state(jax.random.PRNGKey(99), model_init=initialize_model)
+    assert int(restored.step) == 2
+    np.testing.assert_array_equal(restored.training_key, second.training_key)
+
+
+def test_trainer_checkpoint_hook_commits_model_metadata(tmp_path):
+    mesh = Mesh(np.asarray(jax.devices()[:1]), ("data",), axis_types=(AxisType.Explicit,))
+    metadata = {"application": {"geometry": [3], "precision": "float32"}}
+    config = TrainerConfig(
+        id="metadata",
+        tracker=NoopConfig(),
+        load_checkpoint=False,
+        checkpointer=CheckpointerConfig(base_path=str(tmp_path), keep=[{"every": 1}]),
+        log_jaxprs=False,
+        log_xla_hlo=False,
+        train_batch_size=4,
+        model_averaging=EmaModelAveragingConfig(beta=0.8),
+    )
+    seen_weights = []
+
+    def model_metadata(model):
+        seen_weights.append(np.asarray(model.weight).copy())
+        return metadata
+
+    trainer = Trainer(
+        config,
+        optax.adam(0.01),
+        _loss,
+        explicit_layout=ExplicitTrainingLayout(mesh, P("data")),
+        checkpoint_metadata=model_metadata,
+    )
+    with trainer:
+        state = trainer.initial_state(jax.random.PRNGKey(9), model=_Model(jnp.ones(3), jnp.zeros(3)))
+        batch = {"x": jnp.ones((4, 3)), "target": jnp.zeros((4, 3))}
+        state = trainer.train_step(state, batch).state
+        result = trainer.train_step(state, batch)
+    candidate = discover_checkpoint_candidates(tmp_path / "metadata")[-1]
+    assert candidate.metadata["application"] == {"geometry": [3], "precision": "float32"}
+    np.testing.assert_array_equal(seen_weights[-1], result.state.model.weight)
+    assert not np.array_equal(seen_weights[-1], result.state.model_averaging.model.weight)
