@@ -3,12 +3,14 @@
 
 """Tests for the import-driven test selector (infra/ci/select_tests.py)."""
 
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
 import textwrap
+import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from pathlib import Path
 
@@ -768,3 +770,200 @@ def test_broad_trigger_does_not_source_build(tmp_path: Path) -> None:
     matrix = select_matrix(["uv.lock"], tmp_path)
     assert matrix, "broad trigger emits the full matrix"
     assert all(leg.setup == "" for leg in matrix)
+
+
+@pytest.fixture
+def ci_batch_workspace(tmp_path: Path) -> Path:
+    configuration = (
+        "[tool.pytest.ini_options]\n"
+        f"addopts = \"--import-mode=importlib -m '{run_tests.LOCAL_SAFE_MARKERS}'\"\n"
+        'markers = ["cluster: scratch sentinel that must not execute"]\n'
+    )
+    write(tmp_path, "pyproject.toml", configuration)
+    write(tmp_path, "lib/levanter/pyproject.toml", configuration)
+    write(
+        tmp_path,
+        "lib/levanter/tests/test_batch_probe.py",
+        f"""\
+        import json
+        import logging
+        import os
+        import sys
+        from pathlib import Path
+
+        import pytest
+
+        OUTPUT = Path({str(tmp_path / 'case-events.jsonl')!r})
+
+        @pytest.mark.parametrize("index", range(4))
+        def test_case(index, request):
+            print(f"batch probe stdout {{index}}")
+            print(f"batch probe stderr {{index}}", file=sys.stderr)
+            logging.warning("batch probe log %s", index)
+            with OUTPUT.open("a") as output:
+                output.write(json.dumps({{"id": request.node.nodeid, "index": index,
+                                         "pid": os.getpid(),
+                                         "device_env": os.environ.get("JAX_NUM_CPU_DEVICES")}}) + "\\n")
+
+        @pytest.mark.cluster
+        def test_excluded():
+            (OUTPUT.parent / "excluded-ran").touch()
+        """,
+    )
+    return tmp_path
+
+
+def _run_ci_batch_probe(workspace: Path, monkeypatch: pytest.MonkeyPatch, cwd: str = "root") -> tuple[int, dict]:
+    directory = workspace if cwd == "root" else workspace / "lib/levanter"
+    monkeypatch.chdir(directory)
+    monkeypatch.setenv("JAX_NUM_CPU_DEVICES", "7")
+    relative = "lib/levanter/tests/test_batch_probe.py"
+    status = run_tests.run_ci_batches(
+        workspace,
+        (relative,),
+        ("-n", "0", "-q", "--tb=short"),
+        workspace / "reports",
+        batch_count=2,
+    )
+    return status, json.loads((workspace / "reports/manifest.json").read_text())
+
+
+@pytest.mark.parametrize("cwd", ["root", "package"])
+def test_ci_batches_execute_every_selected_case_once_in_distinct_sessions(
+    ci_batch_workspace: Path, monkeypatch: pytest.MonkeyPatch, cwd: str
+) -> None:
+    status, manifest = _run_ci_batch_probe(ci_batch_workspace, monkeypatch, cwd)
+
+    events = [json.loads(line) for line in (ci_batch_workspace / "case-events.jsonl").read_text().splitlines()]
+    assert status == 0
+    assert sorted(event["index"] for event in events) == list(range(4))
+    assert len({event["pid"] for event in events}) == 2
+    assert all(event["device_env"] is None for event in events)
+    assert not (ci_batch_workspace / "excluded-ran").exists()
+    assert set(manifest["ids"]) == {f"lib/levanter/tests/test_batch_probe.py::test_case[{index}]" for index in range(4)}
+    assert [batch["status"] for batch in manifest["batches"]] == ["passed", "passed"]
+
+
+def test_ci_batch_failure_does_not_prevent_the_later_session(
+    ci_batch_workspace: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    path = ci_batch_workspace / "lib/levanter/tests/test_batch_probe.py"
+    path.write_text(
+        path.read_text().replace(
+            '    with OUTPUT.open("a") as output:', '    assert index != 0\n    with OUTPUT.open("a") as output:'
+        )
+    )
+
+    status, manifest = _run_ci_batch_probe(ci_batch_workspace, monkeypatch)
+
+    events = [json.loads(line) for line in (ci_batch_workspace / "case-events.jsonl").read_text().splitlines()]
+    assert status != 0
+    assert sorted(event["index"] for event in events) == [1, 2, 3]
+    assert [batch["status"] for batch in manifest["batches"]] == ["failed", "passed"]
+    reports = [json.loads((ci_batch_workspace / f"reports/batch-{index}.json").read_text()) for index in (1, 2)]
+    failed = next(test for test in reports[0]["tests"] if test["outcome"] == "failed")
+    failed_path, _, failed_case = failed["nodeid"].partition("::")
+    assert (Path(reports[0]["root"]) / failed_path).resolve() == path.resolve()
+    assert failed_case == "test_case[0]"
+    assert [failed[phase]["outcome"] for phase in ("setup", "call", "teardown")] == ["passed", "failed", "passed"]
+    assert "assert 0 != 0" in failed["call"]["longrepr"]
+    assert failed["call"]["traceback"]
+    for report in reports:
+        for test in report["tests"]:
+            for phase in ("setup", "call", "teardown"):
+                assert not {"log", "stdout", "stderr"} & test[phase].keys()
+
+    failure = ET.parse(ci_batch_workspace / "reports/batch-1.xml").find(".//failure")
+    assert failure is not None
+    assert "assert 0 != 0" in "".join(failure.itertext())
+    captured = capfd.readouterr()
+    console = captured.out + captured.err
+    assert "batch probe stdout 0" in console
+    assert "batch probe stderr 0" in console
+    assert "batch probe log 0" in console
+
+
+def test_ci_batch_interruption_reports_every_unfinished_case(
+    ci_batch_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write(
+        ci_batch_workspace,
+        "lib/levanter/tests/conftest.py",
+        """\
+        def pytest_runtest_teardown(item, nextitem):
+            item.session.shouldstop = True
+        """,
+    )
+
+    status, manifest = _run_ci_batch_probe(ci_batch_workspace, monkeypatch)
+
+    events = [json.loads(line) for line in (ci_batch_workspace / "case-events.jsonl").read_text().splitlines()]
+    assert status != 0
+    assert sorted(event["index"] for event in events) == [0, 1]
+    missing = {nodeid for batch in manifest["batches"] for nodeid in batch["missing"]}
+    assert missing == {f"lib/levanter/tests/test_batch_probe.py::test_case[{index}]" for index in (2, 3)}
+
+
+def test_ci_batch_collection_error_aborts_before_executing_cases(
+    ci_batch_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = ci_batch_workspace / "lib/levanter/tests/test_batch_probe.py"
+    path.write_text('raise RuntimeError("broken scratch collection")\n' + path.read_text())
+
+    status, manifest = _run_ci_batch_probe(ci_batch_workspace, monkeypatch)
+
+    assert status != 0
+    assert manifest["status"] == "failed"
+    assert manifest["batches"] == []
+    assert not (ci_batch_workspace / "case-events.jsonl").exists()
+
+
+@pytest.mark.parametrize(
+    "fault", ["unknown", "duplicate", "missing", "unfinished", "missing_json", "missing_junit", "exit5"]
+)
+def test_ci_batches_cannot_pass_with_invalid_or_incomplete_reports(
+    ci_batch_workspace: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    write(
+        ci_batch_workspace,
+        "lib/levanter/tests/conftest.py",
+        f"""\
+        from pathlib import Path
+
+        import pytest
+
+        FAULT = {fault!r}
+
+        def pytest_json_modifyreport(json_report):
+            tests = json_report.get("tests", [])
+            if not tests:
+                return
+            if FAULT == "unknown":
+                tests[0]["nodeid"] = "tests/test_batch_probe.py::test_unknown"
+            elif FAULT == "duplicate":
+                tests.append(tests[0].copy())
+            elif FAULT == "missing":
+                tests.pop()
+            elif FAULT == "unfinished":
+                tests[0].pop("teardown")
+
+        @pytest.hookimpl(trylast=True)
+        def pytest_sessionfinish(session, exitstatus):
+            if session.config.option.collectonly:
+                return
+            if FAULT == "missing_json":
+                Path(session.config.option.json_report_file).unlink()
+            elif FAULT == "missing_junit":
+                Path(session.config.option.xmlpath).unlink()
+            elif FAULT == "exit5":
+                session.exitstatus = 5
+        """,
+    )
+
+    status, manifest = _run_ci_batch_probe(ci_batch_workspace, monkeypatch)
+
+    events = [json.loads(line) for line in (ci_batch_workspace / "case-events.jsonl").read_text().splitlines()]
+    assert sorted(event["index"] for event in events) == list(range(4))
+    assert status != 0
+    assert manifest["status"] == "failed"
+    assert all(batch["status"] == "failed" for batch in manifest["batches"])

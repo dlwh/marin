@@ -26,11 +26,20 @@ partial marker expression such as `-m "not slow"`; pytest replaces the default
 expression and may select live-cluster tests. Run excluded markers only when
 requested or directed by the relevant module guide.
 
-Tests run from the repository root have a 60-second per-test timeout, including
-fixture setup and teardown. On POSIX, pytest-timeout first interrupts the test
-with `SIGALRM`; if the test suppresses that failure, the test process exits five
-seconds later. Give a legitimately longer test an explicit
+The root and standalone Levanter pytest configurations use a 60-second per-test
+timeout, including fixture setup and teardown. On POSIX, pytest-timeout first
+interrupts the test with `SIGALRM`; if the test suppresses that failure, the test
+process exits five seconds later. Give a legitimately longer test an explicit
 `@pytest.mark.timeout(...)` value instead of increasing the repository default.
+Both configurations also stop the session between tests once its 600-second
+budget has elapsed. Levanter retains its `src` and `tests` Python paths and adds
+the repository root to load the shared guard without a Marin package dependency.
+
+Levanter CPU CI collects the selected cases once and runs two disjoint, serial
+pytest sessions inside each existing matrix job. Each session retains the
+600-second budget; the entire job still has its 15-minute limit. Native pytest
+JSON reports, JUnit results, and the planned case manifest are uploaded even
+when a session fails. A failed or incomplete session fails the job.
 
 A formatter-only mechanical edit does not require another test run. Rerun the
 repository formatting and lint checks after the edit; rerun tests only when the

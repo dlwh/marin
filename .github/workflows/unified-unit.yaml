@@ -96,7 +96,9 @@ jobs:
         if: matrix.setup == 'rust'
         run: python3 scripts/rust_mode.py dev
 
-      - env:
+      - name: Test selected suite
+        if: matrix.package != 'marin-levanter'
+        env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         # pytest exits 5 when it collects no tests. The diff-based selector can hand a lane
         # only tests that its default marker filter deselects (integration, slow,
@@ -117,6 +119,43 @@ jobs:
             ${{ matrix.test_paths }} || status=$?
           [ "$status" -eq 5 ] && exit 0
           exit "$status"
+
+      - name: Test Levanter in two sessions
+        if: matrix.package == 'marin-levanter'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          TEST_PATHS: ${{ matrix.test_paths }}
+          PYTEST_ARGS: ${{ matrix.pytest_args }}
+          TEST_REPORT_DIR: ${{ runner.temp }}/levanter-test-reports
+        run: |
+          uv run \
+            --python ${{ matrix.python }} \
+            --package ${{ matrix.package }} \
+            ${{ matrix.extras }} \
+            --group test \
+            python - <<'PYTHON'
+          import os
+          import shlex
+          from pathlib import Path
+
+          from infra.ci.run_tests import run_ci_batches
+
+          raise SystemExit(run_ci_batches(
+              Path.cwd(),
+              tuple(shlex.split(os.environ["TEST_PATHS"])),
+              tuple(shlex.split(os.environ["PYTEST_ARGS"])),
+              Path(os.environ["TEST_REPORT_DIR"]),
+              batch_count=2,
+          ))
+          PYTHON
+
+      - name: Upload Levanter test reports
+        if: always() && matrix.package == 'marin-levanter'
+        uses: actions/upload-artifact@v7
+        with:
+          name: unit-levanter-${{ github.run_attempt }}-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/levanter-test-reports
+          if-no-files-found: error
 
   slow:
     if: ${{ github.event_name == 'schedule' }}

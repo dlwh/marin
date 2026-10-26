@@ -18,12 +18,16 @@ Usage:
 
 import argparse
 import ast
+import json
 import os
 import shlex
 import subprocess
 import sys
-from dataclasses import dataclass, replace
+from collections import Counter
+from dataclasses import asdict, dataclass, field, replace
+from enum import StrEnum
 from pathlib import Path
+from typing import Any
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -282,14 +286,217 @@ def pytest_command(
     )
 
 
-def pytest_environment(lane: PytestLane) -> dict[str, str]:
+def pytest_environment(jax_cpu_devices: int) -> dict[str, str]:
     """Build the process environment for one JAX device topology."""
     environment = os.environ.copy()
-    if lane.jax_cpu_devices == 1:
+    if jax_cpu_devices == 1:
         environment.pop(JAX_CPU_DEVICE_ENV, None)
     else:
-        environment[JAX_CPU_DEVICE_ENV] = str(lane.jax_cpu_devices)
+        environment[JAX_CPU_DEVICE_ENV] = str(jax_cpu_devices)
     return environment
+
+
+def _repo_test_id(nodeid: str, report_root: Path, repo_root: Path) -> str:
+    path, separator, name = nodeid.partition("::")
+    if not separator:
+        raise ValueError(f"Not a test case ID: {nodeid}")
+    return f"{(report_root / path).resolve().relative_to(repo_root)}::{name}"
+
+
+def _collected_test_ids(report: dict[str, Any], repo_root: Path) -> tuple[str, ...]:
+    report_root = Path(report["root"])
+    collectors = report.get("collectors", [])
+    collector_ids = {collector["nodeid"] for collector in collectors}
+    ids = tuple(
+        _repo_test_id(item["nodeid"], report_root, repo_root)
+        for collector in collectors
+        for item in collector["result"]
+        if item["nodeid"] not in collector_ids and not item.get("deselected", False)
+    )
+    expected = report["summary"]["collected"] - report["summary"].get("deselected", 0)
+    if len(ids) != expected or len(set(ids)) != len(ids):
+        raise ValueError(f"Collection inventory is incomplete or duplicated: {len(ids)} IDs, {expected} expected")
+    return tuple(sorted(ids))
+
+
+class CiBatchStatus(StrEnum):
+    COLLECTING = "collecting"
+    PENDING = "pending"
+    RUNNING = "running"
+    EMPTY = "empty"
+    FAILED = "failed"
+    PASSED = "passed"
+
+
+@dataclass
+class CiBatchRecord:
+    """Planned cases and observed completion for one pytest session."""
+
+    ids: tuple[str, ...]
+    status: CiBatchStatus = CiBatchStatus.PENDING
+    exit_code: int | None = None
+    report_error: str | None = None
+    reported: list[str] = field(default_factory=list)
+    missing: list[str] = field(default_factory=list)
+    unknown: list[str] = field(default_factory=list)
+    duplicates: list[str] = field(default_factory=list)
+    failed_or_error: list[str] = field(default_factory=list)
+
+
+@dataclass
+class CiBatchManifest:
+    """Collection and session lifecycle written to the CI artifact."""
+
+    test_paths: tuple[str, ...]
+    status: CiBatchStatus = CiBatchStatus.COLLECTING
+    batches: list[CiBatchRecord] = field(default_factory=list)
+    collection_exit_code: int | None = None
+    collection_error: str | None = None
+    ids: tuple[str, ...] = ()
+
+
+def run_ci_batches(
+    repo_root: Path,
+    test_paths: tuple[str, ...],
+    pytest_args: tuple[str, ...],
+    report_dir: Path,
+    *,
+    batch_count: int,
+) -> int:
+    """Run a CI selection in disjoint serial sessions, failing on incomplete reports.
+
+    Uses the current interpreter and pytest policy. Test paths are resolved
+    relative to repo_root. The enclosing CI job owns the total time budget;
+    each session retains its configured timeout.
+    """
+    if batch_count < 1:
+        raise ValueError("batch_count must be positive")
+    repo_root = repo_root.resolve()
+    report_dir = report_dir.resolve()
+    paths = tuple(str((repo_root / path).resolve().relative_to(repo_root)) for path in test_paths)
+    report_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = report_dir / "manifest.json"
+    if manifest_path.exists():
+        raise ValueError(f"Refusing to reuse existing test reports: {report_dir}")
+    manifest = CiBatchManifest(test_paths=paths)
+
+    def save_manifest() -> None:
+        manifest_path.write_text(json.dumps(asdict(manifest), indent=2) + "\n")
+
+    environment = pytest_environment(1)
+    command = (sys.executable, "-m", "pytest", *pytest_args)
+    collection_path = report_dir / "collection.json"
+    save_manifest()
+    collection = subprocess.run(
+        [
+            *command,
+            "--collect-only",
+            "-n",
+            "0",
+            "--json-report",
+            f"--json-report-file={collection_path}",
+            *paths,
+        ],
+        cwd=repo_root,
+        env=environment,
+        check=False,
+    )
+    manifest.collection_exit_code = collection.returncode
+    if collection.returncode not in (0, 5) or not collection_path.exists():
+        manifest.status = CiBatchStatus.FAILED
+        save_manifest()
+        return collection.returncode or 1
+    try:
+        ids = _collected_test_ids(json.loads(collection_path.read_text()), repo_root)
+    except ValueError as error:
+        manifest.status = CiBatchStatus.FAILED
+        manifest.collection_error = str(error)
+        save_manifest()
+        return 1
+    if collection.returncode == 5 and ids:
+        manifest.status = CiBatchStatus.FAILED
+        manifest.collection_error = "Nonempty collection exited with no-tests status"
+        save_manifest()
+        return 5
+    batches = [ids[index::batch_count] for index in range(batch_count)]
+    assert Counter(nodeid for batch in batches for nodeid in batch) == Counter(ids)
+    manifest.status = CiBatchStatus.RUNNING
+    manifest.ids = ids
+    manifest.batches = [CiBatchRecord(ids=batch) for batch in batches]
+    save_manifest()
+    failure = 0
+    for index, batch in enumerate(batches, 1):
+        entry = manifest.batches[index - 1]
+        if not batch:
+            entry.status = CiBatchStatus.EMPTY
+            save_manifest()
+            continue
+        json_path = report_dir / f"batch-{index}.json"
+        junit_path = report_dir / f"batch-{index}.xml"
+        entry.status = CiBatchStatus.RUNNING
+        save_manifest()
+        print(f"==> pytest session {index}/{batch_count}: {len(batch)} cases", flush=True)
+        result = subprocess.run(
+            [
+                *command,
+                "--json-report",
+                f"--json-report-file={json_path}",
+                "--json-report-omit",
+                "log",
+                "streams",
+                f"--junitxml={junit_path}",
+                *batch,
+            ],
+            cwd=repo_root,
+            env=environment,
+            check=False,
+        )
+        entry.exit_code = result.returncode
+        failure = failure or result.returncode
+        if not junit_path.exists():
+            entry.report_error = "Missing pytest JUnit report"
+            failure = failure or 1
+        if not json_path.exists():
+            entry.status = CiBatchStatus.FAILED
+            entry.report_error = "Missing pytest JSON report"
+            entry.missing = list(batch)
+            failure = failure or 1
+            save_manifest()
+            continue
+        try:
+            report = json.loads(json_path.read_text())
+            report_root = Path(report["root"])
+            reported = [_repo_test_id(test["nodeid"], report_root, repo_root) for test in report["tests"]]
+            completed = {
+                _repo_test_id(test["nodeid"], report_root, repo_root) for test in report["tests"] if "teardown" in test
+            }
+        except ValueError as error:
+            entry.status = CiBatchStatus.FAILED
+            entry.report_error = str(error)
+            entry.missing = list(batch)
+            failure = failure or 1
+            save_manifest()
+            continue
+        counts = Counter(reported)
+        missing = sorted(set(batch) - completed)
+        unknown = sorted(set(reported) - set(batch))
+        duplicates = sorted(nodeid for nodeid, count in counts.items() if count > 1)
+        bad_outcomes = [test["nodeid"] for test in report["tests"] if test["outcome"] in ("failed", "error")]
+        valid = not (
+            result.returncode or missing or unknown or duplicates or bad_outcomes or entry.report_error is not None
+        )
+        entry.status = CiBatchStatus.PASSED if valid else CiBatchStatus.FAILED
+        entry.reported = reported
+        entry.missing = missing
+        entry.unknown = unknown
+        entry.duplicates = duplicates
+        entry.failed_or_error = bad_outcomes
+        if not valid:
+            failure = failure or 1
+        save_manifest()
+    manifest.status = CiBatchStatus.FAILED if failure else CiBatchStatus.PASSED
+    save_manifest()
+    return failure
 
 
 def top_level_pytest_command(extra_args: tuple[str, ...] = ()) -> tuple[str, ...]:
@@ -450,7 +657,7 @@ def run(argv: list[str] | None = None) -> int:
         result = subprocess.run(
             pytest_command(lane, extra_args),
             cwd=repo_root,
-            env=pytest_environment(lane),
+            env=pytest_environment(lane.jax_cpu_devices),
             check=False,
         )
         return 0 if result.returncode == 5 else result.returncode
@@ -467,7 +674,7 @@ def run(argv: list[str] | None = None) -> int:
             subprocess.Popen(
                 pytest_command(lane, extra_args, no_sync=True),
                 cwd=repo_root,
-                env=pytest_environment(lane),
+                env=pytest_environment(lane.jax_cpu_devices),
             ),
         )
         for lane in lanes
