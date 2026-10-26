@@ -39,6 +39,7 @@ from levanter.models.llama import LlamaConfig
 from levanter.models.llama_native import NativeLlamaSharding
 from levanter.models.llama_native_lm import NativeLlamaLmConfig
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel, LmInitContext, split_activations
+from levanter.tokenizers import MarinTokenizer
 from levanter.optim.config import AdamConfig, OptimizerConfig
 from levanter.trainer import ExplicitTrainingLayout, Trainer, TrainerConfig
 from levanter.trainer_state import trainables_only
@@ -157,12 +158,16 @@ def _load_lm_model_from_configured_source(
     parameter_axis_mapping,
     trainer: Trainer,
     init_context: LmInitContext,
+    tokenizer: MarinTokenizer,
 ) -> LmHeadModel:
     if config.initialize_from_hf:
-        assert converter is not None
         model_init = None
         load_dtype = trainer.mp.compute_dtype
         if isinstance(config.model, NativeLlamaLmConfig):
+            converter = config.model.hf_checkpoint_converter(
+                config.initialize_from_hf if isinstance(config.initialize_from_hf, str) else None,
+                tokenizer=tokenizer,
+            )
 
             def initialize_native_model(vocab: Axis) -> ModelWithHfSerializationMixin:
                 return cast(
@@ -172,6 +177,7 @@ def _load_lm_model_from_configured_source(
             model_init = initialize_native_model
             # Compute precision must not round pretrained master weights before initialization.
             load_dtype = trainer.mp.param_dtype
+        assert converter is not None
         model = converter.load_pretrained(
             config.model.model_type,
             config=config.model if not config.use_hf_model_config else None,
@@ -311,14 +317,12 @@ def main(config: TrainLmConfig):
     ):
         checkpoint = trainer.checkpoint_to_load
         resuming = checkpoint is not None
-        init_context, source_converter = config.model.prepare_init_context(
+        init_context = config.model.prepare_init_context(
             tokenizer=tokenizer,
             checkpoint_metadata=checkpoint.metadata if checkpoint is not None else None,
             initialize_from_hf=config.initialize_from_hf,
             initialize_from=config.trainer.initialize_from,
         )
-        if source_converter is not None:
-            converter = source_converter
 
         # randomness in jax is tightly controlled by "keys" which are the states of the random number generators
         # this makes deterministic training pretty easy
@@ -397,6 +401,7 @@ def main(config: TrainLmConfig):
             parameter_axis_mapping=parameter_axis_mapping,
             trainer=trainer,
             init_context=init_context,
+            tokenizer=tokenizer,
         )
         weight_source = config.initialize_from_hf or config.initialize_model_from_checkpoint_path is not None
         if weight_source and not resuming:

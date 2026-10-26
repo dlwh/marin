@@ -33,6 +33,9 @@ from levanter.tokenizers import MarinTokenizer
 from levanter.utils.activation import ActivationFunctionEnum
 
 
+_CHECKPOINT_MODEL_KEY = "levanter_model"
+
+
 def _checkpoint_architecture(config: NativeLlamaConfig) -> dict[str, Any]:
     return {
         "hidden_dim": config.hidden_dim,
@@ -192,14 +195,13 @@ class NativeLlamaLmConfig(LlamaConfig):
         checkpoint_metadata: Mapping[str, Any] | None = None,
         initialize_from_hf: bool | str = False,
         initialize_from: str | None = None,
-    ) -> tuple[LmInitContext, HFCheckpointConverter | None]:
+    ) -> LmInitContext:
         """Resolve an optional legacy HF fallback before entering traced initialization."""
         metadata = {} if checkpoint_metadata is None else checkpoint_metadata
-        converter = None
         hf_config = None
         # Even malformed model metadata belongs to the constructor; do not mask it
         # by opening the original source. Older metadata needs the explicit fallback.
-        if "levanter_model" not in metadata and initialize_from_hf:
+        if _CHECKPOINT_MODEL_KEY not in metadata and initialize_from_hf:
             if initialize_from is not None:
                 raise ValueError("Cannot specify both initialize_from_hf and initialize_from")
             converter = self.hf_checkpoint_converter(
@@ -207,16 +209,16 @@ class NativeLlamaLmConfig(LlamaConfig):
                 tokenizer=tokenizer,
             )
             hf_config = converter.default_hf_config
-        return LmInitContext(len(tokenizer), metadata, hf_config), converter
+        return LmInitContext(len(tokenizer), metadata, hf_config)
 
     def checkpoint_vocab_size(self, metadata: Mapping[str, Any]) -> int | None:
         """Validate native checkpoint semantics and recover its complete model vocabulary.
 
         Checkpoints without model metadata retain the explicit-config initialization path.
         """
-        if "levanter_model" not in metadata:
+        if _CHECKPOINT_MODEL_KEY not in metadata:
             return None
-        identity = metadata["levanter_model"]
+        identity = metadata[_CHECKPOINT_MODEL_KEY]
         if not isinstance(identity, dict) or set(identity) != {"version", "type", "vocab_size", "architecture"}:
             raise ValueError("Malformed native checkpoint model metadata")
         if type(identity["version"]) is not int or identity["version"] != 1 or identity["type"] != "llama_native":
@@ -288,7 +290,7 @@ class NativeLlamaLmHeadModel(ModuleWithStateDictSerialization, LmHeadModel[Nativ
     def checkpoint_metadata(self) -> Mapping[str, Any]:
         """Describe the actual stored model without source paths or runtime placement policy."""
         return {
-            "levanter_model": {
+            _CHECKPOINT_MODEL_KEY: {
                 "version": 1,
                 "type": "llama_native",
                 "vocab_size": self.Vocab.size,

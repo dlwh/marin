@@ -209,15 +209,11 @@ class LmConfig(draccus.PluginRegistry, abc.ABC, Generic[LmT], discover_packages_
         checkpoint_metadata: Mapping[str, Any] | None = None,
         initialize_from_hf: bool | str = False,
         initialize_from: str | None = None,
-    ) -> tuple[LmInitContext, Any]:
-        """Prepare source information on the host before traced model construction.
-
-        The optional second result is the legacy HF loader's host-side converter.
-        It is separate from the data-only context passed into ``build``.
-        """
+    ) -> LmInitContext:
+        """Prepare source information on the host before traced model construction."""
         del initialize_from_hf, initialize_from
         metadata = {} if checkpoint_metadata is None else checkpoint_metadata
-        return LmInitContext(len(tokenizer), metadata), None
+        return LmInitContext(len(tokenizer), metadata)
 
     def build(self, Vocab: Axis, *, key: PRNGKeyArray, init_context: LmInitContext | None = None) -> "LmT":
         del init_context
