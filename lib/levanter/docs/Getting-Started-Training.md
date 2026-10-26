@@ -166,7 +166,9 @@ Tied embeddings remain unquantized. Native INT8 remains unsupported.
 base weights and quantization state stay fixed; trainable factors and their FP8
 state resume from partial checkpoints after reconstructing the original base.
 See [adapter training](Training-On-Your-Data.md#lora-adapters) for source and
-precision requirements. Native DPO quantization remains unsupported.
+precision requirements. Native DPO also supports FP8 for full-parameter and LoRA
+training; see [Native DPO](guides/DPO-Training.md#native-llama-training) for reference,
+target-path and checkpoint requirements.
 Existing `model.type: llama` configurations retain their behavior.
 
 ## Set Custom Training Configuration

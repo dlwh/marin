@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import dataclasses
+import hashlib
 import json
 import shutil
 import tempfile
@@ -15,6 +16,7 @@ import jax.numpy as jnp
 import jax.random as jrandom
 import jmp
 import numpy as np
+import optax
 import pytest
 import safetensors.numpy
 from transformers import LlamaConfig as HfLlamaConfig
@@ -67,6 +69,7 @@ from levanter.main.train_dpo import (
     SeparateReferenceConfig,
     TrainDpoConfig,
     _build_dpo_dataset,
+    _build_validation_split,
     _initialize_policy_model_from_source,
     _load_separate_reference_model,
     main as train_dpo_main,
@@ -1803,3 +1806,313 @@ def test_named_full_dpo_checkpoint_resumes_without_pretrained_policy_source(
         strict=True,
     ):
         np.testing.assert_array_equal(actual, expected)
+
+
+def _fp8_operations(model):
+    return [
+        node
+        for node in jax.tree.leaves(model, is_leaf=lambda node: isinstance(node, Fp8DotGeneralOp))
+        if isinstance(node, Fp8DotGeneralOp)
+    ]
+
+
+@pytest.mark.tpu
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize(
+    "adaptor_kind,reference_type,precision,targets,accumulate",
+    [
+        ("full", "separate", "f32", None, False),
+        ("full", "separate", "params=float32,compute=bfloat16,output=float32", r"policy\..*", False),
+        ("lora", "separate", "params=float32,compute=bfloat16,output=float32", r"policy\..*", False),
+        ("lora", "adapter_base", "params=float32,compute=bfloat16,output=float32", None, True),
+    ],
+    ids=["full-f32-all-fp8", "full-bf16-policy-fp8", "lora-bf16-policy-fp8", "lora-base-bf16-fp8-accumulation"],
+)
+def test_native_fp8_dpo_main_preserves_pretrained_state_and_checkpoint_continuation(
+    tmp_path,
+    dpo_llama_source,
+    dpo_separate_reference_source,
+    tiny_hf_tokenizer_path,
+    dpo_preference_data,
+    adaptor_kind,
+    reference_type,
+    precision,
+    targets,
+    accumulate,
+):
+    config = _native_dpo_configuration(tmp_path / "full", dpo_llama_source, tiny_hf_tokenizer_path)
+    adapter = (
+        NoAdaptorConfig()
+        if adaptor_kind == "full"
+        else LoraAdaptorConfig(r=3, alpha=6, dropout=0.25, target_modules=["q_proj"])
+    )
+    config = dataclasses.replace(
+        config,
+        data=dpo_preference_data,
+        use_hf_model_config=False,
+        train_seq_len=8,
+        adapter=adapter,
+        reference=(
+            SeparateReferenceConfig(model_path=str(dpo_separate_reference_source.path), is_hf=True)
+            if reference_type == "separate"
+            else AdapterBaseReferenceConfig()
+        ),
+        trainer=dataclasses.replace(
+            config.trainer,
+            mp=jmp.get_policy(precision),
+            quantization=QuantizationConfig(fp8=True, amax_history_length=4, targets=targets),
+            train_batch_size=2 * config.trainer.train_batch_size if accumulate else config.trainer.train_batch_size,
+            per_device_parallelism=1 if accumulate else config.trainer.per_device_parallelism,
+        ),
+    )
+    full = train_dpo_main(config)
+    split_config = dataclasses.replace(
+        config,
+        trainer=dataclasses.replace(
+            config.trainer,
+            tracker=JsonFileTrackerConfig(output_path=str(tmp_path / "resumed")),
+            checkpointer=CheckpointerConfig(base_path=str(tmp_path / "resumed/checkpoints"), save_interval=None),
+            num_train_steps=1,
+        ),
+    )
+    split = train_dpo_main(split_config)
+    if adaptor_kind == "full":
+        shutil.rmtree(dpo_llama_source.path)
+    resumed = train_dpo_main(
+        dataclasses.replace(
+            split_config,
+            initialize_from_hf=False if adaptor_kind == "full" else split_config.initialize_from_hf,
+            trainer=dataclasses.replace(split_config.trainer, num_train_steps=2, load_checkpoint=True),
+        )
+    )
+    assert int(split.state.step) == 1
+    assert int(full.state.step) == int(resumed.state.step) == 2
+    np.testing.assert_array_equal(full.loss, resumed.loss)
+    assert jax.tree.structure(full.state.model) == jax.tree.structure(resumed.state.model)
+    assert jax.tree.structure(full.state.opt_state) == jax.tree.structure(resumed.state.opt_state)
+    for actual, expected in zip(
+        jax.tree.leaves(eqx.filter(resumed.state, eqx.is_array)),
+        jax.tree.leaves(eqx.filter(full.state, eqx.is_array)),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(actual, expected)
+        assert actual.dtype == expected.dtype
+        assert actual.sharding == expected.sharding
+    metadata_names = (
+        "input_scale",
+        "kernel_scale",
+        "output_grad_scale",
+        "input_amax_history",
+        "kernel_amax_history",
+        "output_grad_amax_history",
+    )
+    for info in (full, resumed):
+        policy = info.state.model.policy if isinstance(info.state.model, DpoModel) else info.state.model
+        assert policy.Vocab.size == 32 > len(dpo_preference_data.the_tokenizer)
+        operations = _fp8_operations(policy)
+        assert operations
+        assert any(np.any(operation.input_amax_history != 0) for operation in operations)
+        for operation in operations:
+            for name in metadata_names:
+                assert getattr(operation, name).dtype == jnp.float32
+        for value in jax.tree.leaves(eqx.filter(info.state.trainable_model, eqx.is_array)):
+            assert value.dtype == jnp.float32
+        reference = (
+            info.state.model.reference if isinstance(info.state.model, DpoModel) else adapter.base_model_view(policy)
+        )
+        reference_source = dpo_separate_reference_source if reference_type == "separate" else dpo_llama_source
+        assert bool(_fp8_operations(reference)) == (targets is None)
+        for operation in _fp8_operations(reference):
+            for name in metadata_names:
+                value = getattr(operation, name)
+                assert value.dtype == jnp.float32
+                expected = np.zeros(value.shape, np.float32) if "history" in name else np.ones(value.shape, np.float32)
+                np.testing.assert_array_equal(value, expected)
+        for name, value in reference.to_state_dict().items():
+            assert value.dtype == config.trainer.mp.compute_dtype
+            np.testing.assert_array_equal(
+                value,
+                np.asarray(
+                    np.asarray(reference_source.weights[name]), dtype=np.dtype(config.trainer.mp.compute_dtype)
+                ),
+            )
+        if adaptor_kind == "lora":
+            for name, value in unwrap_lora_modules(policy).to_state_dict().items():
+                assert value.dtype == config.trainer.mp.compute_dtype
+                np.testing.assert_array_equal(
+                    value,
+                    np.asarray(
+                        np.asarray(dpo_llama_source.weights[name]), dtype=np.dtype(config.trainer.mp.compute_dtype)
+                    ),
+                )
+            projection = policy.native.layers.stacked.self_attn.q_proj
+            previous_policy = (
+                split.state.model.policy if isinstance(split.state.model, DpoModel) else split.state.model
+            )
+            previous = previous_policy.native.layers.stacked.self_attn.q_proj
+            for factor, prior_factor in (
+                (projection.lora.lora_A, previous.lora.lora_A),
+                (projection.lora.lora_B, previous.lora.lora_B),
+            ):
+                assert not np.array_equal(factor.weight, prior_factor.weight)
+                assert isinstance(factor.dot_general, Fp8DotGeneralOp)
+        adam = [
+            node
+            for node in jax.tree.leaves(
+                info.state.opt_state, is_leaf=lambda node: isinstance(node, optax.ScaleByAdamState)
+            )
+            if isinstance(node, optax.ScaleByAdamState)
+        ]
+        assert adam
+        for node in adam:
+            np.testing.assert_array_equal(node.count, 2)
+    with config.trainer.use_device_mesh():
+        saved = load_checkpoint(
+            full.state.saveable_state,
+            latest_checkpoint_path(tmp_path / "resumed/checkpoints/dpo"),
+            mesh=config.trainer.device_mesh,
+        )
+    for actual, expected in zip(
+        jax.tree.leaves(eqx.filter(saved, eqx.is_array)),
+        jax.tree.leaves(eqx.filter(full.state.saveable_state, eqx.is_array)),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.tpu
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize("reference_type", ["separate", "adapter_base"])
+def test_native_fp8_dpo_reference_cache_persists_reuses_and_matches_direct_loss(
+    tmp_path,
+    dpo_llama_source,
+    dpo_separate_reference_source,
+    tiny_hf_tokenizer_path,
+    dpo_preference_data,
+    reference_type,
+):
+    config = _native_dpo_configuration(tmp_path / "initial", dpo_llama_source, tiny_hf_tokenizer_path)
+    config = dataclasses.replace(
+        config,
+        data=dpo_preference_data,
+        use_hf_model_config=False,
+        adapter=LoraAdaptorConfig(r=3, alpha=6, dropout=0.25, target_modules=["q_proj"]),
+        reference=(
+            SeparateReferenceConfig(model_path=str(dpo_separate_reference_source.path), is_hf=True)
+            if reference_type == "separate"
+            else AdapterBaseReferenceConfig()
+        ),
+        validation_split_fraction=1 / 3,
+        reference_eval_cache=ReferenceEvalCacheConfig(
+            mode="build_or_load", cache_dir=str(tmp_path / "reference-cache")
+        ),
+        trainer=dataclasses.replace(
+            config.trainer,
+            num_train_steps=1,
+            max_eval_batches=1,
+            per_device_eval_parallelism=config.trainer.per_device_parallelism,
+            mp=jmp.get_policy("params=float32,compute=bfloat16,output=float32"),
+            quantization=QuantizationConfig(fp8=True, amax_history_length=4),
+        ),
+    )
+    first = train_dpo_main(config)
+    data_key, *_ = _derive_training_keys(config.trainer.seed)
+    _, validation_specs = _build_validation_split(config.data, config.model.max_Pos, key=data_key, fraction=1 / 3)
+    spec = validation_specs["preference"]
+    identity = _reference_eval_cache_identity(config)
+    metadata = reference_eval_cache_metadata(spec, reference_identity=identity, seq_len=8)
+    cache_dir = reference_eval_cache_path(
+        spec, reference_identity=identity, seq_len=8, cache_dir=config.reference_eval_cache.cache_dir
+    )
+    chosen, rejected = load_reference_eval_cache(cache_dir, metadata=metadata)
+    before = {
+        str(path.relative_to(cache_dir)): (hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_mtime_ns)
+        for path in Path(cache_dir).rglob("*")
+        if path.is_file()
+    }
+    repeated = train_dpo_main(
+        dataclasses.replace(
+            config,
+            trainer=dataclasses.replace(
+                config.trainer,
+                tracker=JsonFileTrackerConfig(output_path=str(tmp_path / "reused")),
+                checkpointer=CheckpointerConfig(base_path=str(tmp_path / "reused/checkpoints"), save_interval=None),
+            ),
+        )
+    )
+    after = {
+        str(path.relative_to(cache_dir)): (hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_mtime_ns)
+        for path in Path(cache_dir).rglob("*")
+        if path.is_file()
+    }
+    assert before == after
+    np.testing.assert_array_equal(first.loss, repeated.loss)
+    for actual, expected in zip(
+        jax.tree.leaves(eqx.filter(repeated.state, eqx.is_array)),
+        jax.tree.leaves(eqx.filter(first.state, eqx.is_array)),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(actual, expected)
+    for changed_trainer in (
+        dataclasses.replace(config.trainer, mp=jmp.get_policy("f32")),
+        dataclasses.replace(
+            config.trainer, quantization=QuantizationConfig(fp8=True, amax_history_length=4, targets=["q_proj"])
+        ),
+    ):
+        changed_identity = _reference_eval_cache_identity(dataclasses.replace(config, trainer=changed_trainer))
+        changed_metadata = reference_eval_cache_metadata(spec, reference_identity=changed_identity, seq_len=8)
+        with pytest.raises(FileNotFoundError):
+            load_reference_eval_cache(cache_dir, metadata=changed_metadata)
+    sharding = native_llama_sharding(config.trainer.parameter_axis_mapping, config.trainer.compute_axis_mapping)
+    layout = ExplicitTrainingLayout(config.trainer.device_mesh, P(sharding.batch, None))
+    with (
+        current_tracker(NoopTracker()),
+        Trainer(
+            config.trainer,
+            config.optimizer.build(1),
+            _separate_dpo_loss,
+            add_default_hooks=False,
+            explicit_layout=layout,
+        ) as trainer,
+    ):
+        policy = first.state.model.policy if isinstance(first.state.model, DpoModel) else first.state.model
+        reference = (
+            first.state.model.reference
+            if isinstance(first.state.model, DpoModel)
+            else config.adapter.base_model_view(policy)
+        )
+        reference = inference_mode(
+            cast_model_preserving_quantization_state(reference, trainer.mp.cast_to_compute), True
+        )
+        policy = inference_mode(cast_model_preserving_quantization_state(policy, trainer.mp.cast_to_compute), True)
+        assert _fp8_operations(reference)
+
+        @eqx.filter_jit
+        def direct_logps(reference_model, batch):
+            return logp_sum(reference_model, batch.chosen, key=None), logp_sum(
+                reference_model, batch.rejected, key=None
+            )
+
+        evaluate_loss = eqx.filter_jit(dpo_loss)
+        direct_chosen = []
+        direct_rejected = []
+        offset = 0
+        for batch in trainer.data_loader(spec.dataset, trainer.EvalBatch):
+            batch_chosen, batch_rejected = direct_logps(reference, batch)
+            batch_chosen = np.asarray(batch_chosen.array).reshape(-1)
+            batch_rejected = np.asarray(batch_rejected.array).reshape(-1)
+            direct_chosen.append(batch_chosen)
+            direct_rejected.append(batch_rejected)
+            stop = offset + len(batch_chosen)
+            direct_loss, _ = evaluate_loss(policy, reference, batch, beta=config.beta)
+            cached = CachedDpoExample(
+                chosen=batch.chosen,
+                rejected=batch.rejected,
+                logp_ref_chosen=chosen[offset:stop],
+                logp_ref_rejected=rejected[offset:stop],
+            )
+            cached_loss, _ = evaluate_loss(policy, None, cached, beta=config.beta)
+            np.testing.assert_array_equal(cached_loss, direct_loss)
+            offset = stop
+        np.testing.assert_array_equal(chosen, np.concatenate(direct_chosen))
+        np.testing.assert_array_equal(rejected, np.concatenate(direct_rejected))

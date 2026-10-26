@@ -357,7 +357,7 @@ For DPO, this also requires the unchanged reference source when using a separate
 reference; frozen reference weights are reloaded rather than stored in the
 training checkpoint.
 
-In `train_lm`, native LoRA also supports `trainer.quantization.fp8: true`.
+Native LoRA supports `trainer.quantization.fp8: true` in `train_lm` and `train_dpo`.
 With `targets` omitted, FP8 operations attach to frozen projections and trainable
 factors. Frozen
 weights, scales and histories stay fixed; factors update their FP32 scales and
@@ -365,7 +365,9 @@ histories through the custom-gradient state path, outside Adam. Partial
 checkpoints retain factor quantization state along with LoRA factor weights and
 optimizer state. Resume requires the original base and unchanged precision, quantization
 and adapter settings. Portable PEFT/HF exports contain ordinary weights, not
-FP8 histories. Native INT8 and native DPO quantization remain unsupported.
+FP8 histories. Native INT8 remains unsupported. See
+[Native DPO](guides/DPO-Training.md#native-llama-training) for reference and
+quantization target-path requirements.
 
 Native LoRA DPO uses the same preference dataset and Trainer as full-parameter
 DPO. Set `reference.type: separate` and `reference.model_path` for an independent
