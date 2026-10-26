@@ -159,3 +159,53 @@ and log probabilities are available from the final `GenerationResult` returned b
 `sample_lm.main`; zero sampling rounds return `None`. Printed per-round output is
 unchanged. This caller support does not establish accelerator kernel correctness,
 performance superiority, or larger-model training acceptance.
+
+
+### REPL and completion CLI
+
+`levanter.main.inference_repl` supports native Llama with a local HF directory
+or a native Levanter checkpoint. The data2/model2 example requires four visible
+JAX devices. Save this as `repl.yaml` and run
+`uv run python -m levanter.main.inference_repl --config_path repl.yaml`:
+
+```yaml
+checkpoint: /path/to/local-hf-llama
+model:
+  type: llama_native
+trainer:
+  mp: p=f32,c=bf16
+  mesh:
+    axes: {data: 2, model: 2}
+    compute_mapping: {kv_head: model}
+server:
+  temperature: 0.0
+command: complete
+args: "Example prompt"
+max_tokens: 3
+```
+
+The local HF directory supplies its architecture and, unless the top-level
+`tokenizer` is set, its tokenizer. A local directory containing `config.json`
+is treated as HF; Levanter checkpoint directories use their saved model subtree.
+For a Levanter checkpoint, set `tokenizer` to a local tokenizer directory and
+provide the original model architecture. Native checkpoint metadata validates
+that architecture and restores the complete model vocabulary, including rows
+beyond the tokenizer. This path does not resolve the original HF source.
+
+The REPL uses the top-level Trainer for loading and serving, enables Explicit
+mesh axes for native models, and casts model weights and KV storage to
+`trainer.mp.compute_dtype`. Keep the explicit `kv_head` mapping shown above:
+the ordinary Trainer shared defaults map `heads` and `mlp` to `model`. The
+explicit `compute_mapping` extends those defaults with the paged cache's
+singular `kv_head` axis. Omitting it leaves that cache replicated;
+automatic cache placement from the native model is not qualified by this caller.
+The Native configuration requires `kv_head` to use the same tensor-parallel axis
+as `mlp`. Model storage retains its separate FSDP placement.
+
+This configured path has bounded CPU completion coverage for HF and
+metadata-bearing native checkpoints in F32 and BF16, including a data2/model2
+mesh. The CPU checks use dense, unadapted models; loading LoRA or FP8 Trainer
+checkpoint trees through this entrypoint remains unqualified. Use a fresh REPL
+when changing architecture or tokenizer; arbitrary hot reload is not qualified.
+These checks do not establish HTTP deployment,
+accelerator paged kernels, multihost serving, performance or training convergence.

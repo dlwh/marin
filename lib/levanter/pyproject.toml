@@ -142,6 +142,7 @@ gcp = [
 
 [dependency-groups]
 test = [
+  "prompt_toolkit>=3.0.0",
   "pytest",
   "pytest-forked",
   "pytest-asyncio",

@@ -20,11 +20,10 @@ import logging
 import os
 import shlex
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Dict, Optional
 
-import equinox as eqx
 import jax
 import jax.random as jrandom
 import jmp
@@ -39,9 +38,9 @@ from rich.panel import Panel
 import levanter
 import levanter.config
 from levanter.quantization import cast_model_preserving_quantization_state
-from levanter.checkpoint import latest_checkpoint_path, load_checkpoint
-from levanter.compat.hf_checkpoints import HFCheckpointConverter, load_tokenizer
-from levanter.tokenizers import MarinTokenizer
+from levanter.compat.hf_checkpoints import _is_hf_model_id
+from levanter.main.model_init import ModelInitContext, load_model_from_source, prepare_model_init_context
+from levanter.tokenizers import MarinTokenizer, load_tokenizer
 from levanter.inference.engine import InferenceEngineConfig
 from levanter.inference.openai import (
     ChatCompletionRequest,
@@ -71,60 +70,40 @@ def _load_model(
     hf_checkpoint: str | None,
     levanter_checkpoint: str | None,
     *,
+    tokenizer: MarinTokenizer,
     key,
-) -> tuple[LmHeadModel, MarinTokenizer | None]:
-    """Load a model either from a checkpoint or HF repo."""
-
+) -> LmHeadModel:
+    """Load inference weights with the shared source and computation-cast contract."""
     if levanter_checkpoint is None and hf_checkpoint is None:
         raise ValueError("Must specify either checkpoint_path or hf_checkpoint")
     if levanter_checkpoint is not None and hf_checkpoint is not None:
         raise ValueError("Specify only one of checkpoint_path or hf_checkpoint")
 
-    mp = trainer_config.mp
-    tokenizer = load_tokenizer(hf_checkpoint)
-    vocab_size = tokenizer.vocab_size
-
+    if hf_checkpoint is not None:
+        context = prepare_model_init_context(
+            model_config,
+            tokenizer=tokenizer,
+            initialize_from_hf=hf_checkpoint,
+            use_hf_model_config=True,
+        )
+    else:
+        context = ModelInitContext(model=model_config, converter=None, use_hf_model_config=False)
     with trainer_config.use_device_mesh():
-        Vocab = round_axis_for_partitioning(Axis("vocab", vocab_size), trainer_config.compute_axis_mapping)
-
-        if levanter_checkpoint is not None:
-            model = eqx.filter_eval_shape(model_config.build, Vocab, key=key)
-            checkpoint_path = latest_checkpoint_path(levanter_checkpoint)
-            model = load_checkpoint(
-                model,
-                checkpoint_path,
-                subpath="model",
-                axis_mapping=trainer_config.parameter_axis_mapping,
-            )
-            model = cast_model_preserving_quantization_state(model, mp.cast_to_compute)
-            return model, None
-        else:
-            assert hf_checkpoint
-            logger.info(
-                f"Loading model from HF checkpoint {hf_checkpoint} "
-                + f"type={model_config.model_type}, "
-                + f"vocab_size={Vocab}, "
-                + f"dtype={trainer_config.mp.compute_dtype}"
-            )
-            converter: HFCheckpointConverter = HFCheckpointConverter(
-                type(model_config),
-                reference_checkpoint=hf_checkpoint,
-                tokenizer=tokenizer,
-            )
-            converter = converter.replaced(reference_checkpoint=hf_checkpoint)
-            if tokenizer is not None:
-                converter = converter.replaced(tokenizer=tokenizer)
-
-            logger.info(f"Param mapping: {trainer_config.parameter_axis_mapping}")
-            logger.info(f"Compute mapping: {trainer_config.compute_axis_mapping}")
-
-            model = converter.load_pretrained(
-                model_config.model_type,
-                ref=hf_checkpoint,
-                dtype=trainer_config.mp.compute_dtype,
-                axis_mapping=trainer_config.parameter_axis_mapping,
-            )
-            return model, tokenizer  # type: ignore[return-value]
+        Vocab = round_axis_for_partitioning(Axis("vocab", len(tokenizer)), trainer_config.compute_axis_mapping)
+        return load_model_from_source(
+            context=context,
+            Vocab=Vocab,
+            model_key=key,
+            parameter_axis_mapping=trainer_config.parameter_axis_mapping,
+            compute_axis_mapping=trainer_config.compute_axis_mapping,
+            batch_axis_name=trainer_config.batch_axis_name,
+            load_dtype=trainer_config.mp.compute_dtype,
+            cast_to_param=lambda model: cast_model_preserving_quantization_state(
+                model, trainer_config.mp.cast_to_compute
+            ),
+            hf_ref=hf_checkpoint if hf_checkpoint is not None else False,
+            checkpoint_path=levanter_checkpoint,
+        )
 
 
 @dataclass
@@ -179,7 +158,18 @@ class ReplContext:
     config: InferenceReplConfig
 
     def __init__(self, config: InferenceReplConfig):
-        self.config = config
+        trainer = config.trainer
+        if config.model.requires_explicit_mesh_axes:
+            trainer = replace(trainer, use_explicit_mesh_axes=True)
+        self.config = replace(
+            config,
+            trainer=trainer,
+            server=replace(
+                config.server,
+                trainer=trainer,
+                service=replace(config.server.service, compute_dtype=trainer.mp.compute_dtype),
+            ),
+        )
         self.server = None
         self.model_name = None
 
@@ -212,30 +202,19 @@ class ReplContext:
         """Load a model from checkpoint or HuggingFace."""
         console.print(f"[blue]Loading {path}...[/blue]")
 
-        # Determine if HF model
-        is_hf_model = not ("://" in path or path.startswith("/") or path.startswith("./") or path.startswith("../"))
-        if not tokenizer:
-            tokenizer = self.config.tokenizer
-
-        if is_hf_model:
-            model, loaded_tokenizer = _load_model(
-                trainer_config=self.config.trainer,
-                model_config=self.config.model,
-                hf_checkpoint=path,
-                levanter_checkpoint=None,
-                key=jrandom.PRNGKey(self.config.server.seed),
-            )
-        else:
-            if not tokenizer:
-                console.print("[red]Must specify --tokenizer for local checkpoints[/red]")
-                return
-            model, loaded_tokenizer = _load_model(
-                trainer_config=self.config.trainer,
-                model_config=self.config.model,
-                hf_checkpoint=None,
-                levanter_checkpoint=path,
-                key=jrandom.PRNGKey(self.config.server.seed),
-            )
+        is_hf_model = (Path(path) / "config.json").is_file() or _is_hf_model_id(path)
+        tokenizer_path = tokenizer or self.config.tokenizer or (path if is_hf_model else None)
+        if tokenizer_path is None:
+            raise ValueError("Must specify a tokenizer for Levanter checkpoints")
+        loaded_tokenizer = load_tokenizer(tokenizer_path)
+        model = _load_model(
+            trainer_config=self.config.trainer,
+            model_config=self.config.model,
+            hf_checkpoint=path if is_hf_model else None,
+            levanter_checkpoint=None if is_hf_model else path,
+            tokenizer=loaded_tokenizer,
+            key=jrandom.PRNGKey(self.config.server.seed),
+        )
 
         if self.server is not None:
 
