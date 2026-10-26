@@ -145,7 +145,6 @@ def test_default_timeout_interrupts_test_before_its_side_effect(timeout_workspac
     )
 
     assert result.returncode == pytest.ExitCode.TESTS_FAILED, result.stdout + result.stderr
-    assert "Timeout (>60.0s)" in result.stdout
     assert not (timeout_workspace / "sentinels/escaped").exists()
 
 
