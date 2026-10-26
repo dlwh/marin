@@ -8,6 +8,7 @@ import equinox as eqx
 from haliax import Axis
 from haliax.partitioning import ResourceMapping, named_jit
 from jaxtyping import PRNGKeyArray
+from jax.typing import DTypeLike
 
 import haliax as hax
 from levanter.checkpoint import latest_checkpoint_path, load_checkpoint
@@ -95,13 +96,17 @@ def load_model_from_source(
     Vocab,
     model_key,
     parameter_axis_mapping,
-    compute_dtype,
+    load_dtype: DTypeLike,
     cast_to_param,
     compute_axis_mapping=None,
     batch_axis_name: str = "batch",
     hf_ref: bool | str = False,
     checkpoint_path: str | None = None,
 ) -> LmHeadModel:
+    """Load named HF tensors in load_dtype and apply the final cast for every source.
+
+    Native HF sources retain the shared loader's FP32 loading contract.
+    """
     if hf_ref and checkpoint_path is not None:
         raise ValueError("Specify only one of hf_ref or checkpoint_path.")
 
@@ -115,7 +120,7 @@ def load_model_from_source(
                 source,
                 axis_mapping=parameter_axis_mapping,
                 tokenizer=context.converter.tokenizer,
-                compute_dtype=compute_dtype,
+                compute_dtype=load_dtype,
                 compute_axis_mapping=compute_axis_mapping,
                 batch_axis_name=batch_axis_name,
             )
@@ -146,7 +151,7 @@ def load_model_from_source(
             ref=hf_ref if isinstance(hf_ref, str) else None,
             config=converter_config,
             axis_mapping=parameter_axis_mapping,
-            dtype=compute_dtype,
+            dtype=load_dtype,
         )
         return named_jit(cast_to_param, parameter_axis_mapping)(model)
 

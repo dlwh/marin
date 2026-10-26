@@ -58,6 +58,7 @@ from levanter.models.llama import LlamaLMHeadModel
 from levanter.models.llama_native_lm import NativeLlamaLmConfig, native_llama_sharding
 from levanter.utils.activation import ActivationFunctionEnum
 from levanter.model_loading import load_hf_checkpoint, load_levanter_checkpoint
+from levanter.main.model_init import load_model_from_source, prepare_model_init_context
 from levanter.optim.config import AdamConfig, ConstantLrSchedule
 from levanter.tracker import NoopConfig, NoopTracker, current_tracker
 from levanter.tracker.json_file import JsonFileTrackerConfig
@@ -571,6 +572,112 @@ def test_native_shared_checkpoint_validates_identity_without_discovery_bookkeepi
         metadata_path.write_text("{")
         with pytest.raises(json.JSONDecodeError):
             load_levanter_checkpoint(model_config, str(checkpoint), **loader_args)
+
+
+@pytest.mark.tpu
+@pytest.mark.parametrize("native", [False, True], ids=["named", "native"])
+@pytest.mark.parametrize("param_dtype", [jnp.float32, jnp.bfloat16], ids=["master-f32", "param-bf16"])
+def test_shared_hf_source_load_preserves_parameter_precision(
+    native_hf_source, tiny_hf_tokenizer_path, native, param_dtype
+):
+    source = native_hf_source
+    tokenizer = load_tokenizer(tiny_hf_tokenizer_path)
+    model_config = source.config
+    if native:
+        model_config = NativeLlamaLmConfig.from_hf_config(source.config.to_hf_config(32))
+    model_config = dataclasses.replace(
+        model_config, reference_checkpoint=str(source.path), tokenizer=tiny_hf_tokenizer_path
+    )
+    policy = jmp.Policy(param_dtype=param_dtype, compute_dtype=jnp.bfloat16, output_dtype=jnp.float32)
+    trainer = train_lm.TrainerConfig(
+        mesh=MeshConfig(axes={"data": len(jax.devices()), "model": 1}),
+        use_explicit_mesh_axes=native,
+        require_accelerator=False,
+    )
+    context = prepare_model_init_context(
+        model_config, tokenizer=tokenizer, initialize_from_hf=str(source.path), use_hf_model_config=False
+    )
+    # Compute independent host references before entering either mesh axis mode.
+    expected_weights = {name: np.asarray(value).astype(param_dtype) for name, value in source.weights.items()}
+    compute_weights = {name: np.asarray(value).astype(jnp.bfloat16) for name, value in source.weights.items()}
+    assert any(
+        not np.array_equal(np.asarray(value), compute_weights[name].astype(np.float32))
+        for name, value in source.weights.items()
+    )
+    with trainer.use_device_mesh():
+        model = load_model_from_source(
+            context=context,
+            Vocab=Axis("vocab", len(tokenizer)),
+            model_key=jrandom.PRNGKey(0),
+            parameter_axis_mapping=trainer.parameter_axis_mapping,
+            compute_axis_mapping=trainer.compute_axis_mapping,
+            load_dtype=policy.param_dtype,
+            cast_to_param=policy.cast_to_param,
+            hf_ref=str(source.path),
+        )
+        state = TrainerState.init(AdamConfig(learning_rate=0.0).build(1), model, key=jrandom.PRNGKey(1), mp=policy)
+        assert model.Vocab.size == 32 and len(tokenizer) == 31
+        for candidate in (model, state.model):
+            actual = to_torch_compatible_state_dict(candidate)
+            assert actual.keys() == source.weights.keys()
+            for name, expected in expected_weights.items():
+                assert actual[name].dtype == param_dtype
+                np.testing.assert_array_equal(actual[name], expected)
+        if not native:
+            evaluated = load_hf_checkpoint(
+                model_config,
+                str(source.path),
+                tokenizer=tokenizer,
+                compute_dtype=policy.compute_dtype,
+                axis_mapping=trainer.parameter_axis_mapping,
+            )
+            for name, actual in to_torch_compatible_state_dict(evaluated).items():
+                np.testing.assert_array_equal(actual, compute_weights[name])
+
+
+@pytest.mark.tpu
+def test_named_hf_training_preserves_fp32_source_with_bf16_compute(tmp_path, native_hf_source, tiny_hf_tokenizer_path):
+    source = native_hf_source
+    examples = ListAsyncDataset([GrugLmExample.causal((jnp.arange(4) + i) % 31) for i in range(16)])
+    devices = len(jax.devices())
+    batch_size = max(4, devices)
+    config = train_lm.TrainLmConfig(
+        model=dataclasses.replace(
+            source.config, reference_checkpoint=str(source.path), tokenizer=tiny_hf_tokenizer_path
+        ),
+        data=LmDataConfig(
+            tokenizer=tiny_hf_tokenizer_path,
+            shuffle=False,
+            components={"direct": DirectDatasetComponent(datasets={"train": examples})},
+        ),
+        initialize_from_hf=str(source.path),
+        use_hf_model_config=False,
+        train_seq_len=4,
+        optimizer=AdamConfig(learning_rate=0.0, warmup=0, lr_schedule=ConstantLrSchedule(), weight_decay=0.0),
+        trainer=train_lm.TrainerConfig(
+            id="source-precision",
+            mesh=MeshConfig(axes={"data": devices, "model": 1}),
+            mp=jmp.get_policy("p=f32,c=bf16,o=f32"),
+            tracker=NoopConfig(),
+            checkpointer=CheckpointerConfig(base_path=str(tmp_path / "checkpoint"), save_interval=None),
+            load_checkpoint=False,
+            train_batch_size=batch_size,
+            per_device_parallelism=batch_size // devices,
+            num_train_steps=1,
+            max_eval_batches=0,
+            require_accelerator=False,
+            distributed=DistributedConfig(initialize_jax_distributed=False),
+            log_jaxprs=False,
+            log_xla_hlo=False,
+        ),
+    )
+    step = train_lm.main(config)
+    assert int(step.state.step) == 1 and np.isfinite(step.loss)
+    assert step.state.model.Vocab.size == 32 and len(config.data.the_tokenizer) == 31
+    actual = to_torch_compatible_state_dict(step.state.model)
+    for name, expected in source.weights.items():
+        assert actual[name].dtype == jnp.float32
+        np.testing.assert_array_equal(actual[name], np.asarray(expected))
 
 
 def test_named_shared_hf_loader_retains_source_config_reconstruction(native_hf_source, tiny_hf_tokenizer_path):
