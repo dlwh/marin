@@ -451,10 +451,16 @@ def _load_separate_reference_model(
 
 
 def _reference_eval_cache_identity(config: TrainDpoConfig) -> dict[str, Any]:
+    computation = {
+        "model": config.model,
+        "precision": str(config.trainer.mp),
+        "quantization": config.trainer.quantization,
+    }
     if isinstance(config.reference, SeparateReferenceConfig):
         return {
             "reference_type": "separate",
             "reference": config.reference,
+            **computation,
         }
 
     if isinstance(config.reference, AdapterBaseReferenceConfig):
@@ -472,6 +478,7 @@ def _reference_eval_cache_identity(config: TrainDpoConfig) -> dict[str, Any]:
             "reference": config.reference,
             "adapter": config.adapter,
             "base_source": base_source,
+            **computation,
         }
 
     raise TypeError(f"Unsupported reference configuration: {type(config.reference).__name__}")
@@ -704,26 +711,25 @@ def main(config: TrainDpoConfig) -> callbacks.StepInfo:
         vocab_size = len(tokenizer)
         Vocab = round_axis_for_partitioning(Axis("vocab", vocab_size), parameter_axis_mapping)
         initial_policy_source = None
+        checkpoint = trainer.checkpoint_to_load
         if isinstance(config.model, NativeLlamaLmConfig):
-            checkpoint = trainer.checkpoint_to_load
             source_vocab = config.model.checkpoint_vocab_size(checkpoint.metadata) if checkpoint is not None else None
             if source_vocab is not None:
                 if vocab_size > source_vocab:
                     raise ValueError("llama_native tokenizer vocabulary exceeds the checkpoint vocabulary")
                 Vocab = Vocab.resize(source_vocab)
-            if checkpoint is None and (
-                config.initialize_from_hf or config.initialize_from_checkpoint_path is not None
-            ):
-                initial_policy_source = _initialize_policy_model_from_source(
-                    config=config,
-                    model_context=model_context,
-                    Vocab=Vocab,
-                    policy_key=policy_key,
-                    adapter_key=adapter_key,
-                    parameter_axis_mapping=parameter_axis_mapping,
-                    trainer=trainer,
-                )
-                Vocab = initial_policy_source.Vocab
+        if checkpoint is None and (config.initialize_from_hf or config.initialize_from_checkpoint_path is not None):
+            initial_policy_source = _initialize_policy_model_from_source(
+                config=config,
+                model_context=model_context,
+                Vocab=Vocab,
+                policy_key=policy_key,
+                adapter_key=adapter_key,
+                parameter_axis_mapping=parameter_axis_mapping,
+                trainer=trainer,
+            )
+            Vocab = initial_policy_source.Vocab
+        if isinstance(config.model, NativeLlamaLmConfig):
             config.model.validate_sharding(sharding, trainer.device_mesh, Vocab.size)
         if vocab_size != Vocab.size:
             logger.info(f"Rounding vocab size from {vocab_size} to {Vocab.size} for partitioning")
@@ -760,13 +766,13 @@ def main(config: TrainDpoConfig) -> callbacks.StepInfo:
                 axis_mapping=parameter_axis_mapping,
             )
         if isinstance(config.reference, SeparateReferenceConfig):
-            initial_reference_model = build_model(
-                config.model,
-                Vocab,
-                key=model_key,
-                parameter_axis_mapping=trainer.parameter_axis_mapping,
-                compute_axis_mapping=trainer.compute_axis_mapping,
-                batch_axis_name=trainer.config.batch_axis_name,
+            initial_reference_model = _load_separate_reference_model(
+                config,
+                reference_model_key=model_key,
+                model_context=model_context,
+                Vocab=Vocab,
+                parameter_axis_mapping=parameter_axis_mapping,
+                trainer=trainer,
             )
             initial_model = DpoModel(policy=initial_policy_model, reference=initial_reference_model)
             trainable_filter = DpoModel(policy=config.adapter.trainable_filter(initial_policy_model), reference=False)
@@ -776,38 +782,10 @@ def main(config: TrainDpoConfig) -> callbacks.StepInfo:
 
         state = trainer.initial_state(training_key, model=initial_model, is_trainable=trainable_filter)
 
-        if int(state.step) == 0:
-            if initial_policy_source is not None:
-                policy_model = initial_policy_source
-            elif config.initialize_from_hf:
-                logger.info(
-                    f"No training checkpoint found. Initializing model from HF checkpoint '{config.initialize_from_hf}'"
-                )
-                policy_model = _initialize_policy_model_from_source(
-                    config=config,
-                    model_context=model_context,
-                    Vocab=Vocab,
-                    policy_key=policy_key,
-                    adapter_key=adapter_key,
-                    parameter_axis_mapping=parameter_axis_mapping,
-                    trainer=trainer,
-                )
-            elif config.initialize_from_checkpoint_path is not None:
-                policy_model = _initialize_policy_model_from_source(
-                    config=config,
-                    model_context=model_context,
-                    Vocab=Vocab,
-                    policy_key=policy_key,
-                    adapter_key=adapter_key,
-                    parameter_axis_mapping=parameter_axis_mapping,
-                    trainer=trainer,
-                )
-            else:
-                logger.info("No checkpoint found. Starting from scratch.")
-                policy_model = state.model.policy if isinstance(state.model, DpoModel) else state.model
-        else:
+        # Retain the policy after Trainer applies precision, quantization and checkpoint state.
+        policy_model = state.model.policy if isinstance(state.model, DpoModel) else state.model
+        if checkpoint is not None:
             logger.info(f"Resuming from step {state.step}, using checkpoint policy weights.")
-            policy_model = state.model.policy if isinstance(state.model, DpoModel) else state.model
             if not isinstance(config.adapter, NoAdaptorConfig):
                 logger.info(
                     "Adapter checkpoints only store trainable weights. Reconstructing the base policy model from the "
@@ -829,14 +807,7 @@ def main(config: TrainDpoConfig) -> callbacks.StepInfo:
                 )
 
         if isinstance(config.reference, SeparateReferenceConfig):
-            reference_model = _load_separate_reference_model(
-                config,
-                reference_model_key=model_key,
-                model_context=model_context,
-                Vocab=Vocab,
-                parameter_axis_mapping=parameter_axis_mapping,
-                trainer=trainer,
-            )
+            reference_model = cast(DpoModel, state.model).reference
             state = dataclasses.replace(state, model=DpoModel(policy=policy_model, reference=reference_model))
         else:
             reference_provider = _build_reference_provider(config)
