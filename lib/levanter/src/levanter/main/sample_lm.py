@@ -15,13 +15,12 @@ from haliax.partitioning import round_axis_for_partitioning
 import levanter
 import levanter.config
 import levanter.tracker
-from levanter.quantization import cast_model_preserving_quantization_state
 from levanter.callbacks import profile_ctx
 from levanter.compat.hf_checkpoints import RepoRef, load_tokenizer
 from levanter.inference.engine import GenerationResult, InferenceEngine, InferenceEngineConfig, Request
 from levanter.inference.jit_scheduler import SeqDecodingParams
 from levanter.inference.utils import INVALID
-from levanter.main.model_init import ModelInitContext, load_model_from_source, prepare_model_init_context
+from levanter.main.model_init import load_model_for_inference
 from levanter.models.llama import LlamaConfig
 from levanter.models.lm_model import LmConfig, LmHeadModel
 from levanter.trainer import TrainerConfig
@@ -67,31 +66,16 @@ class SampleLmConfig:
 
 def _load_model(config: SampleLmConfig, Vocab: Axis, *, tokenizer, key) -> LmHeadModel:
     """Load sampling parameters in computation precision under the active mesh."""
-    if config.checkpoint_path is None and config.hf_checkpoint is None:
-        raise ValueError("Must specify either checkpoint_path or hf_checkpoint")
-    if config.checkpoint_path is not None and config.hf_checkpoint is not None:
-        raise ValueError("Specify only one of checkpoint_path or hf_checkpoint")
-
-    hf_ref = str(config.hf_checkpoint) if config.hf_checkpoint is not None else False
-    if hf_ref:
-        context = prepare_model_init_context(
-            config.model,
-            tokenizer=tokenizer,
-            initialize_from_hf=hf_ref,
-            use_hf_model_config=True,
-        )
-    else:
-        context = ModelInitContext(model=config.model, converter=None, use_hf_model_config=False)
-    return load_model_from_source(
-        context=context,
-        Vocab=Vocab,
+    return load_model_for_inference(
+        config.model,
+        Vocab,
+        tokenizer=tokenizer,
         model_key=key,
         parameter_axis_mapping=config.trainer.parameter_axis_mapping,
         compute_axis_mapping=config.trainer.compute_axis_mapping,
         batch_axis_name=config.trainer.batch_axis_name,
-        load_dtype=config.trainer.mp.compute_dtype,
-        cast_to_param=lambda model: cast_model_preserving_quantization_state(model, config.trainer.mp.cast_to_compute),
-        hf_ref=hf_ref,
+        mp=config.trainer.mp,
+        hf_ref=str(config.hf_checkpoint) if config.hf_checkpoint is not None else None,
         checkpoint_path=config.checkpoint_path,
     )
 

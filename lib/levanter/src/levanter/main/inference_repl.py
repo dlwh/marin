@@ -37,9 +37,8 @@ from rich.panel import Panel
 
 import levanter
 import levanter.config
-from levanter.quantization import cast_model_preserving_quantization_state
 from levanter.compat.hf_checkpoints import _is_hf_model_id
-from levanter.main.model_init import ModelInitContext, load_model_from_source, prepare_model_init_context
+from levanter.main.model_init import load_model_for_inference
 from levanter.tokenizers import MarinTokenizer, load_tokenizer
 from levanter.inference.engine import InferenceEngineConfig
 from levanter.inference.openai import (
@@ -74,34 +73,18 @@ def _load_model(
     key,
 ) -> LmHeadModel:
     """Load inference weights with the shared source and computation-cast contract."""
-    if levanter_checkpoint is None and hf_checkpoint is None:
-        raise ValueError("Must specify either checkpoint_path or hf_checkpoint")
-    if levanter_checkpoint is not None and hf_checkpoint is not None:
-        raise ValueError("Specify only one of checkpoint_path or hf_checkpoint")
-
-    if hf_checkpoint is not None:
-        context = prepare_model_init_context(
-            model_config,
-            tokenizer=tokenizer,
-            initialize_from_hf=hf_checkpoint,
-            use_hf_model_config=True,
-        )
-    else:
-        context = ModelInitContext(model=model_config, converter=None, use_hf_model_config=False)
     with trainer_config.use_device_mesh():
         Vocab = round_axis_for_partitioning(Axis("vocab", len(tokenizer)), trainer_config.compute_axis_mapping)
-        return load_model_from_source(
-            context=context,
-            Vocab=Vocab,
+        return load_model_for_inference(
+            model_config,
+            Vocab,
+            tokenizer=tokenizer,
             model_key=key,
             parameter_axis_mapping=trainer_config.parameter_axis_mapping,
             compute_axis_mapping=trainer_config.compute_axis_mapping,
             batch_axis_name=trainer_config.batch_axis_name,
-            load_dtype=trainer_config.mp.compute_dtype,
-            cast_to_param=lambda model: cast_model_preserving_quantization_state(
-                model, trainer_config.mp.cast_to_compute
-            ),
-            hf_ref=hf_checkpoint if hf_checkpoint is not None else False,
+            mp=trainer_config.mp,
+            hf_ref=hf_checkpoint,
             checkpoint_path=levanter_checkpoint,
         )
 

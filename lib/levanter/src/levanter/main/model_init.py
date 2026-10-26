@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import cast
 
 import equinox as eqx
+import jmp
 from haliax import Axis
 from haliax.partitioning import ResourceMapping, named_jit
 from jaxtyping import PRNGKeyArray
@@ -16,6 +17,7 @@ from levanter.compat.hf_checkpoints import HFCheckpointConverter, HFCompatConfig
 from levanter.model_loading import load_hf_checkpoint, load_levanter_checkpoint
 from levanter.models.llama_native_lm import NativeLlamaLmConfig, native_llama_sharding
 from levanter.models.lm_model import LmConfig, LmHeadModel
+from levanter.quantization import cast_model_preserving_quantization_state
 from levanter.utils.jax_utils import use_cpu_device
 
 
@@ -88,6 +90,48 @@ def prepare_model_init_context(
         converter = None
 
     return ModelInitContext(model=model, converter=converter, use_hf_model_config=use_hf_model_config)
+
+
+def load_model_for_inference(
+    model: LmConfig,
+    Vocab: Axis,
+    *,
+    tokenizer,
+    model_key: PRNGKeyArray,
+    parameter_axis_mapping: ResourceMapping,
+    compute_axis_mapping: ResourceMapping,
+    batch_axis_name: str,
+    mp: jmp.Policy,
+    hf_ref: str | None,
+    checkpoint_path: str | None,
+) -> LmHeadModel:
+    """Load inference weights in computation precision under the active mesh."""
+    if checkpoint_path is None and hf_ref is None:
+        raise ValueError("Must specify either checkpoint_path or hf_checkpoint")
+    if checkpoint_path is not None and hf_ref is not None:
+        raise ValueError("Specify only one of checkpoint_path or hf_checkpoint")
+
+    if hf_ref is not None:
+        context = prepare_model_init_context(
+            model,
+            tokenizer=tokenizer,
+            initialize_from_hf=hf_ref,
+            use_hf_model_config=True,
+        )
+    else:
+        context = ModelInitContext(model=model, converter=None, use_hf_model_config=False)
+    return load_model_from_source(
+        context=context,
+        Vocab=Vocab,
+        model_key=model_key,
+        parameter_axis_mapping=parameter_axis_mapping,
+        compute_axis_mapping=compute_axis_mapping,
+        batch_axis_name=batch_axis_name,
+        load_dtype=mp.compute_dtype,
+        cast_to_param=lambda model: cast_model_preserving_quantization_state(model, mp.cast_to_compute),
+        hf_ref=hf_ref if hf_ref is not None else False,
+        checkpoint_path=checkpoint_path,
+    )
 
 
 def load_model_from_source(
