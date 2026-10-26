@@ -605,7 +605,8 @@ def main(config: TrainDpoConfig) -> callbacks.StepInfo:
         if not isinstance(config.adapter, (NoAdaptorConfig, LoraAdaptorConfig)):
             raise ValueError("llama_native DPO supports only full-parameter training and LoRA adapters")
         if config.trainer.quantization is not None:
-            raise ValueError("llama_native DPO does not support Haliax quantization")
+            if not config.trainer.quantization.fp8:
+                raise ValueError("llama_native quantization supports FP8 only")
         if config.initialize_from_hf and config.use_hf_model_config:
             model_context = prepare_model_init_context(
                 config.model,

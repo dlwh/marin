@@ -15,6 +15,7 @@ import jax
 import jax.numpy as jnp
 import jmp
 import numpy as np
+from jax.sharding import AxisType, reshard
 from haliax.partitioning import ResourceMapping, named_jit
 from haliax.quantization import accumulate_gradients
 
@@ -172,21 +173,26 @@ def _policy_logps_bwd(residuals, cotangents, perturbed, policy_model, chosen, re
     return accumulate_gradients(chosen_gradient, rejected_gradient)
 
 
-def _cached_logp_named(logps: Any, axes: tuple[hax.Axis, ...]) -> hax.NamedArray:
-    return hax.named(jnp.reshape(jnp.asarray(logps), tuple(axis.size for axis in axes)), axes)
+def _cached_logp_named(logps: Any, template: hax.NamedArray) -> hax.NamedArray:
+    values = jnp.reshape(jnp.asarray(logps), template.array.shape)
+    sharding = jax.typeof(template.array).sharding
+    if not sharding.mesh.empty and all(axis_type == AxisType.Explicit for axis_type in sharding.mesh.axis_types):
+        # Cached loader arrays may retain size-one batch axes omitted by the policy.
+        values = reshard(values, sharding.spec)
+    return hax.named(values, template.axes)
 
 
 def _reference_logps_for_example(
     example: DpoExample | CachedDpoExample,
     *,
     reference_model: LmHeadModel | None,
-    logp_axes: tuple[hax.Axis, ...],
+    logp_template: hax.NamedArray,
     key_chosen=None,
     key_rejected=None,
 ) -> tuple[hax.NamedArray, hax.NamedArray]:
     if isinstance(example, CachedDpoExample):
-        return _cached_logp_named(example.logp_ref_chosen, logp_axes), _cached_logp_named(
-            example.logp_ref_rejected, logp_axes
+        return _cached_logp_named(example.logp_ref_chosen, logp_template), _cached_logp_named(
+            example.logp_ref_rejected, logp_template
         )
 
     if reference_model is None:
@@ -215,7 +221,7 @@ def dpo_loss(
     logp_ref_chosen, logp_ref_rejected = _reference_logps_for_example(
         example,
         reference_model=reference_model,
-        logp_axes=logp_pi_chosen.axes,
+        logp_template=logp_pi_chosen,
         key_chosen=key_chosen,
         key_rejected=key_rejected,
     )

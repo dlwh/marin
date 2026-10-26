@@ -207,8 +207,26 @@ checkpoints omit the frozen base, so resume requires the unchanged base source,
 model and adapter configuration. Base-source identity, adapter alpha and target
 selection are not validated by these checkpoints.
 
-Native DPO does not support Haliax quantization or Hub upload. Full-parameter HF
-policy exports use a local `hf_save_path`; LoRA uses local `peft_save_path` and
+Native DPO supports `trainer.quantization.fp8: true` with FP32 trainable weights
+and FP32 or BF16 compute, for full-parameter and LoRA training. Scales and amax
+histories remain float32. Native INT8 and non-FP8 quantization configurations
+remain unsupported. Resume with unchanged precision and quantization settings;
+full checkpoints retain trainable FP8 state, while LoRA checkpoints retain factor
+state and reconstruct the frozen base before restoring it. With
+`use_hf_model_config: false`, full checkpoints can resume without the policy HF
+source; a separate reference still requires its unchanged source.
+
+With `reference.type: separate`, quantization regexes match the complete model
+path. Use `targets: 'policy\..*'` to quantize the policy and keep the reference
+unquantized. Omitting `targets` quantizes both policy and frozen reference
+projections. With `reference.type: adapter_base`, omit `targets` to quantize base
+projections and LoRA factors; this policy is the root model, so its paths do not
+have the `policy.` prefix. Frozen base/reference weights and their FP8 scales and
+histories remain fixed. The reference eval cache supports both modes and records
+the precision and quantization request in its identity.
+
+Hub upload remains unsupported. Full-parameter HF policy exports use a local
+`hf_save_path`; LoRA uses local `peft_save_path` and
 `merged_hf_save_path` directories. See [LoRA adapters](../Training-On-Your-Data.md#lora-adapters)
 for export and resume details. The default remains Haliax Llama (`model.type: llama`).
 
