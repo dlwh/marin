@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from pathlib import Path
 
@@ -785,7 +786,9 @@ def ci_batch_workspace(tmp_path: Path) -> Path:
         "lib/levanter/tests/test_batch_probe.py",
         f"""\
         import json
+        import logging
         import os
+        import sys
         from pathlib import Path
 
         import pytest
@@ -794,6 +797,9 @@ def ci_batch_workspace(tmp_path: Path) -> Path:
 
         @pytest.mark.parametrize("index", range(4))
         def test_case(index, request):
+            print(f"batch probe stdout {{index}}")
+            print(f"batch probe stderr {{index}}", file=sys.stderr)
+            logging.warning("batch probe log %s", index)
             with OUTPUT.open("a") as output:
                 output.write(json.dumps({{"id": request.node.nodeid, "index": index,
                                          "pid": os.getpid(),
@@ -839,7 +845,7 @@ def test_ci_batches_execute_every_selected_case_once_in_distinct_sessions(
 
 
 def test_ci_batch_failure_does_not_prevent_the_later_session(
-    ci_batch_workspace: Path, monkeypatch: pytest.MonkeyPatch
+    ci_batch_workspace: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
 ) -> None:
     path = ci_batch_workspace / "lib/levanter/tests/test_batch_probe.py"
     path.write_text(
@@ -854,6 +860,27 @@ def test_ci_batch_failure_does_not_prevent_the_later_session(
     assert status != 0
     assert sorted(event["index"] for event in events) == [1, 2, 3]
     assert [batch["status"] for batch in manifest["batches"]] == ["failed", "passed"]
+    reports = [json.loads((ci_batch_workspace / f"reports/batch-{index}.json").read_text()) for index in (1, 2)]
+    failed = next(test for test in reports[0]["tests"] if test["outcome"] == "failed")
+    failed_path, _, failed_case = failed["nodeid"].partition("::")
+    assert (Path(reports[0]["root"]) / failed_path).resolve() == path.resolve()
+    assert failed_case == "test_case[0]"
+    assert [failed[phase]["outcome"] for phase in ("setup", "call", "teardown")] == ["passed", "failed", "passed"]
+    assert "assert 0 != 0" in failed["call"]["longrepr"]
+    assert failed["call"]["traceback"]
+    for report in reports:
+        for test in report["tests"]:
+            for phase in ("setup", "call", "teardown"):
+                assert not {"log", "stdout", "stderr"} & test[phase].keys()
+
+    failure = ET.parse(ci_batch_workspace / "reports/batch-1.xml").find(".//failure")
+    assert failure is not None
+    assert "assert 0 != 0" in "".join(failure.itertext())
+    captured = capfd.readouterr()
+    console = captured.out + captured.err
+    assert "batch probe stdout 0" in console
+    assert "batch probe stderr 0" in console
+    assert "batch probe log 0" in console
 
 
 def test_ci_batch_interruption_reports_every_unfinished_case(
