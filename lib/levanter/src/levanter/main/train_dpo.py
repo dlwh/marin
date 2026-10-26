@@ -58,7 +58,6 @@ from levanter.models.llama_native_lm import NativeLlamaLmConfig, NativeLlamaLmHe
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel
 from levanter.optim.config import AdamConfig, OptimizerConfig
 from levanter.trainer import ExplicitTrainingLayout, Trainer, TrainerConfig
-from levanter.trainer_state import trainables_only
 from levanter.utils.jax_utils import parameter_count
 from levanter.utils.tree_utils import inference_mode
 
@@ -68,15 +67,6 @@ logger = logging.getLogger(__name__)
 
 def _policy_model_for_hf_save(model: DpoModel | LmHeadModel) -> LmHeadModel:
     return model.policy if isinstance(model, DpoModel) else model
-
-
-def _restore_policy_model_from_partial_checkpoint(
-    checkpointed_policy_model: LmHeadModel,
-    source_policy_model: LmHeadModel,
-    trainable_filter,
-) -> LmHeadModel:
-    checkpointed_trainables = trainables_only(checkpointed_policy_model, trainable_filter)
-    return eqx.combine(checkpointed_trainables, source_policy_model)
 
 
 def _initialize_policy_model_from_source(
@@ -718,7 +708,8 @@ def main(config: TrainDpoConfig) -> callbacks.StepInfo:
                 if vocab_size > source_vocab:
                     raise ValueError("llama_native tokenizer vocabulary exceeds the checkpoint vocabulary")
                 Vocab = Vocab.resize(source_vocab)
-        if checkpoint is None and (config.initialize_from_hf or config.initialize_from_checkpoint_path is not None):
+        needs_policy_source = checkpoint is None or not isinstance(config.adapter, NoAdaptorConfig)
+        if needs_policy_source and (config.initialize_from_hf or config.initialize_from_checkpoint_path is not None):
             initial_policy_source = _initialize_policy_model_from_source(
                 config=config,
                 model_context=model_context,
@@ -786,25 +777,6 @@ def main(config: TrainDpoConfig) -> callbacks.StepInfo:
         policy_model = state.model.policy if isinstance(state.model, DpoModel) else state.model
         if checkpoint is not None:
             logger.info(f"Resuming from step {state.step}, using checkpoint policy weights.")
-            if not isinstance(config.adapter, NoAdaptorConfig):
-                logger.info(
-                    "Adapter checkpoints only store trainable weights. Reconstructing the base policy model from the "
-                    "configured source before overlaying resumed adapter parameters."
-                )
-                source_policy_model = _initialize_policy_model_from_source(
-                    config=config,
-                    model_context=model_context,
-                    Vocab=Vocab,
-                    policy_key=policy_key,
-                    adapter_key=adapter_key,
-                    parameter_axis_mapping=parameter_axis_mapping,
-                    trainer=trainer,
-                )
-                policy_model = _restore_policy_model_from_partial_checkpoint(
-                    policy_model,
-                    source_policy_model,
-                    config.adapter.trainable_filter(source_policy_model),
-                )
 
         if isinstance(config.reference, SeparateReferenceConfig):
             reference_model = cast(DpoModel, state.model).reference
