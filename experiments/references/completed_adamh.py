@@ -27,7 +27,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 
 from levanter.layers.rotary import Llama3RotaryEmbeddingsConfig
-from levanter.models.llama import LlamaConfig
+from levanter.models.llama_config import LlamaConfig
 from levanter.models.qwen import Qwen3Config
 from levanter.optim.adamh import AdamHConfig
 from marin.processing.tokenize.data_configs import get_vocab_size_for_tokenizer

@@ -13,7 +13,8 @@ import levanter.main.viz_logprobs as viz_logprobs
 from levanter.testing import tiny_corpus
 from levanter.checkpoint import save_checkpoint
 from levanter.distributed import DistributedConfig
-from levanter.models.llama import LlamaConfig, LlamaLMHeadModel
+from levanter.models.llama import LlamaLMHeadModel
+from levanter.models.llama_config import LlamaConfig
 from levanter.tracker import NoopConfig
 
 

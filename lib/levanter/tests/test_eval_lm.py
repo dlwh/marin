@@ -12,7 +12,8 @@ import levanter.main.eval_lm as eval_lm
 from levanter.testing import tiny_corpus
 from levanter.checkpoint import save_checkpoint
 from levanter.distributed import DistributedConfig
-from levanter.models.llama import LlamaConfig, LlamaLMHeadModel
+from levanter.models.llama import LlamaLMHeadModel
+from levanter.models.llama_config import LlamaConfig
 from levanter.tracker import NoopConfig
 from levanter.trainer_state import TrainerState
 from levanter.testing.helpers import skip_if_no_torch

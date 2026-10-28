@@ -35,7 +35,7 @@ from levanter.models.gemma import (
 )
 from levanter.models.gemma import Gemma2DecoderLayer as LevDecoderLayer  # local to avoid circular import at top
 from levanter.layers.gated_mlp import LlamaMlp
-from levanter.models.llama import LlamaConfig
+from levanter.models.llama_config import LlamaConfig
 from levanter.utils.jax_utils import parameter_count
 
 # N.B. Gemma uses LLamaAttention directly so we skip tests for attention and rotary embeddings.

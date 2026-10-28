@@ -28,7 +28,7 @@ from levanter.layers.attention import AttentionMask
 from levanter.layers.rotary import DefaultRotaryEmbeddingsConfig
 from levanter.model_loading import load_levanter_checkpoint
 from levanter.models.gpt2 import Gpt2Config, Gpt2LMHeadModel
-from levanter.models.llama import LlamaConfig
+from levanter.models.llama_config import LlamaConfig
 from levanter.models.llama_native_lm import NativeLlamaLmConfig
 from levanter.testing.hf_checkpoints import write_llama_checkpoint
 from levanter.testing.helpers import use_test_mesh

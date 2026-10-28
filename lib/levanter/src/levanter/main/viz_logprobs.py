@@ -19,7 +19,7 @@ from levanter.quantization import cast_model_preserving_quantization_state
 from levanter.data.loader import DataLoader
 from levanter.data.text.datasets import LmDataConfig
 from levanter.model_loading import load_hf_checkpoint, load_levanter_checkpoint, native_evaluation_axis_mapping
-from levanter.models.llama import LlamaConfig
+from levanter.models.llama_config import LlamaConfig
 from levanter.models.llama_native_lm import NativeLlamaLmConfig
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel, split_activations
 from levanter.models.loss import next_token_loss

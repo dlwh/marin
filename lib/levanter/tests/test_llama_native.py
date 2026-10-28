@@ -23,7 +23,8 @@ from levanter.layers.rotary import (
     YarnRotaryEmbeddingsConfig,
 )
 from levanter.layers.rotary_native import Llama3RotaryConfig, RotaryConfig, YarnRotaryConfig, apply_rotary
-from levanter.models.llama import LlamaConfig, LlamaLMHeadModel
+from levanter.models.llama import LlamaLMHeadModel
+from levanter.models.llama_config import LlamaConfig
 from levanter.models.llama_native import NativeLlamaConfig, NativeLlamaModel, NativeLlamaSharding
 from levanter.models.llama_native_lm import NativeLlamaLmConfig
 from levanter.models.lm_model import LmExample

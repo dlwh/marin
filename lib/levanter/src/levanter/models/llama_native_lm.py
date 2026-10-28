@@ -43,7 +43,7 @@ from levanter.layers.rotary_native import (
     YarnRotaryConfig,
     yarn_attention_factor,
 )
-from levanter.models.llama import LlamaConfig
+from levanter.models.llama_config import LlamaConfig
 from levanter.models.llama_native import NativeLlamaConfig, NativeLlamaModel, NativeLlamaSharding
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel
 from levanter.tokenizers import MarinTokenizer

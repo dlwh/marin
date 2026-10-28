@@ -25,7 +25,7 @@ from levanter.compat.hf_checkpoints import (
     RepoRef,
     load_tokenizer,
 )
-from levanter.models.llama import LlamaConfig
+from levanter.models.llama_config import LlamaConfig
 from levanter.models.llama_native import NativeLlamaSharding
 from levanter.models.llama_native_lm import NativeLlamaLmConfig, native_llama_sharding
 from levanter.models.lm_model import LmConfig, LmHeadModel

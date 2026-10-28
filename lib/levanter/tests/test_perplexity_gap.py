@@ -58,7 +58,8 @@ from levanter.main.perplexity_gap import (
     main,
     score_main,
 )
-from levanter.models.llama import LlamaConfig, LlamaLMHeadModel
+from levanter.models.llama import LlamaLMHeadModel
+from levanter.models.llama_config import LlamaConfig
 from levanter.tracker import current_tracker
 from levanter.tracker.tracker import DictTracker
 from levanter.tracker import NoopConfig

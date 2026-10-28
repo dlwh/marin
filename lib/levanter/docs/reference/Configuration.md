@@ -486,7 +486,14 @@ Additionally, [levanter.optim.AdamConfig][] has the following fields:
 [levanter.models.lm_model.LmConfig][] is a Draccus "choice class" that acts as a base class for all autoregressive
 language models in Levanter. You typically will specify a kind of model by using the `type` field, which is a string
 that specifies the kind of model. For instance, `type: gpt2` will use the [levanter.models.gpt2.Gpt2Config][] class,
-while `type: llama` will use the [levanter.models.llama.LlamaConfig][] class.
+while `type: llama` will use the [levanter.models.llama_config.LlamaConfig][] class.
+
+The shared config lives separately from the runtime. `llama` still selects the named
+Haliax model; `llama_native` selects Native-JAX. Python class-valued fingerprints and
+pickled recovery or worker payloads depend on the defining class path. Regenerate
+those payloads with matching source on launchers and workers; mixed-version Python
+serialization is not a compatibility guarantee. Draccus configs retain their registry
+selectors.
 
 We won't go into detail here. You can see the auto-generated docs below.
 
@@ -564,4 +571,4 @@ trainer:
 
 ::: levanter.models.gpt2.Gpt2Config
 
-::: levanter.models.llama.LlamaConfig
+::: levanter.models.llama_config.LlamaConfig

@@ -19,7 +19,7 @@ from levanter.data.text.datasets import UrlDatasetSourceConfig
 from levanter.data.text.trace_chat import TraceChatEvaluationFormat
 from levanter.distributed import DistributedConfig
 from levanter.layers.attention import AttentionMask
-from levanter.models.llama import LlamaConfig
+from levanter.models.llama_config import LlamaConfig
 from levanter.models.llama_native_lm import NativeLlamaLmConfig, native_llama_sharding
 from levanter.testing.hf_checkpoints import write_llama_checkpoint
 from levanter.tokenizers import load_tokenizer

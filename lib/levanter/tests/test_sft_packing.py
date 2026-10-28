@@ -27,7 +27,7 @@ from levanter.data.text.examples import named_lm_example_from_grug
 from levanter.data.text.formats import ChatProcessor
 from levanter.grug.attention import reference_attention
 from levanter.layers.attention import AttentionBackend, AttentionMask, dot_product_attention
-from levanter.models.llama import LlamaConfig
+from levanter.models.llama_config import LlamaConfig
 from levanter.store.cache import SerialCacheWriter
 from levanter.tokenizers import MarinTokenizer, load_tokenizer
 from levanter.utils.tree_utils import inference_mode

@@ -30,7 +30,7 @@ Embed = property(lambda self: Axis(name="embed", size=self.hidden_dim))
 Mlp = property(lambda self: Axis(name="mlp", size=self.intermediate_dim))
 ```
 
-For real examples and deeper understanding, check out `Gpt2Config` in [gpt2.py](https://github.com/stanford-crfm/levanter/blob/main/src/levanter/models/gpt2.py) and `LlamaConfig` in [llama.py](https://github.com/stanford-crfm/levanter/blob/main/src/levanter/models/llama.py).
+For real examples and deeper understanding, check out `Gpt2Config` in [gpt2.py](https://github.com/stanford-crfm/levanter/blob/main/src/levanter/models/gpt2.py) and [`LlamaConfig`][levanter.models.llama_config.LlamaConfig].
 
 #### [For HF models] Convert to/from Hugging Face Config
 To convert your config class to and from Hugging Face config class, you will need to:

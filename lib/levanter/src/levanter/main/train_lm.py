@@ -37,7 +37,7 @@ from levanter.data.text.examples import GrugLmExample, named_lm_example_from_gru
 from levanter.eval_harness import LmEvalHarnessConfig
 from levanter.model_loading import native_evaluation_axis_mapping
 from levanter.main.model_init import ModelInitContext, build_model, prepare_model_init_context
-from levanter.models.llama import LlamaConfig
+from levanter.models.llama_config import LlamaConfig
 from levanter.models.llama_native import NativeLlamaSharding
 from levanter.models.llama_native_lm import NativeLlamaLmConfig, NativeLlamaLmHeadModel, native_llama_sharding
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel, split_activations

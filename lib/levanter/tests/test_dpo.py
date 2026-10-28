@@ -83,7 +83,7 @@ from levanter.main.train_dpo import (
 from levanter.metrics import Metric
 from levanter.models.gpt2 import Gpt2Config, Gpt2LMHeadModel
 from levanter.models.lm_model import LmExample
-from levanter.models.llama import LlamaConfig
+from levanter.models.llama_config import LlamaConfig
 from levanter.models.llama_native_lm import NativeLlamaLmConfig, native_llama_sharding
 from levanter.quantization import cast_model_preserving_quantization_state, quantize_linear_layers
 from levanter.optim.config import AdamConfig

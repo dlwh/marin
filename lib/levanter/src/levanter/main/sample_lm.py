@@ -21,7 +21,7 @@ from levanter.inference.engine import GenerationResult, InferenceEngine, Inferen
 from levanter.inference.jit_scheduler import SeqDecodingParams
 from levanter.inference.utils import INVALID
 from levanter.main.model_init import load_model_for_inference
-from levanter.models.llama import LlamaConfig
+from levanter.models.llama_config import LlamaConfig
 from levanter.models.lm_model import LmConfig, LmHeadModel
 from levanter.trainer import TrainerConfig
 

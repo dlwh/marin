@@ -28,7 +28,7 @@ from levanter.data.text.trace_chat import (
 )
 from levanter.eval import LabeledEvaluator, eval_labeled_model
 from levanter.model_loading import native_evaluation_axis_mapping
-from levanter.models.llama import LlamaConfig
+from levanter.models.llama_config import LlamaConfig
 from levanter.models.llama_native_lm import NativeLlamaLmConfig
 from levanter.models.lm_model import LmConfig
 from levanter.tokenizers import load_tokenizer as load_marin_tokenizer

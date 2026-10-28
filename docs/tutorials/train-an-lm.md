@@ -36,7 +36,7 @@ Choose a Levanter model configuration. The full architecture is stated as litera
 enters the artifact's fingerprint:
 
 ```python
-from levanter.models.llama import LlamaConfig
+from levanter.models.llama_config import LlamaConfig
 
 SEQ_LEN = 2048
 BATCH_SIZE = 256
