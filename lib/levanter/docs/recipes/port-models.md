@@ -49,12 +49,12 @@ In general, pattern match on `llama.py` or `mixtral.py` for examples of how to i
 ## Tips
 - Avoid positional tensors: always use named `Axis`.
 - Use `rearrange`, `dot`, and `einsum` for shape and contraction logic.
-- Use gradient checkpointing policies similar to what's in `llama.py`.
+- Use gradient checkpointing policies similar to what's in `llama_transformer.py`.
 - Haliax means you generally don't need to worry about sharding. For more complex things you may. See `mixtral.py` for an example of an MoE.
 
 ## Example Models
 - `GPT2Config`, `Gpt2Transformer` in `levanter.models.gpt2`
-- `LlamaConfig` in `levanter.models.llama_config` and `LlamaTransformer` in `levanter.models.llama`
+- `LlamaConfig` in `levanter.models.llama_config` and `LlamaTransformer` in `levanter.models.llama_transformer`
 
 Llama is probably the most modern and well-structured example, so it is a good reference point.
 

@@ -22,10 +22,11 @@ from levanter.testing.helpers import (
 )
 from transformers import AutoModelForCausalLM, LlamaForCausalLM
 
-from levanter.layers.attention import AttentionBackend, AttentionMask
+from levanter.layers.attention import Attention, AttentionBackend, AttentionMask
 from levanter.main.train_lm import TrainLmConfig
-from levanter.models.llama import Attention, LlamaDecoderLayer, LlamaLMHeadModel
+from levanter.models.llama import LlamaLMHeadModel
 from levanter.models.llama_config import LlamaConfig
+from levanter.models.llama_transformer import LlamaDecoderLayer
 from levanter.testing.model_configs import llama_test_config
 from levanter.utils.jax_utils import parameter_count
 
