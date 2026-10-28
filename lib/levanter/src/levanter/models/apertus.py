@@ -22,8 +22,8 @@ from levanter.inference.page_table import PageBatchInfo, PageTableSpec
 from levanter.layers.attention import Attention, AttentionMask
 from levanter.layers.kv_cache import KvPageCache, ListCache
 from levanter.layers.rotary import Llama3RotaryEmbeddingsConfig, RotaryEmbeddingsConfig
-from levanter.models.llama import LlamaEmbedding
 from levanter.models.llama_config import LlamaConfig
+from levanter.models.llama_embedding import LlamaEmbedding
 from levanter.models.lm_model import LmConfig, LmHeadModel, resize_embeddings_and_lm_head
 from levanter.utils.activation import ActivationFunctionEnum
 from levanter.utils.flop_utils import lm_flops_per_token

@@ -9,7 +9,7 @@ import pytest
 import haliax as hax
 
 from levanter.utils.token_init import reinitialize_some_tokens
-from levanter.models.llama import LlamaEmbedding
+from levanter.models.llama_embedding import LlamaEmbedding
 
 
 class TestModel(equinox.Module):
