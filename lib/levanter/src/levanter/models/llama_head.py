@@ -145,14 +145,12 @@ class LlamaHeadModel(ModuleWithStateDictSerialization, LmHeadModel[LlamaConfig])
             Updated cache to pass into the next decode call.
         """
 
-        # Embed the incoming token IDs
         x = self.embeddings.embed(input_ids)
 
         # Propagate through the transformer with paged-KV caching
         k_t = maybe_rng_split(key, 1)[0] if key is not None else None
         x, new_state = self.transformer.decode(kv_cache, x, batch_info, pos_ids, key=k_t)
 
-        # Project to logits
         if self.lm_head is not None:
             logits = self.lm_head(x, key=None)
         else:
