@@ -28,7 +28,7 @@ from levanter.layers.attention import (
     dot_product_attention,
 )
 from levanter.layers.rotary import DefaultRotaryEmbeddingsConfig, RotaryEmbeddingsConfig
-from levanter.models.llama import LlamaMlp
+from levanter.layers.gated_mlp import LlamaMlp
 from levanter.models.lm_model import LmConfig, LmHeadModel, resize_embeddings_and_lm_head
 from levanter.utils.activation import ActivationFunctionEnum
 from levanter.utils.flop_utils import lm_flops_per_token
