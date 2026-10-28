@@ -7,7 +7,6 @@ from typing import Dict, Optional, Union, cast
 import equinox as eqx
 import jax
 import jax.random as jrandom
-from jaxtyping import PRNGKeyArray
 
 import haliax as hax
 import haliax.nn as hnn
@@ -21,6 +20,7 @@ from levanter.layers.attention import Attention, AttentionMask
 from levanter.layers.gated_mlp import LlamaMlp
 from levanter.layers.kv_cache import KvPageCache, ListCache
 from levanter.models.llama_config import LlamaConfig
+from levanter.models.llama_embedding import LlamaEmbedding
 from levanter.models.lm_model import LmHeadModel, resize_embeddings_and_lm_head
 
 
@@ -196,49 +196,6 @@ class LlamaTransformer(eqx.Module):
         # return self.layers.vmap_via(LlamaDecoderLayer.initial_cache)(spec, dtype=dtype)
         caches = [layer.initial_cache(spec, dtype=dtype) for layer in self.layers.unstacked()]
         return ListCache(caches)
-
-
-class LlamaEmbedding(ModuleWithStateDictSerialization, eqx.Module):
-    """Similar to GPT2 Embedding, except that:
-    - Llama doesn't have position embedding in the Embedding layer.
-    - Llama doesn't use dropout.
-    """
-
-    token_embeddings: hnn.Embedding
-    norm: Optional[hnn.RmsNorm] = None
-
-    @staticmethod
-    def init(Vocab: Axis, config: LlamaConfig, *, key) -> "LlamaEmbedding":
-        token_embeddings = hnn.Embedding.init(Vocab, config.Embed, key=key)
-        norm = None
-        if config.input_embedding_norm:
-            norm = config.mk_LayerNorm(config.Embed)
-        return LlamaEmbedding(token_embeddings, norm)
-
-    @property
-    def Vocab(self) -> Axis:
-        return self.token_embeddings.Vocab
-
-    @property
-    def Embed(self) -> Axis:
-        return cast(Axis, self.token_embeddings.Embed)
-
-    @named_call
-    def embed(self, input_ids, *args):
-        input_embeds = self.token_embeddings(input_ids)
-        if self.norm is not None:
-            input_embeds = self.norm(input_embeds)
-        return input_embeds
-
-    def unembed(self, x: NamedArray):
-        return self.token_embeddings.unembed(x)
-
-    def _state_dict_key_map(self) -> Dict[str, Optional[str]]:
-        return {"token_embeddings": "model.embed_tokens"}
-
-    def resize_embeddings(self, new_size: int, key: Optional[PRNGKeyArray] = None):
-        new_weights = self.token_embeddings.resize_embeddings(new_size, key=key)
-        return dataclasses.replace(self, token_embeddings=new_weights)
 
 
 class LlamaLMHeadModel(ModuleWithStateDictSerialization, LmHeadModel[LlamaConfig]):

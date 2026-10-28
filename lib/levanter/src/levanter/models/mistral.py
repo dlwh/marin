@@ -17,8 +17,9 @@ from levanter.compat.hf_checkpoints import HFCheckpointConverter
 from levanter.compat.hf_config import hf_config_from_kwargs, hf_rope_config
 from levanter.layers.attention import AttentionBackend, AttentionConfig, AttentionMask
 from levanter.layers.rotary import DefaultRotaryEmbeddingsConfig, RotaryEmbeddingsConfig
-from levanter.models.llama import LlamaEmbedding, LlamaTransformer
+from levanter.models.llama import LlamaTransformer
 from levanter.models.llama_config import LlamaConfig
+from levanter.models.llama_embedding import LlamaEmbedding
 from levanter.models.lm_model import LmConfig, LmHeadModel, resize_embeddings_and_lm_head
 from levanter.utils.activation import ActivationFunctionEnum
 from levanter.utils.logging import silence_transformer_nag
