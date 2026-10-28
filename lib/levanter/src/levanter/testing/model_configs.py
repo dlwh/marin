@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from levanter.layers.attention import AttentionBackend
-from levanter.models.llama import LlamaConfig
+from levanter.models.llama_config import LlamaConfig
 
 
 def llama_test_config(

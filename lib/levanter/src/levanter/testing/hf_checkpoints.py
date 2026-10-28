@@ -13,7 +13,7 @@ from haliax.state_dict import to_torch_compatible_state_dict
 from jaxtyping import PRNGKeyArray
 from transformers import LlamaConfig as HfLlamaConfig
 
-from levanter.models.llama import LlamaConfig
+from levanter.models.llama_config import LlamaConfig
 from levanter.testing.helpers import use_test_mesh
 
 

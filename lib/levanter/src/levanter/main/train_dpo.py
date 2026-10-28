@@ -53,7 +53,7 @@ from levanter.dpo import (
     reference_eval_cache_path,
 )
 from levanter.main.model_init import ModelInitContext, build_model, load_model_from_source, prepare_model_init_context
-from levanter.models.llama import LlamaConfig
+from levanter.models.llama_config import LlamaConfig
 from levanter.models.llama_native_lm import NativeLlamaLmConfig, NativeLlamaLmHeadModel, native_llama_sharding
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel
 from levanter.optim.config import AdamConfig, OptimizerConfig

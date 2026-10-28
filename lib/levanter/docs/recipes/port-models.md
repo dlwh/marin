@@ -54,7 +54,7 @@ In general, pattern match on `llama.py` or `mixtral.py` for examples of how to i
 
 ## Example Models
 - `GPT2Config`, `Gpt2Transformer` in `levanter.models.gpt2`
-- `LlamaConfig`, `LlamaTransformer` in `levanter.models.llama`
+- `LlamaConfig` in `levanter.models.llama_config` and `LlamaTransformer` in `levanter.models.llama`
 
 Llama is probably the most modern and well-structured example, so it is a good reference point.
 

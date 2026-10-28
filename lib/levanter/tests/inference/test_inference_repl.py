@@ -23,7 +23,7 @@ from levanter.inference.openai import InferenceServerConfig
 from levanter.layers.attention import AttentionMask
 from levanter.main import inference_repl
 from levanter.model_loading import load_hf_checkpoint
-from levanter.models.llama import LlamaConfig
+from levanter.models.llama_config import LlamaConfig
 from levanter.models.llama_native_lm import NativeLlamaLmConfig
 from levanter.testing.hf_checkpoints import write_llama_checkpoint
 from levanter.tokenizers import load_tokenizer

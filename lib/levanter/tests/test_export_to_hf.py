@@ -37,7 +37,8 @@ from haliax.state_dict import to_torch_compatible_state_dict
 from levanter.layers.attention import AttentionMask
 from levanter.layers.rotary import Llama3RotaryEmbeddingsConfig
 from levanter.model_loading import load_hf_checkpoint
-from levanter.models.llama import LlamaConfig, LlamaLMHeadModel
+from levanter.models.llama import LlamaLMHeadModel
+from levanter.models.llama_config import LlamaConfig
 from levanter.models.llama_native_lm import NativeLlamaLmConfig, NativeLlamaLmHeadModel, native_llama_sharding
 from levanter.tensorstore_serialization import _flatten_serializable_leaves
 from levanter.tokenizers import load_tokenizer

@@ -55,7 +55,7 @@ dependency graph.
 ## Step 2: Choose a model configuration
 
 ```python
-from levanter.models.llama import LlamaConfig
+from levanter.models.llama_config import LlamaConfig
 
 # A tiny Llama for fast local testing.
 llama_nano = LlamaConfig(

@@ -39,7 +39,7 @@ from levanter.callbacks import JitCallback, ProfileOptionsConfig, profile_ctx
 from levanter.data.text.examples import GrugLmExample
 from levanter.kernels.pallas.fused_cross_entropy_loss import fused_cross_entropy_loss_and_logsumexp_penalty
 from levanter.layers.attention import AttentionBackend, AttentionMask
-from levanter.models.llama import LlamaConfig
+from levanter.models.llama_config import LlamaConfig
 from levanter.models.llama_native import NativeLlamaConfig, NativeLlamaModel, NativeLlamaSharding
 from levanter.models.lm_model import LmExample
 from levanter.tracker import NoopTracker, current_tracker

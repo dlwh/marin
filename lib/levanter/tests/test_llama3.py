@@ -11,7 +11,8 @@ from jax import random
 from levanter.testing.helpers import skip_if_no_torch, use_test_mesh
 
 from levanter.layers.attention import AttentionMask
-from levanter.models.llama import LlamaConfig, LlamaLMHeadModel
+from levanter.models.llama import LlamaLMHeadModel
+from levanter.models.llama_config import LlamaConfig
 
 
 def get_config(vocab_size=1000):

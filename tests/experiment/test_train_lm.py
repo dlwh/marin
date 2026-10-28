@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 from fray.cluster import ResourceConfig
-from levanter.models.llama import LlamaConfig
+from levanter.models.llama_config import LlamaConfig
 from levanter.optim.config import AdamConfig
 from marin.execution.artifact import ArtifactRecord, write_record
 from marin.execution.lazy import ArtifactStep, materialized_config

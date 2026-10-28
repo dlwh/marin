@@ -19,7 +19,7 @@ from levanter.checkpoint import save_checkpoint
 from levanter.compat.hf_checkpoints import RepoRef
 from levanter.distributed import DistributedConfig
 from levanter.main import sample_lm
-from levanter.models.llama import LlamaConfig
+from levanter.models.llama_config import LlamaConfig
 from levanter.model_loading import load_hf_checkpoint
 from levanter.testing.hf_checkpoints import LocalLlamaCheckpoint, write_llama_checkpoint
 from levanter.tracker import NoopConfig

@@ -26,7 +26,7 @@ from levanter.eval_harness import (
 )
 from levanter.eval_harness_config import TaskConfig
 from levanter.layers.attention import AttentionMask
-from levanter.models.llama import LlamaConfig
+from levanter.models.llama_config import LlamaConfig
 from levanter.models.llama_native_lm import NativeLlamaLmConfig, native_llama_sharding
 from levanter.tokenizers import load_tokenizer
 from levanter.tracker import NoopConfig

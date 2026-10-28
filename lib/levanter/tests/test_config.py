@@ -4,6 +4,10 @@
 import dataclasses
 import io
 import os
+import shutil
+import subprocess
+import sys
+import textwrap
 
 import draccus
 import pytest
@@ -163,3 +167,100 @@ def _open_file_descriptors_for_path(path: str):
         if fd_path == path:
             open_fds.append(fd)
     return open_fds
+
+
+@pytest.mark.parametrize("first_import", ["native-first", "config-first"])
+def test_llama_local_hf_selection_and_backend_roundtrip(
+    first_import, tiny_hf_tokenizer_path, tmp_path, record_property
+):
+    """Local HF inference stays named while serialized selectors retain their backends."""
+    source = tmp_path / "local-hf"
+    shutil.copytree(tiny_hf_tokenizer_path, source)
+    io_report = tmp_path / "tokenizer-io.json"
+    script = textwrap.dedent(
+        r"""
+        import json
+        import sys
+        from pathlib import Path
+        from unittest.mock import patch
+
+        import draccus
+        from transformers import LlamaConfig as HfLlamaConfig
+
+        first_import, directory, io_destination = sys.argv[1:]
+        if first_import == "native-first":
+            from levanter.models.llama_native_lm import NativeLlamaLmConfig, NativeLlamaLmHeadModel
+            from levanter.models.llama_config import LlamaConfig
+        else:
+            from levanter.models.llama_config import LlamaConfig
+            from levanter.models.llama_native_lm import NativeLlamaLmConfig, NativeLlamaLmHeadModel
+        from levanter.compat import hf_checkpoints
+        from levanter.models.lm_model import LmConfig
+
+        source = Path(directory)
+        HfLlamaConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=24,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            max_position_embeddings=8,
+        ).save_pretrained(source)
+        real_load_tokenizer = hf_checkpoints.load_tokenizer
+        requests = []
+        unexpected_refusals = []
+        def local_tokenizer_io(model_name_or_path, *args, **kwargs):
+            reference = str(model_name_or_path)
+            revision = kwargs.get("revision")
+            if Path(reference).is_dir():
+                requests.append({"reference": reference, "revision": revision, "status": "LOCAL"})
+                return real_load_tokenizer(model_name_or_path, *args, **kwargs)
+            if reference == "NousResearch/Llama-2-7b-hf" and revision is None:
+                requests.append(
+                    {"reference": reference, "revision": revision, "status": "REDIRECT", "local": str(source)}
+                )
+                return real_load_tokenizer(str(source), *args, **kwargs)
+            requests.append({"reference": reference, "revision": revision, "status": "REFUSED"})
+            unexpected_refusals.append({"reference": reference, "revision": revision})
+            raise OSError("Nonlocal tokenizer I/O refused by the local HF selection test")
+
+        try:
+            with patch.object(hf_checkpoints, "load_tokenizer", local_tokenizer_io):
+                converter = hf_checkpoints.HFCheckpointConverter.from_hf(str(source))
+            if unexpected_refusals:
+                raise AssertionError(f"Unexpected tokenizer requests were refused: {unexpected_refusals}")
+            assert converter.LevConfigClass is LlamaConfig
+            named = draccus.decode(LmConfig, draccus.encode(converter.default_config, LmConfig))
+            native = draccus.decode(
+                LmConfig,
+                draccus.encode(NativeLlamaLmConfig.from_hf_config(HfLlamaConfig.from_pretrained(source)), LmConfig),
+            )
+            from levanter.models.llama import LlamaLMHeadModel
+
+            assert named.model_type is LlamaLMHeadModel
+            assert native.model_type is NativeLlamaLmHeadModel
+        finally:
+            Path(io_destination).write_text(
+                json.dumps({"requests": requests, "unexpected_refusals": unexpected_refusals}, indent=2) + "\n"
+            )
+        """
+    )
+    environment = {
+        **os.environ,
+        "HF_HUB_OFFLINE": "1",
+        "HF_DATASETS_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "TOKENIZERS_PARALLELISM": "false",
+    }
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script, first_import, str(source), str(io_report)],
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=45,
+    )
+    if io_report.exists():
+        record_property("tokenizer_io", io_report.read_text())
+    assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"

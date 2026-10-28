@@ -49,7 +49,8 @@ from levanter.inference.page_table import PageTable
 from levanter.inference.jit_scheduler import SequenceTable
 from levanter.tokenizers import load_tokenizer
 from levanter.models.gpt2 import Gpt2Config, Gpt2LMHeadModel
-from levanter.models.llama import LlamaConfig, LlamaLMHeadModel
+from levanter.models.llama import LlamaLMHeadModel
+from levanter.models.llama_config import LlamaConfig
 from levanter.trainer_state import TrainerState
 from levanter.utils.tree_utils import inference_mode
 

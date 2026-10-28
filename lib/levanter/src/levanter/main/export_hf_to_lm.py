@@ -23,7 +23,7 @@ import levanter
 import levanter.config
 from levanter.checkpoint import save_checkpoint
 from levanter.compat.hf_checkpoints import RepoRef, load_tokenizer
-from levanter.models.llama import LlamaConfig
+from levanter.models.llama_config import LlamaConfig
 from levanter.models.llama_native_lm import NativeLlamaLmConfig, NativeLlamaLmHeadModel
 from levanter.models.lm_model import LmConfig
 from levanter.utils.jax_utils import local_cpu_mesh
