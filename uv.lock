@@ -6078,7 +6078,7 @@ wheels = [
 [[package]]
 name = "lm-eval"
 version = "0.4.9.1"
-source = { git = "https://github.com/stanford-crfm/lm-evaluation-harness.git?rev=d5e3391f22cde186c827674d5c3ec7c5f4fe0cab#d5e3391f22cde186c827674d5c3ec7c5f4fe0cab" }
+source = { git = "https://github.com/marin-community/lm-evaluation-harness.git?rev=40ee133f7e591d78f1876a952c8b8c0d8c985a8d#40ee133f7e591d78f1876a952c8b8c0d8c985a8d" }
 dependencies = [
     { name = "datasets" },
     { name = "dill" },
@@ -7279,7 +7279,7 @@ requires-dist = [
     { name = "jmp", specifier = ">=0.0.3" },
     { name = "lenses" },
     { name = "libtpu", marker = "extra == 'tpu'", specifier = "==0.0.46.*" },
-    { name = "lm-eval", marker = "extra == 'lm-eval'", git = "https://github.com/stanford-crfm/lm-evaluation-harness.git?rev=d5e3391f22cde186c827674d5c3ec7c5f4fe0cab" },
+    { name = "lm-eval", marker = "extra == 'lm-eval'", git = "https://github.com/marin-community/lm-evaluation-harness.git?rev=40ee133f7e591d78f1876a952c8b8c0d8c985a8d" },
     { name = "marin-finelog", editable = "lib/finelog" },
     { name = "marin-finestore", editable = "lib/finestore" },
     { name = "marin-fray", editable = "lib/fray" },
