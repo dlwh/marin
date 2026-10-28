@@ -20,9 +20,9 @@ from levanter.compat.hf_config import hf_config_from_kwargs, hf_rope_config
 from levanter.layers.attention import Attention, AttentionConfig, AttentionMask
 from levanter.layers.rotary import RotaryEmbeddingsConfig
 from levanter.layers.gated_mlp import LlamaMlp
-from levanter.models.llama import LlamaLMHeadModel
 from levanter.models.llama_config import LlamaConfig
 from levanter.models.llama_embedding import LlamaEmbedding
+from levanter.models.llama_head import LlamaHeadModel
 from levanter.models.llama_transformer import LlamaTransformer
 from levanter.models.lm_model import LmConfig, LmHeadModel, resize_embeddings_and_lm_head
 from levanter.utils.activation import ActivationFunctionEnum
@@ -385,8 +385,8 @@ class Qwen3Config(LlamaConfig):
 # =====================
 
 
-class Qwen3LMHeadModel(LlamaLMHeadModel):
-    """Identical to LlamaLMHeadModel except built off a Qwen3Config."""
+class Qwen3LMHeadModel(LlamaHeadModel):
+    """Qwen3 model using the shared named Llama head behavior."""
 
     @classmethod
     def init(cls, Vocab: Axis, config: Qwen3Config, *, key):  # type: ignore[override]
