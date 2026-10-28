@@ -14,7 +14,7 @@ from levanter.testing.helpers import skip_if_no_torch, use_test_mesh
 from transformers import AutoModelForCausalLM, Olmo2ForCausalLM
 
 from levanter.layers.attention import AttentionMask
-from levanter.models.llama import LlamaMlp
+from levanter.layers.gated_mlp import LlamaMlp
 from levanter.models.olmo import Olmo2Attention, Olmo2Config, Olmo2DecoderLayer, Olmo2LMHeadModel
 from levanter.utils.jax_utils import parameter_count
 

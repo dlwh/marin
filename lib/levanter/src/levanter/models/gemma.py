@@ -21,10 +21,8 @@ from levanter.compat.hf_config import hf_config_from_kwargs, hf_rope_config, hf_
 from levanter.layers.attention import Attention, AttentionBackend, AttentionConfig, AttentionMask
 from levanter.layers.normalization import LayerNormConfigBase
 from levanter.layers.rotary import DefaultRotaryEmbeddingsConfig, RotaryEmbeddingsConfig
-from levanter.models.llama import (  # Gemma attention and MLP is identical to LLama
-    LlamaEmbedding,
-    LlamaMlp,
-)
+from levanter.layers.gated_mlp import LlamaMlp
+from levanter.models.llama import LlamaEmbedding
 from levanter.models.lm_model import LmConfig, LmHeadModel, resize_embeddings_and_lm_head
 from levanter.utils.activation import ActivationFunctionEnum
 from levanter.utils.flop_utils import lm_flops_per_token

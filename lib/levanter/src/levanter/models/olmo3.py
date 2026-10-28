@@ -28,7 +28,7 @@ from levanter.compat.hf_config import hf_config_from_kwargs, hf_rope_config
 from levanter.layers.normalization import RmsNormConfig
 from levanter.layers.attention import Attention, AttentionBackend, AttentionConfig, AttentionMask
 from levanter.layers.rotary import DefaultRotaryEmbeddingsConfig, RotaryEmbeddingsConfig
-from levanter.models.llama import LlamaMlp
+from levanter.layers.gated_mlp import LlamaMlp
 from levanter.models.olmo import Olmo2Embedding
 from levanter.models.lm_model import LmConfig, LmHeadModel, resize_embeddings_and_lm_head
 from levanter.utils.activation import ActivationFunctionEnum
