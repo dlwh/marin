@@ -35,7 +35,8 @@ Init sources (the :class:`ModelSource` implementations):
 A vendored model family that is not a Levanter-registry ``LmHeadModel`` (its own train loop and
 train state) supplies its own :class:`ModelSource` implementing the same protocol — see
 ``experiments/june_tpu_67b_a2b/moe/sft_launch.py``'s ``GrugModel``. The dependency runs vendored
-experiment -> this launcher, never the reverse, so this module stays model-family-agnostic.
+experiment -> this launcher, never the reverse. The shared Levanter initialization path preserves
+Native JAX tokenizer IDs while retaining tokenizer padding for named-model HF sources.
 
 The accelerator is not part of the spec — it is chosen at launch time (see
 :func:`resources_from_accelerator` and :func:`run_sft_cli`) and threaded to the training job as a
@@ -80,6 +81,7 @@ from levanter.checkpoint import CheckpointerConfig
 from levanter.data.text.datasets import DatasetComponent, LmDataConfig, UrlDatasetSourceConfig
 from levanter.data.text.formats import ChatLmDatasetFormat
 from levanter.main.train_lm import TrainLmConfig
+from levanter.models.llama_native_lm import NativeLlamaLmConfig
 from levanter.models.lm_model import LmConfig
 from levanter.optim.config import OptimizerConfig
 from levanter.tracker.wandb import WandbConfig
@@ -220,9 +222,11 @@ def _levanter_train_config(
         initialize_from_hf=initialize_from_hf,
         initialize_model_from_checkpoint_path=initialize_model_from_checkpoint_path,
         use_hf_model_config=use_hf_model_config,
-        # A converted checkpoint emits a tokenizer already padded to its model vocab. Native init
-        # has no HF reference from which the generic padding helper could re-derive that vocab.
-        pad_tokenizer_to_match_model=initialize_model_from_checkpoint_path is None,
+        # Weights-only Levanter checkpoints already carry the model vocabulary.
+        # Native JAX HF init preserves token IDs and loads the source vocabulary separately.
+        pad_tokenizer_to_match_model=(
+            initialize_model_from_checkpoint_path is None and not isinstance(model_config, NativeLlamaLmConfig)
+        ),
         hf_save_steps=num_train_steps,  # one HF export at the end
         hf_save_dtype=jnp.dtype(spec.hf_save_dtype) if spec.hf_save_dtype is not None else None,
         hf_generation_eos_token_ids=list(eos_token_ids),

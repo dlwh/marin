@@ -4,11 +4,26 @@
 """Tests for the SFT checkpoint-preparation step and its wiring into ``sft_step``."""
 from __future__ import annotations
 
+import dataclasses
+import json
+
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 from fray.types import ResourceConfig
-from levanter.optim.config import AdamConfig
-from marin.execution.lazy import materialized_config
+from levanter.checkpoint import CheckpointerConfig, discover_checkpoint_candidates
+from levanter.data.dataset import ListAsyncDataset
+from levanter.data.text.datasets import DirectDatasetComponent, LmDataConfig
+from levanter.data.text.examples import GrugLmExample
+from levanter.distributed import DistributedConfig
+from levanter.main import train_lm
+from levanter.models.llama_config import LlamaConfig
+from levanter.optim.config import AdamConfig, ConstantLrSchedule
+from levanter.testing.hf_checkpoints import write_llama_checkpoint
+from levanter.tracker.json_file import JsonFileTrackerConfig
+from levanter.utils.mesh import MeshConfig
+from marin.execution.lazy import StepContext, materialized_config
 from safetensors.numpy import load, save
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
@@ -220,3 +235,90 @@ def test_delphi_renames_produce_single_ids_on_local_llama_layout(delphi_base_tok
     for token_id, token_str in _EXPECTED_NATIVE_TOKENS.items():
         assert prepared.encode(token_str, add_special_tokens=False) == [token_id]
         assert prepared.decode([token_id]) == token_str
+
+
+def test_native_hf_sft_preserves_token_ids_and_pretrained_weights(tmp_path):
+    backend = Tokenizer(
+        WordLevel({"[UNK]": 0, "<s>": 1, "</s>": 2, **{f"token{i}": i for i in range(3, 31)}}, unk_token="[UNK]")
+    )
+    backend.pre_tokenizer = Whitespace()
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]", bos_token="<s>", eos_token="</s>")
+    tokenizer_path = tmp_path / "tokenizer"
+    tokenizer.save_pretrained(tokenizer_path)
+    original_vocab = tokenizer.get_vocab()
+    original_ids = tokenizer.encode("token3 token4", add_special_tokens=False)
+    source_config = LlamaConfig(
+        hidden_dim=16,
+        intermediate_dim=24,
+        num_layers=1,
+        num_heads=4,
+        num_kv_heads=2,
+        max_seq_len=16,
+        tie_word_embeddings=False,
+    )
+    source = write_llama_checkpoint(
+        tmp_path / "source", source_config, source_config.to_hf_config(32), key=jax.random.PRNGKey(13)
+    )
+    batch_size = 2 * jax.device_count()
+    examples = ListAsyncDataset([GrugLmExample.causal((jnp.arange(4) + index) % 31) for index in range(4 * batch_size)])
+    data = LmDataConfig(
+        tokenizer=str(tokenizer_path),
+        shuffle=False,
+        components={"direct": DirectDatasetComponent(datasets={"train": examples})},
+    )
+    model = HFModel(str(source.path), tokenizer_path=str(tokenizer_path), model_type="llama_native", eos_token_ids=(2,))
+    spec = dataclasses.replace(
+        _spec(model),
+        datasets=(),
+        optimizer=AdamConfig(learning_rate=0.0, warmup=0, lr_schedule=ConstantLrSchedule(), weight_decay=0.0),
+        mesh=MeshConfig(axes={"data": jax.device_count(), "model": 1}),
+        seq_len=4,
+        batch_size=batch_size,
+        num_train_steps=2,
+    )
+    context = StepContext.for_run(output_path=str(tmp_path / "pod-output"), prefix=str(tmp_path))
+    config = model.build_train_config(context, spec, data, ResourceConfig.with_cpu(), 2).train_config
+    config = dataclasses.replace(
+        config,
+        trainer=dataclasses.replace(
+            config.trainer,
+            id="native-hf-sft",
+            seed=42,
+            per_device_parallelism=2,
+            per_device_eval_parallelism=2,
+            max_eval_batches=0,
+            steps_per_eval=1,
+            tracker=JsonFileTrackerConfig(output_path=str(tmp_path / "tracker")),
+            checkpointer=CheckpointerConfig(
+                base_path=str(tmp_path / "checkpoints"), save_interval=None, keep=[{"every": 1}]
+            ),
+            load_checkpoint=False,
+            require_accelerator=False,
+            distributed=DistributedConfig(initialize_jax_distributed=False),
+            log_xla_hlo=False,
+            log_jaxprs=False,
+        ),
+        hf_save_path=str(tmp_path / "export"),
+    )
+    data_tokenizer = config.data.the_tokenizer
+    result = train_lm.main(config)
+    assert int(result.state.step) == 2 and np.isfinite(float(result.loss))
+    assert result.state.model.Vocab.size == 32
+    assert data_tokenizer.get_vocab() == original_vocab
+    assert data_tokenizer.encode("token3 token4", add_special_tokens=False) == original_ids
+
+    exported = tmp_path / "export/native-hf-sft/step-1"
+    assert json.loads((exported / "config.json").read_text())["vocab_size"] == 32
+    exported_tokenizer = AutoTokenizer.from_pretrained(exported, local_files_only=True)
+    assert exported_tokenizer.get_vocab() == original_vocab
+    assert exported_tokenizer.encode("token3 token4", add_special_tokens=False) == original_ids
+    for weights in (result.state.model.to_state_dict(), load((exported / "model.safetensors").read_bytes())):
+        assert weights.keys() == source.weights.keys()
+        for name, expected in source.weights.items():
+            actual = np.asarray(weights[name])
+            assert actual.dtype == np.float32
+            np.testing.assert_array_equal(actual, expected, err_msg=name)
+
+    checkpoint = discover_checkpoint_candidates(tmp_path / "checkpoints/native-hf-sft")[-1]
+    assert checkpoint.metadata["levanter_model"]["type"] == "llama_native"
+    assert checkpoint.metadata["levanter_model"]["vocab_size"] == 32
