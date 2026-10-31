@@ -761,7 +761,6 @@ def _assert_bfloat16_rotary_accuracy(actual, reference, *, relative_l2_budget):
     error = actual - reference
     assert np.isfinite(actual).all()
     assert np.linalg.norm(error) / np.linalg.norm(reference) <= relative_l2_budget
-    # Bound the largest-coordinate error separately from the global error.
     assert np.max(np.abs(error)) <= (2 / 128) * np.max(np.abs(reference))
 
 
