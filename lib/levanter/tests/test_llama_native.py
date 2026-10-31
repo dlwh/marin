@@ -444,7 +444,7 @@ def test_native_lm_hf_config_and_vocab_resize_preserve_model_values_and_placemen
         ],
     ],
 )
-def test_native_llama_matches_named_logits_loss_and_gradients(options, compute_dtype):
+def test_native_llama_logits_loss_and_gradients(options, compute_dtype):
     mesh = Mesh(np.asarray(jax.devices()[:1]), ("data",), axis_types=(AxisType.Explicit,))
     config = dataclasses.replace(
         NativeLlamaConfig(
@@ -512,6 +512,10 @@ def test_native_llama_matches_named_logits_loss_and_gradients(options, compute_d
                 lambda value: value.astype(compute_dtype) if eqx.is_inexact_array(value) else value, model
             )
 
+        if compute_dtype == jnp.bfloat16:
+            _assert_native_bfloat16_model_loss_and_gradients(native, tokens, native_mask, positions, weights, source)
+            return
+
         expected_logits = eqx.filter_jit(
             lambda model: to_compute(model)(named_tokens, named_mask, pos_ids=named_positions)
             .rearrange((Batch, Pos, legacy.Vocab))
@@ -554,6 +558,64 @@ def test_native_llama_matches_named_logits_loss_and_gradients(options, compute_d
         exported = native.to_state_dict()
         for key in exported:
             np.testing.assert_array_equal(exported[key], source[key].reshape(exported[key].shape))
+
+
+def _assert_native_bfloat16_model_loss_and_gradients(native, tokens, mask, positions, weights, source):
+    def to_compute(model):
+        return jax.tree.map(lambda value: value.astype(jnp.bfloat16) if eqx.is_inexact_array(value) else value, model)
+
+    def loss(model):
+        return to_compute(model).next_token_loss(
+            tokens, weights, mask=mask, pos_ids=positions, loss_implementation="xla"
+        )
+
+    hidden = eqx.filter_jit(lambda model: to_compute(model).activations(tokens, mask, pos_ids=positions))(native)
+    logits = eqx.filter_jit(lambda model: to_compute(model)(tokens, mask, pos_ids=positions))(native)
+    host_hidden = np.asarray(hidden, dtype=np.float64)
+    head = to_compute(native).get_lm_head()
+    host_head = np.asarray(head, dtype=np.float64)
+    host_logits = host_hidden @ host_head.T
+    rounded_logits = np.asarray(jnp.asarray(host_logits, dtype=jnp.bfloat16), dtype=np.float32)
+    np.testing.assert_allclose(logits, rounded_logits, atol=1e-5, rtol=1e-5)
+
+    labels = np.asarray(jnp.roll(tokens, -1, axis=-1))
+    host_weights = np.asarray(weights, dtype=np.float64)
+    maximum = host_logits.max(axis=-1)
+    log_partition = maximum + np.log(np.exp(host_logits - maximum[..., None]).sum(axis=-1))
+    target_logits = np.take_along_axis(host_logits, labels[..., None], axis=-1)[..., 0]
+    expected_loss = np.sum((log_partition - target_logits) * host_weights) / host_weights.sum()
+    actual_loss, gradients = eqx.filter_jit(eqx.filter_value_and_grad(loss))(native)
+    np.testing.assert_allclose(actual_loss, expected_loss, atol=1e-5, rtol=1e-5)
+
+    probabilities = np.exp(host_logits - log_partition[..., None])
+    delta = probabilities - np.eye(host_logits.shape[-1])[labels]
+    delta *= host_weights[..., None] / host_weights.sum()
+    expected_hidden_grad = delta @ host_head
+    expected_head_grad = np.einsum("bsv,bsd->vd", delta, host_hidden)
+
+    def projection_loss(hidden, head):
+        return fused_linear_softmax_cross_entropy_loss(
+            hidden, head.T, jnp.roll(tokens, -1, axis=-1), weight=weights, implementation="xla"
+        )
+
+    hidden_grad, head_grad = jax.jit(jax.grad(projection_loss, argnums=(0, 1)))(hidden, head)
+    for actual, expected in ((hidden_grad, expected_hidden_grad), (head_grad, expected_head_grad)):
+        # The VJP returns BF16: allow its round-to-nearest unit roundoff.
+        np.testing.assert_allclose(
+            np.asarray(actual, dtype=np.float32),
+            expected,
+            atol=1e-5,
+            rtol=float(jnp.finfo(jnp.bfloat16).eps) / 2,
+        )
+    gradient_state = gradients.to_state_dict()
+    assert set(gradient_state) == set(source)
+    for key, gradient in gradient_state.items():
+        assert gradient.shape == native.to_state_dict()[key].shape and gradient.size == source[key].size, key
+        assert gradient.dtype == source[key].dtype == jnp.float32, key
+        assert np.isfinite(gradient).all(), key
+        assert np.any(np.asarray(gradient) != 0), key
+    for key, value in native.to_state_dict().items():
+        np.testing.assert_array_equal(value, source[key].reshape(value.shape))
 
 
 @pytest.mark.tpu
@@ -640,17 +702,26 @@ def test_native_llama_initialization_matches_named_parameters_and_forward(
         np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-5)
 
 
-def _assert_rotary_values_and_gradients_match_named(named_config, native_config, compute_dtype, shape, host_positions):
+def _assert_rotary_values_and_gradients_match_named(
+    named_config, native_config, compute_dtype, shape, host_positions, *, host_inputs=None
+):
     axes = tuple(hax.Axis(name, size) for name, size in zip(("batch", "position", "heads", "head_size"), shape))
-    rng = np.random.default_rng(173)
-    host_x = rng.standard_normal(shape).astype(np.float32)
-    host_cotangent = rng.standard_normal(shape).astype(np.float32)
+    if host_inputs is None:
+        rng = np.random.default_rng(173)
+        host_x = rng.standard_normal(shape).astype(np.float32)
+        host_cotangent = rng.standard_normal(shape).astype(np.float32)
+    else:
+        host_x, host_cotangent = host_inputs
     named = named_config.build(axes[-1])
     mesh = Mesh(np.asarray(jax.devices()[:1]), ("data",), axis_types=(AxisType.Explicit,))
 
+    reference_dtype = jnp.float32 if compute_dtype == jnp.bfloat16 else compute_dtype
+
     def expected_forward(master, positions):
         return (
-            named(hax.named(master.astype(compute_dtype), axes), hax.named(positions, axes[:2])).rearrange(axes).array
+            named(hax.named(master.astype(reference_dtype), axes), hax.named(positions, axes[:2]))
+            .rearrange(axes)
+            .array
         )
 
     def actual_forward(master, positions):
@@ -662,6 +733,9 @@ def _assert_rotary_values_and_gradients_match_named(named_config, native_config,
     with jax.set_mesh(mesh):
         x = jnp.asarray(host_x)
         cotangent = jnp.asarray(host_cotangent)
+        if compute_dtype == jnp.bfloat16:
+            x = x.astype(compute_dtype).astype(jnp.float32)
+            cotangent = cotangent.astype(compute_dtype).astype(jnp.float32)
         positions = jnp.asarray(host_positions)
         # Positions remain runtime arguments so the test exercises the compiled
         # frequency construction rather than constant-folding a fixed output.
@@ -674,8 +748,50 @@ def _assert_rotary_values_and_gradients_match_named(named_config, native_config,
             x, positions, cotangent
         )
 
-    np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-5)
-    np.testing.assert_allclose(actual_grad, expected_grad, atol=1e-5, rtol=1e-5)
+    if compute_dtype == jnp.float32:
+        np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-5)
+        np.testing.assert_allclose(actual_grad, expected_grad, atol=1e-5, rtol=1e-5)
+    else:
+        _assert_bfloat16_rotary_accuracy(actual, expected, relative_l2_budget=0.002)
+        _assert_bfloat16_rotary_accuracy(actual_grad, expected_grad, relative_l2_budget=0.0025)
+
+
+def _assert_bfloat16_rotary_accuracy(actual, reference, *, relative_l2_budget):
+    actual, reference = np.asarray(actual, dtype=np.float64), np.asarray(reference, dtype=np.float64)
+    error = actual - reference
+    assert np.isfinite(actual).all()
+    assert np.linalg.norm(error) / np.linalg.norm(reference) <= relative_l2_budget
+    # Bound the largest-coordinate error separately from the global error.
+    assert np.max(np.abs(error)) <= (2 / 128) * np.max(np.abs(reference))
+
+
+@pytest.mark.tpu
+@pytest.mark.parametrize("factor", [1.0, 8.0], ids=["default", "linear-scaled"])
+def test_native_bfloat16_rotary_late_positions_match_float32_values_and_input_vjp(factor):
+    rng = np.random.default_rng(42)
+    shape = (2, 128, 2, 128)
+    host_inputs = (rng.standard_normal(shape, dtype=np.float32), rng.standard_normal(shape, dtype=np.float32))
+    positions = np.stack((np.arange(128), np.arange(1920, 2048))).astype(np.int32)
+    _assert_rotary_values_and_gradients_match_named(
+        DefaultRotaryEmbeddingsConfig(theta=10000.0, factor=factor),
+        RotaryConfig(theta=10000.0, factor=factor),
+        jnp.bfloat16,
+        shape,
+        positions,
+        host_inputs=host_inputs,
+    )
+
+
+def test_native_rotary_preserves_float64_input_and_cotangent_at_origin():
+    with jax.enable_x64(True):
+        x = jnp.asarray([[[[1 + 2**-35, -3 + 2**-34]]]], dtype=jnp.float64)
+        cotangent = jnp.asarray([[[[2 + 2**-33, 1 - 2**-32]]]], dtype=jnp.float64)
+        positions = jnp.zeros((1, 1), dtype=jnp.int32)
+        forward = jax.jit(lambda value: apply_rotary(value, positions, RotaryConfig()))
+        actual = forward(x)
+        actual_grad = jax.vjp(forward, x)[1](cotangent)[0]
+    np.testing.assert_array_equal(actual, x)
+    np.testing.assert_array_equal(actual_grad, cotangent)
 
 
 @pytest.mark.tpu
