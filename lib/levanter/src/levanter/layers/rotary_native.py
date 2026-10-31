@@ -83,12 +83,12 @@ def apply_rotary(
         inv_freq = _inverse_frequencies(dim, config)
     frequencies = position_ids[..., None] * inv_freq
     angles = jnp.concatenate((frequencies, frequencies), axis=-1)[..., None, :]
-    cos = jnp.cos(angles).astype(x.dtype)
-    sin = jnp.sin(angles).astype(x.dtype)
+    cos = jnp.cos(angles)
+    sin = jnp.sin(angles)
     if isinstance(config, YarnRotaryConfig):
         temperature = yarn_attention_factor(config.factor, config.mscale)
         cos = cos * temperature
         sin = sin * temperature
     first, second = jnp.split(x, 2, axis=-1)
     rotated = jnp.concatenate((-second, first), axis=-1)
-    return x * cos + rotated * sin
+    return (x * cos + rotated * sin).astype(x.dtype)
