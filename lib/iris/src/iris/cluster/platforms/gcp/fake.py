@@ -270,12 +270,17 @@ class InMemoryGcpService:
     # Queued resource operations (for reserved TPUs)
     # ========================================================================
 
-    def queued_resource_create(self, request: TpuCreateRequest) -> None:
+    def queued_resource_create(self, request: TpuCreateRequest) -> str:
         self._check_injected_failure("queued_resource_create")
         # In DRY_RUN/LOCAL mode, simulate immediate provisioning by creating
         # the TPU directly (as if the queued resource instantly became ACTIVE).
-        self.tpu_create(request)
+        info = self.tpu_create(request)
         self._queued_resources.add((request.name, request.zone))
+        return info.operation_name
+
+    def queued_resource_operation_status(self, operation_name: str) -> OperationStatus:
+        self._check_injected_failure("queued_resource_operation_status")
+        return self._operation_statuses.get(operation_name, OperationStatus(done=True))
 
     def queued_resource_describe(self, name: str, zone: str) -> QueuedResourceInfo | None:
         self._check_injected_failure("queued_resource_describe")

@@ -11,6 +11,7 @@ tests that cannot be expressed through the protocol are in dedicated sections.
 import unittest.mock
 from collections.abc import Iterator
 from dataclasses import dataclass
+from itertools import chain, repeat
 
 import pytest
 from iris.cluster.config import (
@@ -1191,6 +1192,9 @@ def test_vm_bootstrap_cloud_not_ready_raises_phase1_timeout():
 def _make_tpu_slice_for_bootstrap(
     gcp_service: InMemoryGcpService,
     zone: str = "us-central2-b",
+    *,
+    capacity_type: CapacityType = CapacityType.PREEMPTIBLE,
+    accelerator_variant: str = "v5litepod-8",
 ) -> GcpSliceHandle:
     """Create a TPU slice (bootstrap thread suppressed) for direct _run_tpu_bootstrap testing.
 
@@ -1203,7 +1207,8 @@ def _make_tpu_slice_for_bootstrap(
     cfg = SliceConfig(
         name_prefix="iris-tpu",
         accelerator_type=AcceleratorType.TPU,
-        accelerator_variant="v5litepod-8",
+        accelerator_variant=accelerator_variant,
+        capacity_type=capacity_type,
         gcp=GcpSliceConfig(zone=zone, runtime_version="tpu-ubuntu2204-base"),
     )
     wc = WorkerConfig(
@@ -1265,6 +1270,54 @@ def test_tpu_bootstrap_fails_fast_on_create_operation_error(error_code, expected
                 ip_wait_timeout=5.0,
                 bootstrap_timeout=5.0,
             )
+
+
+@pytest.mark.parametrize("creation_done_when_visible", [False, True])
+def test_reserved_tpu_bootstrap_waits_for_initial_resource_visibility(creation_done_when_visible: bool):
+    service = InMemoryGcpService(mode=ServiceMode.DRY_RUN, project_id="test-project")
+    handle = _make_tpu_slice_for_bootstrap(service, capacity_type=CapacityType.RESERVED, accelerator_variant="v4-16")
+    visible = service.queued_resource_describe(handle.slice_id, handle.zone)
+    statuses = chain([OperationStatus(done=False)], repeat(OperationStatus(done=creation_done_when_visible)))
+    # The provider API initially cannot describe the accepted create request.
+    # Worker health is the remote readiness boundary, independent of LRO completion.
+    with (
+        unittest.mock.patch.object(service, "queued_resource_describe", side_effect=[None, visible]),
+        unittest.mock.patch.object(service, "queued_resource_operation_status", side_effect=statuses),
+        unittest.mock.patch("iris.cluster.platforms.gcp.workers.probe_worker_health", return_value=True),
+    ):
+        _run_tpu_bootstrap(
+            service,
+            handle,
+            poll_interval=0,
+            queued_resource_poll_interval=0,
+            ip_wait_timeout=5,
+            bootstrap_timeout=5,
+        )
+    assert handle.describe().state == CloudSliceState.READY
+    assert service.tpu_describe(handle.slice_id, handle.zone) is not None
+
+
+@pytest.mark.parametrize("error_code, expected_error", [(8, QuotaExhaustedError), (13, InfraError)])
+def test_reserved_tpu_bootstrap_surfaces_create_operation_failure(error_code, expected_error):
+    service = InMemoryGcpService(mode=ServiceMode.DRY_RUN, project_id="test-project")
+    handle = _make_tpu_slice_for_bootstrap(service, capacity_type=CapacityType.RESERVED, accelerator_variant="v4-16")
+    with (
+        unittest.mock.patch.object(
+            service,
+            "queued_resource_operation_status",
+            return_value=OperationStatus(done=True, error_code=error_code, error_message="reservation failed"),
+        ),
+        unittest.mock.patch("iris.cluster.platforms.gcp.workers.probe_worker_health", return_value=True),
+        pytest.raises(expected_error, match="reservation failed"),
+    ):
+        _run_tpu_bootstrap(
+            service,
+            handle,
+            poll_interval=0,
+            queued_resource_poll_interval=0,
+            ip_wait_timeout=5,
+            bootstrap_timeout=5,
+        )
 
 
 def test_tpu_bootstrap_aborts_when_slice_enters_deleting():

@@ -39,6 +39,7 @@ from iris.cluster.platforms.gcp.service import (
     CAPACITY_TYPE_LABEL,
     CAPACITY_TYPE_RESERVED_VALUE,
     GcpService,
+    OperationStatus,
     TpuCreateRequest,
     VmCreateRequest,
     operation_error,
@@ -154,9 +155,18 @@ def _wait_for_queued_resource_activation(
     provision_deadline: Deadline | None = None
 
     while True:
+        creation = _create_operation_status(gcp_service, handle)
         qr = gcp_service.queued_resource_describe(handle.slice_id, handle.zone)
         if qr is None:
-            raise InfraError(f"Queued resource {handle.slice_id} not found")
+            if creation is None or creation.done:
+                raise InfraError(f"Queued resource {handle.slice_id} not found")
+            if assign_deadline.expired():
+                raise InfraError(
+                    f"Queued resource {handle.slice_id} creation did not finish within {RESERVED_TPU_ASSIGN_TIMEOUT}s"
+                )
+            logger.info("Queued resource %s creation is pending, waiting...", handle.slice_id)
+            time.sleep(poll_interval)
+            continue
         if qr.state == "ACTIVE":
             logger.info("Queued resource %s is ACTIVE, proceeding to TPU bootstrap", handle.slice_id)
             return
@@ -595,7 +605,7 @@ class GcpWorkerProvider:
             gcp.zone,
         )
         try:
-            self._gcp.queued_resource_create(request)
+            operation_name = self._gcp.queued_resource_create(request)
         except InfraError:
             self._best_effort_delete_queued_resource(slice_id, gcp.zone)
             raise
@@ -609,6 +619,7 @@ class GcpWorkerProvider:
             service_account=request.service_account,
             bootstrapping=worker_config is not None,
             is_queued_resource=True,
+            create_operation=operation_name,
         )
 
         if worker_config:
@@ -849,19 +860,19 @@ class GcpWorkerProvider:
 # ============================================================================
 
 
-def _raise_if_create_failed(gcp_service: GcpService, handle: GcpSliceHandle) -> None:
-    """Fail fast if the slice's create LRO completed with an error.
-
-    A pending or successful operation is a no-op; only a completed-with-error
-    operation raises (quota/stockout as QuotaExhaustedError, else InfraError).
-    Reserved (queued-resource) slices have no create LRO — their failures
-    surface through the queued-resource state instead.
-    """
+def _create_operation_status(gcp_service: GcpService, handle: GcpSliceHandle) -> OperationStatus | None:
+    """Observe creation without using LRO completion as worker readiness."""
     if not handle._create_operation:
-        return
-    error = operation_error(gcp_service.tpu_operation_status(handle._create_operation))
+        return None
+    status = (
+        gcp_service.queued_resource_operation_status(handle._create_operation)
+        if handle.is_queued_resource
+        else gcp_service.tpu_operation_status(handle._create_operation)
+    )
+    error = operation_error(status)
     if error is not None:
         raise error
+    return status
 
 
 def _run_tpu_bootstrap(
@@ -919,7 +930,7 @@ def _run_tpu_bootstrap(
     ip_backoff = ExponentialBackoff(initial=1.0, maximum=30.0, factor=1.5)
 
     while not ip_deadline.expired():
-        _raise_if_create_failed(gcp_service, handle)
+        _create_operation_status(gcp_service, handle)
         cloud_status = handle._describe_cloud()
         if cloud_status.state in (CloudSliceState.FAILED, CloudSliceState.DELETING):
             raise InfraError(f"Slice {handle.slice_id} entered {cloud_status.state} during bootstrap")
