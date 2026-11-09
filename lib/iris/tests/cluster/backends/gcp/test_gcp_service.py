@@ -19,10 +19,13 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
+from google.longrunning import operations_pb2
+from google.rpc import status_pb2
 from iris.cluster.platforms.gcp.cloud import CloudGcpService
 from iris.cluster.platforms.gcp.fake import InMemoryGcpService
 from iris.cluster.platforms.gcp.handles import GcpVmSliceHandle
 from iris.cluster.platforms.gcp.service import (
+    OperationStatus,
     TpuCreateRequest,
     VmCreateRequest,
     VmInfo,
@@ -357,6 +360,31 @@ def test_vm_set_metadata_nonexistent_raises(svc: InMemoryGcpService) -> None:
 # When zones=[] the GCP API is called with locations/- and the real zone
 # must be parsed from the returned full resource name, not left as "-".
 # ========================================================================
+
+
+@pytest.mark.parametrize(
+    "operation, expected",
+    [
+        (operations_pb2.Operation(done=False), OperationStatus(done=False)),
+        (operations_pb2.Operation(done=True), OperationStatus(done=True)),
+        (
+            operations_pb2.Operation(done=True, error=status_pb2.Status(code=8, message="quota exhausted")),
+            OperationStatus(done=True, error_code=8, error_message="quota exhausted"),
+        ),
+    ],
+)
+def test_queued_resource_creation_observes_provider_operation(operation, expected) -> None:
+    service = CloudGcpService(project_id="test-project")
+    client = MagicMock()
+    accepted = operations_pb2.Operation(name="projects/test-project/locations/us-central2-b/operations/create-1")
+    client.create_queued_resource.return_value.operation = accepted
+    client.transport.operations_client.get_operation.return_value = operation
+    service._tpu_alpha_client_cached = client
+
+    operation_name = service.queued_resource_create(_tpu_request(capacity_type=CapacityType.RESERVED))
+
+    assert operation_name == accepted.name
+    assert service.queued_resource_operation_status(operation_name) == expected
 
 
 def test_queued_resource_list_extracts_zone_from_wildcard() -> None:

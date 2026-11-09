@@ -532,6 +532,22 @@ exactly which higher-priority job evicted it.
 
 Full table list: `iris query "SELECT name FROM sqlite_master WHERE type='table'"`.
 
+### Reserved TPU creation failures
+
+Reserved TPU creation returns an asynchronous queued-resource operation. The
+resource can be absent from describe calls while that operation is pending.
+Bootstrap polls creation within the existing assignment deadline, then waits
+for the resource to become ACTIVE. A completed operation error is reported
+through the usual quota or infrastructure error classification. Worker health
+still determines readiness; creation-operation completion alone does not.
+
+For `Queued resource <slice-id> not found` or repeated failed scale-ups, inspect
+`iris rpc controller get-autoscaler-status` and trace the slice with
+`iris process logs --substring='<slice-id>' --max-lines 40`. Distinguish a
+pending create operation from a completed operation failure before treating the
+symptom as unavailable TPU capacity. An absent resource after successful
+creation remains an infrastructure error.
+
 ### Bulk actions: query → act
 
 `iris query` is admin-only and read-only, so it is the safe surface for *finding*

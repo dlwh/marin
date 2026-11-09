@@ -441,7 +441,7 @@ class CloudGcpService:
             return QuotaExhaustedError(str(exc))
         return InfraError(str(exc))
 
-    def queued_resource_create(self, request: TpuCreateRequest) -> None:
+    def queued_resource_create(self, request: TpuCreateRequest) -> str:
         validate_tpu_create(request, self._valid_zones, self._valid_accelerator_types)
 
         node = tpu_v2alpha1.Node(
@@ -479,13 +479,27 @@ class CloudGcpService:
             request.zone,
         )
         try:
-            self._tpu_alpha_client.create_queued_resource(
+            operation = self._tpu_alpha_client.create_queued_resource(
                 parent=parent,
                 queued_resource=queued_resource,
                 queued_resource_id=request.name,
             )
         except google.api_core.exceptions.GoogleAPICallError as exc:
             raise self._qr_api_error(exc) from exc
+
+        return operation.operation.name
+
+    def queued_resource_operation_status(self, operation_name: str) -> OperationStatus:
+        try:
+            operation = self._tpu_alpha_client.transport.operations_client.get_operation(operation_name)
+        except google.api_core.exceptions.GoogleAPICallError as exc:
+            raise self._qr_api_error(exc) from exc
+        error = operation.error if operation.HasField("error") else None
+        return OperationStatus(
+            done=operation.done,
+            error_code=None if error is None else error.code,
+            error_message=None if error is None else error.message,
+        )
 
     def queued_resource_describe(self, name: str, zone: str) -> QueuedResourceInfo | None:
         qr_name = f"projects/{self._project_id}/locations/{zone}/queuedResources/{name}"
