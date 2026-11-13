@@ -312,7 +312,9 @@ def _tpu_splash_attention(
     v: Float[Array, "B K Hkv D"],
     mask: AttentionMask | jax.Array | None,
 ) -> Float[Array, "B Q Hq D"]:
-    # Preserve cotangent scaling before preceding BF16 transforms such as RoPE.
+    # On TPU, keep Splash's backward query scale from folding into the BF16 RoPE multiply.
+    # Changing the rounding order gave ~0.34% relative L2 query gradient error on v4-16.
+    # See https://github.com/dlwh/marin/pull/67 for the paired comparison.
     q = jax.lax.optimization_barrier(q)
     # Splash attention expects BHSD.
     q_ = jnp.transpose(q, (0, 2, 1, 3))
