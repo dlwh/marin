@@ -10,6 +10,7 @@ The state-dict boundary uses canonical output-first Hugging Face parameter shape
 
 import dataclasses
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal, Mapping
 
@@ -17,7 +18,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
-from jax.sharding import get_abstract_mesh, reshard
+from jax.sharding import auto_axes, get_abstract_mesh, reshard
 from jaxtyping import Array, Float, Int, PRNGKeyArray
 
 from levanter.grug.attention import AttentionMask, GrugAttentionImplementation, attention, reference_attention
@@ -358,6 +359,10 @@ class NativeLlamaBlock(eqx.Module):
         return x + (self.post_mlp_layernorm(mlp) if self.post_mlp_layernorm is not None else mlp)
 
 
+def _gather_token_embeddings(weight: Float[Array, "V D"], tokens: Int[Array, "B S"]) -> Float[Array, "B S D"]:
+    return weight.at[tokens].get()
+
+
 class NativeLlamaModel(eqx.Module):
     """Dense Llama with array-only forward, loss and parameter leaves."""
 
@@ -439,8 +444,18 @@ class NativeLlamaModel(eqx.Module):
         return self.norm(hidden)
 
     def embed_tokens(self, tokens: Int[Array, "B S"], *, sharding: NativeLlamaSharding) -> Float[Array, "B S D"]:
-        weight = reshard(self.token_embeddings, sharding.column_compute)
-        hidden = weight.at[tokens].get(out_sharding=sharding.residual)
+        if self.token_embeddings.dtype == jnp.bfloat16 and sharding.fsdp_axis in sharding.batch_axes:
+            # Keep the embedding storage sharding available to the partitioner. Gathering the
+            # weight on the batch axis first makes the BF16 pullback sum repeated IDs separately
+            # on each data shard, then round again when it combines those partial gradients.
+            # pyrefly: ignore[bad-assignment]  # auto_axes erases the callable signature.
+            gather: Callable[[jax.Array, jax.Array], jax.Array] = auto_axes(
+                _gather_token_embeddings, out_sharding=sharding.residual
+            )
+            hidden = gather(self.token_embeddings, tokens)
+        else:
+            weight = reshard(self.token_embeddings, sharding.column_compute)
+            hidden = weight.at[tokens].get(out_sharding=sharding.residual)
         return self.embedding_norm(hidden) if self.embedding_norm is not None else hidden
 
     def get_lm_head(self) -> Float[Array, "V D"]:
