@@ -89,6 +89,9 @@ def apply_rotary(
         temperature = yarn_attention_factor(config.factor, config.mscale)
         cos = cos * temperature
         sin = sin * temperature
-    first, second = jnp.split(x, 2, axis=-1)
+    # Slices and this evaluation order preserve Named RoPE's cotangent accumulation order.
+    cos_component = x * cos
+    first = x[..., : dim // 2]
+    second = x[..., dim // 2 :]
     rotated = jnp.concatenate((-second, first), axis=-1)
-    return (x * cos + rotated * sin).astype(x.dtype)
+    return (cos_component + rotated * sin).astype(x.dtype)
